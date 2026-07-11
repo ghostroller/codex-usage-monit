@@ -1,0 +1,93 @@
+# Codex Usage Monitor
+
+本地优先的 Codex 终端监控工具。默认启动实时 TUI，也能一次性输出 text/JSON 快照。
+
+当前实现已在 `codex-cli 0.144.1` 与真实 `~/.codex` 数据上验证，提供：
+
+- 近期 task/thread 状态、证据来源和置信度；
+- 选中 task 下的 turns、模型和 token；
+- 所有可用 5 小时、周及非标准额度桶；
+- 当前 5 小时窗口内 task、turn、model 的本地 token 占比；
+- 明确标注为 estimated 的额度百分点归因、coverage、confidence 和 unattributed；
+- 完整或按 section 输出的一次性 text/JSON 快照；
+- 文件指纹缓存，TUI 刷新只重读变化的 rollout。
+
+## 精度边界
+
+Task、turn 和模型的 token 来自 Codex 累计计数的单调增量；在扫描完整且日志未缺失时，这是本地可观察范围内的精确值。
+
+5 小时和周额度的账户总百分比来自 `codex app-server`。Codex 不提供 task/turn 级官方配额账单，因此额度归因始终是估算：相邻快照间隔不超过 5 分钟时，工具按该区间本地 token 比例分配观测到的正向百分点变化。长间隔、缺失扫描、窗口校正和无本地调用的变化保留为 `unattributed`；其他设备或云任务仍可能贡献已观测变化，所以输出同时标记 `externalActivityPossible`。
+
+即使所有任务都已结束，也只能得到精确 token 与更稳定的最终估算，不能变成 OpenAI 服务端意义上的精确任务额度账单。`settled=true` 的估算置信度最高为 `Medium`。
+
+## 构建运行
+
+```bash
+cargo build --release
+./target/release/codex-usage-monit
+```
+
+也可以安装到 Cargo bin 目录：
+
+```bash
+cargo install --path .
+codex-usage-monit
+```
+
+默认扫描最近 7 天、最多 500 个 rollout。常用全局选项：
+
+```bash
+codex-usage-monit --days 2 --max-files 200
+codex-usage-monit --offline
+codex-usage-monit --redact-content
+codex-usage-monit --codex-home /path/to/.codex
+```
+
+`--offline` 不启动 App Server，额度改用 rollout 中最近的本地快照并标记为 stale/partial。`--redact-content` 不保留 task 标题预览。
+
+## 一次性输出
+
+```bash
+codex-usage-monit snapshot
+codex-usage-monit snapshot --format json --compact
+codex-usage-monit snapshot --section limits,tasks,turns,models,attribution,health
+codex-usage-monit limits --format json
+codex-usage-monit tasks --format text
+codex-usage-monit turns --thread <thread-id> --format json
+codex-usage-monit models --format json
+codex-usage-monit attribution --format text
+```
+
+`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。JSON schema 当前为 v1，字段统一使用 camelCase。
+
+退出码：
+
+- `0`：所请求 sections 完整；
+- `1`：无法生成有效结果；
+- `2`：所请求 sections 有可用但不完整的数据；
+- `64`：参数错误。
+
+## TUI 操作
+
+- `1` / `2` / `3`：Overview、Window、Data Health；
+- `Tab`、左右方向键：切换视图；
+- `j` / `k`、上下方向键：选择 task；
+- `PageUp` / `PageDown`：滚动选中 task 的 turns；
+- `q`、`Esc`、`Ctrl-C`：退出。
+
+本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 228 文件、约 22.5 万行的 debug 基准中，冷扫约 5 秒，无文件变化的缓存刷新约 11ms。
+
+## 数据与隐私
+
+- 只读 `CODEX_HOME/sessions`、`archived_sessions` 和 Codex App Server；
+- 不读取 `auth.json`，认证完全由 App Server 管理；
+- 不修改、恢复或终止 Codex task；
+- 缓存仅存在于 TUI 进程内，不写入索引数据库；
+- 默认最多保留 96 字符的首条用户消息作为标题，不保存完整消息、reasoning 或工具内容。
+
+## 文档
+
+- [现有开源工具调研](docs/existing-tools.md)
+- [Codex 数据能力与边界](docs/codex-data-capabilities.md)
+- [产品需求](docs/requirements.md)
+- [实现路径](docs/implementation-plan.md)
