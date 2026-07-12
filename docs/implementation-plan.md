@@ -137,7 +137,7 @@ Estimated 部分：
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：窗口、reset drift、server/local mismatch、correction epoch、long gap、settled；
 - output/CLI：camelCase、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；Tasks/Turns 鼠标测试覆盖点击、每格 3 行的面板滚轮、选择与 viewport 独立、刷新 ID 保持、边界和 80x24、100x30、120x40；并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；Tasks/Turns 鼠标测试覆盖点击、每格 3 行的面板滚轮、选择与 viewport 独立、刷新 ID 保持、边界和 80x24、100x30、120x40；Models 测试覆盖 5h 缺失但 week 可用的 unavailable 状态、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 

@@ -1215,7 +1215,54 @@ fn format_turn_timestamp(value: Option<&chrono::DateTime<chrono::Utc>>) -> Strin
 }
 
 fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
-    let rows = snapshot.models.iter().map(|model| {
+    let scope = snapshot
+        .attribution
+        .window
+        .as_ref()
+        .map(|window| window.label.as_str());
+    if snapshot.models.is_empty() {
+        let (title, message) = if let Some(scope) = scope {
+            (
+                format!("Models · {scope}"),
+                format!("No local model usage in the current {scope} window"),
+            )
+        } else if has_active_window(snapshot, 10_080) && !has_active_window(snapshot, 300) {
+            (
+                "Models · 5h unavailable".to_string(),
+                "5h window unavailable; weekly quota data remains available".to_string(),
+            )
+        } else {
+            (
+                "Models · 5h unavailable".to_string(),
+                "No active 5h quota window".to_string(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(theme.palette().muted))
+                .block(panel(&title, theme))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let visible_capacity = usize::from(area.height.saturating_sub(3));
+    let mut models = snapshot.models.iter().collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        right
+            .token_usage
+            .total_tokens
+            .cmp(&left.token_usage.total_tokens)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    let visible_count = models.len().min(visible_capacity);
+    let mut title = format!("Models · {}", scope.unwrap_or("current window"));
+    if visible_count < models.len() {
+        title.push_str(&format!(" · top {visible_count}/{}", models.len()));
+    }
+
+    let rows = models.into_iter().take(visible_capacity).map(|model| {
         Row::new([
             Cell::from(terminal_safe_text(&model.model)),
             Cell::from(format_tokens(model.token_usage)),
@@ -1238,8 +1285,20 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
         ["MODEL", "TOKENS", "LOCAL SHARE", "EST. QUOTA", "CONF"],
         theme,
     ))
-    .block(panel("Models · current window", theme));
+    .block(panel(&title, theme));
     frame.render_widget(table, area);
+}
+
+fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
+    snapshot
+        .limits
+        .iter()
+        .flat_map(|bucket| [bucket.primary.as_ref(), bucket.secondary.as_ref()])
+        .flatten()
+        .any(|window| {
+            window.window_duration_mins == Some(duration_mins)
+                && window.resets_at.is_some_and(|reset| reset > snapshot.as_of)
+        })
 }
 
 fn render_attribution(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
@@ -1499,7 +1558,9 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AttributionSummary, CollectionStats, LimitBucket, LimitWindow};
+    use crate::domain::{
+        AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage, WindowDescriptor,
+    };
     use ratatui::backend::TestBackend;
 
     fn mouse_test_app(task_count: usize) -> App {
@@ -1597,6 +1658,33 @@ mod tests {
         }
     }
 
+    fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_models(frame, frame.area(), snapshot, Theme::Dark))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn model_usage(model: &str, total_tokens: u64) -> ModelUsage {
+        ModelUsage {
+            model: model.to_string(),
+            token_usage: TokenUsage {
+                total_tokens,
+                ..TokenUsage::default()
+            },
+            local_token_share_percent: 0.0,
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+        }
+    }
+
     #[test]
     fn quota_thresholds_are_distinct() {
         for theme in [Theme::Dark, Theme::Light] {
@@ -1662,6 +1750,86 @@ mod tests {
     fn limit_window_labels_known_windows() {
         assert_eq!(LimitWindow::new(10.0, Some(300), None).label(), "5h");
         assert_eq!(LimitWindow::new(10.0, Some(10_080), None).label(), "week");
+    }
+
+    #[test]
+    fn models_panel_explains_missing_five_hour_with_weekly_data() {
+        let mut app = interaction_test_app(0, 0);
+        let now = app.snapshot.as_of;
+        app.snapshot.limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(
+                23.0,
+                Some(10_080),
+                Some(now + chrono::Duration::days(6)),
+            )),
+            secondary: Some(LimitWindow::new(
+                5.0,
+                Some(1_440),
+                Some(now + chrono::Duration::hours(20)),
+            )),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }];
+
+        let content = render_models_content(&app.snapshot, 120, 7);
+
+        assert!(content.contains("Models · 5h unavailable"));
+        assert!(content.contains("weekly quota data remains available"));
+    }
+
+    #[test]
+    fn models_panel_distinguishes_an_empty_active_window() {
+        let mut app = interaction_test_app(0, 0);
+        let now = app.snapshot.as_of;
+        app.snapshot.attribution.window = Some(WindowDescriptor {
+            limit_id: "codex".to_string(),
+            label: "5h".to_string(),
+            starts_at: now - chrono::Duration::hours(1),
+            ends_at: now + chrono::Duration::hours(4),
+            used_percent: 0.0,
+        });
+
+        let content = render_models_content(&app.snapshot, 100, 4);
+
+        assert!(content.contains("Models · 5h"));
+        assert!(content.contains("No local model usage in the current 5h window"));
+        assert!(!content.contains("5h unavailable"));
+    }
+
+    #[test]
+    fn models_panel_prioritizes_token_usage_and_reports_clipping() {
+        let mut app = interaction_test_app(0, 0);
+        let now = app.snapshot.as_of;
+        app.snapshot.attribution.window = Some(WindowDescriptor {
+            limit_id: "codex".to_string(),
+            label: "5h".to_string(),
+            starts_at: now - chrono::Duration::hours(1),
+            ends_at: now + chrono::Duration::hours(4),
+            used_percent: 10.0,
+        });
+        app.snapshot.models = vec![
+            model_usage("small-model", 10),
+            model_usage("largest-model", 1_000),
+            model_usage("medium-model", 100),
+        ];
+
+        let compact = render_models_content(&app.snapshot, 100, 4);
+        assert!(compact.contains("Models · 5h · top 1/3"));
+        assert!(compact.contains("largest-model"));
+        assert!(!compact.contains("small-model"));
+        assert!(!compact.contains("medium-model"));
+
+        let expanded = render_models_content(&app.snapshot, 100, 7);
+        let largest = expanded.find("largest-model").unwrap();
+        let medium = expanded.find("medium-model").unwrap();
+        let small = expanded.find("small-model").unwrap();
+        assert!(largest < medium && medium < small);
+        assert!(!expanded.contains("top 3/3"));
     }
 
     #[test]

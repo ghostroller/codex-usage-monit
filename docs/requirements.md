@@ -75,7 +75,8 @@ task/thread -> turn -> model token events
 - 相邻快照超过 5 分钟不分摊额度；
 - 扫描截断、坏行或不可读文件时不进行额度分摊；
 - 可分摊的正向 delta 按区间本地 token 比例估算；
-- 未覆盖部分保留为 unattributed，并显式标记外部活动仍可能存在。
+- 未覆盖部分保留为 unattributed，并显式标记外部活动仍可能存在；
+- 服务端不提供当前 300 分钟窗口时，不得用周窗口冒充 5 小时归因；Models 面板必须显示明确的 unavailable 原因，不能只留下空表或把不可用表达成零模型使用量。
 
 ### FR-4 Task 与 Turn Token
 
@@ -121,7 +122,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - quota gauges；
 - task 表；
 - 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
-- 当前窗口模型 token 表。
+- 当前窗口模型 token 表；按 token 降序显示，空间不足时标记 `top N/M`，并区分“5 小时窗口不可用”和“窗口内没有本地模型调用”。
 
 ### Window
 

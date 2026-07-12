@@ -368,9 +368,11 @@ fn selects_only_a_current_five_hour_window() {
     );
     assert_eq!(five_hour_summary.window.unwrap().limit_id, "five-hour");
 
-    let (_, weekly_only_summary) =
-        analyze_current_window(&mut tasks, &mut turns, &[], &[], &[weekly], now);
+    let weekly_call = call(at(11, 59), "weekly-task", "weekly-turn", "gpt-week", 100);
+    let (weekly_models, weekly_only_summary) =
+        analyze_current_window(&mut tasks, &mut turns, &[weekly_call], &[], &[weekly], now);
     assert!(weekly_only_summary.window.is_none());
+    assert!(weekly_models.is_empty());
 }
 
 #[test]
