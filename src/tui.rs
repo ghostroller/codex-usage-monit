@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,7 +24,7 @@ use ratatui::widgets::{
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, Confidence, Provenance, Snapshot, TaskRecord, TaskStatus, TokenUsage,
-    TurnRecord,
+    TurnRecord, terminal_safe_text,
 };
 use crate::rollout::RolloutCache;
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
@@ -349,10 +350,18 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let source_rows = app.snapshot.sources.iter().map(|source| {
         Row::new([
-            Cell::from(source.source.clone()),
-            Cell::from(source.status.clone()),
-            Cell::from(source.as_of.format("%H:%M:%S").to_string()),
-            Cell::from(source.message.clone().unwrap_or_default()),
+            Cell::from(terminal_safe_text(&source.source)),
+            Cell::from(terminal_safe_text(&source.status)),
+            Cell::from(
+                source
+                    .as_of
+                    .with_timezone(&Local)
+                    .format("%H:%M:%S")
+                    .to_string(),
+            ),
+            Cell::from(terminal_safe_text(
+                source.message.as_deref().unwrap_or_default(),
+            )),
         ])
     });
     let source_table = Table::new(
@@ -372,13 +381,14 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let status_counts = count_statuses(&app.snapshot.tasks);
     let stats_text = vec![
         Line::from(format!(
-            "Files  {}/{} scanned ({} truncated, {} unreadable)    Lines  {} parsed / {} skipped",
+            "Files  {}/{} scanned ({} truncated, {} unreadable)    Lines  {} parsed / {} skipped    Resets  {} ambiguous",
             stats.scanned_files,
             stats.discovered_files,
             stats.truncated_files,
             stats.unreadable_files,
             stats.parsed_lines,
-            stats.skipped_lines
+            stats.skipped_lines,
+            stats.ambiguous_token_resets
         )),
         Line::from(format!(
             "Tasks  {} running    {} completed    {} stale/unknown",
@@ -396,17 +406,23 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows[1],
     );
 
-    let issues =
-        app.snapshot
-            .errors
-            .iter()
-            .map(|value| Line::from(Span::styled(value, Style::default().fg(Color::Red))))
-            .chain(
-                app.snapshot.warnings.iter().map(|value| {
-                    Line::from(Span::styled(value, Style::default().fg(Color::Yellow)))
-                }),
-            )
-            .collect::<Vec<_>>();
+    let issues = app
+        .snapshot
+        .errors
+        .iter()
+        .map(|value| {
+            Line::from(Span::styled(
+                terminal_safe_text(value),
+                Style::default().fg(Color::Red),
+            ))
+        })
+        .chain(app.snapshot.warnings.iter().map(|value| {
+            Line::from(Span::styled(
+                terminal_safe_text(value),
+                Style::default().fg(Color::Yellow),
+            ))
+        }))
+        .collect::<Vec<_>>();
     let issues = if issues.is_empty() {
         vec![Line::from(Span::styled(
             "No collection issues",
@@ -458,17 +474,22 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
     for (index, (bucket, window)) in windows.iter().enumerate() {
         let reset = window
             .resets_at
-            .map(|value| value.format("%m-%d %H:%M").to_string())
+            .map(|value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
             .unwrap_or_else(|| "unknown".to_string());
         let reset_time = window
             .resets_at
-            .map(|value| value.format("%H:%M").to_string())
+            .map(|value| value.with_timezone(&Local).format("%H:%M").to_string())
             .unwrap_or_else(|| "?".to_string());
         let color = quota_color(window.used_percent);
         let title = format!(
             "{} · {} · {}",
             window.label(),
-            bucket.limit_id,
+            terminal_safe_text(&bucket.limit_id),
             provenance_label(bucket.provenance)
         );
         let width = columns[index].width.saturating_sub(2);
@@ -568,7 +589,9 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &App, window_only: bool)
         };
         Row::new([
             Cell::from(turn_status_label(turn)),
-            Cell::from(turn.model.clone().unwrap_or_else(|| "unknown".to_string())),
+            Cell::from(terminal_safe_text(
+                turn.model.as_deref().unwrap_or("unknown"),
+            )),
             Cell::from(format_tokens(tokens)),
             Cell::from(format!("{:.1}%", turn.local_token_share_percent)),
             Cell::from(format!("{:.1}%", turn.estimated_quota_percent)),
@@ -603,7 +626,7 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &App, window_only: bool)
 fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
     let rows = snapshot.models.iter().map(|model| {
         Row::new([
-            Cell::from(model.model.clone()),
+            Cell::from(terminal_safe_text(&model.model)),
             Cell::from(format_tokens(model.token_usage)),
             Cell::from(format!("{:.1}%", model.local_token_share_percent)),
             Cell::from(format!("{:.1}%", model.estimated_quota_percent)),
@@ -641,8 +664,8 @@ fn render_attribution(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
                 "{} · {:.1}% used · {} to {}",
                 window.label,
                 window.used_percent,
-                window.starts_at.format("%m-%d %H:%M"),
-                window.ends_at.format("%m-%d %H:%M")
+                window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
             )
         })
         .unwrap_or_else(|| "No active quota window".to_string());
@@ -726,10 +749,10 @@ fn task_display_label(task: &TaskRecord) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("-");
     let source = task.source.as_deref().unwrap_or("unknown");
-    format!(
+    terminal_safe_text(&format!(
         "{project} | {source} | {}t | {}",
         task.turn_count, task.title
-    )
+    ))
 }
 
 fn format_tokens(tokens: TokenUsage) -> String {

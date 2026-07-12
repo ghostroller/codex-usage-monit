@@ -5,7 +5,9 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::domain::{Confidence, LimitWindow, Provenance, Snapshot, TokenUsage};
+use crate::domain::{
+    Confidence, LimitWindow, Provenance, Snapshot, TokenUsage, terminal_safe_text,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -68,10 +70,59 @@ pub fn request_is_partial(snapshot: &Snapshot, request: &OutputRequest) -> bool 
 
     request.sections.iter().any(|section| match section {
         Section::Limits => limits_degraded,
-        Section::Tasks | Section::Turns => rollout_degraded,
+        Section::Tasks => rollout_degraded || (!snapshot.tasks.is_empty() && limits_degraded),
+        Section::Turns => {
+            let has_matching_turn = snapshot.turns.iter().any(|turn| {
+                request
+                    .thread_filter
+                    .as_deref()
+                    .is_none_or(|thread_id| turn.thread_id == thread_id)
+            });
+            rollout_degraded || (has_matching_turn && limits_degraded)
+        }
         Section::Models | Section::Attribution => rollout_degraded || limits_degraded,
         Section::Health => snapshot.partial,
     })
+}
+
+pub fn request_is_failure(snapshot: &Snapshot, request: &OutputRequest) -> bool {
+    let rollout_complete = snapshot
+        .sources
+        .iter()
+        .any(|source| source.source == "rollout_jsonl" && source.status == "ok");
+    let mut requested_data_section = false;
+
+    for section in &request.sections {
+        let has_usable_data = match section {
+            Section::Limits => !snapshot.limits.is_empty(),
+            Section::Tasks => !snapshot.tasks.is_empty() || rollout_complete,
+            Section::Turns => {
+                snapshot.turns.iter().any(|turn| {
+                    request
+                        .thread_filter
+                        .as_deref()
+                        .is_none_or(|thread_id| turn.thread_id == thread_id)
+                }) || rollout_complete
+            }
+            Section::Models => {
+                !snapshot.models.is_empty()
+                    || (snapshot.attribution.window.is_some() && rollout_complete)
+            }
+            Section::Attribution => {
+                snapshot.attribution.window.is_some()
+                    && (rollout_complete
+                        || !snapshot.tasks.is_empty()
+                        || !snapshot.turns.is_empty())
+            }
+            Section::Health => continue,
+        };
+        requested_data_section = true;
+        if has_usable_data {
+            return false;
+        }
+    }
+
+    requested_data_section
 }
 
 fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
@@ -145,7 +196,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                     window.used_percent,
                     window.remaining_percent,
                     reset_label(window),
-                    bucket.limit_id,
+                    terminal_safe_text(&bucket.limit_id),
                     bucket.provenance,
                     bucket.as_of.format("%Y-%m-%d %H:%M:%S UTC")
                 );
@@ -172,7 +223,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 compact_tokens(task.token_usage),
                 task.local_token_share_percent,
                 task.estimated_quota_percent,
-                task.title
+                terminal_safe_text(&task.title)
             );
         }
     }
@@ -194,11 +245,11 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 output,
                 "  {:<10} {:<16} {:>12} {:>7.2}% {:>7.2}%  {}",
                 format!("{:?}", turn.status).to_lowercase(),
-                turn.model.as_deref().unwrap_or("unknown"),
+                terminal_safe_text(turn.model.as_deref().unwrap_or("unknown")),
                 compact_tokens(turn.token_usage),
                 turn.local_token_share_percent,
                 turn.estimated_quota_percent,
-                short_id(&turn.thread_id)
+                terminal_safe_text(short_id(&turn.thread_id))
             );
         }
     }
@@ -209,7 +260,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             let _ = writeln!(
                 output,
                 "  {:<24} {:>12}  {:>7.2}% local  {:>7.2}% estimated quota  {:?}",
-                model.model,
+                terminal_safe_text(&model.model),
                 compact_tokens(model.token_usage),
                 model.local_token_share_percent,
                 model.estimated_quota_percent,
@@ -246,7 +297,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             attribution.attribution_coverage_percent,
             attribution.external_activity_possible,
             attribution.settled,
-            attribution.method
+            terminal_safe_text(&attribution.method)
         );
     }
 
@@ -256,26 +307,27 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             let _ = writeln!(
                 output,
                 "  {:<16} {:<8} {}",
-                source.source,
-                source.status,
-                source.message.as_deref().unwrap_or("")
+                terminal_safe_text(&source.source),
+                terminal_safe_text(&source.status),
+                terminal_safe_text(source.message.as_deref().unwrap_or(""))
             );
         }
         let _ = writeln!(
             output,
-            "  files {}/{} | truncated {} | unreadable {} | lines {} | skipped {}",
+            "  files {}/{} | truncated {} | unreadable {} | lines {} | skipped {} | ambiguous resets {}",
             snapshot.stats.scanned_files,
             snapshot.stats.discovered_files,
             snapshot.stats.truncated_files,
             snapshot.stats.unreadable_files,
             snapshot.stats.parsed_lines,
-            snapshot.stats.skipped_lines
+            snapshot.stats.skipped_lines,
+            snapshot.stats.ambiguous_token_resets
         );
         for warning in &snapshot.warnings {
-            let _ = writeln!(output, "  warning: {warning}");
+            let _ = writeln!(output, "  warning: {}", terminal_safe_text(warning));
         }
         for error in &snapshot.errors {
-            let _ = writeln!(output, "  error: {error}");
+            let _ = writeln!(output, "  error: {}", terminal_safe_text(error));
         }
     }
 
@@ -290,13 +342,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             let _ = writeln!(
                 output,
                 "  {}: {} {}",
-                source.source,
-                source.status,
-                source.message.as_deref().unwrap_or_default()
+                terminal_safe_text(&source.source),
+                terminal_safe_text(&source.status),
+                terminal_safe_text(source.message.as_deref().unwrap_or_default())
             );
         }
         for error in &snapshot.errors {
-            let _ = writeln!(output, "  error: {error}");
+            let _ = writeln!(output, "  error: {}", terminal_safe_text(error));
         }
     }
 
@@ -362,7 +414,8 @@ fn status_evidence(provenance: Provenance, confidence: Confidence) -> String {
 mod tests {
     use super::*;
     use crate::domain::{
-        AttributionSummary, CollectionStats, LimitBucket, Provenance, SourceStatus,
+        AttributionSummary, CollectionStats, LimitBucket, Provenance, SourceStatus, TaskRecord,
+        TaskStatus, TurnRecord,
     };
 
     #[test]
@@ -425,7 +478,23 @@ mod tests {
                 as_of: now,
             }],
             account_usage: None,
-            tasks: Vec::new(),
+            tasks: vec![TaskRecord {
+                thread_id: "task-thread".to_string(),
+                title: "task".to_string(),
+                cwd: None,
+                source: None,
+                created_at: None,
+                updated_at: None,
+                status: TaskStatus::Completed,
+                status_provenance: Provenance::LocalExact,
+                status_confidence: Confidence::High,
+                token_usage: TokenUsage::default(),
+                turn_count: 0,
+                window_token_usage: TokenUsage::default(),
+                local_token_share_percent: 0.0,
+                estimated_quota_percent: 0.0,
+                quota_confidence: Confidence::Unknown,
+            }],
             turns: Vec::new(),
             models: Vec::new(),
             attribution: AttributionSummary::default(),
@@ -444,16 +513,72 @@ mod tests {
             ..tasks.clone()
         };
 
-        assert!(!request_is_partial(&snapshot, &tasks));
+        assert!(request_is_partial(&snapshot, &tasks));
+        assert!(!request_is_failure(&snapshot, &tasks));
         assert!(request_is_partial(&snapshot, &limits));
+        assert!(!request_is_failure(&snapshot, &limits));
         let tasks_json: Value =
             serde_json::from_str(&render_output(&snapshot, &tasks).unwrap()).unwrap();
-        assert_eq!(tasks_json["partial"], false);
+        assert_eq!(tasks_json["partial"], true);
         assert!(tasks_json.get("accountUsage").is_none());
-        assert!(tasks_json.get("errors").is_none());
+        assert!(tasks_json.get("errors").is_some());
         let limits_json: Value =
             serde_json::from_str(&render_output(&snapshot, &limits).unwrap()).unwrap();
         assert_eq!(limits_json["partial"], true);
         assert!(limits_json.get("errors").is_some());
+
+        let mut empty_snapshot = snapshot.clone();
+        empty_snapshot.tasks.clear();
+        assert!(!request_is_partial(&empty_snapshot, &tasks));
+        assert!(!request_is_failure(&empty_snapshot, &tasks));
+        let empty_filtered_turns = OutputRequest {
+            sections: BTreeSet::from([Section::Turns]),
+            thread_filter: Some("missing-thread".to_string()),
+            ..tasks.clone()
+        };
+        assert!(!request_is_partial(&empty_snapshot, &empty_filtered_turns));
+        assert!(!request_is_failure(&empty_snapshot, &empty_filtered_turns));
+
+        let mut unavailable = snapshot;
+        unavailable.sources[0].status = "error".to_string();
+        unavailable.limits.clear();
+        unavailable.tasks.clear();
+        assert!(request_is_failure(&unavailable, &tasks));
+        assert!(request_is_failure(&unavailable, &limits));
+
+        unavailable.turns.push(TurnRecord {
+            thread_id: "present-thread".to_string(),
+            turn_id: "turn-1".to_string(),
+            model: None,
+            reasoning_effort: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            status: Default::default(),
+            token_usage: TokenUsage::default(),
+            window_token_usage: TokenUsage::default(),
+            local_token_share_percent: 0.0,
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+        });
+        let filtered_turns = OutputRequest {
+            sections: BTreeSet::from([Section::Turns]),
+            thread_filter: Some("missing-thread".to_string()),
+            ..tasks.clone()
+        };
+        assert!(request_is_failure(&unavailable, &filtered_turns));
+        let matching_turns = OutputRequest {
+            thread_filter: Some("present-thread".to_string()),
+            ..filtered_turns
+        };
+        assert!(!request_is_failure(&unavailable, &matching_turns));
+    }
+
+    #[test]
+    fn terminal_text_removes_control_characters() {
+        assert_eq!(
+            terminal_safe_text("before\u{1b}[2Jafter\u{7}"),
+            "before [2Jafter "
+        );
     }
 }

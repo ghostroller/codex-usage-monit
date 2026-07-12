@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -6,7 +7,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::CollectConfig;
-use crate::output::{OutputFormat, OutputRequest, Section, render_output, request_is_partial};
+use crate::output::{
+    OutputFormat, OutputRequest, Section, render_output, request_is_failure, request_is_partial,
+};
 use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
 
 #[derive(Debug, Parser)]
@@ -138,7 +141,7 @@ fn run_with(cli: Cli) -> Result<i32> {
     }
     config.lookback_days = cli.days.max(1);
     config.max_files = cli.max_files.max(1);
-    config.active_grace = Duration::from_secs(cli.active_grace_minutes.max(1) * 60);
+    config.active_grace = active_grace(cli.active_grace_minutes);
     config.offline = cli.offline;
     config.redact_content = cli.redact_content;
 
@@ -179,12 +182,31 @@ fn run_with(cli: Cli) -> Result<i32> {
         result = collect_snapshot(&config, Some(result.account), false);
     }
 
-    println!("{}", render_output(&result.snapshot, &request)?);
-    Ok(if request_is_partial(&result.snapshot, &request) {
+    let output = render_output(&result.snapshot, &request)?;
+    let mut stdout = io::stdout().lock();
+    if let Err(error) = write_output(&mut stdout, &output) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(0);
+        }
+        return Err(error.into());
+    }
+
+    Ok(if request_is_failure(&result.snapshot, &request) {
+        1
+    } else if request_is_partial(&result.snapshot, &request) {
         2
     } else {
         0
     })
+}
+
+fn write_output(writer: &mut impl Write, output: &str) -> io::Result<()> {
+    writer.write_all(output.as_bytes())?;
+    writer.write_all(b"\n")
+}
+
+fn active_grace(minutes: u64) -> Duration {
+    Duration::from_secs(minutes.max(1).saturating_mul(60))
 }
 
 fn request_for(args: OutputArgs, section: Section) -> OutputRequest {
@@ -199,6 +221,18 @@ fn request_for(args: OutputArgs, section: Section) -> OutputRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn section_all_contains_every_public_section() {
@@ -215,5 +249,16 @@ mod tests {
     fn clap_help_is_successful() {
         let error = Cli::try_parse_from(["codex-usage-monit", "--help"]).unwrap_err();
         assert!(!error.use_stderr());
+    }
+
+    #[test]
+    fn output_writes_report_broken_pipes_without_panicking() {
+        let error = write_output(&mut BrokenPipeWriter, "large output").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn active_grace_conversion_saturates() {
+        assert_eq!(active_grace(u64::MAX), Duration::from_secs(u64::MAX));
     }
 }

@@ -14,7 +14,7 @@
 
 ## 精度边界
 
-Task、turn 和模型的 token 来自 Codex 累计计数的单调增量；在扫描完整且日志未缺失时，这是本地可观察范围内的精确值。
+Task、turn 和模型的 token 来自 Codex 累计计数的单调增量；在扫描完整、日志未缺失且累计计数没有回退时，这是本地可观察范围内的精确值。累计计数回退时，工具不会把新的较小基线重复算作消费，而会跳过该歧义样本并将 `ambiguousTokenResets`、数据源和快照标为 partial。
 
 5 小时和周额度的账户总百分比来自 `codex app-server`。Codex 不提供 task/turn 级官方配额账单，因此额度归因始终是估算：相邻快照间隔不超过 5 分钟时，工具按该区间本地 token 比例分配观测到的正向百分点变化。长间隔、缺失扫描、窗口校正和无本地调用的变化保留为 `unattributed`；其他设备或云任务仍可能贡献已观测变化，所以输出同时标记 `externalActivityPossible`。
 
@@ -75,7 +75,8 @@ codex-usage-monit attribution --format text
 - `PageUp` / `PageDown`：滚动选中 task 的 turns；
 - `q`、`Esc`、`Ctrl-C`：退出。
 
-本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 228 文件、约 22.5 万行的 debug 基准中，冷扫约 5 秒，无文件变化的缓存刷新约 11ms。
+本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
+TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
 
 ## 数据与隐私
 
@@ -84,6 +85,7 @@ codex-usage-monit attribution --format text
 - 不修改、恢复或终止 Codex task；
 - 缓存仅存在于 TUI 进程内，不写入索引数据库；
 - 默认最多保留 96 字符的首条用户消息作为标题，不保存完整消息、reasoning 或工具内容。
+- TUI 与 text 输出会剥离动态文本中的终端控制字符；JSON 使用标准转义。
 
 ## 文档
 

@@ -68,7 +68,9 @@ fn collect_snapshot_with_local(
                 let truncated = dataset.stats.truncated_files;
                 let unreadable = dataset.stats.unreadable_files;
                 let skipped = dataset.stats.skipped_lines;
-                let rollout_partial = truncated > 0 || unreadable > 0 || skipped > 0;
+                let ambiguous_resets = dataset.stats.ambiguous_token_resets;
+                let rollout_partial =
+                    truncated > 0 || unreadable > 0 || skipped > 0 || ambiguous_resets > 0;
                 sources.push(SourceStatus {
                 source: "rollout_jsonl".to_string(),
                 status: if rollout_partial {
@@ -79,7 +81,7 @@ fn collect_snapshot_with_local(
                 as_of: now,
                 message: Some(if rollout_partial {
                     format!(
-                        "{} files, {truncated} truncated, {unreadable} unreadable, {skipped} lines skipped",
+                        "{} files, {truncated} truncated, {unreadable} unreadable, {skipped} lines skipped, {ambiguous_resets} ambiguous token resets",
                         dataset.stats.scanned_files
                     )
                 } else {
@@ -188,7 +190,8 @@ fn collect_snapshot_with_local(
     rate_observations.extend(account.rate_observations.iter().cloned());
     let rollout_complete = dataset.stats.truncated_files == 0
         && dataset.stats.unreadable_files == 0
-        && dataset.stats.skipped_lines == 0;
+        && dataset.stats.skipped_lines == 0
+        && dataset.stats.ambiguous_token_resets == 0;
     let attribution_observations = if rollout_complete {
         rate_observations.as_slice()
     } else {
@@ -220,6 +223,7 @@ fn collect_snapshot_with_local(
         || dataset.stats.skipped_lines > 0
         || dataset.stats.truncated_files > 0
         || dataset.stats.unreadable_files > 0
+        || dataset.stats.ambiguous_token_resets > 0
         || sources
             .iter()
             .any(|source| matches!(source.status.as_str(), "error" | "partial" | "stale"));

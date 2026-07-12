@@ -320,6 +320,7 @@ pub struct CollectionStats {
     pub unreadable_files: usize,
     pub parsed_lines: usize,
     pub skipped_lines: usize,
+    pub ambiguous_token_resets: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -390,4 +391,17 @@ pub fn aggregate_tokens_by_model(calls: &[UsageCall]) -> BTreeMap<String, TokenU
             .add_assign(call.tokens);
     }
     result
+}
+
+pub fn terminal_safe_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }

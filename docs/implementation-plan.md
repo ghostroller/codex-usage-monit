@@ -82,20 +82,20 @@ subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续
 5. 选择集或任一文件变化时重建 reducer；
 6. 完全无变化时复用 reducer，只按 `now` 重算 Running/Stale。
 
-真实 debug 基准：228 文件、225k 行，cold 约 4.97s，warm 约 11ms。
+最新真实 debug 基准：235 文件、约 232k 行，cold 约 5.7s，warm 约 55ms。
 
 ## 5. Token 重建
 
 每个 thread reducer 维护：
 
 ```text
-active_turn_id
+active_turn_stack
 last_turn_id
 previous_cumulative
 turn/model metadata
 ```
 
-相同累计值去重；每字段单调时计算 delta；counter 回退开启新 epoch；task finish 后的最终 delta 使用 `last_turn_id`；新 task 开始后清除旧 last turn。`totalTokens` 是总量，cached/reasoning 仅作为 breakdown。
+相同累计值去重；每字段单调时计算 delta；嵌套 turn 完成后恢复父 turn；task finish 后的最终 delta 使用 `last_turn_id`。Counter 回退时只建立新的累计基线，不把回退样本重复计入，并增加 `ambiguousTokenResets`、把数据标为 partial。`totalTokens` 是总量，cached/reasoning 仅作为 breakdown。
 
 ## 6. 窗口和额度估算
 
@@ -124,11 +124,11 @@ Estimated 部分：
 
 ## 8. 测试
 
-- App Server mock：多桶、legacy、nullable、错误、timeout、child reap；
-- rollout：duplicate/reset、archive、redact、stale、parent replay、final token、truncate；
+- App Server mock：多桶、legacy、nullable、错误、可选 usage stall、timeout、child reap；
+- rollout：duplicate/reset、嵌套 turn、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：窗口、reset drift、server/local mismatch、correction epoch、long gap、settled；
-- output/CLI：camelCase、section partial、help/usage；
+- output/CLI：camelCase、section partial/failure、broken pipe、help/usage；
 - TUI：80x24 与 120x40 TestBackend，并做真实 PTY smoke test。
 
 ## 9. 已完成阶段

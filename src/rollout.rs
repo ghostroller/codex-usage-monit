@@ -138,7 +138,7 @@ struct ThreadBuilder {
     source: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
-    active_turn_id: Option<String>,
+    active_turn_ids: Vec<String>,
     last_turn_id: Option<String>,
     previous_cumulative: Option<TokenUsage>,
     token_usage: TokenUsage,
@@ -287,6 +287,7 @@ fn materialize_dataset(
     discovery.stats.scanned_files = reduced.dataset.stats.scanned_files;
     discovery.stats.parsed_lines = reduced.dataset.stats.parsed_lines;
     discovery.stats.skipped_lines = reduced.dataset.stats.skipped_lines;
+    discovery.stats.ambiguous_token_resets = reduced.dataset.stats.ambiguous_token_resets;
     discovery.stats.unreadable_files += reduced.dataset.stats.unreadable_files;
     discovery.warnings.extend(reduced.dataset.warnings.clone());
     discovery.calls = reduced.dataset.calls.clone();
@@ -301,7 +302,9 @@ fn discover_rollout_files(
     dataset: &mut RolloutDataset,
 ) -> Vec<RolloutFile> {
     let lookback_days = config.lookback_days.max(0);
-    let cutoff = now - ChronoDuration::days(lookback_days);
+    let cutoff = ChronoDuration::try_days(lookback_days)
+        .and_then(|lookback| now.checked_sub_signed(lookback))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let roots = [
         config.codex_home.join("sessions"),
         config.codex_home.join("archived_sessions"),
@@ -793,7 +796,13 @@ fn apply_turn_context(
         return;
     };
 
-    activate_turn(thread, &turn_id, timestamp);
+    if !thread
+        .active_turn_ids
+        .iter()
+        .any(|active| active == &turn_id)
+    {
+        activate_turn(thread, &turn_id, timestamp);
+    }
     let turn = ensure_turn(thread, &turn_id);
     if let Some(model) = string_field_in(payload, &["model"]) {
         turn.model = Some(model.to_owned());
@@ -880,14 +889,6 @@ fn apply_event_msg(
 }
 
 fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime<Utc>) {
-    if let Some(previous_id) = thread.active_turn_id.as_deref()
-        && previous_id != turn_id
-        && let Some(previous) = thread.turns.get_mut(previous_id)
-        && previous.status == TurnStatus::InProgress
-    {
-        previous.status = TurnStatus::Stale;
-    }
-
     let turn = ensure_turn(thread, turn_id);
     if matches!(
         turn.status,
@@ -899,8 +900,9 @@ fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime
     if matches!(turn.status, TurnStatus::Unknown | TurnStatus::Stale) {
         turn.status = TurnStatus::InProgress;
     }
+    thread.active_turn_ids.retain(|active| active != turn_id);
+    thread.active_turn_ids.push(turn_id.to_owned());
     thread.last_turn_id = None;
-    thread.active_turn_id = Some(turn_id.to_owned());
 }
 
 fn finish_turn(
@@ -922,9 +924,7 @@ fn finish_turn(
                 .ok()
         })
     });
-    if thread.active_turn_id.as_deref() == Some(turn_id) {
-        thread.active_turn_id = None;
-    }
+    thread.active_turn_ids.retain(|active| active != turn_id);
     thread.last_turn_id = Some(turn_id.to_owned());
 }
 
@@ -945,8 +945,9 @@ fn apply_token_count(
             timestamp,
             &thread.thread_id,
             thread
-                .active_turn_id
-                .as_deref()
+                .active_turn_ids
+                .last()
+                .map(String::as_str)
                 .or(thread.last_turn_id.as_deref()),
         )
     {
@@ -965,11 +966,13 @@ fn apply_token_count(
             Some(delta) => delta,
             None => {
                 dataset.warnings.push(format!(
-                    "token counter reset for thread {} at {} line {line_number}; started a new counter epoch",
+                    "token counter reset for thread {} at {} line {line_number}; re-established the cumulative baseline without counting the ambiguous reset sample",
                     thread.thread_id,
                     path.display()
                 ));
-                total_usage
+                dataset.stats.ambiguous_token_resets += 1;
+                thread.previous_cumulative = Some(total_usage);
+                return;
             }
         },
     };
@@ -980,8 +983,9 @@ fn apply_token_count(
 
     thread.token_usage.add_assign(delta);
     let turn_id = thread
-        .active_turn_id
-        .clone()
+        .active_turn_ids
+        .last()
+        .cloned()
         .or_else(|| thread.last_turn_id.clone());
     let model = turn_id
         .as_deref()
@@ -1157,16 +1161,16 @@ fn finish_dataset(
     dataset: &mut RolloutDataset,
 ) {
     for mut thread in threads.into_values() {
-        let active_is_fresh = thread.active_turn_id.is_some()
+        let active_is_fresh = !thread.active_turn_ids.is_empty()
             && timestamp_is_fresh(thread.updated_at, now, config.active_grace);
-        if let Some(active_turn_id) = thread.active_turn_id.as_deref()
-            && let Some(turn) = thread.turns.get_mut(active_turn_id)
-        {
-            turn.status = if active_is_fresh {
-                TurnStatus::InProgress
-            } else {
-                TurnStatus::Stale
-            };
+        for active_turn_id in &thread.active_turn_ids {
+            if let Some(turn) = thread.turns.get_mut(active_turn_id) {
+                turn.status = if active_is_fresh {
+                    TurnStatus::InProgress
+                } else {
+                    TurnStatus::Stale
+                };
+            }
         }
 
         let (status, status_provenance, status_confidence) = task_status(&thread, active_is_fresh);
@@ -1252,7 +1256,7 @@ fn task_status(
     thread: &ThreadBuilder,
     active_is_fresh: bool,
 ) -> (TaskStatus, Provenance, Confidence) {
-    if thread.active_turn_id.is_some() {
+    if !thread.active_turn_ids.is_empty() {
         return if active_is_fresh {
             (
                 TaskStatus::Running,

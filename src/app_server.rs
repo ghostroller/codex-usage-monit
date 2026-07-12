@@ -142,7 +142,16 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         let mut rate_limits = None;
         let mut account_usage = None;
         while rate_limits.is_none() || account_usage.is_none() {
-            let event = recv_event(deadline, &reader_rx, "account snapshot", &stderr_output)?;
+            let event = match recv_event(deadline, &reader_rx, "account snapshot", &stderr_output) {
+                Ok(event) => event,
+                Err(error) if rate_limits.is_some() => {
+                    protocol_warnings.push(format!(
+                        "account/usage/read did not complete after rate limits were received: {error:#}"
+                    ));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             match event {
                 ReaderEvent::Message(message) => {
                     if response_id(&message) == Some(RATE_LIMITS_ID) && rate_limits.is_none() {
@@ -155,6 +164,13 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                 }
                 ReaderEvent::Malformed(message) => protocol_warnings.push(message),
                 ReaderEvent::Eof => {
+                    if rate_limits.is_some() {
+                        protocol_warnings.push(format!(
+                            "codex app-server closed stdout before returning account/usage/read{}",
+                            stderr_suffix(&stderr_output)
+                        ));
+                        break;
+                    }
                     bail!(
                         "codex app-server closed stdout before returning the account snapshot{}",
                         stderr_suffix(&stderr_output)
@@ -178,16 +194,18 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                 .errors
                 .push(format!("account/rateLimits/read failed: {message}")),
         }
-        match account_usage.expect("account-usage response must be present") {
-            Ok(result) => match parse_account_usage_result(&result) {
-                Ok(usage) => snapshot.usage = Some(usage),
-                Err(error) => snapshot.warnings.push(format!(
-                    "account/usage/read returned invalid data: {error:#}"
-                )),
-            },
-            Err(message) => snapshot
-                .warnings
-                .push(format!("account/usage/read failed: {message}")),
+        if let Some(account_usage) = account_usage {
+            match account_usage {
+                Ok(result) => match parse_account_usage_result(&result) {
+                    Ok(usage) => snapshot.usage = Some(usage),
+                    Err(error) => snapshot.warnings.push(format!(
+                        "account/usage/read returned invalid data: {error:#}"
+                    )),
+                },
+                Err(message) => snapshot
+                    .warnings
+                    .push(format!("account/usage/read failed: {message}")),
+            }
         }
 
         Ok(snapshot)

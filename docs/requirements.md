@@ -80,7 +80,8 @@ task/thread -> turn -> model token events
 
 - task/turn token 从单调累计计数计算；
 - 完全重复的 `token_count` 不重复计数；
-- counter 回退开启新 epoch 并报告 warning；
+- counter 回退只重建 baseline、不重复计算歧义样本，并报告 warning/partial；
+- 嵌套 turn 完成后恢复仍在执行的父 turn；
 - task 完成后迟到的最终 token 仍归入刚完成的 turn；
 - subagent rollout 内嵌的 parent 历史不得重复计入 parent 或 child；
 - TUI 显示 total，JSON 同时显示 input、cached input、output、reasoning output 和 total。
@@ -128,7 +129,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 
 - 数据源状态；
 - scanned/discovered/truncated/unreadable 文件数；
-- parsed/skipped 行数；
+- parsed/skipped 行数与 ambiguous token reset 数；
 - active/completed/uncertain task 数；
 - partial 与 diagnostics。
 
@@ -150,7 +151,8 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - 不读取 `auth.json`；
 - 不保存完整 prompt、assistant、reasoning 或工具内容；
 - `--redact-content` 禁用标题预览；
-- 未识别字段容忍，坏行与不可读文件进入 partial；
+- 未识别字段容忍，坏行、不可读文件与累计 token 回退进入 partial；
+- TUI/text 输出清洗终端控制字符，JSON 使用标准转义；
 - 不向第三方发送本地数据。
 
 ## 6. v0.1 验收
@@ -160,7 +162,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - 真实 subagent parent replay 不重复计数；
 - 真实 80x24 与 120x40 TUI 不重叠、不崩溃并能恢复终端；
 - 多额度桶读取成功；
-- 228 文件真实基准 warm refresh 小于 200ms；
+- 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
 - idle 后额度估算仍不声称 exact。
 

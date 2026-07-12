@@ -129,6 +129,11 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(3, 0, 1, 0, 4)}}
         }),
         json!({
+            "timestamp": timestamp(t1 + chrono::Duration::seconds(5)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage(5, 1, 2, 0, 7)}}
+        }),
+        json!({
             "timestamp": timestamp(t2),
             "type": "event_msg",
             "payload": {"type": "turn_aborted", "turn_id": "turn-2", "reason": "interrupted", "completed_at": t2.timestamp()}
@@ -144,6 +149,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(dataset.stats.scanned_files, 1);
     assert_eq!(dataset.stats.parsed_lines, records.len());
     assert_eq!(dataset.stats.skipped_lines, 1);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.turns.len(), 2);
     assert_eq!(
@@ -166,11 +172,11 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(
         task.token_usage,
         TokenUsage {
-            input_tokens: 21,
-            cached_input_tokens: 5,
+            input_tokens: 20,
+            cached_input_tokens: 6,
             output_tokens: 5,
             reasoning_output_tokens: 1,
-            total_tokens: 26,
+            total_tokens: 25,
         }
     );
 
@@ -193,7 +199,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(turn_2.status, TurnStatus::Interrupted);
     assert_eq!(turn_2.model.as_deref(), Some("gpt-next"));
     assert_eq!(turn_2.reasoning_effort.as_deref(), Some("medium"));
-    assert_eq!(turn_2.token_usage.total_tokens, 11);
+    assert_eq!(turn_2.token_usage.total_tokens, 10);
 
     assert_eq!(dataset.rate_observations.len(), 1);
     let limits = &dataset.rate_observations[0];
@@ -218,6 +224,82 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
             .iter()
             .any(|warning| warning.contains("malformed JSON"))
     );
+}
+
+#[test]
+fn resumes_the_parent_turn_after_a_nested_turn_completes() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-nested-turns.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "nested-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "outer"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": usage(8, 0, 2, 0, 10)}}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "inner"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "turn_context",
+                "payload": {"turn_id": "outer", "model": "outer-model"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": usage(16, 0, 4, 0, 20)}}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "inner"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": usage(24, 0, 6, 0, 30)}}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "outer"}
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let outer = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "outer")
+        .unwrap();
+    let inner = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "inner")
+        .unwrap();
+
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 30);
+    assert_eq!(outer.token_usage.total_tokens, 20);
+    assert_eq!(inner.token_usage.total_tokens, 10);
+    assert_eq!(outer.status, TurnStatus::Completed);
+    assert_eq!(inner.status, TurnStatus::Completed);
 }
 
 #[test]
@@ -521,6 +603,19 @@ fn missing_codex_home_is_reported_as_incomplete() {
             .iter()
             .any(|warning| warning.contains("no Codex rollout directories"))
     );
+}
+
+#[test]
+fn an_extreme_lookback_does_not_overflow() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = i64::MAX;
+
+    let dataset = scan_rollouts(&scan_config, now).unwrap();
+
+    assert_eq!(dataset.stats.discovered_files, 0);
+    assert_eq!(dataset.stats.unreadable_files, 1);
 }
 
 #[test]

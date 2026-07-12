@@ -135,7 +135,7 @@ observed_delta = max(0, current_used_percent - previous_used_percent)
 
 这只是账户额度变化。若区间内只有一个本地模型调用且没有可见并发，可把它显示为“观测到的百分点变化”，并附置信度。若区间内有多个任务、并发、缺口或外部活动，则必须进入 `unattributed`，或者在用户明确接受后按 token 代理量做 `estimated` 分摊。
 
-v0.1 采用已经确认的 token 比例代理量，但只分摊间隔不超过 5 分钟的快照。扫描截断、坏行、不可读文件、长快照间隔和没有本地调用的变化不分摊。服务端与 rollout 明显不一致时只使用服务端历史；百分比回退会开启新的观测 epoch。即使区间成功分摊，其他设备或云 task 仍可能同时贡献该 delta，因此 schema 保留 `externalActivityPossible`，confidence 不会达到 High。
+v0.1 采用已经确认的 token 比例代理量，但只分摊间隔不超过 5 分钟的快照。扫描截断、坏行、不可读文件、累计 token counter 回退、长快照间隔和没有本地调用的变化不分摊。Counter 回退样本只重建 baseline 并标记 partial，避免把共享基线重复算作消费。服务端与 rollout 明显不一致时只使用服务端历史；百分比回退会开启新的观测 epoch。即使区间成功分摊，其他设备或云 task 仍可能同时贡献该 delta，因此 schema 保留 `externalActivityPossible`，confidence 不会达到 High。
 
 ### 不允许的口径
 

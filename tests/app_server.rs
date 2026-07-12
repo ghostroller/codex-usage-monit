@@ -282,6 +282,44 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
 
 #[cfg(unix)]
 #[test]
+fn preserves_limits_when_the_optional_usage_rpc_stalls() {
+    let script = r#"#!/bin/sh
+IFS= read -r initialize || exit 61
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 62
+IFS= read -r limits || exit 63
+IFS= read -r usage || exit 64
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":17,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null}}'
+while IFS= read -r ignored; do :; done
+"#;
+
+    with_mock_codex(script, |directory| {
+        let config = CollectConfig {
+            codex_home: directory.join("home"),
+            app_server_timeout: Duration::from_millis(100),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert_eq!(snapshot.limits.len(), 1);
+        assert_eq!(
+            snapshot.limits[0].primary.as_ref().unwrap().used_percent,
+            17.0
+        );
+        assert!(snapshot.usage.is_none());
+        assert!(snapshot.errors.is_empty());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("usage/read did not complete"))
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn initialization_timeout_returns_promptly() {
     let script = r#"#!/bin/sh
 IFS= read -r initialize || exit 51
