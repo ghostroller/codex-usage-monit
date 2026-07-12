@@ -28,12 +28,13 @@
 
 TUI Overview 显示近期 tasks：
 
-- 状态；
+- 状态使用轻量行背景色及单字符标记表达，Recent tasks 和 Turns 不单独占用状态列；
+- Turns 面板底部显示统一状态图例；
 - `live`、`exact`、`inferred`、`stale` 等证据和置信度；
 - task token 总量；
 - 当前窗口 local token share 与 estimated quota；
 - project、来源、turn 数和标题预览；
-- 选中 task 的近期 turns、模型、状态和 token。
+- 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与当前 5 小时窗口 token breakdown，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
 
@@ -83,6 +84,7 @@ task/thread -> turn -> model token events
 - counter 回退只重建 baseline、不重复计算歧义样本，并报告 warning/partial；
 - 嵌套 turn 完成后恢复仍在执行的父 turn；
 - task 完成后迟到的最终 token 仍归入刚完成的 turn；
+- 用户消息有显式 `turn_id` 时按其归属；缺失时只归入当前 active turn，没有 active turn 时不猜测归属；
 - subagent rollout 内嵌的 parent 历史不得重复计入 parent 或 child；
 - TUI 显示 total，JSON 同时显示 input、cached input、output、reasoning output 和 total。
 
@@ -92,7 +94,10 @@ task/thread -> turn -> model token events
 
 ```bash
 codex-usage-monit
+codex-usage-monit --theme light
 ```
+
+TUI 默认使用 dark 主题；`--theme light` 启动浅色主题，`bright` 是 `light` 的别名，运行中按 `t` 可切换。主题只影响 TUI 渲染，不得改变采集结果或一次性 text/JSON 输出。
 
 一次性输出：
 
@@ -105,7 +110,7 @@ codex-usage-monit models
 codex-usage-monit attribution
 ```
 
-TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。
+TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。Turns 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。
 
 退出码：`0` 完整、`1` 失败、`2` partial、`64` 参数错误。局部命令只根据与所请求 section 相关的数据源决定 partial。
 
@@ -115,7 +120,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 
 - quota gauges；
 - task 表；
-- 选中 task 的 turns；
+- 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
 - 当前窗口模型 token 表。
 
 ### Window
@@ -133,7 +138,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - active/completed/uncertain task 数；
 - partial 与 diagnostics。
 
-宽度小于 100 列时 task/turn 区域改为上下布局。Turns 可分页滚动。
+宽度小于 100 列时 task/turn 区域改为上下布局。Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview 和 Window 中可用鼠标左键点击 Tasks/Turns 数据行选择；标题、边框、表头和空白区不得触发选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，并与点击选择相互独立。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -150,7 +155,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - Codex 数据源只读；
 - 不读取 `auth.json`；
 - 不保存完整 prompt、assistant、reasoning 或工具内容；
-- `--redact-content` 禁用标题预览；
+- `--redact-content` 禁用 task 标题预览和 turn 消息摘要；
 - 未识别字段容忍，坏行、不可读文件与累计 token 回退进入 partial；
 - TUI/text 输出清洗终端控制字符，JSON 使用标准转义；
 - 不向第三方发送本地数据。
@@ -170,7 +175,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 
 - 统一通过同一 App Server 启动 tasks，从而获得精确 waiting approval/input 状态；
 - 模型/项目/时间筛选与多种排序；
-- TUI token breakdown 切换和 turn 详情选择；
+- TUI token breakdown 显示模式切换；
 - 跨进程持久化额度快照与索引；
 - 多额度桶的交互式归因选择；
 - 安装包、Homebrew 与跨平台发布流水线。

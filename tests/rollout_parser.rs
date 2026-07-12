@@ -66,12 +66,12 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
         json!({
             "timestamp": timestamp(t0),
             "type": "event_msg",
-            "payload": {"type": "user_message", "message": "  Investigate   the token counter  "}
+            "payload": {"type": "task_started", "turn_id": "turn-1", "started_at": t0.timestamp()}
         }),
         json!({
             "timestamp": timestamp(t0),
             "type": "event_msg",
-            "payload": {"type": "task_started", "turn_id": "turn-1", "started_at": t0.timestamp()}
+            "payload": {"type": "user_message", "message": "  Investigate   the token counter  "}
         }),
         json!({
             "timestamp": timestamp(t0),
@@ -188,6 +188,10 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(turn_1.status, TurnStatus::Completed);
     assert_eq!(turn_1.model.as_deref(), Some("gpt-test"));
     assert_eq!(turn_1.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        turn_1.message_preview.as_deref(),
+        Some("Investigate the token counter")
+    );
     assert_eq!(turn_1.token_usage.total_tokens, 15);
     assert_eq!(turn_1.duration_ms, Some(60_000));
 
@@ -199,6 +203,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(turn_2.status, TurnStatus::Interrupted);
     assert_eq!(turn_2.model.as_deref(), Some("gpt-next"));
     assert_eq!(turn_2.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(turn_2.message_preview, None);
     assert_eq!(turn_2.token_usage.total_tokens, 10);
 
     assert_eq!(dataset.rate_observations.len(), 1);
@@ -256,6 +261,17 @@ fn resumes_the_parent_turn_after_a_nested_turn_completes() {
             }),
             json!({
                 "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "inner prompt"}
+            }),
+            // Steering messages do not replace the first preview for a turn.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "inner steering"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
                 "type": "turn_context",
                 "payload": {"turn_id": "outer", "model": "outer-model"}
             }),
@@ -268,6 +284,11 @@ fn resumes_the_parent_turn_after_a_nested_turn_completes() {
                 "timestamp": timestamp(now),
                 "type": "event_msg",
                 "payload": {"type": "task_complete", "turn_id": "inner"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "outer followup"}
             }),
             json!({
                 "timestamp": timestamp(now),
@@ -300,6 +321,171 @@ fn resumes_the_parent_turn_after_a_nested_turn_completes() {
     assert_eq!(inner.token_usage.total_tokens, 10);
     assert_eq!(outer.status, TurnStatus::Completed);
     assert_eq!(inner.status, TurnStatus::Completed);
+    assert_eq!(outer.message_preview.as_deref(), Some("outer followup"));
+    assert_eq!(inner.message_preview.as_deref(), Some("inner prompt"));
+}
+
+#[test]
+fn associates_only_active_or_explicit_messages_without_guessing_a_future_turn() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-message-association.jsonl");
+    let long_message = "x".repeat(80);
+    let unassigned_message = "t".repeat(120);
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "message-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1"}
+            }),
+            // With no active turn, this cannot be assigned safely.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": unassigned_message}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-2"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-2"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-3"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": long_message}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-3"}
+            }),
+            // A future payload may provide an explicit turn id even after completion.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "turn_id": "turn-1", "message": "late explicit prompt"}
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let turn_1 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-1")
+        .unwrap();
+    let turn_2 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-2")
+        .unwrap();
+    let turn_3 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-3")
+        .unwrap();
+
+    assert_eq!(
+        turn_1.message_preview.as_deref(),
+        Some("late explicit prompt")
+    );
+    assert_eq!(dataset.tasks[0].title.chars().count(), 96);
+    assert!(dataset.tasks[0].title.ends_with("..."));
+    assert_eq!(turn_2.message_preview, None);
+    assert_eq!(turn_3.message_preview.as_ref().unwrap().chars().count(), 72);
+    assert!(turn_3.message_preview.as_ref().unwrap().ends_with("..."));
+}
+
+#[test]
+fn source_labels_distinguish_clients_roles_and_fallbacks() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let cases = vec![
+        (
+            "desktop-thread",
+            json!({
+                "id": "desktop-thread",
+                "source": "vscode",
+                "originator": "Codex Desktop",
+                "thread_source": "user"
+            }),
+            "desktop",
+        ),
+        (
+            "cli-thread",
+            json!({
+                "id": "cli-thread",
+                "source": "cli",
+                "originator": "codex-tui",
+                "thread_source": "user"
+            }),
+            "cli",
+        ),
+        (
+            "subagent-thread",
+            json!({
+                "id": "subagent-thread",
+                "source": {"subagent": {"other": "worker"}},
+                "originator": "Codex Desktop",
+                "thread_source": "subagent"
+            }),
+            "subagent",
+        ),
+        (
+            "fallback-thread",
+            json!({"id": "fallback-thread", "source": "exec"}),
+            "exec",
+        ),
+    ];
+
+    for (index, (_, payload, _)) in cases.iter().enumerate() {
+        write_jsonl(
+            &temp
+                .path()
+                .join(format!("sessions/rollout-source-{index}.jsonl")),
+            &[json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": payload
+            })],
+            false,
+        );
+    }
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    for (thread_id, _, expected) in cases {
+        let task = dataset
+            .tasks
+            .iter()
+            .find(|task| task.thread_id == thread_id)
+            .unwrap();
+        assert_eq!(task.source.as_deref(), Some(expected));
+    }
 }
 
 #[test]
@@ -335,6 +521,11 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             "timestamp": timestamp(child_created + chrono::Duration::microseconds(100)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": parent_turn, "started_at": parent_started.timestamp()}
+        }),
+        json!({
+            "timestamp": timestamp(child_created + chrono::Duration::microseconds(150)),
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "foreign parent prompt"}
         }),
         json!({
             "timestamp": timestamp(child_created + chrono::Duration::microseconds(200)),
@@ -413,6 +604,10 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 25);
     assert_eq!(dataset.turns.len(), 1);
     assert_eq!(dataset.turns[0].turn_id, child_turn);
+    assert_eq!(
+        dataset.turns[0].message_preview.as_deref(),
+        Some("implement the child task")
+    );
     assert_eq!(dataset.turns[0].token_usage.total_tokens, 25);
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 25);
@@ -554,6 +749,12 @@ fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
     let task = &dataset.tasks[0];
     assert_eq!(task.thread_id, "active-thread");
     assert_eq!(task.title, "[redacted]");
+    assert!(
+        dataset
+            .turns
+            .iter()
+            .all(|turn| turn.message_preview.is_none())
+    );
     assert_eq!(task.source.as_deref(), Some("subagent"));
     assert_eq!(task.status, TaskStatus::Running);
     assert_eq!(task.status_provenance, Provenance::Inferred);

@@ -16,6 +16,8 @@
 
 在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback 和来源一致时的补充。TUI 进程会积累连续服务端快照，一次性命令不会跨进程保存快照历史。
 
+TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）启动浅色主题，并在运行中按 `t` 切换。主题属于渲染层，不影响数据采集、精度标记或一次性 text/JSON。
+
 ## 术语
 
 - **任务 / Thread**：一条 Codex 会话，包含多个 turns。
@@ -35,7 +37,7 @@
 | App Server `thread/list` / `thread/read` | 线程元数据、标题、cwd、来源、runtime status | 元数据可靠 | 非本 App Server 加载的线程通常为 `notLoaded` |
 | App Server `thread/status/changed` | `idle`、`active`、`systemError`、等待审批/输入 | 同一 App Server 内精确、实时 | 无法观察其他独立 CLI 运行时 |
 | App Server `thread/tokenUsage/updated` | thread、turn、last/total token、上下文窗口 | 同一 App Server 内精确、实时 | 历史 turn 的 token 没有直接包含在 `Turn` 中 |
-| Rollout JSONL | thread/turn 边界、模型、token、当时的额度快照、完成/中断 | 本地历史最细来源，可增量 tail | 内部格式；ephemeral、缺失日志或格式升级会造成不完整 |
+| Rollout JSONL | thread/turn 边界、用户消息摘要、模型、token、当时的额度快照、完成/中断 | 本地历史最细来源，可增量 tail | 内部格式；用户消息不一定带 `turn_id`，ephemeral、缺失日志或格式升级会造成不完整 |
 | `state_5.sqlite` | thread 元数据和聚合 `tokens_used` | 快速、本地 | 内部 schema；没有 turn token 和跨进程 runtime status |
 | 进程与文件新鲜度 | Codex 进程存活、最近写入 | 推断 | 无法可靠区分思考、等待审批和等待输入 |
 
@@ -88,10 +90,15 @@ Token breakdown 包括：
 Rollout JSONL 中可利用以下事件重建历史：
 
 - `task_started`：turn id 和开始时间；
+- `user_message`：用户消息正文，以及部分版本可选的 turn id；
 - `turn_context`：turn id、模型、reasoning effort；
 - `token_count`：last/total token 和额度快照；
 - `task_complete`：完成时间和耗时；
 - `turn_aborted`：中断原因和时间。
+
+近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
+
+工具最多保留每个 turn 首条用户消息的 72 字符摘要。有显式 `turn_id` 时直接归属；没有时只归入当前 active turn，若当前没有 active turn，则不猜测归属。部分 subagent turn 没有明文 `user_message`，摘要显示 `-`，不会从注入上下文反推。
 
 对每个 turn 的 token 统计应使用累计计数的单调增量，避免重复的 `token_count` 通知被重复相加。
 
@@ -179,6 +186,8 @@ turn_tokens / window_tokens * current_used_percent
 - 只读 Codex JSONL 与 App Server，不写入或修改其状态；v0.1 不查询 SQLite。
 - 不直接读取、复制或缓存 `auth.json`。
 - 默认索引聚合字段，不持久化提示词、回复、工具输出或 secrets。
+- TUI 的 Recent tasks 与 Turns 使用轻量背景色及单字符标记表达状态，Turns 底部显示统一图例；一次性 text 输出包含消息摘要，JSON 使用 `messagePreview`。
+- `--redact-content` 不保留 task 标题或 turn 消息摘要。
 
 ## 官方依据
 

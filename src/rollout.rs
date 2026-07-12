@@ -15,6 +15,8 @@ use crate::domain::{
     TokenUsage, TurnRecord, TurnStatus, UsageCall,
 };
 
+const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
     path: PathBuf,
@@ -69,7 +71,10 @@ enum ParsedEvent {
         payload: Map<String, Value>,
     },
     ForeignCounterBaseline(TokenUsage),
-    UserTitle(String),
+    UserMessage {
+        preview: String,
+        turn_id: Option<String>,
+    },
     TurnContext {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
@@ -150,6 +155,7 @@ struct TurnBuilder {
     turn_id: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    message_preview: Option<String>,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
     duration_ms: Option<u64>,
@@ -635,7 +641,11 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                                 .and_then(Value::as_str)
                                 .and_then(title_preview)
                         {
-                            parsed.events.push(ParsedEvent::UserTitle(title));
+                            parsed.events.push(ParsedEvent::UserMessage {
+                                preview: title,
+                                turn_id: string_field_in(payload, &["turn_id", "turnId"])
+                                    .map(str::to_owned),
+                            });
                         }
                     } else if should_cache_event_message(payload) {
                         parsed.events.push(ParsedEvent::EventMessage {
@@ -731,10 +741,8 @@ fn replay_rollout_file(
             ParsedEvent::ForeignCounterBaseline(total_usage) => {
                 thread.previous_cumulative = Some(*total_usage);
             }
-            ParsedEvent::UserTitle(title) => {
-                if thread.title.is_none() {
-                    thread.title = Some(title.clone());
-                }
+            ParsedEvent::UserMessage { preview, turn_id } => {
+                apply_user_message(thread, preview, turn_id.as_deref());
             }
             ParsedEvent::TurnContext { timestamp, payload } => {
                 apply_turn_context(thread, payload, *timestamp);
@@ -770,13 +778,7 @@ fn apply_session_meta(
         thread.cwd = string_field_in(payload, &["cwd"]).map(PathBuf::from);
     }
     if thread.source.is_none() {
-        thread.source = payload
-            .get("source")
-            .and_then(source_label)
-            .or_else(|| {
-                string_field_in(payload, &["thread_source", "threadSource"]).map(str::to_owned)
-            })
-            .or_else(|| string_field_in(payload, &["originator"]).map(str::to_owned));
+        thread.source = session_source_label(payload);
     }
 
     let created_at = payload
@@ -785,6 +787,25 @@ fn apply_session_meta(
         .unwrap_or(timestamp);
     set_min_timestamp(&mut thread.created_at, created_at);
     set_max_timestamp(&mut thread.updated_at, timestamp);
+}
+
+fn apply_user_message(thread: &mut ThreadBuilder, message: &str, explicit_turn_id: Option<&str>) {
+    if thread.title.is_none() {
+        thread.title = Some(message.to_owned());
+    }
+
+    let preview = shorten_preview(message, TURN_MESSAGE_PREVIEW_CHARS);
+    if let Some(turn_id) = explicit_turn_id {
+        let turn = ensure_turn(thread, turn_id);
+        if turn.message_preview.is_none() {
+            turn.message_preview = Some(preview);
+        }
+    } else if let Some(turn_id) = thread.active_turn_ids.last().cloned() {
+        let turn = ensure_turn(thread, &turn_id);
+        if turn.message_preview.is_none() {
+            turn.message_preview = Some(preview);
+        }
+    }
 }
 
 fn apply_turn_context(
@@ -1191,6 +1212,7 @@ fn finish_dataset(
                 turn_id: turn.turn_id,
                 model: turn.model,
                 reasoning_effort: turn.reasoning_effort,
+                message_preview: turn.message_preview,
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
                 duration_ms,
@@ -1326,11 +1348,25 @@ fn title_preview(message: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    let mut preview: String = normalized.chars().take(96).collect();
-    if normalized.chars().count() > 96 {
-        preview.push_str("...");
+    Some(shorten_preview(&normalized, 96))
+}
+
+fn shorten_preview(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_owned();
     }
-    Some(preview)
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut preview = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    preview.push_str("...");
+    preview
 }
 
 fn source_label(value: &Value) -> Option<String> {
@@ -1339,6 +1375,38 @@ fn source_label(value: &Value) -> Option<String> {
         Value::Object(source) => source.keys().next().cloned(),
         _ => None,
     }
+}
+
+fn session_source_label(payload: &Map<String, Value>) -> Option<String> {
+    let thread_source = string_field_in(payload, &["thread_source", "threadSource"]);
+    let source = payload.get("source");
+    let source_is_subagent = source
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent") || source.contains_key("subAgent"));
+    if thread_source.is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+        || source_is_subagent
+    {
+        return Some("subagent".to_string());
+    }
+
+    if let Some(originator) = string_field_in(payload, &["originator"])
+        .map(str::trim)
+        .filter(|originator| !originator.is_empty())
+    {
+        return Some(if originator.eq_ignore_ascii_case("Codex Desktop") {
+            "desktop".to_string()
+        } else if originator.eq_ignore_ascii_case("codex-tui") {
+            "cli".to_string()
+        } else {
+            originator.to_string()
+        });
+    }
+
+    source.and_then(source_label).or_else(|| {
+        thread_source
+            .filter(|source| !source.eq_ignore_ascii_case("user"))
+            .map(str::to_owned)
+    })
 }
 
 fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {

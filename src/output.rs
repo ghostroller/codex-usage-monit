@@ -208,13 +208,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         let _ = writeln!(output, "\nTasks");
         let _ = writeln!(
             output,
-            "  {:<15} {:>12} {:>8} {:>8}  TITLE",
-            "STATUS/EVIDENCE", "TOKENS", "LOCAL5H", "EST.Q5H"
+            "  {:<15} {:>12} {:>8} {:>8} {:<12}  TITLE",
+            "STATUS/EVIDENCE", "TOKENS", "LOCAL5H", "EST.Q5H", "SOURCE"
         );
         for task in &snapshot.tasks {
             let _ = writeln!(
                 output,
-                "  {:<15} {:>12} {:>7.2}% {:>7.2}%  {}",
+                "  {:<15} {:>12} {:>7.2}% {:>7.2}% {:<12}  {}",
                 format!(
                     "{} {}",
                     task.status.label(),
@@ -223,6 +223,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 compact_tokens(task.token_usage),
                 task.local_token_share_percent,
                 task.estimated_quota_percent,
+                terminal_safe_text(task.source.as_deref().unwrap_or("unknown")),
                 terminal_safe_text(&task.title)
             );
         }
@@ -232,8 +233,8 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         let _ = writeln!(output, "\nTurns");
         let _ = writeln!(
             output,
-            "  {:<10} {:<16} {:>12} {:>8} {:>8}  THREAD",
-            "STATUS", "MODEL", "TOKENS", "LOCAL%", "EST.Q%"
+            "  {:<11} {:<16} {:<7} {:>12} {:>8} {:>8}  THREAD   MESSAGE",
+            "STATUS", "MODEL", "EFFORT", "TOKENS", "LOCAL%", "EST.Q%"
         );
         for turn in snapshot.turns.iter().filter(|turn| {
             request
@@ -243,13 +244,15 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         }) {
             let _ = writeln!(
                 output,
-                "  {:<10} {:<16} {:>12} {:>7.2}% {:>7.2}%  {}",
-                format!("{:?}", turn.status).to_lowercase(),
+                "  {:<11} {:<16} {:<7} {:>12} {:>7.2}% {:>7.2}%  {}  {}",
+                turn.status.label(),
                 terminal_safe_text(turn.model.as_deref().unwrap_or("unknown")),
+                terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown")),
                 compact_tokens(turn.token_usage),
                 turn.local_token_share_percent,
                 turn.estimated_quota_percent,
-                terminal_safe_text(short_id(&turn.thread_id))
+                terminal_safe_text(short_id(&turn.thread_id)),
+                terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"))
             );
         }
     }
@@ -415,7 +418,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         AttributionSummary, CollectionStats, LimitBucket, Provenance, SourceStatus, TaskRecord,
-        TaskStatus, TurnRecord,
+        TaskStatus, TurnRecord, TurnStatus,
     };
 
     #[test]
@@ -482,20 +485,35 @@ mod tests {
                 thread_id: "task-thread".to_string(),
                 title: "task".to_string(),
                 cwd: None,
-                source: None,
+                source: Some("desktop".to_string()),
                 created_at: None,
                 updated_at: None,
                 status: TaskStatus::Completed,
                 status_provenance: Provenance::LocalExact,
                 status_confidence: Confidence::High,
                 token_usage: TokenUsage::default(),
-                turn_count: 0,
+                turn_count: 1,
                 window_token_usage: TokenUsage::default(),
                 local_token_share_percent: 0.0,
                 estimated_quota_percent: 0.0,
                 quota_confidence: Confidence::Unknown,
             }],
-            turns: Vec::new(),
+            turns: vec![TurnRecord {
+                thread_id: "task-thread".to_string(),
+                turn_id: "task-turn".to_string(),
+                model: Some("gpt-test".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                message_preview: Some("message preview".to_string()),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                status: TurnStatus::InProgress,
+                token_usage: TokenUsage::default(),
+                window_token_usage: TokenUsage::default(),
+                local_token_share_percent: 0.0,
+                estimated_quota_percent: 0.0,
+                quota_confidence: Confidence::Unknown,
+            }],
             models: Vec::new(),
             attribution: AttributionSummary::default(),
             stats: CollectionStats::default(),
@@ -520,12 +538,40 @@ mod tests {
         let tasks_json: Value =
             serde_json::from_str(&render_output(&snapshot, &tasks).unwrap()).unwrap();
         assert_eq!(tasks_json["partial"], true);
+        assert_eq!(tasks_json["tasks"][0]["source"], "desktop");
         assert!(tasks_json.get("accountUsage").is_none());
         assert!(tasks_json.get("errors").is_some());
+        let turns_json: Value = serde_json::from_str(
+            &render_output(
+                &snapshot,
+                &OutputRequest {
+                    sections: BTreeSet::from([Section::Turns]),
+                    ..tasks.clone()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(turns_json["turns"][0]["messagePreview"], "message preview");
+        assert_eq!(turns_json["turns"][0]["status"], "in_progress");
         let limits_json: Value =
             serde_json::from_str(&render_output(&snapshot, &limits).unwrap()).unwrap();
         assert_eq!(limits_json["partial"], true);
         assert!(limits_json.get("errors").is_some());
+        let text = render_output(
+            &snapshot,
+            &OutputRequest {
+                format: OutputFormat::Text,
+                compact: false,
+                sections: BTreeSet::from([Section::Tasks, Section::Turns]),
+                thread_filter: None,
+            },
+        )
+        .unwrap();
+        assert!(text.contains("desktop"));
+        assert!(text.contains("xhigh"));
+        assert!(text.contains("in_progress"));
+        assert!(text.contains("message preview"));
 
         let mut empty_snapshot = snapshot.clone();
         empty_snapshot.tasks.clear();
@@ -551,6 +597,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             model: None,
             reasoning_effort: None,
+            message_preview: None,
             started_at: None,
             completed_at: None,
             duration_ms: None,

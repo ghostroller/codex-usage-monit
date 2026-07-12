@@ -87,6 +87,19 @@ pub enum TurnStatus {
     Unknown,
 }
 
+impl TurnStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
@@ -239,6 +252,7 @@ pub struct TurnRecord {
     pub turn_id: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub message_preview: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,

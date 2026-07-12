@@ -65,7 +65,7 @@ CODEX_HOME/sessions/**/*.jsonl
 CODEX_HOME/archived_sessions/**/*.jsonl
 ```
 
-保留的规范化语义包括 session metadata、title preview、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。未知记录忽略，坏行/不可读文件计入 partial。
+保留的规范化语义包括 session metadata、title preview、最多 72 字符的 turn 用户消息摘要、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。未知记录忽略，坏行/不可读文件计入 partial。
 
 subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。
 
@@ -97,6 +97,14 @@ turn/model metadata
 
 相同累计值去重；每字段单调时计算 delta；嵌套 turn 完成后恢复父 turn；task finish 后的最终 delta 使用 `last_turn_id`。Counter 回退时只建立新的累计基线，不把回退样本重复计入，并增加 `ambiguousTokenResets`、把数据标为 partial。`totalTokens` 是总量，cached/reasoning 仅作为 breakdown。
 
+用户消息有显式 `turn_id` 时直接归属对应 turn；缺失时只归入 `active_turn_stack` 顶部，没有 active turn 时不猜测归属。每个 turn 只保留首条摘要；`--redact-content` 在规范化阶段同时丢弃 task 标题与 turn 消息摘要。
+
+Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最后回退到 rollout `source`。Turn 的 reasoning effort 从 `turn_context` 保留到 JSON、text 和 TUI；窄 TUI 面板将 effort 前置合并到 model 单元格。
+
+Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Turns 底部渲染统一图例，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
+
+TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
+
 ## 6. 窗口和额度估算
 
 窗口 key 为 limit id、duration 和容差内的 reset time。仅选择当前有效窗口。
@@ -120,16 +128,16 @@ Estimated 部分：
 - account refresh gate：45 秒；
 - 同时只运行一个 worker；
 - worker 复用 `Arc<Mutex<RolloutCache>>` 与最近 AccountSnapshot；
-- UI thread 只绘制 immutable Snapshot 并处理按键。
+- UI thread 只绘制 immutable Snapshot 并处理键盘和鼠标事件。
 
 ## 8. 测试
 
 - App Server mock：多桶、legacy、nullable、错误、可选 usage stall、timeout、child reap；
-- rollout：duplicate/reset、嵌套 turn、archive、redact、stale、parent replay、final token、truncate；
+- rollout：duplicate/reset、嵌套 turn、消息归属、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：窗口、reset drift、server/local mismatch、correction epoch、long gap、settled；
 - output/CLI：camelCase、section partial/failure、broken pipe、help/usage；
-- TUI：80x24 与 120x40 TestBackend，并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；Tasks/Turns 鼠标测试覆盖点击、每格 3 行的面板滚轮、选择与 viewport 独立、刷新 ID 保持、边界和 80x24、100x30、120x40；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 

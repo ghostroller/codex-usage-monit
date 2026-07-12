@@ -11,6 +11,7 @@ use crate::output::{
     OutputFormat, OutputRequest, Section, render_output, request_is_failure, request_is_partial,
 };
 use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
+use crate::tui::Theme;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +37,10 @@ pub struct Cli {
 
     #[arg(long)]
     redact_content: bool,
+
+    /// TUI color theme; `bright` is an alias for `light`.
+    #[arg(long, value_enum, default_value_t = ThemeArg::Dark)]
+    theme: ThemeArg,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -90,6 +95,13 @@ enum FormatArg {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ThemeArg {
+    Dark,
+    #[value(alias = "bright")]
+    Light,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SectionArg {
     Limits,
@@ -122,6 +134,15 @@ impl From<SectionArg> for Section {
     }
 }
 
+impl From<ThemeArg> for Theme {
+    fn from(value: ThemeArg) -> Self {
+        match value {
+            ThemeArg::Dark => Self::Dark,
+            ThemeArg::Light => Self::Light,
+        }
+    }
+}
+
 pub fn run() -> Result<i32> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -146,7 +167,7 @@ fn run_with(cli: Cli) -> Result<i32> {
     config.redact_content = cli.redact_content;
 
     let Some(command) = cli.command else {
-        crate::tui::run(config)?;
+        crate::tui::run_with_theme(config, cli.theme.into())?;
         return Ok(0);
     };
 
@@ -249,6 +270,18 @@ mod tests {
     fn clap_help_is_successful() {
         let error = Cli::try_parse_from(["codex-usage-monit", "--help"]).unwrap_err();
         assert!(!error.use_stderr());
+    }
+
+    #[test]
+    fn tui_theme_defaults_to_dark_and_accepts_light_aliases() {
+        let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
+        assert_eq!(default.theme, ThemeArg::Dark);
+
+        let light = Cli::try_parse_from(["codex-usage-monit", "--theme", "light"]).unwrap();
+        assert_eq!(light.theme, ThemeArg::Light);
+
+        let bright = Cli::try_parse_from(["codex-usage-monit", "--theme", "bright"]).unwrap();
+        assert_eq!(bright.theme, ThemeArg::Light);
     }
 
     #[test]
