@@ -42,6 +42,9 @@ const TAB_PADDING: &str = " ";
 const TAB_DIVIDER: &str = " | ";
 const ENTER_FOCUS_HINT: &str = "↵";
 const BACK_FOCUS_HINT: &str = "←";
+const CLEAR_FILTER_LABEL: &str = "[Del]";
+const FILTER_CLEAR_GAP_WIDTH: u16 = 1;
+const FILTER_MIN_QUERY_WIDTH: u16 = 1;
 const TASK_TOKENS_WIDTH: u16 = 10;
 const TASK_LOCAL_WIDTH: u16 = 8;
 const TASK_QUOTA_WIDTH: u16 = 8;
@@ -429,6 +432,7 @@ struct TaskControlsHitbox {
     toggle_turns: Rect,
     toggle_models: Rect,
     toggle_tree: Rect,
+    collapse_all: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,6 +644,13 @@ impl App {
     }
 
     fn filtered_task_rows(&self) -> Vec<TaskListRow> {
+        self.filtered_task_rows_with_collapsed(&self.collapsed_task_threads)
+    }
+
+    fn filtered_task_rows_with_collapsed(
+        &self,
+        collapsed_task_threads: &HashSet<String>,
+    ) -> Vec<TaskListRow> {
         let query = self.task_search.to_lowercase();
         let filtered = self
             .snapshot
@@ -727,7 +738,7 @@ impl App {
                 root,
                 &children,
                 &self.snapshot.tasks,
-                &self.collapsed_task_threads,
+                collapsed_task_threads,
                 &mut Vec::new(),
                 &mut rows,
             );
@@ -860,7 +871,7 @@ impl App {
     fn close_temporary_turns(&mut self) {
         self.turns_temporarily_visible = false;
         if matches!(self.focus, Focus::Turns | Focus::TurnSearch) {
-            self.focus = Focus::Tasks;
+            self.transition_to_tasks();
         }
     }
 
@@ -872,7 +883,7 @@ impl App {
             self.task_reveal_pending = true;
         }
         if !self.turns_default_visible && matches!(self.focus, Focus::Turns | Focus::TurnSearch) {
-            self.focus = Focus::Tasks;
+            self.transition_to_tasks();
         }
     }
 
@@ -921,10 +932,7 @@ impl App {
     }
 
     fn set_task_source_filter(&mut self, filter: TaskSourceFilter) {
-        self.focus = Focus::Tasks;
-        if !self.turns_default_visible {
-            self.turns_temporarily_visible = false;
-        }
+        self.transition_to_tasks();
         self.task_search_before_edit.clone_from(&self.task_search);
         self.clear_task_search_restore();
         if self.task_source_filter == filter {
@@ -936,9 +944,7 @@ impl App {
 
     fn begin_task_search(&mut self) {
         if self.focus != Focus::TaskSearch {
-            if !self.turns_default_visible {
-                self.turns_temporarily_visible = false;
-            }
+            self.transition_to_tasks();
             self.task_search_before_edit.clone_from(&self.task_search);
             self.task_search_cursor = self.task_search.chars().count();
             self.task_search_restore_thread_id = self.selected_thread_id().map(str::to_string);
@@ -1143,10 +1149,15 @@ impl App {
     fn clear_turn_search(&mut self) {
         let selected = self.selected_turn_record().map(|turn| turn.turn_id.clone());
         self.turn_search.clear();
+        self.clear_turn_search_edit_state();
+        self.reconcile_turn_filter(true, selected.as_deref());
+    }
+
+    fn clear_turn_search_edit_state(&mut self) {
         self.turn_search_cursor = 0;
         self.turn_search_before_edit.clear();
         self.turn_search_restore_turn_id = None;
-        self.reconcile_turn_filter(true, selected.as_deref());
+        self.turn_search_restore_offset = 0;
     }
 
     fn accept_active_search(&mut self) {
@@ -1205,6 +1216,32 @@ impl App {
 
     fn set_selected_task_collapsed(&mut self, collapsed: bool) -> bool {
         self.set_task_collapsed(self.selected_task, collapsed)
+    }
+
+    fn collapse_all_task_threads(&mut self) -> bool {
+        if self.task_list_mode != TaskListMode::Tree {
+            return false;
+        }
+        let collapsible = self
+            .filtered_task_rows_with_collapsed(&HashSet::new())
+            .into_iter()
+            .filter(|row| row.has_children)
+            .filter_map(|row| {
+                self.snapshot
+                    .tasks
+                    .get(row.index)
+                    .map(|task| task.thread_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for thread_id in collapsible {
+            changed |= self.collapsed_task_threads.insert(thread_id);
+        }
+        if changed {
+            self.reconcile_task_filter(false);
+            self.task_reveal_pending = true;
+        }
+        changed
     }
 
     fn replace(&mut self, result: CollectionResult, refreshed_account: bool) {
@@ -1467,11 +1504,22 @@ impl App {
         }
     }
 
-    fn focus_tasks(&mut self) {
+    fn transition_to_tasks(&mut self) {
+        if matches!(self.focus, Focus::Turns | Focus::TurnSearch) {
+            if self.turn_search.is_empty() {
+                self.clear_turn_search_edit_state();
+            } else {
+                self.clear_turn_search();
+            }
+        }
         self.focus = Focus::Tasks;
         if !self.turns_default_visible {
             self.turns_temporarily_visible = false;
         }
+    }
+
+    fn focus_tasks(&mut self) {
+        self.transition_to_tasks();
         self.select_task(self.selected_task, true);
     }
 
@@ -1548,10 +1596,7 @@ impl App {
             return false;
         };
         self.accept_active_search();
-        self.focus = Focus::Tasks;
-        if !self.turns_default_visible {
-            self.turns_temporarily_visible = false;
-        }
+        self.transition_to_tasks();
         if !self.select_task(marker.task_index, false) {
             return false;
         }
@@ -1588,6 +1633,13 @@ impl App {
         if rect_contains(hitbox.toggle_tree, column, row) {
             self.accept_active_search();
             self.toggle_task_list_mode();
+            return true;
+        }
+        if rect_contains(hitbox.collapse_all, column, row)
+            && self.task_list_mode == TaskListMode::Tree
+        {
+            self.accept_active_search();
+            self.collapse_all_task_threads();
             return true;
         }
         if rect_contains(hitbox.clear_search, column, row) {
@@ -1651,7 +1703,7 @@ impl App {
         }
         if view == View::Health {
             self.close_temporary_turns();
-            self.focus = Focus::Tasks;
+            self.transition_to_tasks();
         }
         self.view = view;
     }
@@ -1709,12 +1761,7 @@ impl App {
         };
         self.accept_active_search();
         match target {
-            ScrollTarget::Tasks => {
-                self.focus = Focus::Tasks;
-                if !self.turns_default_visible {
-                    self.turns_temporarily_visible = false;
-                }
-            }
+            ScrollTarget::Tasks => self.transition_to_tasks(),
             ScrollTarget::Turns => self.focus = Focus::Turns,
         }
         let on_thumb = rect_contains(hitbox.thumb, column, row);
@@ -2140,6 +2187,11 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('r' | 'R') if app.view != View::Health => {
             app.toggle_task_list_mode();
         }
+        KeyCode::Char('E')
+            if app.view != View::Health && app.task_list_mode == TaskListMode::Tree =>
+        {
+            app.collapse_all_task_threads();
+        }
         KeyCode::Char('-')
             if app.view != View::Health
                 && app.focus == Focus::Tasks
@@ -2173,9 +2225,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             app.cycle_task_source_filter(false);
         }
         KeyCode::Delete if app.view != View::Health => match app.focus {
-            Focus::Tasks => app.clear_task_search(),
-            Focus::Turns => app.clear_turn_search(),
+            Focus::Tasks if !app.task_search.is_empty() => app.clear_task_search(),
+            Focus::Turns if !app.turn_search.is_empty() => app.clear_turn_search(),
             Focus::TaskSearch | Focus::TurnSearch => {}
+            Focus::Tasks | Focus::Turns => {}
         },
         KeyCode::Enter if app.view != View::Health && app.focus == Focus::Tasks => {
             app.focus_turns();
@@ -2907,13 +2960,16 @@ fn task_panel_block(
         + UnicodeWidthStr::width("[M]Models")
         + 1
         + UnicodeWidthStr::width("[R]Tree")
+        + 1
+        + UnicodeWidthStr::width("[E]Collapse")
         + TaskSourceFilter::ALL
             .into_iter()
             .map(|filter| 1 + UnicodeWidthStr::width(filter.label(false)) + 2)
             .sum::<usize>()
         + 1
         + UnicodeWidthStr::width("Filter:")
-        + 3;
+        + UnicodeWidthStr::width(CLEAR_FILTER_LABEL)
+        + usize::from(FILTER_CLEAR_GAP_WIDTH + FILTER_MIN_QUERY_WIDTH);
     let compact = usize::from(area.width.saturating_sub(2)) < full_controls_width;
     let mut spans = vec![Span::styled(
         format!(" {title}"),
@@ -2951,8 +3007,10 @@ fn task_panel_block(
     ));
     title_x = title_x.saturating_add(1);
 
-    spans.push(Span::raw(" "));
-    title_x = title_x.saturating_add(1);
+    if !compact {
+        spans.push(Span::raw(" "));
+        title_x = title_x.saturating_add(1);
+    }
     let toggle_label = if compact { "[V]" } else { "[V]Turns" };
     let toggle_width = u16::try_from(UnicodeWidthStr::width(toggle_label)).unwrap_or(u16::MAX);
     let toggle_turns = title_hitbox(area, title_x, toggle_width);
@@ -2981,8 +3039,10 @@ fn task_panel_block(
     ));
     title_x = title_x.saturating_add(toggle_width);
 
-    spans.push(Span::raw(" "));
-    title_x = title_x.saturating_add(1);
+    if !compact {
+        spans.push(Span::raw(" "));
+        title_x = title_x.saturating_add(1);
+    }
     let models_label = if compact { "[M]" } else { "[M]Models" };
     let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
     let toggle_models = title_hitbox(area, title_x, models_width);
@@ -3011,8 +3071,10 @@ fn task_panel_block(
     ));
     title_x = title_x.saturating_add(models_width);
 
-    spans.push(Span::raw(" "));
-    title_x = title_x.saturating_add(1);
+    if !compact {
+        spans.push(Span::raw(" "));
+        title_x = title_x.saturating_add(1);
+    }
     let tree_label = if compact { "[R]" } else { "[R]Tree" };
     let tree_width = u16::try_from(UnicodeWidthStr::width(tree_label)).unwrap_or(u16::MAX);
     let toggle_tree = title_hitbox(area, title_x, tree_width);
@@ -3042,11 +3104,36 @@ fn task_panel_block(
     ));
     title_x = title_x.saturating_add(tree_width);
 
+    if !compact {
+        spans.push(Span::raw(" "));
+        title_x = title_x.saturating_add(1);
+    }
+    let collapse_label = if compact { "[E]" } else { "[E]Collapse" };
+    let collapse_width = u16::try_from(UnicodeWidthStr::width(collapse_label)).unwrap_or(u16::MAX);
+    let collapse_all = title_hitbox(area, title_x, collapse_width);
+    let collapse_style = Style::default().fg(palette.muted);
+    let collapse_shortcut_style = if tree_selected && !app.focus.is_search() {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        collapse_style
+    };
+    spans.push(Span::styled("[", collapse_style));
+    spans.push(Span::styled("E", collapse_shortcut_style));
+    spans.push(Span::styled(
+        if compact { "]" } else { "]Collapse" },
+        collapse_style,
+    ));
+    title_x = title_x.saturating_add(collapse_width);
+
     let mut source_hitboxes = [Rect::default(); 4];
     let shortcuts_active = !app.focus.is_search();
     for filter in TaskSourceFilter::ALL {
-        spans.push(Span::raw(" "));
-        title_x = title_x.saturating_add(1);
+        if !compact {
+            spans.push(Span::raw(" "));
+            title_x = title_x.saturating_add(1);
+        }
         let label = filter.label(compact);
         let label_width = u16::try_from(UnicodeWidthStr::width(label) + 2).unwrap_or(u16::MAX);
         source_hitboxes[filter.index()] = title_hitbox(area, title_x, label_width);
@@ -3083,9 +3170,19 @@ fn task_panel_block(
     title_x = title_x.saturating_add(1);
     let search_start = title_x;
     let query_start = search_start.saturating_add("Filter:".len() as u16);
-    let clear_search = if !app.task_search.is_empty() && query_start < inner_right.saturating_sub(1)
+    let clear_width = u16::try_from(CLEAR_FILTER_LABEL.len()).unwrap_or(u16::MAX);
+    let clear_reserve = clear_width
+        .saturating_add(FILTER_CLEAR_GAP_WIDTH)
+        .saturating_add(FILTER_MIN_QUERY_WIDTH);
+    let clear_search = if !app.task_search.is_empty()
+        && inner_right.saturating_sub(query_start) >= clear_reserve
     {
-        Rect::new(inner_right - 1, area.y, 1, u16::from(area.height > 0))
+        Rect::new(
+            inner_right - clear_width,
+            area.y,
+            clear_width,
+            u16::from(area.height > 0),
+        )
     } else {
         Rect::default()
     };
@@ -3115,7 +3212,7 @@ fn task_panel_block(
     let query_right = if clear_search.is_empty() {
         search_right
     } else {
-        search_right.saturating_sub(1)
+        search_right.saturating_sub(FILTER_CLEAR_GAP_WIDTH)
     };
     let query_width = usize::from(query_right.saturating_sub(query_start));
     let rendered_query_width;
@@ -3140,12 +3237,17 @@ fn task_panel_block(
             query_start.saturating_add(u16::try_from(rendered_query_width).unwrap_or(u16::MAX));
         let padding = clear_search.x.saturating_sub(rendered_right);
         spans.push(Span::raw(" ".repeat(usize::from(padding))));
-        spans.push(Span::styled(
-            "×",
+        let clear_style = Style::default().fg(palette.muted);
+        let shortcut_style = if app.focus == Focus::Tasks {
             Style::default()
-                .fg(palette.muted)
-                .add_modifier(Modifier::BOLD),
-        ));
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            clear_style
+        };
+        spans.push(Span::styled("[", clear_style));
+        spans.push(Span::styled("Del", shortcut_style));
+        spans.push(Span::styled("]", clear_style));
     } else {
         spans.push(Span::raw(" "));
     }
@@ -3195,6 +3297,7 @@ fn task_panel_block(
         toggle_turns,
         toggle_models,
         toggle_tree,
+        collapse_all,
     };
     (block, controls)
 }
@@ -3245,8 +3348,20 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
     x = x.saturating_add(1);
 
     let search_start = x;
-    let clear_search = if !app.turn_search.is_empty() && inner_right > search_start {
-        Rect::new(inner_right - 1, area.y, 1, u16::from(area.height > 0))
+    let query_start = search_start.saturating_add("Filter:".len() as u16);
+    let clear_width = u16::try_from(CLEAR_FILTER_LABEL.len()).unwrap_or(u16::MAX);
+    let clear_reserve = clear_width
+        .saturating_add(FILTER_CLEAR_GAP_WIDTH)
+        .saturating_add(FILTER_MIN_QUERY_WIDTH);
+    let clear_search = if !app.turn_search.is_empty()
+        && inner_right.saturating_sub(query_start) >= clear_reserve
+    {
+        Rect::new(
+            inner_right - clear_width,
+            area.y,
+            clear_width,
+            u16::from(area.height > 0),
+        )
     } else {
         Rect::default()
     };
@@ -3273,11 +3388,10 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         },
     ));
     spans.push(Span::styled("ilter:", search_style));
-    let query_start = search_start.saturating_add("Filter:".len() as u16);
     let query_right = if clear_search.is_empty() {
         search_right
     } else {
-        search_right.saturating_sub(1)
+        search_right.saturating_sub(FILTER_CLEAR_GAP_WIDTH)
     };
     let query_width = usize::from(query_right.saturating_sub(query_start));
     let rendered_query_width;
@@ -3303,12 +3417,17 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         spans.push(Span::raw(" ".repeat(usize::from(
             clear_search.x.saturating_sub(rendered_right),
         ))));
-        spans.push(Span::styled(
-            "×",
+        let clear_style = Style::default().fg(palette.muted);
+        let shortcut_style = if app.focus == Focus::Turns {
             Style::default()
-                .fg(palette.muted)
-                .add_modifier(Modifier::BOLD),
-        ));
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            clear_style
+        };
+        spans.push(Span::styled("[", clear_style));
+        spans.push(Span::styled("Del", shortcut_style));
+        spans.push(Span::styled("]", clear_style));
     } else {
         spans.push(Span::raw(" "));
     }
@@ -5329,21 +5448,56 @@ mod tests {
         assert_eq!(app.focus, Focus::TurnSearch);
         assert_eq!(app.turn_search, "R");
         assert_eq!(app.task_list_mode, TaskListMode::Tree);
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert_eq!(app.turn_search, "RE");
+        assert!(app.collapsed_task_threads.is_empty());
+    }
+
+    #[test]
+    fn collapse_all_marks_nested_parents_and_moves_hidden_selection_to_its_root() {
+        let mut app = interaction_test_app(6, 2);
+        set_task_parent(&mut app, 0, 3);
+        set_task_parent(&mut app, 3, 5);
+        app.task_list_mode = TaskListMode::Tree;
+        app.selected_task = 0;
+        app.selected_turn = 1;
+        app.turn_offset = 1;
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(app.collapsed_task_threads.contains("task-thread-3"));
+        assert!(app.collapsed_task_threads.contains("task-thread-5"));
+        assert_eq!(app.selected_task, 5);
+        assert_eq!(app.selected_turn, 0);
+        assert_eq!(app.turn_offset, 0);
+        assert!(!app.collapse_all_task_threads());
+
+        assert!(app.set_task_collapsed(5, false));
+        let middle = app
+            .filtered_task_rows()
+            .into_iter()
+            .find(|row| row.index == 3)
+            .expect("the middle parent should reappear");
+        assert!(middle.collapsed);
+        assert_eq!(middle.hidden_descendants, vec![0]);
     }
 
     #[test]
     fn tree_control_is_fully_clickable_stable_and_muted_while_searching() {
         for (width, expected_width) in [(60, 3), (120, 7)] {
             let mut app = interaction_test_app(8, 1);
+            set_task_parent(&mut app, 0, 4);
             app.turns_default_visible = false;
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let controls = app.task_controls_hitbox.unwrap();
             let initial = controls.toggle_tree;
+            let initial_collapse = controls.collapse_all;
             assert_eq!(initial.width, expected_width);
+            assert_eq!(initial_collapse.width, if width == 60 { 3 } else { 11 });
             assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
             assert!(controls.toggle_models.right() <= initial.x);
-            assert!(initial.right() <= controls.sources[0].x);
+            assert!(initial.right() <= initial_collapse.x);
+            assert!(initial_collapse.right() <= controls.sources[0].x);
             assert_eq!(
                 terminal.backend().buffer()[(initial.x + 1, initial.y)].symbol(),
                 "R"
@@ -5360,12 +5514,26 @@ mod tests {
             assert_eq!(app.task_list_mode, TaskListMode::Tree);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let selected = app.task_controls_hitbox.unwrap().toggle_tree;
+            let collapse = app.task_controls_hitbox.unwrap().collapse_all;
             assert_eq!(selected, initial);
+            assert_eq!(collapse, initial_collapse);
             assert!(
                 terminal.backend().buffer()[(selected.x + 1, selected.y)]
                     .modifier
                     .contains(Modifier::UNDERLINED)
             );
+            let collapse_shortcut = &terminal.backend().buffer()[(collapse.x + 1, collapse.y)];
+            assert_eq!(collapse_shortcut.fg, app.theme.palette().accent);
+            assert!(collapse_shortcut.modifier.contains(Modifier::BOLD));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    collapse.right() - 1,
+                    collapse.y,
+                ),
+            ));
+            assert!(app.collapsed_task_threads.contains("task-thread-4"));
 
             handle_mouse_event(
                 &mut app,
@@ -5378,11 +5546,17 @@ mod tests {
             app.begin_task_search();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let searching = app.task_controls_hitbox.unwrap().toggle_tree;
+            let searching_collapse = app.task_controls_hitbox.unwrap().collapse_all;
             let shortcut = &terminal.backend().buffer()[(searching.x + 1, searching.y)];
             assert_eq!(searching, initial);
+            assert_eq!(searching_collapse, initial_collapse);
             assert_eq!(shortcut.fg, app.theme.palette().muted);
             assert!(!shortcut.modifier.contains(Modifier::BOLD));
             assert!(!shortcut.modifier.contains(Modifier::UNDERLINED));
+            let collapse_shortcut =
+                &terminal.backend().buffer()[(searching_collapse.x + 1, searching_collapse.y)];
+            assert_eq!(collapse_shortcut.fg, app.theme.palette().muted);
+            assert!(!collapse_shortcut.modifier.contains(Modifier::BOLD));
         }
     }
 
@@ -5845,7 +6019,7 @@ mod tests {
 
     #[test]
     fn source_buttons_search_hitbox_and_empty_results_are_safe() {
-        for (width, height) in [(80, 24), (100, 30), (120, 40)] {
+        for (width, height) in [(60, 24), (80, 24), (100, 30), (120, 40)] {
             let mut app = interaction_test_app(8, 2);
             for (index, source) in [
                 "desktop", "subagent", "cli", "desktop", "subagent", "cli", "desktop", "subagent",
@@ -5904,9 +6078,16 @@ mod tests {
             assert!(app.turn_table_hitbox.is_none());
             let clear = app.task_controls_hitbox.unwrap().clear_search;
             assert!(!clear.is_empty());
+            let clear_shortcut = &terminal.backend().buffer()[(clear.x + 1, clear.y)];
+            assert_eq!(clear_shortcut.fg, app.theme.palette().muted);
+            assert!(!clear_shortcut.modifier.contains(Modifier::BOLD));
             assert!(handle_mouse_event(
                 &mut app,
-                mouse_event(MouseEventKind::Down(MouseButton::Left), clear.x, clear.y,),
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    clear.right() - 1,
+                    clear.y,
+                ),
             ));
             assert!(app.task_search.is_empty());
             assert!(!app.filtered_task_indices().is_empty());
@@ -5934,7 +6115,8 @@ mod tests {
                 assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
                 assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
                 assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
-                assert!(controls.toggle_tree.right() <= controls.sources[0].x);
+                assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
+                assert!(controls.collapse_all.right() <= controls.sources[0].x);
                 for pair in controls.sources.windows(2) {
                     assert!(pair[0].right() <= pair[1].x);
                 }
@@ -5955,12 +6137,63 @@ mod tests {
                     assert!(controls.clear_search.is_empty());
                 } else {
                     assert!(!controls.clear_search.is_empty());
+                    assert_eq!(controls.clear_search.width, 5);
                     assert_eq!(
                         buffer[(controls.clear_search.x, controls.clear_search.y)].symbol(),
-                        "×"
+                        "["
                     );
+                    assert_eq!(
+                        buffer[(controls.clear_search.x + 1, controls.clear_search.y)].symbol(),
+                        "D"
+                    );
+                    let shortcut = &buffer[(controls.clear_search.x + 1, controls.clear_search.y)];
+                    assert_eq!(shortcut.fg, app.theme.palette().accent);
+                    assert!(shortcut.modifier.contains(Modifier::BOLD));
                     assert!(controls.search.right() <= controls.clear_search.x);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_clear_controls_reserve_query_space_across_layout_boundaries() {
+        let mut app = interaction_test_app(8, 4);
+        app.task_search = "task".to_string();
+        app.task_search_before_edit.clone_from(&app.task_search);
+        app.turn_search = "model".to_string();
+        app.turn_search_before_edit.clone_from(&app.turn_search);
+
+        for scope in WindowScope::ALL {
+            app.window_scope = scope;
+            for width in 60..=140 {
+                let (_, controls) = task_panel_block(
+                    Rect::new(0, 0, width, 10),
+                    &app,
+                    true,
+                    app.filtered_task_indices().len(),
+                );
+                assert_eq!(controls.clear_search.width, 5, "task width={width}");
+                let query_start = controls.search.x.saturating_add("Filter:".len() as u16);
+                assert!(
+                    controls.clear_search.x.saturating_sub(query_start)
+                        >= FILTER_CLEAR_GAP_WIDTH + FILTER_MIN_QUERY_WIDTH,
+                    "task width={width} scope={scope:?}"
+                );
+            }
+
+            let title = match scope {
+                WindowScope::FiveHours => "Turns · 5h cycle",
+                WindowScope::Week => "Turns · Week cycle",
+            };
+            for width in 40..=80 {
+                let (_, controls) = turn_panel_block(Rect::new(0, 0, width, 10), &app, title);
+                assert_eq!(controls.clear_search.width, 5, "turn width={width}");
+                let query_start = controls.search.x.saturating_add("Filter:".len() as u16);
+                assert!(
+                    controls.clear_search.x.saturating_sub(query_start)
+                        >= FILTER_CLEAR_GAP_WIDTH + FILTER_MIN_QUERY_WIDTH,
+                    "turn width={width} scope={scope:?}"
+                );
             }
         }
     }
@@ -5999,6 +6232,85 @@ mod tests {
         assert_eq!(app.focus, Focus::Tasks);
         assert_eq!(app.task_search, "task 2");
         assert_eq!(app.selected_task, 2);
+    }
+
+    #[test]
+    fn delete_clears_the_focused_filter_only_after_editing_finishes() {
+        let mut app = interaction_test_app(2, 4);
+        app.task_search = "task".to_string();
+        app.task_search_before_edit.clone_from(&app.task_search);
+        app.reconcile_task_filter(true);
+        app.focus_turns();
+        app.turn_search = "model-2".to_string();
+        app.turn_search_before_edit.clone_from(&app.turn_search);
+        app.reconcile_turn_filter(true, None);
+
+        handle_key_event(&mut app, key_event(KeyCode::Delete));
+        assert!(app.turn_search.is_empty());
+        assert_eq!(app.task_search, "task");
+        assert_eq!(app.selected_task_turn_count(), 4);
+
+        app.focus_tasks();
+        handle_key_event(&mut app, key_event(KeyCode::Delete));
+        assert!(app.task_search.is_empty());
+
+        app.task_search = "task".to_string();
+        app.task_search_before_edit.clone_from(&app.task_search);
+        app.begin_task_search();
+        handle_key_event(&mut app, key_event(KeyCode::Home));
+        handle_key_event(&mut app, key_event(KeyCode::Delete));
+        assert_eq!(app.task_search, "ask");
+        assert_eq!(app.focus, Focus::TaskSearch);
+    }
+
+    #[test]
+    fn returning_to_tasks_clears_turn_filter_and_keeps_task_filter() {
+        let mut app = interaction_test_app(2, 4);
+        app.task_search = "task".to_string();
+        app.task_search_before_edit.clone_from(&app.task_search);
+        app.reconcile_task_filter(true);
+        app.focus_turns();
+        app.turn_search = "model-2".to_string();
+        app.turn_search_before_edit.clone_from(&app.turn_search);
+        app.reconcile_turn_filter(true, None);
+        assert_eq!(app.selected_turn_record().unwrap().turn_id, "turn-0-2");
+
+        handle_key_event(&mut app, key_event(KeyCode::Backspace));
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.task_search, "task");
+        assert!(app.turn_search.is_empty());
+        assert!(app.turn_search_before_edit.is_empty());
+        assert!(app.turn_search_restore_turn_id.is_none());
+        assert_eq!(app.turn_search_restore_offset, 0);
+        assert_eq!(app.selected_task_turn_count(), 4);
+        assert_eq!(app.selected_turn_record().unwrap().turn_id, "turn-0-2");
+
+        app.focus_turns();
+        app.turn_search = "model-1".to_string();
+        app.turn_search_before_edit.clone_from(&app.turn_search);
+        app.reconcile_turn_filter(true, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let task_rows = app.task_table_hitbox.unwrap().rows;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                task_rows.x,
+                task_rows.y,
+            ),
+        ));
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.task_search, "task");
+        assert!(app.turn_search.is_empty());
+
+        app.focus_turns();
+        app.turn_search = "model-3".to_string();
+        app.reconcile_turn_filter(true, None);
+        app.begin_task_search();
+        assert_eq!(app.focus, Focus::TaskSearch);
+        assert_eq!(app.task_search, "task");
+        assert!(app.turn_search.is_empty());
     }
 
     #[test]
@@ -6071,13 +6383,22 @@ mod tests {
             handle_key_event(&mut app, key_event(KeyCode::Char(character)));
         }
         assert_eq!(app.selected_task_turn_count(), 1);
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Turns);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         let clear = app.turn_controls_hitbox.unwrap().clear_search;
         assert!(!clear.is_empty());
+        let clear_shortcut = &terminal.backend().buffer()[(clear.x + 1, clear.y)];
+        assert_eq!(clear_shortcut.fg, app.theme.palette().accent);
+        assert!(clear_shortcut.modifier.contains(Modifier::BOLD));
         assert!(handle_mouse_event(
             &mut app,
-            mouse_event(MouseEventKind::Down(MouseButton::Left), clear.x, clear.y),
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                clear.right() - 1,
+                clear.y,
+            ),
         ));
         assert!(app.turn_search.is_empty());
         assert_eq!(app.selected_task_turn_count(), 4);
@@ -6118,6 +6439,9 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let clear = app.turn_controls_hitbox.unwrap().clear_search;
+        let clear_shortcut = &terminal.backend().buffer()[(clear.x + 1, clear.y)];
+        assert_eq!(clear_shortcut.fg, app.theme.palette().muted);
+        assert!(!clear_shortcut.modifier.contains(Modifier::BOLD));
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(MouseEventKind::Down(MouseButton::Left), clear.x, clear.y),
@@ -6290,11 +6614,13 @@ mod tests {
         assert!(!controls.toggle_turns.is_empty());
         assert!(!controls.toggle_models.is_empty());
         assert!(!controls.toggle_tree.is_empty());
+        assert!(!controls.collapse_all.is_empty());
         assert!(!controls.search.is_empty());
         assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
         assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
         assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
-        assert!(controls.toggle_tree.right() <= controls.sources[0].x);
+        assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
+        assert!(controls.collapse_all.right() <= controls.sources[0].x);
         for pair in controls.sources.windows(2) {
             assert!(pair[0].right() <= pair[1].x);
         }
@@ -6316,6 +6642,10 @@ mod tests {
         assert_eq!(
             buffer[(controls.toggle_tree.x + 1, controls.toggle_tree.y)].symbol(),
             "R"
+        );
+        assert_eq!(
+            buffer[(controls.collapse_all.x + 1, controls.collapse_all.y)].symbol(),
+            "E"
         );
         assert_eq!(buffer[(controls.search.x, controls.search.y)].symbol(), "F");
 
@@ -6566,10 +6896,14 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("30/30"));
+        let turn_offset = app.turn_offset;
+        assert!(!app.turn_reveal_pending);
 
         handle_key_event(&mut app, key_event(KeyCode::Backspace));
         assert_eq!(app.focus, Focus::Tasks);
         assert_eq!(app.selected_turn, 29);
+        assert_eq!(app.turn_offset, turn_offset);
+        assert!(!app.turn_reveal_pending);
         handle_key_event(&mut app, key_event(KeyCode::Up));
         assert_eq!(app.selected_task, 0);
         assert_eq!(app.selected_turn, 0);
