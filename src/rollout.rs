@@ -158,9 +158,18 @@ enum SessionTitleState {
     Loaded(FileFingerprint),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ParentThreadRank {
+    Fork,
+    Direct,
+    Nested,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ThreadBuilder {
     thread_id: String,
+    parent_thread_id: Option<String>,
+    parent_thread_rank: Option<ParentThreadRank>,
     title: Option<String>,
     cwd: Option<PathBuf>,
     source: Option<String>,
@@ -650,6 +659,10 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                                 "threadSource",
                                 "originator",
                                 "timestamp",
+                                "parent_thread_id",
+                                "parentThreadId",
+                                "forked_from_id",
+                                "forkedFromId",
                             ],
                         ),
                     });
@@ -667,6 +680,10 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                                 "threadSource",
                                 "originator",
                                 "timestamp",
+                                "parent_thread_id",
+                                "parentThreadId",
+                                "forked_from_id",
+                                "forkedFromId",
                             ],
                         ),
                     });
@@ -798,18 +815,95 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
 }
 
 fn is_forked_session(payload: &Map<String, Value>) -> bool {
-    ["parent_thread_id", "forked_from_id"]
-        .into_iter()
-        .any(|field| {
-            payload
-                .get(field)
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
+    [
+        "parent_thread_id",
+        "parentThreadId",
+        "forked_from_id",
+        "forkedFromId",
+    ]
+    .into_iter()
+    .filter_map(|field| payload.get(field).and_then(Value::as_str))
+    .any(|parent| !parent.trim().is_empty())
+        || is_subagent_session(payload)
+}
+
+fn session_parent_thread_id<'a>(
+    payload: &'a Map<String, Value>,
+    owner_thread_id: Option<&str>,
+) -> Option<(&'a str, ParentThreadRank)> {
+    if !is_subagent_session(payload) {
+        return None;
+    }
+
+    nested_subagent_parent_thread_id(payload, owner_thread_id)
+        .map(|parent| (parent, ParentThreadRank::Nested))
+        .or_else(|| {
+            valid_parent_thread_id_in(
+                payload,
+                &["parent_thread_id", "parentThreadId"],
+                owner_thread_id,
+            )
+            .map(|parent| (parent, ParentThreadRank::Direct))
         })
+        .or_else(|| {
+            valid_parent_thread_id_in(
+                payload,
+                &["forked_from_id", "forkedFromId"],
+                owner_thread_id,
+            )
+            .map(|parent| (parent, ParentThreadRank::Fork))
+        })
+}
+
+fn is_subagent_session(payload: &Map<String, Value>) -> bool {
+    string_field_in(payload, &["thread_source", "threadSource"])
+        .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
         || payload
             .get("source")
             .and_then(Value::as_object)
-            .is_some_and(|source| source.contains_key("subagent"))
+            .is_some_and(|source| {
+                source.contains_key("subagent") || source.contains_key("subAgent")
+            })
+}
+
+fn nested_subagent_parent_thread_id<'a>(
+    payload: &'a Map<String, Value>,
+    owner_thread_id: Option<&str>,
+) -> Option<&'a str> {
+    let source = payload.get("source")?.as_object()?;
+    let subagent = source
+        .get("subagent")
+        .or_else(|| source.get("subAgent"))?
+        .as_object()?;
+    let thread_spawn = subagent
+        .get("thread_spawn")
+        .or_else(|| subagent.get("threadSpawn"))?
+        .as_object()?;
+    valid_parent_thread_id_in(
+        thread_spawn,
+        &["parent_thread_id", "parentThreadId"],
+        owner_thread_id,
+    )
+}
+
+fn valid_parent_thread_id_in<'a>(
+    value: &'a Map<String, Value>,
+    fields: &[&str],
+    owner_thread_id: Option<&str>,
+) -> Option<&'a str> {
+    fields.iter().find_map(|field| {
+        valid_parent_thread_id(value.get(*field).and_then(Value::as_str), owner_thread_id)
+    })
+}
+
+fn valid_parent_thread_id<'a>(
+    candidate: Option<&'a str>,
+    owner_thread_id: Option<&str>,
+) -> Option<&'a str> {
+    candidate
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .filter(|candidate| owner_thread_id != Some(*candidate))
 }
 
 fn should_cache_event_message(payload: &Map<String, Value>) -> bool {
@@ -892,6 +986,18 @@ fn apply_session_meta(
     payload: &Map<String, Value>,
     timestamp: DateTime<Utc>,
 ) {
+    if let Some((parent_thread_id, rank)) =
+        session_parent_thread_id(payload, Some(&thread.thread_id))
+    {
+        let should_replace = match thread.parent_thread_rank {
+            None => true,
+            Some(current_rank) => rank > current_rank,
+        };
+        if should_replace {
+            thread.parent_thread_id = Some(parent_thread_id.to_owned());
+            thread.parent_thread_rank = Some(rank);
+        }
+    }
     if thread.cwd.is_none() {
         thread.cwd = string_field_in(payload, &["cwd"]).map(PathBuf::from);
     }
@@ -1360,6 +1466,7 @@ fn finish_dataset(
         };
         dataset.tasks.push(TaskRecord {
             thread_id: thread.thread_id,
+            parent_thread_id: thread.parent_thread_id,
             title,
             cwd: thread.cwd,
             source: thread.source,

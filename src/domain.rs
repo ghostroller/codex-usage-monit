@@ -229,6 +229,8 @@ pub struct DailyTokenBucket {
 #[serde(rename_all = "camelCase")]
 pub struct TaskRecord {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
     pub title: String,
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,

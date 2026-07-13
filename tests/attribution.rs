@@ -28,6 +28,7 @@ fn tokens(total_tokens: u64) -> TokenUsage {
 fn task(thread_id: &str, status: TaskStatus) -> TaskRecord {
     TaskRecord {
         thread_id: thread_id.to_string(),
+        parent_thread_id: None,
         title: thread_id.to_string(),
         cwd: Some(PathBuf::from("/tmp/project")),
         source: Some("test".to_string()),

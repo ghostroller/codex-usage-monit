@@ -4,7 +4,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
-use codex_usage_monit::domain::{Confidence, Provenance, TaskStatus, TokenUsage, TurnStatus};
+use codex_usage_monit::domain::{
+    Confidence, Provenance, TaskRecord, TaskStatus, TokenUsage, TurnStatus,
+};
 use codex_usage_monit::rollout::scan_rollouts;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -39,6 +41,40 @@ fn config(home: &std::path::Path) -> CollectConfig {
         codex_home: home.to_owned(),
         ..CollectConfig::default()
     }
+}
+
+fn simple_task_rollout(
+    started_at: DateTime<Utc>,
+    session_payload: Value,
+    turn_id: &str,
+    title: &str,
+) -> Vec<Value> {
+    vec![
+        json!({
+            "timestamp": timestamp(started_at),
+            "type": "session_meta",
+            "payload": session_payload
+        }),
+        json!({
+            "timestamp": timestamp(started_at),
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id,
+                "started_at": timestamp(started_at)
+            }
+        }),
+        json!({
+            "timestamp": timestamp(started_at + chrono::Duration::milliseconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": title}
+        }),
+        json!({
+            "timestamp": timestamp(started_at + chrono::Duration::milliseconds(2)),
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": turn_id}
+        }),
+    ]
 }
 
 #[test]
@@ -662,6 +698,272 @@ fn source_labels_distinguish_clients_roles_and_fallbacks() {
 }
 
 #[test]
+fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let root_id = "root-thread";
+    let child_id = "child-thread";
+    let grandchild_id = "grandchild-thread";
+    let nested_id = "nested-only-thread";
+    let self_id = "self-parent-thread";
+    let ordinary_fork_id = "ordinary-user-fork";
+
+    let root_started = now - chrono::Duration::minutes(10);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-root.jsonl"),
+        &simple_task_rollout(
+            root_started,
+            json!({
+                "id": root_id,
+                "session_id": root_id,
+                "timestamp": timestamp(root_started),
+                "source": "vscode"
+            }),
+            "root-turn",
+            "root task",
+        ),
+        false,
+    );
+
+    let child_started = now - chrono::Duration::minutes(8);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-child.jsonl"),
+        &simple_task_rollout(
+            child_started,
+            json!({
+                "id": child_id,
+                "session_id": root_id,
+                "forked_from_id": root_id,
+                "timestamp": timestamp(child_started),
+                "source": {"subagent": {"other": "worker"}},
+                "thread_source": "subagent"
+            }),
+            "child-turn",
+            "child task",
+        ),
+        false,
+    );
+
+    let grandchild_started = now - chrono::Duration::minutes(6);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-grandchild.jsonl"),
+        &simple_task_rollout(
+            grandchild_started,
+            json!({
+                "id": grandchild_id,
+                "session_id": root_id,
+                "parentThreadId": child_id,
+                "forkedFromId": root_id,
+                "timestamp": timestamp(grandchild_started),
+                "source": {"subagent": {"other": "worker"}},
+                "threadSource": "subagent"
+            }),
+            "grandchild-turn",
+            "grandchild task",
+        ),
+        false,
+    );
+
+    let nested_started = now - chrono::Duration::minutes(4);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-nested.jsonl"),
+        &simple_task_rollout(
+            nested_started,
+            json!({
+                "id": nested_id,
+                "session_id": root_id,
+                "parent_thread_id": root_id,
+                "forked_from_id": root_id,
+                "timestamp": timestamp(nested_started),
+                "source": {"subAgent": {"threadSpawn": {
+                    "parentThreadId": child_id
+                }}},
+                "threadSource": "subagent"
+            }),
+            "nested-turn",
+            "nested fallback task",
+        ),
+        false,
+    );
+
+    let ordinary_started = now - chrono::Duration::minutes(3);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-ordinary-fork.jsonl"),
+        &simple_task_rollout(
+            ordinary_started,
+            json!({
+                "id": ordinary_fork_id,
+                "session_id": root_id,
+                "forked_from_id": root_id,
+                "timestamp": timestamp(ordinary_started),
+                "source": "vscode",
+                "thread_source": "user"
+            }),
+            "ordinary-fork-turn",
+            "ordinary user fork",
+        ),
+        false,
+    );
+
+    let self_started = now - chrono::Duration::minutes(2);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-self.jsonl"),
+        &simple_task_rollout(
+            self_started,
+            json!({
+                "id": self_id,
+                "session_id": root_id,
+                "parent_thread_id": self_id,
+                "timestamp": timestamp(self_started),
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": self_id
+                }}},
+                "thread_source": "subagent"
+            }),
+            "self-turn",
+            "self parent task",
+        ),
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let parent_of = |thread_id: &str| {
+        dataset
+            .tasks
+            .iter()
+            .find(|task| task.thread_id == thread_id)
+            .unwrap()
+            .parent_thread_id
+            .as_deref()
+    };
+
+    assert_eq!(parent_of(root_id), None);
+    assert_eq!(parent_of(child_id), Some(root_id));
+    assert_eq!(parent_of(grandchild_id), Some(child_id));
+    assert_eq!(parent_of(nested_id), Some(child_id));
+    assert_eq!(parent_of(ordinary_fork_id), None);
+    assert_eq!(parent_of(self_id), None);
+}
+
+#[test]
+fn upgrades_parent_priority_when_a_thread_spans_multiple_rollout_files() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let thread_id = "child-thread";
+    let root_id = "root-thread";
+    let direct_parent_id = "direct-parent-thread";
+    let old_path = temp.path().join("sessions/rollout-01-old-fork.jsonl");
+    let new_path = temp.path().join("sessions/rollout-02-new-nested.jsonl");
+
+    write_jsonl(
+        &old_path,
+        &simple_task_rollout(
+            now - chrono::Duration::minutes(2),
+            json!({
+                "id": thread_id,
+                "forked_from_id": root_id,
+                "timestamp": timestamp(now - chrono::Duration::minutes(2)),
+                "source": {"subagent": {"other": "worker"}},
+                "thread_source": "subagent"
+            }),
+            "old-turn",
+            "old task",
+        ),
+        false,
+    );
+    write_jsonl(
+        &new_path,
+        &simple_task_rollout(
+            now - chrono::Duration::minutes(1),
+            json!({
+                "id": thread_id,
+                "parent_thread_id": root_id,
+                "forked_from_id": root_id,
+                "timestamp": timestamp(now - chrono::Duration::minutes(1)),
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": direct_parent_id
+                }}},
+                "thread_source": "subagent"
+            }),
+            "new-turn",
+            "new task",
+        ),
+        false,
+    );
+
+    let modified = SystemTime::now();
+    File::options()
+        .write(true)
+        .open(&old_path)
+        .unwrap()
+        .set_modified(modified - Duration::from_secs(2))
+        .unwrap();
+    File::options()
+        .write(true)
+        .open(&new_path)
+        .unwrap()
+        .set_modified(modified - Duration::from_secs(1))
+        .unwrap();
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let task = dataset
+        .tasks
+        .iter()
+        .find(|task| task.thread_id == thread_id)
+        .unwrap();
+
+    assert_eq!(task.parent_thread_id.as_deref(), Some(direct_parent_id));
+}
+
+#[test]
+fn task_record_parent_id_is_optional_in_legacy_json_and_uses_camel_case() {
+    let legacy = json!({
+        "threadId": "legacy-thread",
+        "title": "legacy task",
+        "cwd": null,
+        "source": null,
+        "createdAt": null,
+        "updatedAt": null,
+        "status": "completed",
+        "statusProvenance": "local_exact",
+        "statusConfidence": "high",
+        "tokenUsage": {
+            "inputTokens": 0,
+            "cachedInputTokens": 0,
+            "outputTokens": 0,
+            "reasoningOutputTokens": 0,
+            "totalTokens": 0
+        },
+        "turnCount": 0,
+        "windowTokenUsage": {
+            "inputTokens": 0,
+            "cachedInputTokens": 0,
+            "outputTokens": 0,
+            "reasoningOutputTokens": 0,
+            "totalTokens": 0
+        },
+        "localTokenSharePercent": 0.0,
+        "estimatedQuotaPercent": 0.0,
+        "quotaConfidence": "unknown"
+    });
+
+    let mut task: TaskRecord = serde_json::from_value(legacy).unwrap();
+    assert_eq!(task.parent_thread_id, None);
+    assert!(
+        serde_json::to_value(&task)
+            .unwrap()
+            .get("parentThreadId")
+            .is_none()
+    );
+
+    task.parent_thread_id = Some("parent-thread".to_string());
+    assert_eq!(
+        serde_json::to_value(task).unwrap()["parentThreadId"],
+        "parent-thread"
+    );
+}
+
+#[test]
 fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -780,6 +1082,10 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
 
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.tasks[0].thread_id, child_id);
+    assert_eq!(
+        dataset.tasks[0].parent_thread_id.as_deref(),
+        Some(parent_id)
+    );
     assert_eq!(dataset.tasks[0].title, "implement the child task");
     assert_eq!(dataset.tasks[0].source.as_deref(), Some("subagent"));
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 25);

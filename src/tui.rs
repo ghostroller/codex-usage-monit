@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -41,6 +42,12 @@ const TAB_PADDING: &str = " ";
 const TAB_DIVIDER: &str = " | ";
 const ENTER_FOCUS_HINT: &str = "↵";
 const BACK_FOCUS_HINT: &str = "←";
+const TASK_TOKENS_WIDTH: u16 = 10;
+const TASK_LOCAL_WIDTH: u16 = 8;
+const TASK_QUOTA_WIDTH: u16 = 8;
+const TASK_COLUMN_SPACING: u16 = 1;
+const TASK_HIGHLIGHT_WIDTH: u16 = 1;
+const TASK_TREE_MARKER_WIDTH: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Theme {
@@ -264,6 +271,31 @@ enum TaskSourceFilter {
     Cli,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TaskListMode {
+    #[default]
+    Flat,
+    Tree,
+}
+
+impl TaskListMode {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Flat => Self::Tree,
+            Self::Tree => Self::Flat,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TaskListRow {
+    index: usize,
+    prefix: String,
+    depth: usize,
+    has_children: bool,
+    collapsed: bool,
+}
+
 impl TaskSourceFilter {
     const ALL: [Self; 4] = [Self::All, Self::Desktop, Self::Subagent, Self::Cli];
 
@@ -335,6 +367,13 @@ struct TaskControlsHitbox {
     clear_search: Rect,
     enter_turns: Rect,
     toggle_turns: Rect,
+    toggle_tree: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskTreeMarkerHitbox {
+    area: Rect,
+    task_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +482,8 @@ struct App {
     window_scope: WindowScope,
     focus: Focus,
     task_source_filter: TaskSourceFilter,
+    task_list_mode: TaskListMode,
+    collapsed_task_threads: HashSet<String>,
     task_search: String,
     task_search_before_edit: String,
     task_search_cursor: usize,
@@ -465,6 +506,7 @@ struct App {
     task_table_hitbox: Option<TableHitbox>,
     turn_table_hitbox: Option<TableHitbox>,
     task_controls_hitbox: Option<TaskControlsHitbox>,
+    task_tree_marker_hitboxes: Vec<TaskTreeMarkerHitbox>,
     turn_controls_hitbox: Option<TurnControlsHitbox>,
     window_controls_hitbox: Option<WindowControlsHitbox>,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
@@ -487,6 +529,8 @@ impl App {
             window_scope: WindowScope::FiveHours,
             focus: Focus::Tasks,
             task_source_filter: TaskSourceFilter::All,
+            task_list_mode: TaskListMode::Flat,
+            collapsed_task_threads: HashSet::new(),
             task_search: String::new(),
             task_search_before_edit: String::new(),
             task_search_cursor: 0,
@@ -509,6 +553,7 @@ impl App {
             task_table_hitbox: None,
             turn_table_hitbox: None,
             task_controls_hitbox: None,
+            task_tree_marker_hitboxes: Vec::new(),
             turn_controls_hitbox: None,
             window_controls_hitbox: None,
             view_tabs_hitbox: None,
@@ -536,9 +581,10 @@ impl App {
             || task_project_name(task).is_some_and(|project| project.to_lowercase().contains(query))
     }
 
-    fn filtered_task_indices(&self) -> Vec<usize> {
+    fn filtered_task_rows(&self) -> Vec<TaskListRow> {
         let query = self.task_search.to_lowercase();
-        self.snapshot
+        let filtered = self
+            .snapshot
             .tasks
             .iter()
             .enumerate()
@@ -546,6 +592,94 @@ impl App {
                 self.task_matches_filter_query(task, &query)
                     .then_some(index)
             })
+            .collect::<Vec<_>>();
+        if self.task_list_mode == TaskListMode::Flat {
+            return filtered
+                .into_iter()
+                .map(|index| TaskListRow {
+                    index,
+                    prefix: String::new(),
+                    depth: 0,
+                    has_children: false,
+                    collapsed: false,
+                })
+                .collect();
+        }
+
+        let visible_by_thread = filtered
+            .iter()
+            .filter_map(|index| {
+                self.snapshot
+                    .tasks
+                    .get(*index)
+                    .map(|task| (task.thread_id.as_str(), *index))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut parent_by_index = vec![None; self.snapshot.tasks.len()];
+        for &child_index in &filtered {
+            let Some(child) = self.snapshot.tasks.get(child_index) else {
+                continue;
+            };
+            if !child
+                .source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+            {
+                continue;
+            }
+            let Some(parent_index) = child
+                .parent_thread_id
+                .as_deref()
+                .and_then(|thread_id| visible_by_thread.get(thread_id))
+                .copied()
+            else {
+                continue;
+            };
+            if parent_index == child_index
+                || task_parent_edge_would_cycle(child_index, parent_index, &parent_by_index)
+            {
+                continue;
+            }
+            parent_by_index[child_index] = Some(parent_index);
+        }
+
+        let mut children = vec![Vec::new(); self.snapshot.tasks.len()];
+        let mut roots = Vec::new();
+        for &index in &filtered {
+            if let Some(parent) = parent_by_index[index] {
+                children[parent].push(index);
+            } else {
+                roots.push(index);
+            }
+        }
+
+        let mut subtree_ranks = vec![None; self.snapshot.tasks.len()];
+        for &index in &filtered {
+            task_subtree_rank(index, &children, &mut subtree_ranks);
+        }
+        for siblings in &mut children {
+            siblings.sort_by_key(|index| (subtree_ranks[*index].unwrap_or(*index), *index));
+        }
+        roots.sort_by_key(|index| (subtree_ranks[*index].unwrap_or(*index), *index));
+
+        let mut rows = Vec::with_capacity(filtered.len());
+        for root in roots {
+            append_task_tree_rows(
+                root,
+                &children,
+                &self.snapshot.tasks,
+                &self.collapsed_task_threads,
+                &mut Vec::new(),
+                &mut rows,
+            );
+        }
+        rows
+    }
+
+    fn filtered_task_indices(&self) -> Vec<usize> {
+        self.filtered_task_rows()
+            .into_iter()
+            .map(|row| row.index)
             .collect()
     }
 
@@ -558,8 +692,47 @@ impl App {
 
     fn selected_thread_id(&self) -> Option<&str> {
         let task = self.snapshot.tasks.get(self.selected_task)?;
-        self.task_matches_filter(task)
+        self.filtered_task_indices()
+            .contains(&self.selected_task)
             .then_some(task.thread_id.as_str())
+    }
+
+    fn nearest_visible_task_ancestor(
+        &self,
+        index: usize,
+        visible: &HashSet<usize>,
+    ) -> Option<usize> {
+        let by_thread = self
+            .snapshot
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.thread_id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut cursor = index;
+        let mut seen = HashSet::from([index]);
+        loop {
+            let task = self.snapshot.tasks.get(cursor)?;
+            if !task
+                .source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+            {
+                return None;
+            }
+            let parent = task
+                .parent_thread_id
+                .as_deref()
+                .and_then(|thread_id| by_thread.get(thread_id))
+                .copied()?;
+            if visible.contains(&parent) {
+                return Some(parent);
+            }
+            if !seen.insert(parent) {
+                return None;
+            }
+            cursor = parent;
+        }
     }
 
     fn selected_turn_record(&self) -> Option<&TurnRecord> {
@@ -663,10 +836,12 @@ impl App {
             return;
         }
 
-        let target = if filtered.contains(&self.selected_task) {
+        let visible = filtered.iter().copied().collect::<HashSet<_>>();
+        let target = if visible.contains(&self.selected_task) {
             self.selected_task
         } else {
-            filtered[0]
+            self.nearest_visible_task_ancestor(self.selected_task, &visible)
+                .unwrap_or(filtered[0])
         };
         let selection_changed = target != self.selected_task;
         if selection_changed {
@@ -728,11 +903,12 @@ impl App {
             self.task_search.clone_from(&self.task_search_before_edit);
             self.task_search_cursor = self.task_search.chars().count();
             self.focus = Focus::Tasks;
+            let visible_tasks = self.filtered_task_indices();
             let restored_task = restore_thread_id.as_deref().and_then(|thread_id| {
-                self.snapshot
-                    .tasks
+                visible_tasks
                     .iter()
-                    .position(|task| task.thread_id == thread_id && self.task_matches_filter(task))
+                    .copied()
+                    .find(|index| self.snapshot.tasks[*index].thread_id == thread_id)
             });
             if let Some(task_index) = restored_task {
                 self.selected_task = task_index;
@@ -928,6 +1104,44 @@ impl App {
         self.set_task_source_filter(TaskSourceFilter::ALL[next]);
     }
 
+    fn toggle_task_list_mode(&mut self) {
+        self.task_list_mode = self.task_list_mode.toggle();
+        self.reconcile_task_filter(true);
+    }
+
+    fn set_task_collapsed(&mut self, index: usize, collapsed: bool) -> bool {
+        if self.task_list_mode != TaskListMode::Tree
+            || !self
+                .filtered_task_rows()
+                .iter()
+                .any(|row| row.index == index && row.has_children)
+        {
+            return false;
+        }
+        let Some(thread_id) = self
+            .snapshot
+            .tasks
+            .get(index)
+            .map(|task| task.thread_id.clone())
+        else {
+            return false;
+        };
+        let changed = if collapsed {
+            self.collapsed_task_threads.insert(thread_id)
+        } else {
+            self.collapsed_task_threads.remove(&thread_id)
+        };
+        if changed {
+            self.reconcile_task_filter(false);
+            self.task_reveal_pending = true;
+        }
+        changed
+    }
+
+    fn set_selected_task_collapsed(&mut self, collapsed: bool) -> bool {
+        self.set_task_collapsed(self.selected_task, collapsed)
+    }
+
     fn replace(&mut self, result: CollectionResult, refreshed_account: bool) {
         let filtered = self.filtered_task_indices();
         let task_viewport_was_at_top = self.task_table_offset == 0;
@@ -957,9 +1171,18 @@ impl App {
             .map(|turn| turn.turn_id.clone());
         self.snapshot = result.snapshot;
         self.account = result.account;
+        let existing_threads = self
+            .snapshot
+            .tasks
+            .iter()
+            .map(|task| task.thread_id.as_str())
+            .collect::<HashSet<_>>();
+        self.collapsed_task_threads
+            .retain(|thread_id| existing_threads.contains(thread_id.as_str()));
         self.task_table_hitbox = None;
         self.turn_table_hitbox = None;
         self.task_controls_hitbox = None;
+        self.task_tree_marker_hitboxes.clear();
         self.turn_controls_hitbox = None;
         self.window_controls_hitbox = None;
         self.view_tabs_hitbox = None;
@@ -1250,6 +1473,32 @@ impl App {
         self.select_task(index, false)
     }
 
+    fn activate_task_tree_marker_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(marker) = self
+            .task_tree_marker_hitboxes
+            .iter()
+            .find(|marker| rect_contains(marker.area, column, row))
+            .copied()
+        else {
+            return false;
+        };
+        self.accept_active_search();
+        self.focus = Focus::Tasks;
+        if !self.turns_default_visible {
+            self.turns_temporarily_visible = false;
+        }
+        if !self.select_task(marker.task_index, false) {
+            return false;
+        }
+        let collapsed = self
+            .filtered_task_rows()
+            .iter()
+            .find(|row| row.index == marker.task_index)
+            .is_some_and(|row| row.collapsed);
+        self.set_task_collapsed(marker.task_index, !collapsed);
+        true
+    }
+
     fn activate_task_control_at(&mut self, column: u16, row: u16) -> bool {
         let Some(hitbox) = self.task_controls_hitbox else {
             return false;
@@ -1264,6 +1513,11 @@ impl App {
         if rect_contains(hitbox.toggle_turns, column, row) {
             self.accept_active_search();
             self.toggle_turns_default_visibility();
+            return true;
+        }
+        if rect_contains(hitbox.toggle_tree, column, row) {
+            self.accept_active_search();
+            self.toggle_task_list_mode();
             return true;
         }
         if rect_contains(hitbox.clear_search, column, row) {
@@ -1444,6 +1698,78 @@ impl App {
     }
 }
 
+fn task_parent_edge_would_cycle(
+    child: usize,
+    parent: usize,
+    parent_by_index: &[Option<usize>],
+) -> bool {
+    let mut cursor = Some(parent);
+    let mut remaining = parent_by_index.len().saturating_add(1);
+    while let Some(index) = cursor {
+        if index == child || remaining == 0 {
+            return true;
+        }
+        cursor = parent_by_index.get(index).copied().flatten();
+        remaining = remaining.saturating_sub(1);
+    }
+    false
+}
+
+fn task_subtree_rank(
+    index: usize,
+    children: &[Vec<usize>],
+    subtree_ranks: &mut [Option<usize>],
+) -> usize {
+    if let Some(rank) = subtree_ranks[index] {
+        return rank;
+    }
+    let mut rank = index;
+    for &child in &children[index] {
+        rank = rank.min(task_subtree_rank(child, children, subtree_ranks));
+    }
+    subtree_ranks[index] = Some(rank);
+    rank
+}
+
+fn append_task_tree_rows(
+    index: usize,
+    children: &[Vec<usize>],
+    tasks: &[TaskRecord],
+    collapsed_task_threads: &HashSet<String>,
+    guides: &mut Vec<bool>,
+    rows: &mut Vec<TaskListRow>,
+) {
+    let mut prefix = String::new();
+    if let Some((&is_last, ancestors)) = guides.split_last() {
+        for ancestor_is_last in ancestors {
+            prefix.push_str(if *ancestor_is_last { "  " } else { "│ " });
+        }
+        prefix.push_str(if is_last { "└─ " } else { "├─ " });
+    }
+    let has_children = !children[index].is_empty();
+    let collapsed = has_children
+        && tasks
+            .get(index)
+            .is_some_and(|task| collapsed_task_threads.contains(&task.thread_id));
+    rows.push(TaskListRow {
+        index,
+        prefix,
+        depth: guides.len(),
+        has_children,
+        collapsed,
+    });
+    if collapsed {
+        return;
+    }
+
+    let child_count = children[index].len();
+    for (position, &child) in children[index].iter().enumerate() {
+        guides.push(position + 1 == child_count);
+        append_task_tree_rows(child, children, tasks, collapsed_task_threads, guides, rows);
+        guides.pop();
+    }
+}
+
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1452,6 +1778,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 || app.activate_window_control_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
                 || app.activate_turn_control_at(event.column, event.row)
+                || app.activate_task_tree_marker_at(event.column, event.row)
                 || app.begin_scrollbar_drag_at(event.column, event.row)
             {
                 true
@@ -1683,6 +2010,23 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('v' | 'V') if app.view != View::Health => {
             app.toggle_turns_default_visibility();
+        }
+        KeyCode::Char('r' | 'R') if app.view != View::Health => {
+            app.toggle_task_list_mode();
+        }
+        KeyCode::Char('-')
+            if app.view != View::Health
+                && app.focus == Focus::Tasks
+                && app.task_list_mode == TaskListMode::Tree =>
+        {
+            app.set_selected_task_collapsed(true);
+        }
+        KeyCode::Char('+')
+            if app.view != View::Health
+                && app.focus == Focus::Tasks
+                && app.task_list_mode == TaskListMode::Tree =>
+        {
+            app.set_selected_task_collapsed(false);
         }
         KeyCode::Char('a' | 'A') if app.view != View::Health => {
             app.set_task_source_filter(TaskSourceFilter::All);
@@ -1924,6 +2268,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.task_table_hitbox = None;
     app.turn_table_hitbox = None;
     app.task_controls_hitbox = None;
+    app.task_tree_marker_hitboxes.clear();
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
     app.view_tabs_hitbox = None;
@@ -2261,10 +2606,10 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: bool) {
-    let filtered = app.filtered_task_indices();
+    let filtered = app.filtered_task_rows();
     let selected_position = filtered
         .iter()
-        .position(|index| *index == app.selected_task);
+        .position(|row| row.index == app.selected_task);
     let (block, controls) = task_panel_block(area, app, window_only, filtered.len());
     app.task_controls_hitbox = Some(controls);
     let table_inner = block.inner(area);
@@ -2288,11 +2633,46 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .and_then(|position| position.checked_sub(offset))
         .filter(|index| *index < visible_capacity);
     let theme = app.theme;
+    let palette = theme.palette();
+    let tasks_focused = app.focus == Focus::Tasks;
+    let tree_mode = app.task_list_mode == TaskListMode::Tree;
+    let task_column = task_table_columns(table_inner)[3];
+    if tree_mode {
+        app.task_tree_marker_hitboxes = filtered
+            .iter()
+            .skip(offset)
+            .take(visible_capacity)
+            .enumerate()
+            .filter_map(|(position, row)| {
+                if !row.has_children {
+                    return None;
+                }
+                let marker_x = task_column.x.saturating_add(
+                    u16::try_from(UnicodeWidthStr::width(row.prefix.as_str())).unwrap_or(u16::MAX),
+                );
+                (marker_x.saturating_add(TASK_TREE_MARKER_WIDTH) <= task_column.right()).then_some(
+                    TaskTreeMarkerHitbox {
+                        area: Rect::new(
+                            marker_x,
+                            table_inner
+                                .y
+                                .saturating_add(1)
+                                .saturating_add(u16::try_from(position).unwrap_or(u16::MAX)),
+                            TASK_TREE_MARKER_WIDTH,
+                            1,
+                        ),
+                        task_index: row.index,
+                    },
+                )
+            })
+            .collect();
+    }
     let task_rows = filtered
         .iter()
         .skip(offset)
-        .filter_map(|index| app.snapshot.tasks.get(*index))
-        .map(|task| {
+        .take(visible_capacity)
+        .filter_map(|row| app.snapshot.tasks.get(row.index).map(|task| (task, row)))
+        .map(|(task, row)| {
             let usage = task_usage_for_scope(&app.snapshot, app.window_scope, task);
             let tokens = if window_only {
                 usage.token_usage
@@ -2315,25 +2695,52 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
                 task.quota_confidence
             };
             let tone = task_status_tone(task.status);
+            let task_cell = if tree_mode {
+                let marker_style = Style::default().fg(palette.muted);
+                let shortcut_style = if tasks_focused && row.index == app.selected_task {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    marker_style
+                };
+                let mut spans = vec![Span::raw(row.prefix.clone())];
+                if row.has_children {
+                    spans.push(Span::styled("[", marker_style));
+                    spans.push(Span::styled(
+                        if row.collapsed { "+" } else { "-" },
+                        shortcut_style,
+                    ));
+                    spans.push(Span::styled("]", marker_style));
+                } else {
+                    spans.push(Span::raw("   "));
+                }
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw(task_display_label(task, row.depth > 0)));
+                Cell::from(Line::from(spans))
+            } else {
+                Cell::from(task_display_label(task, false))
+            };
             Row::new([
                 Cell::from(format!("{} {}", status_marker(tone), format_tokens(tokens))),
                 Cell::from(format!("{local_share:.1}%")),
                 Cell::from(format_estimated_quota(estimated_quota, quota_confidence)),
-                Cell::from(task_display_label(task)),
+                task_cell,
             ])
             .style(status_tone_style(tone, theme))
-        });
-    let tasks_focused = app.focus == Focus::Tasks;
-    let palette = theme.palette();
+        })
+        .collect::<Vec<_>>();
     let table = Table::new(
         task_rows,
         [
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(TASK_TOKENS_WIDTH),
+            Constraint::Length(TASK_LOCAL_WIDTH),
+            Constraint::Length(TASK_QUOTA_WIDTH),
             Constraint::Min(12),
         ],
     )
+    .flex(Flex::Legacy)
+    .column_spacing(TASK_COLUMN_SPACING)
     .header(table_header(
         [
             "TOKENS",
@@ -2424,6 +2831,8 @@ fn task_panel_block(
         + 2
         + 1
         + UnicodeWidthStr::width("[V]Turns")
+        + 1
+        + UnicodeWidthStr::width("[R]Tree")
         + TaskSourceFilter::ALL
             .into_iter()
             .map(|filter| 1 + UnicodeWidthStr::width(filter.label(false)) + 2)
@@ -2497,6 +2906,37 @@ fn task_panel_block(
         toggle_style,
     ));
     title_x = title_x.saturating_add(toggle_width);
+
+    spans.push(Span::raw(" "));
+    title_x = title_x.saturating_add(1);
+    let tree_label = if compact { "[R]" } else { "[R]Tree" };
+    let tree_width = u16::try_from(UnicodeWidthStr::width(tree_label)).unwrap_or(u16::MAX);
+    let toggle_tree = title_hitbox(area, title_x, tree_width);
+    let tree_selected = app.task_list_mode == TaskListMode::Tree;
+    let tree_style = if tree_selected {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let tree_shortcut_style = if app.focus.is_search() {
+        tree_style
+    } else if tree_selected {
+        tree_style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled("[", tree_style));
+    spans.push(Span::styled("R", tree_shortcut_style));
+    spans.push(Span::styled(
+        if compact { "]" } else { "]Tree" },
+        tree_style,
+    ));
+    title_x = title_x.saturating_add(tree_width);
 
     let mut source_hitboxes = [Rect::default(); 4];
     let shortcuts_active = !app.focus.is_search();
@@ -2649,6 +3089,7 @@ fn task_panel_block(
         clear_search,
         enter_turns,
         toggle_turns,
+        toggle_tree,
     };
     (block, controls)
 }
@@ -3566,13 +4007,35 @@ fn status_legend(theme: Theme, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn task_display_label(task: &TaskRecord) -> String {
-    let project = task_project_name(task).unwrap_or("-");
+fn task_table_columns(area: Rect) -> [Rect; 4] {
+    let [_highlight, columns] = Layout::horizontal([
+        Constraint::Length(TASK_HIGHLIGHT_WIDTH),
+        Constraint::Fill(0),
+    ])
+    .areas(area);
+    Layout::horizontal([
+        Constraint::Length(TASK_TOKENS_WIDTH),
+        Constraint::Length(TASK_LOCAL_WIDTH),
+        Constraint::Length(TASK_QUOTA_WIDTH),
+        Constraint::Min(12),
+    ])
+    .flex(Flex::Legacy)
+    .spacing(TASK_COLUMN_SPACING)
+    .areas(columns)
+}
+
+fn task_display_label(task: &TaskRecord, omit_project: bool) -> String {
     let source = task.source.as_deref().unwrap_or("unknown");
-    terminal_safe_text(&format!(
-        "{project} | {source} | {}t | {}",
-        task.turn_count, task.title
-    ))
+    let label = if omit_project {
+        format!("{source} | {}t | {}", task.turn_count, task.title)
+    } else {
+        let project = task_project_name(task).unwrap_or("-");
+        format!(
+            "{project} | {source} | {}t | {}",
+            task.turn_count, task.title
+        )
+    };
+    terminal_safe_text(&label)
 }
 
 fn task_project_name(task: &TaskRecord) -> Option<&str> {
@@ -3684,6 +4147,7 @@ mod tests {
                 title: format!("task {index}"),
                 cwd: Some("/tmp/project".into()),
                 source: Some("desktop".to_string()),
+                parent_thread_id: None,
                 created_at: Some(now),
                 updated_at: Some(now),
                 status: TaskStatus::Completed,
@@ -3777,6 +4241,13 @@ mod tests {
         let task = &mut app.snapshot.tasks[index];
         task.title = title.to_string();
         task.source = source.map(str::to_string);
+    }
+
+    fn set_task_parent(app: &mut App, child: usize, parent: usize) {
+        let parent_thread_id = app.snapshot.tasks[parent].thread_id.clone();
+        let task = &mut app.snapshot.tasks[child];
+        task.source = Some("subagent".to_string());
+        task.parent_thread_id = Some(parent_thread_id);
     }
 
     fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
@@ -4168,6 +4639,423 @@ mod tests {
     }
 
     #[test]
+    fn tree_rows_group_visible_subagents_by_subtree_recency_and_break_cycles() {
+        let mut app = interaction_test_app(8, 1);
+        set_task_parent(&mut app, 0, 3);
+        set_task_parent(&mut app, 2, 5);
+        set_task_parent(&mut app, 3, 5);
+        app.snapshot.tasks[4].source = Some("subagent".to_string());
+        app.snapshot.tasks[4].parent_thread_id = Some("missing-parent".to_string());
+        set_task_parent(&mut app, 6, 7);
+        set_task_parent(&mut app, 7, 6);
+        app.task_list_mode = TaskListMode::Tree;
+
+        let rows = app.filtered_task_rows();
+        assert_eq!(
+            rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![5, 3, 0, 2, 1, 4, 7, 6]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["", "├─ ", "│ └─ ", "└─ ", "", "", "", "└─ "]
+        );
+
+        app.task_source_filter = TaskSourceFilter::Subagent;
+        let rows = app.filtered_task_rows();
+        assert_eq!(
+            rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![3, 0, 2, 4, 7, 6]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| { app.snapshot.tasks[row.index].source.as_deref() == Some("subagent") })
+        );
+        assert_eq!(rows[0].prefix, "");
+        assert_eq!(rows[1].prefix, "└─ ");
+
+        app.task_source_filter = TaskSourceFilter::All;
+        app.task_search = "task 0".to_string();
+        let rows = app.filtered_task_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 0);
+        assert!(rows[0].prefix.is_empty());
+    }
+
+    #[test]
+    fn tree_collapse_hides_nested_rows_keeps_rank_and_promotes_filtered_orphans() {
+        let mut app = interaction_test_app(6, 2);
+        set_task_parent(&mut app, 0, 3);
+        set_task_parent(&mut app, 2, 5);
+        set_task_parent(&mut app, 3, 5);
+        app.snapshot.tasks[4].source = Some("subagent".to_string());
+        app.snapshot.tasks[4].parent_thread_id = Some("missing-parent".to_string());
+        app.task_list_mode = TaskListMode::Tree;
+
+        let rows = app.filtered_task_rows();
+        assert_eq!(
+            rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![5, 3, 0, 2, 1, 4]
+        );
+        assert_eq!(rows.iter().find(|row| row.index == 0).unwrap().depth, 2);
+        assert_eq!(rows.iter().find(|row| row.index == 4).unwrap().depth, 0);
+        assert!(!task_display_label(&app.snapshot.tasks[0], true).contains("project |"));
+        assert!(task_display_label(&app.snapshot.tasks[4], false).contains("project |"));
+
+        app.selected_task = 0;
+        app.selected_turn = 1;
+        app.turn_offset = 1;
+        assert!(app.set_task_collapsed(3, true));
+        assert_eq!(app.selected_task, 3);
+        assert_eq!(app.selected_turn, 0);
+        assert_eq!(app.turn_offset, 0);
+        assert_eq!(
+            app.filtered_task_indices(),
+            vec![5, 3, 2, 1, 4],
+            "the hidden newest grandchild must still rank its branch first"
+        );
+
+        assert!(app.set_task_collapsed(5, true));
+        assert_eq!(app.selected_task, 5);
+        assert_eq!(app.filtered_task_indices(), vec![5, 1, 4]);
+
+        app.task_search = "task 0".to_string();
+        let rows = app.filtered_task_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].depth, 0);
+        assert!(!rows[0].has_children);
+        assert!(task_display_label(&app.snapshot.tasks[0], false).contains("project |"));
+
+        app.task_list_mode = TaskListMode::Flat;
+        let flat = app.filtered_task_rows();
+        assert_eq!(flat[0].depth, 0);
+        assert!(task_display_label(&app.snapshot.tasks[0], false).contains("project |"));
+    }
+
+    #[test]
+    fn tree_plus_minus_toggle_selected_parent_but_search_consumes_the_symbols() {
+        let mut app = interaction_test_app(3, 2);
+        set_task_parent(&mut app, 0, 2);
+        app.task_list_mode = TaskListMode::Tree;
+        app.selected_task = 2;
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('-')));
+        assert!(app.collapsed_task_threads.contains("task-thread-2"));
+        assert_eq!(app.filtered_task_indices(), vec![2, 1]);
+        handle_key_event(&mut app, key_event(KeyCode::Char('+')));
+        assert!(!app.collapsed_task_threads.contains("task-thread-2"));
+        assert_eq!(app.filtered_task_indices(), vec![2, 0, 1]);
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('-')));
+        app.begin_task_search();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let marker = app
+            .task_tree_marker_hitboxes
+            .iter()
+            .find(|marker| marker.task_index == 2)
+            .unwrap();
+        let shortcut = &terminal.backend().buffer()[(marker.area.x + 1, marker.area.y)];
+        assert_eq!(shortcut.symbol(), "+");
+        assert!(!shortcut.modifier.contains(Modifier::UNDERLINED));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('-')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('+')));
+        assert_eq!(app.task_search, "-+");
+        assert!(app.collapsed_task_threads.contains("task-thread-2"));
+    }
+
+    #[test]
+    fn tree_marker_mouse_click_selects_once_and_has_stable_geometry_and_placeholder() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut app = interaction_test_app(4, 2);
+            set_task_parent(&mut app, 0, 3);
+            app.task_list_mode = TaskListMode::Tree;
+            app.theme = theme;
+            app.selected_task = 1;
+            app.selected_turn = 1;
+            app.turn_offset = 1;
+            app.focus = Focus::Turns;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let marker = app
+                .task_tree_marker_hitboxes
+                .iter()
+                .find(|marker| marker.task_index == 3)
+                .copied()
+                .unwrap();
+            assert_eq!(marker.area.width, TASK_TREE_MARKER_WIDTH);
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(marker.area.x, marker.area.y)].symbol(), "[");
+            assert_eq!(buffer[(marker.area.x + 1, marker.area.y)].symbol(), "-");
+            assert_eq!(buffer[(marker.area.x + 2, marker.area.y)].symbol(), "]");
+
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    marker.area.right() - 1,
+                    marker.area.y,
+                ),
+            ));
+            assert_eq!(app.focus, Focus::Tasks);
+            assert_eq!(app.selected_task, 3);
+            assert_eq!(app.selected_turn, 0);
+            assert_eq!(app.turn_offset, 0);
+            assert!(!app.filtered_task_indices().contains(&0));
+
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let collapsed = app
+                .task_tree_marker_hitboxes
+                .iter()
+                .find(|marker| marker.task_index == 3)
+                .copied()
+                .unwrap();
+            assert_eq!(collapsed.area, marker.area);
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(collapsed.area.x + 1, collapsed.area.y)].symbol(),
+                "+"
+            );
+            assert!(
+                buffer[(collapsed.area.x + 1, collapsed.area.y)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+
+            let leaf_position = app
+                .filtered_task_indices()
+                .iter()
+                .position(|index| *index == 1)
+                .unwrap();
+            let task_column = task_table_columns(app.task_table_hitbox.unwrap().viewport)[3];
+            let leaf_y = app
+                .task_table_hitbox
+                .unwrap()
+                .rows
+                .y
+                .saturating_add(u16::try_from(leaf_position).unwrap());
+            assert!(
+                (0..TASK_TREE_MARKER_WIDTH)
+                    .all(|offset| buffer[(task_column.x + offset, leaf_y)].symbol() == " ")
+            );
+        }
+    }
+
+    #[test]
+    fn compact_tree_marker_hitbox_matches_all_three_clickable_cells() {
+        let mut app = interaction_test_app(4, 1);
+        set_task_parent(&mut app, 0, 3);
+        app.task_list_mode = TaskListMode::Tree;
+        app.turns_default_visible = false;
+        app.selected_task = 3;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+
+        for (offset, expected_before) in [(0, "-"), (1, "+"), (2, "-")] {
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let marker = app
+                .task_tree_marker_hitboxes
+                .iter()
+                .find(|marker| marker.task_index == 3)
+                .copied()
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(marker.area.width, 3);
+            assert_eq!(buffer[(marker.area.x, marker.area.y)].symbol(), "[");
+            assert_eq!(
+                buffer[(marker.area.x + 1, marker.area.y)].symbol(),
+                expected_before
+            );
+            assert_eq!(buffer[(marker.area.x + 2, marker.area.y)].symbol(), "]");
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    marker.area.x + offset,
+                    marker.area.y,
+                ),
+            ));
+            assert_eq!(
+                app.collapsed_task_threads.contains("task-thread-3"),
+                expected_before == "-"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
+        let mut flat = interaction_test_app(4, 2);
+        set_task_parent(&mut flat, 0, 3);
+        flat.selected_task = 0;
+        flat.selected_turn = 1;
+        flat.turn_offset = 1;
+        flat.collapsed_task_threads
+            .insert("task-thread-3".to_string());
+        handle_key_event(&mut flat, key_event(KeyCode::Char('R')));
+        assert_eq!(flat.task_list_mode, TaskListMode::Tree);
+        assert_eq!(flat.selected_task, 3);
+        assert_eq!(flat.selected_turn, 0);
+        assert_eq!(flat.turn_offset, 0);
+        assert!(!flat.filtered_task_indices().contains(&0));
+
+        let mut refreshed = interaction_test_app(4, 2);
+        refreshed.task_list_mode = TaskListMode::Tree;
+        refreshed.selected_task = 0;
+        refreshed.selected_turn = 1;
+        refreshed.turn_offset = 1;
+        refreshed
+            .collapsed_task_threads
+            .insert("task-thread-3".to_string());
+        let mut snapshot = refreshed.snapshot.clone();
+        snapshot.tasks[0].source = Some("subagent".to_string());
+        snapshot.tasks[0].parent_thread_id = Some("task-thread-3".to_string());
+        refreshed.replace(
+            CollectionResult {
+                snapshot,
+                account: refreshed.account.clone(),
+            },
+            false,
+        );
+        assert_eq!(refreshed.selected_task, 3);
+        assert_eq!(refreshed.selected_turn, 0);
+        assert_eq!(refreshed.turn_offset, 0);
+        assert_eq!(refreshed.selected_thread_id(), Some("task-thread-3"));
+        assert!(!refreshed.filtered_task_indices().contains(&0));
+    }
+
+    #[test]
+    fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
+        let mut app = interaction_test_app(4, 1);
+        set_task_parent(&mut app, 0, 3);
+        app.task_list_mode = TaskListMode::Tree;
+        app.selected_task = 3;
+        assert!(app.set_task_collapsed(3, true));
+        let parent_id = app.snapshot.tasks[3].thread_id.clone();
+        let child_id = app.snapshot.tasks[0].thread_id.clone();
+
+        app.replace(
+            CollectionResult {
+                snapshot: app.snapshot.clone(),
+                account: app.account.clone(),
+            },
+            false,
+        );
+        assert!(app.collapsed_task_threads.contains(&parent_id));
+        assert!(
+            !app.filtered_task_indices()
+                .iter()
+                .any(|index| app.snapshot.tasks[*index].thread_id == child_id)
+        );
+
+        let mut snapshot = app.snapshot.clone();
+        snapshot.tasks.retain(|task| task.thread_id != parent_id);
+        app.replace(
+            CollectionResult {
+                snapshot,
+                account: app.account.clone(),
+            },
+            false,
+        );
+        assert!(!app.collapsed_task_threads.contains(&parent_id));
+        let child = app
+            .filtered_task_rows()
+            .into_iter()
+            .find(|row| app.snapshot.tasks[row.index].thread_id == child_id)
+            .unwrap();
+        assert_eq!(child.depth, 0);
+        assert!(!child.has_children);
+        assert!(task_display_label(&app.snapshot.tasks[child.index], false).contains("project |"));
+    }
+
+    #[test]
+    fn tree_keyboard_toggle_preserves_selection_and_search_consumes_the_shortcut() {
+        let mut app = interaction_test_app(6, 2);
+        set_task_parent(&mut app, 0, 4);
+        app.selected_task = 0;
+        app.selected_turn = 1;
+        app.task_table_offset = 3;
+        app.turn_offset = 1;
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('R')));
+        assert_eq!(app.task_list_mode, TaskListMode::Tree);
+        assert_eq!(app.selected_task, 0);
+        assert_eq!(app.selected_turn, 1);
+        assert_eq!(app.turn_offset, 1);
+        assert_eq!(app.task_table_offset, 0);
+        assert!(app.task_reveal_pending);
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')));
+        assert_eq!(app.focus, Focus::TaskSearch);
+        assert_eq!(app.task_search, "r");
+        assert_eq!(app.task_list_mode, TaskListMode::Tree);
+        handle_key_event(&mut app, key_event(KeyCode::Esc));
+
+        app.focus = Focus::Turns;
+        app.begin_turn_search();
+        handle_key_event(&mut app, key_event(KeyCode::Char('R')));
+        assert_eq!(app.focus, Focus::TurnSearch);
+        assert_eq!(app.turn_search, "R");
+        assert_eq!(app.task_list_mode, TaskListMode::Tree);
+    }
+
+    #[test]
+    fn tree_control_is_fully_clickable_stable_and_muted_while_searching() {
+        for (width, expected_width) in [(60, 3), (120, 7)] {
+            let mut app = interaction_test_app(8, 1);
+            app.turns_default_visible = false;
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let controls = app.task_controls_hitbox.unwrap();
+            let initial = controls.toggle_tree;
+            assert_eq!(initial.width, expected_width);
+            assert!(controls.toggle_turns.right() <= initial.x);
+            assert!(initial.right() <= controls.sources[0].x);
+            assert_eq!(
+                terminal.backend().buffer()[(initial.x + 1, initial.y)].symbol(),
+                "R"
+            );
+
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    initial.right() - 1,
+                    initial.y,
+                ),
+            ));
+            assert_eq!(app.task_list_mode, TaskListMode::Tree);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let selected = app.task_controls_hitbox.unwrap().toggle_tree;
+            assert_eq!(selected, initial);
+            assert!(
+                terminal.backend().buffer()[(selected.x + 1, selected.y)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    selected.right() - 1,
+                    selected.y,
+                ),
+            );
+            app.begin_task_search();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let searching = app.task_controls_hitbox.unwrap().toggle_tree;
+            let shortcut = &terminal.backend().buffer()[(searching.x + 1, searching.y)];
+            assert_eq!(searching, initial);
+            assert_eq!(shortcut.fg, app.theme.palette().muted);
+            assert!(!shortcut.modifier.contains(Modifier::BOLD));
+            assert!(!shortcut.modifier.contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
     fn filtered_task_navigation_clicks_and_scroll_use_visible_positions() {
         let mut app = interaction_test_app(30, 1);
         for index in 0..app.snapshot.tasks.len() {
@@ -4214,6 +5102,68 @@ mod tests {
         assert_eq!(app.selected_task, filtered[scrolled.offset + 1]);
         handle_key_event(&mut app, key_event(KeyCode::Up));
         assert_eq!(app.selected_task, expected);
+    }
+
+    #[test]
+    fn tree_click_scroll_and_refresh_keep_flattened_positions_mapped_by_thread() {
+        let mut app = interaction_test_app(30, 1);
+        set_task_parent(&mut app, 0, 10);
+        set_task_parent(&mut app, 1, 10);
+        app.task_list_mode = TaskListMode::Tree;
+        assert_eq!(&app.filtered_task_indices()[..4], &[10, 0, 1, 2]);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = app.task_table_hitbox.unwrap().rows;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), rows.x, rows.y + 1,),
+        ));
+        assert_eq!(app.selected_task, 0);
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::ScrollDown, rows.x, rows.y),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hitbox = app.task_table_hitbox.unwrap();
+        let flattened = app.filtered_task_indices();
+        let expected_clicked = flattened[hitbox.offset];
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                hitbox.rows.x,
+                hitbox.rows.y,
+            ),
+        ));
+        assert_eq!(app.selected_task, expected_clicked);
+
+        let viewport_thread_id = app.snapshot.tasks[flattened[hitbox.offset]]
+            .thread_id
+            .clone();
+        let mut snapshot = app.snapshot.clone();
+        let mut newest_child = snapshot.tasks[0].clone();
+        newest_child.thread_id = "newest-tree-child".to_string();
+        newest_child.parent_thread_id = Some("task-thread-10".to_string());
+        snapshot.tasks.insert(0, newest_child);
+        app.replace(
+            CollectionResult {
+                snapshot,
+                account: app.account.clone(),
+            },
+            false,
+        );
+
+        let flattened = app.filtered_task_indices();
+        assert_eq!(
+            app.snapshot.tasks[flattened[app.task_table_offset]].thread_id,
+            viewport_thread_id
+        );
+        assert_eq!(
+            app.raw_selected_thread_id(),
+            Some(viewport_thread_id.as_str())
+        );
     }
 
     #[test]
@@ -6191,6 +7141,7 @@ mod tests {
                     title: "task".to_string(),
                     cwd: Some("/tmp/project".into()),
                     source: Some("desktop".to_string()),
+                    parent_thread_id: None,
                     created_at: Some(now),
                     updated_at: Some(now),
                     status: TaskStatus::Completed,

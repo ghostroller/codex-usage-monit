@@ -734,6 +734,7 @@ mod tests {
             account_usage: None,
             tasks: vec![TaskRecord {
                 thread_id: "task-thread".to_string(),
+                parent_thread_id: None,
                 title: "task".to_string(),
                 cwd: None,
                 source: Some("desktop".to_string()),
