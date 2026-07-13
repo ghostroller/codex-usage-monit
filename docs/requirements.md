@@ -33,15 +33,15 @@ TUI Overview 显示近期 tasks：
 - Turns 面板底部显示统一状态图例；
 - `live`、`exact`、`inferred`、`stale` 等证据和置信度；
 - task token 总量；
-- 当前窗口 local token share 与 estimated quota；
+- 当前选中 5h/Week reset cycle 的 local token share 与 estimated quota；
 - project、来源、turn 数和会话标题；会话标题优先取 `$CODEX_HOME/session_index.jsonl` 中 thread 最新的非空 `thread_name`，缺失或不可读时回退 rollout 首条消息摘要，`--redact-content` 始终显示 `[redacted]`；
-- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
+- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown、所选 reset cycle local share 与 estimated quota 必须汇总当前过滤树内所有隐藏后代；展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数，汇总置信度采取最保守的非零贡献等级。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
 - Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；当前会话标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
 - 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，两个提示整体都是鼠标按钮，且出现或消失不得移动相邻控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
 - Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影；
 - `V` 切换 Turns 默认显隐。默认显示时 Turns 常显；默认隐藏时 Tasks 使用完整内容区域，`Enter` / `↵` 临时展开并聚焦 Turns，`Backspace` / `←` 返回 Tasks 后关闭临时面板；
-- rollout 中 `thread_settings_applied.thread_settings.service_tier=priority` 在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 增加醒目标识，普通 turn 保持原显示；
-- 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与窗口 token breakdown，Overview 使用兼容 5h 分析，Window 使用所选 5h/Week scope，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
+- rollout 中 `thread_settings_applied.thread_settings.service_tier=priority` 在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 在模型名称后增加醒目标识，普通 turn 保持原显示；
+- 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与所选 5h/Week reset cycle 的 token breakdown，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
 
@@ -134,19 +134,14 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的 5h/Week
 ### Overview
 
 - quota gauges；
-- task 表；
-- 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
-- 当前窗口模型 token 表；按 token 降序显示，空间不足时标记 `top N/M`，并区分“5 小时窗口不可用”和“窗口内没有本地模型调用”。
-
-Overview 保持首选 5h 兼容视图；Week 的交互分析只在 Window 页切换，不能改变 Overview 或旧 JSON 字段的 5h 语义。
-
-### Window
-
-- `[5h]` / `[Week]` scope 按钮；`5` / `W` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；
+- Models 标题中的 `[5h]` / `[Week]` scope 按钮；`5` / `W` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；
 - 所选当前 reset cycle 的 duration、实际起止时间和额度；
-- 随 scope 同步切换的 observed/estimated/unattributed/coverage/confidence；
-- 随 scope 同步切换的 task 与 turn 窗口 token/占比；
-- 随 scope 同步切换的模型分布。
+- 使用所选 scope 的 task 表；
+- 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
+- Models 面板先显示所选 scope 的 observed/estimated/unattributed/coverage/confidence 归因摘要，再显示按 token 降序的模型表；空间不足时标记 `top N/M`，并区分“scope 不可用”和“窗口内没有本地模型调用”；
+- `M` 与 Tasks 标题中可点击的 `[M]Models` 切换 Models 面板显隐；隐藏后 Tasks/Turns 使用释放的空间，恢复控件始终可达。
+
+Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要，但只属于 TUI 生命周期状态；旧 JSON v1 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
 
 ### Data Health
 
@@ -158,7 +153,7 @@ Overview 保持首选 5h 兼容视图；Week 的交互分析只在 Window 页切
 
 宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的 Tree、名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。Flat/Tree 的显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；切换模式保留所选 thread/turn 并 reveal 新位置，刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
-Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview、Window、Data Health 顶层 tab 均可用鼠标左键切换；Window scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 和 Window 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、scope 按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview、Data Health 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -191,7 +186,9 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
 - 5h/Week 使用服务端 reset cycle 边界；`--days` 覆盖不足时对应 `windowAnalyses` 为 partial；
-- Window 的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与 Attribution；
+- Overview Models 标题中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`M` 和 `[M]Models` 可稳定隐藏并恢复 Models；
+- Tree 节点收起时父行准确汇总当前过滤树中隐藏后代的 token、local share 与 estimated quota，展开时不重复计数；
+- Fast turn 的 `FAST` 只出现在模型名称后，普通 turn 的模型单元格保持不变；
 - 相同 duration 多桶选择 Codex/Server 优先、输出 warning，未选桶保持 gauge-only；
 - `windows` 与 `snapshot --section windows` 输出多窗口分析，旧 5h 字段保持兼容；
 - idle 后额度估算仍不声称 exact。

@@ -24,12 +24,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::CollectConfig;
 use crate::domain::{
-    AccountSnapshot, Confidence, Provenance, Snapshot, TaskRecord, TaskStatus, TokenUsage,
-    TurnRecord, TurnStatus, WindowAnalysis, WindowUsage, terminal_safe_text,
+    AccountSnapshot, AttributionSummary, Confidence, Provenance, Snapshot, TaskRecord, TaskStatus,
+    TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage, terminal_safe_text,
 };
 use crate::rollout::RolloutCache;
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
@@ -118,7 +118,6 @@ impl Theme {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Overview,
-    Window,
     Health,
 }
 
@@ -189,10 +188,7 @@ fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAna
         .find(|analysis| analysis.duration_mins == scope.duration_mins())
 }
 
-fn attribution_for_scope(
-    snapshot: &Snapshot,
-    scope: WindowScope,
-) -> Option<&crate::domain::AttributionSummary> {
+fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&AttributionSummary> {
     window_analysis(snapshot, scope)
         .map(|analysis| &analysis.attribution)
         .or_else(|| {
@@ -247,6 +243,69 @@ fn turn_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, turn: &TurnReco
         })
 }
 
+fn task_record_usage(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    task: &TaskRecord,
+    window_only: bool,
+) -> WindowUsage {
+    if window_only {
+        task_usage_for_scope(snapshot, scope, task)
+    } else {
+        WindowUsage {
+            token_usage: task.token_usage,
+            local_token_share_percent: task.local_token_share_percent,
+            estimated_quota_percent: task.estimated_quota_percent,
+            quota_confidence: task.quota_confidence,
+        }
+    }
+}
+
+fn aggregate_task_row_usage(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    row: &TaskListRow,
+    window_only: bool,
+) -> WindowUsage {
+    let Some(task) = snapshot.tasks.get(row.index) else {
+        return WindowUsage::default();
+    };
+    let mut aggregate = task_record_usage(snapshot, scope, task, window_only);
+    if row.hidden_descendants.is_empty() {
+        return aggregate;
+    }
+    let parent_confidence = aggregate.quota_confidence;
+    let mut quota_confidence =
+        (aggregate.estimated_quota_percent > 0.0).then_some(aggregate.quota_confidence);
+    for index in row.hidden_descendants.iter().copied() {
+        let Some(descendant) = snapshot.tasks.get(index) else {
+            continue;
+        };
+        let usage = task_record_usage(snapshot, scope, descendant, window_only);
+        aggregate.token_usage.add_assign(usage.token_usage);
+        aggregate.local_token_share_percent += usage.local_token_share_percent;
+        aggregate.estimated_quota_percent += usage.estimated_quota_percent;
+        if usage.estimated_quota_percent > 0.0 {
+            quota_confidence = Some(match quota_confidence {
+                None => usage.quota_confidence,
+                Some(current) => weakest_quota_confidence(current, usage.quota_confidence),
+            });
+        }
+    }
+    aggregate.quota_confidence = quota_confidence.unwrap_or(parent_confidence);
+    aggregate
+}
+
+fn weakest_quota_confidence(left: Confidence, right: Confidence) -> Confidence {
+    use Confidence::{High, Low, Medium, Unknown};
+    match (left, right) {
+        (Unknown, _) | (_, Unknown) => Unknown,
+        (Low, _) | (_, Low) => Low,
+        (Medium, _) | (_, Medium) => Medium,
+        (High, High) => High,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Focus {
     #[default]
@@ -294,6 +353,7 @@ struct TaskListRow {
     depth: usize,
     has_children: bool,
     collapsed: bool,
+    hidden_descendants: Vec<usize>,
 }
 
 impl TaskSourceFilter {
@@ -367,6 +427,7 @@ struct TaskControlsHitbox {
     clear_search: Rect,
     enter_turns: Rect,
     toggle_turns: Rect,
+    toggle_models: Rect,
     toggle_tree: Rect,
 }
 
@@ -385,7 +446,7 @@ struct TurnControlsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ViewTabsHitbox {
-    tabs: [Rect; 3],
+    tabs: [Rect; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -431,12 +492,11 @@ impl TableHitbox {
 }
 
 impl View {
-    const ALL: [Self; 3] = [Self::Overview, Self::Window, Self::Health];
+    const ALL: [Self; 2] = [Self::Overview, Self::Health];
 
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
-            Self::Window => "Window",
             Self::Health => "Data health",
         }
     }
@@ -444,23 +504,20 @@ impl View {
     fn shortcut(self) -> char {
         match self {
             Self::Overview => '1',
-            Self::Window => '2',
-            Self::Health => '3',
+            Self::Health => '2',
         }
     }
 
     fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Window => 1,
-            Self::Health => 2,
+            Self::Health => 1,
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Overview => Self::Window,
-            Self::Window => Self::Health,
+            Self::Overview => Self::Health,
             Self::Health => Self::Overview,
         }
     }
@@ -468,8 +525,7 @@ impl View {
     fn previous(self) -> Self {
         match self {
             Self::Overview => Self::Health,
-            Self::Window => Self::Overview,
-            Self::Health => Self::Window,
+            Self::Health => Self::Overview,
         }
     }
 }
@@ -498,6 +554,7 @@ struct App {
     turn_search_restore_offset: usize,
     turns_default_visible: bool,
     turns_temporarily_visible: bool,
+    models_visible: bool,
     selected_task: usize,
     selected_turn: usize,
     turn_offset: usize,
@@ -545,6 +602,7 @@ impl App {
             turn_search_restore_offset: 0,
             turns_default_visible: true,
             turns_temporarily_visible: false,
+            models_visible: true,
             selected_task: 0,
             selected_turn: 0,
             turn_offset: 0,
@@ -602,6 +660,7 @@ impl App {
                     depth: 0,
                     has_children: false,
                     collapsed: false,
+                    hidden_descendants: Vec::new(),
                 })
                 .collect();
         }
@@ -815,6 +874,12 @@ impl App {
         if !self.turns_default_visible && matches!(self.focus, Focus::Turns | Focus::TurnSearch) {
             self.focus = Focus::Tasks;
         }
+    }
+
+    fn toggle_models_visibility(&mut self) {
+        self.models_visible = !self.models_visible;
+        self.task_reveal_pending = true;
+        self.turn_reveal_pending = true;
     }
 
     fn reset_turn_selection(&mut self) {
@@ -1515,6 +1580,11 @@ impl App {
             self.toggle_turns_default_visibility();
             return true;
         }
+        if rect_contains(hitbox.toggle_models, column, row) {
+            self.accept_active_search();
+            self.toggle_models_visibility();
+            return true;
+        }
         if rect_contains(hitbox.toggle_tree, column, row) {
             self.accept_active_search();
             self.toggle_task_list_mode();
@@ -1591,7 +1661,7 @@ impl App {
     }
 
     fn activate_window_control_at(&mut self, column: u16, row: u16) -> bool {
-        if self.view != View::Window {
+        if self.view != View::Overview {
             return false;
         }
         let Some(hitbox) = self.window_controls_hitbox else {
@@ -1751,12 +1821,17 @@ fn append_task_tree_rows(
         && tasks
             .get(index)
             .is_some_and(|task| collapsed_task_threads.contains(&task.thread_id));
+    let mut hidden_descendants = Vec::new();
+    if collapsed {
+        collect_task_descendants(index, children, &mut hidden_descendants);
+    }
     rows.push(TaskListRow {
         index,
         prefix,
         depth: guides.len(),
         has_children,
         collapsed,
+        hidden_descendants,
     });
     if collapsed {
         return;
@@ -1767,6 +1842,16 @@ fn append_task_tree_rows(
         guides.push(position + 1 == child_count);
         append_task_tree_rows(child, children, tasks, collapsed_task_threads, guides, rows);
         guides.pop();
+    }
+}
+
+fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: &mut Vec<usize>) {
+    let Some(direct_children) = children.get(index) else {
+        return;
+    };
+    for &child in direct_children {
+        descendants.push(child);
+        collect_task_descendants(child, children, descendants);
     }
 }
 
@@ -1830,7 +1915,7 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
-    let mut tabs = [Rect::default(); 3];
+    let mut tabs = [Rect::default(); 2];
     let mut x = area.x;
     for (position, view) in View::ALL.into_iter().enumerate() {
         let width = UnicodeWidthStr::width(TAB_PADDING)
@@ -1928,6 +2013,45 @@ fn compact_search_text(value: &str, max_width: usize) -> String {
     format!("<{}", chars[start..].iter().collect::<String>())
 }
 
+fn truncate_display_text(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let content_width = max_width - 1;
+    let mut width = 0;
+    let mut output = String::new();
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > content_width {
+            break;
+        }
+        output.push(character);
+        width += character_width;
+    }
+    output.push('…');
+    output
+}
+
+fn fast_model_line(value: &str, column_width: usize, theme: Theme) -> Line<'static> {
+    const SUFFIX: &str = " FAST";
+    let value_width = column_width.saturating_sub(UnicodeWidthStr::width(SUFFIX));
+    Line::from(vec![
+        Span::raw(truncate_display_text(value, value_width)),
+        Span::styled(
+            SUFFIX,
+            Style::default()
+                .fg(theme.palette().warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
@@ -1992,12 +2116,11 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab | KeyCode::Right => app.set_view(app.view.next()),
         KeyCode::BackTab | KeyCode::Left => app.set_view(app.view.previous()),
         KeyCode::Char('1') => app.set_view(View::Overview),
-        KeyCode::Char('2') => app.set_view(View::Window),
-        KeyCode::Char('3') => app.set_view(View::Health),
-        KeyCode::Char('5') if app.view == View::Window => {
+        KeyCode::Char('2') => app.set_view(View::Health),
+        KeyCode::Char('5') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::FiveHours);
         }
-        KeyCode::Char('w' | 'W') if app.view == View::Window => {
+        KeyCode::Char('w' | 'W') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::Week);
         }
         KeyCode::Char('t' | 'T') => app.toggle_theme(),
@@ -2010,6 +2133,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('v' | 'V') if app.view != View::Health => {
             app.toggle_turns_default_visibility();
+        }
+        KeyCode::Char('m' | 'M') if app.view == View::Overview => {
+            app.toggle_models_visibility();
         }
         KeyCode::Char('r' | 'R') if app.view != View::Health => {
             app.toggle_task_list_mode();
@@ -2333,7 +2459,6 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
-        View::Window => render_window(frame, root[1], app),
         View::Health => render_health(frame, root[1], app),
     };
     if app
@@ -2345,58 +2470,19 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let compact = area.height < 28;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(if compact { 3 } else { 5 }),
-            Constraint::Min(10),
-            Constraint::Length(if compact { 4 } else { 7 }),
-        ])
-        .split(area);
-    render_limits(frame, rows[0], &app.snapshot, app.theme);
-
-    if app.turns_visible() {
-        let narrow = area.width < 100;
-        let body = Layout::default()
-            .direction(if narrow {
-                Direction::Vertical
-            } else {
-                Direction::Horizontal
-            })
-            .constraints(if narrow {
-                [Constraint::Percentage(42), Constraint::Percentage(58)]
-            } else {
-                [Constraint::Percentage(54), Constraint::Percentage(46)]
-            })
-            .split(rows[1]);
-        render_tasks(frame, body[0], app, false);
-        render_turns(frame, body[1], app, false);
-    } else {
-        render_tasks(frame, rows[1], app, false);
-    }
-    render_models(
-        frame,
-        rows[2],
-        &app.snapshot,
-        app.theme,
-        WindowScope::FiveHours,
-    );
-}
-
-fn render_window(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let compact = area.height < 30;
+    let mut constraints = vec![
+        Constraint::Length(if compact { 3 } else { 5 }),
+        Constraint::Min(9),
+    ];
+    if app.models_visible {
+        constraints.push(Constraint::Length(if compact { 8 } else { 10 }));
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(if compact { 3 } else { 5 }),
-            Constraint::Length(if compact { 4 } else { 5 }),
-            Constraint::Min(9),
-            Constraint::Length(if compact { 4 } else { 7 }),
-        ])
+        .constraints(constraints)
         .split(area);
     render_limits(frame, rows[0], &app.snapshot, app.theme);
-    render_attribution(frame, rows[1], app);
 
     if app.turns_visible() {
         let narrow = area.width < 100;
@@ -2411,13 +2497,15 @@ fn render_window(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 [Constraint::Percentage(52), Constraint::Percentage(48)]
             })
-            .split(rows[2]);
+            .split(rows[1]);
         render_tasks(frame, body[0], app, true);
         render_turns(frame, body[1], app, true);
     } else {
-        render_tasks(frame, rows[2], app, true);
+        render_tasks(frame, rows[1], app, true);
     }
-    render_models(frame, rows[3], &app.snapshot, app.theme, app.window_scope);
+    if app.models_visible {
+        render_models(frame, rows[2], app);
+    }
 }
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2673,27 +2761,11 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .take(visible_capacity)
         .filter_map(|row| app.snapshot.tasks.get(row.index).map(|task| (task, row)))
         .map(|(task, row)| {
-            let usage = task_usage_for_scope(&app.snapshot, app.window_scope, task);
-            let tokens = if window_only {
-                usage.token_usage
-            } else {
-                task.token_usage
-            };
-            let local_share = if window_only {
-                usage.local_token_share_percent
-            } else {
-                task.local_token_share_percent
-            };
-            let estimated_quota = if window_only {
-                usage.estimated_quota_percent
-            } else {
-                task.estimated_quota_percent
-            };
-            let quota_confidence = if window_only {
-                usage.quota_confidence
-            } else {
-                task.quota_confidence
-            };
+            let usage = aggregate_task_row_usage(&app.snapshot, app.window_scope, row, window_only);
+            let tokens = usage.token_usage;
+            let local_share = usage.local_token_share_percent;
+            let estimated_quota = usage.estimated_quota_percent;
+            let quota_confidence = usage.quota_confidence;
             let tone = task_status_tone(task.status);
             let task_cell = if tree_mode {
                 let marker_style = Style::default().fg(palette.muted);
@@ -2832,6 +2904,8 @@ fn task_panel_block(
         + 1
         + UnicodeWidthStr::width("[V]Turns")
         + 1
+        + UnicodeWidthStr::width("[M]Models")
+        + 1
         + UnicodeWidthStr::width("[R]Tree")
         + TaskSourceFilter::ALL
             .into_iter()
@@ -2906,6 +2980,36 @@ fn task_panel_block(
         toggle_style,
     ));
     title_x = title_x.saturating_add(toggle_width);
+
+    spans.push(Span::raw(" "));
+    title_x = title_x.saturating_add(1);
+    let models_label = if compact { "[M]" } else { "[M]Models" };
+    let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
+    let toggle_models = title_hitbox(area, title_x, models_width);
+    let models_style = if app.models_visible {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let models_shortcut_style = if app.focus.is_search() {
+        models_style
+    } else if app.models_visible {
+        models_style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled("[", models_style));
+    spans.push(Span::styled("M", models_shortcut_style));
+    spans.push(Span::styled(
+        if compact { "]" } else { "]Models" },
+        models_style,
+    ));
+    title_x = title_x.saturating_add(models_width);
 
     spans.push(Span::raw(" "));
     title_x = title_x.saturating_add(1);
@@ -3089,6 +3193,7 @@ fn task_panel_block(
         clear_search,
         enter_turns,
         toggle_turns,
+        toggle_models,
         toggle_tree,
     };
     (block, controls)
@@ -3282,6 +3387,11 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .checked_sub(offset)
         .filter(|index| *index < visible_capacity);
     let show_effort_column = table_area.width >= 72;
+    let model_column_width = if show_effort_column {
+        16
+    } else {
+        usize::from(table_area.width.saturating_sub(38).clamp(12, 17))
+    };
     let theme = app.theme;
     let rows = turns.iter().skip(offset).map(|turn| {
         let usage = turn_usage_for_scope(&app.snapshot, app.window_scope, turn);
@@ -3311,15 +3421,7 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         let tone = turn_status_tone(turn.status);
         let mut cells = Vec::new();
         let model = if turn.is_fast() {
-            Line::from(vec![
-                Span::styled(
-                    "FAST ",
-                    Style::default()
-                        .fg(theme.palette().warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(model),
-            ])
+            fast_model_line(&model, model_column_width, theme)
         } else {
             Line::from(model)
         };
@@ -3329,18 +3431,14 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             cells.push(Cell::from(message));
         } else {
             let compact_model = if turn.is_fast() {
-                Line::from(vec![
-                    Span::styled(
-                        "FAST ",
-                        Style::default()
-                            .fg(theme.palette().warning)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(
+                fast_model_line(
+                    &format!(
                         "{effort}/{}",
                         terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"))
-                    )),
-                ])
+                    ),
+                    model_column_width,
+                    theme,
+                )
             } else {
                 Line::from(format!(
                     "{effort}/{}",
@@ -3374,10 +3472,9 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         )
     } else {
         // Reserve nine message cells after borders, spacing, and numeric columns.
-        let model_width = table_area.width.saturating_sub(38).clamp(12, 17);
         (
             vec![
-                Constraint::Length(model_width),
+                Constraint::Length(u16::try_from(model_column_width).unwrap_or(u16::MAX)),
                 Constraint::Min(9),
                 Constraint::Length(9),
                 Constraint::Length(7),
@@ -3647,58 +3744,112 @@ fn format_turn_timestamp(value: Option<&chrono::DateTime<chrono::Utc>>) -> Strin
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn render_models(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &Snapshot,
-    theme: Theme,
+fn attribution_summary_lines(
+    attribution: Option<&AttributionSummary>,
     window_scope: WindowScope,
-) {
-    let analysis = window_analysis(snapshot, window_scope);
-    let attribution = attribution_for_scope(snapshot, window_scope);
-    let models = analysis
-        .map(|analysis| analysis.models.as_slice())
+    selected_partial: bool,
+    compact: bool,
+) -> Vec<String> {
+    let Some(attribution) = attribution else {
+        return vec![
+            format!(
+                "Attribution  {} reset cycle unavailable",
+                window_scope.label()
+            ),
+            "No active quota window with duration and reset time".to_string(),
+        ];
+    };
+    let window = attribution
+        .window
+        .as_ref()
+        .map(|window| {
+            format!(
+                "{} reset cycle · {:.1}% used · {} to {}",
+                terminal_safe_text(&window.label),
+                window.used_percent,
+                window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
+            )
+        })
+        .unwrap_or_else(|| format!("{} reset cycle unavailable", window_scope.label()));
+    let estimated_quota = if attribution.confidence == Confidence::Unknown {
+        "-".to_string()
+    } else {
+        format!("{:.2}pp", attribution.estimated_assigned_percent)
+    };
+    let allocation = if compact {
+        format!(
+            "Local {} · obs +{:.2}pp · est {} · unattr {:.2}pp",
+            format_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            estimated_quota,
+            attribution.unattributed_percent,
+        )
+    } else {
+        format!(
+            "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed",
+            format_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            estimated_quota,
+            attribution.unattributed_percent,
+        )
+    };
+    let mut quality = if compact {
+        format!(
+            "Coverage {:.0}% · conf {}",
+            attribution.attribution_coverage_percent,
+            confidence_label(attribution.confidence),
+        )
+    } else {
+        format!(
+            "{:.0}% coverage · {}",
+            attribution.attribution_coverage_percent,
+            confidence_label(attribution.confidence),
+        )
+    };
+    if attribution.external_activity_possible {
+        quality.push_str(if compact {
+            " · external"
+        } else {
+            " · external possible"
+        });
+    }
+    if attribution.settled {
+        quality.push_str(" · settled");
+    }
+    if selected_partial {
+        quality.push_str(" · partial");
+    }
+    vec![format!("Attribution  {window}"), allocation, quality]
+}
+
+fn wrapped_text_height(lines: &[String], width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()).max(1).div_ceil(width))
+        .sum()
+}
+
+fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let theme = app.theme;
+    let window_scope = app.window_scope;
+    let selected_analysis = window_analysis(&app.snapshot, window_scope);
+    let selected_partial = selected_analysis
+        .map(|analysis| analysis.partial)
+        .unwrap_or_else(|| window_scope == WindowScope::FiveHours && app.snapshot.partial);
+    let attribution = attribution_for_scope(&app.snapshot, window_scope).cloned();
+    let mut models = selected_analysis
+        .map(|analysis| analysis.models.clone())
         .unwrap_or_else(|| {
             if window_scope == WindowScope::FiveHours {
-                snapshot.models.as_slice()
+                app.snapshot.models.clone()
             } else {
-                &[]
+                Vec::new()
             }
         });
-    let scope = attribution
-        .and_then(|attribution| attribution.window.as_ref())
-        .map(|window| window.label.as_str());
-    if models.is_empty() {
-        let (title, message) = if let Some(scope) = scope {
-            (
-                format!("Models · {scope}"),
-                format!("No local model usage in the current {scope} window"),
-            )
-        } else if window_scope == WindowScope::FiveHours
-            && has_active_window(snapshot, WindowScope::Week.duration_mins())
-        {
-            (
-                "Models · 5h unavailable".to_string(),
-                "5h window unavailable; weekly reset-cycle data remains available".to_string(),
-            )
-        } else {
-            (
-                format!("Models · {} unavailable", window_scope.label()),
-                format!("No active {} quota window", window_scope.label()),
-            )
-        };
-        frame.render_widget(
-            Paragraph::new(message)
-                .style(Style::default().fg(theme.palette().muted))
-                .block(panel(&title, theme))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
-
-    let visible_capacity = usize::from(area.height.saturating_sub(3));
-    let mut models = models.iter().collect::<Vec<_>>();
     models.sort_by(|left, right| {
         right
             .token_usage
@@ -3706,13 +3857,80 @@ fn render_models(
             .cmp(&left.token_usage.total_tokens)
             .then_with(|| left.model.cmp(&right.model))
     });
+
+    let panel_inner = Block::default().borders(Borders::ALL).inner(area);
+    let attribution_lines = attribution_summary_lines(
+        attribution.as_ref(),
+        window_scope,
+        selected_partial,
+        panel_inner.width < 100,
+    );
+    let attribution_height = u16::try_from(wrapped_text_height(
+        &attribution_lines,
+        usize::from(panel_inner.width),
+    ))
+    .unwrap_or(u16::MAX)
+    .min(panel_inner.height);
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(attribution_height), Constraint::Min(0)])
+        .split(panel_inner);
+    let model_area = regions[1];
+    let visible_capacity = usize::from(model_area.height.saturating_sub(1));
     let visible_count = models.len().min(visible_capacity);
-    let mut title = format!("Models · {}", scope.unwrap_or("current window"));
+    let scope = attribution
+        .as_ref()
+        .and_then(|attribution| attribution.window.as_ref())
+        .map(|window| window.label.clone());
+    let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
+    if attribution.is_none() {
+        title_suffix.push_str(" unavailable");
+    }
     if visible_count < models.len() {
-        title.push_str(&format!(" · top {visible_count}/{}", models.len()));
+        title_suffix.push_str(&format!(" · top {visible_count}/{}", models.len()));
+    }
+    let (block, controls) = models_panel_block(area, app, &title_suffix);
+    app.window_controls_hitbox = Some(controls);
+    frame.render_widget(block, area);
+
+    frame.render_widget(
+        Paragraph::new(
+            attribution_lines
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(theme.palette().muted))
+        .wrap(Wrap { trim: true }),
+        regions[0],
+    );
+
+    if model_area.is_empty() {
+        return;
+    }
+    if models.is_empty() {
+        let message = if scope.is_some() {
+            format!(
+                "No local model usage in the current {} window",
+                scope.as_deref().unwrap_or(window_scope.label())
+            )
+        } else if window_scope == WindowScope::FiveHours
+            && has_active_window(&app.snapshot, WindowScope::Week.duration_mins())
+        {
+            "5h window unavailable; weekly reset-cycle data remains available".to_string()
+        } else {
+            format!("No active {} quota window", window_scope.label())
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(theme.palette().muted))
+                .wrap(Wrap { trim: true }),
+            model_area,
+        );
+        return;
     }
 
-    let rows = models.into_iter().take(visible_capacity).map(|model| {
+    let rows = models.iter().take(visible_capacity).map(|model| {
         Row::new([
             Cell::from(terminal_safe_text(&model.model)),
             Cell::from(format_tokens(model.token_usage)),
@@ -3737,9 +3955,8 @@ fn render_models(
     .header(table_header(
         ["MODEL", "TOKENS", "LOCAL SHARE", "EST. QUOTA", "CONF"],
         theme,
-    ))
-    .block(panel(&title, theme));
-    frame.render_widget(table, area);
+    ));
+    frame.render_widget(table, model_area);
 }
 
 fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
@@ -3754,79 +3971,20 @@ fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
         })
 }
 
-fn render_attribution(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let snapshot = &app.snapshot;
-    let selected_analysis = window_analysis(snapshot, app.window_scope);
-    let selected_partial = selected_analysis
-        .map(|analysis| analysis.partial)
-        .unwrap_or_else(|| app.window_scope == WindowScope::FiveHours && snapshot.partial);
-    let attribution = attribution_for_scope(snapshot, app.window_scope);
-    let (window, detail) = if let Some(attribution) = attribution {
-        let window = attribution
-            .window
-            .as_ref()
-            .map(|window| {
-                format!(
-                    "{} reset cycle · {:.1}% used · {} to {}",
-                    window.label,
-                    window.used_percent,
-                    window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                    window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
-                )
-            })
-            .unwrap_or_else(|| format!("{} reset cycle unavailable", app.window_scope.label()));
-        let estimated_quota = if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        let detail = format!(
-            "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed · {:.0}% coverage · {}{}{}{}",
-            format_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_quota,
-            attribution.unattributed_percent,
-            attribution.attribution_coverage_percent,
-            confidence_label(attribution.confidence),
-            if attribution.external_activity_possible {
-                " · external possible"
-            } else {
-                ""
-            },
-            if attribution.settled {
-                " · settled"
-            } else {
-                ""
-            },
-            if selected_partial { " · partial" } else { "" }
-        );
-        (window, detail)
-    } else {
-        (
-            format!("{} reset cycle unavailable", app.window_scope.label()),
-            "No active quota window with duration and reset time".to_string(),
-        )
-    };
-    let (block, controls) = window_attribution_block(area, app);
-    app.window_controls_hitbox = Some(controls);
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(window), Line::from(detail)])
-            .block(block)
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn window_attribution_block(area: Rect, app: &App) -> (Block<'static>, WindowControlsHitbox) {
+fn models_panel_block(
+    area: Rect,
+    app: &App,
+    suffix: &str,
+) -> (Block<'static>, WindowControlsHitbox) {
     let palette = app.theme.palette();
     let shortcuts_active = !app.focus.is_search();
     let mut spans = vec![Span::styled(
-        " Attribution",
+        " Models",
         Style::default()
             .fg(palette.title)
             .add_modifier(Modifier::BOLD),
     )];
-    let mut x = area.x.saturating_add(1 + " Attribution".len() as u16);
+    let mut x = area.x.saturating_add(1 + " Models".len() as u16);
     let mut scopes = [Rect::default(); 2];
     for scope in WindowScope::ALL {
         spans.push(Span::raw(" "));
@@ -3862,6 +4020,10 @@ fn window_attribution_block(area: Rect, app: &App) -> (Block<'static>, WindowCon
         ));
         x = x.saturating_add(width);
     }
+    spans.push(Span::styled(
+        format!(" · {}", terminal_safe_text(suffix)),
+        Style::default().fg(palette.muted),
+    ));
     (
         Block::default()
             .borders(Borders::ALL)
@@ -4251,17 +4413,16 @@ mod tests {
     }
 
     fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
+        let mut app = App::new(
+            CollectionResult {
+                snapshot: snapshot.clone(),
+                account: AccountSnapshot::default(),
+            },
+            Theme::Dark,
+        );
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| {
-                render_models(
-                    frame,
-                    frame.area(),
-                    snapshot,
-                    Theme::Dark,
-                    WindowScope::FiveHours,
-                )
-            })
+            .draw(|frame| render_models(frame, frame.area(), &mut app))
             .unwrap();
         terminal
             .backend()
@@ -4447,9 +4608,9 @@ mod tests {
             as_of: now,
         }];
 
-        let content = render_models_content(&app.snapshot, 120, 7);
+        let content = render_models_content(&app.snapshot, 120, 8);
 
-        assert!(content.contains("Models · 5h unavailable"));
+        assert!(content.contains("Models [5h] [Week] · 5h unavailable"));
         assert!(content.contains("weekly reset-cycle data remains available"));
     }
 
@@ -4465,9 +4626,9 @@ mod tests {
             used_percent: 0.0,
         });
 
-        let content = render_models_content(&app.snapshot, 100, 4);
+        let content = render_models_content(&app.snapshot, 100, 8);
 
-        assert!(content.contains("Models · 5h"));
+        assert!(content.contains("Models [5h] [Week] · 5h"));
         assert!(content.contains("No local model usage in the current 5h window"));
         assert!(!content.contains("5h unavailable"));
     }
@@ -4489,18 +4650,35 @@ mod tests {
             model_usage("medium-model", 100),
         ];
 
-        let compact = render_models_content(&app.snapshot, 100, 4);
-        assert!(compact.contains("Models · 5h · top 1/3"));
+        let compact = render_models_content(&app.snapshot, 100, 7);
+        assert!(compact.contains("Models [5h] [Week] · 5h · top 1/3"));
         assert!(compact.contains("largest-model"));
         assert!(!compact.contains("small-model"));
         assert!(!compact.contains("medium-model"));
 
-        let expanded = render_models_content(&app.snapshot, 100, 7);
+        let expanded = render_models_content(&app.snapshot, 100, 10);
         let largest = expanded.find("largest-model").unwrap();
         let medium = expanded.find("medium-model").unwrap();
         let small = expanded.find("small-model").unwrap();
         assert!(largest < medium && medium < small);
         assert!(!expanded.contains("top 3/3"));
+    }
+
+    #[test]
+    fn models_panel_keeps_attribution_quality_visible_at_eighty_columns() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
+        app.snapshot.window_analyses[0].partial = true;
+
+        let content = render_models_content(&app.snapshot, 80, 8);
+
+        assert!(content.contains("obs +1.00pp"));
+        assert!(content.contains("unattr 22.00pp"));
+        assert!(content.contains("Coverage 4%"));
+        assert!(content.contains("conf medium"));
+        assert!(content.contains("external"));
+        assert!(content.contains("settled"));
+        assert!(content.contains("partial"));
     }
 
     #[test]
@@ -4732,6 +4910,158 @@ mod tests {
         let flat = app.filtered_task_rows();
         assert_eq!(flat[0].depth, 0);
         assert!(task_display_label(&app.snapshot.tasks[0], false).contains("project |"));
+    }
+
+    #[test]
+    fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
+        let mut app = interaction_test_app(3, 1);
+        set_task_parent(&mut app, 0, 2);
+        set_task_parent(&mut app, 1, 0);
+        let totals = [
+            TokenUsage {
+                input_tokens: 11,
+                cached_input_tokens: 2,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+                total_tokens: 20,
+            },
+            TokenUsage {
+                input_tokens: 13,
+                cached_input_tokens: 3,
+                output_tokens: 10,
+                reasoning_output_tokens: 4,
+                total_tokens: 30,
+            },
+            TokenUsage {
+                input_tokens: 4,
+                cached_input_tokens: 1,
+                output_tokens: 4,
+                reasoning_output_tokens: 1,
+                total_tokens: 10,
+            },
+        ];
+        let five_hour_totals = [2, 3, 1];
+        let shares = [20.0, 30.0, 10.0];
+        let quotas = [0.2, 0.3, 0.1];
+        let confidences = [Confidence::High, Confidence::Unknown, Confidence::Medium];
+        for index in 0..3 {
+            let task = &mut app.snapshot.tasks[index];
+            task.token_usage = totals[index];
+            task.window_token_usage = TokenUsage {
+                input_tokens: u64::from(index != 0) + 1,
+                total_tokens: five_hour_totals[index],
+                ..TokenUsage::default()
+            };
+            task.local_token_share_percent = shares[index];
+            task.estimated_quota_percent = quotas[index];
+            task.quota_confidence = confidences[index];
+        }
+        let weekly_usages = [
+            WindowUsage {
+                token_usage: TokenUsage {
+                    total_tokens: 200,
+                    ..TokenUsage::default()
+                },
+                local_token_share_percent: 20.0,
+                estimated_quota_percent: 2.0,
+                quota_confidence: Confidence::High,
+            },
+            WindowUsage {
+                token_usage: TokenUsage {
+                    total_tokens: 300,
+                    ..TokenUsage::default()
+                },
+                local_token_share_percent: 30.0,
+                estimated_quota_percent: 3.0,
+                quota_confidence: Confidence::Low,
+            },
+            WindowUsage {
+                token_usage: TokenUsage {
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
+                local_token_share_percent: 10.0,
+                estimated_quota_percent: 1.0,
+                quota_confidence: Confidence::Medium,
+            },
+        ];
+        app.snapshot.window_analyses.push(WindowAnalysis {
+            duration_mins: WindowScope::Week.duration_mins(),
+            attribution: AttributionSummary::default(),
+            partial: false,
+            partial_reasons: Vec::new(),
+            threads: app
+                .snapshot
+                .tasks
+                .iter()
+                .zip(weekly_usages)
+                .map(|(task, usage)| ThreadWindowUsage {
+                    thread_id: task.thread_id.clone(),
+                    usage,
+                })
+                .collect(),
+            turns: Vec::new(),
+            models: Vec::new(),
+        });
+
+        app.task_list_mode = TaskListMode::Tree;
+        app.selected_task = 2;
+        assert!(app.set_task_collapsed(2, true));
+        let rows = app.filtered_task_rows();
+        let root = rows.iter().find(|row| row.index == 2).unwrap();
+        assert_eq!(root.hidden_descendants, vec![0, 1]);
+
+        let all_time = aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, root, false);
+        assert_eq!(all_time.token_usage.total_tokens, 60);
+        assert_eq!(all_time.token_usage.input_tokens, 28);
+        assert_eq!(all_time.token_usage.cached_input_tokens, 6);
+        assert_eq!(all_time.token_usage.output_tokens, 19);
+        assert_eq!(all_time.token_usage.reasoning_output_tokens, 7);
+
+        let five_hours =
+            aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, root, true);
+        assert_eq!(five_hours.token_usage.total_tokens, 6);
+        assert_eq!(five_hours.local_token_share_percent, 60.0);
+        assert!((five_hours.estimated_quota_percent - 0.6).abs() < f64::EPSILON);
+        assert_eq!(five_hours.quota_confidence, Confidence::Unknown);
+
+        let week = aggregate_task_row_usage(&app.snapshot, WindowScope::Week, root, true);
+        assert_eq!(week.token_usage.total_tokens, 600);
+        assert_eq!(week.local_token_share_percent, 60.0);
+        assert_eq!(week.estimated_quota_percent, 6.0);
+        assert_eq!(week.quota_confidence, Confidence::Low);
+
+        assert!(app.set_task_collapsed(2, false));
+        assert!(app.set_task_collapsed(0, true));
+        let rows = app.filtered_task_rows();
+        let root = rows.iter().find(|row| row.index == 2).unwrap();
+        let child = rows.iter().find(|row| row.index == 0).unwrap();
+        assert!(root.hidden_descendants.is_empty());
+        assert_eq!(child.hidden_descendants, vec![1]);
+        assert_eq!(
+            aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, child, true,)
+                .token_usage
+                .total_tokens,
+            5
+        );
+
+        app.task_search = "task 2".to_string();
+        let filtered_root = app.filtered_task_rows().pop().unwrap();
+        assert!(filtered_root.hidden_descendants.is_empty());
+        assert_eq!(
+            aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, &filtered_root, true,)
+                .token_usage
+                .total_tokens,
+            1
+        );
+
+        app.task_search.clear();
+        app.task_list_mode = TaskListMode::Flat;
+        assert!(
+            app.filtered_task_rows()
+                .iter()
+                .all(|row| row.hidden_descendants.is_empty())
+        );
     }
 
     #[test]
@@ -5011,7 +5341,8 @@ mod tests {
             let controls = app.task_controls_hitbox.unwrap();
             let initial = controls.toggle_tree;
             assert_eq!(initial.width, expected_width);
-            assert!(controls.toggle_turns.right() <= initial.x);
+            assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
+            assert!(controls.toggle_models.right() <= initial.x);
             assert!(initial.right() <= controls.sources[0].x);
             assert_eq!(
                 terminal.backend().buffer()[(initial.x + 1, initial.y)].symbol(),
@@ -5294,7 +5625,7 @@ mod tests {
         let mut app = interaction_test_app(3, 2);
         add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
         add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
-        app.view = View::Window;
+        app.view = View::Overview;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5353,10 +5684,92 @@ mod tests {
     }
 
     #[test]
+    fn models_panel_visibility_uses_keyboard_mouse_and_search_priority() {
+        let mut app = interaction_test_app(3, 2);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
+        add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let visible_capacity = app.task_table_hitbox.unwrap().capacity;
+        let controls = app.task_controls_hitbox.unwrap();
+        let model_button = controls.toggle_models;
+        let shortcut = &terminal.backend().buffer()[(model_button.x + 1, model_button.y)];
+        assert_eq!(shortcut.symbol(), "M");
+        assert!(shortcut.modifier.contains(Modifier::UNDERLINED));
+        assert!(app.window_controls_hitbox.is_some());
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('M')));
+        assert!(!app.models_visible);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hidden_button = app.task_controls_hitbox.unwrap().toggle_models;
+        assert_eq!(hidden_button, model_button);
+        let hidden_shortcut = &terminal.backend().buffer()[(hidden_button.x + 1, hidden_button.y)];
+        assert_eq!(hidden_shortcut.fg, app.theme.palette().accent);
+        assert!(hidden_shortcut.modifier.contains(Modifier::BOLD));
+        assert!(!hidden_shortcut.modifier.contains(Modifier::UNDERLINED));
+        assert!(app.window_controls_hitbox.is_none());
+        assert!(app.task_table_hitbox.unwrap().capacity > visible_capacity);
+        let hidden = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!hidden.contains("Attribution"));
+        assert!(!hidden.contains("gpt-window"));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('W')));
+        assert_eq!(app.window_scope, WindowScope::Week);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let model_button = app.task_controls_hitbox.unwrap().toggle_models;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                model_button.right() - 1,
+                model_button.y,
+            ),
+        ));
+        assert!(app.models_visible);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.window_controls_hitbox.is_some());
+        let visible_week_button = app.task_controls_hitbox.unwrap().toggle_models;
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Attribution"));
+
+        app.begin_task_search();
+        handle_key_event(&mut app, key_event(KeyCode::Char('m')));
+        assert_eq!(app.task_search, "m");
+        assert!(app.models_visible);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let searching = app.task_controls_hitbox.unwrap().toggle_models;
+        let searching_shortcut = &terminal.backend().buffer()[(searching.x + 1, searching.y)];
+        let searching_bracket = &terminal.backend().buffer()[(searching.x, searching.y)];
+        assert_eq!(searching, visible_week_button);
+        assert_eq!(searching_shortcut.fg, searching_bracket.fg);
+        assert_eq!(searching_shortcut.bg, searching_bracket.bg);
+        assert_eq!(searching_shortcut.modifier, searching_bracket.modifier);
+        assert!(!searching_shortcut.modifier.contains(Modifier::UNDERLINED));
+        app.cancel_task_search();
+
+        app.set_view(View::Health);
+        handle_key_event(&mut app, key_event(KeyCode::Char('M')));
+        assert!(app.models_visible);
+    }
+
+    #[test]
     fn missing_selected_reset_cycle_is_explicitly_unavailable() {
         let mut app = interaction_test_app(1, 1);
         add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
-        app.view = View::Window;
+        app.view = View::Overview;
         app.window_scope = WindowScope::Week;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
 
@@ -5369,7 +5782,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Week reset cycle unavailable"));
-        assert!(content.contains("Models · Week unavailable"));
+        assert!(content.contains("Models [5h] [Week] · Week unavailable"));
         assert!(!content.contains("No local model usage in the current Week window"));
     }
 
@@ -5403,7 +5816,7 @@ mod tests {
             model.quota_confidence = Confidence::Unknown;
         }
         app.snapshot.partial = true;
-        app.view = View::Window;
+        app.view = View::Overview;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5509,7 +5922,7 @@ mod tests {
         for scope in WindowScope::ALL {
             for query in ["", "task"] {
                 let mut app = interaction_test_app(8, 2);
-                app.view = View::Window;
+                app.view = View::Overview;
                 app.window_scope = scope;
                 app.task_search = query.to_string();
                 app.task_search_before_edit = app.task_search.clone();
@@ -5519,7 +5932,9 @@ mod tests {
 
                 let controls = app.task_controls_hitbox.unwrap();
                 assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-                assert!(controls.toggle_turns.right() <= controls.sources[0].x);
+                assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
+                assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
+                assert!(controls.toggle_tree.right() <= controls.sources[0].x);
                 for pair in controls.sources.windows(2) {
                     assert!(pair[0].right() <= pair[1].x);
                 }
@@ -5873,9 +6288,13 @@ mod tests {
         let controls = app.task_controls_hitbox.unwrap();
         assert!(!controls.enter_turns.is_empty());
         assert!(!controls.toggle_turns.is_empty());
+        assert!(!controls.toggle_models.is_empty());
+        assert!(!controls.toggle_tree.is_empty());
         assert!(!controls.search.is_empty());
         assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-        assert!(controls.toggle_turns.right() <= controls.sources[0].x);
+        assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
+        assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
+        assert!(controls.toggle_tree.right() <= controls.sources[0].x);
         for pair in controls.sources.windows(2) {
             assert!(pair[0].right() <= pair[1].x);
         }
@@ -5890,7 +6309,30 @@ mod tests {
             buffer[(controls.toggle_turns.x + 1, controls.toggle_turns.y)].symbol(),
             "V"
         );
+        assert_eq!(
+            buffer[(controls.toggle_models.x + 1, controls.toggle_models.y)].symbol(),
+            "M"
+        );
+        assert_eq!(
+            buffer[(controls.toggle_tree.x + 1, controls.toggle_tree.y)].symbol(),
+            "R"
+        );
         assert_eq!(buffer[(controls.search.x, controls.search.y)].symbol(), "F");
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                controls.toggle_models.right() - 1,
+                controls.toggle_models.y,
+            ),
+        ));
+        assert!(!app.models_visible);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.task_controls_hitbox.unwrap().toggle_models,
+            controls.toggle_models
+        );
     }
 
     #[test]
@@ -5903,14 +6345,15 @@ mod tests {
         assert!(!app.turns_temporarily_visible);
 
         app.focus_turns();
-        app.set_view(View::Window);
-        assert_eq!(app.focus, Focus::Tasks);
-        assert!(!app.turns_temporarily_visible);
-
-        app.focus_turns();
         app.set_view(View::Health);
         assert_eq!(app.focus, Focus::Tasks);
         assert!(!app.turns_temporarily_visible);
+
+        app.set_view(View::Overview);
+        app.focus_turns();
+        app.set_view(View::Overview);
+        assert_eq!(app.focus, Focus::Turns);
+        assert!(app.turns_temporarily_visible);
     }
 
     #[test]
@@ -5990,6 +6433,54 @@ mod tests {
         assert!(fast.contains("FAST"));
         assert!(fast.contains("model-0"));
         assert!(fast.contains("model-1"));
+        let turn_hitbox = app.turn_table_hitbox.unwrap();
+        let fast_row_y = turn_hitbox.rows.y + u16::try_from(1 - turn_hitbox.offset).unwrap();
+        let fast_row = (turn_hitbox.rows.x..turn_hitbox.rows.right())
+            .map(|x| terminal.backend().buffer()[(x, fast_row_y)].symbol())
+            .collect::<String>();
+        assert!(fast_row.contains("model-1 FAST"));
+        assert!(!fast_row.contains("FAST model-1"));
+
+        let mut compact_terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        app.turn_reveal_pending = true;
+        compact_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let compact_hitbox = app.turn_table_hitbox.unwrap();
+        let compact_fast_row_y =
+            compact_hitbox.rows.y + u16::try_from(1 - compact_hitbox.offset).unwrap();
+        let compact_fast_row = (compact_hitbox.rows.x..compact_hitbox.rows.right())
+            .map(|x| compact_terminal.backend().buffer()[(x, compact_fast_row_y)].symbol())
+            .collect::<String>();
+        assert!(
+            compact_fast_row.contains("high/model-1 FAST"),
+            "compact row was {compact_fast_row:?}"
+        );
+
+        app.snapshot.turns[1].model = Some("gpt-5.6-codex-super-long".to_string());
+        app.turn_reveal_pending = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let wide_hitbox = app.turn_table_hitbox.unwrap();
+        let wide_row_y = wide_hitbox.rows.y + u16::try_from(1 - wide_hitbox.offset).unwrap();
+        let wide_row = (wide_hitbox.rows.x..wide_hitbox.rows.right())
+            .map(|x| terminal.backend().buffer()[(x, wide_row_y)].symbol())
+            .collect::<String>();
+        assert!(wide_row.contains("… FAST"), "wide row was {wide_row:?}");
+
+        app.turn_reveal_pending = true;
+        compact_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let compact_hitbox = app.turn_table_hitbox.unwrap();
+        let compact_row_y =
+            compact_hitbox.rows.y + u16::try_from(1 - compact_hitbox.offset).unwrap();
+        let compact_row = (compact_hitbox.rows.x..compact_hitbox.rows.right())
+            .map(|x| compact_terminal.backend().buffer()[(x, compact_row_y)].symbol())
+            .collect::<String>();
+        assert!(
+            compact_row.contains("… FAST"),
+            "compact long-model row was {compact_row:?}"
+        );
     }
 
     #[test]
@@ -6443,8 +6934,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let tabs = app.view_tabs_hitbox.expect("view tabs should render");
         assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 12, 1));
-        assert_eq!(tabs.tabs[View::Window.index()], Rect::new(15, 0, 10, 1));
-        assert_eq!(tabs.tabs[View::Health.index()], Rect::new(28, 0, 15, 1));
+        assert_eq!(tabs.tabs[View::Health.index()], Rect::new(15, 0, 15, 1));
 
         let divider = tabs.tabs[View::Overview.index()].right();
         assert!(!handle_mouse_event(
@@ -6456,17 +6946,10 @@ mod tests {
             &mut app,
             mouse_event(
                 MouseEventKind::Down(MouseButton::Right),
-                tabs.tabs[View::Window.index()].x,
+                tabs.tabs[View::Health.index()].x,
                 0,
             ),
         ));
-
-        let window = tabs.tabs[View::Window.index()];
-        assert!(handle_mouse_event(
-            &mut app,
-            mouse_event(MouseEventKind::Down(MouseButton::Left), window.x, window.y),
-        ));
-        assert_eq!(app.view, View::Window);
 
         handle_key_event(&mut app, key_event(KeyCode::Char('/')));
         handle_key_event(&mut app, key_event(KeyCode::Char('q')));
@@ -6554,7 +7037,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         app.select_last_task();
         assert!(app.task_reveal_pending);
-        app.view = View::Window;
+        app.view = View::Overview;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let window = app.task_table_hitbox.expect("task rows should be visible");
         assert_eq!(app.selected_task, 49);
@@ -6861,41 +7344,38 @@ mod tests {
     }
 
     #[test]
-    fn turn_click_maps_scrolled_rows_across_views_and_sizes() {
+    fn turn_click_maps_scrolled_rows_across_sizes() {
         for (width, height) in [(80, 24), (100, 30), (120, 40)] {
-            for view in [View::Overview, View::Window] {
-                let mut app = interaction_test_app(1, 30);
-                app.view = view;
-                app.turn_offset = 10;
-                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                terminal.draw(|frame| render(frame, &mut app)).unwrap();
-                let hitbox = app.turn_table_hitbox.expect("turn rows should be visible");
-                assert!(hitbox.offset > 0);
-                let relative = usize::from(hitbox.rows.height > 1);
-                let target = hitbox.offset + relative;
+            let mut app = interaction_test_app(1, 30);
+            app.turn_offset = 10;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let hitbox = app.turn_table_hitbox.expect("turn rows should be visible");
+            assert!(hitbox.offset > 0);
+            let relative = usize::from(hitbox.rows.height > 1);
+            let target = hitbox.offset + relative;
 
-                assert!(handle_mouse_event(
-                    &mut app,
-                    mouse_event(
-                        MouseEventKind::Down(MouseButton::Left),
-                        hitbox.rows.x,
-                        hitbox.rows.y + relative as u16,
-                    ),
-                ));
-                assert_eq!(app.selected_turn, target);
-                assert_eq!(app.turn_offset, hitbox.offset);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    hitbox.rows.x,
+                    hitbox.rows.y + relative as u16,
+                ),
+            ));
+            assert_eq!(app.selected_turn, target);
+            assert_eq!(app.turn_offset, hitbox.offset);
 
-                terminal.draw(|frame| render(frame, &mut app)).unwrap();
-                let content = terminal
-                    .backend()
-                    .buffer()
-                    .content()
-                    .iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>();
-                assert!(content.contains("Turn detail"));
-                assert!(content.contains(&format!("{}/30", target + 1)));
-            }
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Turn detail"));
+            assert!(content.contains(&format!("{}/30", target + 1)));
         }
     }
 
@@ -6963,46 +7443,43 @@ mod tests {
     #[test]
     fn task_click_uses_rendered_scroll_offset_without_jumping() {
         for (width, height) in [(80, 24), (100, 30), (120, 40)] {
-            for view in [View::Overview, View::Window] {
-                let mut app = mouse_test_app(50);
-                app.view = view;
-                app.selected_task = 40;
-                app.task_table_offset = 35;
-                app.turn_offset = 5;
-                let backend = TestBackend::new(width, height);
-                let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = mouse_test_app(50);
+            app.selected_task = 40;
+            app.task_table_offset = 35;
+            app.turn_offset = 5;
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
 
-                terminal.draw(|frame| render(frame, &mut app)).unwrap();
-                let hitbox = app.task_table_hitbox.expect("task rows should be visible");
-                assert!(hitbox.offset > 0, "expected a scrolled table in {view:?}");
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let hitbox = app.task_table_hitbox.expect("task rows should be visible");
+            assert!(hitbox.offset > 0, "expected a scrolled task table");
 
-                let target = hitbox.offset;
-                assert_ne!(target, app.selected_task);
-                assert!(handle_mouse_event(
-                    &mut app,
-                    mouse_event(
-                        MouseEventKind::Down(MouseButton::Left),
-                        hitbox.rows.x,
-                        hitbox.rows.y,
-                    ),
-                ));
-                assert_eq!(app.selected_task, target);
-                assert_eq!(app.turn_offset, 0);
+            let target = hitbox.offset;
+            assert_ne!(target, app.selected_task);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    hitbox.rows.x,
+                    hitbox.rows.y,
+                ),
+            ));
+            assert_eq!(app.selected_task, target);
+            assert_eq!(app.turn_offset, 0);
 
-                terminal.draw(|frame| render(frame, &mut app)).unwrap();
-                let rerendered = app
-                    .task_table_hitbox
-                    .expect("task rows should remain visible");
-                assert_eq!(rerendered.offset, hitbox.offset);
-                assert_eq!(app.task_table_offset, hitbox.offset);
-            }
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let rerendered = app
+                .task_table_hitbox
+                .expect("task rows should remain visible");
+            assert_eq!(rerendered.offset, hitbox.offset);
+            assert_eq!(app.task_table_offset, hitbox.offset);
         }
     }
 
     #[test]
-    fn task_scroll_offset_refills_rows_after_resize_and_view_change() {
+    fn task_scroll_offset_refills_rows_after_resize_and_models_visibility_change() {
         let mut app = mouse_test_app(50);
-        app.view = View::Window;
+        app.view = View::Overview;
         app.selected_task = 40;
         app.task_table_offset = 39;
 
@@ -7015,16 +7492,16 @@ mod tests {
         let mut wide = Terminal::new(TestBackend::new(120, 40)).unwrap();
         wide.draw(|frame| render(frame, &mut app)).unwrap();
         let wide_hitbox = app.task_table_hitbox.expect("task rows should be visible");
-        assert_eq!(wide_hitbox.rows.height, 19);
+        assert_eq!(wide_hitbox.rows.height, 21);
         assert!(wide_hitbox.offset <= 31);
         assert!(app.selected_task >= wide_hitbox.offset);
         assert!(app.selected_task < wide_hitbox.offset + usize::from(wide_hitbox.rows.height));
 
-        app.view = View::Overview;
+        app.toggle_models_visibility();
         wide.draw(|frame| render(frame, &mut app)).unwrap();
         let overview_hitbox = app.task_table_hitbox.expect("task rows should be visible");
-        assert_eq!(overview_hitbox.rows.height, 24);
-        assert!(overview_hitbox.offset <= 26);
+        assert_eq!(overview_hitbox.rows.height, 31);
+        assert!(overview_hitbox.offset <= 19);
         assert!(app.selected_task >= overview_hitbox.offset);
         assert!(
             app.selected_task < overview_hitbox.offset + usize::from(overview_hitbox.rows.height)
@@ -7200,7 +7677,7 @@ mod tests {
                 let backend = TestBackend::new(width, height);
                 let mut terminal = Terminal::new(backend).unwrap();
 
-                for view in [View::Overview, View::Window, View::Health] {
+                for view in View::ALL {
                     app.view = view;
                     terminal.draw(|frame| render(frame, &mut app)).unwrap();
                     let buffer = terminal.backend().buffer();

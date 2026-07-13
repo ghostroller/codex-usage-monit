@@ -37,7 +37,7 @@ src/
   snapshot.rs    来源融合、partial 与账户快照历史
   domain.rs      统一 schema/provenance/confidence
   output.rs      text/JSON section 输出
-  tui.rs         Overview/Window/Data Health、筛选与焦点交互
+  tui.rs         Overview/Data Health、筛选与焦点交互
   cli.rs         参数、子命令与退出码
 ```
 
@@ -99,19 +99,21 @@ turn/model metadata
 
 用户消息有显式 `turn_id` 时直接归属对应 turn；缺失时只归入 `active_turn_stack` 顶部，没有 active turn 时不猜测归属。每个 turn 只保留首条摘要；`--redact-content` 在规范化阶段同时丢弃 task 标题与 turn 消息摘要。
 
-Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最后回退到 rollout `source`。Turn 的 reasoning effort 从 `turn_context` 保留到 JSON、text 和 TUI；窄 TUI 面板将 effort 前置合并到 model 单元格。
+Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最后回退到 rollout `source`。Turn 的 reasoning effort 从 `turn_context` 保留到 JSON、text 和 TUI；窄 TUI 面板将 effort 前置合并到 model 单元格，Fast 标识始终追加在模型名称后。
 
 Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Turns 底部渲染统一图例，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
 
-Window 页维护独立 `WindowScope`，用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换。Tasks、Turns、Models、Attribution 和 turn detail 必须从同一 scope 的 `windowAnalyses` 读取，标题和列名不得硬编码成 5h。切换 scope 保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
+Overview 维护独立 `WindowScope`，在 Models 标题中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope 的 `windowAnalyses` 读取，标题和列名不得硬编码成 5h。切换 scope 保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
 
 TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
 
 Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；Recent tasks 偏移为 `0` 时保持顶部锚定，使刷新插入的最新 task 立即可见，非零偏移才按刷新前的首行 `thread_id` 锚定阅读位置。对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。可执行焦点跳转时，Tasks/Turns 标题分别显示 `↵` / `←`；Tasks 标题始终预留固定提示宽度，避免筛选控件随焦点切换位移。可见按钮把真实快捷键拆为独立 accent/bold span，标签整体继续共享同一鼠标 hitbox；Tasks/Turns 右边框由共享几何函数绘制比例滚动条，Down/Drag/Up 状态只更新对应 viewport offset，轨道点击、滚轮与数据行选择保持独立。
 
-Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投影；模型、推理强度、消息、状态、turn ID 与 Fast 标识共享同一匹配入口。`V` 控制默认显隐，默认隐藏时 `Enter` / 可点击 `↵` 只设置临时可见状态，`Backspace` / 可点击 `←` 返回 Tasks 并清除该状态。Fast 来自 `thread_settings_applied` 的 `service_tier`，在 turn 激活时快照，避免之后的设置变化回写历史 turn。
+Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投影；模型、推理强度、消息、状态、turn ID 与 Fast 标识共享同一匹配入口。`V` 控制默认显隐，默认隐藏时 `Enter` / 可点击 `↵` 只设置临时可见状态，`Backspace` / 可点击 `←` 返回 Tasks 并清除该状态。Fast 来自 `thread_settings_applied` 的 `service_tier`，在 turn 激活时快照，避免之后的设置变化回写历史 turn；渲染时追加在模型名称后，普通 turn 不占用额外前缀。
 
-Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时跳过后代，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
+Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时记录并跳过完整后代集合，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。渲染折叠父行时，用父节点及隐藏后代对 `TokenUsage` 分量、当前 scope local share 和 estimated quota 求和，quota confidence 对非零贡献取最保守等级；展开行与 `Snapshot` 原始实体保持不变。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
+
+Models 默认可见，`M` 与 Tasks 标题中的可点击 `[M]Models` 共同切换显隐；隐藏时主 Tasks/Turns 布局接管释放的高度，恢复入口仍留在 Tasks 标题。Models 使用单一外框：标题先放稳定位置的 `[5h]` / `[Week]`，内容先渲染当前 scope attribution 摘要，再渲染无嵌套边框的模型表；即使模型为空，scope 控件和 unavailable/归因信息仍然存在。
 
 TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
 
@@ -146,7 +148,7 @@ Estimated 部分：
 - worker 复用 `Arc<Mutex<RolloutCache>>` 与最近 AccountSnapshot；
 - UI thread 只绘制 immutable Snapshot 并处理键盘和鼠标事件。
 - 查询、来源筛选和焦点属于 UI 生命周期状态，worker 替换 Snapshot 时不得清空它们。
-- Window scope 也属于 UI 生命周期状态；worker 刷新不得擅自从 Week 切回 5h，只有当前 scope 消失时才显示 unavailable。
+- Overview scope 与 Models 显隐都属于 UI 生命周期状态；worker 刷新不得擅自从 Week 切回 5h 或重新显示隐藏面板，当前 scope 消失时只显示 unavailable。
 
 ## 8. 测试
 
@@ -155,18 +157,18 @@ Estimated 部分：
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、同 duration 多桶 Codex/Server 优先与 warning、gauge-only 候选、server/local mismatch、correction epoch、long gap、settled，以及 `--days` 覆盖不足的 per-window partial；
 - output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、旧 5h 字段投影兼容、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、真实快捷键字符样式与直达键、顶层视图 tab 点击、`[5h]` / `[Week]` 的 `5` / `W` 与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/Attribution、scope 不可用、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、`[5h]` / `[Week]` 的 `5` / `W` 与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、`M` / `[M]Models` 显隐与布局回收、scope 不可用、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 
 - Phase 0：能力边界与估算口径；
 - Phase 1：rollout parser 与一次性输出；
 - Phase 2：App Server 额度和账户用量；
-- Phase 3：TUI 三视图；
+- Phase 3：TUI 基础视图（当前收敛为 Overview 与 Data Health）；
 - Phase 4：状态 provenance 与 stale 降级；
 - Phase 5：保守额度估算与来源校准；
 - Phase 6：真实 subagent 兼容、缓存、partial 和审查修复。
 - Phase 7：Recent tasks 标题/source 筛选与 Tasks/Turns 统一键鼠焦点。
-- Phase 8：5h/Week 多窗口分析、Window scope 切换、`windows` 输出与旧 5h schema 兼容。
+- Phase 8：5h/Week 多窗口分析、Overview scope 切换、`windows` 输出与旧 5h schema 兼容。
 
 后续路线见需求文档第 7 节。

@@ -73,12 +73,13 @@ codex-usage-monit attribution --format text
 
 ## TUI 操作
 
-- `1` / `2` / `3`：Overview、Window、Data Health；
-- Window 页使用 `5` / `W` 在 `[5h]` 与 `[Week]` 间切换；两个按钮也可用鼠标左键点击，Tasks、Turns、Models 和 Attribution 同步使用所选 scope；
+- `1` / `2`：Overview、Data Health；
+- Overview 的 Models 标题使用 `5` / `W` 在 `[5h]` 与 `[Week]` 间切换；两个按钮也可用鼠标左键点击，Tasks、Turns、Models 及其中的归因摘要同步使用所选 reset cycle；
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
 - `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；标题中的 `↵` / `←` 也可用鼠标点击；
 - `V`：切换 Turns 的默认显隐。默认隐藏时，`Enter` / `↵` 会临时展开 Turns，`Backspace` / `←` 返回 Tasks 时自动收起；
+- `M`：切换 Models 面板显隐；Tasks 标题中的 `[M]Models` 也可用鼠标点击；
 - `R`：在 Recent tasks 的 Flat 与 Tree 视图间切换；标题中的 `[R]Tree` 也可用鼠标点击。Tree 中选中拥有子节点的 task 后，`-` 收起、`+` 展开；行内固定宽度的 `[-]` / `[+]` 也可直接点击；
 - `/` / `F`：编辑当前焦点面板自己的 Filter；Tasks 与 Turns 的查询相互独立，`Delete` 清空当前面板查询；
 - Filter 输入时可用左右方向键、`Home` / `End` 移动光标，`Backspace` / `Delete` 编辑，`Enter` / `Tab` 确认，`Esc` 取消本次编辑；
@@ -92,7 +93,7 @@ codex-usage-monit attribution --format text
 
 本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
-Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 默认保持 Flat 排序；Tree 模式把已知直接父会话且父节点也在当前过滤结果中的 subagent 递归缩进到父节点下，缺失或被过滤的父节点不会被强行补回。拥有子节点的行显示可点击的 `[-]` / `[+]`，并可在 Tasks 焦点下用 `-` / `+` 收起或展开；折叠状态跨数据刷新保留。挂在父节点下的 child 省略重复项目名，作为 orphan root 显示时仍保留项目名。树根和同层分支由最近活动的后代带动排序，因此新活动的 subagent 仍会把整组带到顶部。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；两处非空筛选右侧的 `×` 均可用鼠标清空。Codex 标记为 Fast 的 turn 会额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Window 页的 Models 面板按所选 5h/Week scope 的 token 从高到低显示；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充。
+Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 默认保持 Flat 排序；Tree 模式把已知直接父会话且父节点也在当前过滤结果中的 subagent 递归缩进到父节点下，缺失或被过滤的父节点不会被强行补回。拥有子节点的行显示可点击的 `[-]` / `[+]`，并可在 Tasks 焦点下用 `-` / `+` 收起或展开；折叠状态跨数据刷新保留。节点收起时，父行会汇总当前过滤树中所有被隐藏后代的 token、local share 与 estimated quota，展开后各行恢复独立显示，避免折叠视图低估该分支。挂在父节点下的 child 省略重复项目名，作为 orphan root 显示时仍保留项目名。树根和同层分支由最近活动的后代带动排序，因此新活动的 subagent 仍会把整组带到顶部。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；两处非空筛选右侧的 `×` 均可用鼠标清空。Codex 标记为 Fast 的 turn 会在模型名称后额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Overview 的 Models 面板把所选 5h/Week scope 的 observed、estimated、unattributed、coverage 与 confidence 归因摘要和按 token 降序的模型表放在一起；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充；面板隐藏后仍可从 Tasks 标题恢复。
 
 若服务端同时返回多个相同 duration 的当前额度桶，工具优先选择 Codex 产品桶和服务端来源数据作为周期边界，并输出歧义 warning；其余同 duration 桶仍只显示 gauge。由于本地调用没有 limit id，此时只能保留该 duration 的通用本地 token 构成，必须禁用 task/turn/model 的桶级 estimated quota，不能把调用强行归给所选桶。`windowAnalyses` 会在每个 scope 上分别给出 `partial` 和 `partialReasons`，所以 Week 扫描不完整不会污染完整的 5h 标记。
 

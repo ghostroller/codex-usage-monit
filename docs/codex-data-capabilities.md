@@ -100,9 +100,9 @@ Rollout JSONL 中可利用以下事件重建历史：
 - `task_complete`：完成时间和耗时；
 - `turn_aborted`：中断原因和时间。
 
-近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
+近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。`thread_settings_applied.thread_settings.service_tier=priority` 可以为下一次激活的 turn 提供 Fast 标识，TUI 把 `FAST` 放在模型名称后，普通 turn 不显示。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
 
-subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。
+subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。Tree 模式收起父节点时，父行会在渲染层汇总当前过滤树内隐藏后代的 token、所选 reset cycle local share 与 estimated quota；它不改变底层 task/turn 归属，也不会影响一次性输出。
 
 工具最多保留每个 turn 首条用户消息的 72 字符摘要。有显式 `turn_id` 时直接归属；没有时只归入当前 active turn，若当前没有 active turn，则不猜测归属。部分 subagent turn 没有明文 `user_message`，摘要显示 `-`，不会从注入上下文反推。
 
@@ -164,9 +164,9 @@ turn_tokens / window_tokens * current_used_percent
 
 ## 多窗口输出与交互
 
-TUI Window 页提供 `[5h]` / `[Week]` scope，分别由 `5` / `W` 或鼠标左键选择。Tasks、选中 task 的 Turns、Models 和 Attribution 必须在一次切换中使用同一个 scope；不可用的 scope 显示 unavailable，不能借用另一时长的数据。
+TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 的 Models 标题提供 `[5h]` / `[Week]` scope，分别由 `5` / `W` 或鼠标左键选择；Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长的数据。Models 可由 `M` 或 Tasks 标题中的 `[M]Models` 隐藏和恢复，归因信息不再占用独立 TUI 面板。
 
-一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义；新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。
+一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。
 
 ## 状态可信度
 
