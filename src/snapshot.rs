@@ -1,11 +1,13 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::app_server::fetch_account_snapshot;
-use crate::attribution::analyze_current_window;
+use crate::attribution::{
+    active_bucket_ids_for_duration, analyze_windows, project_five_hour_analysis,
+};
 use crate::config::CollectConfig;
 use crate::domain::{
-    AccountSnapshot, LimitBucket, LimitWindow, Provenance, RateObservation, RolloutDataset,
-    Snapshot, SourceStatus,
+    AccountSnapshot, Confidence, LimitBucket, LimitWindow, Provenance, RateObservation,
+    RolloutDataset, Snapshot, SourceStatus, WindowAnalysis,
 };
 use crate::rollout::{RolloutCache, scan_rollouts};
 
@@ -197,15 +199,44 @@ fn collect_snapshot_with_local(
     } else {
         &[]
     };
-    let (models, attribution) = analyze_current_window(
-        &mut tasks,
-        &mut turns,
+    let mut window_analyses = analyze_windows(
+        &tasks,
+        &turns,
         &dataset.calls,
         attribution_observations,
         &limits,
         now,
     );
-    if attribution.method.contains("discontinuity") {
+    let rollout_source_degraded = sources.iter().any(|source| {
+        source.source == "rollout_jsonl"
+            && matches!(source.status.as_str(), "error" | "partial" | "stale")
+    });
+    if !scan_local || !rollout_complete || rollout_source_degraded {
+        let reason = if scan_local {
+            "rollout_scan_incomplete"
+        } else {
+            "local_scan_disabled"
+        };
+        for analysis in &mut window_analyses {
+            mark_analysis_partial(analysis, reason);
+        }
+    }
+    if scan_local {
+        mark_incomplete_window_coverage(
+            &mut warnings,
+            &mut window_analyses,
+            now,
+            config.lookback_days,
+        );
+    }
+    mark_stale_window_analyses(&mut window_analyses, &limits);
+    handle_ambiguous_window_buckets(&mut warnings, &limits, &mut window_analyses, now);
+    let (models, attribution) =
+        project_five_hour_analysis(&mut tasks, &mut turns, &window_analyses);
+    if window_analyses
+        .iter()
+        .any(|analysis| analysis.attribution.method.contains("discontinuity"))
+    {
         warnings.push(
             "quota percentage moved backwards inside one window; attribution uses only the later monotonic epoch"
                 .to_string(),
@@ -224,6 +255,7 @@ fn collect_snapshot_with_local(
         || dataset.stats.truncated_files > 0
         || dataset.stats.unreadable_files > 0
         || dataset.stats.ambiguous_token_resets > 0
+        || window_analyses.iter().any(|analysis| analysis.partial)
         || sources
             .iter()
             .any(|source| matches!(source.status.as_str(), "error" | "partial" | "stale"));
@@ -241,11 +273,130 @@ fn collect_snapshot_with_local(
             turns,
             models,
             attribution,
+            window_analyses,
             stats: dataset.stats,
             warnings,
             errors,
         },
         account,
+    }
+}
+
+fn mark_incomplete_window_coverage(
+    warnings: &mut Vec<String>,
+    analyses: &mut [WindowAnalysis],
+    now: DateTime<Utc>,
+    lookback_days: i64,
+) {
+    let cutoff = Duration::try_days(lookback_days.max(0))
+        .and_then(|lookback| now.checked_sub_signed(lookback))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let mut incomplete = Vec::new();
+    for analysis in analyses {
+        let Some(window) = analysis.attribution.window.as_ref() else {
+            continue;
+        };
+        if window.starts_at < cutoff {
+            incomplete.push(window.label.clone());
+            mark_analysis_partial(analysis, "rollout_lookback_incomplete");
+        }
+    }
+    if incomplete.is_empty() {
+        return;
+    }
+    warnings.push(format!(
+        "rollout --days {lookback_days} starts after the {} reset-cycle boundary; local window shares cover only scanned data",
+        incomplete.join(", ")
+    ));
+}
+
+fn handle_ambiguous_window_buckets(
+    warnings: &mut Vec<String>,
+    limits: &[LimitBucket],
+    analyses: &mut [WindowAnalysis],
+    now: DateTime<Utc>,
+) {
+    for duration_mins in [300, 10_080] {
+        let bucket_ids = active_bucket_ids_for_duration(limits, now, duration_mins);
+        if bucket_ids.len() < 2 {
+            continue;
+        }
+        let Some(analysis) = analyses
+            .iter()
+            .find(|analysis| analysis.duration_mins == duration_mins)
+        else {
+            continue;
+        };
+        let Some(selected_id) = analysis
+            .attribution
+            .window
+            .as_ref()
+            .map(|window| window.limit_id.clone())
+        else {
+            continue;
+        };
+        let analysis = analyses
+            .iter_mut()
+            .find(|analysis| analysis.duration_mins == duration_mins)
+            .expect("analysis selected from the same slice");
+        disable_ambiguous_quota_estimation(analysis);
+        warnings.push(format!(
+            "multiple active {duration_mins}m quota buckets ({}); local calls lack limit ids, so analysis selected {selected_id}; other buckets remain gauge-only",
+            bucket_ids.join(", ")
+        ));
+    }
+}
+
+fn disable_ambiguous_quota_estimation(analysis: &mut WindowAnalysis) {
+    let used_percent = analysis
+        .attribution
+        .window
+        .as_ref()
+        .map(|window| window.used_percent.max(0.0))
+        .unwrap_or_default();
+    analysis.attribution.estimated_assigned_percent = 0.0;
+    analysis.attribution.unattributed_percent = used_percent;
+    analysis.attribution.attribution_coverage_percent = 0.0;
+    analysis.attribution.confidence = Confidence::Unknown;
+    analysis.attribution.method = "ambiguous_limit_bucket_local_tokens_only".to_string();
+    for thread in &mut analysis.threads {
+        thread.usage.estimated_quota_percent = 0.0;
+        thread.usage.quota_confidence = Confidence::Unknown;
+    }
+    for turn in &mut analysis.turns {
+        turn.usage.estimated_quota_percent = 0.0;
+        turn.usage.quota_confidence = Confidence::Unknown;
+    }
+    for model in &mut analysis.models {
+        model.estimated_quota_percent = 0.0;
+        model.quota_confidence = Confidence::Unknown;
+    }
+    mark_analysis_partial(analysis, "multiple_active_limit_buckets");
+}
+
+fn mark_stale_window_analyses(analyses: &mut [WindowAnalysis], limits: &[LimitBucket]) {
+    for analysis in analyses {
+        let Some(limit_id) = analysis
+            .attribution
+            .window
+            .as_ref()
+            .map(|window| window.limit_id.as_str())
+        else {
+            continue;
+        };
+        if limits.iter().any(|bucket| {
+            bucket.limit_id == limit_id
+                && matches!(bucket.provenance, Provenance::Stale | Provenance::Unknown)
+        }) {
+            mark_analysis_partial(analysis, "quota_window_stale");
+        }
+    }
+}
+
+fn mark_analysis_partial(analysis: &mut WindowAnalysis, reason: &str) {
+    analysis.partial = true;
+    if !analysis.partial_reasons.iter().any(|value| value == reason) {
+        analysis.partial_reasons.push(reason.to_string());
     }
 }
 
@@ -361,7 +512,7 @@ fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBuc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::AccountTokenUsage;
+    use crate::domain::{AccountTokenUsage, ThreadWindowUsage, TokenUsage, WindowUsage};
 
     #[test]
     fn failed_fresh_fields_preserve_cached_data_as_stale() {
@@ -398,5 +549,105 @@ mod tests {
         assert_eq!(fresh.limits.len(), 1);
         assert_eq!(fresh.limits[0].provenance, Provenance::Stale);
         assert_eq!(fresh.usage.unwrap().lifetime_tokens, Some(42));
+    }
+
+    #[test]
+    fn warns_when_window_analysis_must_choose_between_active_buckets() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let make_limit = |limit_id: &str, provenance| LimitBucket {
+            limit_id: limit_id.to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: None,
+            secondary: Some(LimitWindow::new(20.0, Some(10_080), Some(reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance,
+            as_of: now,
+        };
+        let limits = vec![
+            make_limit("codex-secondary", Provenance::ServerSnapshot),
+            make_limit("codex", Provenance::Stale),
+        ];
+        let mut analyses = analyze_windows(&[], &[], &[], &[], &limits, now);
+        analyses[0].attribution.estimated_assigned_percent = 2.0;
+        analyses[0].attribution.confidence = Confidence::Medium;
+        analyses[0].threads.push(ThreadWindowUsage {
+            thread_id: "thread".to_string(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
+                local_token_share_percent: 100.0,
+                estimated_quota_percent: 2.0,
+                quota_confidence: Confidence::Medium,
+            },
+        });
+        let mut warnings = Vec::new();
+
+        handle_ambiguous_window_buckets(&mut warnings, &limits, &mut analyses, now);
+
+        assert_eq!(analyses.len(), 1);
+        assert_eq!(
+            analyses[0].attribution.window.as_ref().unwrap().limit_id,
+            "codex"
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("analysis selected codex"));
+        assert!(warnings[0].contains("other buckets remain gauge-only"));
+        assert!(analyses[0].partial);
+        assert!(
+            analyses[0]
+                .partial_reasons
+                .contains(&"multiple_active_limit_buckets".to_string())
+        );
+        assert_eq!(analyses[0].attribution.estimated_assigned_percent, 0.0);
+        assert_eq!(analyses[0].attribution.confidence, Confidence::Unknown);
+        assert_eq!(analyses[0].threads[0].usage.estimated_quota_percent, 0.0);
+        assert_eq!(
+            analyses[0].threads[0].usage.quota_confidence,
+            Confidence::Unknown
+        );
+    }
+
+    #[test]
+    fn short_rollout_lookback_marks_weekly_cycle_coverage_incomplete() {
+        let now = Utc::now();
+        let limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: None,
+            secondary: Some(LimitWindow::new(
+                20.0,
+                Some(10_080),
+                Some(now + Duration::days(2)),
+            )),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }];
+        let analyses = analyze_windows(&[], &[], &[], &[], &limits, now);
+        let mut short = analyses.clone();
+        let mut warnings = Vec::new();
+
+        mark_incomplete_window_coverage(&mut warnings, &mut short, now, 1);
+        assert!(warnings[0].contains("week reset-cycle boundary"));
+        assert!(short[0].partial);
+        assert!(
+            short[0]
+                .partial_reasons
+                .contains(&"rollout_lookback_incomplete".to_string())
+        );
+
+        let mut complete = analyses.clone();
+        warnings.clear();
+        mark_incomplete_window_coverage(&mut warnings, &mut complete, now, 7);
+        mark_incomplete_window_coverage(&mut warnings, &mut complete, now, i64::MAX);
+        assert!(!complete[0].partial);
+        assert!(warnings.is_empty());
     }
 }

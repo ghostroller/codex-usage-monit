@@ -7,7 +7,7 @@
 - 近期 task/thread 状态，以轻量行背景色和图例表达状态，选中项保留证据来源与置信度；
 - 选中 task 下的 turns、模型、推理强度、消息摘要和 token；
 - 所有可用 5 小时、周及非标准额度桶；
-- 当前 5 小时窗口内 task、turn、model 的本地 token 占比；
+- 当前 5 小时或周重置周期内 task、turn、model 的本地 token 占比；
 - 明确标注为 estimated 的额度百分点归因、coverage、confidence 和 unattributed；
 - 完整或按 section 输出的一次性 text/JSON 快照；
 - 文件指纹缓存，TUI 刷新只重读变化的 rollout。
@@ -16,7 +16,9 @@
 
 Task、turn 和模型的 token 来自 Codex 累计计数的单调增量；在扫描完整、日志未缺失且累计计数没有回退时，这是本地可观察范围内的精确值。累计计数回退时，工具不会把新的较小基线重复算作消费，而会跳过该歧义样本并将 `ambiguousTokenResets`、数据源和快照标为 partial。
 
-5 小时和周额度的账户总百分比来自 `codex app-server`。Codex 不提供 task/turn 级官方配额账单，因此额度归因始终是估算：相邻快照间隔不超过 5 分钟时，工具按该区间本地 token 比例分配观测到的正向百分点变化。长间隔、缺失扫描、窗口校正和无本地调用的变化保留为 `unattributed`；其他设备或云任务仍可能贡献已观测变化，所以输出同时标记 `externalActivityPossible`。
+5 小时和周额度的账户总百分比来自 `codex app-server`。周窗口指服务端当前 reset cycle：从 `resetsAt - 10080 分钟` 到 `resetsAt`，不是滚动的过去 7 天，也不一定是自然周。Codex 不提供 task/turn 级官方配额账单，因此额度归因始终是估算：相邻快照间隔不超过 5 分钟时，工具按该区间本地 token 比例分配观测到的正向百分点变化。长间隔、缺失扫描、窗口校正和无本地调用的变化保留为 `unattributed`；其他设备或云任务仍可能贡献已观测变化，所以输出同时标记 `externalActivityPossible`。
+
+5 小时和周周期的本地 token share 在整个周期日志扫描完整时可以精确结算。`--days` 控制本地 rollout 的扫描范围；若它没有覆盖所选周期起点，或受 `--max-files`、坏行、不可读文件、counter 回退影响，相应窗口分析必须标为 partial，不能把不完整分母称为精确占比。无论扫描是否完整，task/turn 级 quota share 都仍是 estimated。
 
 即使所有任务都已结束，也只能得到精确 token 与更稳定的最终估算，不能变成 OpenAI 服务端意义上的精确任务额度账单。`settled=true` 的估算置信度最高为 `Medium`。
 
@@ -51,15 +53,16 @@ codex-usage-monit --theme light
 ```bash
 codex-usage-monit snapshot
 codex-usage-monit snapshot --format json --compact
-codex-usage-monit snapshot --section limits,tasks,turns,models,attribution,health
+codex-usage-monit snapshot --section limits,windows,tasks,turns,models,attribution,health
 codex-usage-monit limits --format json
+codex-usage-monit windows --format json
 codex-usage-monit tasks --format text
 codex-usage-monit turns --thread <thread-id> --format json
 codex-usage-monit models --format json
 codex-usage-monit attribution --format text
 ```
 
-`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。JSON schema 当前为 v1，字段统一使用 camelCase。
+`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。`windows` 输出所有可分析的当前 reset cycle；`snapshot --section windows` 在 JSON 中使用 `windowAnalyses` 字段。为兼容既有消费者，task/turn 上原有的 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models` 和 `attribution`，继续表示首选 5h 分析，不改成周数据。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。JSON schema 当前为 v1，字段统一使用 camelCase。
 
 退出码：
 
@@ -71,6 +74,7 @@ codex-usage-monit attribution --format text
 ## TUI 操作
 
 - `1` / `2` / `3`：Overview、Window、Data Health；
+- Window 页使用 `5` / `W` 在 `[5h]` 与 `[Week]` 间切换；两个按钮也可用鼠标左键点击，Tasks、Turns、Models 和 Attribution 同步使用所选 scope；
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
 - `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；可执行时，聚焦面板标题分别显示 `↵` / `←`；
@@ -84,7 +88,9 @@ codex-usage-monit attribution --format text
 
 本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
-Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 顶栏按 task 标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All，非空名称筛选右侧的 `×` 可用鼠标清空。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Models 面板按当前 5 小时窗口 token 从高到低显示；容量不足时标出 `top N/M`。当服务端只提供周窗口时，面板明确显示 5 小时窗口不可用，不会把周数据冒充 5 小时归因。
+Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 顶栏按 task 标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All，非空名称筛选右侧的 `×` 可用鼠标清空。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Window 页的 Models 面板按所选 5h/Week scope 的 token 从高到低显示；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充。
+
+若服务端同时返回多个相同 duration 的当前额度桶，工具优先选择 Codex 产品桶和服务端来源数据作为周期边界，并输出歧义 warning；其余同 duration 桶仍只显示 gauge。由于本地调用没有 limit id，此时只能保留该 duration 的通用本地 token 构成，必须禁用 task/turn/model 的桶级 estimated quota，不能把调用强行归给所选桶。`windowAnalyses` 会在每个 scope 上分别给出 `partial` 和 `partialReasons`，所以 Week 扫描不完整不会污染完整的 5h 标记。
 
 ## 数据与隐私
 

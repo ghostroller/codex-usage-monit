@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, Confidence, Provenance, Snapshot, TaskRecord, TaskStatus, TokenUsage,
-    TurnRecord, TurnStatus, terminal_safe_text,
+    TurnRecord, TurnStatus, WindowAnalysis, WindowUsage, terminal_safe_text,
 };
 use crate::rollout::RolloutCache;
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
@@ -113,6 +113,131 @@ enum View {
     Overview,
     Window,
     Health,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WindowScope {
+    #[default]
+    FiveHours,
+    Week,
+}
+
+impl WindowScope {
+    const ALL: [Self; 2] = [Self::FiveHours, Self::Week];
+
+    fn index(self) -> usize {
+        match self {
+            Self::FiveHours => 0,
+            Self::Week => 1,
+        }
+    }
+
+    fn duration_mins(self) -> i64 {
+        match self {
+            Self::FiveHours => 300,
+            Self::Week => 10_080,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FiveHours => "5h",
+            Self::Week => "Week",
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::FiveHours => '5',
+            Self::Week => 'W',
+        }
+    }
+
+    fn local_header(self) -> &'static str {
+        match self {
+            Self::FiveHours => "LOCAL5H",
+            Self::Week => "LOCALWK",
+        }
+    }
+
+    fn quota_header(self) -> &'static str {
+        match self {
+            Self::FiveHours => "EST.Q5H",
+            Self::Week => "EST.QWK",
+        }
+    }
+
+    fn task_title(self) -> &'static str {
+        match self {
+            Self::FiveHours => "5h tasks",
+            Self::Week => "Week-cycle tasks",
+        }
+    }
+}
+
+fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAnalysis> {
+    snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == scope.duration_mins())
+}
+
+fn attribution_for_scope(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+) -> Option<&crate::domain::AttributionSummary> {
+    window_analysis(snapshot, scope)
+        .map(|analysis| &analysis.attribution)
+        .or_else(|| {
+            (scope == WindowScope::FiveHours && snapshot.attribution.window.is_some())
+                .then_some(&snapshot.attribution)
+        })
+}
+
+fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskRecord) -> WindowUsage {
+    window_analysis(snapshot, scope)
+        .and_then(|analysis| {
+            analysis
+                .threads
+                .iter()
+                .find(|usage| usage.thread_id == task.thread_id)
+                .map(|usage| usage.usage)
+        })
+        .unwrap_or_else(|| {
+            if scope == WindowScope::FiveHours {
+                WindowUsage {
+                    token_usage: task.window_token_usage,
+                    local_token_share_percent: task.local_token_share_percent,
+                    estimated_quota_percent: task.estimated_quota_percent,
+                    quota_confidence: task.quota_confidence,
+                }
+            } else {
+                WindowUsage::default()
+            }
+        })
+}
+
+fn turn_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, turn: &TurnRecord) -> WindowUsage {
+    window_analysis(snapshot, scope)
+        .and_then(|analysis| {
+            analysis
+                .turns
+                .iter()
+                .find(|usage| usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id)
+                .map(|usage| usage.usage)
+        })
+        .unwrap_or_else(|| {
+            if scope == WindowScope::FiveHours {
+                WindowUsage {
+                    token_usage: turn.window_token_usage,
+                    local_token_share_percent: turn.local_token_share_percent,
+                    estimated_quota_percent: turn.estimated_quota_percent,
+                    quota_confidence: turn.quota_confidence,
+                }
+            } else {
+                WindowUsage::default()
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -207,6 +332,11 @@ struct ViewTabsHitbox {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowControlsHitbox {
+    scopes: [Rect; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollTarget {
     Tasks,
     Turns,
@@ -292,6 +422,7 @@ struct App {
     account: AccountSnapshot,
     theme: Theme,
     view: View,
+    window_scope: WindowScope,
     focus: Focus,
     task_source_filter: TaskSourceFilter,
     task_search: String,
@@ -309,6 +440,7 @@ struct App {
     task_table_hitbox: Option<TableHitbox>,
     turn_table_hitbox: Option<TableHitbox>,
     task_controls_hitbox: Option<TaskControlsHitbox>,
+    window_controls_hitbox: Option<WindowControlsHitbox>,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
@@ -326,6 +458,7 @@ impl App {
             account: result.account,
             theme,
             view: View::Overview,
+            window_scope: WindowScope::FiveHours,
             focus: Focus::Tasks,
             task_source_filter: TaskSourceFilter::All,
             task_search: String::new(),
@@ -343,6 +476,7 @@ impl App {
             task_table_hitbox: None,
             turn_table_hitbox: None,
             task_controls_hitbox: None,
+            window_controls_hitbox: None,
             view_tabs_hitbox: None,
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
@@ -639,6 +773,7 @@ impl App {
         self.task_table_hitbox = None;
         self.turn_table_hitbox = None;
         self.task_controls_hitbox = None;
+        self.window_controls_hitbox = None;
         self.view_tabs_hitbox = None;
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
@@ -956,6 +1091,30 @@ impl App {
         true
     }
 
+    fn set_window_scope(&mut self, scope: WindowScope) {
+        self.window_scope = scope;
+    }
+
+    fn activate_window_control_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Window {
+            return false;
+        }
+        let Some(hitbox) = self.window_controls_hitbox else {
+            return false;
+        };
+        let Some(scope) = WindowScope::ALL
+            .into_iter()
+            .find(|scope| rect_contains(hitbox.scopes[scope.index()], column, row))
+        else {
+            return false;
+        };
+        if self.focus == Focus::Search {
+            self.accept_task_search();
+        }
+        self.set_window_scope(scope);
+        true
+    }
+
     fn select_turn_at(&mut self, column: u16, row: u16) -> bool {
         let Some(index) = self
             .turn_table_hitbox
@@ -1048,6 +1207,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         MouseEventKind::Down(MouseButton::Left) => {
             app.scroll_drag = None;
             if app.activate_view_at(event.column, event.row)
+                || app.activate_window_control_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
                 || app.begin_scrollbar_drag_at(event.column, event.row)
             {
@@ -1239,6 +1399,12 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('1') => app.view = View::Overview,
         KeyCode::Char('2') => app.view = View::Window,
         KeyCode::Char('3') => app.view = View::Health,
+        KeyCode::Char('5') if app.view == View::Window => {
+            app.set_window_scope(WindowScope::FiveHours);
+        }
+        KeyCode::Char('w' | 'W') if app.view == View::Window => {
+            app.set_window_scope(WindowScope::Week);
+        }
         KeyCode::Char('t' | 'T') => app.toggle_theme(),
         KeyCode::Char('/') | KeyCode::Char('f' | 'F') if app.view != View::Health => {
             app.begin_task_search();
@@ -1479,6 +1645,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.task_table_hitbox = None;
     app.turn_table_hitbox = None;
     app.task_controls_hitbox = None;
+    app.window_controls_hitbox = None;
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
@@ -1579,7 +1746,13 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .split(rows[1]);
     render_tasks(frame, body[0], app, false);
     render_turns(frame, body[1], app, false);
-    render_models(frame, rows[2], &app.snapshot, app.theme);
+    render_models(
+        frame,
+        rows[2],
+        &app.snapshot,
+        app.theme,
+        WindowScope::FiveHours,
+    );
 }
 
 fn render_window(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1594,7 +1767,7 @@ fn render_window(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ])
         .split(area);
     render_limits(frame, rows[0], &app.snapshot, app.theme);
-    render_attribution(frame, rows[1], &app.snapshot, app.theme);
+    render_attribution(frame, rows[1], app);
 
     let narrow = area.width < 100;
     let body = Layout::default()
@@ -1611,7 +1784,7 @@ fn render_window(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .split(rows[2]);
     render_tasks(frame, body[0], app, true);
     render_turns(frame, body[1], app, true);
-    render_models(frame, rows[3], &app.snapshot, app.theme);
+    render_models(frame, rows[3], &app.snapshot, app.theme, app.window_scope);
 }
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1832,16 +2005,32 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .skip(offset)
         .filter_map(|index| app.snapshot.tasks.get(*index))
         .map(|task| {
+            let usage = task_usage_for_scope(&app.snapshot, app.window_scope, task);
             let tokens = if window_only {
-                task.window_token_usage
+                usage.token_usage
             } else {
                 task.token_usage
+            };
+            let local_share = if window_only {
+                usage.local_token_share_percent
+            } else {
+                task.local_token_share_percent
+            };
+            let estimated_quota = if window_only {
+                usage.estimated_quota_percent
+            } else {
+                task.estimated_quota_percent
+            };
+            let quota_confidence = if window_only {
+                usage.quota_confidence
+            } else {
+                task.quota_confidence
             };
             let tone = task_status_tone(task.status);
             Row::new([
                 Cell::from(format!("{} {}", status_marker(tone), format_tokens(tokens))),
-                Cell::from(format!("{:.1}%", task.local_token_share_percent)),
-                Cell::from(format!("{:.1}%", task.estimated_quota_percent)),
+                Cell::from(format!("{local_share:.1}%")),
+                Cell::from(format_estimated_quota(estimated_quota, quota_confidence)),
                 Cell::from(task_display_label(task)),
             ])
             .style(status_tone_style(tone, theme))
@@ -1858,7 +2047,20 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         ],
     )
     .header(table_header(
-        ["TOKENS", "LOCAL5H", "EST.Q5H", "TASK"],
+        [
+            "TOKENS",
+            if window_only {
+                app.window_scope.local_header()
+            } else {
+                WindowScope::FiveHours.local_header()
+            },
+            if window_only {
+                app.window_scope.quota_header()
+            } else {
+                WindowScope::FiveHours.quota_header()
+            },
+            "TASK",
+        ],
         app.theme,
     ))
     .block(block)
@@ -1927,7 +2129,7 @@ fn task_panel_block(
     let inner_right = area.right().saturating_sub(1);
     let compact = area.width < 60;
     let title = if window_only {
-        "5h tasks"
+        app.window_scope.task_title()
     } else {
         "Recent tasks"
     };
@@ -2152,7 +2354,10 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     app.selected_turn = app.selected_turn.min(turns.len().saturating_sub(1));
 
     let title_base = if window_only {
-        "Turns · current window"
+        match app.window_scope {
+            WindowScope::FiveHours => "Turns · 5h cycle",
+            WindowScope::Week => "Turns · Week cycle",
+        }
     } else {
         "Turns"
     };
@@ -2190,10 +2395,26 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     let show_effort_column = table_area.width >= 72;
     let theme = app.theme;
     let rows = turns.iter().skip(offset).map(|turn| {
+        let usage = turn_usage_for_scope(&app.snapshot, app.window_scope, turn);
         let tokens = if window_only {
-            turn.window_token_usage
+            usage.token_usage
         } else {
             turn.token_usage
+        };
+        let local_share = if window_only {
+            usage.local_token_share_percent
+        } else {
+            turn.local_token_share_percent
+        };
+        let estimated_quota = if window_only {
+            usage.estimated_quota_percent
+        } else {
+            turn.estimated_quota_percent
+        };
+        let quota_confidence = if window_only {
+            usage.quota_confidence
+        } else {
+            turn.quota_confidence
         };
         let model = terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"));
         let effort = terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown"));
@@ -2210,8 +2431,8 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         }
         cells.extend([
             Cell::from(format!("{} {}", status_marker(tone), format_tokens(tokens))),
-            Cell::from(format!("{:.1}%", turn.local_token_share_percent)),
-            Cell::from(format!("{:.1}%", turn.estimated_quota_percent)),
+            Cell::from(format!("{local_share:.1}%")),
+            Cell::from(format_estimated_quota(estimated_quota, quota_confidence)),
         ]);
         Row::new(cells).style(status_tone_style(tone, theme))
     });
@@ -2304,13 +2525,24 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     }
 
     if let Some(detail_area) = detail_area {
+        let detail_scope = if window_only {
+            app.window_scope
+        } else {
+            WindowScope::FiveHours
+        };
+        let selected_turn = turns.get(app.selected_turn).copied();
+        let selected_usage = selected_turn
+            .map(|turn| turn_usage_for_scope(&app.snapshot, detail_scope, turn))
+            .unwrap_or_default();
         render_turn_detail(
             frame,
             detail_area,
-            turns.get(app.selected_turn).copied(),
+            selected_turn,
             app.selected_turn,
             turns.len(),
             window_only,
+            detail_scope,
+            selected_usage,
             theme,
         );
     }
@@ -2336,6 +2568,8 @@ fn render_turn_detail(
     selected_index: usize,
     turn_count: usize,
     window_only: bool,
+    window_scope: WindowScope,
+    selected_window_usage: WindowUsage,
     theme: Theme,
 ) {
     let Some(turn) = turn else {
@@ -2361,23 +2595,44 @@ fn render_turn_detail(
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let all_tokens = format_token_breakdown("all", turn.token_usage, content_width);
-    let window_tokens = format_token_breakdown("5h", turn.window_token_usage, content_width);
+    let selected_window_tokens = format_token_breakdown(
+        window_scope.label(),
+        selected_window_usage.token_usage,
+        content_width,
+    );
     let (first_tokens, second_tokens) = if window_only {
-        (window_tokens, all_tokens)
+        (selected_window_tokens, all_tokens)
     } else {
-        (all_tokens, window_tokens)
+        (all_tokens, selected_window_tokens)
     };
     let started = format_turn_timestamp(turn.started_at.as_ref());
     let completed = format_turn_timestamp(turn.completed_at.as_ref());
     let message = terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"));
+    let quota_confidence = if window_only {
+        selected_window_usage.quota_confidence
+    } else {
+        turn.quota_confidence
+    };
+    let estimated_quota = format_estimated_quota(
+        if window_only {
+            selected_window_usage.estimated_quota_percent
+        } else {
+            turn.estimated_quota_percent
+        },
+        quota_confidence,
+    );
     let lines = vec![
         Line::from(first_tokens),
         Line::from(second_tokens),
         Line::from(format!(
-            "local={:.1}% · est.quota={:.1}% · confidence={}",
-            turn.local_token_share_percent,
-            turn.estimated_quota_percent,
-            confidence_label(turn.quota_confidence)
+            "local={:.1}% · est.quota={} · confidence={}",
+            if window_only {
+                selected_window_usage.local_token_share_percent
+            } else {
+                turn.local_token_share_percent
+            },
+            estimated_quota,
+            confidence_label(quota_confidence)
         )),
         Line::from(format!(
             "start={started} · end={completed} · duration={duration}"
@@ -2456,27 +2711,44 @@ fn format_turn_timestamp(value: Option<&chrono::DateTime<chrono::Utc>>) -> Strin
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
-    let scope = snapshot
-        .attribution
-        .window
-        .as_ref()
+fn render_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &Snapshot,
+    theme: Theme,
+    window_scope: WindowScope,
+) {
+    let analysis = window_analysis(snapshot, window_scope);
+    let attribution = attribution_for_scope(snapshot, window_scope);
+    let models = analysis
+        .map(|analysis| analysis.models.as_slice())
+        .unwrap_or_else(|| {
+            if window_scope == WindowScope::FiveHours {
+                snapshot.models.as_slice()
+            } else {
+                &[]
+            }
+        });
+    let scope = attribution
+        .and_then(|attribution| attribution.window.as_ref())
         .map(|window| window.label.as_str());
-    if snapshot.models.is_empty() {
+    if models.is_empty() {
         let (title, message) = if let Some(scope) = scope {
             (
                 format!("Models · {scope}"),
                 format!("No local model usage in the current {scope} window"),
             )
-        } else if has_active_window(snapshot, 10_080) && !has_active_window(snapshot, 300) {
+        } else if window_scope == WindowScope::FiveHours
+            && has_active_window(snapshot, WindowScope::Week.duration_mins())
+        {
             (
                 "Models · 5h unavailable".to_string(),
-                "5h window unavailable; weekly quota data remains available".to_string(),
+                "5h window unavailable; weekly reset-cycle data remains available".to_string(),
             )
         } else {
             (
-                "Models · 5h unavailable".to_string(),
-                "No active 5h quota window".to_string(),
+                format!("Models · {} unavailable", window_scope.label()),
+                format!("No active {} quota window", window_scope.label()),
             )
         };
         frame.render_widget(
@@ -2490,7 +2762,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
     }
 
     let visible_capacity = usize::from(area.height.saturating_sub(3));
-    let mut models = snapshot.models.iter().collect::<Vec<_>>();
+    let mut models = models.iter().collect::<Vec<_>>();
     models.sort_by(|left, right| {
         right
             .token_usage
@@ -2509,7 +2781,10 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
             Cell::from(terminal_safe_text(&model.model)),
             Cell::from(format_tokens(model.token_usage)),
             Cell::from(format!("{:.1}%", model.local_token_share_percent)),
-            Cell::from(format!("{:.1}%", model.estimated_quota_percent)),
+            Cell::from(format_estimated_quota(
+                model.estimated_quota_percent,
+                model.quota_confidence,
+            )),
             Cell::from(confidence_label(model.quota_confidence)),
         ])
     });
@@ -2543,46 +2818,121 @@ fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
         })
 }
 
-fn render_attribution(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
-    let attribution = &snapshot.attribution;
-    let window = attribution
-        .window
-        .as_ref()
-        .map(|window| {
-            format!(
-                "{} · {:.1}% used · {} to {}",
-                window.label,
-                window.used_percent,
-                window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
-            )
-        })
-        .unwrap_or_else(|| "No active quota window".to_string());
-    let detail = format!(
-        "{} local · +{:.2}pp observed · {:.2}pp estimated · {:.2}pp unattributed · {:.0}% coverage · {}{}{}",
-        format_tokens(attribution.local_token_usage),
-        attribution.observed_delta_percent,
-        attribution.estimated_assigned_percent,
-        attribution.unattributed_percent,
-        attribution.attribution_coverage_percent,
-        confidence_label(attribution.confidence),
-        if attribution.external_activity_possible {
-            " · external possible"
+fn render_attribution(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let snapshot = &app.snapshot;
+    let selected_analysis = window_analysis(snapshot, app.window_scope);
+    let selected_partial = selected_analysis
+        .map(|analysis| analysis.partial)
+        .unwrap_or_else(|| app.window_scope == WindowScope::FiveHours && snapshot.partial);
+    let attribution = attribution_for_scope(snapshot, app.window_scope);
+    let (window, detail) = if let Some(attribution) = attribution {
+        let window = attribution
+            .window
+            .as_ref()
+            .map(|window| {
+                format!(
+                    "{} reset cycle · {:.1}% used · {} to {}",
+                    window.label,
+                    window.used_percent,
+                    window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                    window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
+                )
+            })
+            .unwrap_or_else(|| format!("{} reset cycle unavailable", app.window_scope.label()));
+        let estimated_quota = if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
         } else {
-            ""
-        },
-        if attribution.settled {
-            " · settled"
-        } else {
-            ""
-        }
-    );
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
+        let detail = format!(
+            "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed · {:.0}% coverage · {}{}{}{}",
+            format_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            estimated_quota,
+            attribution.unattributed_percent,
+            attribution.attribution_coverage_percent,
+            confidence_label(attribution.confidence),
+            if attribution.external_activity_possible {
+                " · external possible"
+            } else {
+                ""
+            },
+            if attribution.settled {
+                " · settled"
+            } else {
+                ""
+            },
+            if selected_partial { " · partial" } else { "" }
+        );
+        (window, detail)
+    } else {
+        (
+            format!("{} reset cycle unavailable", app.window_scope.label()),
+            "No active quota window with duration and reset time".to_string(),
+        )
+    };
+    let (block, controls) = window_attribution_block(area, app);
+    app.window_controls_hitbox = Some(controls);
     frame.render_widget(
         Paragraph::new(vec![Line::from(window), Line::from(detail)])
-            .block(panel("Attribution", theme))
+            .block(block)
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn window_attribution_block(area: Rect, app: &App) -> (Block<'static>, WindowControlsHitbox) {
+    let palette = app.theme.palette();
+    let shortcuts_active = app.focus != Focus::Search;
+    let mut spans = vec![Span::styled(
+        " Attribution",
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let mut x = area.x.saturating_add(1 + " Attribution".len() as u16);
+    let mut scopes = [Rect::default(); 2];
+    for scope in WindowScope::ALL {
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+        let label = scope.label();
+        let width = u16::try_from(UnicodeWidthStr::width(label) + 2).unwrap_or(u16::MAX);
+        scopes[scope.index()] = title_hitbox(area, x, width);
+        let selected = app.window_scope == scope;
+        let style = if selected {
+            Style::default()
+                .fg(palette.background)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let shortcut_style = if !shortcuts_active {
+            style
+        } else if selected {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut label_chars = label.chars();
+        let _ = label_chars.next();
+        spans.push(Span::styled("[", style));
+        spans.push(Span::styled(scope.shortcut().to_string(), shortcut_style));
+        spans.push(Span::styled(
+            format!("{}]", label_chars.collect::<String>()),
+            style,
+        ));
+        x = x.saturating_add(width);
+    }
+    (
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(Line::from(spans)),
+        WindowControlsHitbox { scopes },
+    )
 }
 
 fn panel(title: &str, theme: Theme) -> Block<'_> {
@@ -2766,6 +3116,14 @@ fn confidence_label(confidence: Confidence) -> &'static str {
     }
 }
 
+fn format_estimated_quota(value: f64, confidence: Confidence) -> String {
+    if confidence == Confidence::Unknown {
+        "-".to_string()
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
 fn status_evidence(provenance: Provenance, confidence: Confidence) -> String {
     let provenance = provenance_label(provenance);
     let confidence = match confidence {
@@ -2814,7 +3172,8 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crate::domain::{
-        AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage, WindowDescriptor,
+        AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage,
+        ThreadWindowUsage, TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
     };
     use ratatui::backend::TestBackend;
 
@@ -2894,6 +3253,7 @@ mod tests {
                     turns,
                     models: Vec::new(),
                     attribution: AttributionSummary::default(),
+                    window_analyses: Vec::new(),
                     stats: CollectionStats::default(),
                     warnings: Vec::new(),
                     errors: Vec::new(),
@@ -2926,7 +3286,15 @@ mod tests {
     fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_models(frame, frame.area(), snapshot, Theme::Dark))
+            .draw(|frame| {
+                render_models(
+                    frame,
+                    frame.area(),
+                    snapshot,
+                    Theme::Dark,
+                    WindowScope::FiveHours,
+                )
+            })
             .unwrap();
         terminal
             .backend()
@@ -2948,6 +3316,75 @@ mod tests {
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
         }
+    }
+
+    fn add_window_analysis(
+        app: &mut App,
+        scope: WindowScope,
+        total_tokens: u64,
+        local_share_percent: f64,
+    ) {
+        let now = app.snapshot.as_of;
+        let usage = WindowUsage {
+            token_usage: TokenUsage {
+                input_tokens: total_tokens,
+                total_tokens,
+                ..TokenUsage::default()
+            },
+            local_token_share_percent: local_share_percent,
+            estimated_quota_percent: 2.5,
+            quota_confidence: Confidence::Medium,
+        };
+        let thread_id = app.snapshot.tasks[0].thread_id.clone();
+        let turn_id = app
+            .snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.thread_id == thread_id)
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_else(|| "turn-0-0".to_string());
+        app.snapshot
+            .window_analyses
+            .retain(|analysis| analysis.duration_mins != scope.duration_mins());
+        app.snapshot.window_analyses.push(WindowAnalysis {
+            duration_mins: scope.duration_mins(),
+            attribution: AttributionSummary {
+                window: Some(WindowDescriptor {
+                    limit_id: "codex".to_string(),
+                    label: scope.label().to_ascii_lowercase(),
+                    starts_at: now - chrono::Duration::minutes(scope.duration_mins() - 60),
+                    ends_at: now + chrono::Duration::hours(1),
+                    used_percent: 23.0,
+                }),
+                local_token_usage: usage.token_usage,
+                observed_delta_percent: 1.0,
+                estimated_assigned_percent: 1.0,
+                unattributed_percent: 22.0,
+                attribution_coverage_percent: 4.3,
+                external_activity_possible: true,
+                confidence: Confidence::Medium,
+                method: "observed_delta_token_proportional".to_string(),
+                settled: true,
+            },
+            partial: false,
+            partial_reasons: Vec::new(),
+            threads: vec![ThreadWindowUsage {
+                thread_id: thread_id.clone(),
+                usage,
+            }],
+            turns: vec![TurnWindowUsage {
+                thread_id,
+                turn_id,
+                usage,
+            }],
+            models: vec![ModelUsage {
+                model: "gpt-window".to_string(),
+                token_usage: usage.token_usage,
+                local_token_share_percent: local_share_percent,
+                estimated_quota_percent: usage.estimated_quota_percent,
+                quota_confidence: usage.quota_confidence,
+            }],
+        });
     }
 
     #[test]
@@ -3009,6 +3446,8 @@ mod tests {
     #[test]
     fn confidence_labels_are_stable() {
         assert_eq!(confidence_label(Confidence::Medium), "medium");
+        assert_eq!(format_estimated_quota(0.0, Confidence::Unknown), "-");
+        assert_eq!(format_estimated_quota(2.26, Confidence::Low), "2.3%");
     }
 
     #[test]
@@ -3044,7 +3483,7 @@ mod tests {
         let content = render_models_content(&app.snapshot, 120, 7);
 
         assert!(content.contains("Models · 5h unavailable"));
-        assert!(content.contains("weekly quota data remains available"));
+        assert!(content.contains("weekly reset-cycle data remains available"));
     }
 
     #[test]
@@ -3402,6 +3841,147 @@ mod tests {
         assert_eq!(buffer[(desktop.x + 1, desktop.y)].fg, palette.muted);
         let overview = app.view_tabs_hitbox.unwrap().tabs[View::Overview.index()];
         assert_eq!(buffer[(overview.x + 1, overview.y)].fg, palette.muted);
+    }
+
+    #[test]
+    fn window_scope_shortcuts_and_mouse_switch_reset_cycle_data() {
+        let mut app = interaction_test_app(3, 2);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
+        add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
+        app.view = View::Window;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let controls = app
+            .window_controls_hitbox
+            .expect("window controls should render");
+        let palette = app.theme.palette();
+        let buffer = terminal.backend().buffer();
+        for scope in WindowScope::ALL {
+            let button = controls.scopes[scope.index()];
+            let shortcut = &buffer[(button.x + 1, button.y)];
+            assert_eq!(shortcut.symbol(), scope.shortcut().to_string());
+            if scope == WindowScope::FiveHours {
+                assert!(shortcut.modifier.contains(Modifier::UNDERLINED));
+            } else {
+                assert_eq!(shortcut.fg, palette.accent);
+                assert!(shortcut.modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('W')));
+        assert_eq!(app.window_scope, WindowScope::Week);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("week reset cycle"));
+        assert!(content.contains("Week-cycle tasks"));
+        assert!(content.contains("LOCALWK"));
+        assert!(content.contains("777"));
+        assert!(content.contains("63.0%"));
+        assert!(content.contains("gpt-window"));
+
+        let five_hours = app.window_controls_hitbox.unwrap().scopes[WindowScope::FiveHours.index()];
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                five_hours.x,
+                five_hours.y,
+            ),
+        ));
+        assert_eq!(app.window_scope, WindowScope::FiveHours);
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('5')));
+        assert_eq!(app.window_scope, WindowScope::FiveHours);
+        handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('w')));
+        assert_eq!(app.focus, Focus::Search);
+        assert_eq!(app.task_search, "w");
+        assert_eq!(app.window_scope, WindowScope::FiveHours);
+    }
+
+    #[test]
+    fn missing_selected_reset_cycle_is_explicitly_unavailable() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+        app.view = View::Window;
+        app.window_scope = WindowScope::Week;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Week reset cycle unavailable"));
+        assert!(content.contains("Models · Week unavailable"));
+        assert!(!content.contains("No local model usage in the current Week window"));
+    }
+
+    #[test]
+    fn window_partial_marker_follows_the_selected_scope() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 100, 40.0);
+        add_window_analysis(&mut app, WindowScope::Week, 250, 100.0);
+        let weekly = app
+            .snapshot
+            .window_analyses
+            .iter_mut()
+            .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+            .unwrap();
+        weekly.partial = true;
+        weekly
+            .partial_reasons
+            .push("rollout_lookback_incomplete".to_string());
+        weekly.attribution.estimated_assigned_percent = 0.0;
+        weekly.attribution.confidence = Confidence::Unknown;
+        for thread in &mut weekly.threads {
+            thread.usage.estimated_quota_percent = 0.0;
+            thread.usage.quota_confidence = Confidence::Unknown;
+        }
+        for turn in &mut weekly.turns {
+            turn.usage.estimated_quota_percent = 0.0;
+            turn.usage.quota_confidence = Confidence::Unknown;
+        }
+        for model in &mut weekly.models {
+            model.estimated_quota_percent = 0.0;
+            model.quota_confidence = Confidence::Unknown;
+        }
+        app.snapshot.partial = true;
+        app.view = View::Window;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let five_hour = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!five_hour.contains(" · partial"));
+
+        app.window_scope = WindowScope::Week;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let weekly = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(weekly.contains(" · partial"));
+        assert!(weekly.contains("est.quota=-"));
+        assert!(!weekly.contains("0.0% estimated"));
     }
 
     #[test]
@@ -4626,6 +5206,7 @@ mod tests {
                 }],
                 models: Vec::new(),
                 attribution: AttributionSummary::default(),
+                window_analyses: Vec::new(),
                 stats: CollectionStats::default(),
                 warnings: Vec::new(),
                 errors: Vec::new(),

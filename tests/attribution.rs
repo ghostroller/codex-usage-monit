@@ -1,14 +1,18 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use codex_usage_monit::attribution::analyze_current_window;
+use codex_usage_monit::attribution::{analyze_current_window, analyze_windows};
 use codex_usage_monit::domain::{
     Confidence, LimitBucket, LimitWindow, Provenance, RateObservation, TaskRecord, TaskStatus,
     TokenUsage, TurnRecord, TurnStatus, UsageCall,
 };
 
 fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 7, 12, hour, minute, 0)
+    on(12, hour, minute)
+}
+
+fn on(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, day, hour, minute, 0)
         .single()
         .unwrap()
 }
@@ -104,12 +108,25 @@ fn observation(
     used_percent: f64,
     resets_at: DateTime<Utc>,
 ) -> RateObservation {
+    observation_for(timestamp, used_percent, 300, resets_at)
+}
+
+fn observation_for(
+    timestamp: DateTime<Utc>,
+    used_percent: f64,
+    duration_mins: i64,
+    resets_at: DateTime<Utc>,
+) -> RateObservation {
     RateObservation {
         timestamp,
         thread_id: "source-thread".to_string(),
         turn_id: None,
         limit_id: "codex".to_string(),
-        primary: Some(LimitWindow::new(used_percent, Some(300), Some(resets_at))),
+        primary: Some(LimitWindow::new(
+            used_percent,
+            Some(duration_mins),
+            Some(resets_at),
+        )),
         secondary: None,
         provenance: Provenance::LocalExact,
     }
@@ -373,6 +390,194 @@ fn selects_only_a_current_five_hour_window() {
         analyze_current_window(&mut tasks, &mut turns, &[weekly_call], &[], &[weekly], now);
     assert!(weekly_only_summary.window.is_none());
     assert!(weekly_models.is_empty());
+}
+
+#[test]
+fn analyzes_five_hour_and_weekly_reset_cycles_without_overwriting() {
+    let now = at(12, 0);
+    let five_hour_reset = at(14, 0);
+    let weekly_reset = on(14, 12, 0);
+    let mut five_hour = limit(now, 10.0, 300, five_hour_reset);
+    five_hour.limit_id = "five-hour".to_string();
+    let mut weekly = limit(now, 35.0, 10_080, weekly_reset);
+    weekly.limit_id = "weekly".to_string();
+    let calls = vec![
+        call(on(7, 11, 59), "ignored", "ignored-turn", "gpt-old", 900),
+        call(on(7, 12, 0), "a", "a-turn", "gpt-a", 200),
+        call(at(8, 0), "b", "b-turn", "gpt-b", 300),
+        call(at(10, 0), "a", "a-turn", "gpt-a", 100),
+        call(at(11, 0), "b", "b-turn", "gpt-b", 400),
+    ];
+    let tasks = vec![
+        task("a", TaskStatus::Completed),
+        task("b", TaskStatus::Completed),
+    ];
+    let turns = vec![turn("a", "a-turn"), turn("b", "b-turn")];
+
+    let analyses = analyze_windows(&tasks, &turns, &calls, &[], &[weekly, five_hour], now);
+
+    assert_eq!(analyses.len(), 2);
+    let five_hour = analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 300)
+        .unwrap();
+    let weekly = analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 10_080)
+        .unwrap();
+    assert_eq!(
+        five_hour.attribution.window.as_ref().unwrap().starts_at,
+        at(9, 0)
+    );
+    assert_eq!(
+        weekly.attribution.window.as_ref().unwrap().starts_at,
+        on(7, 12, 0)
+    );
+    assert_eq!(five_hour.attribution.local_token_usage, tokens(500));
+    assert_eq!(weekly.attribution.local_token_usage, tokens(1_000));
+
+    let five_hour_a = five_hour
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == "a")
+        .unwrap();
+    let weekly_a = weekly
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == "a")
+        .unwrap();
+    assert_close(five_hour_a.usage.local_token_share_percent, 20.0);
+    assert_close(weekly_a.usage.local_token_share_percent, 30.0);
+    assert_eq!(five_hour_a.usage.token_usage, tokens(100));
+    assert_eq!(weekly_a.usage.token_usage, tokens(300));
+
+    let mut legacy_tasks = tasks;
+    let mut legacy_turns = turns;
+    let (_, legacy) = analyze_current_window(
+        &mut legacy_tasks,
+        &mut legacy_turns,
+        &calls,
+        &[],
+        &[
+            limit(now, 35.0, 10_080, weekly_reset),
+            limit(now, 10.0, 300, five_hour_reset),
+        ],
+        now,
+    );
+    assert_eq!(legacy.window.unwrap().label, "5h");
+    assert_eq!(legacy_tasks[0].window_token_usage, tokens(100));
+    assert_close(legacy_tasks[0].local_token_share_percent, 20.0);
+}
+
+#[test]
+fn weekly_analysis_estimates_only_its_matching_reset_epoch() {
+    let now = at(12, 0);
+    let reset = on(14, 12, 0);
+    let mut weekly_limit = limit(now, 20.0, 10_080, reset);
+    weekly_limit.secondary = weekly_limit.primary.take();
+    let mut observations = vec![
+        observation_for(at(11, 55), 99.0, 10_080, reset + Duration::days(7)),
+        observation_for(at(11, 58), 18.0, 10_080, reset),
+    ];
+    for observation in &mut observations {
+        observation.secondary = observation.primary.take();
+    }
+    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
+    let tasks = vec![task("a", TaskStatus::Completed)];
+    let turns = vec![turn("a", "turn")];
+
+    let analyses = analyze_windows(&tasks, &turns, &calls, &observations, &[weekly_limit], now);
+
+    assert_eq!(analyses.len(), 1);
+    let weekly = &analyses[0];
+    assert_eq!(weekly.duration_mins, 10_080);
+    assert_close(weekly.attribution.observed_delta_percent, 2.0);
+    assert_close(weekly.attribution.estimated_assigned_percent, 2.0);
+    assert_close(weekly.threads[0].usage.estimated_quota_percent, 2.0);
+    assert_eq!(weekly.threads[0].usage.quota_confidence, Confidence::Medium);
+}
+
+#[test]
+fn matching_reset_epoch_survives_primary_secondary_slot_changes() {
+    let now = at(12, 0);
+    let reset = on(14, 12, 0);
+    let tasks = vec![task("a", TaskStatus::Completed)];
+    let turns = vec![turn("a", "turn")];
+    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
+
+    for current_is_primary in [true, false] {
+        let mut current = limit(now, 20.0, 10_080, reset);
+        let mut previous = observation_for(at(11, 58), 18.0, 10_080, reset);
+        if current_is_primary {
+            previous.secondary = previous.primary.take();
+        } else {
+            current.secondary = current.primary.take();
+        }
+
+        let analyses = analyze_windows(&tasks, &turns, &calls, &[previous], &[current], now);
+
+        assert_eq!(analyses.len(), 1);
+        let weekly = &analyses[0];
+        assert_close(weekly.attribution.observed_delta_percent, 2.0);
+        assert_close(weekly.attribution.estimated_assigned_percent, 2.0);
+        assert_close(weekly.threads[0].usage.estimated_quota_percent, 2.0);
+        assert_eq!(weekly.threads[0].usage.quota_confidence, Confidence::Medium);
+    }
+}
+
+#[test]
+fn same_duration_prefers_codex_bucket_and_serializes_window_usage() {
+    let now = at(12, 0);
+    let reset = on(14, 12, 0);
+    let mut codex = limit(now, 20.0, 10_080, reset);
+    codex.limit_id = "codex".to_string();
+    codex.provenance = Provenance::Stale;
+    let mut secondary = limit(now, 5.0, 10_080, reset);
+    secondary.limit_id = "codex-secondary".to_string();
+    let unsupported = limit(now, 3.0, 1_440, now + Duration::hours(12));
+    let tasks = vec![task("a", TaskStatus::Completed)];
+    let turns = vec![turn("a", "turn")];
+    let calls = vec![call(at(11, 0), "a", "turn", "gpt-a", 100)];
+
+    let analyses = analyze_windows(
+        &tasks,
+        &turns,
+        &calls,
+        &[],
+        &[secondary, unsupported, codex],
+        now,
+    );
+
+    assert_eq!(analyses.len(), 1);
+    assert_eq!(
+        analyses[0].attribution.window.as_ref().unwrap().limit_id,
+        "codex"
+    );
+    let value = serde_json::to_value(&analyses[0]).unwrap();
+    assert_eq!(value["durationMins"], 10_080);
+    assert_eq!(value["threads"][0]["threadId"], "a");
+    assert_eq!(
+        value["threads"][0]["usage"]["tokenUsage"]["totalTokens"],
+        100
+    );
+
+    let mut alphabetic_first = limit(now, 8.0, 10_080, reset);
+    alphabetic_first.limit_id = "alpha".to_string();
+    alphabetic_first.provenance = Provenance::Stale;
+    let mut server = limit(now, 9.0, 10_080, reset);
+    server.limit_id = "zeta".to_string();
+    let preferred = analyze_windows(
+        &tasks,
+        &turns,
+        &calls,
+        &[],
+        &[alphabetic_first, server],
+        now,
+    );
+    assert_eq!(
+        preferred[0].attribution.window.as_ref().unwrap().limit_id,
+        "zeta"
+    );
 }
 
 #[test]

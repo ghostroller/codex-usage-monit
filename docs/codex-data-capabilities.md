@@ -1,12 +1,12 @@
 # Codex 数据能力与边界
 
-更新日期：2026-07-12
+更新日期：2026-07-13
 
 验证版本：`codex-cli 0.144.1`
 
 ## 结论
 
-需求 1、2、4、5 可以实现。需求 3 可以实现“窗口内精确 token 占比”和“额度变化估算”，但不能实现服务端意义上精确到任务或 turn 的 5 小时配额贡献。
+需求 1、2、4、5 可以实现。需求 3 可以实现“5 小时/周 reset cycle 内的精确本地 token 占比”和“额度变化估算”，但不能实现服务端意义上精确到任务或 turn 的配额贡献。
 
 运行状态也有一个边界：连接到同一个 App Server 的线程可以获得精确状态；普通方式独立启动的 Codex CLI 属于不同运行时，只能从进程和持久化事件推断状态。
 
@@ -23,7 +23,8 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 - **任务 / Thread**：一条 Codex 会话，包含多个 turns。
 - **对话 / Turn**：一次用户请求及随后发生的 agent 工作。
 - **模型调用**：turn 内产生一次 token usage 更新的模型响应。
-- **额度窗口**：由服务端返回的 `windowDurationMins` 和 `resetsAt` 标识，不能仅用 `now - 5h` 推导。
+- **额度窗口**：由服务端返回的 `windowDurationMins` 和 `resetsAt` 标识，周期为 `resetsAt - windowDurationMins` 到 `resetsAt`，不能用 `now - duration` 推导。
+- **周 reset cycle**：`windowDurationMins == 10080` 的当前服务端周期，不是滚动过去 7 天，也不保证与日历自然周重合。
 - **本地 token**：当前 `CODEX_HOME` 下可以从 rollout JSONL 观察到的 token。
 - **配额占比**：OpenAI 服务端 `usedPercent`，不是 token 的同义词。
 
@@ -53,6 +54,8 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 - `planType`、`credits`、`individualLimit`、`rateLimitReachedType`。
 
 工具必须按 `windowDurationMins == 300` 和 `10080` 识别 5 小时/周窗口。若服务端返回其他时长，应显示通用窗口名称，而不是把 primary/secondary 硬编码为 5 小时/周。
+
+若同一 duration 返回多个当前桶，不能把它们的账户百分比混合。周期边界候选应优先 Codex 产品桶和服务端 provenance；仍有歧义时使用稳定排序选一个并输出 warning，其他候选只保留在额度 gauge 中。由于本地 `UsageCall` 没有 limit id，duration 级 token 构成仍可展示，但无法证明属于所选桶；因此该窗口必须标为 partial，并禁用所有实体的 estimated quota。
 
 ### Thread 与 Turn 状态
 
@@ -102,7 +105,7 @@ Rollout JSONL 中可利用以下事件重建历史：
 
 对每个 turn 的 token 统计应使用累计计数的单调增量，避免重复的 `token_count` 通知被重复相加。
 
-## 五小时归因的硬边界
+## 当前窗口归因的硬边界
 
 OpenAI 当前没有暴露类似以下字段：
 
@@ -132,6 +135,8 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 该值必须标记为 `local token share`，不能称为官方额度贡献。
 
+同一公式同时适用于当前 5 小时和周 reset cycle。周周期只有在本地扫描覆盖服务端周期起点，且没有 `max-files` 截断、坏行、不可读文件或歧义 counter reset 时才能标为本地精确。`--days 7` 表示本地扫描 lookback，不定义周窗口；若配置的 `--days` 不足以覆盖 `resetsAt - 10080m`，只有周分析标为 partial，完整的 5h 分析不受污染。每项 `windowAnalyses` 通过自己的 `partial` / `partialReasons` 表达这一点；额度 gauge 仍可保持服务端完整，因为它不依赖 rollout lookback。
+
 ### 可以观测但不能精确归因
 
 在相同 `limitId` 和相同窗口内，可以计算相邻快照：
@@ -154,6 +159,12 @@ turn_tokens / window_tokens * current_used_percent
 
 它可以作为估算代理，但必须明确标为 `estimated quota share`，并同时展示置信度和未归因部分。
 
+## 多窗口输出与交互
+
+TUI Window 页提供 `[5h]` / `[Week]` scope，分别由 `5` / `W` 或鼠标左键选择。Tasks、选中 task 的 Turns、Models 和 Attribution 必须在一次切换中使用同一个 scope；不可用的 scope 显示 unavailable，不能借用另一时长的数据。
+
+一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义；新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。
+
 ## 状态可信度
 
 所有状态记录都应带 provenance：
@@ -172,7 +183,7 @@ turn_tokens / window_tokens * current_used_percent
 当没有 active 或 stale task 时，最终服务端快照可以把 `settled` 标为 true，并让已经观测到的额度 delta 不再继续变化。此时：
 
 - task/turn/model token 可以精确结算；
-- 当前窗口本地 token share 可以精确结算；
+- 扫描完整的当前 5 小时或周 reset cycle 本地 token share 可以精确结算；
 - estimated quota share 可以提高到 Medium confidence；
 - 服务端 task/turn quota 仍然不能精确计算。
 

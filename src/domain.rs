@@ -316,6 +316,44 @@ impl Default for AttributionSummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowUsage {
+    pub token_usage: TokenUsage,
+    pub local_token_share_percent: f64,
+    pub estimated_quota_percent: f64,
+    pub quota_confidence: Confidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadWindowUsage {
+    pub thread_id: String,
+    pub usage: WindowUsage,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnWindowUsage {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub usage: WindowUsage,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowAnalysis {
+    pub duration_mins: i64,
+    pub attribution: AttributionSummary,
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+    pub threads: Vec<ThreadWindowUsage>,
+    pub turns: Vec<TurnWindowUsage>,
+    pub models: Vec<ModelUsage>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceStatus {
@@ -351,6 +389,8 @@ pub struct Snapshot {
     pub turns: Vec<TurnRecord>,
     pub models: Vec<ModelUsage>,
     pub attribution: AttributionSummary,
+    #[serde(default)]
+    pub window_analyses: Vec<WindowAnalysis>,
     pub stats: CollectionStats,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,

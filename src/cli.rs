@@ -60,6 +60,8 @@ enum Command {
     Models(OutputArgs),
     /// Print quota attribution and data-quality details.
     Attribution(OutputArgs),
+    /// Print per-task, turn, and model usage for each current reset cycle.
+    Windows(OutputArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -109,6 +111,7 @@ enum SectionArg {
     Turns,
     Models,
     Attribution,
+    Windows,
     Health,
 }
 
@@ -129,6 +132,7 @@ impl From<SectionArg> for Section {
             SectionArg::Turns => Self::Turns,
             SectionArg::Models => Self::Models,
             SectionArg::Attribution => Self::Attribution,
+            SectionArg::Windows => Self::Windows,
             SectionArg::Health => Self::Health,
         }
     }
@@ -192,6 +196,7 @@ fn run_with(cli: Cli) -> Result<i32> {
         },
         Command::Models(args) => request_for(args, Section::Models),
         Command::Attribution(args) => request_for(args, Section::Attribution),
+        Command::Windows(args) => request_for(args, Section::Windows),
     };
     let limits_only = request.sections.len() == 1 && request.sections.contains(&Section::Limits);
     let mut result = if limits_only && !config.offline {
@@ -257,7 +262,7 @@ mod tests {
 
     #[test]
     fn section_all_contains_every_public_section() {
-        assert_eq!(Section::all().len(), 6);
+        assert_eq!(Section::all().len(), 7);
     }
 
     #[test]
@@ -270,6 +275,21 @@ mod tests {
     fn clap_help_is_successful() {
         let error = Cli::try_parse_from(["codex-usage-monit", "--help"]).unwrap_err();
         assert!(!error.use_stderr());
+    }
+
+    #[test]
+    fn windows_are_available_as_a_command_and_snapshot_section() {
+        let command =
+            Cli::try_parse_from(["codex-usage-monit", "windows", "--format", "json"]).unwrap();
+        assert!(matches!(command.command, Some(Command::Windows(_))));
+
+        let snapshot =
+            Cli::try_parse_from(["codex-usage-monit", "snapshot", "--section", "windows"]).unwrap();
+        assert!(matches!(
+            snapshot.command,
+            Some(Command::Snapshot(SnapshotArgs { section, .. }))
+                if matches!(section.as_slice(), [SectionArg::Windows])
+        ));
     }
 
     #[test]

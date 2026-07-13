@@ -22,6 +22,7 @@ pub enum Section {
     Turns,
     Models,
     Attribution,
+    Windows,
     Health,
 }
 
@@ -33,6 +34,7 @@ impl Section {
             Self::Turns,
             Self::Models,
             Self::Attribution,
+            Self::Windows,
             Self::Health,
         ])
     }
@@ -67,10 +69,18 @@ pub fn request_is_partial(snapshot: &Snapshot, request: &OutputRequest) -> bool 
             .limits
             .iter()
             .any(|bucket| matches!(bucket.provenance, Provenance::Stale | Provenance::Unknown));
+    let five_hour_partial = snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 300)
+        .is_some_and(|analysis| analysis.partial);
 
     request.sections.iter().any(|section| match section {
         Section::Limits => limits_degraded,
-        Section::Tasks => rollout_degraded || (!snapshot.tasks.is_empty() && limits_degraded),
+        Section::Tasks => {
+            rollout_degraded
+                || (!snapshot.tasks.is_empty() && (limits_degraded || five_hour_partial))
+        }
         Section::Turns => {
             let has_matching_turn = snapshot.turns.iter().any(|turn| {
                 request
@@ -78,9 +88,19 @@ pub fn request_is_partial(snapshot: &Snapshot, request: &OutputRequest) -> bool 
                     .as_deref()
                     .is_none_or(|thread_id| turn.thread_id == thread_id)
             });
-            rollout_degraded || (has_matching_turn && limits_degraded)
+            rollout_degraded || (has_matching_turn && (limits_degraded || five_hour_partial))
         }
-        Section::Models | Section::Attribution => rollout_degraded || limits_degraded,
+        Section::Models | Section::Attribution => {
+            rollout_degraded || limits_degraded || five_hour_partial
+        }
+        Section::Windows => {
+            rollout_degraded
+                || app_limits_degraded
+                || snapshot
+                    .window_analyses
+                    .iter()
+                    .any(|analysis| analysis.partial)
+        }
         Section::Health => snapshot.partial,
     })
 }
@@ -114,6 +134,7 @@ pub fn request_is_failure(snapshot: &Snapshot, request: &OutputRequest) -> bool 
                         || !snapshot.tasks.is_empty()
                         || !snapshot.turns.is_empty())
             }
+            Section::Windows => !snapshot.window_analyses.is_empty(),
             Section::Health => continue,
         };
         requested_data_section = true;
@@ -139,6 +160,7 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
         (Section::Turns, "turns"),
         (Section::Models, "models"),
         (Section::Attribution, "attribution"),
+        (Section::Windows, "windowAnalyses"),
     ] {
         if !request.sections.contains(&section) {
             object.remove(key);
@@ -214,7 +236,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         for task in &snapshot.tasks {
             let _ = writeln!(
                 output,
-                "  {:<15} {:>12} {:>7.2}% {:>7.2}% {:<12}  {}",
+                "  {:<15} {:>12} {:>7.2}% {:>8} {:<12}  {}",
                 format!(
                     "{} {}",
                     task.status.label(),
@@ -222,7 +244,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 ),
                 compact_tokens(task.token_usage),
                 task.local_token_share_percent,
-                task.estimated_quota_percent,
+                estimated_percent(task.estimated_quota_percent, task.quota_confidence),
                 terminal_safe_text(task.source.as_deref().unwrap_or("unknown")),
                 terminal_safe_text(&task.title)
             );
@@ -244,13 +266,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         }) {
             let _ = writeln!(
                 output,
-                "  {:<11} {:<16} {:<7} {:>12} {:>7.2}% {:>7.2}%  {}  {}",
+                "  {:<11} {:<16} {:<7} {:>12} {:>7.2}% {:>8}  {}  {}",
                 turn.status.label(),
                 terminal_safe_text(turn.model.as_deref().unwrap_or("unknown")),
                 terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown")),
                 compact_tokens(turn.token_usage),
                 turn.local_token_share_percent,
-                turn.estimated_quota_percent,
+                estimated_percent(turn.estimated_quota_percent, turn.quota_confidence),
                 terminal_safe_text(short_id(&turn.thread_id)),
                 terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"))
             );
@@ -262,11 +284,11 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         for model in &snapshot.models {
             let _ = writeln!(
                 output,
-                "  {:<24} {:>12}  {:>7.2}% local  {:>7.2}% estimated quota  {:?}",
+                "  {:<24} {:>12}  {:>7.2}% local  {:>8} estimated quota  {:?}",
                 terminal_safe_text(&model.model),
                 compact_tokens(model.token_usage),
                 model.local_token_share_percent,
-                model.estimated_quota_percent,
+                estimated_percent(model.estimated_quota_percent, model.quota_confidence),
                 model.quota_confidence
             );
         }
@@ -285,12 +307,17 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 window.used_percent
             );
         }
+        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
+        } else {
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
         let _ = writeln!(
             output,
-            "  local tokens {} | observed +{:.2}pp | estimated {:.2}pp | unattributed {:.2}pp",
+            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
             compact_tokens(attribution.local_token_usage),
             attribution.observed_delta_percent,
-            attribution.estimated_assigned_percent,
+            estimated_assigned,
             attribution.unattributed_percent
         );
         let _ = writeln!(
@@ -302,6 +329,10 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             attribution.settled,
             terminal_safe_text(&attribution.method)
         );
+    }
+
+    if request.sections.contains(&Section::Windows) {
+        render_window_analyses(&mut output, snapshot);
     }
 
     if request.sections.contains(&Section::Health) {
@@ -356,6 +387,216 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
     }
 
     output.trim_end().to_string()
+}
+
+fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
+    let _ = writeln!(output, "\nWindow analyses");
+    if snapshot.window_analyses.is_empty() {
+        let _ = writeln!(output, "  unavailable");
+        return;
+    }
+
+    for analysis in &snapshot.window_analyses {
+        let attribution = &analysis.attribution;
+        if let Some(window) = &attribution.window {
+            let _ = writeln!(
+                output,
+                "\n  {} | {} | {}m  {} -> {}  {:.1}% used{}",
+                terminal_safe_text(&window.label),
+                terminal_safe_text(&window.limit_id),
+                analysis.duration_mins,
+                window.starts_at.to_rfc3339(),
+                window.ends_at.to_rfc3339(),
+                window.used_percent,
+                if analysis.partial { "  [PARTIAL]" } else { "" }
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "\n  {}m | window descriptor unavailable",
+                analysis.duration_mins
+            );
+        }
+        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
+        } else {
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
+        let _ = writeln!(
+            output,
+            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
+            compact_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            estimated_assigned,
+            attribution.unattributed_percent
+        );
+        if !analysis.partial_reasons.is_empty() {
+            let _ = writeln!(
+                output,
+                "  partial reasons: {}",
+                terminal_safe_text(&analysis.partial_reasons.join(", "))
+            );
+        }
+        let _ = writeln!(
+            output,
+            "  confidence {:?} | coverage {:.1}% | external activity possible {} | settled {} | method {}",
+            attribution.confidence,
+            attribution.attribution_coverage_percent,
+            attribution.external_activity_possible,
+            attribution.settled,
+            terminal_safe_text(&attribution.method)
+        );
+
+        if attribution.local_token_usage.is_zero()
+            && analysis.threads.is_empty()
+            && analysis.turns.is_empty()
+            && analysis.models.is_empty()
+        {
+            let _ = writeln!(output, "  no local token events in this reset cycle");
+            continue;
+        }
+
+        let mut threads = analysis
+            .threads
+            .iter()
+            .filter(|thread| {
+                !thread.usage.token_usage.is_zero() || thread.usage.estimated_quota_percent > 0.0
+            })
+            .collect::<Vec<_>>();
+        threads.sort_by(|left, right| {
+            right
+                .usage
+                .token_usage
+                .total_tokens
+                .cmp(&left.usage.token_usage.total_tokens)
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
+        if !threads.is_empty() {
+            let _ = writeln!(output, "  Tasks");
+            let _ = writeln!(
+                output,
+                "    {:>8} {:>8} {:>12} {:<8}  TITLE",
+                "LOCAL%", "EST.Q%", "TOKENS", "THREAD"
+            );
+            for thread in threads {
+                let title = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.thread_id == thread.thread_id)
+                    .map(|task| task.title.as_str())
+                    .unwrap_or("-");
+                let _ = writeln!(
+                    output,
+                    "    {:>8} {:>8} {:>12} {:<8}  {}",
+                    format!("{:.2}%", thread.usage.local_token_share_percent),
+                    estimated_percent(
+                        thread.usage.estimated_quota_percent,
+                        thread.usage.quota_confidence
+                    ),
+                    compact_tokens(thread.usage.token_usage),
+                    terminal_safe_text(short_id(&thread.thread_id)),
+                    terminal_safe_text(title)
+                );
+            }
+        }
+
+        let mut turns = analysis
+            .turns
+            .iter()
+            .filter(|turn| {
+                !turn.usage.token_usage.is_zero() || turn.usage.estimated_quota_percent > 0.0
+            })
+            .collect::<Vec<_>>();
+        turns.sort_by(|left, right| {
+            right
+                .usage
+                .token_usage
+                .total_tokens
+                .cmp(&left.usage.token_usage.total_tokens)
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        if !turns.is_empty() {
+            let _ = writeln!(output, "  Turns");
+            let _ = writeln!(
+                output,
+                "    {:>8} {:>8} {:>12} {:<16} {:<7} {:<17}  MESSAGE",
+                "LOCAL%", "EST.Q%", "TOKENS", "MODEL", "EFFORT", "THREAD/TURN"
+            );
+            for window_turn in turns {
+                let turn = snapshot.turns.iter().find(|turn| {
+                    turn.thread_id == window_turn.thread_id && turn.turn_id == window_turn.turn_id
+                });
+                let model = turn
+                    .and_then(|turn| turn.model.as_deref())
+                    .unwrap_or("unknown");
+                let effort = turn
+                    .and_then(|turn| turn.reasoning_effort.as_deref())
+                    .unwrap_or("unknown");
+                let message = turn
+                    .and_then(|turn| turn.message_preview.as_deref())
+                    .unwrap_or("-");
+                let turn_ref = format!(
+                    "{}/{}",
+                    short_id(&window_turn.thread_id),
+                    short_id(&window_turn.turn_id)
+                );
+                let _ = writeln!(
+                    output,
+                    "    {:>8} {:>8} {:>12} {:<16} {:<7} {:<17}  {}",
+                    format!("{:.2}%", window_turn.usage.local_token_share_percent),
+                    estimated_percent(
+                        window_turn.usage.estimated_quota_percent,
+                        window_turn.usage.quota_confidence
+                    ),
+                    compact_tokens(window_turn.usage.token_usage),
+                    terminal_safe_text(model),
+                    terminal_safe_text(effort),
+                    terminal_safe_text(&turn_ref),
+                    terminal_safe_text(message)
+                );
+            }
+        }
+
+        let mut models = analysis
+            .models
+            .iter()
+            .filter(|model| !model.token_usage.is_zero() || model.estimated_quota_percent > 0.0)
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            right
+                .token_usage
+                .total_tokens
+                .cmp(&left.token_usage.total_tokens)
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        if !models.is_empty() {
+            let _ = writeln!(output, "  Models");
+            let _ = writeln!(
+                output,
+                "    {:>8} {:>8} {:>12}  MODEL",
+                "LOCAL%", "EST.Q%", "TOKENS"
+            );
+            for model in models {
+                let _ = writeln!(
+                    output,
+                    "    {:>8} {:>8} {:>12}  {}",
+                    format!("{:.2}%", model.local_token_share_percent),
+                    estimated_percent(model.estimated_quota_percent, model.quota_confidence),
+                    compact_tokens(model.token_usage),
+                    terminal_safe_text(&model.model)
+                );
+            }
+        }
+    }
+}
+
+fn estimated_percent(value: f64, confidence: Confidence) -> String {
+    if confidence == Confidence::Unknown {
+        "-".to_string()
+    } else {
+        format!("{value:.2}%")
+    }
 }
 
 fn compact_tokens(usage: TokenUsage) -> String {
@@ -417,8 +658,9 @@ fn status_evidence(provenance: Provenance, confidence: Confidence) -> String {
 mod tests {
     use super::*;
     use crate::domain::{
-        AttributionSummary, CollectionStats, LimitBucket, Provenance, SourceStatus, TaskRecord,
-        TaskStatus, TurnRecord, TurnStatus,
+        AttributionSummary, CollectionStats, LimitBucket, ModelUsage, Provenance, SourceStatus,
+        TaskRecord, TaskStatus, ThreadWindowUsage, TurnRecord, TurnStatus, TurnWindowUsage,
+        WindowAnalysis, WindowDescriptor, WindowUsage,
     };
 
     #[test]
@@ -446,6 +688,15 @@ mod tests {
     #[test]
     fn partial_status_is_scoped_to_requested_sections() {
         let now = Utc::now();
+        let window_usage = WindowUsage {
+            token_usage: TokenUsage {
+                total_tokens: 42,
+                ..TokenUsage::default()
+            },
+            local_token_share_percent: 100.0,
+            estimated_quota_percent: 1.25,
+            quota_confidence: Confidence::Medium,
+        };
         let snapshot = Snapshot {
             schema_version: 1,
             as_of: now,
@@ -516,6 +767,39 @@ mod tests {
             }],
             models: Vec::new(),
             attribution: AttributionSummary::default(),
+            window_analyses: vec![WindowAnalysis {
+                duration_mins: 10_080,
+                attribution: AttributionSummary {
+                    window: Some(WindowDescriptor {
+                        limit_id: "codex".to_string(),
+                        label: "week".to_string(),
+                        starts_at: now - chrono::Duration::days(5),
+                        ends_at: now + chrono::Duration::days(2),
+                        used_percent: 23.0,
+                    }),
+                    local_token_usage: window_usage.token_usage,
+                    method: "local_tokens_only".to_string(),
+                    ..AttributionSummary::default()
+                },
+                partial: false,
+                partial_reasons: Vec::new(),
+                threads: vec![ThreadWindowUsage {
+                    thread_id: "task-thread".to_string(),
+                    usage: window_usage,
+                }],
+                turns: vec![TurnWindowUsage {
+                    thread_id: "task-thread".to_string(),
+                    turn_id: "task-turn".to_string(),
+                    usage: window_usage,
+                }],
+                models: vec![ModelUsage {
+                    model: "gpt-test".to_string(),
+                    token_usage: window_usage.token_usage,
+                    local_token_share_percent: 100.0,
+                    estimated_quota_percent: 0.0,
+                    quota_confidence: Confidence::Unknown,
+                }],
+            }],
             stats: CollectionStats::default(),
             warnings: Vec::new(),
             errors: vec!["app-server unavailable".to_string()],
@@ -539,6 +823,7 @@ mod tests {
             serde_json::from_str(&render_output(&snapshot, &tasks).unwrap()).unwrap();
         assert_eq!(tasks_json["partial"], true);
         assert_eq!(tasks_json["tasks"][0]["source"], "desktop");
+        assert!(tasks_json.get("windowAnalyses").is_none());
         assert!(tasks_json.get("accountUsage").is_none());
         assert!(tasks_json.get("errors").is_some());
         let turns_json: Value = serde_json::from_str(
@@ -572,6 +857,148 @@ mod tests {
         assert!(text.contains("xhigh"));
         assert!(text.contains("in_progress"));
         assert!(text.contains("message preview"));
+
+        let mut five_hour_partial = snapshot.clone();
+        five_hour_partial.partial = false;
+        five_hour_partial.errors.clear();
+        for source in &mut five_hour_partial.sources {
+            source.status = "ok".to_string();
+            source.message = None;
+        }
+        five_hour_partial.window_analyses[0].duration_mins = 300;
+        five_hour_partial.window_analyses[0].partial = true;
+        five_hour_partial.window_analyses[0]
+            .partial_reasons
+            .push("multiple_active_limit_buckets".to_string());
+        for section in [
+            Section::Tasks,
+            Section::Turns,
+            Section::Models,
+            Section::Attribution,
+        ] {
+            assert!(request_is_partial(
+                &five_hour_partial,
+                &OutputRequest {
+                    sections: BTreeSet::from([section]),
+                    ..tasks.clone()
+                }
+            ));
+        }
+
+        let windows = OutputRequest {
+            sections: BTreeSet::from([Section::Windows]),
+            ..tasks.clone()
+        };
+        assert!(request_is_partial(&snapshot, &windows));
+        assert!(!request_is_failure(&snapshot, &windows));
+        let windows_json: Value =
+            serde_json::from_str(&render_output(&snapshot, &windows).unwrap()).unwrap();
+        assert_eq!(windows_json["windowAnalyses"][0]["durationMins"], 10_080);
+        assert_eq!(windows_json["windowAnalyses"][0]["partial"], false);
+        assert!(
+            windows_json["windowAnalyses"][0]
+                .get("partialReasons")
+                .is_none()
+        );
+        assert_eq!(
+            windows_json["windowAnalyses"][0]["attribution"]["window"]["label"],
+            "week"
+        );
+        assert_eq!(
+            windows_json["windowAnalyses"][0]["threads"][0]["usage"]["localTokenSharePercent"],
+            100.0
+        );
+        assert!(windows_json.get("tasks").is_none());
+        assert!(windows_json.get("turns").is_none());
+        assert!(windows_json.get("models").is_none());
+        assert!(windows_json.get("attribution").is_none());
+
+        let full_json: Value = serde_json::from_str(
+            &render_output(
+                &snapshot,
+                &OutputRequest {
+                    sections: Section::all(),
+                    ..tasks.clone()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(full_json.get("windowAnalyses").is_some());
+        assert!(full_json.get("tasks").is_some());
+        assert!(full_json.get("attribution").is_some());
+
+        let windows_text = render_output(
+            &snapshot,
+            &OutputRequest {
+                format: OutputFormat::Text,
+                compact: false,
+                ..windows.clone()
+            },
+        )
+        .unwrap();
+        assert!(windows_text.contains("week | codex | 10080m"));
+        assert!(windows_text.contains(&(now - chrono::Duration::days(5)).to_rfc3339()));
+        assert!(windows_text.contains(&(now + chrono::Duration::days(2)).to_rfc3339()));
+        assert!(windows_text.contains("task"));
+        assert!(windows_text.contains("gpt-test"));
+        assert!(windows_text.contains("xhigh"));
+        assert!(windows_text.contains("message preview"));
+        assert!(windows_text.contains("100.00%"));
+        assert!(windows_text.contains("        -"));
+
+        let mut partial_window = snapshot.clone();
+        partial_window.window_analyses[0].partial = true;
+        partial_window.window_analyses[0]
+            .partial_reasons
+            .push("rollout_lookback_incomplete".to_string());
+        let partial_window_text = render_output(
+            &partial_window,
+            &OutputRequest {
+                format: OutputFormat::Text,
+                compact: false,
+                ..windows.clone()
+            },
+        )
+        .unwrap();
+        assert!(partial_window_text.contains("[PARTIAL]"));
+        assert!(partial_window_text.contains("rollout_lookback_incomplete"));
+
+        let mut zero_call_window = snapshot.clone();
+        let analysis = &mut zero_call_window.window_analyses[0];
+        analysis.attribution.local_token_usage = TokenUsage::default();
+        analysis.threads.clear();
+        analysis.turns.clear();
+        analysis.models.clear();
+        assert!(!request_is_failure(&zero_call_window, &windows));
+        assert!(
+            render_output(
+                &zero_call_window,
+                &OutputRequest {
+                    format: OutputFormat::Text,
+                    compact: false,
+                    ..windows.clone()
+                }
+            )
+            .unwrap()
+            .contains("no local token events in this reset cycle")
+        );
+
+        let mut no_windows = snapshot.clone();
+        no_windows.window_analyses.clear();
+        assert!(request_is_failure(&no_windows, &windows));
+        assert!(
+            render_output(
+                &no_windows,
+                &OutputRequest {
+                    format: OutputFormat::Text,
+                    compact: false,
+                    ..windows.clone()
+                }
+            )
+            .unwrap()
+            .contains("unavailable")
+        );
 
         let mut empty_snapshot = snapshot.clone();
         empty_snapshot.tasks.clear();
