@@ -39,6 +39,8 @@ const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
 const TAB_PADDING: &str = " ";
 const TAB_DIVIDER: &str = " | ";
+const ENTER_FOCUS_HINT: &str = "↵";
+const BACK_FOCUS_HINT: &str = "←";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Theme {
@@ -153,6 +155,15 @@ impl TaskSourceFilter {
         }
     }
 
+    fn shortcut(self) -> char {
+        match self {
+            Self::All => 'A',
+            Self::Desktop => 'D',
+            Self::Subagent => 'S',
+            Self::Cli => 'C',
+        }
+    }
+
     fn matches(self, source: Option<&str>) -> bool {
         match self {
             Self::All => true,
@@ -195,6 +206,26 @@ struct ViewTabsHitbox {
     tabs: [Rect; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollTarget {
+    Tasks,
+    Turns,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbarHitbox {
+    track: Rect,
+    thumb: Rect,
+    max_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollDrag {
+    target: ScrollTarget,
+    grab_row: u16,
+    pointer_row: Option<u16>,
+}
+
 impl TableHitbox {
     fn index_at(self, column: u16, row: u16) -> Option<usize> {
         let inside = column >= self.rows.x
@@ -220,6 +251,14 @@ impl View {
             Self::Overview => "Overview",
             Self::Window => "Window",
             Self::Health => "Data health",
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::Overview => '1',
+            Self::Window => '2',
+            Self::Health => '3',
         }
     }
 
@@ -271,6 +310,9 @@ struct App {
     turn_table_hitbox: Option<TableHitbox>,
     task_controls_hitbox: Option<TaskControlsHitbox>,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
+    task_scrollbar_hitbox: Option<ScrollbarHitbox>,
+    turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
+    scroll_drag: Option<ScrollDrag>,
     turn_reveal_pending: bool,
     worker_running: bool,
     last_local_refresh: Instant,
@@ -302,6 +344,9 @@ impl App {
             turn_table_hitbox: None,
             task_controls_hitbox: None,
             view_tabs_hitbox: None,
+            task_scrollbar_hitbox: None,
+            turn_scrollbar_hitbox: None,
+            scroll_drag: None,
             turn_reveal_pending: false,
             worker_running: false,
             last_local_refresh: Instant::now(),
@@ -595,6 +640,9 @@ impl App {
         self.turn_table_hitbox = None;
         self.task_controls_hitbox = None;
         self.view_tabs_hitbox = None;
+        self.task_scrollbar_hitbox = None;
+        self.turn_scrollbar_hitbox = None;
+        self.scroll_drag = None;
         let restored_task = selected.as_deref().and_then(|thread_id| {
             self.snapshot
                 .tasks
@@ -918,13 +966,90 @@ impl App {
         };
         self.select_turn(index, false)
     }
+
+    fn scrollbar_hitbox(&self, target: ScrollTarget) -> Option<ScrollbarHitbox> {
+        match target {
+            ScrollTarget::Tasks => self.task_scrollbar_hitbox,
+            ScrollTarget::Turns => self.turn_scrollbar_hitbox,
+        }
+    }
+
+    fn begin_scrollbar_drag_at(&mut self, column: u16, row: u16) -> bool {
+        let Some((target, hitbox)) = [ScrollTarget::Turns, ScrollTarget::Tasks]
+            .into_iter()
+            .find_map(|target| {
+                self.scrollbar_hitbox(target)
+                    .filter(|hitbox| rect_contains(hitbox.track, column, row))
+                    .map(|hitbox| (target, hitbox))
+            })
+        else {
+            return false;
+        };
+        if self.focus == Focus::Search {
+            self.accept_task_search();
+        }
+        self.focus = match target {
+            ScrollTarget::Tasks => Focus::Tasks,
+            ScrollTarget::Turns => Focus::Turns,
+        };
+        let on_thumb = rect_contains(hitbox.thumb, column, row);
+        self.scroll_drag = Some(ScrollDrag {
+            target,
+            grab_row: if on_thumb {
+                row.saturating_sub(hitbox.thumb.y)
+            } else {
+                hitbox.thumb.height / 2
+            },
+            pointer_row: on_thumb.then_some(row),
+        });
+        if !on_thumb {
+            self.drag_scrollbar_to(row);
+        }
+        true
+    }
+
+    fn drag_scrollbar_to(&mut self, row: u16) -> bool {
+        let Some(mut drag) = self.scroll_drag else {
+            return false;
+        };
+        if drag.pointer_row == Some(row) {
+            return true;
+        }
+        drag.pointer_row = Some(row);
+        self.scroll_drag = Some(drag);
+        let Some(hitbox) = self.scrollbar_hitbox(drag.target) else {
+            self.scroll_drag = None;
+            return false;
+        };
+        let travel = hitbox.track.height.saturating_sub(hitbox.thumb.height);
+        let pointer_row = row.saturating_sub(hitbox.track.y);
+        let thumb_row = pointer_row.saturating_sub(drag.grab_row).min(travel);
+        let offset = scale_rounded(
+            usize::from(thumb_row),
+            hitbox.max_offset,
+            usize::from(travel),
+        );
+        match drag.target {
+            ScrollTarget::Tasks => {
+                self.task_reveal_pending = false;
+                self.task_table_offset = offset;
+            }
+            ScrollTarget::Turns => {
+                self.turn_reveal_pending = false;
+                self.turn_offset = offset;
+            }
+        }
+        true
+    }
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            app.scroll_drag = None;
             if app.activate_view_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
+                || app.begin_scrollbar_drag_at(event.column, event.row)
             {
                 true
             } else {
@@ -942,17 +1067,25 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 }
             }
         }
+        MouseEventKind::Drag(MouseButton::Left) => app.drag_scrollbar_to(event.row),
+        MouseEventKind::Up(MouseButton::Left) => app.scroll_drag.take().is_some(),
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = matches!(event.kind, MouseEventKind::ScrollDown);
             if app
-                .turn_table_hitbox
-                .is_some_and(|hitbox| hitbox.contains_viewport(event.column, event.row))
+                .turn_scrollbar_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
+                || app
+                    .turn_table_hitbox
+                    .is_some_and(|hitbox| hitbox.contains_viewport(event.column, event.row))
             {
                 app.scroll_turns(down, MOUSE_SCROLL_LINES);
                 true
             } else if app
-                .task_table_hitbox
-                .is_some_and(|hitbox| hitbox.contains_viewport(event.column, event.row))
+                .task_scrollbar_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
+                || app
+                    .task_table_hitbox
+                    .is_some_and(|hitbox| hitbox.contains_viewport(event.column, event.row))
             {
                 app.scroll_tasks(down, MOUSE_SCROLL_LINES);
                 true
@@ -973,6 +1106,7 @@ fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
     let mut x = area.x;
     for (position, view) in View::ALL.into_iter().enumerate() {
         let width = UnicodeWidthStr::width(TAB_PADDING)
+            + 2
             + UnicodeWidthStr::width(view.label())
             + UnicodeWidthStr::width(TAB_PADDING);
         let width = u16::try_from(width).unwrap_or(u16::MAX);
@@ -1105,9 +1239,21 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('1') => app.view = View::Overview,
         KeyCode::Char('2') => app.view = View::Window,
         KeyCode::Char('3') => app.view = View::Health,
-        KeyCode::Char('t') => app.toggle_theme(),
-        KeyCode::Char('/') | KeyCode::Char('f') if app.view != View::Health => {
+        KeyCode::Char('t' | 'T') => app.toggle_theme(),
+        KeyCode::Char('/') | KeyCode::Char('f' | 'F') if app.view != View::Health => {
             app.begin_task_search();
+        }
+        KeyCode::Char('a' | 'A') if app.view != View::Health => {
+            app.set_task_source_filter(TaskSourceFilter::All);
+        }
+        KeyCode::Char('d' | 'D') if app.view != View::Health => {
+            app.set_task_source_filter(TaskSourceFilter::Desktop);
+        }
+        KeyCode::Char('s' | 'S') if app.view != View::Health => {
+            app.set_task_source_filter(TaskSourceFilter::Subagent);
+        }
+        KeyCode::Char('c' | 'C') if app.view != View::Health => {
+            app.set_task_source_filter(TaskSourceFilter::Cli);
         }
         KeyCode::Char(']') if app.view != View::Health => {
             app.cycle_task_source_filter(true);
@@ -1172,6 +1318,73 @@ fn scroll_offset(
         offset.saturating_add(lines).min(max_offset)
     } else {
         offset.saturating_sub(lines)
+    }
+}
+
+fn scrollbar_geometry(
+    track: Rect,
+    item_count: usize,
+    capacity: usize,
+    offset: usize,
+) -> Option<ScrollbarHitbox> {
+    if track.width == 0 || track.height < 2 || capacity == 0 || item_count <= capacity {
+        return None;
+    }
+    let track_height = usize::from(track.height);
+    let thumb_height = track_height
+        .saturating_mul(capacity)
+        .div_ceil(item_count)
+        .clamp(1, track_height - 1);
+    let max_offset = item_count - capacity;
+    let travel = track_height - thumb_height;
+    let thumb_offset = scale_rounded(offset.min(max_offset), travel, max_offset);
+    Some(ScrollbarHitbox {
+        track,
+        thumb: Rect::new(
+            track.x,
+            track
+                .y
+                .saturating_add(u16::try_from(thumb_offset).unwrap_or(u16::MAX)),
+            1,
+            u16::try_from(thumb_height).unwrap_or(track.height),
+        ),
+        max_offset,
+    })
+}
+
+fn scale_rounded(value: usize, scale: usize, denominator: usize) -> usize {
+    if denominator == 0 {
+        return 0;
+    }
+    let denominator = denominator as u128;
+    let scaled = ((value as u128) * (scale as u128) + denominator / 2) / denominator;
+    usize::try_from(scaled).unwrap_or(usize::MAX)
+}
+
+fn render_scrollbar(frame: &mut Frame<'_>, hitbox: ScrollbarHitbox, theme: Theme, active: bool) {
+    let palette = theme.palette();
+    for row in hitbox.track.y..hitbox.track.bottom() {
+        let in_thumb = row >= hitbox.thumb.y && row < hitbox.thumb.bottom();
+        if let Some(cell) = frame.buffer_mut().cell_mut((hitbox.track.x, row)) {
+            cell.set_symbol(if in_thumb { "█" } else { "│" });
+            cell.set_style(
+                Style::default()
+                    .fg(if in_thumb {
+                        if active {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        }
+                    } else {
+                        palette.border
+                    })
+                    .add_modifier(if in_thumb {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            );
+        }
     }
 }
 
@@ -1267,6 +1480,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.turn_table_hitbox = None;
     app.task_controls_hitbox = None;
     app.view_tabs_hitbox = None;
+    app.task_scrollbar_hitbox = None;
+    app.turn_scrollbar_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
     let root = Layout::default()
@@ -1276,16 +1491,46 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let titles = View::ALL
         .into_iter()
-        .map(|view| Line::from(view.label()))
+        .map(|view| {
+            let selected = view == app.view;
+            let shortcut_active = app.focus != Focus::Search;
+            Line::from(vec![
+                Span::styled(
+                    view.shortcut().to_string(),
+                    Style::default()
+                        .fg(if shortcut_active {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        })
+                        .add_modifier(if shortcut_active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    view.label(),
+                    Style::default()
+                        .fg(if selected {
+                            palette.title
+                        } else {
+                            palette.muted
+                        })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ])
+        })
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
         .select(app.view.index())
         .style(Style::default().fg(palette.muted))
-        .highlight_style(
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default())
         .padding(TAB_PADDING, TAB_PADDING)
         .divider(Span::styled(
             TAB_DIVIDER,
@@ -1298,6 +1543,12 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         View::Overview => render_overview(frame, root[1], app),
         View::Window => render_window(frame, root[1], app),
         View::Health => render_health(frame, root[1], app),
+    };
+    if app
+        .scroll_drag
+        .is_some_and(|drag| app.scrollbar_hitbox(drag.target).is_none())
+    {
+        app.scroll_drag = None;
     }
 }
 
@@ -1647,6 +1898,23 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         offset,
         capacity: visible_capacity,
     });
+    app.task_scrollbar_hitbox = scrollbar_geometry(
+        Rect::new(area.right().saturating_sub(1), rows.y, 1, rows.height),
+        filtered.len(),
+        visible_capacity,
+        offset,
+    );
+    if let Some(scrollbar) = app.task_scrollbar_hitbox {
+        render_scrollbar(
+            frame,
+            scrollbar,
+            theme,
+            app.focus == Focus::Tasks
+                || app
+                    .scroll_drag
+                    .is_some_and(|drag| drag.target == ScrollTarget::Tasks),
+        );
+    }
 }
 
 fn task_panel_block(
@@ -1669,25 +1937,64 @@ fn task_panel_block(
             .fg(palette.title)
             .add_modifier(Modifier::BOLD),
     )];
-    let mut title_x = area.x.saturating_add(1 + title.len() as u16 + 1);
+    let enter_available = app.focus == Focus::Tasks
+        && app
+            .snapshot
+            .tasks
+            .get(app.selected_task)
+            .is_some_and(|task| app.task_matches_filter(task))
+        && app.selected_task_turn_count() > 0;
+    spans.push(Span::raw(" "));
+    let focus_hint = if enter_available {
+        ENTER_FOCUS_HINT
+    } else {
+        " "
+    };
+    spans.push(Span::styled(
+        focus_hint,
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let mut title_x = area
+        .x
+        .saturating_add(1 + title.len() as u16 + 1)
+        .saturating_add(1)
+        .saturating_add(u16::try_from(UnicodeWidthStr::width(focus_hint)).unwrap_or(u16::MAX));
     let mut source_hitboxes = [Rect::default(); 4];
+    let shortcuts_active = app.focus != Focus::Search;
     for filter in TaskSourceFilter::ALL {
         spans.push(Span::raw(" "));
         title_x = title_x.saturating_add(1);
-        let label = format!("[{}]", filter.label(compact));
-        let label_width = label.len() as u16;
+        let label = filter.label(compact);
+        let label_width = u16::try_from(UnicodeWidthStr::width(label) + 2).unwrap_or(u16::MAX);
         source_hitboxes[filter.index()] = title_hitbox(area, title_x, label_width);
-        let style = if app.task_source_filter == filter {
+        let selected = app.task_source_filter == filter;
+        let style = if selected {
             Style::default()
                 .fg(palette.background)
                 .bg(palette.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
+            Style::default().fg(palette.muted)
+        };
+        let shortcut_style = if !shortcuts_active {
+            style
+        } else if selected {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
             Style::default()
-                .fg(palette.muted)
+                .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
         };
-        spans.push(Span::styled(label, style));
+        let mut label_chars = label.chars();
+        let _ = label_chars.next();
+        spans.push(Span::styled("[", style));
+        spans.push(Span::styled(filter.shortcut().to_string(), shortcut_style));
+        spans.push(Span::styled(
+            format!("{}]", label_chars.collect::<String>()),
+            style,
+        ));
         title_x = title_x.saturating_add(label_width);
     }
 
@@ -1704,14 +2011,24 @@ fn task_panel_block(
     } else {
         clear_search.x
     };
-    let search_style = Style::default()
-        .fg(if app.focus == Focus::Search {
-            palette.accent
+    let search_style = if app.focus == Focus::Search {
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    spans.push(Span::styled(
+        "F",
+        if shortcuts_active {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
-            palette.muted
-        })
-        .add_modifier(Modifier::BOLD);
-    spans.push(Span::styled("Filter:", search_style));
+            search_style
+        },
+    ));
+    spans.push(Span::styled("ilter:", search_style));
     let query_start = search_start.saturating_add("Filter:".len() as u16);
     let query_right = if clear_search.is_empty() {
         search_right
@@ -1840,13 +2157,17 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         "Turns"
     };
     let turns_focused = app.focus == Focus::Turns;
-    let table_block = panel(title_base, app.theme)
-        .border_style(Style::default().fg(if turns_focused {
-            app.theme.palette().accent
-        } else {
-            app.theme.palette().border
-        }))
-        .title_bottom(status_legend(app.theme, table_area.width));
+    let table_block = panel_with_focus_hint(
+        title_base,
+        turns_focused.then_some(BACK_FOCUS_HINT),
+        app.theme,
+    )
+    .border_style(Style::default().fg(if turns_focused {
+        app.theme.palette().accent
+    } else {
+        app.theme.palette().border
+    }))
+    .title_bottom(status_legend(app.theme, table_area.width));
     let table_inner = table_block.inner(table_area);
     let visible_capacity = usize::from(table_inner.height.saturating_sub(1));
     app.turn_offset = app
@@ -1964,6 +2285,23 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         offset,
         capacity: visible_capacity,
     });
+    app.turn_scrollbar_hitbox = scrollbar_geometry(
+        Rect::new(table_area.right().saturating_sub(1), rows.y, 1, rows.height),
+        turns.len(),
+        visible_capacity,
+        offset,
+    );
+    if let Some(scrollbar) = app.turn_scrollbar_hitbox {
+        render_scrollbar(
+            frame,
+            scrollbar,
+            theme,
+            app.focus == Focus::Turns
+                || app
+                    .scroll_drag
+                    .is_some_and(|drag| drag.target == ScrollTarget::Turns),
+        );
+    }
 
     if let Some(detail_area) = detail_area {
         render_turn_detail(
@@ -2248,16 +2586,30 @@ fn render_attribution(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, th
 }
 
 fn panel(title: &str, theme: Theme) -> Block<'_> {
+    panel_with_focus_hint(title, None, theme)
+}
+
+fn panel_with_focus_hint<'a>(title: &'a str, hint: Option<&'a str>, theme: Theme) -> Block<'a> {
     let palette = theme.palette();
+    let mut title_spans = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(hint) = hint {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            hint,
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette.border))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(palette.title)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(Line::from(title_spans))
 }
 
 fn table_header<const N: usize>(labels: [&str; N], theme: Theme) -> Row<'static> {
@@ -2778,6 +3130,34 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_geometry_maps_offsets_to_a_proportional_thumb() {
+        let track = Rect::new(79, 7, 1, 10);
+        assert!(scrollbar_geometry(track, 10, 10, 0).is_none());
+        assert!(scrollbar_geometry(Rect::default(), 100, 10, 0).is_none());
+        assert!(scrollbar_geometry(Rect::new(0, 0, 1, 1), 2, 1, 0).is_none());
+        assert_eq!(
+            scrollbar_geometry(Rect::new(0, 0, 1, 4), 5, 4, 0)
+                .unwrap()
+                .thumb
+                .height,
+            3
+        );
+
+        let top = scrollbar_geometry(track, 100, 20, 0).unwrap();
+        assert_eq!(top.thumb, Rect::new(79, 7, 1, 2));
+        assert_eq!(top.max_offset, 80);
+
+        let middle = scrollbar_geometry(track, 100, 20, 40).unwrap();
+        assert_eq!(middle.thumb, Rect::new(79, 11, 1, 2));
+
+        let bottom = scrollbar_geometry(track, 100, 20, 80).unwrap();
+        assert_eq!(bottom.thumb, Rect::new(79, 15, 1, 2));
+        assert_eq!(scale_rounded(0, 80, 8), 0);
+        assert_eq!(scale_rounded(4, 80, 8), 40);
+        assert_eq!(scale_rounded(8, 80, 8), 80);
+    }
+
+    #[test]
     fn turn_detail_allocation_never_reduces_table_capacity_as_height_grows() {
         let mut previous_capacity = 0;
         for height in 7_u16..=40 {
@@ -2945,6 +3325,83 @@ mod tests {
         ));
         assert_eq!(app.task_table_offset, scrolled_offset);
         assert_eq!(app.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn shortcut_labels_highlight_real_bindings_and_direct_source_keys() {
+        let mut app = interaction_test_app(8, 1);
+        for (index, source) in [
+            "desktop", "subagent", "cli", "desktop", "subagent", "cli", "desktop", "subagent",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.snapshot.tasks[index].source = Some(source.to_string());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let palette = app.theme.palette();
+        let buffer = terminal.backend().buffer();
+        let controls = app.task_controls_hitbox.unwrap();
+        assert_eq!(buffer[(controls.search.x, controls.search.y)].symbol(), "F");
+        assert_eq!(
+            buffer[(controls.search.x, controls.search.y)].fg,
+            palette.accent
+        );
+
+        for filter in TaskSourceFilter::ALL {
+            let button = controls.sources[filter.index()];
+            let shortcut = &buffer[(button.x + 1, button.y)];
+            assert_eq!(shortcut.symbol(), filter.shortcut().to_string());
+            if filter == TaskSourceFilter::All {
+                assert!(shortcut.modifier.contains(Modifier::UNDERLINED));
+            } else {
+                assert_eq!(shortcut.fg, palette.accent);
+                assert!(shortcut.modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        let tabs = app.view_tabs_hitbox.unwrap();
+        for view in View::ALL {
+            let tab = tabs.tabs[view.index()];
+            let shortcut = &buffer[(tab.x + 1, tab.y)];
+            assert_eq!(shortcut.symbol(), view.shortcut().to_string());
+            assert_eq!(shortcut.fg, palette.accent);
+        }
+
+        for (key, expected) in [
+            ('d', TaskSourceFilter::Desktop),
+            ('S', TaskSourceFilter::Subagent),
+            ('c', TaskSourceFilter::Cli),
+            ('A', TaskSourceFilter::All),
+        ] {
+            handle_key_event(&mut app, key_event(KeyCode::Char(key)));
+            assert_eq!(app.task_source_filter, expected);
+        }
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('d')));
+        assert_eq!(app.focus, Focus::Search);
+        assert_eq!(app.task_search, "d");
+        assert_eq!(app.task_source_filter, TaskSourceFilter::All);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let controls = app.task_controls_hitbox.unwrap();
+        assert_eq!(
+            buffer[(controls.search.x, controls.search.y)].fg,
+            palette.title
+        );
+        let all = controls.sources[TaskSourceFilter::All.index()];
+        assert!(
+            !buffer[(all.x + 1, all.y)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        let desktop = controls.sources[TaskSourceFilter::Desktop.index()];
+        assert_eq!(buffer[(desktop.x + 1, desktop.y)].fg, palette.muted);
+        let overview = app.view_tabs_hitbox.unwrap().tabs[View::Overview.index()];
+        assert_eq!(buffer[(overview.x + 1, overview.y)].fg, palette.muted);
     }
 
     #[test]
@@ -3362,14 +3819,75 @@ mod tests {
     }
 
     #[test]
+    fn focus_transition_hints_follow_available_keyboard_actions_without_layout_shift() {
+        let mut app = interaction_test_app(1, 2);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let palette = app.theme.palette();
+        let task_controls = app.task_controls_hitbox.unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == ENTER_FOCUS_HINT && cell.fg == palette.accent)
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() != BACK_FOCUS_HINT)
+        );
+
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() != ENTER_FOCUS_HINT)
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == BACK_FOCUS_HINT && cell.fg == palette.accent)
+        );
+        assert_eq!(app.task_controls_hitbox.unwrap(), task_controls);
+
+        handle_key_event(&mut app, key_event(KeyCode::Backspace));
+        handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().all(|cell| {
+                cell.symbol() != ENTER_FOCUS_HINT && cell.symbol() != BACK_FOCUS_HINT
+            })
+        );
+        assert_eq!(app.task_controls_hitbox.unwrap(), task_controls);
+
+        let mut no_turns = interaction_test_app(1, 0);
+        terminal.draw(|frame| render(frame, &mut no_turns)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() != ENTER_FOCUS_HINT)
+        );
+    }
+
+    #[test]
     fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
         let mut app = interaction_test_app(3, 2);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let tabs = app.view_tabs_hitbox.expect("view tabs should render");
-        assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 10, 1));
-        assert_eq!(tabs.tabs[View::Window.index()], Rect::new(13, 0, 8, 1));
-        assert_eq!(tabs.tabs[View::Health.index()], Rect::new(24, 0, 13, 1));
+        assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 12, 1));
+        assert_eq!(tabs.tabs[View::Window.index()], Rect::new(15, 0, 10, 1));
+        assert_eq!(tabs.tabs[View::Health.index()], Rect::new(28, 0, 15, 1));
 
         let divider = tabs.tabs[View::Overview.index()].right();
         assert!(!handle_mouse_event(
@@ -3486,6 +4004,160 @@ mod tests {
         assert!(app.selected_task >= window.offset);
         assert!(app.selected_task < window.offset + usize::from(window.rows.height));
         assert!(!app.task_reveal_pending);
+    }
+
+    #[test]
+    fn task_and_turn_scrollbars_drag_without_changing_selection_or_wheel_behavior() {
+        let mut app = interaction_test_app(30, 30);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let task_bar = app.task_scrollbar_hitbox.expect("task scrollbar");
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                task_bar.thumb.x,
+                task_bar.thumb.y,
+            ),
+        ));
+        assert_eq!(app.task_table_offset, 0);
+        assert_eq!(app.selected_task, 0);
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                task_bar.track.bottom().saturating_add(10),
+            ),
+        ));
+        assert_eq!(app.task_table_offset, task_bar.max_offset);
+        assert_eq!(app.selected_task, 0);
+        assert_eq!(app.focus, Focus::Tasks);
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+        ));
+        let dragged_offset = app.task_table_offset;
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+        ));
+        assert_eq!(app.task_table_offset, dragged_offset);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let task_bar = app.task_scrollbar_hitbox.expect("task scrollbar");
+        assert_eq!(task_bar.thumb.bottom(), task_bar.track.bottom());
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::ScrollUp, task_bar.track.x, task_bar.track.y,),
+        ));
+        assert_eq!(
+            app.task_table_offset,
+            dragged_offset.saturating_sub(MOUSE_SCROLL_LINES)
+        );
+        assert_eq!(app.selected_task, 0);
+
+        app.begin_task_search();
+        let turn_bar = app.turn_scrollbar_hitbox.expect("turn scrollbar");
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                turn_bar.track.x,
+                turn_bar.track.bottom().saturating_sub(1),
+            ),
+        ));
+        assert_eq!(app.focus, Focus::Turns);
+        assert_eq!(app.turn_offset, turn_bar.max_offset);
+        assert_eq!(app.selected_turn, 0);
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                turn_bar.track.x,
+                turn_bar.track.bottom().saturating_sub(1),
+            ),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let turn_bar = app.turn_scrollbar_hitbox.expect("turn scrollbar");
+        assert_eq!(turn_bar.thumb.bottom(), turn_bar.track.bottom());
+    }
+
+    #[test]
+    fn horizontal_drag_on_a_scrollbar_thumb_does_not_quantize_the_offset() {
+        let mut app = mouse_test_app(100);
+        app.task_table_offset = 44;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let scrollbar = app.task_scrollbar_hitbox.expect("task scrollbar");
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.thumb.x,
+                scrollbar.thumb.y,
+            ),
+        ));
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                scrollbar.thumb.x.saturating_sub(10),
+                scrollbar.thumb.y,
+            ),
+        ));
+        assert_eq!(app.task_table_offset, 44);
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                scrollbar.track.bottom().saturating_sub(1),
+            ),
+        ));
+        assert!(app.task_table_offset > 44);
+    }
+
+    #[test]
+    fn filtered_task_scrollbar_keeps_row_clicks_mapped_to_absolute_tasks() {
+        let mut app = interaction_test_app(30, 1);
+        for index in 0..30 {
+            app.snapshot.tasks[index].source =
+                Some(if index % 2 == 0 { "cli" } else { "desktop" }.to_string());
+        }
+        app.set_task_source_filter(TaskSourceFilter::Cli);
+        let filtered = app.filtered_task_indices();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let scrollbar = app.task_scrollbar_hitbox.expect("filtered task scrollbar");
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.track.x,
+                scrollbar.track.bottom().saturating_sub(1),
+            ),
+        ));
+        assert_eq!(app.task_table_offset, scrollbar.max_offset);
+        handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.track.x,
+                scrollbar.track.bottom().saturating_sub(1),
+            ),
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = app.task_table_hitbox.unwrap().rows;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), rows.x, rows.y),
+        ));
+        assert_eq!(app.selected_task, filtered[scrollbar.max_offset]);
     }
 
     #[test]

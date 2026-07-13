@@ -73,10 +73,10 @@ codex-usage-monit attribution --format text
 - `1` / `2` / `3`：Overview、Window、Data Health；
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
-- `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；
+- `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；可执行时，聚焦面板标题分别显示 `↵` / `←`；
 - `/` / `f`：按 task 标题或项目名编辑筛选；输入时可用左右方向键、`Home` / `End` 移动光标，`Backspace` / `Delete` 编辑，`Enter` / `Tab` 确认，`Esc` 取消本次编辑；
-- `[` / `]`：在 All、Desktop、Subagent、CLI 来源间切换；非输入状态下 `Delete` 清空名称筛选；
-- 鼠标左键：点击最上方视图 tab、顶栏筛选控件，或选择 Tasks / Turns 数据行并把键盘焦点切到该面板；
+- `A` / `D` / `S` / `C`：直接切换 All、Desktop、Subagent、CLI 来源，`[` / `]` 循环切换；非输入状态下 `Delete` 清空名称筛选；
+- 鼠标左键：点击最上方视图 tab、顶栏筛选控件，或选择 Tasks / Turns 数据行并把键盘焦点切到该面板；右侧滚动条支持点击轨道和按住拖动；
 - 鼠标滚轮：只滚动所在的 Tasks 或 Turns viewport，每格 3 行，不改变当前选择或键盘焦点；
 - `PageUp` / `PageDown`：滚动当前焦点所在的 Tasks 或 Turns viewport；
 - `t`：在 dark 与 light 主题间切换；

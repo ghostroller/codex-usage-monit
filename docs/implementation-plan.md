@@ -105,7 +105,7 @@ Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单
 
 TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
 
-Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。
+Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。可执行焦点跳转时，Tasks/Turns 标题分别显示 `↵` / `←`；Tasks 标题始终预留固定提示宽度，避免筛选控件随焦点切换位移。可见按钮把真实快捷键拆为独立 accent/bold span，标签整体继续共享同一鼠标 hitbox；Tasks/Turns 右边框由共享几何函数绘制比例滚动条，Down/Drag/Up 状态只更新对应 viewport offset，轨道点击、滚轮与数据行选择保持独立。
 
 TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
 
@@ -142,7 +142,7 @@ Estimated 部分：
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：窗口、reset drift、server/local mismatch、correction epoch、long gap、settled；
 - output/CLI：camelCase、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、顶层视图 tab 点击、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、滚轮与选择独立、跨刷新 ID 保持、5h 缺失但 week 可用的 Models unavailable、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、真实快捷键字符样式与直达键、顶层视图 tab 点击、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、5h 缺失但 week 可用的 Models unavailable、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 
