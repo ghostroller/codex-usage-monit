@@ -42,6 +42,59 @@ fn config(home: &std::path::Path) -> CollectConfig {
 }
 
 #[test]
+fn latest_session_index_title_overrides_the_first_message_without_bypassing_redaction() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-titled.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "renamed-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Original first message"}
+            }),
+        ],
+        false,
+    );
+    // Timestamp order, rather than file order, determines the latest rename.
+    write_jsonl(
+        &temp.path().join("session_index.jsonl"),
+        &[
+            json!({
+                "id": "renamed-thread",
+                "thread_name": "Current Desktop title",
+                "updated_at": timestamp(now + chrono::Duration::seconds(2))
+            }),
+            json!({
+                "id": "renamed-thread",
+                "thread_name": "Older title written later",
+                "updated_at": timestamp(now + chrono::Duration::seconds(1))
+            }),
+            json!({
+                "id": "renamed-thread",
+                "thread_name": "   ",
+                "updated_at": timestamp(now + chrono::Duration::seconds(3))
+            }),
+        ],
+        true,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(dataset.tasks[0].title, "Current Desktop title");
+
+    let mut redacted = config(temp.path());
+    redacted.redact_content = true;
+    let dataset = scan_rollouts(&redacted, now).unwrap();
+    assert_eq!(dataset.tasks[0].title, "[redacted]");
+}
+
+#[test]
 fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -229,6 +282,126 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
             .iter()
             .any(|warning| warning.contains("malformed JSON"))
     );
+}
+
+#[test]
+fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/2026/07/13/rollout-service-tier.jsonl");
+    let event = |offset: i64, payload: Value| {
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(offset)),
+            "type": "event_msg",
+            "payload": payload
+        })
+    };
+    let records = vec![
+        json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "tier-thread", "timestamp": timestamp(now)}
+        }),
+        event(
+            1,
+            json!({"type": "task_started", "turn_id": "tierless-finished-turn"}),
+        ),
+        event(
+            2,
+            json!({"type": "task_complete", "turn_id": "tierless-finished-turn"}),
+        ),
+        event(
+            3,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "default"}
+            }),
+        ),
+        event(
+            4,
+            json!({"type": "task_started", "turn_id": "default-turn"}),
+        ),
+        event(
+            5,
+            json!({"type": "task_complete", "turn_id": "default-turn"}),
+        ),
+        event(
+            6,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "priority"}
+            }),
+        ),
+        event(7, json!({"type": "task_started", "turn_id": "fast-turn"})),
+        event(8, json!({"type": "task_complete", "turn_id": "fast-turn"})),
+        // Live rollouts do not necessarily repeat unchanged thread settings.
+        event(
+            9,
+            json!({"type": "task_started", "turn_id": "inherited-fast-turn"}),
+        ),
+        event(
+            10,
+            json!({"type": "task_complete", "turn_id": "inherited-fast-turn"}),
+        ),
+        // Replayed activation events must not backfill a completed historical turn.
+        event(
+            11,
+            json!({"type": "task_started", "turn_id": "tierless-finished-turn"}),
+        ),
+        event(
+            12,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "future-tier"}
+            }),
+        ),
+        event(
+            13,
+            json!({"type": "task_started", "turn_id": "unknown-tier-turn"}),
+        ),
+        event(
+            14,
+            json!({"type": "task_complete", "turn_id": "unknown-tier-turn"}),
+        ),
+    ];
+    write_jsonl(&path, &records, false);
+
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(15)).unwrap();
+    let turn = |id: &str| {
+        dataset
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == id)
+            .unwrap()
+    };
+
+    let default_turn = turn("default-turn");
+    assert_eq!(default_turn.service_tier.as_deref(), Some("default"));
+    assert!(!default_turn.is_fast());
+
+    let tierless_finished_turn = turn("tierless-finished-turn");
+    assert_eq!(tierless_finished_turn.service_tier, None);
+    assert!(!tierless_finished_turn.is_fast());
+
+    let fast_turn = turn("fast-turn");
+    assert_eq!(fast_turn.service_tier.as_deref(), Some("priority"));
+    assert!(fast_turn.is_fast());
+
+    let inherited_fast_turn = turn("inherited-fast-turn");
+    assert_eq!(
+        inherited_fast_turn.service_tier.as_deref(),
+        Some("priority")
+    );
+    assert!(inherited_fast_turn.is_fast());
+
+    let unknown_tier_turn = turn("unknown-tier-turn");
+    assert_eq!(
+        unknown_tier_turn.service_tier.as_deref(),
+        Some("future-tier")
+    );
+    assert!(!unknown_tier_turn.is_fast());
 }
 
 #[test]
@@ -564,6 +737,14 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             "payload": {"type": "task_complete", "turn_id": parent_turn}
         }),
         json!({
+            "timestamp": timestamp(child_created + chrono::Duration::milliseconds(4)),
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "priority"}
+            }
+        }),
+        json!({
             "timestamp": timestamp(child_created + chrono::Duration::milliseconds(300)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": child_turn, "started_at": child_created.timestamp()}
@@ -609,6 +790,8 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
         Some("implement the child task")
     );
     assert_eq!(dataset.turns[0].token_usage.total_tokens, 25);
+    assert_eq!(dataset.turns[0].service_tier, None);
+    assert!(!dataset.turns[0].is_fast());
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 25);
     assert_eq!(dataset.rate_observations.len(), 1);

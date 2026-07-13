@@ -754,6 +754,7 @@ mod tests {
                 turn_id: "task-turn".to_string(),
                 model: Some("gpt-test".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
+                service_tier: Some("priority".to_string()),
                 message_preview: Some("message preview".to_string()),
                 started_at: None,
                 completed_at: None,
@@ -839,6 +840,7 @@ mod tests {
         .unwrap();
         assert_eq!(turns_json["turns"][0]["messagePreview"], "message preview");
         assert_eq!(turns_json["turns"][0]["status"], "in_progress");
+        assert_eq!(turns_json["turns"][0]["serviceTier"], "priority");
         let limits_json: Value =
             serde_json::from_str(&render_output(&snapshot, &limits).unwrap()).unwrap();
         assert_eq!(limits_json["partial"], true);
@@ -1024,6 +1026,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             model: None,
             reasoning_effort: None,
+            service_tier: None,
             message_preview: None,
             started_at: None,
             completed_at: None,

@@ -252,6 +252,10 @@ pub struct TurnRecord {
     pub turn_id: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Service tier captured from Codex's `thread_settings_applied` event.
+    /// `None` means the rollout did not expose the setting for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub message_preview: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -262,6 +266,12 @@ pub struct TurnRecord {
     pub local_token_share_percent: f64,
     pub estimated_quota_percent: f64,
     pub quota_confidence: Confidence,
+}
+
+impl TurnRecord {
+    pub fn is_fast(&self) -> bool {
+        self.service_tier.as_deref() == Some("priority")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

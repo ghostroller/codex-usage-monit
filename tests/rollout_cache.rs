@@ -94,6 +94,320 @@ fn unchanged_scan_reuses_files_and_recomputes_freshness() {
 }
 
 #[test]
+fn cached_scan_refreshes_session_titles_without_reparsing_rollouts() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-renamed.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "renamed-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fallback message title"}
+            }),
+        ],
+    );
+    let index_path = temp.path().join("session_index.jsonl");
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "renamed-thread",
+            "thread_name": "Initial session title",
+            "updated_at": timestamp(now)
+        })],
+    );
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let first = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(first.tasks[0].title, "Initial session title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+    assert!(!cache.last_refresh().session_index_reused);
+
+    let unchanged = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(unchanged.tasks[0].title, "Initial session title");
+    assert_eq!(cache.last_refresh().session_index_reads, 0);
+    assert!(cache.last_refresh().session_index_reused);
+
+    write_jsonl(
+        &index_path,
+        &[
+            json!({
+                "id": "renamed-thread",
+                "thread_name": "Initial session title",
+                "updated_at": timestamp(now)
+            }),
+            json!({
+                "id": "renamed-thread",
+                "thread_name": "Renamed while TUI is running",
+                "updated_at": timestamp(now + chrono::Duration::seconds(1))
+            }),
+        ],
+    );
+    let second = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+
+    assert_eq!(second.tasks[0].title, "Renamed while TUI is running");
+    assert_eq!(cache.last_refresh().reused_files, 1);
+    assert_eq!(cache.last_refresh().reparsed_files, 0);
+    assert!(!cache.last_refresh().rebuilt);
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+    assert!(!cache.last_refresh().session_index_reused);
+}
+
+#[test]
+fn cached_session_titles_follow_index_deletion_and_recreation() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let rollout_path = temp.path().join("sessions/rollout-index-lifecycle.jsonl");
+    write_jsonl(
+        &rollout_path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "lifecycle-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fallback lifecycle title"}
+            }),
+        ],
+    );
+    let index_path = temp.path().join("session_index.jsonl");
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "lifecycle-thread",
+            "thread_name": "Indexed lifecycle title",
+            "updated_at": timestamp(now)
+        })],
+    );
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let indexed = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(indexed.tasks[0].title, "Indexed lifecycle title");
+
+    fs::remove_file(&index_path).unwrap();
+    let deleted = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(deleted.tasks[0].title, "Fallback lifecycle title");
+    assert_eq!(cache.last_refresh().session_index_reads, 0);
+    assert!(!cache.last_refresh().session_index_reused);
+
+    cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(cache.last_refresh().session_index_reads, 0);
+    assert!(cache.last_refresh().session_index_reused);
+
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "lifecycle-thread",
+            "thread_name": "Recreated lifecycle title",
+            "updated_at": timestamp(now + chrono::Duration::seconds(3))
+        })],
+    );
+    let recreated = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .unwrap();
+    assert_eq!(recreated.tasks[0].title, "Recreated lifecycle title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+}
+
+#[test]
+fn session_title_cache_is_scoped_to_codex_home_and_redaction() {
+    let first_home = TempDir::new().unwrap();
+    let second_home = TempDir::new().unwrap();
+    let now = Utc::now();
+    for (home, title) in [
+        (&first_home, "First home title"),
+        (&second_home, "Second home title"),
+    ] {
+        write_jsonl(
+            &home.path().join("sessions/rollout-key.jsonl"),
+            &[
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "session_meta",
+                    "payload": {"id": "key-thread", "timestamp": timestamp(now)}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "Fallback key title"}
+                }),
+            ],
+        );
+        write_jsonl(
+            &home.path().join("session_index.jsonl"),
+            &[json!({
+                "id": "key-thread",
+                "thread_name": title,
+                "updated_at": timestamp(now)
+            })],
+        );
+    }
+
+    let mut cache = RolloutCache::new();
+    let first_config = config(first_home.path());
+    let first = cache.scan(&first_config, now).unwrap();
+    assert_eq!(first.tasks[0].title, "First home title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+
+    let second_config = config(second_home.path());
+    let second = cache.scan(&second_config, now).unwrap();
+    assert_eq!(second.tasks[0].title, "Second home title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+
+    let mut redacted = second_config.clone();
+    redacted.redact_content = true;
+    let hidden = cache.scan(&redacted, now).unwrap();
+    assert_eq!(hidden.tasks[0].title, "[redacted]");
+    assert_eq!(cache.last_refresh().session_index_reads, 0);
+    assert!(!cache.last_refresh().session_index_reused);
+
+    fs::remove_file(second_home.path().join("session_index.jsonl")).unwrap();
+    let visible_again = cache.scan(&second_config, now).unwrap();
+    assert_eq!(visible_again.tasks[0].title, "Fallback key title");
+    assert_eq!(cache.last_refresh().session_index_reads, 0);
+}
+
+#[test]
+fn cached_session_titles_recover_when_a_partial_line_is_completed() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-partial-title.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "partial-thread", "timestamp": timestamp(now)}
+        })],
+    );
+    let index_path = temp.path().join("session_index.jsonl");
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "partial-thread",
+            "thread_name": "Complete title",
+            "updated_at": timestamp(now)
+        })],
+    );
+    let mut index = OpenOptions::new().append(true).open(&index_path).unwrap();
+    write!(
+        index,
+        "{{\"id\":\"partial-thread\",\"thread_name\":\"Recovered title"
+    )
+    .unwrap();
+    index.flush().unwrap();
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let partial = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(partial.tasks[0].title, "Complete title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+
+    writeln!(
+        index,
+        "\",\"updated_at\":\"{}\"}}",
+        timestamp(now + chrono::Duration::seconds(1))
+    )
+    .unwrap();
+    index.flush().unwrap();
+    let recovered = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(recovered.tasks[0].title, "Recovered title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+}
+
+#[test]
+fn session_index_read_errors_are_retried() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-index-error.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "error-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fallback after index error"}
+            }),
+        ],
+    );
+    let index_path = temp.path().join("session_index.jsonl");
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "error-thread",
+            "thread_name": "Previously cached title",
+            "updated_at": timestamp(now)
+        })],
+    );
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let cached = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(cached.tasks[0].title, "Previously cached title");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+
+    fs::remove_file(&index_path).unwrap();
+    fs::create_dir(&index_path).unwrap();
+    let first = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(first.tasks[0].title, "Fallback after index error");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("session title index unavailable"))
+    );
+
+    let second = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(second.tasks[0].title, "Fallback after index error");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+    assert!(!cache.last_refresh().session_index_reused);
+
+    fs::remove_dir(&index_path).unwrap();
+    write_jsonl(
+        &index_path,
+        &[json!({
+            "id": "error-thread",
+            "thread_name": "Recovered after read error",
+            "updated_at": timestamp(now + chrono::Duration::seconds(3))
+        })],
+    );
+    let recovered = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .unwrap();
+    assert_eq!(recovered.tasks[0].title, "Recovered after read error");
+    assert_eq!(cache.last_refresh().session_index_reads, 1);
+}
+
+#[test]
 fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();

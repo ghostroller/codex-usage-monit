@@ -51,6 +51,7 @@ fn turn(thread_id: &str, turn_id: &str) -> TurnRecord {
         turn_id: turn_id.to_string(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         message_preview: None,
         started_at: None,
         completed_at: None,

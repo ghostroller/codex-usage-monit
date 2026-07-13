@@ -62,7 +62,7 @@ codex-usage-monit models --format json
 codex-usage-monit attribution --format text
 ```
 
-`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。`windows` 输出所有可分析的当前 reset cycle；`snapshot --section windows` 在 JSON 中使用 `windowAnalyses` 字段。为兼容既有消费者，task/turn 上原有的 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models` 和 `attribution`，继续表示首选 5h 分析，不改成周数据。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。JSON schema 当前为 v1，字段统一使用 camelCase。
+`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。`windows` 输出所有可分析的当前 reset cycle；`snapshot --section windows` 在 JSON 中使用 `windowAnalyses` 字段。为兼容既有消费者，task/turn 上原有的 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models` 和 `attribution`，继续表示首选 5h 分析，不改成周数据。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段；已知时 `serviceTier` 给出 turn 激活时的服务等级，其中 `priority` 对应 TUI 的 Fast。JSON schema 当前为 v1，字段统一使用 camelCase。
 
 退出码：
 
@@ -77,28 +77,31 @@ codex-usage-monit attribution --format text
 - Window 页使用 `5` / `W` 在 `[5h]` 与 `[Week]` 间切换；两个按钮也可用鼠标左键点击，Tasks、Turns、Models 和 Attribution 同步使用所选 scope；
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
-- `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；可执行时，聚焦面板标题分别显示 `↵` / `←`；
-- `/` / `f`：按 task 标题或项目名编辑筛选；输入时可用左右方向键、`Home` / `End` 移动光标，`Backspace` / `Delete` 编辑，`Enter` / `Tab` 确认，`Esc` 取消本次编辑；
+- `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；标题中的 `↵` / `←` 也可用鼠标点击；
+- `V`：切换 Turns 的默认显隐。默认隐藏时，`Enter` / `↵` 会临时展开 Turns，`Backspace` / `←` 返回 Tasks 时自动收起；
+- `/` / `F`：编辑当前焦点面板自己的 Filter；Tasks 与 Turns 的查询相互独立，`Delete` 清空当前面板查询；
+- Filter 输入时可用左右方向键、`Home` / `End` 移动光标，`Backspace` / `Delete` 编辑，`Enter` / `Tab` 确认，`Esc` 取消本次编辑；
 - `A` / `D` / `S` / `C`：直接切换 All、Desktop、Subagent、CLI 来源，`[` / `]` 循环切换；非输入状态下 `Delete` 清空名称筛选；
 - 鼠标左键：点击最上方视图 tab、顶栏筛选控件，或选择 Tasks / Turns 数据行并把键盘焦点切到该面板；右侧滚动条支持点击轨道和按住拖动；
 - 鼠标滚轮：只滚动所在的 Tasks 或 Turns viewport，每格 3 行，不改变当前选择或键盘焦点；
+- Recent tasks 位于顶部时会随刷新保持顶部，让新建或刚更新的 task/subagent 立即可见；向下滚动后则固定当前阅读位置，直到再次滚回顶部；
 - `PageUp` / `PageDown`：滚动当前焦点所在的 Tasks 或 Turns viewport；
 - `t`：在 dark 与 light 主题间切换；
 - `q`、`Esc`、`Ctrl-C`：退出；搜索输入状态中的 `Esc` 只取消本次编辑。
 
 本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
-Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 顶栏按 task 标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All，非空名称筛选右侧的 `×` 可用鼠标清空。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Window 页的 Models 面板按所选 5h/Week scope 的 token 从高到低显示；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充。
+Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；两处非空筛选右侧的 `×` 均可用鼠标清空。Codex 标记为 Fast 的 turn 会额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Window 页的 Models 面板按所选 5h/Week scope 的 token 从高到低显示；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充。
 
 若服务端同时返回多个相同 duration 的当前额度桶，工具优先选择 Codex 产品桶和服务端来源数据作为周期边界，并输出歧义 warning；其余同 duration 桶仍只显示 gauge。由于本地调用没有 limit id，此时只能保留该 duration 的通用本地 token 构成，必须禁用 task/turn/model 的桶级 estimated quota，不能把调用强行归给所选桶。`windowAnalyses` 会在每个 scope 上分别给出 `partial` 和 `partialReasons`，所以 Week 扫描不完整不会污染完整的 5h 标记。
 
 ## 数据与隐私
 
-- 只读 `CODEX_HOME/sessions`、`archived_sessions` 和 Codex App Server；
+- 只读 `CODEX_HOME/sessions`、`CODEX_HOME/archived_sessions`、`CODEX_HOME/session_index.jsonl` 和 Codex App Server；
 - 不读取 `auth.json`，认证完全由 App Server 管理；
 - 不修改、恢复或终止 Codex task；
 - 缓存仅存在于 TUI 进程内，不写入索引数据库；
-- 默认最多保留 96 字符的首条用户消息作为 task 标题、每个 turn 最多 72 字符的用户消息摘要，不保存完整消息、reasoning 或工具内容；缺少显式 `turn_id` 时只归入当前 active turn，没有 active turn 则不猜测归属。
+- 进程内保留 `session_index.jsonl` 的当前会话标题；索引没有对应标题时，才回退到最多 96 字符的首条用户消息。每个 turn 最多保留 72 字符的用户消息摘要，不保存完整消息、reasoning 或工具内容；缺少显式 `turn_id` 时只归入当前 active turn，没有 active turn 则不猜测归属。
 - 部分 subagent turn 没有明文 `user_message`，消息摘要会显示 `-`，不会从注入上下文反推。
 - TUI 与 text 输出会剥离动态文本中的终端控制字符；JSON 使用标准转义。
 - task 来源优先按 `originator` 归一化为 `desktop`/`cli`，子代理保持 `subagent`；缺失时才回退到底层 rollout `source`。

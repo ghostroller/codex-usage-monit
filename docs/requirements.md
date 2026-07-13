@@ -34,9 +34,12 @@ TUI Overview 显示近期 tasks：
 - `live`、`exact`、`inferred`、`stale` 等证据和置信度；
 - task token 总量；
 - 当前窗口 local token share 与 estimated quota；
-- project、来源、turn 数和标题预览；
-- Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
-- 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，提示出现或消失不得移动筛选控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
+- project、来源、turn 数和会话标题；会话标题优先取 `$CODEX_HOME/session_index.jsonl` 中 thread 最新的非空 `thread_name`，缺失或不可读时回退 rollout 首条消息摘要，`--redact-content` 始终显示 `[redacted]`；
+- Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；当前会话标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
+- 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，两个提示整体都是鼠标按钮，且出现或消失不得移动相邻控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
+- Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影；
+- `V` 切换 Turns 默认显隐。默认显示时 Turns 常显；默认隐藏时 Tasks 使用完整内容区域，`Enter` / `↵` 临时展开并聚焦 Turns，`Backspace` / `←` 返回 Tasks 后关闭临时面板；
+- rollout 中 `thread_settings_applied.thread_settings.service_tier=priority` 在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 增加醒目标识，普通 turn 保持原显示；
 - 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与窗口 token breakdown，Overview 使用兼容 5h 分析，Window 使用所选 5h/Week scope，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
@@ -152,7 +155,7 @@ Overview 保持首选 5h 兼容视图；Week 的交互分析只在 Window 页切
 - active/completed/uncertain task 数；
 - partial 与 diagnostics。
 
-宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。
+宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
 Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview、Window、Data Health 顶层 tab 均可用鼠标左键切换；Window scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 和 Window 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、scope 按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
@@ -162,7 +165,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 
 - 默认最近 7 天、最多 500 文件；
 - TUI 维护进程内文件指纹缓存；
-- 无变化刷新不得重新读取 JSONL；
+- 无变化刷新不得重新读取 rollout 或 session title JSONL，只允许检查文件元数据指纹；
 - 单文件变化只重读该文件，再用缓存事件重建全局累计状态；
 - Running/Stale 必须即使在缓存命中时仍按当前时间重算。
 
@@ -170,6 +173,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 
 - Codex 数据源只读；
 - 不读取 `auth.json`；
+- 可在进程内缓存 `session_index.jsonl` 的当前会话标题；索引缺失时只保留最多 96 字符的首条用户消息回退标题；
 - 不保存完整 prompt、assistant、reasoning 或工具内容；
 - `--redact-content` 禁用 task 标题预览和 turn 消息摘要；
 - 未识别字段容忍，坏行、不可读文件与累计 token 回退进入 partial；

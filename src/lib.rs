@@ -5,5 +5,6 @@ pub mod config;
 pub mod domain;
 pub mod output;
 pub mod rollout;
+mod session_index;
 pub mod snapshot;
 pub mod tui;

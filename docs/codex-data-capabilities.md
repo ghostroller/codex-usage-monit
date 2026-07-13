@@ -39,6 +39,7 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 | App Server `thread/status/changed` | `idle`、`active`、`systemError`、等待审批/输入 | 同一 App Server 内精确、实时 | 无法观察其他独立 CLI 运行时 |
 | App Server `thread/tokenUsage/updated` | thread、turn、last/total token、上下文窗口 | 同一 App Server 内精确、实时 | 历史 turn 的 token 没有直接包含在 `Turn` 中 |
 | Rollout JSONL | thread/turn 边界、用户消息摘要、模型、token、当时的额度快照、完成/中断 | 本地历史最细来源，可增量 tail | 内部格式；用户消息不一定带 `turn_id`，ephemeral、缺失日志或格式升级会造成不完整 |
+| `session_index.jsonl` | 用户可见的 thread 标题与重命名时间 | 小型本地追加日志；可按 thread 取最新标题 | 可能缺失旧 thread；损坏或并发写入中的行需忽略并回退 rollout 摘要 |
 | `state_5.sqlite` | thread 元数据和聚合 `tokens_used` | 快速、本地 | 内部 schema；没有 turn token 和跨进程 runtime status |
 | 进程与文件新鲜度 | Codex 进程存活、最近写入 | 推断 | 无法可靠区分思考、等待审批和等待输入 |
 

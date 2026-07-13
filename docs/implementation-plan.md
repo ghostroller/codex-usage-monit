@@ -58,20 +58,20 @@ src/
 
 ### Rollout
 
-只扫描：
+Token 与状态历史只扫描：
 
 ```text
 CODEX_HOME/sessions/**/*.jsonl
 CODEX_HOME/archived_sessions/**/*.jsonl
 ```
 
-保留的规范化语义包括 session metadata、title preview、最多 72 字符的 turn 用户消息摘要、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。未知记录忽略，坏行/不可读文件计入 partial。
+保留的规范化语义包括 session metadata、title preview、最多 72 字符的 turn 用户消息摘要、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。未知记录忽略，坏行/不可读文件计入 partial。缓存层另外检查 `$CODEX_HOME/session_index.jsonl` 的文件指纹，仅在创建、修改或替换时重新读取，并按 `updated_at` 为每个 thread 选择最新非空 `thread_name`；materialize 使用缓存标题覆盖 title preview。文件缺失、删除、不可读或记录损坏时保留 rollout 回退值，读取失败不缓存为成功结果并在后续刷新重试，redact 模式完全跳过标题索引。单独重命名会在 TUI 下一次刷新生效而无需重解析 rollout。
 
 subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。
 
 ## 4. Rollout 缓存
 
-每个文件的 fingerprint 包括 length、mtime，Unix 下再包含 dev、inode 与 ctime。缓存值是规范化事件，不是独立 token delta；这样重新归并时仍能正确处理跨文件累计 counter、reset 与 foreign baseline。
+每个 rollout 与 session title 索引的 fingerprint 包括 length、mtime，Unix 下再包含 dev、inode 与 ctime。rollout 缓存值是规范化事件，不是独立 token delta；这样重新归并时仍能正确处理跨文件累计 counter、reset 与 foreign baseline。标题索引缓存值是当前 thread title map，文件未变化时 materialize 只复用该 map。
 
 刷新步骤：
 
@@ -107,7 +107,9 @@ Window 页维护独立 `WindowScope`，用 `[5h]` / `[Week]`、键盘 `5` / `W` 
 
 TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
 
-Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。可执行焦点跳转时，Tasks/Turns 标题分别显示 `↵` / `←`；Tasks 标题始终预留固定提示宽度，避免筛选控件随焦点切换位移。可见按钮把真实快捷键拆为独立 accent/bold span，标签整体继续共享同一鼠标 hitbox；Tasks/Turns 右边框由共享几何函数绘制比例滚动条，Down/Drag/Up 状态只更新对应 viewport offset，轨道点击、滚轮与数据行选择保持独立。
+Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；Recent tasks 偏移为 `0` 时保持顶部锚定，使刷新插入的最新 task 立即可见，非零偏移才按刷新前的首行 `thread_id` 锚定阅读位置。对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。可执行焦点跳转时，Tasks/Turns 标题分别显示 `↵` / `←`；Tasks 标题始终预留固定提示宽度，避免筛选控件随焦点切换位移。可见按钮把真实快捷键拆为独立 accent/bold span，标签整体继续共享同一鼠标 hitbox；Tasks/Turns 右边框由共享几何函数绘制比例滚动条，Down/Drag/Up 状态只更新对应 viewport offset，轨道点击、滚轮与数据行选择保持独立。
+
+Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投影；模型、推理强度、消息、状态、turn ID 与 Fast 标识共享同一匹配入口。`V` 控制默认显隐，默认隐藏时 `Enter` / 可点击 `↵` 只设置临时可见状态，`Backspace` / 可点击 `←` 返回 Tasks 并清除该状态。Fast 来自 `thread_settings_applied` 的 `service_tier`，在 turn 激活时快照，避免之后的设置变化回写历史 turn。
 
 TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
 

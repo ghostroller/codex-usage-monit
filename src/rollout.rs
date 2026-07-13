@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, Metadata};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -14,6 +14,7 @@ use crate::domain::{
     Confidence, LimitWindow, Provenance, RateObservation, RolloutDataset, TaskRecord, TaskStatus,
     TokenUsage, TurnRecord, TurnStatus, UsageCall,
 };
+use crate::session_index::load_thread_titles;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 
@@ -75,6 +76,9 @@ enum ParsedEvent {
         preview: String,
         turn_id: Option<String>,
     },
+    ThreadSettingsApplied {
+        service_tier: String,
+    },
     TurnContext {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
@@ -122,6 +126,10 @@ pub struct RolloutCacheRefresh {
     pub reused_files: usize,
     pub reparsed_files: usize,
     pub rebuilt: bool,
+    /// Number of `session_index.jsonl` content-read attempts.
+    pub session_index_reads: usize,
+    /// Whether the cached session-title snapshot was reused unchanged.
+    pub session_index_reused: bool,
 }
 
 /// Reuses parsed rollout files across refreshes while preserving global token
@@ -132,7 +140,22 @@ pub struct RolloutCache {
     files: HashMap<PathBuf, CachedFile>,
     selected: Vec<SelectedFile>,
     reduced: Option<ReducedRollouts>,
+    session_titles: SessionTitleCache,
     last_refresh: RolloutCacheRefresh,
+}
+
+#[derive(Debug, Default)]
+struct SessionTitleCache {
+    state: SessionTitleState,
+    titles: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+enum SessionTitleState {
+    #[default]
+    Unknown,
+    Missing,
+    Loaded(FileFingerprint),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -143,6 +166,7 @@ struct ThreadBuilder {
     source: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    service_tier: Option<String>,
     active_turn_ids: Vec<String>,
     last_turn_id: Option<String>,
     previous_cumulative: Option<TokenUsage>,
@@ -155,6 +179,7 @@ struct TurnBuilder {
     turn_id: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    service_tier: Option<String>,
     message_preview: Option<String>,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
@@ -180,8 +205,8 @@ impl RolloutCache {
         self.last_refresh
     }
 
-    /// Scans recent rollouts, reparsing only files whose metadata fingerprint
-    /// changed since the previous call.
+    /// Scans recent rollouts, reparsing rollout files and reloading the session
+    /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
         let key = CacheKey {
             codex_home: config.codex_home.clone(),
@@ -191,6 +216,7 @@ impl RolloutCache {
             self.files.clear();
             self.selected.clear();
             self.reduced = None;
+            self.session_titles = SessionTitleCache::default();
             self.key = Some(key);
         }
 
@@ -206,6 +232,7 @@ impl RolloutCache {
         });
 
         let mut refresh = RolloutCacheRefresh::default();
+        self.refresh_session_titles(config, &mut discovery, &mut refresh);
         for file in &files {
             let reusable = self.files.get(&file.path).is_some_and(|cached| {
                 cached.fingerprint == file.fingerprint && cached.parsed.complete
@@ -253,7 +280,74 @@ impl RolloutCache {
             discovery,
             config,
             now,
+            &self.session_titles.titles,
         ))
+    }
+
+    fn refresh_session_titles(
+        &mut self,
+        config: &CollectConfig,
+        discovery: &mut RolloutDataset,
+        refresh: &mut RolloutCacheRefresh,
+    ) {
+        if config.redact_content {
+            self.session_titles = SessionTitleCache::default();
+            return;
+        }
+
+        let path = config.codex_home.join("session_index.jsonl");
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if matches!(self.session_titles.state, SessionTitleState::Missing) {
+                    refresh.session_index_reused = true;
+                } else {
+                    self.session_titles.state = SessionTitleState::Missing;
+                    self.session_titles.titles.clear();
+                }
+                return;
+            }
+            Err(error) => {
+                self.session_titles = SessionTitleCache::default();
+                discovery.warnings.push(format!(
+                    "session title index unavailable: could not inspect {}: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        let fingerprint = match FileFingerprint::from_metadata(&metadata) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.session_titles = SessionTitleCache::default();
+                discovery.warnings.push(format!(
+                    "session title index unavailable: could not fingerprint {}: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        if matches!(
+            &self.session_titles.state,
+            SessionTitleState::Loaded(cached) if cached == &fingerprint
+        ) {
+            refresh.session_index_reused = true;
+            return;
+        }
+
+        refresh.session_index_reads += 1;
+        match load_thread_titles(&config.codex_home) {
+            Ok(titles) => {
+                self.session_titles.state = SessionTitleState::Loaded(fingerprint);
+                self.session_titles.titles = titles;
+            }
+            Err(error) => {
+                self.session_titles = SessionTitleCache::default();
+                discovery
+                    .warnings
+                    .push(format!("session title index unavailable: {error:#}"));
+            }
+        }
     }
 }
 
@@ -289,6 +383,7 @@ fn materialize_dataset(
     mut discovery: RolloutDataset,
     config: &CollectConfig,
     now: DateTime<Utc>,
+    thread_titles: &HashMap<String, String>,
 ) -> RolloutDataset {
     discovery.stats.scanned_files = reduced.dataset.stats.scanned_files;
     discovery.stats.parsed_lines = reduced.dataset.stats.parsed_lines;
@@ -298,7 +393,13 @@ fn materialize_dataset(
     discovery.warnings.extend(reduced.dataset.warnings.clone());
     discovery.calls = reduced.dataset.calls.clone();
     discovery.rate_observations = reduced.dataset.rate_observations.clone();
-    finish_dataset(config, now, reduced.threads.clone(), &mut discovery);
+    finish_dataset(
+        config,
+        now,
+        reduced.threads.clone(),
+        thread_titles,
+        &mut discovery,
+    );
     discovery
 }
 
@@ -647,6 +748,20 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                                     .map(str::to_owned),
                             });
                         }
+                    } else if string_field_in(payload, &["type"]) == Some("thread_settings_applied")
+                    {
+                        if let Some(service_tier) = payload
+                            .get("thread_settings")
+                            .or_else(|| payload.get("threadSettings"))
+                            .and_then(Value::as_object)
+                            .and_then(|settings| {
+                                string_field_in(settings, &["service_tier", "serviceTier"])
+                            })
+                        {
+                            parsed.events.push(ParsedEvent::ThreadSettingsApplied {
+                                service_tier: service_tier.to_owned(),
+                            });
+                        }
                     } else if should_cache_event_message(payload) {
                         parsed.events.push(ParsedEvent::EventMessage {
                             timestamp,
@@ -743,6 +858,9 @@ fn replay_rollout_file(
             }
             ParsedEvent::UserMessage { preview, turn_id } => {
                 apply_user_message(thread, preview, turn_id.as_deref());
+            }
+            ParsedEvent::ThreadSettingsApplied { service_tier } => {
+                thread.service_tier = Some(service_tier.clone());
             }
             ParsedEvent::TurnContext { timestamp, payload } => {
                 apply_turn_context(thread, payload, *timestamp);
@@ -910,12 +1028,16 @@ fn apply_event_msg(
 }
 
 fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime<Utc>) {
+    let service_tier = thread.service_tier.clone();
     let turn = ensure_turn(thread, turn_id);
     if matches!(
         turn.status,
         TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed
     ) {
         return;
+    }
+    if turn.service_tier.is_none() {
+        turn.service_tier = service_tier;
     }
     set_min_timestamp(&mut turn.started_at, started_at);
     if matches!(turn.status, TurnStatus::Unknown | TurnStatus::Stale) {
@@ -1179,6 +1301,7 @@ fn finish_dataset(
     config: &CollectConfig,
     now: DateTime<Utc>,
     threads: HashMap<String, ThreadBuilder>,
+    thread_titles: &HashMap<String, String>,
     dataset: &mut RolloutDataset,
 ) {
     for mut thread in threads.into_values() {
@@ -1212,6 +1335,7 @@ fn finish_dataset(
                 turn_id: turn.turn_id,
                 model: turn.model,
                 reasoning_effort: turn.reasoning_effort,
+                service_tier: turn.service_tier,
                 message_preview: turn.message_preview,
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
@@ -1225,13 +1349,18 @@ fn finish_dataset(
             });
         }
 
+        let title = if config.redact_content {
+            "[redacted]".to_owned()
+        } else {
+            thread_titles
+                .get(&thread.thread_id)
+                .cloned()
+                .or(thread.title)
+                .unwrap_or_else(|| "Untitled task".to_owned())
+        };
         dataset.tasks.push(TaskRecord {
             thread_id: thread.thread_id,
-            title: if config.redact_content {
-                "[redacted]".to_owned()
-            } else {
-                thread.title.unwrap_or_else(|| "Untitled task".to_owned())
-            },
+            title,
             cwd: thread.cwd,
             source: thread.source,
             created_at: thread.created_at,
