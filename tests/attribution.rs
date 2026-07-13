@@ -366,6 +366,41 @@ fn server_history_ignores_a_disagreeing_rollout_quota_stream() {
 }
 
 #[test]
+fn server_integer_plateaus_keep_agreeing_rollout_deltas() {
+    let now = at(12, 0);
+    let resets_at = at(14, 0);
+    let limits = vec![limit(now, 34.0, 300, resets_at)];
+    let mut observations = vec![
+        observation(at(11, 52), 32.0, resets_at),
+        observation(at(11, 54), 33.0, resets_at),
+        observation(at(11, 56), 34.0, resets_at),
+        observation(at(11, 58), 34.0, resets_at),
+        observation(at(11, 59), 34.0, resets_at),
+    ];
+    for observation in &mut observations[3..] {
+        observation.provenance = Provenance::ServerSnapshot;
+    }
+    let calls = vec![
+        call(at(11, 53), "a", "a-turn", "gpt-a", 100),
+        call(at(11, 55), "b", "b-turn", "gpt-b", 300),
+    ];
+    let mut tasks = vec![
+        task("a", TaskStatus::Completed),
+        task("b", TaskStatus::Completed),
+    ];
+    let mut turns = vec![turn("a", "a-turn"), turn("b", "b-turn")];
+
+    let (_, summary) =
+        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
+
+    assert_close(summary.observed_delta_percent, 2.0);
+    assert_close(summary.estimated_assigned_percent, 2.0);
+    assert_close(summary.unattributed_percent, 32.0);
+    assert_close(tasks[0].estimated_quota_percent, 1.0);
+    assert_close(tasks[1].estimated_quota_percent, 1.0);
+}
+
+#[test]
 fn selects_only_a_current_five_hour_window() {
     let now = at(12, 0);
     let weekly_reset = now + Duration::days(2);
@@ -580,6 +615,191 @@ fn same_duration_prefers_codex_bucket_and_serializes_window_usage() {
         preferred[0].attribution.window.as_ref().unwrap().limit_id,
         "zeta"
     );
+}
+
+#[test]
+fn model_mapping_isolates_codex_and_spark_buckets_with_their_own_resets() {
+    let now = at(12, 0);
+    let codex_reset = at(14, 0);
+    let spark_reset = at(13, 0);
+    let mut codex = limit(now, 10.0, 300, codex_reset);
+    codex.limit_id = "codex".to_string();
+    let mut spark = limit(now, 20.0, 300, spark_reset);
+    spark.limit_id = "codex_bengalfox".to_string();
+
+    let codex_observation = observation_for(at(11, 58), 8.0, 300, codex_reset);
+    let mut spark_observation = observation_for(at(11, 58), 15.0, 300, spark_reset);
+    spark_observation.limit_id = "codex_bengalfox".to_string();
+    let calls = vec![
+        call(
+            at(8, 30),
+            "old-regular",
+            "old-regular-turn",
+            "gpt-5.3-codex",
+            900,
+        ),
+        call(
+            at(8, 30),
+            "old-spark",
+            "old-spark-turn",
+            "GPT-5.3-CODEX-SPARK",
+            100,
+        ),
+        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
+        call(
+            at(11, 59),
+            "spark",
+            "spark-turn",
+            "GPT-5.3-CODEX-SPARK",
+            300,
+        ),
+    ];
+
+    let analyses = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[codex_observation, spark_observation],
+        &[spark, codex],
+        now,
+    );
+
+    assert_eq!(analyses.len(), 2);
+    let codex = analyses
+        .iter()
+        .find(|analysis| analysis.attribution.window.as_ref().unwrap().limit_id == "codex")
+        .unwrap();
+    let spark = analyses
+        .iter()
+        .find(|analysis| {
+            analysis.attribution.window.as_ref().unwrap().limit_id == "codex_bengalfox"
+        })
+        .unwrap();
+
+    assert_eq!(
+        codex.attribution.window.as_ref().unwrap().starts_at,
+        at(9, 0)
+    );
+    assert_eq!(
+        spark.attribution.window.as_ref().unwrap().starts_at,
+        at(8, 0)
+    );
+    assert_eq!(codex.attribution.local_token_usage, tokens(200));
+    assert_eq!(spark.attribution.local_token_usage, tokens(400));
+    assert_close(codex.attribution.estimated_assigned_percent, 2.0);
+    assert_close(spark.attribution.estimated_assigned_percent, 5.0);
+    assert_eq!(codex.models.len(), 1);
+    assert_eq!(codex.models[0].model, "gpt-5.3-codex");
+    assert_eq!(spark.models.len(), 1);
+    assert!(
+        spark.models[0]
+            .model
+            .eq_ignore_ascii_case("gpt-5.3-codex-spark")
+    );
+    assert!(
+        codex
+            .threads
+            .iter()
+            .all(|thread| thread.thread_id != "old-regular")
+    );
+    assert!(
+        spark
+            .threads
+            .iter()
+            .all(|thread| thread.thread_id != "regular")
+    );
+}
+
+#[test]
+fn known_single_bucket_excludes_calls_mapped_to_the_missing_pool() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![
+        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
+        call(
+            at(11, 59),
+            "spark",
+            "spark-turn",
+            "gpt-5.3-codex-spark",
+            300,
+        ),
+    ];
+    let mut codex = limit(now, 10.0, 300, reset);
+    codex.limit_id = "codex".to_string();
+    let mut spark = limit(now, 20.0, 300, reset);
+    spark.limit_id = "codex_bengalfox".to_string();
+
+    let codex_analyses = analyze_windows(&[], &[], &calls, &[], &[codex], now);
+    let spark_analyses = analyze_windows(&[], &[], &calls, &[], &[spark], now);
+
+    assert_eq!(codex_analyses.len(), 1);
+    assert_eq!(spark_analyses.len(), 1);
+    let codex = &codex_analyses[0];
+    let spark = &spark_analyses[0];
+    assert_eq!(codex.attribution.local_token_usage, tokens(200));
+    assert_eq!(spark.attribution.local_token_usage, tokens(300));
+    assert_eq!(codex.models[0].model, "gpt-5.3-codex");
+    assert_eq!(spark.models[0].model, "gpt-5.3-codex-spark");
+    for analysis in [codex, spark] {
+        assert!(analysis.partial);
+        assert!(
+            analysis
+                .partial_reasons
+                .contains(&"mapped_bucket_unavailable".to_string())
+        );
+    }
+}
+
+#[test]
+fn unmapped_models_leave_overlapping_bucket_deltas_unassigned() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let mut codex = limit(now, 10.0, 300, reset);
+    codex.limit_id = "codex".to_string();
+    let mut spark = limit(now, 20.0, 300, reset);
+    spark.limit_id = "codex_bengalfox".to_string();
+    let codex_observation = observation_for(at(11, 58), 8.0, 300, reset);
+    let mut spark_observation = observation_for(at(11, 58), 15.0, 300, reset);
+    spark_observation.limit_id = "codex_bengalfox".to_string();
+    let mut unknown = call(at(11, 59), "unknown", "unknown-turn", "placeholder", 100);
+    unknown.model = None;
+    let calls = vec![
+        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
+        call(
+            at(11, 59),
+            "spark",
+            "spark-turn",
+            "gpt-5.3-codex-spark",
+            300,
+        ),
+        unknown,
+    ];
+
+    let analyses = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[codex_observation, spark_observation],
+        &[codex, spark],
+        now,
+    );
+
+    assert_eq!(analyses.len(), 2);
+    assert!(analyses.iter().all(|analysis| analysis.partial));
+    assert!(analyses.iter().all(|analysis| {
+        analysis
+            .partial_reasons
+            .contains(&"unmapped_call_model".to_string())
+    }));
+    assert!(analyses.iter().all(|analysis| {
+        analysis.attribution.observed_delta_percent > 0.0
+            && analysis.attribution.estimated_assigned_percent == 0.0
+            && analysis.attribution.confidence == Confidence::Unknown
+            && analysis
+                .threads
+                .iter()
+                .all(|thread| thread.usage.estimated_quota_percent == 0.0)
+    }));
 }
 
 #[test]

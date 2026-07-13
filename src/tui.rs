@@ -22,14 +22,17 @@ use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    Block, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
+    Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::attribution::{MAPPED_BUCKET_UNAVAILABLE_REASON, UNMAPPED_CALL_MODEL_REASON};
 use crate::config::CollectConfig;
 use crate::domain::{
-    AccountSnapshot, AttributionSummary, Confidence, Provenance, Snapshot, TaskRecord, TaskStatus,
-    TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage, terminal_safe_text,
+    AccountSnapshot, AttributionSummary, Confidence, ModelUsage, Provenance, Snapshot, TaskRecord,
+    TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage,
+    terminal_safe_text,
 };
 use crate::rollout::RolloutCache;
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
@@ -188,7 +191,58 @@ fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAna
     snapshot
         .window_analyses
         .iter()
-        .find(|analysis| analysis.duration_mins == scope.duration_mins())
+        .filter(|analysis| analysis.duration_mins == scope.duration_mins())
+        .min_by_key(|analysis| {
+            analysis
+                .attribution
+                .window
+                .as_ref()
+                .is_none_or(|window| !window.limit_id.eq_ignore_ascii_case("codex"))
+        })
+}
+
+fn window_analyses(snapshot: &Snapshot, scope: WindowScope) -> Vec<&WindowAnalysis> {
+    snapshot
+        .window_analyses
+        .iter()
+        .filter(|analysis| analysis.duration_mins == scope.duration_mins())
+        .collect()
+}
+
+fn combine_bucket_usages(total_local_tokens: u64, usages: Vec<WindowUsage>) -> WindowUsage {
+    if usages.len() == 1 {
+        return usages[0];
+    }
+
+    let mut aggregate = WindowUsage::default();
+    let mut contributing_buckets = 0;
+    let mut quota_confidence = None;
+    for usage in usages {
+        aggregate.token_usage.add_assign(usage.token_usage);
+        if usage.token_usage.is_zero() {
+            continue;
+        }
+        contributing_buckets += 1;
+        aggregate.estimated_quota_percent += usage.estimated_quota_percent;
+        quota_confidence = Some(match quota_confidence {
+            None => usage.quota_confidence,
+            Some(current) => weakest_quota_confidence(current, usage.quota_confidence),
+        });
+    }
+
+    aggregate.local_token_share_percent = if total_local_tokens == 0 {
+        0.0
+    } else {
+        aggregate.token_usage.total_tokens as f64 / total_local_tokens as f64 * 100.0
+    };
+    if contributing_buckets == 1 {
+        aggregate.quota_confidence = quota_confidence.unwrap_or(Confidence::Unknown);
+    } else {
+        // Percentage points from independent quota pools do not share a denominator.
+        aggregate.estimated_quota_percent = 0.0;
+        aggregate.quota_confidence = Confidence::Unknown;
+    }
+    aggregate
 }
 
 fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&AttributionSummary> {
@@ -201,49 +255,71 @@ fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&Att
 }
 
 fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskRecord) -> WindowUsage {
-    window_analysis(snapshot, scope)
-        .and_then(|analysis| {
-            analysis
-                .threads
-                .iter()
-                .find(|usage| usage.thread_id == task.thread_id)
-                .map(|usage| usage.usage)
-        })
-        .unwrap_or_else(|| {
-            if scope == WindowScope::FiveHours {
-                WindowUsage {
-                    token_usage: task.window_token_usage,
-                    local_token_share_percent: task.local_token_share_percent,
-                    estimated_quota_percent: task.estimated_quota_percent,
-                    quota_confidence: task.quota_confidence,
-                }
-            } else {
-                WindowUsage::default()
-            }
-        })
+    let analyses = window_analyses(snapshot, scope);
+    if !analyses.is_empty() {
+        let total_local_tokens = analyses
+            .iter()
+            .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
+            .sum();
+        let usages = analyses
+            .into_iter()
+            .map(|analysis| {
+                analysis
+                    .threads
+                    .iter()
+                    .find(|usage| usage.thread_id == task.thread_id)
+                    .map(|usage| usage.usage)
+                    .unwrap_or_default()
+            })
+            .collect();
+        return combine_bucket_usages(total_local_tokens, usages);
+    }
+
+    if scope == WindowScope::FiveHours {
+        WindowUsage {
+            token_usage: task.window_token_usage,
+            local_token_share_percent: task.local_token_share_percent,
+            estimated_quota_percent: task.estimated_quota_percent,
+            quota_confidence: task.quota_confidence,
+        }
+    } else {
+        WindowUsage::default()
+    }
 }
 
 fn turn_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, turn: &TurnRecord) -> WindowUsage {
-    window_analysis(snapshot, scope)
-        .and_then(|analysis| {
-            analysis
-                .turns
-                .iter()
-                .find(|usage| usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id)
-                .map(|usage| usage.usage)
-        })
-        .unwrap_or_else(|| {
-            if scope == WindowScope::FiveHours {
-                WindowUsage {
-                    token_usage: turn.window_token_usage,
-                    local_token_share_percent: turn.local_token_share_percent,
-                    estimated_quota_percent: turn.estimated_quota_percent,
-                    quota_confidence: turn.quota_confidence,
-                }
-            } else {
-                WindowUsage::default()
-            }
-        })
+    let analyses = window_analyses(snapshot, scope);
+    if !analyses.is_empty() {
+        let total_local_tokens = analyses
+            .iter()
+            .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
+            .sum();
+        let usages = analyses
+            .into_iter()
+            .map(|analysis| {
+                analysis
+                    .turns
+                    .iter()
+                    .find(|usage| {
+                        usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id
+                    })
+                    .map(|usage| usage.usage)
+                    .unwrap_or_default()
+            })
+            .collect();
+        return combine_bucket_usages(total_local_tokens, usages);
+    }
+
+    if scope == WindowScope::FiveHours {
+        WindowUsage {
+            token_usage: turn.window_token_usage,
+            local_token_share_percent: turn.local_token_share_percent,
+            estimated_quota_percent: turn.estimated_quota_percent,
+            quota_confidence: turn.quota_confidence,
+        }
+    } else {
+        WindowUsage::default()
+    }
 }
 
 fn task_record_usage(
@@ -273,6 +349,52 @@ fn aggregate_task_row_usage(
     let Some(task) = snapshot.tasks.get(row.index) else {
         return WindowUsage::default();
     };
+    if window_only && !row.hidden_descendants.is_empty() {
+        let analyses = window_analyses(snapshot, scope);
+        if !analyses.is_empty() {
+            let thread_ids = std::iter::once(row.index)
+                .chain(row.hidden_descendants.iter().copied())
+                .filter_map(|index| snapshot.tasks.get(index))
+                .map(|task| task.thread_id.as_str())
+                .collect::<HashSet<_>>();
+            let total_local_tokens = analyses
+                .iter()
+                .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
+                .sum();
+            let usages = analyses
+                .into_iter()
+                .map(|analysis| {
+                    let mut bucket_usage = WindowUsage::default();
+                    let mut quota_confidence = None;
+                    for thread in analysis
+                        .threads
+                        .iter()
+                        .filter(|thread| thread_ids.contains(thread.thread_id.as_str()))
+                    {
+                        bucket_usage
+                            .token_usage
+                            .add_assign(thread.usage.token_usage);
+                        bucket_usage.local_token_share_percent +=
+                            thread.usage.local_token_share_percent;
+                        bucket_usage.estimated_quota_percent +=
+                            thread.usage.estimated_quota_percent;
+                        if thread.usage.estimated_quota_percent > 0.0 {
+                            quota_confidence = Some(match quota_confidence {
+                                None => thread.usage.quota_confidence,
+                                Some(current) => {
+                                    weakest_quota_confidence(current, thread.usage.quota_confidence)
+                                }
+                            });
+                        }
+                    }
+                    bucket_usage.quota_confidence = quota_confidence.unwrap_or(Confidence::Unknown);
+                    bucket_usage
+                })
+                .collect();
+            return combine_bucket_usages(total_local_tokens, usages);
+        }
+    }
+
     let mut aggregate = task_record_usage(snapshot, scope, task, window_only);
     if row.hidden_descendants.is_empty() {
         return aggregate;
@@ -430,7 +552,6 @@ struct TaskControlsHitbox {
     clear_search: Rect,
     enter_turns: Rect,
     toggle_turns: Rect,
-    toggle_models: Rect,
     toggle_tree: Rect,
     collapse_all: Rect,
 }
@@ -455,7 +576,14 @@ struct ViewTabsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowControlsHitbox {
+    toggle_models: Rect,
     scopes: [Rect; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuitConfirmationHitbox {
+    confirm: Rect,
+    cancel: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,6 +702,9 @@ struct App {
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
     scroll_drag: Option<ScrollDrag>,
+    quit_confirmation_visible: bool,
+    quit_confirmation_hitbox: Option<QuitConfirmationHitbox>,
+    quit_requested: bool,
     turn_reveal_pending: bool,
     worker_running: bool,
     last_local_refresh: Instant,
@@ -622,6 +753,9 @@ impl App {
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
             scroll_drag: None,
+            quit_confirmation_visible: false,
+            quit_confirmation_hitbox: None,
+            quit_requested: false,
             turn_reveal_pending: false,
             worker_running: false,
             last_local_refresh: Instant::now(),
@@ -866,6 +1000,10 @@ impl App {
 
     fn turns_visible(&self) -> bool {
         self.turns_default_visible || self.turns_temporarily_visible
+    }
+
+    fn shortcuts_active(&self) -> bool {
+        !self.focus.is_search() && !self.quit_confirmation_visible
     }
 
     fn close_temporary_turns(&mut self) {
@@ -1625,11 +1763,6 @@ impl App {
             self.toggle_turns_default_visibility();
             return true;
         }
-        if rect_contains(hitbox.toggle_models, column, row) {
-            self.accept_active_search();
-            self.toggle_models_visibility();
-            return true;
-        }
         if rect_contains(hitbox.toggle_tree, column, row) {
             self.accept_active_search();
             self.toggle_task_list_mode();
@@ -1719,6 +1852,11 @@ impl App {
         let Some(hitbox) = self.window_controls_hitbox else {
             return false;
         };
+        if rect_contains(hitbox.toggle_models, column, row) {
+            self.accept_active_search();
+            self.toggle_models_visibility();
+            return true;
+        }
         let Some(scope) = WindowScope::ALL
             .into_iter()
             .find(|scope| rect_contains(hitbox.scopes[scope.index()], column, row))
@@ -1728,6 +1866,18 @@ impl App {
         self.accept_active_search();
         self.set_window_scope(scope);
         true
+    }
+
+    fn open_quit_confirmation(&mut self) {
+        self.quit_confirmation_visible = true;
+        self.quit_requested = false;
+        self.scroll_drag = None;
+    }
+
+    fn close_quit_confirmation(&mut self) {
+        self.quit_confirmation_visible = false;
+        self.quit_confirmation_hitbox = None;
+        self.quit_requested = false;
     }
 
     fn select_turn_at(&mut self, column: u16, row: u16) -> bool {
@@ -1903,6 +2053,23 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.quit_confirmation_visible {
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            if app
+                .quit_confirmation_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.confirm, event.column, event.row))
+            {
+                app.quit_requested = true;
+            } else if app
+                .quit_confirmation_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.cancel, event.column, event.row))
+            {
+                app.close_quit_confirmation();
+            }
+        }
+        return true;
+    }
+
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             app.scroll_drag = None;
@@ -2104,6 +2271,15 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    if app.quit_confirmation_visible {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('q') => return true,
+            KeyCode::Esc => app.close_quit_confirmation(),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.focus == Focus::TaskSearch {
         match key.code {
             KeyCode::Esc => app.cancel_task_search(),
@@ -2159,7 +2335,8 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('q') => return true,
+        KeyCode::Esc => app.open_quit_confirmation(),
         KeyCode::Tab | KeyCode::Right => app.set_view(app.view.next()),
         KeyCode::BackTab | KeyCode::Left => app.set_view(app.view.previous()),
         KeyCode::Char('1') => app.set_view(View::Overview),
@@ -2411,6 +2588,9 @@ fn run_loop(
                 }
                 Event::Mouse(mouse) => {
                     handle_mouse_event(app, mouse);
+                    if app.quit_requested {
+                        return Ok(());
+                    }
                 }
                 _ => {}
             }
@@ -2453,6 +2633,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
+    app.quit_confirmation_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
     let root = Layout::default()
@@ -2464,7 +2645,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         .into_iter()
         .map(|view| {
             let selected = view == app.view;
-            let shortcut_active = !app.focus.is_search();
+            let shortcut_active = app.shortcuts_active();
             Line::from(vec![
                 Span::styled(
                     view.shortcut().to_string(),
@@ -2509,6 +2690,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         ));
     app.view_tabs_hitbox = Some(view_tabs_hitbox(root[0]));
     frame.render_widget(tabs, root[0]);
+    if app.view == View::Overview {
+        app.window_controls_hitbox = Some(render_overview_controls(frame, root[0], app));
+    }
 
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
@@ -2520,6 +2704,229 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     {
         app.scroll_drag = None;
     }
+    if app.quit_confirmation_visible {
+        app.quit_confirmation_hitbox = Some(render_quit_confirmation(frame, area, app.theme));
+    }
+}
+
+fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> WindowControlsHitbox {
+    let palette = app.theme.palette();
+    let tabs = view_tabs_hitbox(area);
+    let start_x = tabs.tabs[View::Health.index()].right();
+    let remaining = usize::from(area.right().saturating_sub(start_x));
+    let full_width = UnicodeWidthStr::width(" | [M]Models [5h] [Week]");
+    let compact = remaining < full_width;
+    let separator = if compact { " " } else { TAB_DIVIDER };
+    let gap = if compact { "" } else { " " };
+    let separator_width = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let mut spans = Vec::new();
+    let mut x = start_x;
+    let shortcuts_active = app.shortcuts_active();
+
+    let models_label = if compact { "[M]" } else { "[M]Models" };
+    let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
+    let mut toggle_models = Rect::default();
+    if x.saturating_add(separator_width)
+        .saturating_add(models_width)
+        <= area.right()
+    {
+        spans.push(Span::styled(separator, Style::default().fg(palette.muted)));
+        x = x.saturating_add(separator_width);
+        toggle_models = clipped_horizontal_hitbox(area, x, models_width);
+        let models_style = if app.models_visible {
+            Style::default()
+                .fg(palette.background)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let models_shortcut_style = if !shortcuts_active {
+            models_style
+        } else if app.models_visible {
+            models_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled("[", models_style));
+        spans.push(Span::styled("M", models_shortcut_style));
+        spans.push(Span::styled(
+            if compact { "]" } else { "]Models" },
+            models_style,
+        ));
+        x = x.saturating_add(models_width);
+    }
+
+    let mut scopes = [Rect::default(); 2];
+    for scope in WindowScope::ALL {
+        let label = if compact {
+            scope.shortcut().to_string()
+        } else {
+            scope.label().to_string()
+        };
+        let width = u16::try_from(UnicodeWidthStr::width(label.as_str()) + 2).unwrap_or(u16::MAX);
+        if toggle_models.is_empty()
+            || x.saturating_add(gap_width).saturating_add(width) > area.right()
+        {
+            break;
+        }
+        spans.push(Span::raw(gap));
+        x = x.saturating_add(gap_width);
+        scopes[scope.index()] = clipped_horizontal_hitbox(area, x, width);
+        let selected = app.window_scope == scope;
+        let style = if selected {
+            Style::default()
+                .fg(palette.background)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let shortcut_style = if !shortcuts_active {
+            style
+        } else if selected {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut label_chars = label.chars();
+        let _ = label_chars.next();
+        spans.push(Span::styled("[", style));
+        spans.push(Span::styled(scope.shortcut().to_string(), shortcut_style));
+        spans.push(Span::styled(
+            format!("{}]", label_chars.collect::<String>()),
+            style,
+        ));
+        x = x.saturating_add(width);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(
+            start_x.min(area.right()),
+            area.y,
+            area.right().saturating_sub(start_x),
+            u16::from(area.height > 0),
+        ),
+    );
+    WindowControlsHitbox {
+        toggle_models,
+        scopes,
+    }
+}
+
+fn render_quit_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+) -> QuitConfirmationHitbox {
+    let palette = theme.palette();
+    let popup_width = area.width.min(44);
+    let popup_height = area.height.min(7);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(theme.base_style())
+        .title(Span::styled(
+            " Quit? ",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    if !inner.is_empty() {
+        let message_y = inner
+            .y
+            .saturating_add(u16::from(inner.height > 2))
+            .min(inner.bottom().saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new("Exit codex-usage-monit?")
+                .style(Style::default().fg(palette.foreground))
+                .alignment(Alignment::Center),
+            Rect::new(inner.x, message_y, inner.width, 1),
+        );
+    }
+
+    let full = inner.width >= 23;
+    let confirm_label = if full { "[↵] Exit" } else { "[↵]" };
+    let cancel_label = if full { "[Esc] Cancel" } else { "[Esc]" };
+    let gap = if full { "   " } else { " " };
+    let confirm_width = u16::try_from(UnicodeWidthStr::width(confirm_label)).unwrap_or(u16::MAX);
+    let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let both_width = confirm_width
+        .saturating_add(gap_width)
+        .saturating_add(cancel_width);
+    let button_y = inner.bottom().saturating_sub(1);
+    let button_row = Rect::new(inner.x, button_y, inner.width, u16::from(inner.height > 0));
+    let button_style = Style::default()
+        .fg(palette.foreground)
+        .bg(palette.gauge_track);
+    let shortcut_style = button_style.fg(palette.accent).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut confirm = Rect::default();
+    let mut cancel = Rect::default();
+    let (group_x, group_width) = if button_row.height > 0 && both_width <= inner.width {
+        let group_x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(both_width) / 2);
+        confirm = Rect::new(group_x, button_y, confirm_width, 1);
+        cancel = Rect::new(
+            group_x
+                .saturating_add(confirm_width)
+                .saturating_add(gap_width),
+            button_y,
+            cancel_width,
+            1,
+        );
+        spans.extend([
+            Span::styled("[", button_style),
+            Span::styled("↵", shortcut_style),
+            Span::styled(if full { "] Exit" } else { "]" }, button_style),
+            Span::raw(gap),
+            Span::styled("[", button_style),
+            Span::styled("Esc", shortcut_style),
+            Span::styled(if full { "] Cancel" } else { "]" }, button_style),
+        ]);
+        (group_x, both_width)
+    } else if button_row.height > 0 && confirm_width <= inner.width {
+        let group_x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(confirm_width) / 2);
+        confirm = Rect::new(group_x, button_y, confirm_width, 1);
+        spans.extend([
+            Span::styled("[", button_style),
+            Span::styled("↵", shortcut_style),
+            Span::styled(if full { "] Exit" } else { "]" }, button_style),
+        ]);
+        (group_x, confirm_width)
+    } else {
+        (inner.x, 0)
+    };
+    if group_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(group_x, button_y, group_width, 1),
+        );
+    }
+
+    QuitConfirmationHitbox { confirm, cancel }
 }
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -2822,13 +3229,14 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             let tone = task_status_tone(task.status);
             let task_cell = if tree_mode {
                 let marker_style = Style::default().fg(palette.muted);
-                let shortcut_style = if tasks_focused && row.index == app.selected_task {
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    marker_style
-                };
+                let shortcut_style =
+                    if tasks_focused && app.shortcuts_active() && row.index == app.selected_task {
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        marker_style
+                    };
                 let mut spans = vec![Span::raw(row.prefix.clone())];
                 if row.has_children {
                     spans.push(Span::styled("[", marker_style));
@@ -2957,8 +3365,6 @@ fn task_panel_block(
         + 1
         + UnicodeWidthStr::width("[V]Turns")
         + 1
-        + UnicodeWidthStr::width("[M]Models")
-        + 1
         + UnicodeWidthStr::width("[R]Tree")
         + 1
         + UnicodeWidthStr::width("[E]Collapse")
@@ -2978,6 +3384,7 @@ fn task_panel_block(
             .add_modifier(Modifier::BOLD),
     )];
     let enter_available = app.focus == Focus::Tasks
+        && app.shortcuts_active()
         && app
             .snapshot
             .tasks
@@ -3022,7 +3429,7 @@ fn task_panel_block(
     } else {
         Style::default().fg(palette.muted)
     };
-    let toggle_shortcut_style = if app.focus.is_search() {
+    let toggle_shortcut_style = if !app.shortcuts_active() {
         toggle_style
     } else if app.turns_default_visible {
         toggle_style.add_modifier(Modifier::UNDERLINED)
@@ -3043,38 +3450,6 @@ fn task_panel_block(
         spans.push(Span::raw(" "));
         title_x = title_x.saturating_add(1);
     }
-    let models_label = if compact { "[M]" } else { "[M]Models" };
-    let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
-    let toggle_models = title_hitbox(area, title_x, models_width);
-    let models_style = if app.models_visible {
-        Style::default()
-            .fg(palette.background)
-            .bg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.muted)
-    };
-    let models_shortcut_style = if app.focus.is_search() {
-        models_style
-    } else if app.models_visible {
-        models_style.add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    };
-    spans.push(Span::styled("[", models_style));
-    spans.push(Span::styled("M", models_shortcut_style));
-    spans.push(Span::styled(
-        if compact { "]" } else { "]Models" },
-        models_style,
-    ));
-    title_x = title_x.saturating_add(models_width);
-
-    if !compact {
-        spans.push(Span::raw(" "));
-        title_x = title_x.saturating_add(1);
-    }
     let tree_label = if compact { "[R]" } else { "[R]Tree" };
     let tree_width = u16::try_from(UnicodeWidthStr::width(tree_label)).unwrap_or(u16::MAX);
     let toggle_tree = title_hitbox(area, title_x, tree_width);
@@ -3087,7 +3462,7 @@ fn task_panel_block(
     } else {
         Style::default().fg(palette.muted)
     };
-    let tree_shortcut_style = if app.focus.is_search() {
+    let tree_shortcut_style = if !app.shortcuts_active() {
         tree_style
     } else if tree_selected {
         tree_style.add_modifier(Modifier::UNDERLINED)
@@ -3112,7 +3487,7 @@ fn task_panel_block(
     let collapse_width = u16::try_from(UnicodeWidthStr::width(collapse_label)).unwrap_or(u16::MAX);
     let collapse_all = title_hitbox(area, title_x, collapse_width);
     let collapse_style = Style::default().fg(palette.muted);
-    let collapse_shortcut_style = if tree_selected && !app.focus.is_search() {
+    let collapse_shortcut_style = if tree_selected && app.shortcuts_active() {
         Style::default()
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD)
@@ -3128,7 +3503,7 @@ fn task_panel_block(
     title_x = title_x.saturating_add(collapse_width);
 
     let mut source_hitboxes = [Rect::default(); 4];
-    let shortcuts_active = !app.focus.is_search();
+    let shortcuts_active = app.shortcuts_active();
     for filter in TaskSourceFilter::ALL {
         if !compact {
             spans.push(Span::raw(" "));
@@ -3200,7 +3575,7 @@ fn task_panel_block(
     };
     spans.push(Span::styled(
         "F",
-        if app.focus == Focus::Tasks {
+        if app.focus == Focus::Tasks && app.shortcuts_active() {
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3238,7 +3613,7 @@ fn task_panel_block(
         let padding = clear_search.x.saturating_sub(rendered_right);
         spans.push(Span::raw(" ".repeat(usize::from(padding))));
         let clear_style = Style::default().fg(palette.muted);
-        let shortcut_style = if app.focus == Focus::Tasks {
+        let shortcut_style = if app.focus == Focus::Tasks && app.shortcuts_active() {
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3295,7 +3670,6 @@ fn task_panel_block(
         clear_search,
         enter_turns,
         toggle_turns,
-        toggle_models,
         toggle_tree,
         collapse_all,
     };
@@ -3330,7 +3704,7 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         .saturating_add(u16::try_from(UnicodeWidthStr::width(title)).unwrap_or(u16::MAX));
     spans.push(Span::raw(" "));
     x = x.saturating_add(1);
-    let back_available = app.focus == Focus::Turns;
+    let back_available = app.focus == Focus::Turns && app.shortcuts_active();
     let back_tasks = title_hitbox(area, x, 1);
     spans.push(Span::styled(
         if back_available { BACK_FOCUS_HINT } else { " " },
@@ -3379,7 +3753,7 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
     };
     spans.push(Span::styled(
         "F",
-        if app.focus == Focus::Turns {
+        if app.focus == Focus::Turns && app.shortcuts_active() {
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3418,7 +3792,7 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
             clear_search.x.saturating_sub(rendered_right),
         ))));
         let clear_style = Style::default().fg(palette.muted);
-        let shortcut_style = if app.focus == Focus::Turns {
+        let shortcut_style = if app.focus == Focus::Turns && app.shortcuts_active() {
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3867,6 +4241,7 @@ fn attribution_summary_lines(
     attribution: Option<&AttributionSummary>,
     window_scope: WindowScope,
     selected_partial: bool,
+    ambiguous_limit_buckets: bool,
     compact: bool,
 ) -> Vec<String> {
     let Some(attribution) = attribution else {
@@ -3891,29 +4266,68 @@ fn attribution_summary_lines(
             )
         })
         .unwrap_or_else(|| format!("{} reset cycle unavailable", window_scope.label()));
-    let estimated_quota = if attribution.confidence == Confidence::Unknown {
-        "-".to_string()
+    let has_proxy = attribution.proxy_projected_percent > 0.0;
+    let allocation = if has_proxy {
+        let total_estimate =
+            attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
+        if compact {
+            format!(
+                "Local {} · est ~{total_estimate:.2}pp (evidence {:.2} + proxy {:.2} from gap)",
+                format_tokens(attribution.local_token_usage),
+                attribution.estimated_assigned_percent,
+                attribution.proxy_projected_percent,
+            )
+        } else {
+            format!(
+                "{} local · ~{total_estimate:.2}pp estimated ({:.2}pp evidence assigned + {:.2}pp proxy from unverified gap)",
+                format_tokens(attribution.local_token_usage),
+                attribution.estimated_assigned_percent,
+                attribution.proxy_projected_percent,
+            )
+        }
     } else {
-        format!("{:.2}pp", attribution.estimated_assigned_percent)
+        let estimated_quota = if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
+        } else {
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
+        if compact {
+            format!(
+                "Local {} · obs +{:.2}pp · est {} · unattr {:.2}pp",
+                format_tokens(attribution.local_token_usage),
+                attribution.observed_delta_percent,
+                estimated_quota,
+                attribution.unattributed_percent,
+            )
+        } else {
+            format!(
+                "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed",
+                format_tokens(attribution.local_token_usage),
+                attribution.observed_delta_percent,
+                estimated_quota,
+                attribution.unattributed_percent,
+            )
+        }
     };
-    let allocation = if compact {
-        format!(
-            "Local {} · obs +{:.2}pp · est {} · unattr {:.2}pp",
-            format_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_quota,
-            attribution.unattributed_percent,
-        )
-    } else {
-        format!(
-            "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed",
-            format_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_quota,
-            attribution.unattributed_percent,
-        )
-    };
-    let mut quality = if compact {
+    let mut quality = if has_proxy {
+        if compact {
+            format!(
+                "obs +{:.2}pp · unverified gap {:.2}pp · Coverage {:.0}% · conf {}",
+                attribution.observed_delta_percent,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        } else {
+            format!(
+                "+{:.2}pp observed · {:.2}pp unverified evidence gap · {:.0}% evidence coverage · {} confidence",
+                attribution.observed_delta_percent,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        }
+    } else if compact {
         format!(
             "Coverage {:.0}% · conf {}",
             attribution.attribution_coverage_percent,
@@ -3936,10 +4350,259 @@ fn attribution_summary_lines(
     if attribution.settled {
         quality.push_str(" · settled");
     }
+    if ambiguous_limit_buckets {
+        quality.push_str(if compact {
+            " · est unavailable: multiple buckets"
+        } else {
+            " · quota estimate unavailable: multiple active buckets"
+        });
+    }
     if selected_partial {
         quality.push_str(" · partial");
     }
     vec![format!("Attribution  {window}"), allocation, quality]
+}
+
+fn mapped_bucket_attribution_lines(
+    analyses: &[&WindowAnalysis],
+    window_scope: WindowScope,
+    compact: bool,
+) -> Vec<String> {
+    if analyses.len() <= 1 {
+        let analysis = analyses.first().copied();
+        let ambiguous = analysis.is_some_and(|analysis| {
+            analysis
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "multiple_active_limit_buckets")
+        });
+        return attribution_summary_lines(
+            analysis.map(|analysis| &analysis.attribution),
+            window_scope,
+            analysis.is_some_and(|analysis| analysis.partial),
+            ambiguous,
+            compact,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            if index == 2
+                && let Some(analysis) = analysis
+                && let Some(note) = mapping_partial_note(analysis, compact)
+            {
+                line.push_str(" · ");
+                line.push_str(&note);
+            }
+            line
+        })
+        .collect();
+    }
+
+    let mut lines = vec![format!(
+        "Attribution  {} · {} model-mapped buckets",
+        window_scope.label(),
+        analyses.len()
+    )];
+    for analysis in analyses {
+        let attribution = &analysis.attribution;
+        let Some(window) = attribution.window.as_ref() else {
+            continue;
+        };
+        let has_proxy = attribution.proxy_projected_percent > 0.0;
+        let estimated = if has_proxy {
+            let total =
+                attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
+            format!(
+                "~{total:.2}pp (evidence {:.2} + proxy {:.2} from gap)",
+                attribution.estimated_assigned_percent, attribution.proxy_projected_percent,
+            )
+        } else if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
+        } else {
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
+        let mut line = if compact && has_proxy {
+            format!(
+                "{} {:.0}%→{} L{} EST~{:.1}(P{:.1}) A{:.1} U{:.1} C{:.0}%/{}",
+                terminal_safe_text(&window.limit_id),
+                window.used_percent,
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                format_tokens(attribution.local_token_usage),
+                attribution.estimated_assigned_percent + attribution.proxy_projected_percent,
+                attribution.proxy_projected_percent,
+                attribution.estimated_assigned_percent,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        } else if compact {
+            format!(
+                "{} {:.0}% →{} · L{} O+{:.1} E{} U{:.1} C{:.0}%/{}",
+                terminal_safe_text(&window.limit_id),
+                window.used_percent,
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                format_tokens(attribution.local_token_usage),
+                attribution.observed_delta_percent,
+                estimated,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        } else if has_proxy {
+            format!(
+                "{} · {:.1}% used · reset {} · local {} · est {} · unverified gap {:.2}pp · evidence coverage {:.0}% · {} confidence",
+                terminal_safe_text(&window.limit_id),
+                window.used_percent,
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                format_tokens(attribution.local_token_usage),
+                estimated,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        } else {
+            format!(
+                "{} · {:.1}% used · reset {} · local {} · obs +{:.2}pp · est {} · unattr {:.2}pp · cov {:.0}% {}",
+                terminal_safe_text(&window.limit_id),
+                window.used_percent,
+                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
+                format_tokens(attribution.local_token_usage),
+                attribution.observed_delta_percent,
+                estimated,
+                attribution.unattributed_percent,
+                attribution.attribution_coverage_percent,
+                confidence_label(attribution.confidence),
+            )
+        };
+        if let Some(note) = mapping_partial_note(analysis, compact) {
+            line.push_str(" · ");
+            line.push_str(&note);
+        } else if analysis.partial {
+            line.push_str(" · partial");
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn mapping_partial_note(analysis: &WindowAnalysis, compact: bool) -> Option<String> {
+    let missing_model = analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == UNMAPPED_CALL_MODEL_REASON);
+    let unavailable_bucket = analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == MAPPED_BUCKET_UNAVAILABLE_REASON);
+    match (missing_model, unavailable_bucket, compact) {
+        (false, false, _) => None,
+        (true, false, true) => Some("scope partial: missing-model calls excluded".to_string()),
+        (true, false, false) => {
+            Some("scope partial: calls without model metadata excluded".to_string())
+        }
+        (false, true, true) => Some("scope partial: mapped bucket unavailable".to_string()),
+        (false, true, false) => {
+            Some("scope partial: calls for an unavailable mapped bucket excluded".to_string())
+        }
+        (true, true, true) => Some("scope partial: missing model / unavailable bucket".to_string()),
+        (true, true, false) => {
+            Some("scope partial: missing-model and unavailable-bucket calls excluded".to_string())
+        }
+    }
+}
+
+fn mapping_exclusion_message(
+    analyses: &[&WindowAnalysis],
+    window_scope: WindowScope,
+) -> Option<String> {
+    let missing_model = analyses.iter().any(|analysis| {
+        analysis
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == UNMAPPED_CALL_MODEL_REASON)
+    });
+    let unavailable_bucket = analyses.iter().any(|analysis| {
+        analysis
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == MAPPED_BUCKET_UNAVAILABLE_REASON)
+    });
+    match (missing_model, unavailable_bucket) {
+        (false, false) => None,
+        (true, false) => Some(format!(
+            "Local calls in the current {} scope were excluded because model metadata is missing",
+            window_scope.label()
+        )),
+        (false, true) => Some(format!(
+            "Local calls map to a quota bucket with no current {} window",
+            window_scope.label()
+        )),
+        (true, true) => Some(format!(
+            "Current {} scope excludes missing-model calls and calls whose mapped bucket is unavailable",
+            window_scope.label()
+        )),
+    }
+}
+
+fn models_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Vec<ModelUsage> {
+    let analyses = window_analyses(snapshot, scope);
+    if analyses.is_empty() {
+        return if scope == WindowScope::FiveHours {
+            snapshot.models.clone()
+        } else {
+            Vec::new()
+        };
+    }
+    if analyses.len() == 1 {
+        return analyses[0].models.clone();
+    }
+
+    let total_local_tokens = analyses
+        .iter()
+        .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
+        .sum::<u64>();
+    let mut grouped: HashMap<String, (TokenUsage, f64, Confidence, usize)> = HashMap::new();
+    for analysis in analyses {
+        for model in &analysis.models {
+            let entry = grouped.entry(model.model.clone()).or_insert((
+                TokenUsage::default(),
+                0.0,
+                model.quota_confidence,
+                0,
+            ));
+            entry.0.add_assign(model.token_usage);
+            entry.1 += model.estimated_quota_percent;
+            entry.2 = weakest_quota_confidence(entry.2, model.quota_confidence);
+            if !model.token_usage.is_zero() {
+                entry.3 += 1;
+            }
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(
+            |(model, (token_usage, estimated_quota_percent, quota_confidence, buckets))| {
+                let local_token_share_percent = if total_local_tokens == 0 {
+                    0.0
+                } else {
+                    token_usage.total_tokens as f64 / total_local_tokens as f64 * 100.0
+                };
+                let (estimated_quota_percent, quota_confidence) = if buckets <= 1 {
+                    (estimated_quota_percent, quota_confidence)
+                } else {
+                    (0.0, Confidence::Unknown)
+                };
+                ModelUsage {
+                    model,
+                    token_usage,
+                    local_token_share_percent,
+                    estimated_quota_percent,
+                    quota_confidence,
+                }
+            },
+        )
+        .collect()
 }
 
 fn wrapped_text_height(lines: &[String], width: usize) -> usize {
@@ -3955,20 +4618,12 @@ fn wrapped_text_height(lines: &[String], width: usize) -> usize {
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
-    let selected_analysis = window_analysis(&app.snapshot, window_scope);
-    let selected_partial = selected_analysis
-        .map(|analysis| analysis.partial)
-        .unwrap_or_else(|| window_scope == WindowScope::FiveHours && app.snapshot.partial);
-    let attribution = attribution_for_scope(&app.snapshot, window_scope).cloned();
-    let mut models = selected_analysis
-        .map(|analysis| analysis.models.clone())
-        .unwrap_or_else(|| {
-            if window_scope == WindowScope::FiveHours {
-                app.snapshot.models.clone()
-            } else {
-                Vec::new()
-            }
-        });
+    let analyses = window_analyses(&app.snapshot, window_scope);
+    let legacy_attribution = analyses
+        .is_empty()
+        .then(|| attribution_for_scope(&app.snapshot, window_scope))
+        .flatten();
+    let mut models = models_for_scope(&app.snapshot, window_scope);
     models.sort_by(|left, right| {
         right
             .token_usage
@@ -3978,12 +4633,17 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     });
 
     let panel_inner = Block::default().borders(Borders::ALL).inner(area);
-    let attribution_lines = attribution_summary_lines(
-        attribution.as_ref(),
-        window_scope,
-        selected_partial,
-        panel_inner.width < 100,
-    );
+    let attribution_lines = if analyses.is_empty() {
+        attribution_summary_lines(
+            legacy_attribution,
+            window_scope,
+            window_scope == WindowScope::FiveHours && app.snapshot.partial,
+            false,
+            panel_inner.width < 100,
+        )
+    } else {
+        mapped_bucket_attribution_lines(&analyses, window_scope, panel_inner.width < 100)
+    };
     let attribution_height = u16::try_from(wrapped_text_height(
         &attribution_lines,
         usize::from(panel_inner.width),
@@ -3997,20 +4657,27 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let model_area = regions[1];
     let visible_capacity = usize::from(model_area.height.saturating_sub(1));
     let visible_count = models.len().min(visible_capacity);
-    let scope = attribution
-        .as_ref()
-        .and_then(|attribution| attribution.window.as_ref())
-        .map(|window| window.label.clone());
-    let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
-    if attribution.is_none() {
+    let scope = analyses
+        .first()
+        .and_then(|analysis| analysis.attribution.window.as_ref())
+        .map(|window| window.label.clone())
+        .or_else(|| {
+            legacy_attribution
+                .and_then(|attribution| attribution.window.as_ref())
+                .map(|window| window.label.clone())
+        });
+    let mut title_suffix = if analyses.len() > 1 {
+        format!("{} · {} buckets", window_scope.label(), analyses.len())
+    } else {
+        scope.as_deref().unwrap_or(window_scope.label()).to_string()
+    };
+    if analyses.is_empty() && legacy_attribution.is_none() {
         title_suffix.push_str(" unavailable");
     }
     if visible_count < models.len() {
         title_suffix.push_str(&format!(" · top {visible_count}/{}", models.len()));
     }
-    let (block, controls) = models_panel_block(area, app, &title_suffix);
-    app.window_controls_hitbox = Some(controls);
-    frame.render_widget(block, area);
+    frame.render_widget(models_panel_block(app, &title_suffix), area);
 
     frame.render_widget(
         Paragraph::new(
@@ -4028,7 +4695,9 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     if models.is_empty() {
-        let message = if scope.is_some() {
+        let message = if let Some(message) = mapping_exclusion_message(&analyses, window_scope) {
+            message
+        } else if !analyses.is_empty() || legacy_attribution.is_some() {
             format!(
                 "No local model usage in the current {} window",
                 scope.as_deref().unwrap_or(window_scope.label())
@@ -4090,66 +4759,24 @@ fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
         })
 }
 
-fn models_panel_block(
-    area: Rect,
-    app: &App,
-    suffix: &str,
-) -> (Block<'static>, WindowControlsHitbox) {
+fn models_panel_block(app: &App, suffix: &str) -> Block<'static> {
     let palette = app.theme.palette();
-    let shortcuts_active = !app.focus.is_search();
-    let mut spans = vec![Span::styled(
-        " Models",
-        Style::default()
-            .fg(palette.title)
-            .add_modifier(Modifier::BOLD),
-    )];
-    let mut x = area.x.saturating_add(1 + " Models".len() as u16);
-    let mut scopes = [Rect::default(); 2];
-    for scope in WindowScope::ALL {
-        spans.push(Span::raw(" "));
-        x = x.saturating_add(1);
-        let label = scope.label();
-        let width = u16::try_from(UnicodeWidthStr::width(label) + 2).unwrap_or(u16::MAX);
-        scopes[scope.index()] = title_hitbox(area, x, width);
-        let selected = app.window_scope == scope;
-        let style = if selected {
+    let spans = vec![
+        Span::styled(
+            " Models",
             Style::default()
-                .fg(palette.background)
-                .bg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(palette.muted)
-        };
-        let shortcut_style = if !shortcuts_active {
-            style
-        } else if selected {
-            style.add_modifier(Modifier::UNDERLINED)
-        } else {
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        };
-        let mut label_chars = label.chars();
-        let _ = label_chars.next();
-        spans.push(Span::styled("[", style));
-        spans.push(Span::styled(scope.shortcut().to_string(), shortcut_style));
-        spans.push(Span::styled(
-            format!("{}]", label_chars.collect::<String>()),
-            style,
-        ));
-        x = x.saturating_add(width);
-    }
-    spans.push(Span::styled(
-        format!(" · {}", terminal_safe_text(suffix)),
-        Style::default().fg(palette.muted),
-    ));
-    (
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette.border))
-            .title(Line::from(spans)),
-        WindowControlsHitbox { scopes },
-    )
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {}", terminal_safe_text(suffix)),
+            Style::default().fg(palette.muted),
+        ),
+    ];
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.border))
+        .title(Line::from(spans))
 }
 
 fn panel(title: &str, theme: Theme) -> Block<'_> {
@@ -4356,10 +4983,10 @@ fn confidence_label(confidence: Confidence) -> &'static str {
 }
 
 fn format_estimated_quota(value: f64, confidence: Confidence) -> String {
-    if confidence == Confidence::Unknown {
-        "-".to_string()
-    } else {
-        format!("{value:.1}%")
+    match confidence {
+        Confidence::Unknown => "-".to_string(),
+        Confidence::Low => format!("~{value:.1}%"),
+        Confidence::Medium | Confidence::High => format!("{value:.1}%"),
     }
 }
 
@@ -4532,6 +5159,15 @@ mod tests {
     }
 
     fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
+        render_models_content_for_scope(snapshot, WindowScope::FiveHours, width, height)
+    }
+
+    fn render_models_content_for_scope(
+        snapshot: &Snapshot,
+        scope: WindowScope,
+        width: u16,
+        height: u16,
+    ) -> String {
         let mut app = App::new(
             CollectionResult {
                 snapshot: snapshot.clone(),
@@ -4539,6 +5175,7 @@ mod tests {
             },
             Theme::Dark,
         );
+        app.window_scope = scope;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| render_models(frame, frame.area(), &mut app))
@@ -4606,6 +5243,7 @@ mod tests {
                 local_token_usage: usage.token_usage,
                 observed_delta_percent: 1.0,
                 estimated_assigned_percent: 1.0,
+                proxy_projected_percent: 0.0,
                 unattributed_percent: 22.0,
                 attribution_coverage_percent: 4.3,
                 external_activity_possible: true,
@@ -4632,6 +5270,47 @@ mod tests {
                 quota_confidence: usage.quota_confidence,
             }],
         });
+    }
+
+    fn add_spark_window_analysis(app: &mut App, scope: WindowScope, total_tokens: u64) {
+        let mut analysis = app
+            .snapshot
+            .window_analyses
+            .iter()
+            .find(|analysis| analysis.duration_mins == scope.duration_mins())
+            .cloned()
+            .expect("base window analysis");
+        let usage = WindowUsage {
+            token_usage: TokenUsage {
+                input_tokens: total_tokens,
+                total_tokens,
+                ..TokenUsage::default()
+            },
+            local_token_share_percent: 100.0,
+            estimated_quota_percent: 1.25,
+            quota_confidence: Confidence::Low,
+        };
+        let window = analysis.attribution.window.as_mut().unwrap();
+        window.limit_id = "codex_bengalfox".to_string();
+        window.used_percent = 7.0;
+        window.ends_at += chrono::Duration::minutes(30);
+        window.starts_at += chrono::Duration::minutes(30);
+        analysis.attribution.local_token_usage = usage.token_usage;
+        analysis.attribution.observed_delta_percent = 0.5;
+        analysis.attribution.estimated_assigned_percent = 0.4;
+        analysis.attribution.unattributed_percent = 6.6;
+        analysis.attribution.attribution_coverage_percent = 5.7;
+        analysis.attribution.confidence = Confidence::Low;
+        analysis.threads[0].usage = usage;
+        analysis.turns[0].usage = usage;
+        analysis.models = vec![ModelUsage {
+            model: "gpt-5.3-codex-spark".to_string(),
+            token_usage: usage.token_usage,
+            local_token_share_percent: 100.0,
+            estimated_quota_percent: usage.estimated_quota_percent,
+            quota_confidence: usage.quota_confidence,
+        }];
+        app.snapshot.window_analyses.push(analysis);
     }
 
     #[test]
@@ -4694,7 +5373,42 @@ mod tests {
     fn confidence_labels_are_stable() {
         assert_eq!(confidence_label(Confidence::Medium), "medium");
         assert_eq!(format_estimated_quota(0.0, Confidence::Unknown), "-");
-        assert_eq!(format_estimated_quota(2.26, Confidence::Low), "2.3%");
+        assert_eq!(format_estimated_quota(2.26, Confidence::Low), "~2.3%");
+        assert_eq!(format_estimated_quota(2.26, Confidence::Medium), "2.3%");
+        assert_eq!(format_estimated_quota(2.26, Confidence::High), "2.3%");
+    }
+
+    #[test]
+    fn proxy_attribution_summary_keeps_projection_and_gap_distinct() {
+        let attribution = AttributionSummary {
+            local_token_usage: TokenUsage {
+                total_tokens: 760_000_000,
+                ..TokenUsage::default()
+            },
+            observed_delta_percent: 4.0,
+            estimated_assigned_percent: 4.0,
+            proxy_projected_percent: 30.0,
+            unattributed_percent: 30.0,
+            attribution_coverage_percent: 11.8,
+            confidence: Confidence::Low,
+            ..AttributionSummary::default()
+        };
+
+        let compact =
+            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false, true);
+        assert!(compact[1].contains("est ~34.00pp"));
+        assert!(compact[1].contains("evidence 4.00 + proxy 30.00 from gap"));
+        assert!(compact[2].contains("unverified gap 30.00pp"));
+        assert!(compact[2].contains("Coverage 12%"));
+        assert!(compact[2].contains("conf low"));
+
+        let wide =
+            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false, false);
+        assert!(wide[1].contains("~34.00pp estimated"));
+        assert!(wide[1].contains("30.00pp proxy from unverified gap"));
+        assert!(wide[2].contains("30.00pp unverified evidence gap"));
+        assert!(wide[2].contains("12% evidence coverage"));
+        assert!(wide[2].contains("low confidence"));
     }
 
     #[test]
@@ -4729,7 +5443,7 @@ mod tests {
 
         let content = render_models_content(&app.snapshot, 120, 8);
 
-        assert!(content.contains("Models [5h] [Week] · 5h unavailable"));
+        assert!(content.contains("Models · 5h unavailable"));
         assert!(content.contains("weekly reset-cycle data remains available"));
     }
 
@@ -4747,7 +5461,7 @@ mod tests {
 
         let content = render_models_content(&app.snapshot, 100, 8);
 
-        assert!(content.contains("Models [5h] [Week] · 5h"));
+        assert!(content.contains("Models · 5h"));
         assert!(content.contains("No local model usage in the current 5h window"));
         assert!(!content.contains("5h unavailable"));
     }
@@ -4770,7 +5484,7 @@ mod tests {
         ];
 
         let compact = render_models_content(&app.snapshot, 100, 7);
-        assert!(compact.contains("Models [5h] [Week] · 5h · top 1/3"));
+        assert!(compact.contains("Models · 5h · top 1/3"));
         assert!(compact.contains("largest-model"));
         assert!(!compact.contains("small-model"));
         assert!(!compact.contains("medium-model"));
@@ -4798,6 +5512,150 @@ mod tests {
         assert!(content.contains("external"));
         assert!(content.contains("settled"));
         assert!(content.contains("partial"));
+    }
+
+    #[test]
+    fn models_panel_explains_ambiguous_quota_buckets_for_selected_scope() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
+        add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
+        let weekly = app
+            .snapshot
+            .window_analyses
+            .iter_mut()
+            .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+            .unwrap();
+        weekly.partial = true;
+        weekly
+            .partial_reasons
+            .push("multiple_active_limit_buckets".to_string());
+        weekly.attribution.estimated_assigned_percent = 0.0;
+        weekly.attribution.confidence = Confidence::Unknown;
+        for model in &mut weekly.models {
+            model.estimated_quota_percent = 0.0;
+            model.quota_confidence = Confidence::Unknown;
+        }
+
+        let compact = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 9);
+        assert!(compact.contains("est unavailable:"));
+        assert!(compact.contains("multiple"));
+        assert!(compact.contains("buckets"));
+        assert!(compact.contains("unknown"));
+
+        let wide = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 140, 9);
+        assert!(wide.contains("quota estimate unavailable: multiple active buckets"));
+
+        let five_hours =
+            render_models_content_for_scope(&app.snapshot, WindowScope::FiveHours, 140, 9);
+        assert!(!five_hours.contains("multiple active buckets"));
+    }
+
+    #[test]
+    fn mapped_bucket_rows_recompute_local_share_without_adding_quota_pools() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 150, 100.0);
+        add_spark_window_analysis(&mut app, WindowScope::FiveHours, 50);
+
+        let task_usage = task_usage_for_scope(
+            &app.snapshot,
+            WindowScope::FiveHours,
+            &app.snapshot.tasks[0],
+        );
+        assert_eq!(task_usage.token_usage.total_tokens, 200);
+        assert!((task_usage.local_token_share_percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(task_usage.estimated_quota_percent, 0.0);
+        assert_eq!(task_usage.quota_confidence, Confidence::Unknown);
+
+        let models = models_for_scope(&app.snapshot, WindowScope::FiveHours);
+        assert_eq!(models.len(), 2);
+        let regular = models
+            .iter()
+            .find(|model| model.model == "gpt-window")
+            .unwrap();
+        let spark = models
+            .iter()
+            .find(|model| model.model == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert!((regular.local_token_share_percent - 75.0).abs() < f64::EPSILON);
+        assert!((spark.local_token_share_percent - 25.0).abs() < f64::EPSILON);
+        assert_eq!(regular.estimated_quota_percent, 2.5);
+        assert_eq!(spark.estimated_quota_percent, 1.25);
+    }
+
+    #[test]
+    fn models_panel_lists_each_model_mapped_quota_bucket() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::Week, 150, 100.0);
+        add_spark_window_analysis(&mut app, WindowScope::Week, 50);
+
+        let wide = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 140, 12);
+        assert!(wide.contains("Models · Week · 2 buckets"));
+        assert!(wide.contains("codex_bengalfox"));
+        assert!(wide.contains("gpt-window"));
+        assert!(wide.contains("gpt-5.3-codex-spark"));
+
+        let compact = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 10);
+        assert!(compact.contains("2 model-mapped buckets"));
+        assert!(compact.contains("codex_bengalfox"));
+    }
+
+    #[test]
+    fn compact_mapped_bucket_proxy_summary_leaves_room_for_models() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::Week, 150, 100.0);
+        add_spark_window_analysis(&mut app, WindowScope::Week, 50);
+        for analysis in &mut app.snapshot.window_analyses {
+            analysis.attribution.proxy_projected_percent =
+                analysis.attribution.unattributed_percent;
+            analysis.attribution.confidence = Confidence::Low;
+            for model in &mut analysis.models {
+                model.quota_confidence = Confidence::Low;
+            }
+        }
+
+        let analyses = window_analyses(&app.snapshot, WindowScope::Week);
+        let lines = mapped_bucket_attribution_lines(&analyses, WindowScope::Week, true);
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("EST~23.0(P22.0) A1.0 U22.0 C4%/low") })
+        );
+        assert!(lines.iter().skip(1).all(|line| line.width() <= 78));
+
+        let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 10);
+        assert!(content.contains("gpt-window"));
+        assert!(content.contains("~2.5%"));
+    }
+
+    #[test]
+    fn models_panel_explains_why_model_mapped_calls_were_excluded() {
+        let mut unavailable = interaction_test_app(1, 1);
+        add_window_analysis(&mut unavailable, WindowScope::Week, 0, 0.0);
+        let analysis = &mut unavailable.snapshot.window_analyses[0];
+        analysis.models.clear();
+        analysis.partial = true;
+        analysis
+            .partial_reasons
+            .push(MAPPED_BUCKET_UNAVAILABLE_REASON.to_string());
+        let content =
+            render_models_content_for_scope(&unavailable.snapshot, WindowScope::Week, 120, 10);
+        assert!(content.contains("scope partial"));
+        assert!(content.contains("unavailable mapped bucket"));
+        assert!(content.contains("no current Week window"));
+        assert!(!content.contains("No local model usage"));
+
+        let mut missing_model = interaction_test_app(1, 1);
+        add_window_analysis(&mut missing_model, WindowScope::FiveHours, 0, 0.0);
+        let analysis = &mut missing_model.snapshot.window_analyses[0];
+        analysis.models.clear();
+        analysis.partial = true;
+        analysis
+            .partial_reasons
+            .push(UNMAPPED_CALL_MODEL_REASON.to_string());
+        let content = render_models_content(&missing_model.snapshot, 120, 10);
+        assert!(content.contains("without model metadata excluded"));
+        assert!(content.contains("model metadata is missing"));
+        assert!(!content.contains("No local model usage"));
     }
 
     #[test]
@@ -5494,8 +6352,7 @@ mod tests {
             let initial_collapse = controls.collapse_all;
             assert_eq!(initial.width, expected_width);
             assert_eq!(initial_collapse.width, if width == 60 { 3 } else { 11 });
-            assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
-            assert!(controls.toggle_models.right() <= initial.x);
+            assert!(controls.toggle_turns.right() <= initial.x);
             assert!(initial.right() <= initial_collapse.x);
             assert!(initial_collapse.right() <= controls.sources[0].x);
             assert_eq!(
@@ -5858,6 +6715,119 @@ mod tests {
     }
 
     #[test]
+    fn top_window_controls_keep_stable_compact_geometry() {
+        for width in [8, 20, 44, 54, 80, 120] {
+            let mut app = interaction_test_app(1, 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let controls = render_overview_controls(frame, frame.area(), &app);
+                    app.window_controls_hitbox = Some(controls);
+                })
+                .unwrap();
+            let initial = app.window_controls_hitbox.unwrap();
+            let tabs = view_tabs_hitbox(Rect::new(0, 0, width, 1));
+            for button in std::iter::once(initial.toggle_models).chain(initial.scopes) {
+                if !button.is_empty() {
+                    assert!(button.x >= tabs.tabs[View::Health.index()].right());
+                    assert!(button.right() <= width);
+                }
+            }
+
+            app.models_visible = false;
+            app.focus = Focus::TaskSearch;
+            terminal
+                .draw(|frame| {
+                    let controls = render_overview_controls(frame, frame.area(), &app);
+                    app.window_controls_hitbox = Some(controls);
+                })
+                .unwrap();
+            assert_eq!(app.window_controls_hitbox.unwrap(), initial);
+
+            if width >= 44 {
+                assert!(!initial.toggle_models.is_empty());
+                assert!(initial.scopes.iter().all(|button| !button.is_empty()));
+                let buffer = terminal.backend().buffer();
+                assert_eq!(buffer[(initial.toggle_models.x + 1, 0)].symbol(), "M");
+                assert_eq!(buffer[(initial.scopes[0].x + 1, 0)].symbol(), "5");
+                assert_eq!(buffer[(initial.scopes[1].x + 1, 0)].symbol(), "W");
+            }
+        }
+
+        for width in 31..40 {
+            let app = interaction_test_app(1, 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            let mut controls = None;
+            terminal
+                .draw(|frame| controls = Some(render_overview_controls(frame, frame.area(), &app)))
+                .unwrap();
+            let rendered = (30..width)
+                .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                .collect::<String>();
+            let expected = match width {
+                31..=33 => "",
+                34..=36 => " [M]",
+                37..=39 => " [M][5]",
+                _ => unreachable!(),
+            };
+            assert_eq!(rendered.trim_end(), expected, "width={width}");
+            let controls = controls.unwrap();
+            for (button, shortcut) in [
+                (controls.toggle_models, "M"),
+                (controls.scopes[WindowScope::FiveHours.index()], "5"),
+                (controls.scopes[WindowScope::Week.index()], "W"),
+            ] {
+                if !button.is_empty() {
+                    assert_eq!(button.width, 3);
+                    assert_eq!(
+                        terminal.backend().buffer()[(button.x + 1, 0)].symbol(),
+                        shortcut
+                    );
+                }
+            }
+        }
+
+        let mut app = interaction_test_app(1, 1);
+        let mut terminal = Terminal::new(TestBackend::new(44, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let controls = render_overview_controls(frame, frame.area(), &app);
+                app.window_controls_hitbox = Some(controls);
+            })
+            .unwrap();
+        let controls = app.window_controls_hitbox.unwrap();
+        for (button, expected_scope) in [
+            (
+                controls.scopes[WindowScope::Week.index()],
+                WindowScope::Week,
+            ),
+            (
+                controls.scopes[WindowScope::FiveHours.index()],
+                WindowScope::FiveHours,
+            ),
+        ] {
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    button.right() - 1,
+                    button.y,
+                ),
+            ));
+            assert_eq!(app.window_scope, expected_scope);
+        }
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                controls.toggle_models.right() - 1,
+                controls.toggle_models.y,
+            ),
+        ));
+        assert!(!app.models_visible);
+    }
+
+    #[test]
     fn models_panel_visibility_uses_keyboard_mouse_and_search_priority() {
         let mut app = interaction_test_app(3, 2);
         add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
@@ -5866,8 +6836,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let visible_capacity = app.task_table_hitbox.unwrap().capacity;
-        let controls = app.task_controls_hitbox.unwrap();
-        let model_button = controls.toggle_models;
+        let model_button = app.window_controls_hitbox.unwrap().toggle_models;
         let shortcut = &terminal.backend().buffer()[(model_button.x + 1, model_button.y)];
         assert_eq!(shortcut.symbol(), "M");
         assert!(shortcut.modifier.contains(Modifier::UNDERLINED));
@@ -5876,13 +6845,13 @@ mod tests {
         handle_key_event(&mut app, key_event(KeyCode::Char('M')));
         assert!(!app.models_visible);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let hidden_button = app.task_controls_hitbox.unwrap().toggle_models;
+        let hidden_button = app.window_controls_hitbox.unwrap().toggle_models;
         assert_eq!(hidden_button, model_button);
         let hidden_shortcut = &terminal.backend().buffer()[(hidden_button.x + 1, hidden_button.y)];
         assert_eq!(hidden_shortcut.fg, app.theme.palette().accent);
         assert!(hidden_shortcut.modifier.contains(Modifier::BOLD));
         assert!(!hidden_shortcut.modifier.contains(Modifier::UNDERLINED));
-        assert!(app.window_controls_hitbox.is_none());
+        assert!(app.window_controls_hitbox.is_some());
         assert!(app.task_table_hitbox.unwrap().capacity > visible_capacity);
         let hidden = terminal
             .backend()
@@ -5894,10 +6863,18 @@ mod tests {
         assert!(!hidden.contains("Attribution"));
         assert!(!hidden.contains("gpt-window"));
 
-        handle_key_event(&mut app, key_event(KeyCode::Char('W')));
+        let week = app.window_controls_hitbox.unwrap().scopes[WindowScope::Week.index()];
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                week.right() - 1,
+                week.y,
+            ),
+        ));
         assert_eq!(app.window_scope, WindowScope::Week);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let model_button = app.task_controls_hitbox.unwrap().toggle_models;
+        let model_button = app.window_controls_hitbox.unwrap().toggle_models;
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(
@@ -5909,7 +6886,7 @@ mod tests {
         assert!(app.models_visible);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.window_controls_hitbox.is_some());
-        let visible_week_button = app.task_controls_hitbox.unwrap().toggle_models;
+        let visible_week_button = app.window_controls_hitbox.unwrap().toggle_models;
         let visible = terminal
             .backend()
             .buffer()
@@ -5924,7 +6901,7 @@ mod tests {
         assert_eq!(app.task_search, "m");
         assert!(app.models_visible);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let searching = app.task_controls_hitbox.unwrap().toggle_models;
+        let searching = app.window_controls_hitbox.unwrap().toggle_models;
         let searching_shortcut = &terminal.backend().buffer()[(searching.x + 1, searching.y)];
         let searching_bracket = &terminal.backend().buffer()[(searching.x, searching.y)];
         assert_eq!(searching, visible_week_button);
@@ -5937,6 +6914,8 @@ mod tests {
         app.set_view(View::Health);
         handle_key_event(&mut app, key_event(KeyCode::Char('M')));
         assert!(app.models_visible);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.window_controls_hitbox.is_none());
     }
 
     #[test]
@@ -5956,7 +6935,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Week reset cycle unavailable"));
-        assert!(content.contains("Models [5h] [Week] · Week unavailable"));
+        assert!(content.contains("Models · Week unavailable"));
         assert!(!content.contains("No local model usage in the current Week window"));
     }
 
@@ -6113,8 +7092,7 @@ mod tests {
 
                 let controls = app.task_controls_hitbox.unwrap();
                 assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-                assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
-                assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
+                assert!(controls.toggle_turns.right() <= controls.toggle_tree.x);
                 assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
                 assert!(controls.collapse_all.right() <= controls.sources[0].x);
                 for pair in controls.sources.windows(2) {
@@ -6232,6 +7210,148 @@ mod tests {
         assert_eq!(app.focus, Focus::Tasks);
         assert_eq!(app.task_search, "task 2");
         assert_eq!(app.selected_task, 2);
+    }
+
+    #[test]
+    fn escape_uses_confirmation_while_ctrl_c_and_q_exit_directly() {
+        let mut app = interaction_test_app(2, 1);
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(app.quit_confirmation_visible);
+
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('2'))));
+        assert_eq!(app.view, View::Overview);
+        assert!(app.quit_confirmation_visible);
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(!app.quit_confirmation_visible);
+
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(handle_key_event(&mut app, key_event(KeyCode::Enter)));
+        app.open_quit_confirmation();
+        assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
+
+        app.open_quit_confirmation();
+        assert!(handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ));
+        app.close_quit_confirmation();
+        assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
+
+        app.begin_task_search();
+        assert!(handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ));
+        handle_key_event(&mut app, key_event(KeyCode::Char('x')));
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert_eq!(app.focus, Focus::Tasks);
+        assert!(!app.quit_confirmation_visible);
+    }
+
+    #[test]
+    fn quit_confirmation_renders_and_blocks_background_mouse_input() {
+        for (theme, width, height) in [(Theme::Dark, 80, 24), (Theme::Light, 12, 9)] {
+            let mut app = interaction_test_app(3, 2);
+            app.theme = theme;
+            app.open_quit_confirmation();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+            let hitbox = app
+                .quit_confirmation_hitbox
+                .expect("quit controls should render");
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(hitbox.confirm.x + 1, hitbox.confirm.y)].symbol(),
+                "↵"
+            );
+            assert_eq!(
+                buffer[(hitbox.confirm.x + 1, hitbox.confirm.y)].fg,
+                theme.palette().accent
+            );
+            assert_eq!(buffer[(hitbox.cancel.x + 1, hitbox.cancel.y)].symbol(), "E");
+
+            if width == 80 {
+                let tabs = app.view_tabs_hitbox.unwrap();
+                let overview = tabs.tabs[View::Overview.index()];
+                assert_eq!(
+                    buffer[(overview.x + 1, overview.y)].fg,
+                    theme.palette().muted
+                );
+                let models = app.window_controls_hitbox.unwrap().toggle_models;
+                assert!(
+                    !buffer[(models.x + 1, models.y)]
+                        .modifier
+                        .contains(Modifier::UNDERLINED)
+                );
+                let filter = app.task_controls_hitbox.unwrap().search;
+                assert_eq!(buffer[(filter.x, filter.y)].fg, theme.palette().muted);
+            }
+
+            let health = app.view_tabs_hitbox.unwrap().tabs[View::Health.index()];
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Down(MouseButton::Left), health.x, health.y),
+            ));
+            assert_eq!(app.view, View::Overview);
+            assert!(app.quit_confirmation_visible);
+
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    hitbox.cancel.right() - 1,
+                    hitbox.cancel.y,
+                ),
+            ));
+            assert!(!app.quit_confirmation_visible);
+            assert!(!app.quit_requested);
+
+            app.open_quit_confirmation();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let confirm = app.quit_confirmation_hitbox.unwrap().confirm;
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    confirm.right() - 1,
+                    confirm.y,
+                ),
+            ));
+            assert!(app.quit_requested);
+        }
+    }
+
+    #[test]
+    fn quit_confirmation_never_renders_partial_buttons_in_tiny_terminals() {
+        for width in 3..=12 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 7)).unwrap();
+            let mut hitbox = None;
+            terminal
+                .draw(|frame| {
+                    hitbox = Some(render_quit_confirmation(frame, frame.area(), Theme::Dark));
+                })
+                .unwrap();
+            let hitbox = hitbox.unwrap();
+            assert_eq!(!hitbox.confirm.is_empty(), width >= 5, "width={width}");
+            assert_eq!(!hitbox.cancel.is_empty(), width >= 11, "width={width}");
+            if !hitbox.confirm.is_empty() {
+                assert_eq!(hitbox.confirm.width, 3);
+                assert!(hitbox.confirm.right() <= width);
+                assert_eq!(
+                    terminal.backend().buffer()[(hitbox.confirm.x + 1, hitbox.confirm.y)].symbol(),
+                    "↵"
+                );
+            }
+            if !hitbox.cancel.is_empty() {
+                assert_eq!(hitbox.cancel.width, 5);
+                assert!(hitbox.cancel.right() <= width);
+                assert_eq!(
+                    terminal.backend().buffer()[(hitbox.cancel.x + 1, hitbox.cancel.y)].symbol(),
+                    "E"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6452,7 +7572,8 @@ mod tests {
         assert!(app.turn_search_restore_turn_id.is_none());
         assert_eq!(app.selected_task_turn_count(), 4);
 
-        assert!(handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(app.quit_confirmation_visible);
         assert_eq!(app.focus, Focus::Turns);
         assert!(app.turn_search.is_empty());
     }
@@ -6612,13 +7733,11 @@ mod tests {
         let controls = app.task_controls_hitbox.unwrap();
         assert!(!controls.enter_turns.is_empty());
         assert!(!controls.toggle_turns.is_empty());
-        assert!(!controls.toggle_models.is_empty());
         assert!(!controls.toggle_tree.is_empty());
         assert!(!controls.collapse_all.is_empty());
         assert!(!controls.search.is_empty());
         assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-        assert!(controls.toggle_turns.right() <= controls.toggle_models.x);
-        assert!(controls.toggle_models.right() <= controls.toggle_tree.x);
+        assert!(controls.toggle_turns.right() <= controls.toggle_tree.x);
         assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
         assert!(controls.collapse_all.right() <= controls.sources[0].x);
         for pair in controls.sources.windows(2) {
@@ -6636,10 +7755,6 @@ mod tests {
             "V"
         );
         assert_eq!(
-            buffer[(controls.toggle_models.x + 1, controls.toggle_models.y)].symbol(),
-            "M"
-        );
-        assert_eq!(
             buffer[(controls.toggle_tree.x + 1, controls.toggle_tree.y)].symbol(),
             "R"
         );
@@ -6649,19 +7764,21 @@ mod tests {
         );
         assert_eq!(buffer[(controls.search.x, controls.search.y)].symbol(), "F");
 
+        let top_models = app.window_controls_hitbox.unwrap().toggle_models;
+        assert_eq!(buffer[(top_models.x + 1, top_models.y)].symbol(), "M");
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
-                controls.toggle_models.right() - 1,
-                controls.toggle_models.y,
+                top_models.right() - 1,
+                top_models.y,
             ),
         ));
         assert!(!app.models_visible);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(
-            app.task_controls_hitbox.unwrap().toggle_models,
-            controls.toggle_models
+            app.window_controls_hitbox.unwrap().toggle_models,
+            top_models
         );
     }
 

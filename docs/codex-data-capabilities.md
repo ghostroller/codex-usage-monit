@@ -14,7 +14,9 @@
 
 当前工具启动独立 App Server，只调用账户额度与账户用量读取方法。这个新 runtime 无法提供其他已经运行的 CLI/IDE/Desktop task 的精确 active flags，所以 v0.1 的 task 状态来自 rollout turn 边界与文件新鲜度，并明确标为 `inferred` 或 `stale`。官方 thread status API 是未来统一 runtime 模式的数据能力，不是当前实现已经声称拥有的能力。
 
-在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback 和来源一致时的补充。TUI 进程会积累连续服务端快照，一次性命令不会跨进程保存快照历史。
+在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback 和来源一致时的补充。TUI 进程会积累连续服务端快照，一次性命令不会跨进程保存快照历史。由于服务端百分比是整数，两个以上相同整数快照不能证明中间没有变化；与当前服务端值和 reset epoch 一致的细粒度 rollout 样本仍保留为严格证据。
+
+完整、当前且模型归桶明确的周期同时提供 Low-confidence cycle proxy：把严格证据未覆盖的当前 gauge 按桶内本地 token share 投影到 task/turn/model。它解决冷启动和整数平台期全为 `-` 的可用性问题，但不是服务端账单。
 
 TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）启动浅色主题，并在运行中按 `t` 切换。主题属于渲染层，不影响数据采集、精度标记或一次性 text/JSON。
 
@@ -56,7 +58,7 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 
 工具必须按 `windowDurationMins == 300` 和 `10080` 识别 5 小时/周窗口。若服务端返回其他时长，应显示通用窗口名称，而不是把 primary/secondary 硬编码为 5 小时/周。
 
-若同一 duration 返回多个当前桶，不能把它们的账户百分比混合。周期边界候选应优先 Codex 产品桶和服务端 provenance；仍有歧义时使用稳定排序选一个并输出 warning，其他候选只保留在额度 gauge 中。由于本地 `UsageCall` 没有 limit id，duration 级 token 构成仍可展示，但无法证明属于所选桶；因此该窗口必须标为 partial，并禁用所有实体的 estimated quota。
+同一 duration 的多个账户百分比不能混合。当前唯一可验证的规则适用于已知 `codex` / `codex_bengalfox` 桶：本地 rollout 的明确模型将 `gpt-5.3-codex-spark` 路由到 `codex_bengalfox`，其他非空模型路由到 `codex`，再按每个桶自己的 reset cycle 和额度观测分别归因。该规则在只出现其中一个桶时也生效；映射到缺失桶的调用不回退到现有桶，scope 标为 partial。缺失或空模型不能默认进 `codex`，因为它也可能来自旧版 Spark 日志；这类调用从桶级分析中排除，任何与它重叠的服务端增量区间保持 unattributed，不能全部转嫁给已映射调用。其他多桶组合仍按 Codex 产品桶、服务端 provenance 和稳定排序选择一个边界，其他候选只保留 gauge，同时禁用所有实体的 estimated quota。
 
 ### Thread 与 Turn 状态
 
@@ -150,7 +152,12 @@ observed_delta = max(0, current_used_percent - previous_used_percent)
 
 这只是账户额度变化。若区间内只有一个本地模型调用且没有可见并发，可把它显示为“观测到的百分点变化”，并附置信度。若区间内有多个任务、并发、缺口或外部活动，则必须进入 `unattributed`，或者在用户明确接受后按 token 代理量做 `estimated` 分摊。
 
-v0.1 采用已经确认的 token 比例代理量，但只分摊间隔不超过 5 分钟的快照。扫描截断、坏行、不可读文件、累计 token counter 回退、长快照间隔和没有本地调用的变化不分摊。Counter 回退样本只重建 baseline 并标记 partial，避免把共享基线重复算作消费。服务端与 rollout 明显不一致时只使用服务端历史；百分比回退会开启新的观测 epoch。即使区间成功分摊，其他设备或云 task 仍可能同时贡献该 delta，因此 schema 保留 `externalActivityPossible`，confidence 不会达到 High。
+v0.1 把两层估算分开保存：
+
+- **Evidence allocation**：只分摊间隔不超过 5 分钟的正向快照 delta，写入 `estimatedAssignedPercent`；`attributionCoveragePercent` 只衡量这一层。
+- **Cycle proxy**：在周期数据完整、当前、非 stale 且模型映射无歧义时，将 `unattributedPercent` 证据缺口按桶内本地 token share 投影，写入 `proxyProjectedPercent`。实体的 `estimatedQuotaPercent` 等于 evidence contribution 加 proxy contribution，并始终标为 Low，TUI/text 用 `~` 表示近似。
+
+`proxyProjectedPercent` 是 `unattributedPercent` 中被投影的部分，两者重叠，不能相加；证据恒等式仍为 `estimatedAssignedPercent + unattributedPercent = usedPercent`。扫描截断、坏行、不可读文件、累计 token counter 回退、lookback 不足、stale、未知模型和目标桶缺失时不生成 proxy。服务端与 rollout 明显不一致时只使用服务端历史；同周期百分比回退会开启新的严格证据 epoch并保留 warning，但当前 gauge 仍可生成 Low proxy。即使成功分摊，其他设备或云 task 仍可能贡献额度，因此 schema 保留 `externalActivityPossible`，confidence 不会达到 High。
 
 ### 不允许的口径
 
@@ -160,11 +167,11 @@ v0.1 采用已经确认的 token 比例代理量，但只分摊间隔不超过 5
 turn_tokens / window_tokens * current_used_percent
 ```
 
-它可以作为估算代理，但必须明确标为 `estimated quota share`，并同时展示置信度和未归因部分。
+工具仅在上述质量门槛满足时把它用于 cycle proxy，并明确标为 `estimated quota share`、`~`/Low，同时展示严格证据、evidence coverage 和仍未验证的 gap；绝不称为官方贡献。
 
 ## 多窗口输出与交互
 
-TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 的 Models 标题提供 `[5h]` / `[Week]` scope，分别由 `5` / `W` 或鼠标左键选择；Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长的数据。Models 可由 `M` 或 Tasks 标题中的 `[M]Models` 隐藏和恢复，归因信息不再占用独立 TUI 面板。
+TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[M]Models`、`[5h]` 与 `[Week]`，分别由 `M`、`5`、`W` 或鼠标左键操作；Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长的数据。存在已知模型映射的两个桶时，Models 逐桶显示 reset、observed evidence、完整 estimated、proxy、unverified gap、evidence coverage 与 confidence；task/turn 的 local share 使用两个当前桶内已映射 token 的合并分母重新计算，只有实体落在单一桶时才显示 estimated quota，跨桶实体显示 `-`。Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
 
 一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。
 
@@ -187,7 +194,7 @@ TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 的 Models 
 
 - task/turn/model token 可以精确结算；
 - 扫描完整的当前 5 小时或周 reset cycle 本地 token share 可以精确结算；
-- estimated quota share 可以提高到 Medium confidence；
+- 只有不含 proxy 的严格观测 estimated quota share 可以提高到 Medium confidence；包含 proxy 的结果保持 Low；
 - 服务端 task/turn quota 仍然不能精确计算。
 
 取整、模型隐藏权重、快照间隙和外部活动不会因为本地任务停止而消失，所以 idle 不是把 estimated 变成 exact 的条件。

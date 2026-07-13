@@ -307,28 +307,8 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 window.used_percent
             );
         }
-        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        let _ = writeln!(
-            output,
-            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
-            compact_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_assigned,
-            attribution.unattributed_percent
-        );
-        let _ = writeln!(
-            output,
-            "  confidence {:?} | coverage {:.1}% | external activity possible {} | settled {} | method {}",
-            attribution.confidence,
-            attribution.attribution_coverage_percent,
-            attribution.external_activity_possible,
-            attribution.settled,
-            terminal_safe_text(&attribution.method)
-        );
+        let _ = writeln!(output, "{}", attribution_allocation_line(attribution));
+        let _ = writeln!(output, "{}", attribution_quality_line(attribution));
     }
 
     if request.sections.contains(&Section::Windows) {
@@ -417,19 +397,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
                 analysis.duration_mins
             );
         }
-        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        let _ = writeln!(
-            output,
-            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
-            compact_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_assigned,
-            attribution.unattributed_percent
-        );
+        let _ = writeln!(output, "{}", attribution_allocation_line(attribution));
         if !analysis.partial_reasons.is_empty() {
             let _ = writeln!(
                 output,
@@ -437,15 +405,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
                 terminal_safe_text(&analysis.partial_reasons.join(", "))
             );
         }
-        let _ = writeln!(
-            output,
-            "  confidence {:?} | coverage {:.1}% | external activity possible {} | settled {} | method {}",
-            attribution.confidence,
-            attribution.attribution_coverage_percent,
-            attribution.external_activity_possible,
-            attribution.settled,
-            terminal_safe_text(&attribution.method)
-        );
+        let _ = writeln!(output, "{}", attribution_quality_line(attribution));
 
         if attribution.local_token_usage.is_zero()
             && analysis.threads.is_empty()
@@ -592,11 +552,55 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
 }
 
 fn estimated_percent(value: f64, confidence: Confidence) -> String {
-    if confidence == Confidence::Unknown {
-        "-".to_string()
-    } else {
-        format!("{value:.2}%")
+    match confidence {
+        Confidence::Unknown => "-".to_string(),
+        Confidence::Low => format!("~{value:.2}%"),
+        Confidence::Medium | Confidence::High => format!("{value:.2}%"),
     }
+}
+
+fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) -> String {
+    if attribution.proxy_projected_percent > 0.0 {
+        let total_estimate =
+            attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
+        format!(
+            "  local tokens {} | observed +{:.2}pp | estimated ~{total_estimate:.2}pp ({:.2}pp evidence assigned + {:.2}pp proxy from unverified gap) | unverified gap {:.2}pp",
+            compact_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            attribution.estimated_assigned_percent,
+            attribution.proxy_projected_percent,
+            attribution.unattributed_percent,
+        )
+    } else {
+        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
+            "-".to_string()
+        } else {
+            format!("{:.2}pp", attribution.estimated_assigned_percent)
+        };
+        format!(
+            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
+            compact_tokens(attribution.local_token_usage),
+            attribution.observed_delta_percent,
+            estimated_assigned,
+            attribution.unattributed_percent,
+        )
+    }
+}
+
+fn attribution_quality_line(attribution: &crate::domain::AttributionSummary) -> String {
+    let coverage_label = if attribution.proxy_projected_percent > 0.0 {
+        "evidence coverage"
+    } else {
+        "coverage"
+    };
+    format!(
+        "  confidence {:?} | {coverage_label} {:.1}% | external activity possible {} | settled {} | method {}",
+        attribution.confidence,
+        attribution.attribution_coverage_percent,
+        attribution.external_activity_possible,
+        attribution.settled,
+        terminal_safe_text(&attribution.method)
+    )
 }
 
 fn compact_tokens(usage: TokenUsage) -> String {
@@ -672,6 +676,61 @@ mod tests {
             }),
             "12.3K"
         );
+    }
+
+    #[test]
+    fn low_confidence_estimates_are_marked_as_approximate() {
+        assert_eq!(estimated_percent(2.26, Confidence::Unknown), "-");
+        assert_eq!(estimated_percent(2.26, Confidence::Low), "~2.26%");
+        assert_eq!(estimated_percent(2.26, Confidence::Medium), "2.26%");
+        assert_eq!(estimated_percent(2.26, Confidence::High), "2.26%");
+    }
+
+    #[test]
+    fn proxy_attribution_text_separates_estimate_from_evidence_gap() {
+        let attribution = AttributionSummary {
+            local_token_usage: TokenUsage {
+                total_tokens: 760_000_000,
+                ..TokenUsage::default()
+            },
+            observed_delta_percent: 4.0,
+            estimated_assigned_percent: 4.0,
+            proxy_projected_percent: 30.0,
+            unattributed_percent: 30.0,
+            attribution_coverage_percent: 11.8,
+            confidence: Confidence::Low,
+            method: "observed_delta_plus_cycle_token_proxy".to_string(),
+            ..AttributionSummary::default()
+        };
+
+        let allocation = attribution_allocation_line(&attribution);
+        assert!(allocation.contains("estimated ~34.00pp"));
+        assert!(allocation.contains("4.00pp evidence assigned"));
+        assert!(allocation.contains("30.00pp proxy from unverified gap"));
+        assert!(allocation.contains("unverified gap 30.00pp"));
+        assert!(!allocation.contains("unattributed"));
+
+        let quality = attribution_quality_line(&attribution);
+        assert!(quality.contains("confidence Low"));
+        assert!(quality.contains("evidence coverage 11.8%"));
+    }
+
+    #[test]
+    fn proxy_projection_json_is_camel_case_and_backward_compatible() {
+        let attribution = AttributionSummary {
+            proxy_projected_percent: 30.0,
+            ..AttributionSummary::default()
+        };
+        let mut value = serde_json::to_value(&attribution).unwrap();
+        assert_eq!(value["proxyProjectedPercent"], 30.0);
+        assert!(value.get("proxy_projected_percent").is_none());
+
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("proxyProjectedPercent");
+        let legacy: AttributionSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.proxy_projected_percent, 0.0);
     }
 
     #[test]

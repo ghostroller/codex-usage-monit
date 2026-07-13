@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
 
 use crate::app_server::fetch_account_snapshot;
 use crate::attribution::{
-    active_bucket_ids_for_duration, analyze_windows, project_five_hour_analysis,
+    MAPPED_BUCKET_UNAVAILABLE_REASON, UNMAPPED_CALL_MODEL_REASON, active_bucket_ids_for_duration,
+    analyze_windows, project_five_hour_analysis, supports_model_bucket_mapping,
 };
 use crate::config::CollectConfig;
 use crate::domain::{
@@ -231,6 +234,7 @@ fn collect_snapshot_with_local(
     }
     mark_stale_window_analyses(&mut window_analyses, &limits);
     handle_ambiguous_window_buckets(&mut warnings, &limits, &mut window_analyses, now);
+    apply_cycle_proxy_estimates(&mut window_analyses);
     let (models, attribution) =
         project_five_hour_analysis(&mut tasks, &mut turns, &window_analyses);
     if window_analyses
@@ -318,7 +322,34 @@ fn handle_ambiguous_window_buckets(
 ) {
     for duration_mins in [300, 10_080] {
         let bucket_ids = active_bucket_ids_for_duration(limits, now, duration_mins);
+        if analyses.iter().any(|analysis| {
+            analysis.duration_mins == duration_mins
+                && analysis
+                    .partial_reasons
+                    .iter()
+                    .any(|reason| reason == UNMAPPED_CALL_MODEL_REASON)
+        }) {
+            warnings.push(format!(
+                "some local calls in the active {duration_mins}m quota windows have no model; model-based bucket attribution excluded them"
+            ));
+        }
+        if analyses.iter().any(|analysis| {
+            analysis.duration_mins == duration_mins
+                && analysis
+                    .partial_reasons
+                    .iter()
+                    .any(|reason| reason == MAPPED_BUCKET_UNAVAILABLE_REASON)
+        }) {
+            warnings.push(format!(
+                "some local calls in the active {duration_mins}m period map to a quota bucket with no current window; those calls were excluded"
+            ));
+        }
         if bucket_ids.len() < 2 {
+            continue;
+        }
+        if supports_model_bucket_mapping(&bucket_ids)
+            && mapped_bucket_analyses_complete(analyses, duration_mins, &bucket_ids)
+        {
             continue;
         }
         let Some(analysis) = analyses
@@ -347,6 +378,23 @@ fn handle_ambiguous_window_buckets(
     }
 }
 
+fn mapped_bucket_analyses_complete(
+    analyses: &[WindowAnalysis],
+    duration_mins: i64,
+    bucket_ids: &[String],
+) -> bool {
+    bucket_ids.iter().all(|bucket_id| {
+        analyses.iter().any(|analysis| {
+            analysis.duration_mins == duration_mins
+                && analysis
+                    .attribution
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.limit_id.eq_ignore_ascii_case(bucket_id))
+        })
+    })
+}
+
 fn disable_ambiguous_quota_estimation(analysis: &mut WindowAnalysis) {
     let used_percent = analysis
         .attribution
@@ -355,6 +403,7 @@ fn disable_ambiguous_quota_estimation(analysis: &mut WindowAnalysis) {
         .map(|window| window.used_percent.max(0.0))
         .unwrap_or_default();
     analysis.attribution.estimated_assigned_percent = 0.0;
+    analysis.attribution.proxy_projected_percent = 0.0;
     analysis.attribution.unattributed_percent = used_percent;
     analysis.attribution.attribution_coverage_percent = 0.0;
     analysis.attribution.confidence = Confidence::Unknown;
@@ -372,6 +421,65 @@ fn disable_ambiguous_quota_estimation(analysis: &mut WindowAnalysis) {
         model.quota_confidence = Confidence::Unknown;
     }
     mark_analysis_partial(analysis, "multiple_active_limit_buckets");
+}
+
+fn apply_cycle_proxy_estimates(analyses: &mut [WindowAnalysis]) {
+    for analysis in analyses {
+        analysis.attribution.proxy_projected_percent = 0.0;
+        if analysis.partial
+            || !analysis.partial_reasons.is_empty()
+            || analysis.attribution.local_token_usage.is_zero()
+        {
+            continue;
+        }
+        let quota_discontinuity = analysis.attribution.method.contains("discontinuity");
+        let Some(window) = analysis.attribution.window.as_ref() else {
+            continue;
+        };
+        let evidence_gap = analysis
+            .attribution
+            .unattributed_percent
+            .max(0.0)
+            .min(window.used_percent.max(0.0));
+        if evidence_gap <= f64::EPSILON {
+            continue;
+        }
+
+        for thread in &mut analysis.threads {
+            let projected = evidence_gap * thread.usage.local_token_share_percent / 100.0;
+            thread.usage.estimated_quota_percent += projected;
+            if projected > 0.0 {
+                thread.usage.quota_confidence = Confidence::Low;
+            }
+        }
+        for turn in &mut analysis.turns {
+            let projected = evidence_gap * turn.usage.local_token_share_percent / 100.0;
+            turn.usage.estimated_quota_percent += projected;
+            if projected > 0.0 {
+                turn.usage.quota_confidence = Confidence::Low;
+            }
+        }
+        for model in &mut analysis.models {
+            let projected = evidence_gap * model.local_token_share_percent / 100.0;
+            model.estimated_quota_percent += projected;
+            if projected > 0.0 {
+                model.quota_confidence = Confidence::Low;
+            }
+        }
+
+        analysis.attribution.proxy_projected_percent = evidence_gap;
+        analysis.attribution.confidence = Confidence::Low;
+        analysis.attribution.method = match (
+            quota_discontinuity,
+            analysis.attribution.estimated_assigned_percent > 0.0,
+        ) {
+            (true, true) => "post_discontinuity_observed_delta_plus_cycle_token_proxy",
+            (true, false) => "quota_discontinuity_cycle_token_proxy",
+            (false, true) => "observed_delta_plus_cycle_token_proxy",
+            (false, false) => "cycle_token_proxy_bootstrap",
+        }
+        .to_string();
+    }
 }
 
 fn mark_stale_window_analyses(analyses: &mut [WindowAnalysis], limits: &[LimitBucket]) {
@@ -488,31 +596,99 @@ fn merge_account_observations(
 }
 
 fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBucket> {
-    let Some(observation) = dataset
-        .rate_observations
-        .iter()
-        .max_by_key(|observation| observation.timestamp)
-    else {
-        return Vec::new();
-    };
+    let mut latest_by_bucket: BTreeMap<String, &RateObservation> = BTreeMap::new();
+    for observation in &dataset.rate_observations {
+        let key = observation.limit_id.trim().to_ascii_lowercase();
+        let replace = latest_by_bucket
+            .get(&key)
+            .is_none_or(|current| observation.timestamp > current.timestamp);
+        if replace {
+            latest_by_bucket.insert(key, observation);
+        }
+    }
 
-    vec![LimitBucket {
-        limit_id: observation.limit_id.clone(),
-        limit_name: None,
-        plan_type: None,
-        primary: observation.primary.clone(),
-        secondary: observation.secondary.clone(),
-        credits: None,
-        rate_limit_reached_type: None,
-        provenance: Provenance::Stale,
-        as_of: observation.timestamp.min(now),
-    }]
+    latest_by_bucket
+        .into_values()
+        .map(|observation| LimitBucket {
+            limit_id: observation.limit_id.clone(),
+            limit_name: None,
+            plan_type: None,
+            primary: observation.primary.clone(),
+            secondary: observation.secondary.clone(),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::Stale,
+            as_of: observation.timestamp.min(now),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountTokenUsage, ThreadWindowUsage, TokenUsage, WindowUsage};
+    use crate::domain::{AccountTokenUsage, ThreadWindowUsage, TokenUsage, UsageCall, WindowUsage};
+
+    fn weekly_limit(
+        now: DateTime<Utc>,
+        reset: DateTime<Utc>,
+        limit_id: &str,
+        used_percent: f64,
+    ) -> LimitBucket {
+        LimitBucket {
+            limit_id: limit_id.to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: None,
+            secondary: Some(LimitWindow::new(used_percent, Some(10_080), Some(reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }
+    }
+
+    fn usage_call(
+        timestamp: DateTime<Utc>,
+        thread_id: &str,
+        turn_id: &str,
+        model: &str,
+        total_tokens: u64,
+    ) -> UsageCall {
+        UsageCall {
+            timestamp,
+            thread_id: thread_id.to_string(),
+            turn_id: Some(turn_id.to_string()),
+            model: Some(model.to_string()),
+            tokens: TokenUsage {
+                input_tokens: total_tokens,
+                total_tokens,
+                ..TokenUsage::default()
+            },
+        }
+    }
+
+    fn weekly_observation(
+        timestamp: DateTime<Utc>,
+        reset: DateTime<Utc>,
+        used_percent: f64,
+    ) -> RateObservation {
+        RateObservation {
+            timestamp,
+            thread_id: "source".to_string(),
+            turn_id: None,
+            limit_id: "codex".to_string(),
+            primary: None,
+            secondary: Some(LimitWindow::new(used_percent, Some(10_080), Some(reset))),
+            provenance: Provenance::LocalExact,
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     #[test]
     fn failed_fresh_fields_preserve_cached_data_as_stale() {
@@ -549,6 +725,230 @@ mod tests {
         assert_eq!(fresh.limits.len(), 1);
         assert_eq!(fresh.limits[0].provenance, Provenance::Stale);
         assert_eq!(fresh.usage.unwrap().lifetime_tokens, Some(42));
+    }
+
+    #[test]
+    fn rollout_fallback_keeps_the_latest_observation_for_each_bucket() {
+        let now = Utc::now();
+        let observation = |limit_id: &str, minutes_ago: i64, used_percent: f64| RateObservation {
+            timestamp: now - Duration::minutes(minutes_ago),
+            thread_id: "thread".to_string(),
+            turn_id: None,
+            limit_id: limit_id.to_string(),
+            primary: Some(LimitWindow::new(
+                used_percent,
+                Some(300),
+                Some(now + Duration::hours(2)),
+            )),
+            secondary: None,
+            provenance: Provenance::LocalExact,
+        };
+        let dataset = RolloutDataset {
+            rate_observations: vec![
+                observation("codex", 10, 10.0),
+                observation("codex_bengalfox", 5, 30.0),
+                observation("CODEX", 1, 20.0),
+            ],
+            ..RolloutDataset::default()
+        };
+
+        let limits = fallback_limits(&dataset, now);
+
+        assert_eq!(limits.len(), 2);
+        let codex = limits
+            .iter()
+            .find(|bucket| bucket.limit_id.eq_ignore_ascii_case("codex"))
+            .unwrap();
+        let spark = limits
+            .iter()
+            .find(|bucket| bucket.limit_id == "codex_bengalfox")
+            .unwrap();
+        assert_eq!(codex.primary.as_ref().unwrap().used_percent, 20.0);
+        assert_eq!(spark.primary.as_ref().unwrap().used_percent, 30.0);
+        assert!(
+            limits
+                .iter()
+                .all(|bucket| bucket.provenance == Provenance::Stale)
+        );
+    }
+
+    #[test]
+    fn cycle_proxy_bootstraps_the_full_gauge_from_bucket_local_token_shares() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let limits = vec![weekly_limit(now, reset, "codex", 40.0)];
+        let calls = vec![
+            usage_call(now - Duration::hours(2), "a", "a-turn", "gpt-a", 100),
+            usage_call(now - Duration::hours(1), "b", "b-turn", "gpt-b", 300),
+        ];
+        let mut analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
+
+        assert_eq!(analyses.len(), 1);
+        assert_close(analyses[0].attribution.estimated_assigned_percent, 0.0);
+        assert_close(analyses[0].attribution.unattributed_percent, 40.0);
+        apply_cycle_proxy_estimates(&mut analyses);
+
+        let analysis = &analyses[0];
+        assert_close(analysis.attribution.estimated_assigned_percent, 0.0);
+        assert_close(analysis.attribution.proxy_projected_percent, 40.0);
+        assert_close(analysis.attribution.unattributed_percent, 40.0);
+        assert_close(analysis.attribution.attribution_coverage_percent, 0.0);
+        assert_eq!(analysis.attribution.confidence, Confidence::Low);
+        assert_eq!(analysis.attribution.method, "cycle_token_proxy_bootstrap");
+        assert!(analysis.attribution.settled);
+        assert_close(analysis.threads[0].usage.estimated_quota_percent, 10.0);
+        assert_close(analysis.threads[1].usage.estimated_quota_percent, 30.0);
+        assert!(
+            analysis
+                .threads
+                .iter()
+                .all(|thread| thread.usage.quota_confidence == Confidence::Low)
+        );
+        assert_close(
+            analysis
+                .models
+                .iter()
+                .map(|model| model.estimated_quota_percent)
+                .sum(),
+            40.0,
+        );
+    }
+
+    #[test]
+    fn cycle_proxy_adds_the_evidence_gap_without_relabeling_evidence() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let limits = vec![weekly_limit(now, reset, "codex", 40.0)];
+        let observations = vec![
+            weekly_observation(now - Duration::minutes(4), reset, 30.0),
+            weekly_observation(now - Duration::minutes(2), reset, 35.0),
+        ];
+        let calls = vec![
+            usage_call(now - Duration::minutes(3), "a", "a-turn", "gpt-a", 100),
+            usage_call(now - Duration::minutes(1), "b", "b-turn", "gpt-b", 300),
+        ];
+        let mut analyses = analyze_windows(&[], &[], &calls, &observations, &limits, now);
+
+        assert_close(analyses[0].attribution.estimated_assigned_percent, 10.0);
+        assert_close(analyses[0].attribution.unattributed_percent, 30.0);
+        apply_cycle_proxy_estimates(&mut analyses);
+
+        let analysis = &analyses[0];
+        assert_close(analysis.attribution.estimated_assigned_percent, 10.0);
+        assert_close(analysis.attribution.proxy_projected_percent, 30.0);
+        assert_close(analysis.attribution.unattributed_percent, 30.0);
+        assert_close(analysis.attribution.attribution_coverage_percent, 25.0);
+        assert_eq!(analysis.attribution.confidence, Confidence::Low);
+        assert_eq!(
+            analysis.attribution.method,
+            "observed_delta_plus_cycle_token_proxy"
+        );
+        assert_close(analysis.threads[0].usage.estimated_quota_percent, 12.5);
+        assert_close(analysis.threads[1].usage.estimated_quota_percent, 27.5);
+        assert_close(
+            analysis
+                .threads
+                .iter()
+                .map(|thread| thread.usage.estimated_quota_percent)
+                .sum(),
+            40.0,
+        );
+    }
+
+    #[test]
+    fn cycle_proxy_is_disabled_for_partial_analysis_but_survives_a_quota_correction() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let limits = vec![weekly_limit(now, reset, "codex", 40.0)];
+        let calls = vec![usage_call(
+            now - Duration::minutes(1),
+            "a",
+            "a-turn",
+            "gpt-a",
+            100,
+        )];
+        let base = analyze_windows(&[], &[], &calls, &[], &limits, now)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut partial = base.clone();
+        mark_analysis_partial(&mut partial, "rollout_lookback_incomplete");
+        apply_cycle_proxy_estimates(std::slice::from_mut(&mut partial));
+        assert_close(partial.attribution.proxy_projected_percent, 0.0);
+        assert_close(partial.threads[0].usage.estimated_quota_percent, 0.0);
+        assert_eq!(
+            partial.threads[0].usage.quota_confidence,
+            Confidence::Unknown
+        );
+
+        let mut discontinuous = base;
+        discontinuous.attribution.method = "quota_discontinuity_local_tokens_only".to_string();
+        apply_cycle_proxy_estimates(std::slice::from_mut(&mut discontinuous));
+        assert_close(discontinuous.attribution.proxy_projected_percent, 40.0);
+        assert_close(discontinuous.threads[0].usage.estimated_quota_percent, 40.0);
+        assert_eq!(
+            discontinuous.attribution.method,
+            "quota_discontinuity_cycle_token_proxy"
+        );
+        assert_eq!(discontinuous.attribution.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn cycle_proxy_uses_an_independent_denominator_for_each_model_bucket() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let limits = vec![
+            weekly_limit(now, reset, "codex", 34.0),
+            weekly_limit(now, reset, "codex_bengalfox", 20.0),
+        ];
+        let calls = vec![
+            usage_call(
+                now - Duration::minutes(2),
+                "regular",
+                "regular-turn",
+                "gpt-5.6-codex",
+                300,
+            ),
+            usage_call(
+                now - Duration::minutes(1),
+                "spark",
+                "spark-turn",
+                "gpt-5.3-codex-spark",
+                100,
+            ),
+        ];
+        let mut analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
+
+        apply_cycle_proxy_estimates(&mut analyses);
+
+        assert_eq!(analyses.len(), 2);
+        let codex = analyses
+            .iter()
+            .find(|analysis| {
+                analysis
+                    .attribution
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.limit_id == "codex")
+            })
+            .unwrap();
+        let spark = analyses
+            .iter()
+            .find(|analysis| {
+                analysis
+                    .attribution
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.limit_id == "codex_bengalfox")
+            })
+            .unwrap();
+        assert_eq!(codex.attribution.local_token_usage.total_tokens, 300);
+        assert_close(codex.attribution.proxy_projected_percent, 34.0);
+        assert_close(codex.models[0].estimated_quota_percent, 34.0);
+        assert_eq!(spark.attribution.local_token_usage.total_tokens, 100);
+        assert_close(spark.attribution.proxy_projected_percent, 20.0);
+        assert_close(spark.models[0].estimated_quota_percent, 20.0);
     }
 
     #[test]
@@ -610,6 +1010,106 @@ mod tests {
             analyses[0].threads[0].usage.quota_confidence,
             Confidence::Unknown
         );
+    }
+
+    #[test]
+    fn mapped_buckets_warn_and_stay_partial_when_calls_have_no_model() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(2);
+        let make_limit = |limit_id: &str| LimitBucket {
+            limit_id: limit_id.to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: Some(LimitWindow::new(20.0, Some(300), Some(reset))),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        };
+        let limits = vec![make_limit("codex"), make_limit("codex_bengalfox")];
+        let calls = [None, Some("   ".to_string())]
+            .into_iter()
+            .enumerate()
+            .map(|(index, model)| UsageCall {
+                timestamp: now,
+                thread_id: format!("unknown-model-{index}"),
+                turn_id: Some(format!("turn-{index}")),
+                model,
+                tokens: TokenUsage {
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
+        for analysis in &mut analyses {
+            analysis.attribution.estimated_assigned_percent = 2.0;
+        }
+        let mut warnings = Vec::new();
+
+        handle_ambiguous_window_buckets(&mut warnings, &limits, &mut analyses, now);
+
+        assert_eq!(analyses.len(), 2);
+        assert!(analyses.iter().all(|analysis| analysis.partial));
+        assert!(analyses.iter().all(|analysis| {
+            analysis
+                .partial_reasons
+                .contains(&UNMAPPED_CALL_MODEL_REASON.to_string())
+        }));
+        assert!(
+            analyses
+                .iter()
+                .all(|analysis| { analysis.attribution.estimated_assigned_percent == 2.0 })
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("have no model"));
+        assert!(warnings[0].contains("excluded"));
+    }
+
+    #[test]
+    fn known_single_bucket_warns_when_calls_map_to_the_missing_bucket() {
+        let now = Utc::now();
+        let limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: Some(LimitWindow::new(
+                20.0,
+                Some(300),
+                Some(now + Duration::hours(2)),
+            )),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }];
+        let calls = vec![UsageCall {
+            timestamp: now,
+            thread_id: "spark".to_string(),
+            turn_id: Some("spark-turn".to_string()),
+            model: Some("gpt-5.3-codex-spark".to_string()),
+            tokens: TokenUsage {
+                total_tokens: 100,
+                ..TokenUsage::default()
+            },
+        }];
+        let mut analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
+        let mut warnings = Vec::new();
+
+        handle_ambiguous_window_buckets(&mut warnings, &limits, &mut analyses, now);
+
+        assert_eq!(analyses.len(), 1);
+        assert!(analyses[0].partial);
+        assert!(
+            analyses[0]
+                .partial_reasons
+                .contains(&MAPPED_BUCKET_UNAVAILABLE_REASON.to_string())
+        );
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("no current window") && warning.contains("excluded")
+        }));
     }
 
     #[test]

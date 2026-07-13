@@ -54,7 +54,7 @@ src/
 
 客户端有统一总超时和子进程回收，不读取 `auth.json`，不调用控制或写接口。TUI 在内存中保留连续账户额度快照；一次性命令只拥有本次快照。
 
-`limits` 子命令先走这条轻量路径。若无服务端额度，再执行本地 rollout 扫描做 stale fallback。
+`limits` 子命令先走这条轻量路径。若无服务端额度，再执行本地 rollout 扫描做 stale fallback；fallback 按规范化 `limit_id` 各自保留最新观测，不能只取全局最新一条。
 
 ### Rollout
 
@@ -103,7 +103,7 @@ Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最�
 
 Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Turns 底部渲染统一图例，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
 
-Overview 维护独立 `WindowScope`，在 Models 标题中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope 的 `windowAnalyses` 读取，标题和列名不得硬编码成 5h。切换 scope 保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
+Overview 维护独立 `WindowScope`，在最顶栏中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope 的 `windowAnalyses` 读取，标题和列名不得硬编码成 5h。切换 scope 保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
 
 TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
 
@@ -111,9 +111,11 @@ Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pend
 
 Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投影；模型、推理强度、消息、状态、turn ID 与 Fast 标识共享同一匹配入口。查询非空时标题稳定保留 `[Del]` 命中区，仅在对应面板处于非编辑焦点时强调 `Del`；此时键盘 `Delete` 清空完整查询，编辑焦点中的 `Delete` 仍只删除光标字符。所有 Turns/TurnSearch 到 Tasks/TaskSearch 的焦点转换经过同一入口，先清除 Turns 查询、编辑恢复状态和过滤投影，Tasks 查询保持不变。`V` 控制默认显隐，默认隐藏时 `Enter` / 可点击 `↵` 只设置临时可见状态，`Backspace` / 可点击 `←` 返回 Tasks 并清除该状态。Fast 来自 `thread_settings_applied` 的 `service_tier`，在 turn 激活时快照，避免之后的设置变化回写历史 turn；渲染时追加在模型名称后，普通 turn 不占用额外前缀。
 
-Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时记录并跳过完整后代集合，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。大写 `E` / `[E]Collapse` 以空折叠集合构造当前过滤条件下的完整展开投影，再把所有 `has_children` 节点加入折叠集合，因此不会漏掉嵌套在已折叠祖先下的父节点。渲染折叠父行时，用父节点及隐藏后代对 `TokenUsage` 分量、当前 scope local share 和 estimated quota 求和，quota confidence 对非零贡献取最保守等级；展开行与 `Snapshot` 原始实体保持不变。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
+Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时记录并跳过完整后代集合，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。大写 `E` / `[E]Collapse` 以空折叠集合构造当前过滤条件下的完整展开投影，再把所有 `has_children` 节点加入折叠集合，因此不会漏掉嵌套在已折叠祖先下的父节点。渲染折叠父行时，用父节点及隐藏后代对 `TokenUsage` 分量求和，并按当前 scope 的本地 token 合并分母重算 local share；若所有贡献来自同一额度桶则汇总 estimated quota 并取最保守 confidence，跨桶则显示未知。展开行与 `Snapshot` 原始实体保持不变。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
 
-Models 默认可见，`M` 与 Tasks 标题中的可点击 `[M]Models` 共同切换显隐；隐藏时主 Tasks/Turns 布局接管释放的高度，恢复入口仍留在 Tasks 标题。Models 使用单一外框：标题先放稳定位置的 `[5h]` / `[Week]`，内容先渲染当前 scope attribution 摘要，再渲染无嵌套边框的模型表；即使模型为空，scope 控件和 unavailable/归因信息仍然存在。
+Models 默认可见，`M` 与最顶栏中的可点击 `[M]Models` 共同切换显隐；隐藏时主 Tasks/Turns 布局接管释放的高度，顶栏恢复入口与 scope 控件保持可用。Models 使用单一外框，内容先渲染当前 scope attribution 摘要，再渲染无嵌套边框的模型表；即使模型为空，unavailable/归因信息仍然存在。已知模型映射产生多个同 duration 分析时，摘要逐桶显示 reset 和归因质量，模型表用各桶 token 的合并分母重算 local share；未知多桶组合含 `multiple_active_limit_buckets` 时，摘要明确说明估算不可用。
+
+非搜索状态的 `Esc` 打开覆盖式退出确认弹窗，弹窗吞掉底层键鼠事件，`Enter` 确认、`Esc` 取消；`Ctrl-C` 和既有 `q` 仍直接退出。搜索输入状态继续优先消费 `Esc`，只恢复编辑前查询。
 
 TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
 
@@ -121,22 +123,24 @@ TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`�
 
 窗口 key 为 limit id、duration 和容差内的 reset time。仅选择当前有效窗口。每个窗口的实际周期都是 `[resetsAt - windowDurationMins, resetsAt)`；因此 week 是服务端当前 `resetsAt - 10080m` 到 `resetsAt` 的 reset cycle，不是 `now - 7d`，也不是自然周。
 
-每个 300/10080 分钟 duration 选择一个可分析 scope。同 duration 有多个候选时，先优先 Codex 产品桶，再优先 `ServerSnapshot` provenance，最后使用稳定 key 排序决定；选择发生歧义时记录 warning。其余候选继续进入 limits gauge。由于 `UsageCall` 缺少 limit id，多桶时保留 duration 级本地 token 构成，但把对应 `WindowAnalysis` 标为 partial，并清空 estimated quota、coverage 和实体 confidence，不能声称调用属于所选桶。
+每个 300/10080 分钟 duration 至少选择一个可分析 scope。活跃桶是 `codex`、`codex_bengalfox` 中的一个或两个时，对明确模型应用固定映射：`gpt-5.3-codex-spark -> codex_bengalfox`，其他非空模型 `-> codex`；每个 `(duration, limit_id)` 独立选择服务端优先的当前窗口、按自身 reset 边界过滤调用，并生成独立 `WindowAnalysis`。模型目标桶缺失时不回退到现有桶，而将 scope 标为 partial 并警告。None/空模型同样不映射；与这类调用重叠的观测增量不做分摊。其他多桶组合先优先 Codex 产品桶，再优先 `ServerSnapshot` provenance，最后用稳定 key 选择一个边界并记录 warning；其余候选继续进入 limits gauge，同时清空 estimated quota、coverage 和实体 confidence。
 
 Exact 部分：按窗口时间筛选本地 token events，聚合到 model、turn、task。
 
-Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage。`windows` 子命令和 `snapshot --section windows` 输出该结构。为保持 JSON v1 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution`，继续投影首选 5h 分析；没有可用 5h 时保持 unavailable/empty，绝不投影 Week。
+Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage；同一 duration 可以包含多个模型映射桶。`windows` 子命令和 `snapshot --section windows` 输出该结构。TUI 的 task/turn 行合并各桶本地 token 并重算 local share；只有实体在单一桶有 token 时投影该桶 estimated quota，跨桶时显示未知。为保持 JSON v1 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution`，继续投影首选 5h `codex` 分析；没有可用 5h 时保持 unavailable/empty，绝不投影 Week。
 
 本地 token share 只有在 rollout 扫描覆盖窗口起点且数据完整时才标为 exact。采集器除现有 truncated/unreadable/skipped/counter-reset 检查外，还比较 `--days` cutoff 与各 scope 的 `startsAt`；lookback 不足时只将对应分析标为 partial，limits gauge 仍可保持服务端完整。完整扫描下周 local token share 可精确结算，quota share 仍走 estimated 口径。
 
 Estimated 部分：
 
-1. 在线优先 App Server 历史；只有服务端历史不足且 rollout 最新值与当前值合理接近时才混用；
+1. 在线优先 App Server 历史；与当前值合理接近且 reset 一致的 rollout 样本继续用于补足服务端整数平台期，即使已经积累两个以上相同整数的服务端样本；
 2. 百分比回退从回退点开启新 epoch；
 3. 每个不超过 5 分钟的正 delta 区间，按本地 token 比例分配；
-4. 无调用、长间隔、扫描不完整或未观测的当前额度留在 unattributed；
-5. 任何分配仍标记 external activity possible；
-6. active/stale 时 confidence 为 Low，确定 settled 后最高 Medium。
+4. 严格证据保持 `estimatedAssigned + unattributed = used`，coverage 只表示已分配证据；
+5. 对完整、当前、非 stale 且模型可映射的周期，把剩余 evidence gap 按各额度桶内的本地 token share 投影为 `proxyProjectedPercent`，实体 estimate 为 evidence contribution + proxy contribution；proxy 仍包含在 unattributed gap 中，不能相加；
+6. 同周期百分比回调只切断旧的严格证据 epoch，不禁用基于当前 gauge 的 Low proxy；method 保留 discontinuity 标记和 warning；
+7. 扫描或 lookback 不完整、未知/缺失模型桶、未知多桶时不生成 proxy；
+8. 任何分配仍标记 external activity possible；包含 proxy 时 confidence 固定 Low，只有不含 proxy 且 settled 的严格观测估算最高达到 Medium。
 
 这不是官方配额账单。
 
@@ -155,9 +159,9 @@ Estimated 部分：
 - App Server mock：多桶、legacy、nullable、错误、可选 usage stall、timeout、child reap；
 - rollout：duplicate/reset、嵌套 turn、消息归属、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
-- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、同 duration 多桶 Codex/Server 优先与 warning、gauge-only 候选、server/local mismatch、correction epoch、long gap、settled，以及 `--days` 覆盖不足的 per-window partial；
-- output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、旧 5h 字段投影兼容、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、`[5h]` / `[Week]` 的 `5` / `W` 与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、`M` / `[M]Models` 显隐与布局回收、scope 不可用、`E` / `[E]Collapse` 多层全部折叠、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
+- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、`codex` / `codex_bengalfox` 双桶与单桶模型路由、缺失模型区间保持 unattributed、缺失目标桶 partial、离线逐桶 fallback、未知同 duration 多桶 Codex/Server 优先与 warning、gauge-only 候选、server/local mismatch、整数 server plateau 保留一致 rollout、correction epoch、cycle proxy 冷启动/混合证据/双桶/partial 门槛、long gap、settled，以及 `--days` 覆盖不足的 per-window partial；
+- output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase 与 `proxyProjectedPercent`、Low estimate 的 `~`、旧 5h 字段投影兼容、section partial/failure、broken pipe、help/usage；
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、最顶栏 `[M]Models` / `[5h]` / `[Week]` 的键盘与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、Models 显隐与布局回收、scope 不可用、多额度桶禁用原因、退出确认键鼠阻断、`E` / `[E]Collapse` 多层全部折叠、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 

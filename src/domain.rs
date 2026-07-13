@@ -303,6 +303,10 @@ pub struct AttributionSummary {
     pub local_token_usage: TokenUsage,
     pub observed_delta_percent: f64,
     pub estimated_assigned_percent: f64,
+    /// Low-confidence projection of the evidence gap. This remains part of
+    /// `unattributed_percent`; the two fields must not be added together.
+    #[serde(default)]
+    pub proxy_projected_percent: f64,
     pub unattributed_percent: f64,
     pub attribution_coverage_percent: f64,
     pub external_activity_possible: bool,
@@ -318,6 +322,7 @@ impl Default for AttributionSummary {
             local_token_usage: TokenUsage::default(),
             observed_delta_percent: 0.0,
             estimated_assigned_percent: 0.0,
+            proxy_projected_percent: 0.0,
             unattributed_percent: 0.0,
             attribution_coverage_percent: 0.0,
             external_activity_possible: false,
