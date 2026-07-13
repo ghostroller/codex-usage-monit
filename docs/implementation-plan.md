@@ -1,6 +1,6 @@
 # 实现路径
 
-更新日期：2026-07-12
+更新日期：2026-07-13
 
 ## 1. 技术选型
 
@@ -37,7 +37,7 @@ src/
   snapshot.rs    来源融合、partial 与账户快照历史
   domain.rs      统一 schema/provenance/confidence
   output.rs      text/JSON section 输出
-  tui.rs         Overview/Window/Data Health
+  tui.rs         Overview/Window/Data Health、筛选与焦点交互
   cli.rs         参数、子命令与退出码
 ```
 
@@ -103,6 +103,10 @@ Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最�
 
 Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Turns 底部渲染统一图例，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
 
+TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
+
+Tasks/Turns 分别维护 selection 与 viewport；键盘选择设置 reveal pending，滚轮只改变 viewport。刷新按 `thread_id` / `turn_id` 恢复仍满足筛选的选择；对象消失或被筛掉时回退到第一条匹配 task，并在必要时把焦点退回 Tasks。
+
 TUI 颜色集中到 dark/light palette；默认 dark，CLI 的 `--theme light`（别名 `bright`）只传入无子命令的 TUI 路径，运行中按 `t` 切换。palette 不进入 `Snapshot`、采集配置或 `OutputRequest`，所以不会改变采集与一次性 text/JSON。
 
 ## 6. 窗口和额度估算
@@ -129,6 +133,7 @@ Estimated 部分：
 - 同时只运行一个 worker；
 - worker 复用 `Arc<Mutex<RolloutCache>>` 与最近 AccountSnapshot；
 - UI thread 只绘制 immutable Snapshot 并处理键盘和鼠标事件。
+- 查询、来源筛选和焦点属于 UI 生命周期状态，worker 替换 Snapshot 时不得清空它们。
 
 ## 8. 测试
 
@@ -137,7 +142,7 @@ Estimated 部分：
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：窗口、reset drift、server/local mismatch、correction epoch、long gap、settled；
 - output/CLI：camelCase、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；Tasks/Turns 鼠标测试覆盖点击、每格 3 行的面板滚轮、选择与 viewport 独立、刷新 ID 保持、边界和 80x24、100x30、120x40；Models 测试覆盖 5h 缺失但 week 可用的 unavailable 状态、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示；并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、顶层视图 tab 点击、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、滚轮与选择独立、跨刷新 ID 保持、5h 缺失但 week 可用的 Models unavailable、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及 80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 
@@ -148,5 +153,6 @@ Estimated 部分：
 - Phase 4：状态 provenance 与 stale 降级；
 - Phase 5：保守额度估算与来源校准；
 - Phase 6：真实 subagent 兼容、缓存、partial 和审查修复。
+- Phase 7：Recent tasks 标题/source 筛选与 Tasks/Turns 统一键鼠焦点。
 
 后续路线见需求文档第 7 节。

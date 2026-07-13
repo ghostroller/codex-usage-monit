@@ -72,16 +72,19 @@ codex-usage-monit attribution --format text
 
 - `1` / `2` / `3`：Overview、Window、Data Health；
 - `Tab`、左右方向键：切换视图；
-- `j` / `k`、上下方向键：选择 task；
-- 鼠标左键：点击 Tasks 或 Turns 数据行选择；
-- 鼠标滚轮：在所在的 Tasks 或 Turns 表内每格滚动 3 行，不改变当前选择；
-- `PageUp` / `PageDown`：滚动选中 task 的 turns；
+- 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
+- `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；
+- `/` / `f`：按 task 标题或项目名编辑筛选；输入时可用左右方向键、`Home` / `End` 移动光标，`Backspace` / `Delete` 编辑，`Enter` / `Tab` 确认，`Esc` 取消本次编辑；
+- `[` / `]`：在 All、Desktop、Subagent、CLI 来源间切换；非输入状态下 `Delete` 清空名称筛选；
+- 鼠标左键：点击最上方视图 tab、顶栏筛选控件，或选择 Tasks / Turns 数据行并把键盘焦点切到该面板；
+- 鼠标滚轮：只滚动所在的 Tasks 或 Turns viewport，每格 3 行，不改变当前选择或键盘焦点；
+- `PageUp` / `PageDown`：滚动当前焦点所在的 Tasks 或 Turns viewport；
 - `t`：在 dark 与 light 主题间切换；
-- `q`、`Esc`、`Ctrl-C`：退出。
+- `q`、`Esc`、`Ctrl-C`：退出；搜索输入状态中的 `Esc` 只取消本次编辑。
 
 本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
-Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Models 面板按当前 5 小时窗口 token 从高到低显示；容量不足时标出 `top N/M`。当服务端只提供周窗口时，面板明确显示 5 小时窗口不可用，不会把周数据冒充 5 小时归因。
+Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 顶栏按 task 标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All，非空名称筛选右侧的 `×` 可用鼠标清空。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Models 面板按当前 5 小时窗口 token 从高到低显示；容量不足时标出 `top N/M`。当服务端只提供周窗口时，面板明确显示 5 小时窗口不可用，不会把周数据冒充 5 小时归因。
 
 ## 数据与隐私
 

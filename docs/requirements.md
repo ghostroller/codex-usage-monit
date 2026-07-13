@@ -1,6 +1,6 @@
 # 产品需求文档
 
-更新日期：2026-07-12
+更新日期：2026-07-13
 
 ## 1. 产品目标
 
@@ -34,6 +34,8 @@ TUI Overview 显示近期 tasks：
 - task token 总量；
 - 当前窗口 local token share 与 estimated quota；
 - project、来源、turn 数和标题预览；
+- Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
+- 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
 - 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与当前 5 小时窗口 token breakdown，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
@@ -139,7 +141,9 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - active/completed/uncertain task 数；
 - partial 与 diagnostics。
 
-宽度小于 100 列时 task/turn 区域改为上下布局。Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview 和 Window 中可用鼠标左键点击 Tasks/Turns 数据行选择；标题、边框、表头和空白区不得触发选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，并与点击选择相互独立。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。
+
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview、Window、Data Health 顶层 tab 均可用鼠标左键切换；Overview 和 Window 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab 和顶栏筛选控件外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -166,7 +170,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 - synthetic parser、app-server、归因、输出和 TUI 测试通过；
 - 真实 rollout 中 task token 与 turn token 汇总一致；
 - 真实 subagent parent replay 不重复计数；
-- 真实 80x24 与 120x40 TUI 不重叠、不崩溃并能恢复终端；
+- 真实 80x24 与 120x40 TUI 中筛选控件、Tasks/Turns 焦点与键鼠交互不重叠、不崩溃，并能恢复终端；
 - 多额度桶读取成功；
 - 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
@@ -175,7 +179,7 @@ TUI 与 CLI 使用同一 `Snapshot`。JSON 顶层包含 schemaVersion、asOf、p
 ## 7. 后续增强，不属于 v0.1
 
 - 统一通过同一 App Server 启动 tasks，从而获得精确 waiting approval/input 状态；
-- 模型/项目/时间筛选与多种排序；
+- 模型、项目、时间等更多筛选与多种排序（task 名称/source 筛选已实现）；
 - TUI token breakdown 显示模式切换；
 - 跨进程持久化额度快照与索引；
 - 多额度桶的交互式归因选择；
