@@ -39,8 +39,8 @@ pub struct Cli {
     redact_content: bool,
 
     /// TUI color theme; `bright` is an alias for `light`.
-    #[arg(long, value_enum, default_value_t = ThemeArg::Dark)]
-    theme: ThemeArg,
+    #[arg(long, value_enum)]
+    theme: Option<ThemeArg>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -171,7 +171,11 @@ fn run_with(cli: Cli) -> Result<i32> {
     config.redact_content = cli.redact_content;
 
     let Some(command) = cli.command else {
-        crate::tui::run_with_theme(config, cli.theme.into())?;
+        if let Some(theme) = cli.theme {
+            crate::tui::run_with_theme(config, theme.into())?;
+        } else {
+            crate::tui::run(config)?;
+        }
         return Ok(0);
     };
 
@@ -293,15 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn tui_theme_defaults_to_dark_and_accepts_light_aliases() {
+    fn tui_theme_uses_saved_default_and_accepts_explicit_light_aliases() {
         let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
-        assert_eq!(default.theme, ThemeArg::Dark);
+        assert_eq!(default.theme, None);
 
         let light = Cli::try_parse_from(["codex-usage-monit", "--theme", "light"]).unwrap();
-        assert_eq!(light.theme, ThemeArg::Light);
+        assert_eq!(light.theme, Some(ThemeArg::Light));
 
         let bright = Cli::try_parse_from(["codex-usage-monit", "--theme", "bright"]).unwrap();
-        assert_eq!(bright.theme, ThemeArg::Light);
+        assert_eq!(bright.theme, Some(ThemeArg::Light));
     }
 
     #[test]

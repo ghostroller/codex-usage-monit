@@ -303,8 +303,8 @@ pub struct AttributionSummary {
     pub local_token_usage: TokenUsage,
     pub observed_delta_percent: f64,
     pub estimated_assigned_percent: f64,
-    /// Low-confidence projection of the evidence gap. This remains part of
-    /// `unattributed_percent`; the two fields must not be added together.
+    /// Current normal-Codex gauge percentage distributed by local token share.
+    /// This is a low-confidence estimate, not server-side entity accounting.
     #[serde(default)]
     pub proxy_projected_percent: f64,
     pub unattributed_percent: f64,

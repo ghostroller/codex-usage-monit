@@ -8,3 +8,4 @@ pub mod rollout;
 mod session_index;
 pub mod snapshot;
 pub mod tui;
+pub mod ui_state;

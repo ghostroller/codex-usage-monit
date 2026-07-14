@@ -1,12 +1,12 @@
 # 现有开源工具调研
 
-更新日期：2026-07-12
+更新日期：2026-07-14
 
 ## 结论
 
 目前没有单一开源工具同时满足：近期 task 状态、实时 TUI、当前 5 小时/周服务端额度、task/turn/model token、5 小时额度按 task/turn 估算归因，以及完整/局部一次性输出。
 
-[abtop](https://github.com/graykode/abtop) 最接近任务监控 TUI；[CodexBar](https://github.com/steipete/CodexBar) 的 App Server 额度采集最成熟；[codex-ops](https://github.com/ChenLuoi/codex-ops) 最接近窗口内 session/model/event 分析。这三个项目仍然都缺少“相邻服务端额度快照到 task/turn 的显式估算、coverage 与 unattributed”这一层。
+[abtop](https://github.com/graykode/abtop) 最接近任务监控 TUI；[CodexBar](https://github.com/steipete/CodexBar) 的 App Server 额度采集最成熟；[codex-ops](https://github.com/ChenLuoi/codex-ops) 最接近窗口内 session/model/event 分析。这三个项目仍然都没有把当前普通 `codex` gauge、本地 reset-cycle token share 与 task/turn/model 级 Low-confidence EST 放进同一个实时界面和一次性快照。
 
 ## 对比
 
@@ -37,7 +37,7 @@
 2. CodexBar 的只读 App Server 额度读取；
 3. codex-ops/ccusage 的 rollout token 重建。
 
-本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact local token、observed global quota、estimated quota share、coverage、confidence、external risk 和 unattributed 分开表达。这样不会用 token 占比冒充官方额度账单。
+本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。EST 明确使用 `codex usedPercent × 本地非 Spark token share`，不会把 token 占比冒充官方额度账单。
 
 ## Idle 后是否精确
 

@@ -27,7 +27,6 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::attribution::{MAPPED_BUCKET_UNAVAILABLE_REASON, UNMAPPED_CALL_MODEL_REASON};
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, AttributionSummary, Confidence, ModelUsage, Provenance, Snapshot, TaskRecord,
@@ -36,6 +35,9 @@ use crate::domain::{
 };
 use crate::rollout::RolloutCache;
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
+use crate::ui_state::{
+    UiState, UiStateStore, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
+};
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
@@ -121,10 +123,46 @@ impl Theme {
     }
 }
 
+impl From<UiTheme> for Theme {
+    fn from(value: UiTheme) -> Self {
+        match value {
+            UiTheme::Dark => Self::Dark,
+            UiTheme::Light => Self::Light,
+        }
+    }
+}
+
+impl From<Theme> for UiTheme {
+    fn from(value: Theme) -> Self {
+        match value {
+            Theme::Dark => Self::Dark,
+            Theme::Light => Self::Light,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Overview,
     Health,
+}
+
+impl From<UiView> for View {
+    fn from(value: UiView) -> Self {
+        match value {
+            UiView::Overview => Self::Overview,
+            UiView::Health => Self::Health,
+        }
+    }
+}
+
+impl From<View> for UiView {
+    fn from(value: View) -> Self {
+        match value {
+            View::Overview => Self::Overview,
+            View::Health => Self::Health,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,6 +170,24 @@ enum WindowScope {
     #[default]
     FiveHours,
     Week,
+}
+
+impl From<UiWindowScope> for WindowScope {
+    fn from(value: UiWindowScope) -> Self {
+        match value {
+            UiWindowScope::FiveHours => Self::FiveHours,
+            UiWindowScope::Week => Self::Week,
+        }
+    }
+}
+
+impl From<WindowScope> for UiWindowScope {
+    fn from(value: WindowScope) -> Self {
+        match value {
+            WindowScope::FiveHours => Self::FiveHours,
+            WindowScope::Week => Self::Week,
+        }
+    }
 }
 
 impl WindowScope {
@@ -188,94 +244,44 @@ impl WindowScope {
 }
 
 fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAnalysis> {
-    snapshot
-        .window_analyses
-        .iter()
-        .filter(|analysis| analysis.duration_mins == scope.duration_mins())
-        .min_by_key(|analysis| {
-            analysis
+    snapshot.window_analyses.iter().find(|analysis| {
+        analysis.duration_mins == scope.duration_mins()
+            && analysis
                 .attribution
                 .window
                 .as_ref()
-                .is_none_or(|window| !window.limit_id.eq_ignore_ascii_case("codex"))
-        })
+                .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
+    })
 }
 
-fn window_analyses(snapshot: &Snapshot, scope: WindowScope) -> Vec<&WindowAnalysis> {
+fn has_legacy_codex_window(snapshot: &Snapshot) -> bool {
     snapshot
-        .window_analyses
-        .iter()
-        .filter(|analysis| analysis.duration_mins == scope.duration_mins())
-        .collect()
-}
-
-fn combine_bucket_usages(total_local_tokens: u64, usages: Vec<WindowUsage>) -> WindowUsage {
-    if usages.len() == 1 {
-        return usages[0];
-    }
-
-    let mut aggregate = WindowUsage::default();
-    let mut contributing_buckets = 0;
-    let mut quota_confidence = None;
-    for usage in usages {
-        aggregate.token_usage.add_assign(usage.token_usage);
-        if usage.token_usage.is_zero() {
-            continue;
-        }
-        contributing_buckets += 1;
-        aggregate.estimated_quota_percent += usage.estimated_quota_percent;
-        quota_confidence = Some(match quota_confidence {
-            None => usage.quota_confidence,
-            Some(current) => weakest_quota_confidence(current, usage.quota_confidence),
-        });
-    }
-
-    aggregate.local_token_share_percent = if total_local_tokens == 0 {
-        0.0
-    } else {
-        aggregate.token_usage.total_tokens as f64 / total_local_tokens as f64 * 100.0
-    };
-    if contributing_buckets == 1 {
-        aggregate.quota_confidence = quota_confidence.unwrap_or(Confidence::Unknown);
-    } else {
-        // Percentage points from independent quota pools do not share a denominator.
-        aggregate.estimated_quota_percent = 0.0;
-        aggregate.quota_confidence = Confidence::Unknown;
-    }
-    aggregate
+        .attribution
+        .window
+        .as_ref()
+        .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
 }
 
 fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&AttributionSummary> {
     window_analysis(snapshot, scope)
         .map(|analysis| &analysis.attribution)
         .or_else(|| {
-            (scope == WindowScope::FiveHours && snapshot.attribution.window.is_some())
+            (scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot))
                 .then_some(&snapshot.attribution)
         })
 }
 
 fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskRecord) -> WindowUsage {
-    let analyses = window_analyses(snapshot, scope);
-    if !analyses.is_empty() {
-        let total_local_tokens = analyses
+    if let Some(analysis) = window_analysis(snapshot, scope) {
+        return analysis
+            .threads
             .iter()
-            .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
-            .sum();
-        let usages = analyses
-            .into_iter()
-            .map(|analysis| {
-                analysis
-                    .threads
-                    .iter()
-                    .find(|usage| usage.thread_id == task.thread_id)
-                    .map(|usage| usage.usage)
-                    .unwrap_or_default()
-            })
-            .collect();
-        return combine_bucket_usages(total_local_tokens, usages);
+            .find(|usage| usage.thread_id == task.thread_id)
+            .map(|usage| usage.usage)
+            .unwrap_or_default();
     }
 
-    if scope == WindowScope::FiveHours {
+    if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
         WindowUsage {
             token_usage: task.window_token_usage,
             local_token_share_percent: task.local_token_share_percent,
@@ -288,29 +294,16 @@ fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskReco
 }
 
 fn turn_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, turn: &TurnRecord) -> WindowUsage {
-    let analyses = window_analyses(snapshot, scope);
-    if !analyses.is_empty() {
-        let total_local_tokens = analyses
+    if let Some(analysis) = window_analysis(snapshot, scope) {
+        return analysis
+            .turns
             .iter()
-            .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
-            .sum();
-        let usages = analyses
-            .into_iter()
-            .map(|analysis| {
-                analysis
-                    .turns
-                    .iter()
-                    .find(|usage| {
-                        usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id
-                    })
-                    .map(|usage| usage.usage)
-                    .unwrap_or_default()
-            })
-            .collect();
-        return combine_bucket_usages(total_local_tokens, usages);
+            .find(|usage| usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id)
+            .map(|usage| usage.usage)
+            .unwrap_or_default();
     }
 
-    if scope == WindowScope::FiveHours {
+    if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
         WindowUsage {
             token_usage: turn.window_token_usage,
             local_token_share_percent: turn.local_token_share_percent,
@@ -349,50 +342,36 @@ fn aggregate_task_row_usage(
     let Some(task) = snapshot.tasks.get(row.index) else {
         return WindowUsage::default();
     };
-    if window_only && !row.hidden_descendants.is_empty() {
-        let analyses = window_analyses(snapshot, scope);
-        if !analyses.is_empty() {
-            let thread_ids = std::iter::once(row.index)
-                .chain(row.hidden_descendants.iter().copied())
-                .filter_map(|index| snapshot.tasks.get(index))
-                .map(|task| task.thread_id.as_str())
-                .collect::<HashSet<_>>();
-            let total_local_tokens = analyses
-                .iter()
-                .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
-                .sum();
-            let usages = analyses
-                .into_iter()
-                .map(|analysis| {
-                    let mut bucket_usage = WindowUsage::default();
-                    let mut quota_confidence = None;
-                    for thread in analysis
-                        .threads
-                        .iter()
-                        .filter(|thread| thread_ids.contains(thread.thread_id.as_str()))
-                    {
-                        bucket_usage
-                            .token_usage
-                            .add_assign(thread.usage.token_usage);
-                        bucket_usage.local_token_share_percent +=
-                            thread.usage.local_token_share_percent;
-                        bucket_usage.estimated_quota_percent +=
-                            thread.usage.estimated_quota_percent;
-                        if thread.usage.estimated_quota_percent > 0.0 {
-                            quota_confidence = Some(match quota_confidence {
-                                None => thread.usage.quota_confidence,
-                                Some(current) => {
-                                    weakest_quota_confidence(current, thread.usage.quota_confidence)
-                                }
-                            });
-                        }
+    if window_only
+        && !row.hidden_descendants.is_empty()
+        && let Some(analysis) = window_analysis(snapshot, scope)
+    {
+        let thread_ids = std::iter::once(row.index)
+            .chain(row.hidden_descendants.iter().copied())
+            .filter_map(|index| snapshot.tasks.get(index))
+            .map(|task| task.thread_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut aggregate = WindowUsage::default();
+        let mut quota_confidence = None;
+        for thread in analysis
+            .threads
+            .iter()
+            .filter(|thread| thread_ids.contains(thread.thread_id.as_str()))
+        {
+            aggregate.token_usage.add_assign(thread.usage.token_usage);
+            aggregate.local_token_share_percent += thread.usage.local_token_share_percent;
+            aggregate.estimated_quota_percent += thread.usage.estimated_quota_percent;
+            if !thread.usage.token_usage.is_zero() {
+                quota_confidence = Some(match quota_confidence {
+                    None => thread.usage.quota_confidence,
+                    Some(current) => {
+                        weakest_quota_confidence(current, thread.usage.quota_confidence)
                     }
-                    bucket_usage.quota_confidence = quota_confidence.unwrap_or(Confidence::Unknown);
-                    bucket_usage
-                })
-                .collect();
-            return combine_bucket_usages(total_local_tokens, usages);
+                });
+            }
         }
+        aggregate.quota_confidence = quota_confidence.unwrap_or(Confidence::Unknown);
+        return aggregate;
     }
 
     let mut aggregate = task_record_usage(snapshot, scope, task, window_only);
@@ -462,6 +441,24 @@ enum TaskListMode {
     Tree,
 }
 
+impl From<UiTaskListMode> for TaskListMode {
+    fn from(value: UiTaskListMode) -> Self {
+        match value {
+            UiTaskListMode::Flat => Self::Flat,
+            UiTaskListMode::Tree => Self::Tree,
+        }
+    }
+}
+
+impl From<TaskListMode> for UiTaskListMode {
+    fn from(value: TaskListMode) -> Self {
+        match value {
+            TaskListMode::Flat => Self::Flat,
+            TaskListMode::Tree => Self::Tree,
+        }
+    }
+}
+
 impl TaskListMode {
     fn toggle(self) -> Self {
         match self {
@@ -527,6 +524,28 @@ impl TaskSourceFilter {
     }
 }
 
+impl From<UiTaskSourceFilter> for TaskSourceFilter {
+    fn from(value: UiTaskSourceFilter) -> Self {
+        match value {
+            UiTaskSourceFilter::All => Self::All,
+            UiTaskSourceFilter::Desktop => Self::Desktop,
+            UiTaskSourceFilter::Subagent => Self::Subagent,
+            UiTaskSourceFilter::Cli => Self::Cli,
+        }
+    }
+}
+
+impl From<TaskSourceFilter> for UiTaskSourceFilter {
+    fn from(value: TaskSourceFilter) -> Self {
+        match value {
+            TaskSourceFilter::All => Self::All,
+            TaskSourceFilter::Desktop => Self::Desktop,
+            TaskSourceFilter::Subagent => Self::Subagent,
+            TaskSourceFilter::Cli => Self::Cli,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusTone {
     Active,
@@ -551,7 +570,6 @@ struct TaskControlsHitbox {
     search: Rect,
     clear_search: Rect,
     enter_turns: Rect,
-    toggle_turns: Rect,
     toggle_tree: Rect,
     collapse_all: Rect,
 }
@@ -576,6 +594,7 @@ struct ViewTabsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowControlsHitbox {
+    toggle_turns: Rect,
     toggle_models: Rect,
     scopes: [Rect; 2],
 }
@@ -760,6 +779,34 @@ impl App {
             worker_running: false,
             last_local_refresh: Instant::now(),
             last_account_refresh: Instant::now(),
+        }
+    }
+
+    fn apply_ui_state(&mut self, state: &UiState, theme_override: Option<Theme>) {
+        self.theme = theme_override.unwrap_or_else(|| state.theme.into());
+        self.view = state.view.into();
+        self.window_scope = state.window_scope.into();
+        self.turns_default_visible = state.turns_visible;
+        self.turns_temporarily_visible = false;
+        self.models_visible = state.models_visible;
+        self.task_list_mode = state.task_list_mode.into();
+        self.task_source_filter = state.task_source_filter.into();
+        self.reconcile_task_filter(true);
+        if self.view == View::Health {
+            self.transition_to_tasks();
+        }
+    }
+
+    fn ui_state(&self) -> UiState {
+        UiState {
+            theme: self.theme.into(),
+            view: self.view.into(),
+            window_scope: self.window_scope.into(),
+            turns_visible: self.turns_default_visible,
+            models_visible: self.models_visible,
+            task_list_mode: self.task_list_mode.into(),
+            task_source_filter: self.task_source_filter.into(),
+            ..UiState::default()
         }
     }
 
@@ -1356,12 +1403,11 @@ impl App {
         self.set_task_collapsed(self.selected_task, collapsed)
     }
 
-    fn collapse_all_task_threads(&mut self) -> bool {
+    fn filtered_collapsible_task_threads(&self) -> Vec<String> {
         if self.task_list_mode != TaskListMode::Tree {
-            return false;
+            return Vec::new();
         }
-        let collapsible = self
-            .filtered_task_rows_with_collapsed(&HashSet::new())
+        self.filtered_task_rows_with_collapsed(&HashSet::new())
             .into_iter()
             .filter(|row| row.has_children)
             .filter_map(|row| {
@@ -1370,10 +1416,32 @@ impl App {
                     .get(row.index)
                     .map(|task| task.thread_id.clone())
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn all_filtered_task_threads_collapsed(&self) -> bool {
+        let collapsible = self.filtered_collapsible_task_threads();
+        !collapsible.is_empty()
+            && collapsible
+                .iter()
+                .all(|thread_id| self.collapsed_task_threads.contains(thread_id))
+    }
+
+    fn toggle_all_task_threads(&mut self) -> bool {
+        let collapsible = self.filtered_collapsible_task_threads();
+        if collapsible.is_empty() {
+            return false;
+        }
+        let expand = collapsible
+            .iter()
+            .all(|thread_id| self.collapsed_task_threads.contains(thread_id));
         let mut changed = false;
         for thread_id in collapsible {
-            changed |= self.collapsed_task_threads.insert(thread_id);
+            changed |= if expand {
+                self.collapsed_task_threads.remove(&thread_id)
+            } else {
+                self.collapsed_task_threads.insert(thread_id)
+            };
         }
         if changed {
             self.reconcile_task_filter(false);
@@ -1758,11 +1826,6 @@ impl App {
             self.focus_turns();
             return true;
         }
-        if rect_contains(hitbox.toggle_turns, column, row) {
-            self.accept_active_search();
-            self.toggle_turns_default_visibility();
-            return true;
-        }
         if rect_contains(hitbox.toggle_tree, column, row) {
             self.accept_active_search();
             self.toggle_task_list_mode();
@@ -1772,7 +1835,7 @@ impl App {
             && self.task_list_mode == TaskListMode::Tree
         {
             self.accept_active_search();
-            self.collapse_all_task_threads();
+            self.toggle_all_task_threads();
             return true;
         }
         if rect_contains(hitbox.clear_search, column, row) {
@@ -1852,6 +1915,11 @@ impl App {
         let Some(hitbox) = self.window_controls_hitbox else {
             return false;
         };
+        if rect_contains(hitbox.toggle_turns, column, row) {
+            self.accept_active_search();
+            self.toggle_turns_default_visibility();
+            return true;
+        }
         if rect_contains(hitbox.toggle_models, column, row) {
             self.accept_active_search();
             self.toggle_models_visibility();
@@ -2367,7 +2435,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('E')
             if app.view != View::Health && app.task_list_mode == TaskListMode::Tree =>
         {
-            app.collapse_all_task_threads();
+            app.toggle_all_task_threads();
         }
         KeyCode::Char('-')
             if app.view != View::Health
@@ -2534,10 +2602,16 @@ fn render_scrollbar(frame: &mut Frame<'_>, hitbox: ScrollbarHitbox, theme: Theme
 }
 
 pub fn run(config: CollectConfig) -> Result<()> {
-    run_with_theme(config, Theme::Dark)
+    run_with_theme_override(config, None)
 }
 
 pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
+    run_with_theme_override(config, Some(theme))
+}
+
+fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>) -> Result<()> {
+    let mut ui_state_store = UiStateStore::discover();
+    let ui_state = ui_state_store.load();
     let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
     let initial = {
         let mut cache = rollout_cache
@@ -2545,7 +2619,9 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         collect_snapshot_cached(&config, None, true, &mut cache)
     };
-    let mut app = App::new(initial, theme);
+    let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
+    let mut app = App::new(initial, initial_theme);
+    app.apply_ui_state(&ui_state, theme_override);
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -2559,7 +2635,9 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
         &sender,
         &receiver,
         rollout_cache,
+        &ui_state_store,
     );
+    let _ = ui_state_store.save(&app.ui_state());
     terminal.show_cursor()?;
     result
 }
@@ -2571,6 +2649,7 @@ fn run_loop(
     sender: &mpsc::Sender<(CollectionResult, bool)>,
     receiver: &Receiver<(CollectionResult, bool)>,
     rollout_cache: Arc<Mutex<RolloutCache>>,
+    ui_state_store: &UiStateStore,
 ) -> Result<()> {
     loop {
         while let Ok((result, refreshed_account)) = receiver.try_recv() {
@@ -2580,19 +2659,28 @@ fn run_loop(
         terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
+            let previous_ui_state = app.ui_state();
+            let mut should_quit = false;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if handle_key_event(app, key) {
-                        return Ok(());
+                        should_quit = true;
                     }
                 }
                 Event::Mouse(mouse) => {
                     handle_mouse_event(app, mouse);
                     if app.quit_requested {
-                        return Ok(());
+                        should_quit = true;
                     }
                 }
                 _ => {}
+            }
+            let current_ui_state = app.ui_state();
+            if current_ui_state != previous_ui_state {
+                let _ = ui_state_store.save(&current_ui_state);
+            }
+            if should_quit {
+                return Ok(());
             }
         }
 
@@ -2714,7 +2802,7 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
     let tabs = view_tabs_hitbox(area);
     let start_x = tabs.tabs[View::Health.index()].right();
     let remaining = usize::from(area.right().saturating_sub(start_x));
-    let full_width = UnicodeWidthStr::width(" | [M]Models [5h] [Week]");
+    let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week]");
     let compact = remaining < full_width;
     let separator = if compact { " " } else { TAB_DIVIDER };
     let gap = if compact { "" } else { " " };
@@ -2724,15 +2812,50 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
     let mut x = start_x;
     let shortcuts_active = app.shortcuts_active();
 
-    let models_label = if compact { "[M]" } else { "[M]Models" };
-    let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
-    let mut toggle_models = Rect::default();
+    let turns_label = if compact { "[V]" } else { "[V]Turns" };
+    let turns_width = u16::try_from(UnicodeWidthStr::width(turns_label)).unwrap_or(u16::MAX);
+    let mut toggle_turns = Rect::default();
     if x.saturating_add(separator_width)
-        .saturating_add(models_width)
+        .saturating_add(turns_width)
         <= area.right()
     {
         spans.push(Span::styled(separator, Style::default().fg(palette.muted)));
         x = x.saturating_add(separator_width);
+        toggle_turns = clipped_horizontal_hitbox(area, x, turns_width);
+        let turns_style = if app.turns_default_visible {
+            Style::default()
+                .fg(palette.background)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let turns_shortcut_style = if !shortcuts_active {
+            turns_style
+        } else if app.turns_default_visible {
+            turns_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled("[", turns_style));
+        spans.push(Span::styled("V", turns_shortcut_style));
+        spans.push(Span::styled(
+            if compact { "]" } else { "]Turns" },
+            turns_style,
+        ));
+        x = x.saturating_add(turns_width);
+    }
+
+    let models_label = if compact { "[M]" } else { "[M]Models" };
+    let models_width = u16::try_from(UnicodeWidthStr::width(models_label)).unwrap_or(u16::MAX);
+    let mut toggle_models = Rect::default();
+    if !toggle_turns.is_empty()
+        && x.saturating_add(gap_width).saturating_add(models_width) <= area.right()
+    {
+        spans.push(Span::raw(gap));
+        x = x.saturating_add(gap_width);
         toggle_models = clipped_horizontal_hitbox(area, x, models_width);
         let models_style = if app.models_visible {
             Style::default()
@@ -2768,7 +2891,8 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
             scope.label().to_string()
         };
         let width = u16::try_from(UnicodeWidthStr::width(label.as_str()) + 2).unwrap_or(u16::MAX);
-        if toggle_models.is_empty()
+        if toggle_turns.is_empty()
+            || toggle_models.is_empty()
             || x.saturating_add(gap_width).saturating_add(width) > area.right()
         {
             break;
@@ -2815,6 +2939,7 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         ),
     );
     WindowControlsHitbox {
+        toggle_turns,
         toggle_models,
         scopes,
     }
@@ -3363,8 +3488,6 @@ fn task_panel_block(
     let full_controls_width = UnicodeWidthStr::width(format!(" {title}").as_str())
         + 2
         + 1
-        + UnicodeWidthStr::width("[V]Turns")
-        + 1
         + UnicodeWidthStr::width("[R]Tree")
         + 1
         + UnicodeWidthStr::width("[E]Collapse")
@@ -3418,38 +3541,6 @@ fn task_panel_block(
         spans.push(Span::raw(" "));
         title_x = title_x.saturating_add(1);
     }
-    let toggle_label = if compact { "[V]" } else { "[V]Turns" };
-    let toggle_width = u16::try_from(UnicodeWidthStr::width(toggle_label)).unwrap_or(u16::MAX);
-    let toggle_turns = title_hitbox(area, title_x, toggle_width);
-    let toggle_style = if app.turns_default_visible {
-        Style::default()
-            .fg(palette.background)
-            .bg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.muted)
-    };
-    let toggle_shortcut_style = if !app.shortcuts_active() {
-        toggle_style
-    } else if app.turns_default_visible {
-        toggle_style.add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    };
-    spans.push(Span::styled("[", toggle_style));
-    spans.push(Span::styled("V", toggle_shortcut_style));
-    spans.push(Span::styled(
-        if compact { "]" } else { "]Turns" },
-        toggle_style,
-    ));
-    title_x = title_x.saturating_add(toggle_width);
-
-    if !compact {
-        spans.push(Span::raw(" "));
-        title_x = title_x.saturating_add(1);
-    }
     let tree_label = if compact { "[R]" } else { "[R]Tree" };
     let tree_width = u16::try_from(UnicodeWidthStr::width(tree_label)).unwrap_or(u16::MAX);
     let toggle_tree = title_hitbox(area, title_x, tree_width);
@@ -3483,11 +3574,16 @@ fn task_panel_block(
         spans.push(Span::raw(" "));
         title_x = title_x.saturating_add(1);
     }
-    let collapse_label = if compact { "[E]" } else { "[E]Collapse" };
-    let collapse_width = u16::try_from(UnicodeWidthStr::width(collapse_label)).unwrap_or(u16::MAX);
+    let expand_all = app.all_filtered_task_threads_collapsed();
+    let collapse_width = if compact {
+        3
+    } else {
+        u16::try_from(UnicodeWidthStr::width("[E]Collapse")).unwrap_or(u16::MAX)
+    };
     let collapse_all = title_hitbox(area, title_x, collapse_width);
     let collapse_style = Style::default().fg(palette.muted);
-    let collapse_shortcut_style = if tree_selected && app.shortcuts_active() {
+    let collapse_available = !app.filtered_collapsible_task_threads().is_empty();
+    let collapse_shortcut_style = if tree_selected && collapse_available && app.shortcuts_active() {
         Style::default()
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD)
@@ -3497,7 +3593,13 @@ fn task_panel_block(
     spans.push(Span::styled("[", collapse_style));
     spans.push(Span::styled("E", collapse_shortcut_style));
     spans.push(Span::styled(
-        if compact { "]" } else { "]Collapse" },
+        if compact {
+            "]"
+        } else if expand_all {
+            "]Expand  "
+        } else {
+            "]Collapse"
+        },
         collapse_style,
     ));
     title_x = title_x.saturating_add(collapse_width);
@@ -3669,7 +3771,6 @@ fn task_panel_block(
         ),
         clear_search,
         enter_turns,
-        toggle_turns,
         toggle_tree,
         collapse_all,
     };
@@ -4241,7 +4342,6 @@ fn attribution_summary_lines(
     attribution: Option<&AttributionSummary>,
     window_scope: WindowScope,
     selected_partial: bool,
-    ambiguous_limit_buckets: bool,
     compact: bool,
 ) -> Vec<String> {
     let Some(attribution) = attribution else {
@@ -4266,77 +4366,34 @@ fn attribution_summary_lines(
             )
         })
         .unwrap_or_else(|| format!("{} reset cycle unavailable", window_scope.label()));
-    let has_proxy = attribution.proxy_projected_percent > 0.0;
-    let allocation = if has_proxy {
-        let total_estimate =
-            attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
+    let has_local_denominator = attribution.local_token_usage.total_tokens > 0;
+    let allocation = if has_local_denominator {
         if compact {
             format!(
-                "Local {} · est ~{total_estimate:.2}pp (evidence {:.2} + proxy {:.2} from gap)",
+                "Local {} · EST ~{:.2}pp · codex gauge × local token share",
                 format_tokens(attribution.local_token_usage),
-                attribution.estimated_assigned_percent,
                 attribution.proxy_projected_percent,
             )
         } else {
             format!(
-                "{} local · ~{total_estimate:.2}pp estimated ({:.2}pp evidence assigned + {:.2}pp proxy from unverified gap)",
+                "{} local · ~{:.2}pp estimated · codex gauge × local token share",
                 format_tokens(attribution.local_token_usage),
-                attribution.estimated_assigned_percent,
                 attribution.proxy_projected_percent,
-            )
-        }
-    } else {
-        let estimated_quota = if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        if compact {
-            format!(
-                "Local {} · obs +{:.2}pp · est {} · unattr {:.2}pp",
-                format_tokens(attribution.local_token_usage),
-                attribution.observed_delta_percent,
-                estimated_quota,
-                attribution.unattributed_percent,
-            )
-        } else {
-            format!(
-                "{} local · +{:.2}pp observed · {} estimated · {:.2}pp unattributed",
-                format_tokens(attribution.local_token_usage),
-                attribution.observed_delta_percent,
-                estimated_quota,
-                attribution.unattributed_percent,
-            )
-        }
-    };
-    let mut quality = if has_proxy {
-        if compact {
-            format!(
-                "obs +{:.2}pp · unverified gap {:.2}pp · Coverage {:.0}% · conf {}",
-                attribution.observed_delta_percent,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
-            )
-        } else {
-            format!(
-                "+{:.2}pp observed · {:.2}pp unverified evidence gap · {:.0}% evidence coverage · {} confidence",
-                attribution.observed_delta_percent,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
             )
         }
     } else if compact {
+        "Local 0 · EST - · no local token denominator".to_string()
+    } else {
+        "0 local tokens · estimate unavailable without a local token denominator".to_string()
+    };
+    let mut quality = if compact {
         format!(
-            "Coverage {:.0}% · conf {}",
-            attribution.attribution_coverage_percent,
-            confidence_label(attribution.confidence),
+            "conf {} · relative allocation",
+            confidence_label(attribution.confidence)
         )
     } else {
         format!(
-            "{:.0}% coverage · {}",
-            attribution.attribution_coverage_percent,
+            "{} confidence · relative allocation, not server per-task accounting",
             confidence_label(attribution.confidence),
         )
     };
@@ -4350,259 +4407,22 @@ fn attribution_summary_lines(
     if attribution.settled {
         quality.push_str(" · settled");
     }
-    if ambiguous_limit_buckets {
-        quality.push_str(if compact {
-            " · est unavailable: multiple buckets"
-        } else {
-            " · quota estimate unavailable: multiple active buckets"
-        });
-    }
     if selected_partial {
         quality.push_str(" · partial");
     }
     vec![format!("Attribution  {window}"), allocation, quality]
 }
 
-fn mapped_bucket_attribution_lines(
-    analyses: &[&WindowAnalysis],
-    window_scope: WindowScope,
-    compact: bool,
-) -> Vec<String> {
-    if analyses.len() <= 1 {
-        let analysis = analyses.first().copied();
-        let ambiguous = analysis.is_some_and(|analysis| {
-            analysis
-                .partial_reasons
-                .iter()
-                .any(|reason| reason == "multiple_active_limit_buckets")
-        });
-        return attribution_summary_lines(
-            analysis.map(|analysis| &analysis.attribution),
-            window_scope,
-            analysis.is_some_and(|analysis| analysis.partial),
-            ambiguous,
-            compact,
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            if index == 2
-                && let Some(analysis) = analysis
-                && let Some(note) = mapping_partial_note(analysis, compact)
-            {
-                line.push_str(" · ");
-                line.push_str(&note);
-            }
-            line
-        })
-        .collect();
-    }
-
-    let mut lines = vec![format!(
-        "Attribution  {} · {} model-mapped buckets",
-        window_scope.label(),
-        analyses.len()
-    )];
-    for analysis in analyses {
-        let attribution = &analysis.attribution;
-        let Some(window) = attribution.window.as_ref() else {
-            continue;
-        };
-        let has_proxy = attribution.proxy_projected_percent > 0.0;
-        let estimated = if has_proxy {
-            let total =
-                attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
-            format!(
-                "~{total:.2}pp (evidence {:.2} + proxy {:.2} from gap)",
-                attribution.estimated_assigned_percent, attribution.proxy_projected_percent,
-            )
-        } else if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        let mut line = if compact && has_proxy {
-            format!(
-                "{} {:.0}%→{} L{} EST~{:.1}(P{:.1}) A{:.1} U{:.1} C{:.0}%/{}",
-                terminal_safe_text(&window.limit_id),
-                window.used_percent,
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                format_tokens(attribution.local_token_usage),
-                attribution.estimated_assigned_percent + attribution.proxy_projected_percent,
-                attribution.proxy_projected_percent,
-                attribution.estimated_assigned_percent,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
-            )
-        } else if compact {
-            format!(
-                "{} {:.0}% →{} · L{} O+{:.1} E{} U{:.1} C{:.0}%/{}",
-                terminal_safe_text(&window.limit_id),
-                window.used_percent,
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                format_tokens(attribution.local_token_usage),
-                attribution.observed_delta_percent,
-                estimated,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
-            )
-        } else if has_proxy {
-            format!(
-                "{} · {:.1}% used · reset {} · local {} · est {} · unverified gap {:.2}pp · evidence coverage {:.0}% · {} confidence",
-                terminal_safe_text(&window.limit_id),
-                window.used_percent,
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                format_tokens(attribution.local_token_usage),
-                estimated,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
-            )
-        } else {
-            format!(
-                "{} · {:.1}% used · reset {} · local {} · obs +{:.2}pp · est {} · unattr {:.2}pp · cov {:.0}% {}",
-                terminal_safe_text(&window.limit_id),
-                window.used_percent,
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                format_tokens(attribution.local_token_usage),
-                attribution.observed_delta_percent,
-                estimated,
-                attribution.unattributed_percent,
-                attribution.attribution_coverage_percent,
-                confidence_label(attribution.confidence),
-            )
-        };
-        if let Some(note) = mapping_partial_note(analysis, compact) {
-            line.push_str(" · ");
-            line.push_str(&note);
-        } else if analysis.partial {
-            line.push_str(" · partial");
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-fn mapping_partial_note(analysis: &WindowAnalysis, compact: bool) -> Option<String> {
-    let missing_model = analysis
-        .partial_reasons
-        .iter()
-        .any(|reason| reason == UNMAPPED_CALL_MODEL_REASON);
-    let unavailable_bucket = analysis
-        .partial_reasons
-        .iter()
-        .any(|reason| reason == MAPPED_BUCKET_UNAVAILABLE_REASON);
-    match (missing_model, unavailable_bucket, compact) {
-        (false, false, _) => None,
-        (true, false, true) => Some("scope partial: missing-model calls excluded".to_string()),
-        (true, false, false) => {
-            Some("scope partial: calls without model metadata excluded".to_string())
-        }
-        (false, true, true) => Some("scope partial: mapped bucket unavailable".to_string()),
-        (false, true, false) => {
-            Some("scope partial: calls for an unavailable mapped bucket excluded".to_string())
-        }
-        (true, true, true) => Some("scope partial: missing model / unavailable bucket".to_string()),
-        (true, true, false) => {
-            Some("scope partial: missing-model and unavailable-bucket calls excluded".to_string())
-        }
-    }
-}
-
-fn mapping_exclusion_message(
-    analyses: &[&WindowAnalysis],
-    window_scope: WindowScope,
-) -> Option<String> {
-    let missing_model = analyses.iter().any(|analysis| {
-        analysis
-            .partial_reasons
-            .iter()
-            .any(|reason| reason == UNMAPPED_CALL_MODEL_REASON)
-    });
-    let unavailable_bucket = analyses.iter().any(|analysis| {
-        analysis
-            .partial_reasons
-            .iter()
-            .any(|reason| reason == MAPPED_BUCKET_UNAVAILABLE_REASON)
-    });
-    match (missing_model, unavailable_bucket) {
-        (false, false) => None,
-        (true, false) => Some(format!(
-            "Local calls in the current {} scope were excluded because model metadata is missing",
-            window_scope.label()
-        )),
-        (false, true) => Some(format!(
-            "Local calls map to a quota bucket with no current {} window",
-            window_scope.label()
-        )),
-        (true, true) => Some(format!(
-            "Current {} scope excludes missing-model calls and calls whose mapped bucket is unavailable",
-            window_scope.label()
-        )),
-    }
-}
-
 fn models_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Vec<ModelUsage> {
-    let analyses = window_analyses(snapshot, scope);
-    if analyses.is_empty() {
-        return if scope == WindowScope::FiveHours {
-            snapshot.models.clone()
-        } else {
-            Vec::new()
-        };
-    }
-    if analyses.len() == 1 {
-        return analyses[0].models.clone();
-    }
-
-    let total_local_tokens = analyses
-        .iter()
-        .map(|analysis| analysis.attribution.local_token_usage.total_tokens)
-        .sum::<u64>();
-    let mut grouped: HashMap<String, (TokenUsage, f64, Confidence, usize)> = HashMap::new();
-    for analysis in analyses {
-        for model in &analysis.models {
-            let entry = grouped.entry(model.model.clone()).or_insert((
-                TokenUsage::default(),
-                0.0,
-                model.quota_confidence,
-                0,
-            ));
-            entry.0.add_assign(model.token_usage);
-            entry.1 += model.estimated_quota_percent;
-            entry.2 = weakest_quota_confidence(entry.2, model.quota_confidence);
-            if !model.token_usage.is_zero() {
-                entry.3 += 1;
+    window_analysis(snapshot, scope)
+        .map(|analysis| analysis.models.clone())
+        .unwrap_or_else(|| {
+            if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
+                snapshot.models.clone()
+            } else {
+                Vec::new()
             }
-        }
-    }
-
-    grouped
-        .into_iter()
-        .map(
-            |(model, (token_usage, estimated_quota_percent, quota_confidence, buckets))| {
-                let local_token_share_percent = if total_local_tokens == 0 {
-                    0.0
-                } else {
-                    token_usage.total_tokens as f64 / total_local_tokens as f64 * 100.0
-                };
-                let (estimated_quota_percent, quota_confidence) = if buckets <= 1 {
-                    (estimated_quota_percent, quota_confidence)
-                } else {
-                    (0.0, Confidence::Unknown)
-                };
-                ModelUsage {
-                    model,
-                    token_usage,
-                    local_token_share_percent,
-                    estimated_quota_percent,
-                    quota_confidence,
-                }
-            },
-        )
-        .collect()
+        })
 }
 
 fn wrapped_text_height(lines: &[String], width: usize) -> usize {
@@ -4618,11 +4438,8 @@ fn wrapped_text_height(lines: &[String], width: usize) -> usize {
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
-    let analyses = window_analyses(&app.snapshot, window_scope);
-    let legacy_attribution = analyses
-        .is_empty()
-        .then(|| attribution_for_scope(&app.snapshot, window_scope))
-        .flatten();
+    let analysis = window_analysis(&app.snapshot, window_scope);
+    let attribution = attribution_for_scope(&app.snapshot, window_scope);
     let mut models = models_for_scope(&app.snapshot, window_scope);
     models.sort_by(|left, right| {
         right
@@ -4633,17 +4450,15 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     });
 
     let panel_inner = Block::default().borders(Borders::ALL).inner(area);
-    let attribution_lines = if analyses.is_empty() {
-        attribution_summary_lines(
-            legacy_attribution,
-            window_scope,
-            window_scope == WindowScope::FiveHours && app.snapshot.partial,
-            false,
-            panel_inner.width < 100,
-        )
-    } else {
-        mapped_bucket_attribution_lines(&analyses, window_scope, panel_inner.width < 100)
-    };
+    let selected_partial = analysis
+        .map(|analysis| analysis.partial)
+        .unwrap_or(window_scope == WindowScope::FiveHours && app.snapshot.partial);
+    let attribution_lines = attribution_summary_lines(
+        attribution,
+        window_scope,
+        selected_partial,
+        panel_inner.width < 100,
+    );
     let attribution_height = u16::try_from(wrapped_text_height(
         &attribution_lines,
         usize::from(panel_inner.width),
@@ -4657,21 +4472,11 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let model_area = regions[1];
     let visible_capacity = usize::from(model_area.height.saturating_sub(1));
     let visible_count = models.len().min(visible_capacity);
-    let scope = analyses
-        .first()
-        .and_then(|analysis| analysis.attribution.window.as_ref())
-        .map(|window| window.label.clone())
-        .or_else(|| {
-            legacy_attribution
-                .and_then(|attribution| attribution.window.as_ref())
-                .map(|window| window.label.clone())
-        });
-    let mut title_suffix = if analyses.len() > 1 {
-        format!("{} · {} buckets", window_scope.label(), analyses.len())
-    } else {
-        scope.as_deref().unwrap_or(window_scope.label()).to_string()
-    };
-    if analyses.is_empty() && legacy_attribution.is_none() {
+    let scope = attribution
+        .and_then(|attribution| attribution.window.as_ref())
+        .map(|window| window.label.clone());
+    let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
+    if attribution.is_none() {
         title_suffix.push_str(" unavailable");
     }
     if visible_count < models.len() {
@@ -4695,9 +4500,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     if models.is_empty() {
-        let message = if let Some(message) = mapping_exclusion_message(&analyses, window_scope) {
-            message
-        } else if !analyses.is_empty() || legacy_attribution.is_some() {
+        let message = if attribution.is_some() {
             format!(
                 "No local model usage in the current {} window",
                 scope.as_deref().unwrap_or(window_scope.label())
@@ -5209,6 +5012,7 @@ mod tests {
         local_share_percent: f64,
     ) {
         let now = app.snapshot.as_of;
+        let estimated_quota_percent = 23.0 * local_share_percent / 100.0;
         let usage = WindowUsage {
             token_usage: TokenUsage {
                 input_tokens: total_tokens,
@@ -5216,8 +5020,8 @@ mod tests {
                 ..TokenUsage::default()
             },
             local_token_share_percent: local_share_percent,
-            estimated_quota_percent: 2.5,
-            quota_confidence: Confidence::Medium,
+            estimated_quota_percent,
+            quota_confidence: Confidence::Low,
         };
         let thread_id = app.snapshot.tasks[0].thread_id.clone();
         let turn_id = app
@@ -5241,14 +5045,14 @@ mod tests {
                     used_percent: 23.0,
                 }),
                 local_token_usage: usage.token_usage,
-                observed_delta_percent: 1.0,
-                estimated_assigned_percent: 1.0,
-                proxy_projected_percent: 0.0,
-                unattributed_percent: 22.0,
-                attribution_coverage_percent: 4.3,
+                observed_delta_percent: 0.0,
+                estimated_assigned_percent: 0.0,
+                proxy_projected_percent: 23.0,
+                unattributed_percent: 23.0,
+                attribution_coverage_percent: 0.0,
                 external_activity_possible: true,
-                confidence: Confidence::Medium,
-                method: "observed_delta_token_proportional".to_string(),
+                confidence: Confidence::Low,
+                method: "current_codex_gauge_token_share_proxy".to_string(),
                 settled: true,
             },
             partial: false,
@@ -5354,6 +5158,36 @@ mod tests {
     }
 
     #[test]
+    fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority() {
+        let mut app = interaction_test_app(3, 1);
+        set_task_metadata(&mut app, 1, "subagent task", Some("subagent"));
+        let saved = UiState {
+            theme: UiTheme::Light,
+            view: UiView::Health,
+            window_scope: UiWindowScope::Week,
+            turns_visible: false,
+            models_visible: false,
+            task_list_mode: UiTaskListMode::Tree,
+            task_source_filter: UiTaskSourceFilter::Subagent,
+            ..UiState::default()
+        };
+
+        app.apply_ui_state(&saved, None);
+        assert_eq!(app.ui_state(), saved);
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.selected_task, 1);
+
+        app.task_search = "temporary query".to_string();
+        app.collapsed_task_threads
+            .insert("task-thread-1".to_string());
+        assert_eq!(app.ui_state(), saved);
+
+        app.apply_ui_state(&saved, Some(Theme::Dark));
+        assert_eq!(app.theme, Theme::Dark);
+        assert_eq!(app.ui_state().theme, UiTheme::Dark);
+    }
+
+    #[test]
     fn status_legend_compacts_at_the_horizontal_layout_breakpoint() {
         let compact = status_legend(Theme::Light, 46);
         let full = status_legend(Theme::Light, 80);
@@ -5379,36 +5213,29 @@ mod tests {
     }
 
     #[test]
-    fn proxy_attribution_summary_keeps_projection_and_gap_distinct() {
+    fn attribution_summary_explains_the_single_codex_share_formula() {
         let attribution = AttributionSummary {
             local_token_usage: TokenUsage {
                 total_tokens: 760_000_000,
                 ..TokenUsage::default()
             },
-            observed_delta_percent: 4.0,
-            estimated_assigned_percent: 4.0,
-            proxy_projected_percent: 30.0,
-            unattributed_percent: 30.0,
-            attribution_coverage_percent: 11.8,
+            proxy_projected_percent: 34.0,
             confidence: Confidence::Low,
             ..AttributionSummary::default()
         };
 
-        let compact =
-            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false, true);
-        assert!(compact[1].contains("est ~34.00pp"));
-        assert!(compact[1].contains("evidence 4.00 + proxy 30.00 from gap"));
-        assert!(compact[2].contains("unverified gap 30.00pp"));
-        assert!(compact[2].contains("Coverage 12%"));
+        let compact = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, true);
+        assert!(compact[1].contains("EST ~34.00pp"));
+        assert!(compact[1].contains("codex gauge × local token share"));
         assert!(compact[2].contains("conf low"));
+        assert!(compact[2].contains("relative allocation"));
 
-        let wide =
-            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false, false);
+        let wide = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false);
         assert!(wide[1].contains("~34.00pp estimated"));
-        assert!(wide[1].contains("30.00pp proxy from unverified gap"));
-        assert!(wide[2].contains("30.00pp unverified evidence gap"));
-        assert!(wide[2].contains("12% evidence coverage"));
+        assert!(wide[1].contains("codex gauge × local token share"));
         assert!(wide[2].contains("low confidence"));
+        assert!(!wide.join(" ").contains("evidence"));
+        assert!(!wide.join(" ").contains("gap"));
     }
 
     #[test]
@@ -5496,168 +5323,107 @@ mod tests {
         assert!(largest < medium && medium < small);
         assert!(!expanded.contains("top 3/3"));
     }
-
     #[test]
-    fn models_panel_keeps_attribution_quality_visible_at_eighty_columns() {
+    fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
         let mut app = interaction_test_app(1, 1);
-        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
         app.snapshot.window_analyses[0].partial = true;
 
         let content = render_models_content(&app.snapshot, 80, 8);
 
-        assert!(content.contains("obs +1.00pp"));
-        assert!(content.contains("unattr 22.00pp"));
-        assert!(content.contains("Coverage 4%"));
-        assert!(content.contains("conf medium"));
+        assert!(content.contains("EST ~23.00pp"));
+        assert!(content.contains("codex gauge × local token share"));
+        assert!(content.contains("conf low"));
         assert!(content.contains("external"));
         assert!(content.contains("settled"));
         assert!(content.contains("partial"));
+        assert!(!content.contains("evidence"));
+        assert!(!content.contains("gap"));
     }
 
     #[test]
-    fn models_panel_explains_ambiguous_quota_buckets_for_selected_scope() {
-        let mut app = interaction_test_app(1, 1);
-        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
-        add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
-        let weekly = app
-            .snapshot
-            .window_analyses
-            .iter_mut()
-            .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
-            .unwrap();
-        weekly.partial = true;
-        weekly
-            .partial_reasons
-            .push("multiple_active_limit_buckets".to_string());
-        weekly.attribution.estimated_assigned_percent = 0.0;
-        weekly.attribution.confidence = Confidence::Unknown;
-        for model in &mut weekly.models {
-            model.estimated_quota_percent = 0.0;
-            model.quota_confidence = Confidence::Unknown;
-        }
-
-        let compact = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 9);
-        assert!(compact.contains("est unavailable:"));
-        assert!(compact.contains("multiple"));
-        assert!(compact.contains("buckets"));
-        assert!(compact.contains("unknown"));
-
-        let wide = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 140, 9);
-        assert!(wide.contains("quota estimate unavailable: multiple active buckets"));
-
-        let five_hours =
-            render_models_content_for_scope(&app.snapshot, WindowScope::FiveHours, 140, 9);
-        assert!(!five_hours.contains("multiple active buckets"));
-    }
-
-    #[test]
-    fn mapped_bucket_rows_recompute_local_share_without_adding_quota_pools() {
-        let mut app = interaction_test_app(1, 1);
-        add_window_analysis(&mut app, WindowScope::FiveHours, 150, 100.0);
-        add_spark_window_analysis(&mut app, WindowScope::FiveHours, 50);
-
-        let task_usage = task_usage_for_scope(
-            &app.snapshot,
-            WindowScope::FiveHours,
-            &app.snapshot.tasks[0],
-        );
-        assert_eq!(task_usage.token_usage.total_tokens, 200);
-        assert!((task_usage.local_token_share_percent - 100.0).abs() < f64::EPSILON);
-        assert_eq!(task_usage.estimated_quota_percent, 0.0);
-        assert_eq!(task_usage.quota_confidence, Confidence::Unknown);
-
-        let models = models_for_scope(&app.snapshot, WindowScope::FiveHours);
-        assert_eq!(models.len(), 2);
-        let regular = models
-            .iter()
-            .find(|model| model.model == "gpt-window")
-            .unwrap();
-        let spark = models
-            .iter()
-            .find(|model| model.model == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert!((regular.local_token_share_percent - 75.0).abs() < f64::EPSILON);
-        assert!((spark.local_token_share_percent - 25.0).abs() < f64::EPSILON);
-        assert_eq!(regular.estimated_quota_percent, 2.5);
-        assert_eq!(spark.estimated_quota_percent, 1.25);
-    }
-
-    #[test]
-    fn models_panel_lists_each_model_mapped_quota_bucket() {
+    fn tui_ignores_bengalfox_analysis_for_rows_models_and_summary() {
         let mut app = interaction_test_app(1, 1);
         add_window_analysis(&mut app, WindowScope::Week, 150, 100.0);
         add_spark_window_analysis(&mut app, WindowScope::Week, 50);
 
-        let wide = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 140, 12);
-        assert!(wide.contains("Models · Week · 2 buckets"));
-        assert!(wide.contains("codex_bengalfox"));
-        assert!(wide.contains("gpt-window"));
-        assert!(wide.contains("gpt-5.3-codex-spark"));
+        let task_usage =
+            task_usage_for_scope(&app.snapshot, WindowScope::Week, &app.snapshot.tasks[0]);
+        assert_eq!(task_usage.token_usage.total_tokens, 150);
+        assert_eq!(task_usage.local_token_share_percent, 100.0);
+        assert_eq!(task_usage.estimated_quota_percent, 23.0);
+        assert_eq!(task_usage.quota_confidence, Confidence::Low);
 
-        let compact = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 10);
-        assert!(compact.contains("2 model-mapped buckets"));
-        assert!(compact.contains("codex_bengalfox"));
-    }
+        let models = models_for_scope(&app.snapshot, WindowScope::Week);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "gpt-window");
 
-    #[test]
-    fn compact_mapped_bucket_proxy_summary_leaves_room_for_models() {
-        let mut app = interaction_test_app(1, 1);
-        add_window_analysis(&mut app, WindowScope::Week, 150, 100.0);
-        add_spark_window_analysis(&mut app, WindowScope::Week, 50);
-        for analysis in &mut app.snapshot.window_analyses {
-            analysis.attribution.proxy_projected_percent =
-                analysis.attribution.unattributed_percent;
-            analysis.attribution.confidence = Confidence::Low;
-            for model in &mut analysis.models {
-                model.quota_confidence = Confidence::Low;
-            }
-        }
-
-        let analyses = window_analyses(&app.snapshot, WindowScope::Week);
-        let lines = mapped_bucket_attribution_lines(&analyses, WindowScope::Week, true);
-        assert!(
-            lines
-                .iter()
-                .any(|line| { line.contains("EST~23.0(P22.0) A1.0 U22.0 C4%/low") })
-        );
-        assert!(lines.iter().skip(1).all(|line| line.width() <= 78));
-
-        let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 10);
+        let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 120, 10);
+        assert!(content.contains("Models · week"));
         assert!(content.contains("gpt-window"));
-        assert!(content.contains("~2.5%"));
+        assert!(!content.contains("codex_bengalfox"));
+        assert!(!content.contains("gpt-5.3-codex-spark"));
+        assert!(!content.contains("buckets"));
+
+        app.snapshot.window_analyses.retain(|analysis| {
+            analysis
+                .attribution
+                .window
+                .as_ref()
+                .is_some_and(|window| window.limit_id.eq_ignore_ascii_case("codex_bengalfox"))
+        });
+        assert!(models_for_scope(&app.snapshot, WindowScope::Week).is_empty());
+        assert_eq!(
+            task_usage_for_scope(&app.snapshot, WindowScope::Week, &app.snapshot.tasks[0]),
+            WindowUsage::default()
+        );
+        let unavailable =
+            render_models_content_for_scope(&app.snapshot, WindowScope::Week, 120, 10);
+        assert!(unavailable.contains("Models · Week unavailable"));
+        assert!(!unavailable.contains("gpt-5.3-codex-spark"));
     }
 
     #[test]
-    fn models_panel_explains_why_model_mapped_calls_were_excluded() {
-        let mut unavailable = interaction_test_app(1, 1);
-        add_window_analysis(&mut unavailable, WindowScope::Week, 0, 0.0);
-        let analysis = &mut unavailable.snapshot.window_analyses[0];
-        analysis.models.clear();
-        analysis.partial = true;
-        analysis
-            .partial_reasons
-            .push(MAPPED_BUCKET_UNAVAILABLE_REASON.to_string());
-        let content =
-            render_models_content_for_scope(&unavailable.snapshot, WindowScope::Week, 120, 10);
-        assert!(content.contains("scope partial"));
-        assert!(content.contains("unavailable mapped bucket"));
-        assert!(content.contains("no current Week window"));
-        assert!(!content.contains("No local model usage"));
+    fn tui_ignores_legacy_five_hour_fields_without_a_codex_window() {
+        let mut app = interaction_test_app(1, 1);
+        let now = app.snapshot.as_of;
+        app.snapshot.attribution.window = Some(WindowDescriptor {
+            limit_id: "codex_bengalfox".to_string(),
+            label: "5h".to_string(),
+            starts_at: now - chrono::Duration::hours(4),
+            ends_at: now + chrono::Duration::hours(1),
+            used_percent: 50.0,
+        });
+        app.snapshot.tasks[0].window_token_usage.total_tokens = 100;
+        app.snapshot.tasks[0].estimated_quota_percent = 50.0;
+        app.snapshot.models = vec![model_usage("gpt-5.3-codex-spark", 100)];
 
-        let mut missing_model = interaction_test_app(1, 1);
-        add_window_analysis(&mut missing_model, WindowScope::FiveHours, 0, 0.0);
-        let analysis = &mut missing_model.snapshot.window_analyses[0];
-        analysis.models.clear();
-        analysis.partial = true;
-        analysis
-            .partial_reasons
-            .push(UNMAPPED_CALL_MODEL_REASON.to_string());
-        let content = render_models_content(&missing_model.snapshot, 120, 10);
-        assert!(content.contains("without model metadata excluded"));
-        assert!(content.contains("model metadata is missing"));
-        assert!(!content.contains("No local model usage"));
+        assert_eq!(
+            task_usage_for_scope(
+                &app.snapshot,
+                WindowScope::FiveHours,
+                &app.snapshot.tasks[0]
+            ),
+            WindowUsage::default()
+        );
+        assert!(models_for_scope(&app.snapshot, WindowScope::FiveHours).is_empty());
+        assert!(attribution_for_scope(&app.snapshot, WindowScope::FiveHours).is_none());
     }
 
+    #[test]
+    fn models_panel_reports_missing_local_denominator_without_a_fake_estimate() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::Week, 0, 0.0);
+        let analysis = &mut app.snapshot.window_analyses[0];
+        analysis.attribution.proxy_projected_percent = 0.0;
+        analysis.attribution.confidence = Confidence::Unknown;
+        analysis.models.clear();
+
+        let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 120, 10);
+        assert!(content.contains("local token denominator"));
+        assert!(content.contains("No local model usage in the current week window"));
+        assert!(!content.contains("EST ~"));
+    }
     #[test]
     fn task_hitbox_maps_only_its_visible_rows() {
         let hitbox = TableHitbox {
@@ -5892,6 +5658,13 @@ mod tests {
     #[test]
     fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         let mut app = interaction_test_app(3, 1);
+        app.snapshot.attribution.window = Some(WindowDescriptor {
+            limit_id: "codex".to_string(),
+            label: "5h".to_string(),
+            starts_at: app.snapshot.as_of - chrono::Duration::hours(4),
+            ends_at: app.snapshot.as_of + chrono::Duration::hours(1),
+            used_percent: 1.0,
+        });
         set_task_parent(&mut app, 0, 2);
         set_task_parent(&mut app, 1, 0);
         let totals = [
@@ -5964,7 +5737,16 @@ mod tests {
         ];
         app.snapshot.window_analyses.push(WindowAnalysis {
             duration_mins: WindowScope::Week.duration_mins(),
-            attribution: AttributionSummary::default(),
+            attribution: AttributionSummary {
+                window: Some(WindowDescriptor {
+                    limit_id: "codex".to_string(),
+                    label: "week".to_string(),
+                    starts_at: app.snapshot.as_of - chrono::Duration::days(5),
+                    ends_at: app.snapshot.as_of + chrono::Duration::days(2),
+                    used_percent: 10.0,
+                }),
+                ..AttributionSummary::default()
+            },
             partial: false,
             partial_reasons: Vec::new(),
             threads: app
@@ -6312,7 +6094,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_all_marks_nested_parents_and_moves_hidden_selection_to_its_root() {
+    fn collapse_all_toggles_nested_parents_and_moves_hidden_selection_to_its_root() {
         let mut app = interaction_test_app(6, 2);
         set_task_parent(&mut app, 0, 3);
         set_task_parent(&mut app, 3, 5);
@@ -6327,9 +6109,14 @@ mod tests {
         assert_eq!(app.selected_task, 5);
         assert_eq!(app.selected_turn, 0);
         assert_eq!(app.turn_offset, 0);
-        assert!(!app.collapse_all_task_threads());
+        assert!(app.all_filtered_task_threads_collapsed());
 
-        assert!(app.set_task_collapsed(5, false));
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(app.collapsed_task_threads.is_empty());
+        assert_eq!(app.filtered_task_rows().len(), 6);
+
+        assert!(app.set_task_collapsed(3, true));
+        assert!(!app.all_filtered_task_threads_collapsed());
         let middle = app
             .filtered_task_rows()
             .into_iter()
@@ -6337,6 +6124,39 @@ mod tests {
             .expect("the middle parent should reappear");
         assert!(middle.collapsed);
         assert_eq!(middle.hidden_descendants, vec![0]);
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(app.all_filtered_task_threads_collapsed());
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(app.collapsed_task_threads.is_empty());
+    }
+
+    #[test]
+    fn collapse_all_toggle_only_changes_parents_in_the_current_filter() {
+        let mut app = interaction_test_app(6, 1);
+        set_task_parent(&mut app, 0, 2);
+        set_task_parent(&mut app, 3, 5);
+        set_task_metadata(&mut app, 0, "visible child", Some("subagent"));
+        set_task_metadata(&mut app, 2, "visible parent", Some("desktop"));
+        set_task_metadata(&mut app, 3, "hidden child", Some("subagent"));
+        set_task_metadata(&mut app, 5, "hidden parent", Some("desktop"));
+        app.task_list_mode = TaskListMode::Tree;
+        app.collapsed_task_threads
+            .insert("task-thread-5".to_string());
+        app.task_search = "visible".to_string();
+        app.reconcile_task_filter(true);
+
+        assert_eq!(
+            app.filtered_collapsible_task_threads(),
+            vec!["task-thread-2"]
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(app.collapsed_task_threads.contains("task-thread-2"));
+        assert!(app.collapsed_task_threads.contains("task-thread-5"));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+        assert!(!app.collapsed_task_threads.contains("task-thread-2"));
+        assert!(app.collapsed_task_threads.contains("task-thread-5"));
     }
 
     #[test]
@@ -6352,7 +6172,7 @@ mod tests {
             let initial_collapse = controls.collapse_all;
             assert_eq!(initial.width, expected_width);
             assert_eq!(initial_collapse.width, if width == 60 { 3 } else { 11 });
-            assert!(controls.toggle_turns.right() <= initial.x);
+            assert!(controls.enter_turns.right() <= initial.x);
             assert!(initial.right() <= initial_collapse.x);
             assert!(initial_collapse.right() <= controls.sources[0].x);
             assert_eq!(
@@ -6391,6 +6211,28 @@ mod tests {
                 ),
             ));
             assert!(app.collapsed_task_threads.contains("task-thread-4"));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let expanded_control = app.task_controls_hitbox.unwrap().collapse_all;
+            assert_eq!(expanded_control, initial_collapse);
+            if width == 120 {
+                let rendered = (expanded_control.x..expanded_control.right())
+                    .map(|x| {
+                        terminal.backend().buffer()[(x, expanded_control.y)]
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect::<String>();
+                assert_eq!(rendered, "[E]Expand  ");
+            }
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    expanded_control.right() - 1,
+                    expanded_control.y,
+                ),
+            ));
+            assert!(!app.collapsed_task_threads.contains("task-thread-4"));
 
             handle_mouse_event(
                 &mut app,
@@ -6727,13 +6569,17 @@ mod tests {
                 .unwrap();
             let initial = app.window_controls_hitbox.unwrap();
             let tabs = view_tabs_hitbox(Rect::new(0, 0, width, 1));
-            for button in std::iter::once(initial.toggle_models).chain(initial.scopes) {
+            for button in [initial.toggle_turns, initial.toggle_models]
+                .into_iter()
+                .chain(initial.scopes)
+            {
                 if !button.is_empty() {
                     assert!(button.x >= tabs.tabs[View::Health.index()].right());
                     assert!(button.right() <= width);
                 }
             }
 
+            app.turns_default_visible = false;
             app.models_visible = false;
             app.focus = Focus::TaskSearch;
             terminal
@@ -6745,16 +6591,18 @@ mod tests {
             assert_eq!(app.window_controls_hitbox.unwrap(), initial);
 
             if width >= 44 {
+                assert!(!initial.toggle_turns.is_empty());
                 assert!(!initial.toggle_models.is_empty());
                 assert!(initial.scopes.iter().all(|button| !button.is_empty()));
                 let buffer = terminal.backend().buffer();
+                assert_eq!(buffer[(initial.toggle_turns.x + 1, 0)].symbol(), "V");
                 assert_eq!(buffer[(initial.toggle_models.x + 1, 0)].symbol(), "M");
                 assert_eq!(buffer[(initial.scopes[0].x + 1, 0)].symbol(), "5");
                 assert_eq!(buffer[(initial.scopes[1].x + 1, 0)].symbol(), "W");
             }
         }
 
-        for width in 31..40 {
+        for width in 31..46 {
             let app = interaction_test_app(1, 1);
             let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
             let mut controls = None;
@@ -6766,13 +6614,16 @@ mod tests {
                 .collect::<String>();
             let expected = match width {
                 31..=33 => "",
-                34..=36 => " [M]",
-                37..=39 => " [M][5]",
+                34..=36 => " [V]",
+                37..=39 => " [V][M]",
+                40..=42 => " [V][M][5]",
+                43..=45 => " [V][M][5][W]",
                 _ => unreachable!(),
             };
             assert_eq!(rendered.trim_end(), expected, "width={width}");
             let controls = controls.unwrap();
             for (button, shortcut) in [
+                (controls.toggle_turns, "V"),
                 (controls.toggle_models, "M"),
                 (controls.scopes[WindowScope::FiveHours.index()], "5"),
                 (controls.scopes[WindowScope::Week.index()], "W"),
@@ -6796,6 +6647,15 @@ mod tests {
             })
             .unwrap();
         let controls = app.window_controls_hitbox.unwrap();
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                controls.toggle_turns.right() - 1,
+                controls.toggle_turns.y,
+            ),
+        ));
+        assert!(!app.turns_default_visible);
         for (button, expected_scope) in [
             (
                 controls.scopes[WindowScope::Week.index()],
@@ -6954,20 +6814,6 @@ mod tests {
         weekly
             .partial_reasons
             .push("rollout_lookback_incomplete".to_string());
-        weekly.attribution.estimated_assigned_percent = 0.0;
-        weekly.attribution.confidence = Confidence::Unknown;
-        for thread in &mut weekly.threads {
-            thread.usage.estimated_quota_percent = 0.0;
-            thread.usage.quota_confidence = Confidence::Unknown;
-        }
-        for turn in &mut weekly.turns {
-            turn.usage.estimated_quota_percent = 0.0;
-            turn.usage.quota_confidence = Confidence::Unknown;
-        }
-        for model in &mut weekly.models {
-            model.estimated_quota_percent = 0.0;
-            model.quota_confidence = Confidence::Unknown;
-        }
         app.snapshot.partial = true;
         app.view = View::Overview;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -6992,8 +6838,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(weekly.contains(" · partial"));
-        assert!(weekly.contains("est.quota=-"));
-        assert!(!weekly.contains("0.0% estimated"));
+        assert!(weekly.contains("~23.00pp estimated"));
+        assert!(weekly.contains("~23.0%"));
     }
 
     #[test]
@@ -7091,8 +6937,7 @@ mod tests {
                 terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
                 let controls = app.task_controls_hitbox.unwrap();
-                assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-                assert!(controls.toggle_turns.right() <= controls.toggle_tree.x);
+                assert!(controls.enter_turns.right() <= controls.toggle_tree.x);
                 assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
                 assert!(controls.collapse_all.right() <= controls.sources[0].x);
                 for pair in controls.sources.windows(2) {
@@ -7642,7 +7487,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.turn_table_hitbox.is_some());
 
-        let toggle = app.task_controls_hitbox.unwrap().toggle_turns;
+        let toggle = app.window_controls_hitbox.unwrap().toggle_turns;
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(MouseEventKind::Down(MouseButton::Left), toggle.x, toggle.y),
@@ -7732,12 +7577,10 @@ mod tests {
 
         let controls = app.task_controls_hitbox.unwrap();
         assert!(!controls.enter_turns.is_empty());
-        assert!(!controls.toggle_turns.is_empty());
         assert!(!controls.toggle_tree.is_empty());
         assert!(!controls.collapse_all.is_empty());
         assert!(!controls.search.is_empty());
-        assert!(controls.enter_turns.right() <= controls.toggle_turns.x);
-        assert!(controls.toggle_turns.right() <= controls.toggle_tree.x);
+        assert!(controls.enter_turns.right() <= controls.toggle_tree.x);
         assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
         assert!(controls.collapse_all.right() <= controls.sources[0].x);
         for pair in controls.sources.windows(2) {
@@ -7751,10 +7594,6 @@ mod tests {
             ENTER_FOCUS_HINT
         );
         assert_eq!(
-            buffer[(controls.toggle_turns.x + 1, controls.toggle_turns.y)].symbol(),
-            "V"
-        );
-        assert_eq!(
             buffer[(controls.toggle_tree.x + 1, controls.toggle_tree.y)].symbol(),
             "R"
         );
@@ -7764,8 +7603,12 @@ mod tests {
         );
         assert_eq!(buffer[(controls.search.x, controls.search.y)].symbol(), "F");
 
-        let top_models = app.window_controls_hitbox.unwrap().toggle_models;
+        let top_controls = app.window_controls_hitbox.unwrap();
+        let top_turns = top_controls.toggle_turns;
+        let top_models = top_controls.toggle_models;
+        assert_eq!(buffer[(top_turns.x + 1, top_turns.y)].symbol(), "V");
         assert_eq!(buffer[(top_models.x + 1, top_models.y)].symbol(), "M");
+        assert!(top_turns.right() <= top_models.x);
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(
@@ -9112,7 +8955,16 @@ mod tests {
                     quota_confidence: Confidence::Low,
                 }],
                 models: Vec::new(),
-                attribution: AttributionSummary::default(),
+                attribution: AttributionSummary {
+                    window: Some(WindowDescriptor {
+                        limit_id: "codex".to_string(),
+                        label: "5h".to_string(),
+                        starts_at: now - chrono::Duration::hours(3),
+                        ends_at: now + chrono::Duration::hours(2),
+                        used_percent: 25.0,
+                    }),
+                    ..AttributionSummary::default()
+                },
                 window_analyses: Vec::new(),
                 stats: CollectionStats::default(),
                 warnings: Vec::new(),

@@ -560,43 +560,37 @@ fn estimated_percent(value: f64, confidence: Confidence) -> String {
 }
 
 fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) -> String {
-    if attribution.proxy_projected_percent > 0.0 {
-        let total_estimate =
-            attribution.estimated_assigned_percent + attribution.proxy_projected_percent;
-        format!(
-            "  local tokens {} | observed +{:.2}pp | estimated ~{total_estimate:.2}pp ({:.2}pp evidence assigned + {:.2}pp proxy from unverified gap) | unverified gap {:.2}pp",
-            compact_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            attribution.estimated_assigned_percent,
-            attribution.proxy_projected_percent,
-            attribution.unattributed_percent,
-        )
-    } else {
-        let estimated_assigned = if attribution.confidence == Confidence::Unknown {
-            "-".to_string()
-        } else {
-            format!("{:.2}pp", attribution.estimated_assigned_percent)
-        };
-        format!(
-            "  local tokens {} | observed +{:.2}pp | estimated {} | unattributed {:.2}pp",
-            compact_tokens(attribution.local_token_usage),
-            attribution.observed_delta_percent,
-            estimated_assigned,
-            attribution.unattributed_percent,
-        )
+    let local_tokens = compact_tokens(attribution.local_token_usage);
+    let Some(window) = attribution.window.as_ref() else {
+        return format!(
+            "  local tokens {local_tokens} | estimated - | codex quota window unavailable"
+        );
+    };
+
+    if attribution.local_token_usage.total_tokens == 0 {
+        return format!(
+            "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated - (no local token denominator)",
+            window.used_percent
+        );
     }
+
+    if attribution.confidence == Confidence::Unknown {
+        return format!(
+            "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated - (estimation unavailable)",
+            window.used_percent
+        );
+    }
+
+    format!(
+        "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x local token share)",
+        window.used_percent, attribution.proxy_projected_percent
+    )
 }
 
 fn attribution_quality_line(attribution: &crate::domain::AttributionSummary) -> String {
-    let coverage_label = if attribution.proxy_projected_percent > 0.0 {
-        "evidence coverage"
-    } else {
-        "coverage"
-    };
     format!(
-        "  confidence {:?} | {coverage_label} {:.1}% | external activity possible {} | settled {} | method {}",
+        "  confidence {:?} | normal Codex bucket only (Spark excluded) | external activity possible {} | settled {} | method {}",
         attribution.confidence,
-        attribution.attribution_coverage_percent,
         attribution.external_activity_possible,
         attribution.settled,
         terminal_safe_text(&attribution.method)
@@ -687,32 +681,99 @@ mod tests {
     }
 
     #[test]
-    fn proxy_attribution_text_separates_estimate_from_evidence_gap() {
+    fn attribution_text_describes_codex_gauge_token_share_estimate() {
+        let now = Utc::now();
         let attribution = AttributionSummary {
+            window: Some(WindowDescriptor {
+                limit_id: "codex".to_string(),
+                label: "week".to_string(),
+                starts_at: now - chrono::Duration::days(7),
+                ends_at: now,
+                used_percent: 34.0,
+            }),
             local_token_usage: TokenUsage {
                 total_tokens: 760_000_000,
                 ..TokenUsage::default()
             },
             observed_delta_percent: 4.0,
             estimated_assigned_percent: 4.0,
-            proxy_projected_percent: 30.0,
+            proxy_projected_percent: 34.0,
             unattributed_percent: 30.0,
             attribution_coverage_percent: 11.8,
             confidence: Confidence::Low,
-            method: "observed_delta_plus_cycle_token_proxy".to_string(),
+            method: "current_codex_gauge_token_share_proxy".to_string(),
             ..AttributionSummary::default()
         };
 
         let allocation = attribution_allocation_line(&attribution);
         assert!(allocation.contains("estimated ~34.00pp"));
-        assert!(allocation.contains("4.00pp evidence assigned"));
-        assert!(allocation.contains("30.00pp proxy from unverified gap"));
-        assert!(allocation.contains("unverified gap 30.00pp"));
+        assert!(allocation.contains("codex gauge 34.00% used"));
+        assert!(allocation.contains("gauge x local token share"));
+        assert!(!allocation.contains("observed"));
+        assert!(!allocation.contains("evidence"));
+        assert!(!allocation.contains("gap"));
         assert!(!allocation.contains("unattributed"));
 
         let quality = attribution_quality_line(&attribution);
         assert!(quality.contains("confidence Low"));
-        assert!(quality.contains("evidence coverage 11.8%"));
+        assert!(quality.contains("normal Codex bucket only (Spark excluded)"));
+        assert!(!quality.contains("coverage"));
+        assert!(!quality.contains("observed"));
+    }
+
+    #[test]
+    fn attribution_text_explains_unavailable_inputs() {
+        let unavailable = AttributionSummary {
+            local_token_usage: TokenUsage {
+                total_tokens: 42,
+                ..TokenUsage::default()
+            },
+            ..AttributionSummary::default()
+        };
+        assert!(
+            attribution_allocation_line(&unavailable).contains("codex quota window unavailable")
+        );
+
+        let no_denominator = AttributionSummary {
+            window: Some(WindowDescriptor {
+                limit_id: "codex".to_string(),
+                label: "5h".to_string(),
+                starts_at: Utc::now() - chrono::Duration::hours(5),
+                ends_at: Utc::now(),
+                used_percent: 12.0,
+            }),
+            method: "codex_gauge_without_local_tokens".to_string(),
+            ..AttributionSummary::default()
+        };
+        let allocation = attribution_allocation_line(&no_denominator);
+        assert!(allocation.contains("codex gauge 12.00% used"));
+        assert!(allocation.contains("estimated - (no local token denominator)"));
+    }
+
+    #[test]
+    fn zero_percent_codex_gauge_is_still_a_known_estimate() {
+        let now = Utc::now();
+        let attribution = AttributionSummary {
+            window: Some(WindowDescriptor {
+                limit_id: "codex".to_string(),
+                label: "week".to_string(),
+                starts_at: now - chrono::Duration::days(7),
+                ends_at: now,
+                used_percent: 0.0,
+            }),
+            local_token_usage: TokenUsage {
+                total_tokens: 1_000,
+                ..TokenUsage::default()
+            },
+            proxy_projected_percent: 0.0,
+            confidence: Confidence::Low,
+            method: "current_codex_gauge_token_share_proxy".to_string(),
+            ..AttributionSummary::default()
+        };
+
+        let allocation = attribution_allocation_line(&attribution);
+        assert!(allocation.contains("estimated ~0.00pp"));
+        assert!(!allocation.contains("unavailable"));
     }
 
     #[test]

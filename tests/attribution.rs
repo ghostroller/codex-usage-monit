@@ -70,26 +70,27 @@ fn call(
     timestamp: DateTime<Utc>,
     thread_id: &str,
     turn_id: &str,
-    model: &str,
+    model: Option<&str>,
     total_tokens: u64,
 ) -> UsageCall {
     UsageCall {
         timestamp,
         thread_id: thread_id.to_string(),
         turn_id: Some(turn_id.to_string()),
-        model: Some(model.to_string()),
+        model: model.map(str::to_string),
         tokens: tokens(total_tokens),
     }
 }
 
-fn limit(
+fn limit_with_id(
+    limit_id: &str,
     as_of: DateTime<Utc>,
     used_percent: f64,
     duration_mins: i64,
     resets_at: DateTime<Utc>,
 ) -> LimitBucket {
     LimitBucket {
-        limit_id: "codex".to_string(),
+        limit_id: limit_id.to_string(),
         limit_name: None,
         plan_type: None,
         primary: Some(LimitWindow::new(
@@ -105,15 +106,16 @@ fn limit(
     }
 }
 
-fn observation(
-    timestamp: DateTime<Utc>,
+fn codex_limit(
+    as_of: DateTime<Utc>,
     used_percent: f64,
+    duration_mins: i64,
     resets_at: DateTime<Utc>,
-) -> RateObservation {
-    observation_for(timestamp, used_percent, 300, resets_at)
+) -> LimitBucket {
+    limit_with_id("codex", as_of, used_percent, duration_mins, resets_at)
 }
 
-fn observation_for(
+fn observation(
     timestamp: DateTime<Utc>,
     used_percent: f64,
     duration_mins: i64,
@@ -142,19 +144,15 @@ fn assert_close(actual: f64, expected: f64) {
 }
 
 #[test]
-fn aggregates_exact_tokens_and_estimates_observed_deltas() {
+fn estimates_each_entity_from_codex_gauge_and_local_token_share() {
     let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 40.0, 300, resets_at)];
-    let observations = vec![
-        observation(at(11, 54), 30.0, resets_at + Duration::seconds(90)),
-        observation(at(11, 57), 34.0, resets_at + Duration::seconds(90)),
-    ];
+    let reset = at(14, 0);
+    let limits = vec![codex_limit(now, 40.0, 300, reset)];
     let calls = vec![
-        call(at(9, 30), "old", "old-turn", "gpt-old", 400),
-        call(at(11, 55), "a", "a-turn", "gpt-a", 100),
-        call(at(11, 56), "b", "b-turn", "gpt-b", 300),
-        call(at(11, 58), "a", "a-turn", "gpt-a", 200),
+        call(at(8, 59), "old", "old-turn", Some("gpt-old"), 900),
+        call(at(10, 0), "a", "a-turn", Some("gpt-a"), 100),
+        call(at(11, 0), "a", "a-turn", Some("gpt-a"), 200),
+        call(at(11, 30), "b", "b-turn", Some("gpt-b"), 100),
     ];
     let mut tasks = vec![
         task("a", TaskStatus::Completed),
@@ -168,290 +166,317 @@ fn aggregates_exact_tokens_and_estimates_observed_deltas() {
     ];
 
     let (models, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
+        analyze_current_window(&mut tasks, &mut turns, &calls, &[], &limits, now);
 
-    assert_eq!(summary.local_token_usage, tokens(1_000));
-    assert_close(summary.observed_delta_percent, 10.0);
-    assert_close(summary.estimated_assigned_percent, 10.0);
-    assert_close(summary.unattributed_percent, 30.0);
-    assert_eq!(summary.confidence, Confidence::Medium);
+    assert_eq!(summary.local_token_usage, tokens(400));
+    assert_close(summary.observed_delta_percent, 0.0);
+    assert_close(summary.estimated_assigned_percent, 0.0);
+    assert_close(summary.proxy_projected_percent, 40.0);
+    assert_close(summary.unattributed_percent, 40.0);
+    assert_eq!(summary.confidence, Confidence::Low);
     assert!(summary.settled);
-    assert_eq!(summary.method, "observed_delta_token_proportional");
+    assert_eq!(summary.method, "current_codex_gauge_token_share_proxy");
 
     assert_eq!(tasks[0].window_token_usage, tokens(300));
-    assert_close(tasks[0].local_token_share_percent, 30.0);
-    assert_close(tasks[0].estimated_quota_percent, 7.0);
-    assert_eq!(tasks[0].quota_confidence, Confidence::Medium);
-    assert_close(tasks[1].estimated_quota_percent, 3.0);
-    assert_close(tasks[2].local_token_share_percent, 40.0);
+    assert_close(tasks[0].local_token_share_percent, 75.0);
+    assert_close(tasks[0].estimated_quota_percent, 30.0);
+    assert_eq!(tasks[0].quota_confidence, Confidence::Low);
+    assert_eq!(tasks[1].window_token_usage, tokens(100));
+    assert_close(tasks[1].local_token_share_percent, 25.0);
+    assert_close(tasks[1].estimated_quota_percent, 10.0);
+    assert_eq!(tasks[2].window_token_usage, TokenUsage::default());
     assert_close(tasks[2].estimated_quota_percent, 0.0);
     assert_eq!(tasks[2].quota_confidence, Confidence::Unknown);
 
-    assert_close(turns[0].estimated_quota_percent, 7.0);
-    assert_close(turns[1].estimated_quota_percent, 3.0);
+    assert_close(turns[0].estimated_quota_percent, 30.0);
+    assert_close(turns[1].estimated_quota_percent, 10.0);
     assert_close(turns[2].estimated_quota_percent, 0.0);
 
-    assert_eq!(models.len(), 3);
+    assert_eq!(models.len(), 2);
     assert_eq!(models[0].model, "gpt-a");
     assert_eq!(models[0].token_usage, tokens(300));
-    assert_close(models[0].local_token_share_percent, 30.0);
-    assert_close(models[0].estimated_quota_percent, 7.0);
-    assert_eq!(models[0].quota_confidence, Confidence::Medium);
+    assert_close(models[0].local_token_share_percent, 75.0);
+    assert_close(models[0].estimated_quota_percent, 30.0);
+    assert_eq!(models[0].quota_confidence, Confidence::Low);
     assert_eq!(models[1].model, "gpt-b");
-    assert_close(models[1].estimated_quota_percent, 3.0);
-    assert_eq!(models[2].model, "gpt-old");
-    assert_close(models[2].estimated_quota_percent, 0.0);
+    assert_close(models[1].estimated_quota_percent, 10.0);
 }
 
 #[test]
-fn active_tasks_keep_quota_confidence_low() {
+fn observations_do_not_change_the_simple_estimate() {
     let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 20.0, 300, resets_at)];
-    let observations = vec![observation(at(11, 58), 18.0, resets_at)];
-    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Running)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert_close(summary.estimated_assigned_percent, 2.0);
-    assert_eq!(summary.confidence, Confidence::Low);
-    assert!(!summary.settled);
-    assert_eq!(tasks[0].quota_confidence, Confidence::Low);
-    assert_ne!(summary.confidence, Confidence::High);
-}
-
-#[test]
-fn stale_tasks_do_not_claim_a_settled_window() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 20.0, 300, resets_at)];
-    let observations = vec![observation(at(11, 58), 18.0, resets_at)];
-    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Stale)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert!(!summary.settled);
-    assert_eq!(summary.confidence, Confidence::Low);
-}
-
-#[test]
-fn observations_outside_reset_drift_are_not_used() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 20.0, 300, resets_at)];
-    let observations = vec![observation(
-        at(11, 0),
-        18.0,
-        resets_at + Duration::seconds(121),
-    )];
-    let calls = vec![call(at(11, 30), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert_close(summary.observed_delta_percent, 0.0);
-    assert_close(summary.estimated_assigned_percent, 0.0);
-    assert_close(summary.unattributed_percent, 20.0);
-    assert_eq!(summary.confidence, Confidence::Unknown);
-    assert_eq!(summary.method, "local_tokens_only");
-    assert_close(tasks[0].local_token_share_percent, 100.0);
-}
-
-#[test]
-fn quota_decrease_in_same_window_disables_estimation() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let mut limits = vec![limit(now, 3.0, 300, resets_at)];
-    limits[0].provenance = Provenance::Stale;
-    let observations = vec![
-        observation(at(10, 0), 91.0, resets_at),
-        observation(at(11, 0), 93.0, resets_at),
-    ];
-    let calls = vec![call(at(10, 30), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert_eq!(summary.local_token_usage, tokens(100));
-    assert_close(summary.observed_delta_percent, 0.0);
-    assert_close(summary.estimated_assigned_percent, 0.0);
-    assert_close(summary.unattributed_percent, 3.0);
-    assert_eq!(summary.confidence, Confidence::Unknown);
-    assert_eq!(summary.method, "quota_discontinuity_local_tokens_only");
-    assert_close(tasks[0].local_token_share_percent, 100.0);
-    assert_close(tasks[0].estimated_quota_percent, 0.0);
-}
-
-#[test]
-fn monotonic_samples_after_a_quota_correction_restore_low_confidence_estimation() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 4.0, 300, resets_at)];
-    let observations = vec![
-        observation(at(11, 54), 90.0, resets_at),
-        observation(at(11, 56), 3.0, resets_at),
-        observation(at(11, 58), 4.0, resets_at),
-    ];
-    let calls = vec![call(at(11, 57), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert_close(summary.observed_delta_percent, 1.0);
-    assert_close(summary.estimated_assigned_percent, 1.0);
-    assert_close(summary.unattributed_percent, 3.0);
-    assert_eq!(summary.confidence, Confidence::Low);
-    assert_eq!(
-        summary.method,
-        "post_discontinuity_observed_delta_token_proportional"
-    );
-    assert_close(tasks[0].estimated_quota_percent, 1.0);
-}
-
-#[test]
-fn long_snapshot_gaps_remain_unattributed() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 20.0, 300, resets_at)];
-    let observations = vec![observation(at(10, 0), 10.0, resets_at)];
-    let calls = vec![call(at(11, 0), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
-
-    assert_close(summary.observed_delta_percent, 10.0);
-    assert_close(summary.estimated_assigned_percent, 0.0);
-    assert_close(summary.unattributed_percent, 20.0);
-    assert_eq!(summary.confidence, Confidence::Unknown);
-}
-
-#[test]
-fn server_history_ignores_a_disagreeing_rollout_quota_stream() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 4.0, 300, resets_at)];
-    let local = observation(at(11, 55), 95.0, resets_at);
-    let mut server = observation(at(11, 56), 3.0, resets_at);
-    server.provenance = Provenance::ServerSnapshot;
-    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) = analyze_current_window(
-        &mut tasks,
-        &mut turns,
-        &calls,
-        &[local, server],
-        &limits,
-        now,
-    );
-
-    assert_close(summary.observed_delta_percent, 1.0);
-    assert_close(summary.estimated_assigned_percent, 1.0);
-    assert_eq!(summary.method, "observed_delta_token_proportional");
-}
-
-#[test]
-fn server_integer_plateaus_keep_agreeing_rollout_deltas() {
-    let now = at(12, 0);
-    let resets_at = at(14, 0);
-    let limits = vec![limit(now, 34.0, 300, resets_at)];
-    let mut observations = vec![
-        observation(at(11, 52), 32.0, resets_at),
-        observation(at(11, 54), 33.0, resets_at),
-        observation(at(11, 56), 34.0, resets_at),
-        observation(at(11, 58), 34.0, resets_at),
-        observation(at(11, 59), 34.0, resets_at),
-    ];
-    for observation in &mut observations[3..] {
-        observation.provenance = Provenance::ServerSnapshot;
-    }
+    let reset = at(14, 0);
+    let limits = vec![codex_limit(now, 34.0, 300, reset)];
     let calls = vec![
-        call(at(11, 53), "a", "a-turn", "gpt-a", 100),
-        call(at(11, 55), "b", "b-turn", "gpt-b", 300),
+        call(at(11, 0), "a", "a-turn", Some("gpt-a"), 100),
+        call(at(11, 30), "b", "b-turn", Some("gpt-b"), 300),
     ];
-    let mut tasks = vec![
-        task("a", TaskStatus::Completed),
-        task("b", TaskStatus::Completed),
+    let observations = vec![
+        observation(at(10, 0), 99.0, 300, reset + Duration::minutes(30)),
+        observation(at(11, 0), 3.0, 300, reset),
+        observation(at(11, 59), 33.0, 300, reset),
     ];
-    let mut turns = vec![turn("a", "a-turn"), turn("b", "b-turn")];
 
-    let (_, summary) =
-        analyze_current_window(&mut tasks, &mut turns, &calls, &observations, &limits, now);
+    let without = analyze_windows(&[], &[], &calls, &[], &limits, now);
+    let with = analyze_windows(&[], &[], &calls, &observations, &limits, now);
 
-    assert_close(summary.observed_delta_percent, 2.0);
-    assert_close(summary.estimated_assigned_percent, 2.0);
-    assert_close(summary.unattributed_percent, 32.0);
-    assert_close(tasks[0].estimated_quota_percent, 1.0);
-    assert_close(tasks[1].estimated_quota_percent, 1.0);
+    assert_eq!(with, without);
+    assert_close(with[0].threads[0].usage.estimated_quota_percent, 8.5);
+    assert_close(with[0].threads[1].usage.estimated_quota_percent, 25.5);
 }
 
 #[test]
-fn selects_only_a_current_five_hour_window() {
+fn running_or_stale_tasks_only_change_the_settled_flag() {
     let now = at(12, 0);
-    let weekly_reset = now + Duration::days(2);
-    let five_hour_reset = at(14, 0);
-    let mut weekly = limit(now, 60.0, 10_080, weekly_reset);
-    weekly.limit_id = "weekly".to_string();
-    let mut five_hour = limit(now, 10.0, 300, five_hour_reset);
-    five_hour.limit_id = "five-hour".to_string();
-    let mut tasks = Vec::new();
-    let mut turns = Vec::new();
+    let reset = at(14, 0);
+    let limits = vec![codex_limit(now, 20.0, 300, reset)];
+    let calls = vec![call(at(11, 59), "a", "turn", Some("gpt-a"), 100)];
 
-    let (_, five_hour_summary) = analyze_current_window(
-        &mut tasks,
-        &mut turns,
+    for status in [TaskStatus::Running, TaskStatus::Stale] {
+        let mut tasks = vec![task("a", status)];
+        let mut turns = vec![turn("a", "turn")];
+        let (_, summary) =
+            analyze_current_window(&mut tasks, &mut turns, &calls, &[], &limits, now);
+
+        assert!(!summary.settled);
+        assert_eq!(summary.confidence, Confidence::Low);
+        assert_close(tasks[0].estimated_quota_percent, 20.0);
+        assert_eq!(tasks[0].quota_confidence, Confidence::Low);
+    }
+}
+
+#[test]
+fn an_empty_local_denominator_keeps_estimates_unavailable() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let analyses = analyze_windows(
         &[],
         &[],
-        &[weekly.clone(), five_hour],
+        &[],
+        &[],
+        &[codex_limit(now, 27.0, 300, reset)],
         now,
     );
-    assert_eq!(five_hour_summary.window.unwrap().limit_id, "five-hour");
 
-    let weekly_call = call(at(11, 59), "weekly-task", "weekly-turn", "gpt-week", 100);
-    let (weekly_models, weekly_only_summary) =
-        analyze_current_window(&mut tasks, &mut turns, &[weekly_call], &[], &[weekly], now);
-    assert!(weekly_only_summary.window.is_none());
-    assert!(weekly_models.is_empty());
+    assert_eq!(analyses.len(), 1);
+    let analysis = &analyses[0];
+    assert!(analysis.threads.is_empty());
+    assert!(analysis.turns.is_empty());
+    assert!(analysis.models.is_empty());
+    assert_eq!(
+        analysis.attribution.local_token_usage,
+        TokenUsage::default()
+    );
+    assert_close(analysis.attribution.proxy_projected_percent, 0.0);
+    assert_eq!(analysis.attribution.confidence, Confidence::Unknown);
+    assert_eq!(
+        analysis.attribution.method,
+        "codex_gauge_without_local_tokens"
+    );
 }
 
 #[test]
-fn analyzes_five_hour_and_weekly_reset_cycles_without_overwriting() {
+fn excludes_only_the_exact_spark_model_case_insensitively() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![
+        call(
+            at(11, 0),
+            "spark-a",
+            "spark-a-turn",
+            Some("gpt-5.3-codex-spark"),
+            500,
+        ),
+        call(
+            at(11, 10),
+            "spark-b",
+            "spark-b-turn",
+            Some("  GPT-5.3-CODEX-SPARK  "),
+            500,
+        ),
+        call(
+            at(11, 20),
+            "regular",
+            "regular-turn",
+            Some("gpt-5.3-codex"),
+            200,
+        ),
+        call(
+            at(11, 30),
+            "spark-preview",
+            "preview-turn",
+            Some("gpt-5.3-codex-spark-preview"),
+            100,
+        ),
+    ];
+
+    let analyses = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[],
+        &[codex_limit(now, 30.0, 300, reset)],
+        now,
+    );
+
+    let analysis = &analyses[0];
+    assert_eq!(analysis.attribution.local_token_usage, tokens(300));
+    assert_eq!(analysis.threads.len(), 2);
+    assert!(
+        analysis
+            .threads
+            .iter()
+            .all(|row| !row.thread_id.starts_with("spark-") || row.thread_id == "spark-preview")
+    );
+    assert_eq!(analysis.models.len(), 2);
+    assert!(
+        analysis
+            .models
+            .iter()
+            .any(|row| row.model == "gpt-5.3-codex")
+    );
+    assert!(
+        analysis
+            .models
+            .iter()
+            .any(|row| row.model == "gpt-5.3-codex-spark-preview")
+    );
+    assert_close(
+        analysis
+            .models
+            .iter()
+            .map(|row| row.estimated_quota_percent)
+            .sum(),
+        30.0,
+    );
+}
+
+#[test]
+fn missing_and_other_model_names_remain_in_the_codex_denominator() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![
+        call(at(11, 0), "unknown", "unknown-turn", None, 100),
+        call(at(11, 15), "blank", "blank-turn", Some("   "), 100),
+        call(at(11, 30), "other", "other-turn", Some("custom-model"), 300),
+    ];
+
+    let analysis = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[],
+        &[codex_limit(now, 40.0, 300, reset)],
+        now,
+    )
+    .remove(0);
+
+    assert_eq!(analysis.attribution.local_token_usage, tokens(500));
+    let unknown = analysis
+        .models
+        .iter()
+        .find(|row| row.model == "unknown")
+        .unwrap();
+    let other = analysis
+        .models
+        .iter()
+        .find(|row| row.model == "custom-model")
+        .unwrap();
+    assert_close(unknown.local_token_share_percent, 40.0);
+    assert_close(unknown.estimated_quota_percent, 16.0);
+    assert_close(other.local_token_share_percent, 60.0);
+    assert_close(other.estimated_quota_percent, 24.0);
+}
+
+#[test]
+fn only_codex_limit_buckets_are_analyzed() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![call(at(11, 0), "a", "turn", Some("gpt-a"), 100)];
+    let limits = vec![
+        limit_with_id("codex_bengalfox", now, 70.0, 300, reset),
+        limit_with_id("five-hour", now, 60.0, 300, reset),
+        codex_limit(now, 20.0, 300, reset),
+    ];
+
+    let analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
+
+    assert_eq!(analyses.len(), 1);
+    assert_eq!(
+        analyses[0].attribution.window.as_ref().unwrap().limit_id,
+        "codex"
+    );
+    assert_close(analyses[0].threads[0].usage.estimated_quota_percent, 20.0);
+
+    let without_codex = analyze_windows(&[], &[], &calls, &[], &limits[..2], now);
+    assert!(without_codex.is_empty());
+}
+
+#[test]
+fn duplicate_codex_buckets_choose_the_newest_authoritative_candidate() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![call(at(11, 0), "a", "turn", Some("gpt-a"), 100)];
+    let mut stale = codex_limit(now, 90.0, 300, reset);
+    stale.provenance = Provenance::Stale;
+    stale.as_of = now + Duration::minutes(1);
+    let old_server = codex_limit(now - Duration::hours(1), 80.0, 300, reset);
+    let newest_server = codex_limit(now, 20.0, 300, reset);
+
+    let analyses = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[],
+        &[stale.clone(), old_server, newest_server],
+        now,
+    );
+
+    assert_eq!(analyses.len(), 1);
+    assert_close(
+        analyses[0]
+            .attribution
+            .window
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        20.0,
+    );
+    assert_close(analyses[0].threads[0].usage.estimated_quota_percent, 20.0);
+    assert!(!analyses[0].partial);
+
+    let stale_only = analyze_windows(&[], &[], &calls, &[], &[stale], now);
+    assert!(stale_only[0].partial);
+    assert!(
+        stale_only[0]
+            .partial_reasons
+            .contains(&"quota_window_stale".to_string())
+    );
+    assert_close(stale_only[0].threads[0].usage.estimated_quota_percent, 90.0);
+}
+
+#[test]
+fn five_hour_and_weekly_cycles_use_independent_codex_denominators() {
     let now = at(12, 0);
     let five_hour_reset = at(14, 0);
     let weekly_reset = on(14, 12, 0);
-    let mut five_hour = limit(now, 10.0, 300, five_hour_reset);
-    five_hour.limit_id = "five-hour".to_string();
-    let mut weekly = limit(now, 35.0, 10_080, weekly_reset);
-    weekly.limit_id = "weekly".to_string();
+    let limits = vec![
+        codex_limit(now, 20.0, 300, five_hour_reset),
+        codex_limit(now, 50.0, 10_080, weekly_reset),
+    ];
     let calls = vec![
-        call(on(7, 11, 59), "ignored", "ignored-turn", "gpt-old", 900),
-        call(on(7, 12, 0), "a", "a-turn", "gpt-a", 200),
-        call(at(8, 0), "b", "b-turn", "gpt-b", 300),
-        call(at(10, 0), "a", "a-turn", "gpt-a", 100),
-        call(at(11, 0), "b", "b-turn", "gpt-b", 400),
+        call(
+            on(7, 11, 59),
+            "too-old",
+            "too-old-turn",
+            Some("gpt-old"),
+            900,
+        ),
+        call(on(8, 8, 0), "week-only", "week-turn", Some("gpt-week"), 300),
+        call(at(10, 0), "recent", "recent-turn", Some("gpt-recent"), 100),
     ];
-    let tasks = vec![
-        task("a", TaskStatus::Completed),
-        task("b", TaskStatus::Completed),
-    ];
-    let turns = vec![turn("a", "a-turn"), turn("b", "b-turn")];
 
-    let analyses = analyze_windows(&tasks, &turns, &calls, &[], &[weekly, five_hour], now);
+    let analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
 
     assert_eq!(analyses.len(), 2);
     let five_hour = analyses
@@ -462,373 +487,86 @@ fn analyzes_five_hour_and_weekly_reset_cycles_without_overwriting() {
         .iter()
         .find(|analysis| analysis.duration_mins == 10_080)
         .unwrap();
-    assert_eq!(
-        five_hour.attribution.window.as_ref().unwrap().starts_at,
-        at(9, 0)
-    );
-    assert_eq!(
-        weekly.attribution.window.as_ref().unwrap().starts_at,
-        on(7, 12, 0)
-    );
-    assert_eq!(five_hour.attribution.local_token_usage, tokens(500));
-    assert_eq!(weekly.attribution.local_token_usage, tokens(1_000));
+    assert_eq!(five_hour.attribution.local_token_usage, tokens(100));
+    assert_eq!(weekly.attribution.local_token_usage, tokens(400));
+    assert_eq!(five_hour.threads.len(), 1);
+    assert_close(five_hour.threads[0].usage.estimated_quota_percent, 20.0);
 
-    let five_hour_a = five_hour
+    let weekly_recent = weekly
         .threads
         .iter()
-        .find(|thread| thread.thread_id == "a")
+        .find(|row| row.thread_id == "recent")
         .unwrap();
-    let weekly_a = weekly
+    let weekly_old = weekly
         .threads
         .iter()
-        .find(|thread| thread.thread_id == "a")
+        .find(|row| row.thread_id == "week-only")
         .unwrap();
-    assert_close(five_hour_a.usage.local_token_share_percent, 20.0);
-    assert_close(weekly_a.usage.local_token_share_percent, 30.0);
-    assert_eq!(five_hour_a.usage.token_usage, tokens(100));
-    assert_eq!(weekly_a.usage.token_usage, tokens(300));
-
-    let mut legacy_tasks = tasks;
-    let mut legacy_turns = turns;
-    let (_, legacy) = analyze_current_window(
-        &mut legacy_tasks,
-        &mut legacy_turns,
-        &calls,
-        &[],
-        &[
-            limit(now, 35.0, 10_080, weekly_reset),
-            limit(now, 10.0, 300, five_hour_reset),
-        ],
-        now,
-    );
-    assert_eq!(legacy.window.unwrap().label, "5h");
-    assert_eq!(legacy_tasks[0].window_token_usage, tokens(100));
-    assert_close(legacy_tasks[0].local_token_share_percent, 20.0);
+    assert_close(weekly_recent.usage.local_token_share_percent, 25.0);
+    assert_close(weekly_recent.usage.estimated_quota_percent, 12.5);
+    assert_close(weekly_old.usage.local_token_share_percent, 75.0);
+    assert_close(weekly_old.usage.estimated_quota_percent, 37.5);
 }
 
 #[test]
-fn weekly_analysis_estimates_only_its_matching_reset_epoch() {
-    let now = at(12, 0);
-    let reset = on(14, 12, 0);
-    let mut weekly_limit = limit(now, 20.0, 10_080, reset);
-    weekly_limit.secondary = weekly_limit.primary.take();
-    let mut observations = vec![
-        observation_for(at(11, 55), 99.0, 10_080, reset + Duration::days(7)),
-        observation_for(at(11, 58), 18.0, 10_080, reset),
-    ];
-    for observation in &mut observations {
-        observation.secondary = observation.primary.take();
-    }
-    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
-    let tasks = vec![task("a", TaskStatus::Completed)];
-    let turns = vec![turn("a", "turn")];
-
-    let analyses = analyze_windows(&tasks, &turns, &calls, &observations, &[weekly_limit], now);
-
-    assert_eq!(analyses.len(), 1);
-    let weekly = &analyses[0];
-    assert_eq!(weekly.duration_mins, 10_080);
-    assert_close(weekly.attribution.observed_delta_percent, 2.0);
-    assert_close(weekly.attribution.estimated_assigned_percent, 2.0);
-    assert_close(weekly.threads[0].usage.estimated_quota_percent, 2.0);
-    assert_eq!(weekly.threads[0].usage.quota_confidence, Confidence::Medium);
-}
-
-#[test]
-fn matching_reset_epoch_survives_primary_secondary_slot_changes() {
-    let now = at(12, 0);
-    let reset = on(14, 12, 0);
-    let tasks = vec![task("a", TaskStatus::Completed)];
-    let turns = vec![turn("a", "turn")];
-    let calls = vec![call(at(11, 59), "a", "turn", "gpt-a", 100)];
-
-    for current_is_primary in [true, false] {
-        let mut current = limit(now, 20.0, 10_080, reset);
-        let mut previous = observation_for(at(11, 58), 18.0, 10_080, reset);
-        if current_is_primary {
-            previous.secondary = previous.primary.take();
-        } else {
-            current.secondary = current.primary.take();
-        }
-
-        let analyses = analyze_windows(&tasks, &turns, &calls, &[previous], &[current], now);
-
-        assert_eq!(analyses.len(), 1);
-        let weekly = &analyses[0];
-        assert_close(weekly.attribution.observed_delta_percent, 2.0);
-        assert_close(weekly.attribution.estimated_assigned_percent, 2.0);
-        assert_close(weekly.threads[0].usage.estimated_quota_percent, 2.0);
-        assert_eq!(weekly.threads[0].usage.quota_confidence, Confidence::Medium);
-    }
-}
-
-#[test]
-fn same_duration_prefers_codex_bucket_and_serializes_window_usage() {
-    let now = at(12, 0);
-    let reset = on(14, 12, 0);
-    let mut codex = limit(now, 20.0, 10_080, reset);
-    codex.limit_id = "codex".to_string();
-    codex.provenance = Provenance::Stale;
-    let mut secondary = limit(now, 5.0, 10_080, reset);
-    secondary.limit_id = "codex-secondary".to_string();
-    let unsupported = limit(now, 3.0, 1_440, now + Duration::hours(12));
-    let tasks = vec![task("a", TaskStatus::Completed)];
-    let turns = vec![turn("a", "turn")];
-    let calls = vec![call(at(11, 0), "a", "turn", "gpt-a", 100)];
-
-    let analyses = analyze_windows(
-        &tasks,
-        &turns,
-        &calls,
-        &[],
-        &[secondary, unsupported, codex],
-        now,
-    );
-
-    assert_eq!(analyses.len(), 1);
-    assert_eq!(
-        analyses[0].attribution.window.as_ref().unwrap().limit_id,
-        "codex"
-    );
-    let value = serde_json::to_value(&analyses[0]).unwrap();
-    assert_eq!(value["durationMins"], 10_080);
-    assert_eq!(value["threads"][0]["threadId"], "a");
-    assert_eq!(
-        value["threads"][0]["usage"]["tokenUsage"]["totalTokens"],
-        100
-    );
-
-    let mut alphabetic_first = limit(now, 8.0, 10_080, reset);
-    alphabetic_first.limit_id = "alpha".to_string();
-    alphabetic_first.provenance = Provenance::Stale;
-    let mut server = limit(now, 9.0, 10_080, reset);
-    server.limit_id = "zeta".to_string();
-    let preferred = analyze_windows(
-        &tasks,
-        &turns,
-        &calls,
-        &[],
-        &[alphabetic_first, server],
-        now,
-    );
-    assert_eq!(
-        preferred[0].attribution.window.as_ref().unwrap().limit_id,
-        "zeta"
-    );
-}
-
-#[test]
-fn model_mapping_isolates_codex_and_spark_buckets_with_their_own_resets() {
-    let now = at(12, 0);
-    let codex_reset = at(14, 0);
-    let spark_reset = at(13, 0);
-    let mut codex = limit(now, 10.0, 300, codex_reset);
-    codex.limit_id = "codex".to_string();
-    let mut spark = limit(now, 20.0, 300, spark_reset);
-    spark.limit_id = "codex_bengalfox".to_string();
-
-    let codex_observation = observation_for(at(11, 58), 8.0, 300, codex_reset);
-    let mut spark_observation = observation_for(at(11, 58), 15.0, 300, spark_reset);
-    spark_observation.limit_id = "codex_bengalfox".to_string();
-    let calls = vec![
-        call(
-            at(8, 30),
-            "old-regular",
-            "old-regular-turn",
-            "gpt-5.3-codex",
-            900,
-        ),
-        call(
-            at(8, 30),
-            "old-spark",
-            "old-spark-turn",
-            "GPT-5.3-CODEX-SPARK",
-            100,
-        ),
-        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
-        call(
-            at(11, 59),
-            "spark",
-            "spark-turn",
-            "GPT-5.3-CODEX-SPARK",
-            300,
-        ),
-    ];
-
-    let analyses = analyze_windows(
-        &[],
-        &[],
-        &calls,
-        &[codex_observation, spark_observation],
-        &[spark, codex],
-        now,
-    );
-
-    assert_eq!(analyses.len(), 2);
-    let codex = analyses
-        .iter()
-        .find(|analysis| analysis.attribution.window.as_ref().unwrap().limit_id == "codex")
-        .unwrap();
-    let spark = analyses
-        .iter()
-        .find(|analysis| {
-            analysis.attribution.window.as_ref().unwrap().limit_id == "codex_bengalfox"
-        })
-        .unwrap();
-
-    assert_eq!(
-        codex.attribution.window.as_ref().unwrap().starts_at,
-        at(9, 0)
-    );
-    assert_eq!(
-        spark.attribution.window.as_ref().unwrap().starts_at,
-        at(8, 0)
-    );
-    assert_eq!(codex.attribution.local_token_usage, tokens(200));
-    assert_eq!(spark.attribution.local_token_usage, tokens(400));
-    assert_close(codex.attribution.estimated_assigned_percent, 2.0);
-    assert_close(spark.attribution.estimated_assigned_percent, 5.0);
-    assert_eq!(codex.models.len(), 1);
-    assert_eq!(codex.models[0].model, "gpt-5.3-codex");
-    assert_eq!(spark.models.len(), 1);
-    assert!(
-        spark.models[0]
-            .model
-            .eq_ignore_ascii_case("gpt-5.3-codex-spark")
-    );
-    assert!(
-        codex
-            .threads
-            .iter()
-            .all(|thread| thread.thread_id != "old-regular")
-    );
-    assert!(
-        spark
-            .threads
-            .iter()
-            .all(|thread| thread.thread_id != "regular")
-    );
-}
-
-#[test]
-fn known_single_bucket_excludes_calls_mapped_to_the_missing_pool() {
+fn each_complete_entity_partition_sums_to_codex_used_percent() {
     let now = at(12, 0);
     let reset = at(14, 0);
     let calls = vec![
-        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
-        call(
-            at(11, 59),
-            "spark",
-            "spark-turn",
-            "gpt-5.3-codex-spark",
-            300,
-        ),
-    ];
-    let mut codex = limit(now, 10.0, 300, reset);
-    codex.limit_id = "codex".to_string();
-    let mut spark = limit(now, 20.0, 300, reset);
-    spark.limit_id = "codex_bengalfox".to_string();
-
-    let codex_analyses = analyze_windows(&[], &[], &calls, &[], &[codex], now);
-    let spark_analyses = analyze_windows(&[], &[], &calls, &[], &[spark], now);
-
-    assert_eq!(codex_analyses.len(), 1);
-    assert_eq!(spark_analyses.len(), 1);
-    let codex = &codex_analyses[0];
-    let spark = &spark_analyses[0];
-    assert_eq!(codex.attribution.local_token_usage, tokens(200));
-    assert_eq!(spark.attribution.local_token_usage, tokens(300));
-    assert_eq!(codex.models[0].model, "gpt-5.3-codex");
-    assert_eq!(spark.models[0].model, "gpt-5.3-codex-spark");
-    for analysis in [codex, spark] {
-        assert!(analysis.partial);
-        assert!(
-            analysis
-                .partial_reasons
-                .contains(&"mapped_bucket_unavailable".to_string())
-        );
-    }
-}
-
-#[test]
-fn unmapped_models_leave_overlapping_bucket_deltas_unassigned() {
-    let now = at(12, 0);
-    let reset = at(14, 0);
-    let mut codex = limit(now, 10.0, 300, reset);
-    codex.limit_id = "codex".to_string();
-    let mut spark = limit(now, 20.0, 300, reset);
-    spark.limit_id = "codex_bengalfox".to_string();
-    let codex_observation = observation_for(at(11, 58), 8.0, 300, reset);
-    let mut spark_observation = observation_for(at(11, 58), 15.0, 300, reset);
-    spark_observation.limit_id = "codex_bengalfox".to_string();
-    let mut unknown = call(at(11, 59), "unknown", "unknown-turn", "placeholder", 100);
-    unknown.model = None;
-    let calls = vec![
-        call(at(11, 59), "regular", "regular-turn", "gpt-5.3-codex", 200),
-        call(
-            at(11, 59),
-            "spark",
-            "spark-turn",
-            "gpt-5.3-codex-spark",
-            300,
-        ),
-        unknown,
+        call(at(10, 0), "a", "a-1", Some("gpt-a"), 100),
+        call(at(10, 30), "a", "a-2", Some("gpt-b"), 200),
+        call(at(11, 0), "b", "b-1", Some("gpt-a"), 300),
+        call(at(11, 30), "c", "c-1", None, 400),
     ];
 
-    let analyses = analyze_windows(
+    let analysis = analyze_windows(
         &[],
         &[],
         &calls,
-        &[codex_observation, spark_observation],
-        &[codex, spark],
+        &[],
+        &[codex_limit(now, 37.0, 300, reset)],
         now,
-    );
+    )
+    .remove(0);
 
-    assert_eq!(analyses.len(), 2);
-    assert!(analyses.iter().all(|analysis| analysis.partial));
-    assert!(analyses.iter().all(|analysis| {
+    assert_close(
         analysis
-            .partial_reasons
-            .contains(&"unmapped_call_model".to_string())
-    }));
-    assert!(analyses.iter().all(|analysis| {
-        analysis.attribution.observed_delta_percent > 0.0
-            && analysis.attribution.estimated_assigned_percent == 0.0
-            && analysis.attribution.confidence == Confidence::Unknown
-            && analysis
-                .threads
-                .iter()
-                .all(|thread| thread.usage.estimated_quota_percent == 0.0)
-    }));
+            .threads
+            .iter()
+            .map(|row| row.usage.estimated_quota_percent)
+            .sum(),
+        37.0,
+    );
+    assert_close(
+        analysis
+            .turns
+            .iter()
+            .map(|row| row.usage.estimated_quota_percent)
+            .sum(),
+        37.0,
+    );
+    assert_close(
+        analysis
+            .models
+            .iter()
+            .map(|row| row.estimated_quota_percent)
+            .sum(),
+        37.0,
+    );
 }
 
 #[test]
 fn expired_windows_are_not_analyzed_as_current() {
     let now = at(12, 0);
-    let expired = limit(at(9, 0), 80.0, 300, at(10, 0));
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
+    let expired = codex_limit(at(9, 0), 80.0, 300, at(10, 0));
+    let at_reset = codex_limit(now, 80.0, 300, now);
 
-    let (_, summary) = analyze_current_window(&mut tasks, &mut turns, &[], &[], &[expired], now);
-
-    assert!(summary.window.is_none());
-    assert_eq!(summary.method, "unavailable");
+    assert!(analyze_windows(&[], &[], &[], &[], &[expired], now).is_empty());
+    assert!(analyze_windows(&[], &[], &[], &[], &[at_reset], now).is_empty());
 }
 
 #[test]
-fn a_window_is_expired_immediately_at_its_reset_time() {
-    let now = at(12, 0);
-    let expired = limit(now, 80.0, 300, now);
-    let mut tasks = vec![task("a", TaskStatus::Completed)];
-    let mut turns = vec![turn("a", "turn")];
-
-    let (_, summary) = analyze_current_window(&mut tasks, &mut turns, &[], &[], &[expired], now);
-
-    assert!(summary.window.is_none());
-}
-
-#[test]
-fn no_limits_clears_previous_attribution_values() {
+fn no_current_codex_window_clears_legacy_projection_fields() {
     let mut tasks = vec![task("a", TaskStatus::Completed)];
     let mut turns = vec![turn("a", "turn")];
 
@@ -845,4 +583,6 @@ fn no_limits_clears_previous_attribution_values() {
     assert_eq!(tasks[0].quota_confidence, Confidence::Unknown);
     assert_eq!(turns[0].window_token_usage, TokenUsage::default());
     assert_close(turns[0].local_token_share_percent, 0.0);
+    assert_close(turns[0].estimated_quota_percent, 0.0);
+    assert_eq!(turns[0].quota_confidence, Confidence::Unknown);
 }

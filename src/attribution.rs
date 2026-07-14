@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -12,13 +12,8 @@ const FIVE_HOURS_MINS: i64 = 300;
 const WEEK_MINS: i64 = 10_080;
 const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
-const PERCENT_EPSILON: f64 = 0.01;
-const MAX_ATTRIBUTION_GAP_SECS: i64 = 300;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
-const SPARK_CODEX_BUCKET: &str = "codex_bengalfox";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
-pub(crate) const UNMAPPED_CALL_MODEL_REASON: &str = "unmapped_call_model";
-pub(crate) const MAPPED_BUCKET_UNAVAILABLE_REASON: &str = "mapped_bucket_unavailable";
 
 struct SelectedWindow<'a> {
     bucket: &'a LimitBucket,
@@ -27,39 +22,23 @@ struct SelectedWindow<'a> {
     ends_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Copy)]
-struct QuotaSample {
-    timestamp: DateTime<Utc>,
-    used_percent: f64,
-    provenance: Provenance,
-    is_current: bool,
-}
-
-/// Calculates exact local-token shares and conservative quota estimates for all
-/// current five-hour and weekly rate-limit windows.
+/// Calculates local-token shares and low-confidence quota estimates for the
+/// current normal Codex five-hour and weekly rate-limit windows.
 ///
-/// Quota estimates are derived only from positive changes between compatible
-/// account snapshots. Each observed change is split across local calls made
-/// since the preceding snapshot in proportion to their total token counts.
+/// Spark calls are excluded. Every remaining estimate uses one stable formula:
+/// current Codex used percent multiplied by the entity's local token share.
 pub fn analyze_windows(
     tasks: &[TaskRecord],
     _turns: &[TurnRecord],
     calls: &[UsageCall],
-    observations: &[RateObservation],
+    _observations: &[RateObservation],
     limits: &[LimitBucket],
     now: DateTime<Utc>,
 ) -> Vec<WindowAnalysis> {
     let settled = is_settled(tasks);
     select_windows(limits, now)
         .into_iter()
-        .map(|selected| {
-            let duration_mins = selected
-                .window
-                .window_duration_mins
-                .expect("selected windows always have a duration");
-            let bucket_ids = active_bucket_ids_for_duration(limits, now, duration_mins);
-            analyze_selected_window(calls, observations, selected, now, settled, &bucket_ids)
-        })
+        .map(|selected| analyze_selected_window(calls, selected, now, settled))
         .collect()
 }
 
@@ -83,10 +62,15 @@ pub(crate) fn project_five_hour_analysis(
     analyses: &[WindowAnalysis],
 ) -> (Vec<ModelUsage>, AttributionSummary) {
     reset_records(tasks, turns);
-    let Some(analysis) = analyses
-        .iter()
-        .find(|analysis| analysis.duration_mins == FIVE_HOURS_MINS)
-    else {
+    let Some(analysis) = analyses.iter().find(|analysis| {
+        analysis.duration_mins == FIVE_HOURS_MINS
+            && analysis.attribution.window.as_ref().is_some_and(|window| {
+                window
+                    .limit_id
+                    .trim()
+                    .eq_ignore_ascii_case(DEFAULT_CODEX_BUCKET)
+            })
+    }) else {
         return (
             Vec::new(),
             AttributionSummary {
@@ -144,55 +128,26 @@ fn is_settled(tasks: &[TaskRecord]) -> bool {
 
 fn analyze_selected_window(
     calls: &[UsageCall],
-    observations: &[RateObservation],
     selected: SelectedWindow<'_>,
     now: DateTime<Utc>,
     settled: bool,
-    active_bucket_ids: &[String],
 ) -> WindowAnalysis {
-    let map_calls_by_model = supports_model_bucket_mapping(active_bucket_ids);
-    let window_calls: Vec<(usize, &UsageCall)> = calls
+    let quota_window_stale = matches!(
+        selected.bucket.provenance,
+        Provenance::Stale | Provenance::Unknown
+    );
+    let window_calls = calls
         .iter()
-        .enumerate()
-        .filter(|(_, call)| {
-            let in_window = call.timestamp >= selected.starts_at
-                && call.timestamp <= now
-                && call.timestamp <= selected.ends_at;
-            in_window
-                && (!map_calls_by_model
-                    || quota_bucket_for_model(call.model.as_deref()).is_some_and(|bucket_id| {
-                        bucket_id.eq_ignore_ascii_case(&selected.bucket.limit_id)
-                    }))
-        })
-        .collect();
-    let unmapped_window_calls = if map_calls_by_model {
-        calls
-            .iter()
-            .filter(|call| {
-                call.timestamp >= selected.starts_at
-                    && call.timestamp <= now
-                    && call.timestamp <= selected.ends_at
-                    && quota_bucket_for_model(call.model.as_deref()).is_none()
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let has_unmapped_calls = !unmapped_window_calls.is_empty();
-    let has_calls_for_unavailable_bucket = map_calls_by_model
-        && calls.iter().any(|call| {
+        .filter(|call| {
             call.timestamp >= selected.starts_at
                 && call.timestamp <= now
                 && call.timestamp <= selected.ends_at
-                && quota_bucket_for_model(call.model.as_deref()).is_some_and(|bucket_id| {
-                    !active_bucket_ids
-                        .iter()
-                        .any(|active| active.trim().eq_ignore_ascii_case(bucket_id))
-                })
-        });
+                && !is_spark_model(call.model.as_deref())
+        })
+        .collect::<Vec<_>>();
 
     let mut local_token_usage = TokenUsage::default();
-    for (_, call) in &window_calls {
+    for call in &window_calls {
         local_token_usage.add_assign(call.tokens);
     }
 
@@ -201,7 +156,7 @@ fn analyze_selected_window(
     let mut turn_tokens: BTreeMap<(String, String), TokenUsage> = BTreeMap::new();
     let mut model_tokens: BTreeMap<String, TokenUsage> = BTreeMap::new();
 
-    for (_, call) in &window_calls {
+    for call in &window_calls {
         task_tokens
             .entry(call.thread_id.clone())
             .or_default()
@@ -218,169 +173,43 @@ fn analyze_selected_window(
             .add_assign(call.tokens);
     }
 
-    let mut estimated_by_call = vec![0.0; calls.len()];
-    let mut samples = compatible_samples(observations, &selected, now);
-    add_current_sample(&mut samples, &selected, now);
-    samples.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| sample_rank(left).cmp(&sample_rank(right)))
-            .then_with(|| left.is_current.cmp(&right.is_current))
-    });
-    samples.dedup_by(|later, earlier| {
-        if later.timestamp == earlier.timestamp {
-            if sample_rank(later) >= sample_rank(earlier) {
-                *earlier = *later;
-            }
-            true
-        } else {
-            false
-        }
-    });
-
-    // A backwards move starts a new observation epoch. Older quota deltas no
-    // longer reconcile with the current server value, but later monotonic
-    // snapshots can still support a low-confidence real-time estimate.
-    let epoch_start = samples
-        .windows(2)
-        .rposition(|pair| pair[1].used_percent + PERCENT_EPSILON < pair[0].used_percent)
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let quota_discontinuity = epoch_start > 0;
-    let estimation_samples = &samples[epoch_start..];
-
-    let current_used_percent = selected.window.used_percent.max(0.0);
-    let mut observed_delta_percent = 0.0;
-    let mut estimated_assigned_percent = 0.0;
-
-    for pair in estimation_samples.windows(2) {
-        let previous = pair[0];
-        let current = pair[1];
-        let observed_delta = (current.used_percent - previous.used_percent).max(0.0);
-        if observed_delta == 0.0 {
-            continue;
-        }
-        observed_delta_percent += observed_delta;
-
-        if current
-            .timestamp
-            .signed_duration_since(previous.timestamp)
-            .num_seconds()
-            > MAX_ATTRIBUTION_GAP_SECS
-        {
-            continue;
-        }
-
-        let assignable_delta =
-            observed_delta.min((current_used_percent - estimated_assigned_percent).max(0.0));
-        if assignable_delta == 0.0 {
-            continue;
-        }
-        if unmapped_window_calls
-            .iter()
-            .any(|call| call.timestamp > previous.timestamp && call.timestamp <= current.timestamp)
-        {
-            // The unknown-model call may belong to either quota pool, so this
-            // interval's account delta cannot be assigned to mapped calls safely.
-            continue;
-        }
-
-        let interval_calls: Vec<(usize, &UsageCall)> = window_calls
-            .iter()
-            .copied()
-            .filter(|(_, call)| {
-                call.timestamp > previous.timestamp && call.timestamp <= current.timestamp
-            })
-            .collect();
-        let interval_tokens = interval_calls.iter().fold(0_u64, |total, (_, call)| {
-            total.saturating_add(call.tokens.total_tokens)
-        });
-        if interval_tokens == 0 {
-            continue;
-        }
-
-        for (index, call) in interval_calls {
-            let share = call.tokens.total_tokens as f64 / interval_tokens as f64;
-            estimated_by_call[index] += assignable_delta * share;
-        }
-        estimated_assigned_percent += assignable_delta;
-    }
-
-    let confidence = if estimated_assigned_percent == 0.0 {
+    let used_percent = selected.window.used_percent.clamp(0.0, 100.0);
+    let confidence = if total_tokens == 0 {
         Confidence::Unknown
-    } else if settled && !quota_discontinuity && !has_unmapped_calls {
-        Confidence::Medium
     } else {
         Confidence::Low
     };
-
-    let mut task_estimates: BTreeMap<String, f64> = BTreeMap::new();
-    let mut turn_estimates: BTreeMap<(String, String), f64> = BTreeMap::new();
-    let mut model_estimates: BTreeMap<String, f64> = BTreeMap::new();
-    for (index, call) in calls.iter().enumerate() {
-        let estimate = estimated_by_call[index];
-        if estimate == 0.0 {
-            continue;
+    let usage_for = |token_usage: TokenUsage| {
+        let local_token_share_percent = token_share(token_usage, total_tokens);
+        WindowUsage {
+            token_usage,
+            local_token_share_percent,
+            estimated_quota_percent: used_percent * local_token_share_percent / 100.0,
+            quota_confidence: confidence,
         }
-        *task_estimates.entry(call.thread_id.clone()).or_default() += estimate;
-        if let Some(turn_id) = &call.turn_id {
-            *turn_estimates
-                .entry((call.thread_id.clone(), turn_id.clone()))
-                .or_default() += estimate;
-        }
-        *model_estimates.entry(model_name(call)).or_default() += estimate;
-    }
+    };
 
-    let mut thread_ids = task_tokens.keys().cloned().collect::<BTreeSet<_>>();
-    thread_ids.extend(task_estimates.keys().cloned());
-    let threads = thread_ids
+    let threads = task_tokens
         .into_iter()
-        .map(|thread_id| {
-            let token_usage = task_tokens.get(&thread_id).copied().unwrap_or_default();
-            let estimated_quota_percent =
-                task_estimates.get(&thread_id).copied().unwrap_or_default();
-            ThreadWindowUsage {
-                thread_id,
-                usage: WindowUsage {
-                    token_usage,
-                    local_token_share_percent: token_share(token_usage, total_tokens),
-                    estimated_quota_percent,
-                    quota_confidence: estimate_confidence(estimated_quota_percent, confidence),
-                },
-            }
+        .map(|(thread_id, token_usage)| ThreadWindowUsage {
+            thread_id,
+            usage: usage_for(token_usage),
         })
         .collect();
-
-    let mut turn_ids = turn_tokens.keys().cloned().collect::<BTreeSet<_>>();
-    turn_ids.extend(turn_estimates.keys().cloned());
-    let turns = turn_ids
+    let turns = turn_tokens
         .into_iter()
-        .map(|(thread_id, turn_id)| {
-            let key = (thread_id.clone(), turn_id.clone());
-            let token_usage = turn_tokens.get(&key).copied().unwrap_or_default();
-            let estimated_quota_percent = turn_estimates.get(&key).copied().unwrap_or_default();
-            TurnWindowUsage {
-                thread_id,
-                turn_id,
-                usage: WindowUsage {
-                    token_usage,
-                    local_token_share_percent: token_share(token_usage, total_tokens),
-                    estimated_quota_percent,
-                    quota_confidence: estimate_confidence(estimated_quota_percent, confidence),
-                },
-            }
+        .map(|((thread_id, turn_id), token_usage)| TurnWindowUsage {
+            thread_id,
+            turn_id,
+            usage: usage_for(token_usage),
         })
         .collect();
-
     let models = model_tokens
         .into_iter()
         .map(|(model, token_usage)| ModelUsage {
             local_token_share_percent: token_share(token_usage, total_tokens),
-            estimated_quota_percent: model_estimates.get(&model).copied().unwrap_or_default(),
-            quota_confidence: estimate_confidence(
-                model_estimates.get(&model).copied().unwrap_or_default(),
-                confidence,
-            ),
+            estimated_quota_percent: used_percent * token_share(token_usage, total_tokens) / 100.0,
+            quota_confidence: confidence,
             model,
             token_usage,
         })
@@ -392,59 +221,39 @@ fn analyze_selected_window(
             label: selected.window.label(),
             starts_at: selected.starts_at,
             ends_at: selected.ends_at,
-            used_percent: selected.window.used_percent,
+            used_percent,
         }),
         local_token_usage,
-        observed_delta_percent,
-        estimated_assigned_percent,
-        proxy_projected_percent: 0.0,
-        unattributed_percent: (current_used_percent - estimated_assigned_percent).max(0.0),
-        attribution_coverage_percent: if current_used_percent == 0.0 {
-            0.0
-        } else {
-            estimated_assigned_percent / current_used_percent * 100.0
-        },
+        observed_delta_percent: 0.0,
+        estimated_assigned_percent: 0.0,
+        proxy_projected_percent: if total_tokens == 0 { 0.0 } else { used_percent },
+        unattributed_percent: used_percent,
+        attribution_coverage_percent: 0.0,
         external_activity_possible: true,
         confidence,
-        method: if quota_discontinuity && estimated_assigned_percent > 0.0 {
-            "post_discontinuity_observed_delta_token_proportional".to_string()
-        } else if quota_discontinuity {
-            "quota_discontinuity_local_tokens_only".to_string()
-        } else if estimated_assigned_percent > 0.0 {
-            "observed_delta_token_proportional".to_string()
+        method: if total_tokens == 0 {
+            "codex_gauge_without_local_tokens".to_string()
         } else {
-            "local_tokens_only".to_string()
+            "current_codex_gauge_token_share_proxy".to_string()
         },
         settled,
     };
-
-    let mut partial_reasons = Vec::new();
-    if has_unmapped_calls {
-        partial_reasons.push(UNMAPPED_CALL_MODEL_REASON.to_string());
-    }
-    if has_calls_for_unavailable_bucket {
-        partial_reasons.push(MAPPED_BUCKET_UNAVAILABLE_REASON.to_string());
-    }
 
     WindowAnalysis {
         duration_mins: selected
             .window
             .window_duration_mins
             .expect("selected windows always have a duration"),
-        partial: !partial_reasons.is_empty(),
-        partial_reasons,
+        partial: quota_window_stale,
+        partial_reasons: if quota_window_stale {
+            vec!["quota_window_stale".to_string()]
+        } else {
+            Vec::new()
+        },
         attribution: summary,
         threads,
         turns,
         models,
-    }
-}
-
-fn estimate_confidence(estimated_quota_percent: f64, confidence: Confidence) -> Confidence {
-    if estimated_quota_percent > 0.0 {
-        confidence
-    } else {
-        Confidence::Unknown
     }
 }
 
@@ -480,9 +289,14 @@ fn select_windows(limits: &[LimitBucket], now: DateTime<Utc>) -> Vec<SelectedWin
 
     usable.retain(|window| {
         window
-            .window
-            .window_duration_mins
-            .is_some_and(|duration| ANALYZED_WINDOW_DURATIONS.contains(&duration))
+            .bucket
+            .limit_id
+            .trim()
+            .eq_ignore_ascii_case(DEFAULT_CODEX_BUCKET)
+            && window
+                .window
+                .window_duration_mins
+                .is_some_and(|duration| ANALYZED_WINDOW_DURATIONS.contains(&duration))
             && is_current_window(window, now)
     });
     usable.sort_by(|left, right| {
@@ -490,24 +304,13 @@ fn select_windows(limits: &[LimitBucket], now: DateTime<Utc>) -> Vec<SelectedWin
             .window_duration_mins
             .cmp(&right.window.window_duration_mins)
             .then_with(|| bucket_priority(left.bucket).cmp(&bucket_priority(right.bucket)))
-            .then_with(|| left.bucket.limit_id.cmp(&right.bucket.limit_id))
+            .then_with(|| right.bucket.as_of.cmp(&left.bucket.as_of))
             .then_with(|| left.ends_at.cmp(&right.ends_at))
     });
     let mut selected: Vec<SelectedWindow<'_>> = Vec::new();
     for window in usable {
-        let duration_mins = window
-            .window
-            .window_duration_mins
-            .expect("usable windows always have a duration");
-        let bucket_ids = active_bucket_ids_for_duration(limits, now, duration_mins);
-        let map_calls_by_model = supports_model_bucket_mapping(&bucket_ids);
         let already_selected = selected.iter().any(|previous| {
             previous.window.window_duration_mins == window.window.window_duration_mins
-                && (!map_calls_by_model
-                    || previous
-                        .bucket
-                        .limit_id
-                        .eq_ignore_ascii_case(&window.bucket.limit_id))
         });
         if !already_selected {
             selected.push(window);
@@ -516,66 +319,24 @@ fn select_windows(limits: &[LimitBucket], now: DateTime<Utc>) -> Vec<SelectedWin
     selected
 }
 
-fn bucket_priority(bucket: &LimitBucket) -> (u8, u8) {
-    (
-        u8::from(!bucket.limit_id.eq_ignore_ascii_case(DEFAULT_CODEX_BUCKET)),
-        u8::from(bucket.provenance != Provenance::ServerSnapshot),
-    )
-}
-
-pub(crate) fn supports_model_bucket_mapping(bucket_ids: &[String]) -> bool {
-    let normalized = bucket_ids
-        .iter()
-        .map(|bucket_id| bucket_id.trim().to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    !normalized.is_empty()
-        && normalized.iter().all(|bucket_id| {
-            matches!(
-                bucket_id.as_str(),
-                DEFAULT_CODEX_BUCKET | SPARK_CODEX_BUCKET
-            )
-        })
-}
-
-fn quota_bucket_for_model(model: Option<&str>) -> Option<&'static str> {
-    let model = model?.trim();
-    if model.is_empty() {
-        None
-    } else if model.eq_ignore_ascii_case(SPARK_MODEL) {
-        Some(SPARK_CODEX_BUCKET)
-    } else {
-        Some(DEFAULT_CODEX_BUCKET)
+fn bucket_priority(bucket: &LimitBucket) -> u8 {
+    match bucket.provenance {
+        Provenance::ServerSnapshot => 0,
+        Provenance::Live => 1,
+        Provenance::LocalExact => 2,
+        Provenance::Inferred => 3,
+        Provenance::Estimated => 4,
+        Provenance::Stale => 5,
+        Provenance::Unknown => 6,
     }
+}
+
+fn is_spark_model(model: Option<&str>) -> bool {
+    model.is_some_and(|model| model.trim().eq_ignore_ascii_case(SPARK_MODEL))
 }
 
 fn is_current_window(window: &SelectedWindow<'_>, now: DateTime<Utc>) -> bool {
     now >= window.starts_at - Duration::seconds(RESET_DRIFT_SECS) && now < window.ends_at
-}
-
-pub(crate) fn active_bucket_ids_for_duration(
-    limits: &[LimitBucket],
-    now: DateTime<Utc>,
-    duration_mins: i64,
-) -> Vec<String> {
-    let mut ids = limits
-        .iter()
-        .filter(|bucket| {
-            [bucket.primary.as_ref(), bucket.secondary.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|window| {
-                    window.window_duration_mins == Some(duration_mins)
-                        && window.resets_at.is_some_and(|ends_at| {
-                            let starts_at = ends_at - Duration::minutes(duration_mins);
-                            now >= starts_at - Duration::seconds(RESET_DRIFT_SECS) && now < ends_at
-                        })
-                })
-        })
-        .map(|bucket| bucket.limit_id.clone())
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids.dedup();
-    ids
 }
 
 fn usable_window<'a>(
@@ -592,84 +353,6 @@ fn usable_window<'a>(
     })
 }
 
-fn compatible_samples(
-    observations: &[RateObservation],
-    selected: &SelectedWindow<'_>,
-    now: DateTime<Utc>,
-) -> Vec<QuotaSample> {
-    let candidates = observations
-        .iter()
-        .filter(|observation| observation.limit_id == selected.bucket.limit_id)
-        .filter_map(|observation| {
-            let window = [observation.primary.as_ref(), observation.secondary.as_ref()]
-                .into_iter()
-                .flatten()
-                .find(|window| same_window(window, selected.window))?;
-            if observation.timestamp < selected.starts_at || observation.timestamp > now {
-                return None;
-            }
-            Some(QuotaSample {
-                timestamp: observation.timestamp,
-                used_percent: window.used_percent.max(0.0),
-                provenance: observation.provenance,
-                is_current: false,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if selected.bucket.provenance != Provenance::ServerSnapshot {
-        return candidates;
-    }
-
-    let local_agrees = candidates
-        .iter()
-        .filter(|sample| sample.provenance != Provenance::ServerSnapshot)
-        .max_by_key(|sample| sample.timestamp)
-        .is_some_and(|sample| (sample.used_percent - selected.window.used_percent).abs() <= 20.0);
-    // App Server percentages are often integer plateaus. Keep compatible
-    // rollout samples for intra-plateau evidence even after server history grows.
-    candidates
-        .into_iter()
-        .filter(|sample| sample.provenance == Provenance::ServerSnapshot || local_agrees)
-        .collect()
-}
-
-fn add_current_sample(
-    samples: &mut Vec<QuotaSample>,
-    selected: &SelectedWindow<'_>,
-    now: DateTime<Utc>,
-) {
-    let timestamp = selected.bucket.as_of.min(now).max(selected.starts_at);
-    samples.push(QuotaSample {
-        timestamp,
-        used_percent: selected.window.used_percent.max(0.0),
-        provenance: selected.bucket.provenance,
-        is_current: true,
-    });
-}
-
-fn sample_rank(sample: &QuotaSample) -> u8 {
-    if sample.is_current {
-        2
-    } else if sample.provenance == Provenance::ServerSnapshot {
-        1
-    } else {
-        0
-    }
-}
-
-fn same_window(candidate: &LimitWindow, selected: &LimitWindow) -> bool {
-    if candidate.window_duration_mins != selected.window_duration_mins {
-        return false;
-    }
-    match (candidate.resets_at, selected.resets_at) {
-        (Some(candidate_end), Some(selected_end)) => {
-            (candidate_end - selected_end).num_seconds().abs() <= RESET_DRIFT_SECS
-        }
-        _ => false,
-    }
-}
-
 fn token_share(tokens: TokenUsage, total_tokens: u64) -> f64 {
     if total_tokens == 0 {
         0.0
@@ -679,5 +362,10 @@ fn token_share(tokens: TokenUsage, total_tokens: u64) -> f64 {
 }
 
 fn model_name(call: &UsageCall) -> String {
-    call.model.as_deref().unwrap_or("unknown").to_string()
+    call.model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
