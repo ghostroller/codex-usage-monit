@@ -441,6 +441,108 @@ fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
 }
 
 #[test]
+fn usage_calls_keep_their_turn_service_tier_without_changing_token_deltas() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/2026/07/13/rollout-fast-usage.jsonl");
+    let event = |offset: i64, payload: Value| {
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(offset)),
+            "type": "event_msg",
+            "payload": payload
+        })
+    };
+    let records = vec![
+        json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "fast-usage-thread", "timestamp": timestamp(now)}
+        }),
+        event(
+            1,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "default"}
+            }),
+        ),
+        event(
+            2,
+            json!({"type": "task_started", "turn_id": "standard-turn"}),
+        ),
+        event(
+            3,
+            json!({
+                "type": "token_count",
+                "info": {"total_token_usage": usage(10, 0, 0, 0, 10)}
+            }),
+        ),
+        event(
+            4,
+            json!({"type": "task_complete", "turn_id": "standard-turn"}),
+        ),
+        event(
+            5,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "priority"}
+            }),
+        ),
+        event(6, json!({"type": "task_started", "turn_id": "fast-turn"})),
+        event(
+            7,
+            json!({
+                "type": "token_count",
+                "info": {"total_token_usage": usage(20, 0, 0, 0, 20)}
+            }),
+        ),
+        event(8, json!({"type": "task_complete", "turn_id": "fast-turn"})),
+        // A later thread setting must not relabel the completed turn's final delta.
+        event(
+            9,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "default"}
+            }),
+        ),
+        event(
+            10,
+            json!({
+                "type": "token_count",
+                "info": {"total_token_usage": usage(30, 0, 0, 0, 30)}
+            }),
+        ),
+    ];
+    write_jsonl(&path, &records, false);
+
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(11)).unwrap();
+
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 30);
+    assert_eq!(dataset.calls.len(), 3);
+    assert_eq!(
+        dataset
+            .calls
+            .iter()
+            .map(|call| call.service_tier.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("default"), Some("priority"), Some("priority")]
+    );
+    let standard_turn = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "standard-turn")
+        .unwrap();
+    assert_eq!(standard_turn.token_usage.total_tokens, 10);
+    let fast_turn = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "fast-turn")
+        .unwrap();
+    assert_eq!(fast_turn.token_usage.total_tokens, 20);
+}
+
+#[test]
 fn resumes_the_parent_turn_after_a_nested_turn_completes() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -949,6 +1051,7 @@ fn task_record_parent_id_is_optional_in_legacy_json_and_uses_camel_case() {
 
     let mut task: TaskRecord = serde_json::from_value(legacy).unwrap();
     assert_eq!(task.parent_thread_id, None);
+    assert!(!task.archived);
     assert!(
         serde_json::to_value(&task)
             .unwrap()
@@ -957,10 +1060,9 @@ fn task_record_parent_id_is_optional_in_legacy_json_and_uses_camel_case() {
     );
 
     task.parent_thread_id = Some("parent-thread".to_string());
-    assert_eq!(
-        serde_json::to_value(task).unwrap()["parentThreadId"],
-        "parent-thread"
-    );
+    let serialized = serde_json::to_value(task).unwrap();
+    assert_eq!(serialized["parentThreadId"], "parent-thread");
+    assert_eq!(serialized["archived"], false);
 }
 
 #[test]
@@ -1237,6 +1339,7 @@ fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
     assert_eq!(dataset.tasks.len(), 1);
     let task = &dataset.tasks[0];
     assert_eq!(task.thread_id, "active-thread");
+    assert!(task.archived);
     assert_eq!(task.title, "[redacted]");
     assert!(
         dataset
@@ -1249,6 +1352,37 @@ fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
     assert_eq!(task.status_provenance, Provenance::Inferred);
     assert_eq!(task.status_confidence, Confidence::Medium);
     assert_eq!(dataset.turns[0].status, TurnStatus::InProgress);
+}
+
+#[test]
+fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    for directory in ["archived_sessions", "sessions"] {
+        write_jsonl(
+            &temp
+                .path()
+                .join(directory)
+                .join(format!("rollout-{directory}.jsonl")),
+            &[json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {
+                    "id": "shared-thread",
+                    "timestamp": timestamp(now),
+                    "cwd": "/tmp/project",
+                    "originator": "codex_cli_rs"
+                }
+            })],
+            false,
+        );
+    }
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.tasks.len(), 1);
+    assert_eq!(dataset.tasks[0].thread_id, "shared-thread");
+    assert!(!dataset.tasks[0].archived);
 }
 
 #[test]

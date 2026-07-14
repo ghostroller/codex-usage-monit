@@ -15,6 +15,62 @@ const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 
+// OpenAI short-context prices as of 2026-07-14:
+// https://developers.openai.com/api/docs/pricing?latest-pricing=priority
+// Integer rates use $0.025 per million tokens. The currency and per-million
+// scales cancel when the values are converted into relative shares.
+#[derive(Clone, Copy)]
+struct TokenRates {
+    input: u128,
+    cached_input: u128,
+    output: u128,
+}
+
+const SOL_STANDARD: TokenRates = TokenRates::new(200, 20, 1_200);
+const SOL_FAST: TokenRates = TokenRates::new(400, 40, 2_400);
+const TERRA_STANDARD: TokenRates = TokenRates::new(100, 10, 600);
+const TERRA_FAST: TokenRates = TokenRates::new(200, 20, 1_200);
+const LUNA_STANDARD: TokenRates = TokenRates::new(40, 4, 240);
+const LUNA_FAST: TokenRates = TokenRates::new(80, 8, 480);
+const GPT_5_5_STANDARD: TokenRates = TokenRates::new(200, 20, 1_200);
+const GPT_5_5_FAST: TokenRates = TokenRates::new(500, 50, 3_000);
+const GPT_5_4_STANDARD: TokenRates = TokenRates::new(100, 10, 600);
+const GPT_5_4_FAST: TokenRates = TokenRates::new(200, 20, 1_200);
+const GPT_5_4_MINI_STANDARD: TokenRates = TokenRates::new(30, 3, 180);
+const GPT_5_4_MINI_FAST: TokenRates = TokenRates::new(60, 6, 360);
+
+impl TokenRates {
+    const fn new(input: u128, cached_input: u128, output: u128) -> Self {
+        Self {
+            input,
+            cached_input,
+            output,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EstimatedCost {
+    units: u128,
+    used_model_fallback: bool,
+    used_token_breakdown_fallback: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UsageAccumulator {
+    tokens: TokenUsage,
+    estimated_cost_units: u128,
+}
+
+impl UsageAccumulator {
+    fn add_call(&mut self, call: &UsageCall, estimated_cost_units: u128) {
+        self.tokens.add_assign(call.tokens);
+        self.estimated_cost_units = self
+            .estimated_cost_units
+            .saturating_add(estimated_cost_units);
+    }
+}
+
 struct SelectedWindow<'a> {
     bucket: &'a LimitBucket,
     window: &'a LimitWindow,
@@ -22,11 +78,11 @@ struct SelectedWindow<'a> {
     ends_at: DateTime<Utc>,
 }
 
-/// Calculates local-token shares and low-confidence quota estimates for the
-/// current normal Codex five-hour and weekly rate-limit windows.
+/// Calculates raw local-token shares and low-confidence quota estimates for
+/// the current normal Codex five-hour and weekly rate-limit windows.
 ///
-/// Spark calls are excluded. Every remaining estimate uses one stable formula:
-/// current Codex used percent multiplied by the entity's local token share.
+/// Spark calls are excluded. EST uses the published short-context Standard or
+/// Fast token prices, while raw token totals and LOCAL shares remain unchanged.
 pub fn analyze_windows(
     tasks: &[TaskRecord],
     _turns: &[TurnRecord],
@@ -146,32 +202,37 @@ fn analyze_selected_window(
         })
         .collect::<Vec<_>>();
 
-    let mut local_token_usage = TokenUsage::default();
-    for call in &window_calls {
-        local_token_usage.add_assign(call.tokens);
-    }
-
-    let total_tokens = local_token_usage.total_tokens;
-    let mut task_tokens: BTreeMap<String, TokenUsage> = BTreeMap::new();
-    let mut turn_tokens: BTreeMap<(String, String), TokenUsage> = BTreeMap::new();
-    let mut model_tokens: BTreeMap<String, TokenUsage> = BTreeMap::new();
+    let mut local_usage = UsageAccumulator::default();
+    let mut task_usage: BTreeMap<String, UsageAccumulator> = BTreeMap::new();
+    let mut turn_usage: BTreeMap<(String, String), UsageAccumulator> = BTreeMap::new();
+    let mut model_usage: BTreeMap<String, UsageAccumulator> = BTreeMap::new();
+    let mut used_model_fallback = false;
+    let mut used_token_breakdown_fallback = false;
 
     for call in &window_calls {
-        task_tokens
+        let estimated_cost = estimated_cost(call);
+        used_model_fallback |= estimated_cost.used_model_fallback;
+        used_token_breakdown_fallback |= estimated_cost.used_token_breakdown_fallback;
+        local_usage.add_call(call, estimated_cost.units);
+        task_usage
             .entry(call.thread_id.clone())
             .or_default()
-            .add_assign(call.tokens);
+            .add_call(call, estimated_cost.units);
         if let Some(turn_id) = &call.turn_id {
-            turn_tokens
+            turn_usage
                 .entry((call.thread_id.clone(), turn_id.clone()))
                 .or_default()
-                .add_assign(call.tokens);
+                .add_call(call, estimated_cost.units);
         }
-        model_tokens
+        model_usage
             .entry(model_name(call))
             .or_default()
-            .add_assign(call.tokens);
+            .add_call(call, estimated_cost.units);
     }
+
+    let local_token_usage = local_usage.tokens;
+    let total_tokens = local_token_usage.total_tokens;
+    let total_estimated_cost_units = local_usage.estimated_cost_units;
 
     let used_percent = selected.window.used_percent.clamp(0.0, 100.0);
     let confidence = if total_tokens == 0 {
@@ -179,39 +240,43 @@ fn analyze_selected_window(
     } else {
         Confidence::Low
     };
-    let usage_for = |token_usage: TokenUsage| {
-        let local_token_share_percent = token_share(token_usage, total_tokens);
+    let usage_for = |usage: UsageAccumulator| {
+        let local_token_share_percent = token_share(usage.tokens, total_tokens);
         WindowUsage {
-            token_usage,
+            token_usage: usage.tokens,
             local_token_share_percent,
-            estimated_quota_percent: used_percent * local_token_share_percent / 100.0,
+            estimated_quota_percent: used_percent
+                * cost_share(usage.estimated_cost_units, total_estimated_cost_units)
+                / 100.0,
             quota_confidence: confidence,
         }
     };
 
-    let threads = task_tokens
+    let threads = task_usage
         .into_iter()
-        .map(|(thread_id, token_usage)| ThreadWindowUsage {
+        .map(|(thread_id, usage)| ThreadWindowUsage {
             thread_id,
-            usage: usage_for(token_usage),
+            usage: usage_for(usage),
         })
         .collect();
-    let turns = turn_tokens
+    let turns = turn_usage
         .into_iter()
-        .map(|((thread_id, turn_id), token_usage)| TurnWindowUsage {
+        .map(|((thread_id, turn_id), usage)| TurnWindowUsage {
             thread_id,
             turn_id,
-            usage: usage_for(token_usage),
+            usage: usage_for(usage),
         })
         .collect();
-    let models = model_tokens
+    let models = model_usage
         .into_iter()
-        .map(|(model, token_usage)| ModelUsage {
-            local_token_share_percent: token_share(token_usage, total_tokens),
-            estimated_quota_percent: used_percent * token_share(token_usage, total_tokens) / 100.0,
+        .map(|(model, usage)| ModelUsage {
+            local_token_share_percent: token_share(usage.tokens, total_tokens),
+            estimated_quota_percent: used_percent
+                * cost_share(usage.estimated_cost_units, total_estimated_cost_units)
+                / 100.0,
             quota_confidence: confidence,
             model,
-            token_usage,
+            token_usage: usage.tokens,
         })
         .collect();
 
@@ -234,22 +299,29 @@ fn analyze_selected_window(
         method: if total_tokens == 0 {
             "codex_gauge_without_local_tokens".to_string()
         } else {
-            "current_codex_gauge_token_share_proxy".to_string()
+            "current_codex_gauge_short_context_price_weighted_proxy".to_string()
         },
         settled,
     };
+
+    let mut partial_reasons = Vec::new();
+    if quota_window_stale {
+        partial_reasons.push("quota_window_stale".to_string());
+    }
+    if used_model_fallback {
+        partial_reasons.push("unpriced_model_rate_fallback".to_string());
+    }
+    if used_token_breakdown_fallback {
+        partial_reasons.push("token_breakdown_missing".to_string());
+    }
 
     WindowAnalysis {
         duration_mins: selected
             .window
             .window_duration_mins
             .expect("selected windows always have a duration"),
-        partial: quota_window_stale,
-        partial_reasons: if quota_window_stale {
-            vec!["quota_window_stale".to_string()]
-        } else {
-            Vec::new()
-        },
+        partial: !partial_reasons.is_empty(),
+        partial_reasons,
         attribution: summary,
         threads,
         turns,
@@ -361,6 +433,69 @@ fn token_share(tokens: TokenUsage, total_tokens: u64) -> f64 {
     }
 }
 
+fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f64 {
+    if total_estimated_cost_units == 0 {
+        0.0
+    } else {
+        estimated_cost_units as f64 / total_estimated_cost_units as f64 * 100.0
+    }
+}
+
+fn estimated_cost(call: &UsageCall) -> EstimatedCost {
+    let rates = short_context_rates(call.model.as_deref(), call.is_fast());
+    let used_model_fallback = rates.is_none() && !call.tokens.is_zero();
+    let rates = rates.unwrap_or(if call.is_fast() {
+        LUNA_FAST
+    } else {
+        LUNA_STANDARD
+    });
+
+    let tokens = call.tokens;
+    let used_token_breakdown_fallback =
+        tokens.total_tokens > 0 && tokens.input_tokens == 0 && tokens.output_tokens == 0;
+    let (input_tokens, cached_input_tokens, output_tokens) = if used_token_breakdown_fallback {
+        (tokens.total_tokens, 0, 0)
+    } else {
+        let cached_input_tokens = tokens.cached_input_tokens.min(tokens.input_tokens);
+        (
+            tokens.input_tokens - cached_input_tokens,
+            cached_input_tokens,
+            tokens.output_tokens,
+        )
+    };
+
+    let units = u128::from(input_tokens)
+        .saturating_mul(rates.input)
+        .saturating_add(u128::from(cached_input_tokens).saturating_mul(rates.cached_input))
+        .saturating_add(u128::from(output_tokens).saturating_mul(rates.output));
+
+    EstimatedCost {
+        units,
+        used_model_fallback,
+        used_token_breakdown_fallback,
+    }
+}
+
+fn short_context_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
+    let model = model?.trim();
+    let (standard, priority) = if model.eq_ignore_ascii_case("gpt-5.6-sol") {
+        (SOL_STANDARD, SOL_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.6-terra") {
+        (TERRA_STANDARD, TERRA_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.6-luna") {
+        (LUNA_STANDARD, LUNA_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.5") {
+        (GPT_5_5_STANDARD, GPT_5_5_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.4") {
+        (GPT_5_4_STANDARD, GPT_5_4_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.4-mini") {
+        (GPT_5_4_MINI_STANDARD, GPT_5_4_MINI_FAST)
+    } else {
+        return None;
+    };
+    Some(if fast { priority } else { standard })
+}
+
 fn model_name(call: &UsageCall) -> String {
     call.model
         .as_deref()
@@ -368,4 +503,97 @@ fn model_name(call: &UsageCall) -> String {
         .filter(|model| !model.is_empty())
         .unwrap_or("unknown")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn priced_call(model: &str, fast: bool, tokens: TokenUsage) -> UsageCall {
+        UsageCall {
+            timestamp: Utc::now(),
+            thread_id: "thread".to_string(),
+            turn_id: Some("turn".to_string()),
+            model: Some(model.to_string()),
+            service_tier: fast.then(|| "priority".to_string()),
+            tokens,
+        }
+    }
+
+    #[test]
+    fn published_short_context_price_matrix_uses_each_model_and_tier() {
+        let tokens = TokenUsage {
+            input_tokens: 13,
+            cached_input_tokens: 3,
+            output_tokens: 2,
+            reasoning_output_tokens: 1,
+            total_tokens: 999,
+        };
+        let cases = [
+            ("gpt-5.6-sol", 4_460, 8_920),
+            ("gpt-5.6-terra", 2_230, 4_460),
+            ("gpt-5.6-luna", 892, 1_784),
+            ("gpt-5.5", 4_460, 11_150),
+            ("gpt-5.4", 2_230, 4_460),
+            ("gpt-5.4-mini", 669, 1_338),
+        ];
+
+        for (model, standard, fast) in cases {
+            let standard_cost = estimated_cost(&priced_call(model, false, tokens));
+            assert_eq!(standard_cost.units, standard, "{model} Standard");
+            assert!(!standard_cost.used_model_fallback);
+            assert!(!standard_cost.used_token_breakdown_fallback);
+
+            let fast_cost = estimated_cost(&priced_call(model, true, tokens));
+            assert_eq!(fast_cost.units, fast, "{model} Fast");
+            assert!(!fast_cost.used_model_fallback);
+            assert!(!fast_cost.used_token_breakdown_fallback);
+        }
+    }
+
+    #[test]
+    fn pricing_fallbacks_are_explicit_and_keep_a_nonzero_denominator() {
+        let unknown = priced_call(
+            "unknown-model",
+            true,
+            TokenUsage {
+                input_tokens: 10,
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+        );
+        let unknown_cost = estimated_cost(&unknown);
+        assert_eq!(unknown_cost.units, 800);
+        assert!(unknown_cost.used_model_fallback);
+        assert!(!unknown_cost.used_token_breakdown_fallback);
+
+        let total_only = priced_call(
+            "gpt-5.6-luna",
+            false,
+            TokenUsage {
+                total_tokens: 7,
+                ..TokenUsage::default()
+            },
+        );
+        let total_only_cost = estimated_cost(&total_only);
+        assert_eq!(total_only_cost.units, 280);
+        assert!(!total_only_cost.used_model_fallback);
+        assert!(total_only_cost.used_token_breakdown_fallback);
+    }
+
+    #[test]
+    fn cached_input_is_clamped_to_input_tokens() {
+        let cost = estimated_cost(&priced_call(
+            "gpt-5.6-luna",
+            false,
+            TokenUsage {
+                input_tokens: 5,
+                cached_input_tokens: 8,
+                total_tokens: 5,
+                ..TokenUsage::default()
+            },
+        ));
+
+        assert_eq!(cost.units, 20);
+    }
 }

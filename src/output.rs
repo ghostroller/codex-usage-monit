@@ -582,7 +582,7 @@ fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) 
     }
 
     format!(
-        "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x local token share)",
+        "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x short-context price share)",
         window.used_percent, attribution.proxy_projected_percent
     )
 }
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_text_describes_codex_gauge_token_share_estimate() {
+    fn attribution_text_describes_price_weighted_codex_gauge_estimate() {
         let now = Utc::now();
         let attribution = AttributionSummary {
             window: Some(WindowDescriptor {
@@ -701,14 +701,14 @@ mod tests {
             unattributed_percent: 30.0,
             attribution_coverage_percent: 11.8,
             confidence: Confidence::Low,
-            method: "current_codex_gauge_token_share_proxy".to_string(),
+            method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
             ..AttributionSummary::default()
         };
 
         let allocation = attribution_allocation_line(&attribution);
         assert!(allocation.contains("estimated ~34.00pp"));
         assert!(allocation.contains("codex gauge 34.00% used"));
-        assert!(allocation.contains("gauge x local token share"));
+        assert!(allocation.contains("gauge x short-context price share"));
         assert!(!allocation.contains("observed"));
         assert!(!allocation.contains("evidence"));
         assert!(!allocation.contains("gap"));
@@ -767,7 +767,7 @@ mod tests {
             },
             proxy_projected_percent: 0.0,
             confidence: Confidence::Low,
-            method: "current_codex_gauge_token_share_proxy".to_string(),
+            method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
             ..AttributionSummary::default()
         };
 
@@ -855,6 +855,7 @@ mod tests {
             tasks: vec![TaskRecord {
                 thread_id: "task-thread".to_string(),
                 parent_thread_id: None,
+                archived: false,
                 title: "task".to_string(),
                 cwd: None,
                 source: Some("desktop".to_string()),
@@ -1175,8 +1176,8 @@ mod tests {
     #[test]
     fn terminal_text_removes_control_characters() {
         assert_eq!(
-            terminal_safe_text("before\u{1b}[2Jafter\u{7}"),
-            "before [2Jafter "
+            terminal_safe_text("before\u{1b}[2Jafter\u{7}\u{202e}done"),
+            "before [2Jafter  done"
         );
     }
 }

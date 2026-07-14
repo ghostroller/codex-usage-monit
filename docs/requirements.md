@@ -35,7 +35,7 @@ TUI Overview 显示近期 tasks：
 - task token 总量；
 - 当前选中 5h/Week reset cycle 的 local token share 与 estimated quota；
 - project、来源、turn 数和会话标题；会话标题优先取 `$CODEX_HOME/session_index.jsonl` 中 thread 最新的非空 `thread_name`，缺失或不可读时回退 rollout 首条消息摘要，`--redact-content` 始终显示 `[redacted]`；
-- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown 与所选 reset cycle local share 必须汇总当前过滤树内所有隐藏后代，并以同一普通 `codex` 分母重算 estimated quota；Spark 后代不得进入 local share 或 EST。展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
+- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown 与所选 reset cycle local share 必须汇总当前过滤树内所有隐藏后代，estimated quota 必须累加同一短上下文价格加权分母下的实体值；Spark 后代不得进入 local share 或 EST。展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
 - Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；当前会话标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
 - 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，两个提示整体都是鼠标按钮，且出现或消失不得移动相邻控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
 - Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影。筛选编辑确认后，非输入状态下的 `Delete` 与可点击 `[Del]` 清空当前焦点面板的查询；从 Turns 切换回 Tasks 时自动清空 Turns 查询及编辑恢复状态、重置 Turns 筛选投影，同时保留 Tasks 查询；
@@ -81,11 +81,14 @@ task/thread -> turn -> model token events
 
 - 只选择当前普通 `codex` 窗口，并按该窗口的 `resetsAt - windowDurationMins` 边界筛选本地调用；
 - `local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100`；
-- `estimated_quota_percent = codex_used_percent * local_share_percent / 100`；
-- task、turn、model 使用同一分母，所有可用 EST 都以 `~` 和 Low confidence 显示；
+- EST 使用 OpenAI API Pricing 的短上下文价格；Standard/Fast 的 `(input, cached input, output)` 美元/百万 token 分别为：`gpt-5.6-sol` `(5,.5,30)/(10,1,60)`、`gpt-5.6-terra` `(2.5,.25,15)/(5,.5,30)`、`gpt-5.6-luna` `(1,.1,6)/(2,.2,12)`、`gpt-5.5` `(5,.5,30)/(12.5,1.25,75)`、`gpt-5.4` `(2.5,.25,15)/(5,.5,30)`、`gpt-5.4-mini` `(.75,.075,4.5)/(1.5,.15,9)`；
+- 仅 `serviceTier=priority` 使用 Fast 价格，其他服务层使用 Standard；`cached = min(cached_input, input)`，`uncached = input - cached`，`call_price_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；
+- rollout 未暴露 GPT-5.6 cache-write token，不能套用价目表的独立 cache-write 价格；只有 total 而缺少 input/output breakdown 时按 uncached input 降级，并增加 `token_breakdown_missing` partial reason；
+- 缺失或未定价的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast 价格降级，并增加 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
+- `estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units`；task、turn、model 的 EST 使用同一价格分母，LOCAL 使用同一原始 token 分母；所有可用 EST 都以 `~` 和 Low confidence 显示；
 - partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST，但必须保留数据质量标记；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；
-- 显式标记 external activity possible，不得把线性 token 代理称为服务端账单；
+- 显式标记 external activity possible，不得把短上下文价格代理称为服务端账单；
 - 服务端不提供当前 300 分钟窗口时，不得用周窗口冒充 5 小时归因；Models 面板必须显示明确的 unavailable 原因，不能只留下空表或把不可用表达成零模型使用量。
 - 任何 scope 不可用时不得回退到另一 duration 冒充；旧顶层 window 字段固定兼容首选 5h 结果，周结果只进入多窗口分析结构。
 

@@ -405,6 +405,8 @@ struct ThreadBuilder {
     thread_id: String,
     parent_thread_id: Option<String>,
     parent_thread_rank: Option<ParentThreadRank>,
+    seen_active_file: bool,
+    seen_archived_file: bool,
     title: Option<String>,
     cwd: Option<PathBuf>,
     source: Option<String>,
@@ -1782,6 +1784,11 @@ fn replay_rollout_file(
             thread_id: thread_id.to_owned(),
             ..ThreadBuilder::default()
         });
+    if path.starts_with(config.codex_home.join("archived_sessions")) {
+        thread.seen_archived_file = true;
+    } else {
+        thread.seen_active_file = true;
+    }
 
     for event in &parsed.events {
         match event {
@@ -2077,10 +2084,11 @@ fn apply_token_count(
         .last()
         .cloned()
         .or_else(|| thread.last_turn_id.clone());
-    let model = turn_id
+    let (model, service_tier) = turn_id
         .as_deref()
         .and_then(|turn_id| thread.turns.get(turn_id))
-        .and_then(|turn| turn.model.clone());
+        .map(|turn| (turn.model.clone(), turn.service_tier.clone()))
+        .unwrap_or_default();
     if let Some(turn_id) = turn_id.as_deref() {
         ensure_turn(thread, turn_id).token_usage.add_assign(delta);
     }
@@ -2089,6 +2097,7 @@ fn apply_token_count(
         thread_id: thread.thread_id.clone(),
         turn_id,
         model,
+        service_tier,
         tokens: delta,
     });
 }
@@ -2308,6 +2317,7 @@ fn finish_dataset(
         dataset.tasks.push(TaskRecord {
             thread_id: thread.thread_id,
             parent_thread_id: thread.parent_thread_id,
+            archived: thread.seen_archived_file && !thread.seen_active_file,
             title,
             cwd: thread.cwd,
             source: thread.source,

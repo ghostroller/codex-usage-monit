@@ -136,8 +136,8 @@ Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `p
 Estimated 部分：
 
 1. 读取所选当前 `codex` 窗口的 `usedPercent`；
-2. 对 task/turn/model 分别计算 `entity_non_spark_tokens / all_local_non_spark_tokens`；
-3. 计算 `estimatedQuotaPercent = usedPercent * localSharePercent / 100`；
+2. LOCAL 对 task/turn/model 分别计算原始 `entity_non_spark_tokens / all_local_non_spark_tokens`；
+3. EST 按模型与 `priority`/Standard 的短上下文 input、cached input、output 价格生成整数成本单位，计算 `estimatedQuotaPercent = usedPercent * entityPriceUnits / allPriceUnits`；
 4. 所有可用实体结果标为 Low，TUI/text 加 `~`，summary 保留 `externalActivityPossible`；
 5. partial、lookback 不完整与 stale 继续记录质量问题，但不清空仍可计算的 estimate；
 6. 当前 `codex` 窗口或本地非 Spark 分母不存在时保持 unavailable。

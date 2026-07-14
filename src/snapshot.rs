@@ -643,6 +643,7 @@ mod tests {
             thread_id: thread_id.to_string(),
             turn_id: Some(turn_id.to_string()),
             model: Some(model.to_string()),
+            service_tier: None,
             tokens: TokenUsage {
                 input_tokens: total_tokens,
                 total_tokens,
@@ -746,8 +747,8 @@ mod tests {
         let reset = now + Duration::days(2);
         let limits = vec![weekly_limit(now, reset, "codex", 40.0)];
         let calls = vec![
-            usage_call(now - Duration::hours(2), "a", "a-turn", "gpt-a", 100),
-            usage_call(now - Duration::hours(1), "b", "b-turn", "gpt-b", 300),
+            usage_call(now - Duration::hours(2), "a", "a-turn", "gpt-5.6-sol", 100),
+            usage_call(now - Duration::hours(1), "b", "b-turn", "gpt-5.5", 300),
         ];
         let mut analyses = analyze_windows(&[], &[], &calls, &[], &limits, now);
 
@@ -756,7 +757,7 @@ mod tests {
         assert_close(analysis.attribution.proxy_projected_percent, 40.0);
         assert_eq!(
             analysis.attribution.method,
-            "current_codex_gauge_token_share_proxy"
+            "current_codex_gauge_short_context_price_weighted_proxy"
         );
         assert_eq!(analysis.attribution.confidence, Confidence::Low);
         assert_close(analysis.threads[0].usage.estimated_quota_percent, 10.0);
@@ -797,7 +798,7 @@ mod tests {
                 now - Duration::minutes(2),
                 "regular",
                 "regular-turn",
-                "gpt-5.6-codex",
+                "gpt-5.6-sol",
                 300,
             ),
             usage_call(
@@ -821,7 +822,7 @@ mod tests {
         assert_eq!(analysis.threads.len(), 1);
         assert_eq!(analysis.threads[0].thread_id, "regular");
         assert_eq!(analysis.models.len(), 1);
-        assert_eq!(analysis.models[0].model, "gpt-5.6-codex");
+        assert_eq!(analysis.models[0].model, "gpt-5.6-sol");
         assert_close(analysis.models[0].estimated_quota_percent, 34.0);
     }
     #[test]

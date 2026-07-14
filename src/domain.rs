@@ -231,6 +231,8 @@ pub struct TaskRecord {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
     pub title: String,
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,
@@ -272,7 +274,7 @@ pub struct TurnRecord {
 
 impl TurnRecord {
     pub fn is_fast(&self) -> bool {
-        self.service_tier.as_deref() == Some("priority")
+        is_fast_service_tier(self.service_tier.as_deref())
     }
 }
 
@@ -303,8 +305,9 @@ pub struct AttributionSummary {
     pub local_token_usage: TokenUsage,
     pub observed_delta_percent: f64,
     pub estimated_assigned_percent: f64,
-    /// Current normal-Codex gauge percentage distributed by local token share.
-    /// This is a low-confidence estimate, not server-side entity accounting.
+    /// Current normal-Codex gauge percentage projected across entities using
+    /// the local short-context price-weighted denominator. This is a
+    /// low-confidence estimate, not server-side entity accounting.
     #[serde(default)]
     pub proxy_projected_percent: f64,
     pub unattributed_percent: f64,
@@ -419,7 +422,18 @@ pub struct UsageCall {
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub model: Option<String>,
+    pub service_tier: Option<String>,
     pub tokens: TokenUsage,
+}
+
+impl UsageCall {
+    pub fn is_fast(&self) -> bool {
+        is_fast_service_tier(self.service_tier.as_deref())
+    }
+}
+
+fn is_fast_service_tier(service_tier: Option<&str>) -> bool {
+    service_tier.is_some_and(|tier| tier.trim().eq_ignore_ascii_case("priority"))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -468,11 +482,18 @@ pub fn terminal_safe_text(value: &str) -> String {
     value
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_bidi_control(character) {
                 ' '
             } else {
                 character
             }
         })
         .collect()
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }

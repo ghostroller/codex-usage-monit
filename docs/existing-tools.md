@@ -37,7 +37,7 @@
 2. CodexBar 的只读 App Server 额度读取；
 3. codex-ops/ccusage 的 rollout token 重建。
 
-本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。EST 明确使用 `codex usedPercent × 本地非 Spark token share`，不会把 token 占比冒充官方额度账单。
+本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。LOCAL 保留原始非 Spark token share，EST 使用 `codex usedPercent × 模型/服务层短上下文价格加权用量占比`，不会把 token 占比冒充官方额度账单。
 
 ## Idle 后是否精确
 

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,7 +34,13 @@ use crate::domain::{
     TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage,
     terminal_safe_text,
 };
+use crate::open_config::{OpenConfig, OpenConfigStore};
 use crate::rollout::RolloutCache;
+use crate::session_launch::{
+    FocusResult, LaunchContext, LaunchResult, PaneId, ResumeTarget, ZellijOptions,
+    check_eligibility, check_eligibility_without_cwd_probe, execute_zellij_launch,
+    focus_existing_pane, prepare_zellij_focus, prepare_zellij_launch,
+};
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
 use crate::ui_state::{
     UiState, UiStateStore, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
@@ -43,6 +50,7 @@ const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
+const OPEN_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const TAB_PADDING: &str = " ";
 const TAB_DIVIDER: &str = " | ";
 const ENTER_FOCUS_HINT: &str = "↵";
@@ -50,6 +58,7 @@ const BACK_FOCUS_HINT: &str = "←";
 const CLEAR_FILTER_LABEL: &str = "[Del]";
 const FILTER_CLEAR_GAP_WIDTH: u16 = 1;
 const FILTER_MIN_QUERY_WIDTH: u16 = 1;
+const RESUME_CONFIRM_MIN_INNER_WIDTH: u16 = 44;
 const TASK_TOKENS_WIDTH: u16 = 10;
 const TASK_LOCAL_WIDTH: u16 = 8;
 const TASK_QUOTA_WIDTH: u16 = 8;
@@ -571,6 +580,7 @@ struct TaskControlsHitbox {
     search: Rect,
     clear_search: Rect,
     enter_turns: Rect,
+    open_terminal: Rect,
     toggle_tree: Rect,
     collapse_all: Rect,
 }
@@ -604,6 +614,67 @@ struct WindowControlsHitbox {
 struct QuitConfirmationHitbox {
     confirm: Rect,
     cancel: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResumeConfirmationHitbox {
+    confirm: Rect,
+    cancel: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResumeConfirmation {
+    thread_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenNoticeTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenNotice {
+    message: String,
+    tone: OpenNoticeTone,
+    created_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+enum ResumeLaunchRequest {
+    Create {
+        target: ResumeTarget,
+        codex_home: PathBuf,
+        codex_bin: Option<PathBuf>,
+        options: ZellijOptions,
+    },
+    Focus {
+        thread_id: String,
+        pane_id: PaneId,
+        codex_home: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResumeLaunchOutcome {
+    Created(PaneId),
+    Focused(PaneId),
+    Missing(PaneId),
+}
+
+#[derive(Debug)]
+struct ResumeLaunchCompletion {
+    thread_id: String,
+    result: Result<ResumeLaunchOutcome, String>,
+}
+
+struct RunLoopChannels<'a> {
+    refresh_sender: &'a mpsc::Sender<(CollectionResult, bool)>,
+    refresh_receiver: &'a Receiver<(CollectionResult, bool)>,
+    resume_sender: &'a mpsc::Sender<ResumeLaunchCompletion>,
+    resume_receiver: &'a Receiver<ResumeLaunchCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -707,6 +778,15 @@ struct App {
     turns_default_visible: bool,
     turns_temporarily_visible: bool,
     models_visible: bool,
+    open_config: OpenConfig,
+    open_config_error: Option<String>,
+    zellij_environment: bool,
+    resume_confirmation: Option<ResumeConfirmation>,
+    resume_confirmation_hitbox: Option<ResumeConfirmationHitbox>,
+    pending_resume: Option<ResumeLaunchRequest>,
+    launching_threads: HashSet<String>,
+    open_panes: HashMap<String, PaneId>,
+    open_notice: Option<OpenNotice>,
     selected_task: usize,
     selected_turn: usize,
     turn_offset: usize,
@@ -758,6 +838,15 @@ impl App {
             turns_default_visible: true,
             turns_temporarily_visible: false,
             models_visible: true,
+            open_config: OpenConfig::default(),
+            open_config_error: None,
+            zellij_environment: std::env::var_os("ZELLIJ").is_some(),
+            resume_confirmation: None,
+            resume_confirmation_hitbox: None,
+            pending_resume: None,
+            launching_threads: HashSet::new(),
+            open_panes: HashMap::new(),
+            open_notice: None,
             selected_task: 0,
             selected_turn: 0,
             turn_offset: 0,
@@ -795,6 +884,249 @@ impl App {
         self.reconcile_task_filter(true);
         if self.view == View::Health {
             self.transition_to_tasks();
+        }
+    }
+
+    fn apply_open_config(&mut self, config: OpenConfig, error: Option<String>) {
+        self.open_config = config;
+        self.open_config_error = error;
+    }
+
+    fn set_open_notice(&mut self, message: impl Into<String>, tone: OpenNoticeTone) {
+        self.open_notice = Some(OpenNotice {
+            message: message.into(),
+            tone,
+            created_at: Instant::now(),
+        });
+    }
+
+    fn open_config_unavailable_reason(&self) -> Option<String> {
+        if let Some(error) = self.open_config_error.as_deref() {
+            return Some(format!("Open config is unavailable: {error}"));
+        }
+        if !self.open_config.enabled {
+            return Some("Open is disabled in the user configuration".to_string());
+        }
+        if !self.zellij_environment {
+            return Some("Open requires codex-usage-monit to run inside Zellij".to_string());
+        }
+        None
+    }
+
+    fn target_open_unavailable_reason(
+        &self,
+        target: &ResumeTarget,
+        probe_cwd: bool,
+    ) -> Option<String> {
+        if let Some(reason) = self.open_config_unavailable_reason() {
+            return Some(reason);
+        }
+        if self.launching_threads.contains(&target.thread_id) {
+            return Some("This task is already opening in Zellij".to_string());
+        }
+        let result = if probe_cwd {
+            check_eligibility(target)
+        } else {
+            check_eligibility_without_cwd_probe(target)
+        };
+        result.err().map(|error| error.to_string())
+    }
+
+    fn open_control_available(&self) -> bool {
+        if self.view != View::Overview || self.focus != Focus::Tasks || !self.shortcuts_active() {
+            return false;
+        }
+        let Some(task) = self.selected_task_record() else {
+            return false;
+        };
+        if self.open_config_unavailable_reason().is_some()
+            || self.launching_threads.contains(&task.thread_id)
+        {
+            return false;
+        }
+        if self.open_panes.contains_key(&task.thread_id) {
+            return true;
+        }
+        let target = ResumeTarget::from_task(task);
+        self.target_open_unavailable_reason(&target, false)
+            .is_none()
+    }
+
+    fn activate_open(&mut self) {
+        if self.view != View::Overview || self.focus != Focus::Tasks {
+            return;
+        }
+        let Some(task) = self.selected_task_record().cloned() else {
+            self.set_open_notice("No task selected", OpenNoticeTone::Warning);
+            return;
+        };
+        if let Some(reason) = self.open_config_unavailable_reason() {
+            self.set_open_notice(reason, OpenNoticeTone::Error);
+            return;
+        }
+        if self.launching_threads.contains(&task.thread_id) {
+            self.set_open_notice(
+                "This task is already opening in Zellij",
+                OpenNoticeTone::Info,
+            );
+            return;
+        }
+        if let Some(pane_id) = self.open_panes.get(&task.thread_id).cloned() {
+            self.start_focus_request(task.thread_id, pane_id);
+            return;
+        }
+        let target = ResumeTarget::from_task(&task);
+        if let Some(reason) = self.target_open_unavailable_reason(&target, true) {
+            let tone = if self.launching_threads.contains(&target.thread_id) {
+                OpenNoticeTone::Info
+            } else {
+                OpenNoticeTone::Error
+            };
+            self.set_open_notice(reason, tone);
+            return;
+        }
+        self.open_notice = None;
+        self.resume_confirmation = Some(ResumeConfirmation {
+            thread_id: target.thread_id,
+        });
+    }
+
+    fn start_focus_request(&mut self, thread_id: String, pane_id: PaneId) {
+        if self.pending_resume.is_some() {
+            self.set_open_notice(
+                "Another Open request is waiting to launch",
+                OpenNoticeTone::Warning,
+            );
+            return;
+        }
+        let pane_label = pane_id.as_str().to_string();
+        self.pending_resume = Some(ResumeLaunchRequest::Focus {
+            thread_id: thread_id.clone(),
+            pane_id,
+            codex_home: self.snapshot.codex_home.clone(),
+        });
+        self.launching_threads.insert(thread_id.clone());
+        self.set_open_notice(
+            format!(
+                "Focusing {pane_label} for {}...",
+                short_thread_id(&thread_id)
+            ),
+            OpenNoticeTone::Info,
+        );
+    }
+
+    fn close_resume_confirmation(&mut self) {
+        self.resume_confirmation = None;
+        self.resume_confirmation_hitbox = None;
+    }
+
+    fn confirm_resume(&mut self) {
+        if self
+            .resume_confirmation_hitbox
+            .is_none_or(|hitbox| hitbox.confirm.is_empty())
+        {
+            return;
+        }
+        let Some(thread_id) = self
+            .resume_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.thread_id.clone())
+        else {
+            return;
+        };
+        let Some(task) = self
+            .snapshot
+            .tasks
+            .iter()
+            .find(|task| task.thread_id == thread_id)
+            .cloned()
+        else {
+            self.close_resume_confirmation();
+            self.set_open_notice(
+                "The selected task is no longer available",
+                OpenNoticeTone::Error,
+            );
+            return;
+        };
+        let target = ResumeTarget::from_task(&task);
+        if let Some(pane_id) = self.open_panes.get(&thread_id).cloned() {
+            self.close_resume_confirmation();
+            self.start_focus_request(thread_id, pane_id);
+            return;
+        }
+        if let Some(reason) = self.target_open_unavailable_reason(&target, true) {
+            self.close_resume_confirmation();
+            self.set_open_notice(reason, OpenNoticeTone::Error);
+            return;
+        }
+        if self.pending_resume.is_some() {
+            self.close_resume_confirmation();
+            self.set_open_notice(
+                "Another Open request is waiting to launch",
+                OpenNoticeTone::Warning,
+            );
+            return;
+        }
+
+        let options = ZellijOptions {
+            floating: self.open_config.zellij.floating,
+            width_percent: self.open_config.zellij.width_percent,
+            height_percent: self.open_config.zellij.height_percent,
+            close_on_exit: self.open_config.zellij.close_on_exit,
+        };
+        self.pending_resume = Some(ResumeLaunchRequest::Create {
+            target,
+            codex_home: self.snapshot.codex_home.clone(),
+            codex_bin: self.open_config.codex_bin.clone(),
+            options,
+        });
+        self.launching_threads.insert(thread_id.clone());
+        self.close_resume_confirmation();
+        self.set_open_notice(
+            format!("Opening {} in Zellij...", short_thread_id(&thread_id)),
+            OpenNoticeTone::Info,
+        );
+    }
+
+    fn apply_resume_completion(&mut self, completion: ResumeLaunchCompletion) {
+        self.launching_threads.remove(&completion.thread_id);
+        match completion.result {
+            Ok(ResumeLaunchOutcome::Created(pane_id)) => {
+                let pane_label = pane_id.as_str().to_string();
+                self.open_panes
+                    .insert(completion.thread_id.clone(), pane_id);
+                self.set_open_notice(
+                    format!(
+                        "Opened {} in {pane_label}",
+                        short_thread_id(&completion.thread_id)
+                    ),
+                    OpenNoticeTone::Success,
+                );
+            }
+            Ok(ResumeLaunchOutcome::Focused(pane_id)) => {
+                let pane_label = pane_id.as_str().to_string();
+                self.open_panes
+                    .insert(completion.thread_id.clone(), pane_id);
+                self.set_open_notice(
+                    format!(
+                        "Focused {pane_label} for {}",
+                        short_thread_id(&completion.thread_id)
+                    ),
+                    OpenNoticeTone::Success,
+                );
+            }
+            Ok(ResumeLaunchOutcome::Missing(pane_id)) => {
+                if self.open_panes.get(&completion.thread_id) == Some(&pane_id) {
+                    self.open_panes.remove(&completion.thread_id);
+                }
+                self.set_open_notice(
+                    "The previous pane was closed; press O again to resume in a new terminal",
+                    OpenNoticeTone::Warning,
+                );
+            }
+            Err(error) => {
+                self.set_open_notice(format!("Open failed: {error}"), OpenNoticeTone::Error);
+            }
         }
     }
 
@@ -949,6 +1281,13 @@ impl App {
             .then_some(task.thread_id.as_str())
     }
 
+    fn selected_task_record(&self) -> Option<&TaskRecord> {
+        let task = self.snapshot.tasks.get(self.selected_task)?;
+        self.filtered_task_indices()
+            .contains(&self.selected_task)
+            .then_some(task)
+    }
+
     fn nearest_visible_task_ancestor(
         &self,
         index: usize,
@@ -1051,7 +1390,9 @@ impl App {
     }
 
     fn shortcuts_active(&self) -> bool {
-        !self.focus.is_search() && !self.quit_confirmation_visible
+        !self.focus.is_search()
+            && !self.quit_confirmation_visible
+            && self.resume_confirmation.is_none()
     }
 
     fn close_temporary_turns(&mut self) {
@@ -1498,6 +1839,7 @@ impl App {
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
         self.scroll_drag = None;
+        self.resume_confirmation_hitbox = None;
         let restored_task = selected.as_deref().and_then(|thread_id| {
             self.snapshot
                 .tasks
@@ -1827,6 +2169,10 @@ impl App {
             self.focus_turns();
             return true;
         }
+        if rect_contains(hitbox.open_terminal, column, row) && self.focus == Focus::Tasks {
+            self.activate_open();
+            return true;
+        }
         if rect_contains(hitbox.toggle_tree, column, row) {
             self.accept_active_search();
             self.toggle_task_list_mode();
@@ -2122,6 +2468,23 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.resume_confirmation.is_some() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            if app
+                .resume_confirmation_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.confirm, event.column, event.row))
+            {
+                app.confirm_resume();
+            } else if app
+                .resume_confirmation_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.cancel, event.column, event.row))
+            {
+                app.close_resume_confirmation();
+            }
+        }
+        return true;
+    }
+
     if app.quit_confirmation_visible {
         if event.kind == MouseEventKind::Down(MouseButton::Left) {
             if app
@@ -2151,12 +2514,19 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
             {
                 true
             } else {
+                let activate_selected_task =
+                    app.focus == Focus::Tasks && app.selected_task_record().is_some();
+                let previously_selected_task = app.selected_task;
                 app.accept_active_search();
                 if app.select_turn_at(event.column, event.row) {
                     app.focus = Focus::Turns;
                     true
                 } else if app.select_task_at(event.column, event.row) {
-                    app.focus_tasks();
+                    if activate_selected_task && app.selected_task == previously_selected_task {
+                        app.focus_turns();
+                    } else {
+                        app.focus_tasks();
+                    }
                     true
                 } else {
                     false
@@ -2195,6 +2565,10 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn short_thread_id(thread_id: &str) -> &str {
+    thread_id.get(..8).unwrap_or(thread_id)
 }
 
 fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
@@ -2321,6 +2695,45 @@ fn truncate_display_text(value: &str, max_width: usize) -> String {
     output
 }
 
+fn truncate_middle_display_text(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let content_width = max_width - 1;
+    let prefix_target = content_width / 3;
+    let suffix_target = content_width - prefix_target;
+    let mut prefix = String::new();
+    let mut prefix_width = 0;
+    for character in value.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if prefix_width + width > prefix_target {
+            break;
+        }
+        prefix.push(character);
+        prefix_width += width;
+    }
+
+    let mut suffix = Vec::new();
+    let mut suffix_width = 0;
+    for character in value.chars().rev() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if suffix_width + width > suffix_target {
+            break;
+        }
+        suffix.push(character);
+        suffix_width += width;
+    }
+    suffix.reverse();
+    format!("{prefix}…{}", suffix.into_iter().collect::<String>())
+}
+
 fn fast_model_line(value: &str, column_width: usize, theme: Theme) -> Line<'static> {
     const SUFFIX: &str = " FAST";
     let value_width = column_width.saturating_sub(UnicodeWidthStr::width(SUFFIX));
@@ -2338,6 +2751,15 @@ fn fast_model_line(value: &str, column_width: usize, theme: Theme) -> Line<'stat
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
+    }
+
+    if app.resume_confirmation.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_resume(),
+            KeyCode::Esc => app.close_resume_confirmation(),
+            _ => {}
+        }
+        return false;
     }
 
     if app.quit_confirmation_visible {
@@ -2429,6 +2851,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('m' | 'M') if app.view == View::Overview => {
             app.toggle_models_visibility();
+        }
+        KeyCode::Char('o' | 'O') if app.view == View::Overview && app.focus == Focus::Tasks => {
+            app.activate_open();
         }
         KeyCode::Char('r' | 'R') if app.view != View::Health => {
             app.toggle_task_list_mode();
@@ -2622,12 +3047,18 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     terminal_setup_span.finish("clear=true");
 
     let (sender, receiver) = mpsc::channel::<(CollectionResult, bool)>();
+    let (resume_sender, resume_receiver) = mpsc::channel::<ResumeLaunchCompletion>();
+    let channels = RunLoopChannels {
+        refresh_sender: &sender,
+        refresh_receiver: &receiver,
+        resume_sender: &resume_sender,
+        resume_receiver: &resume_receiver,
+    };
     let result = run_loop(
         &mut terminal,
         &mut app,
         &config,
-        &sender,
-        &receiver,
+        &channels,
         rollout_cache,
         &ui_state_store,
     );
@@ -2645,6 +3076,29 @@ fn prepare_initial_tui(
     let mut ui_state_store = UiStateStore::discover();
     let ui_state = ui_state_store.load();
     state_span.finish("source=user_state");
+    let open_config_span = config.startup_trace.span("tui.open_config_load");
+    let open_config_store = OpenConfigStore::discover();
+    let open_config_path_available = open_config_store.path().is_some();
+    let (open_config, open_config_error) = match open_config_store.load_or_create() {
+        Ok(open_config) => (open_config, None),
+        Err(error) => {
+            let message = open_config_store.path().map_or_else(
+                || error.to_string(),
+                |path| format!("{}: {error}", path.display()),
+            );
+            (OpenConfig::disabled(), Some(message))
+        }
+    };
+    open_config_span.finish(format!(
+        "path_available={} enabled={} status={}",
+        open_config_path_available,
+        open_config.enabled,
+        if open_config_error.is_some() {
+            "error"
+        } else {
+            "loaded"
+        }
+    ));
     let cache_span = config.startup_trace.span("tui.cache_create");
     let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
     cache_span.finish(if config.rollout_cache_dir.is_some() {
@@ -2672,6 +3126,7 @@ fn prepare_initial_tui(
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial, initial_theme);
     app.apply_ui_state(&ui_state, theme_override);
+    app.apply_open_config(open_config, open_config_error);
     app_span.finish_with(|| {
         format!(
             "theme={} turns_visible={} models_visible={} tree={}",
@@ -2714,15 +3169,17 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     config: &CollectConfig,
-    sender: &mpsc::Sender<(CollectionResult, bool)>,
-    receiver: &Receiver<(CollectionResult, bool)>,
+    channels: &RunLoopChannels<'_>,
     rollout_cache: Arc<Mutex<RolloutCache>>,
     ui_state_store: &UiStateStore,
 ) -> Result<()> {
     let mut first_frame = true;
     loop {
-        while let Ok((result, refreshed_account)) = receiver.try_recv() {
+        while let Ok((result, refreshed_account)) = channels.refresh_receiver.try_recv() {
             app.replace(result, refreshed_account);
+        }
+        while let Ok(completion) = channels.resume_receiver.try_recv() {
+            app.apply_resume_completion(completion);
         }
 
         if first_frame {
@@ -2763,12 +3220,19 @@ fn run_loop(
             }
         }
 
+        if let Some(request) = app.pending_resume.take() {
+            let worker_sender = channels.resume_sender.clone();
+            thread::spawn(move || {
+                let _ = worker_sender.send(execute_resume_request(request));
+            });
+        }
+
         if !app.worker_running && app.last_local_refresh.elapsed() >= LOCAL_REFRESH {
             let refresh_account =
                 !config.offline && app.last_account_refresh.elapsed() >= ACCOUNT_REFRESH;
             let worker_config = config.clone();
             let cached_account = app.account.clone();
-            let worker_sender = sender.clone();
+            let worker_sender = channels.refresh_sender.clone();
             let worker_cache = Arc::clone(&rollout_cache);
             app.worker_running = true;
             thread::spawn(move || {
@@ -2789,6 +3253,49 @@ fn run_loop(
     }
 }
 
+fn execute_resume_request(request: ResumeLaunchRequest) -> ResumeLaunchCompletion {
+    let (thread_id, result) = match request {
+        ResumeLaunchRequest::Create {
+            target,
+            codex_home,
+            codex_bin,
+            options,
+        } => {
+            let thread_id = target.thread_id.clone();
+            let result = (|| -> Result<ResumeLaunchOutcome, String> {
+                let context = LaunchContext::capture(codex_home, codex_bin)
+                    .map_err(|error| error.to_string())?;
+                let plan = prepare_zellij_launch(&target, &context, &options)
+                    .map_err(|error| error.to_string())?;
+                match execute_zellij_launch(&plan).map_err(|error| error.to_string())? {
+                    LaunchResult::Created { pane_id } => Ok(ResumeLaunchOutcome::Created(pane_id)),
+                }
+            })();
+            (thread_id, result)
+        }
+        ResumeLaunchRequest::Focus {
+            thread_id,
+            pane_id,
+            codex_home,
+        } => {
+            let result = (|| -> Result<ResumeLaunchOutcome, String> {
+                let context =
+                    LaunchContext::capture(codex_home, None).map_err(|error| error.to_string())?;
+                let zellij_bin =
+                    prepare_zellij_focus(&context).map_err(|error| error.to_string())?;
+                match focus_existing_pane(&zellij_bin, &pane_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    FocusResult::Focused => Ok(ResumeLaunchOutcome::Focused(pane_id)),
+                    FocusResult::Missing => Ok(ResumeLaunchOutcome::Missing(pane_id)),
+                }
+            })();
+            (thread_id, result)
+        }
+    };
+    ResumeLaunchCompletion { thread_id, result }
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     app.task_table_hitbox = None;
@@ -2801,6 +3308,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
     app.quit_confirmation_hitbox = None;
+    app.resume_confirmation_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
     let root = Layout::default()
@@ -2871,7 +3379,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     {
         app.scroll_drag = None;
     }
-    if app.quit_confirmation_visible {
+    if app.resume_confirmation.is_some() {
+        app.resume_confirmation_hitbox = Some(render_resume_confirmation(frame, area, app));
+    } else if app.quit_confirmation_visible {
         app.quit_confirmation_hitbox = Some(render_quit_confirmation(frame, area, app.theme));
     }
 }
@@ -3022,6 +3532,203 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         toggle_models,
         scopes,
     }
+}
+
+fn render_resume_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+) -> ResumeConfirmationHitbox {
+    let palette = app.theme.palette();
+    let popup_width = area.width.min(88);
+    let popup_height = area.height.min(12);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(app.theme.base_style())
+        .title(Span::styled(
+            " Resume in new Codex terminal? ",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let thread_id = app
+        .resume_confirmation
+        .as_ref()
+        .map(|confirmation| confirmation.thread_id.as_str())
+        .unwrap_or_default();
+    let task = app
+        .snapshot
+        .tasks
+        .iter()
+        .find(|task| task.thread_id == thread_id);
+    let content_height = inner.height.saturating_sub(2);
+    let mut confirmation_content_fits = false;
+    if content_height > 0 {
+        let width = usize::from(inner.width);
+        let mut lines = if let Some(task) = task {
+            let source = task.source.as_deref().unwrap_or("unknown");
+            let cwd = task
+                .cwd
+                .as_deref()
+                .map(|path| terminal_safe_text(path.to_string_lossy().as_ref()))
+                .unwrap_or_else(|| "-".to_string());
+            let target = if app.open_config.zellij.floating {
+                format!(
+                    "zellij floating pane · {}% x {}% · current session",
+                    app.open_config.zellij.width_percent, app.open_config.zellij.height_percent
+                )
+            } else {
+                "zellij pane · current session".to_string()
+            };
+            let cwd_label = "Cwd:     ";
+            let cwd = truncate_middle_display_text(
+                &cwd,
+                width.saturating_sub(UnicodeWidthStr::width(cwd_label)),
+            );
+            vec![
+                Line::from(truncate_display_text(
+                    &format!("Task:    {}", terminal_safe_text(&task.title)),
+                    width,
+                )),
+                Line::from(truncate_display_text(
+                    &format!("Thread:  {}", terminal_safe_text(&task.thread_id)),
+                    width,
+                )),
+                Line::from(truncate_display_text(
+                    &format!("Source:  {}", terminal_safe_text(source)),
+                    width,
+                )),
+                Line::from(truncate_display_text(
+                    &format!(
+                        "Status:  {} · {}",
+                        task.status.label(),
+                        status_evidence(task.status_provenance, task.status_confidence)
+                    ),
+                    width,
+                )),
+                Line::from(format!("{cwd_label}{cwd}")),
+                Line::from(truncate_display_text(&format!("Target:  {target}"), width)),
+            ]
+        } else {
+            vec![Line::styled(
+                truncate_display_text(
+                    &format!(
+                        "Task is no longer available: {}",
+                        terminal_safe_text(thread_id)
+                    ),
+                    width,
+                ),
+                Style::default().fg(palette.error),
+            )]
+        };
+        if task.is_some_and(|task| {
+            matches!(task.status, TaskStatus::Stale | TaskStatus::Unknown)
+                || matches!(
+                    task.status_confidence,
+                    Confidence::Low | Confidence::Unknown
+                )
+        }) {
+            lines.push(Line::styled(
+                truncate_display_text(
+                    "Status is uncertain; another frontend may still be active.",
+                    width,
+                ),
+                Style::default().fg(palette.warning),
+            ));
+        }
+        lines.push(Line::styled(
+            truncate_display_text(
+                "Creates a new CLI frontend and uses the current working tree.",
+                width,
+            ),
+            Style::default().fg(palette.warning),
+        ));
+        confirmation_content_fits = task.is_some()
+            && inner.width >= RESUME_CONFIRM_MIN_INNER_WIDTH
+            && usize::from(content_height) >= lines.len();
+        if task.is_some() && !confirmation_content_fits {
+            lines = vec![Line::styled(
+                truncate_display_text("Resize terminal to review cwd and confirm.", width),
+                Style::default().fg(palette.warning),
+            )];
+        }
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect::new(inner.x, inner.y, inner.width, content_height),
+        );
+    }
+
+    let full = inner.width >= 25;
+    let confirm_label = if full { "[↵] Open" } else { "[↵]" };
+    let cancel_label = if full { "[Esc] Cancel" } else { "[Esc]" };
+    let gap = if full { "   " } else { " " };
+    let confirm_width = u16::try_from(UnicodeWidthStr::width(confirm_label)).unwrap_or(u16::MAX);
+    let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let both_width = confirm_width
+        .saturating_add(gap_width)
+        .saturating_add(cancel_width);
+    let button_y = inner.bottom().saturating_sub(1);
+    let button_style = Style::default()
+        .fg(palette.foreground)
+        .bg(palette.gauge_track);
+    let shortcut_style = button_style.fg(palette.accent).add_modifier(Modifier::BOLD);
+    let mut confirm = Rect::default();
+    let mut cancel = Rect::default();
+    if confirmation_content_fits && inner.height > 0 && both_width <= inner.width {
+        let group_x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(both_width) / 2);
+        confirm = Rect::new(group_x, button_y, confirm_width, 1);
+        cancel = Rect::new(
+            group_x
+                .saturating_add(confirm_width)
+                .saturating_add(gap_width),
+            button_y,
+            cancel_width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[", button_style),
+                Span::styled("↵", shortcut_style),
+                Span::styled(if full { "] Open" } else { "]" }, button_style),
+                Span::raw(gap),
+                Span::styled("[", button_style),
+                Span::styled("Esc", shortcut_style),
+                Span::styled(if full { "] Cancel" } else { "]" }, button_style),
+            ])),
+            Rect::new(group_x, button_y, both_width, 1),
+        );
+    } else if inner.height > 0 && cancel_width <= inner.width {
+        let cancel_x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(cancel_width) / 2);
+        cancel = Rect::new(cancel_x, button_y, cancel_width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[", button_style),
+                Span::styled("Esc", shortcut_style),
+                Span::styled(if full { "] Cancel" } else { "]" }, button_style),
+            ])),
+            cancel,
+        );
+    }
+
+    ResumeConfirmationHitbox { confirm, cancel }
 }
 
 fn render_quit_confirmation(
@@ -3567,6 +4274,8 @@ fn task_panel_block(
     let full_controls_width = UnicodeWidthStr::width(format!(" {title}").as_str())
         + 2
         + 1
+        + UnicodeWidthStr::width("[O]Open")
+        + 1
         + UnicodeWidthStr::width("[R]Tree")
         + 1
         + UnicodeWidthStr::width("[E]Collapse")
@@ -3615,6 +4324,29 @@ fn task_panel_block(
         },
     ));
     title_x = title_x.saturating_add(1);
+
+    if !compact {
+        spans.push(Span::raw(" "));
+        title_x = title_x.saturating_add(1);
+    }
+    let open_label = if compact { "[O]" } else { "[O]Open" };
+    let open_width = u16::try_from(UnicodeWidthStr::width(open_label)).unwrap_or(u16::MAX);
+    let open_terminal = title_hitbox(area, title_x, open_width);
+    let open_style = Style::default().fg(palette.muted);
+    let open_shortcut_style = if app.open_control_available() {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        open_style
+    };
+    spans.push(Span::styled("[", open_style));
+    spans.push(Span::styled("O", open_shortcut_style));
+    spans.push(Span::styled(
+        if compact { "]" } else { "]Open" },
+        open_style,
+    ));
+    title_x = title_x.saturating_add(open_width);
 
     if !compact {
         spans.push(Span::raw(" "));
@@ -3808,27 +4540,45 @@ fn task_panel_block(
         spans.push(Span::raw(" "));
     }
 
-    let status = app
-        .snapshot
-        .tasks
-        .get(app.selected_task)
-        .filter(|task| app.task_matches_filter(task))
-        .map(|task| {
-            format!(
-                " {filtered_count}/{} · {} {} ",
-                app.snapshot.tasks.len(),
-                task.status.label(),
-                status_evidence(task.status_provenance, task.status_confidence)
-            )
-        })
-        .unwrap_or_else(|| {
-            let label = if app.snapshot.tasks.is_empty() {
-                "no tasks"
-            } else {
-                "no matches"
-            };
-            format!(" 0/{} · {label} ", app.snapshot.tasks.len())
-        });
+    let (status, status_color) = if let Some(notice) = app
+        .open_notice
+        .as_ref()
+        .filter(|notice| notice.created_at.elapsed() <= OPEN_NOTICE_DURATION)
+    {
+        let color = match notice.tone {
+            OpenNoticeTone::Info => palette.accent,
+            OpenNoticeTone::Success => palette.success,
+            OpenNoticeTone::Warning => palette.warning,
+            OpenNoticeTone::Error => palette.error,
+        };
+        (
+            format!(" Open · {} ", terminal_safe_text(&notice.message)),
+            color,
+        )
+    } else {
+        let status = app
+            .snapshot
+            .tasks
+            .get(app.selected_task)
+            .filter(|task| app.task_matches_filter(task))
+            .map(|task| {
+                format!(
+                    " {filtered_count}/{} · {} {} ",
+                    app.snapshot.tasks.len(),
+                    task.status.label(),
+                    status_evidence(task.status_provenance, task.status_confidence)
+                )
+            })
+            .unwrap_or_else(|| {
+                let label = if app.snapshot.tasks.is_empty() {
+                    "no tasks"
+                } else {
+                    "no matches"
+                };
+                format!(" 0/{} · {label} ", app.snapshot.tasks.len())
+            });
+        (status, palette.muted)
+    };
     let border_color = if matches!(app.focus, Focus::Tasks | Focus::TaskSearch) {
         palette.accent
     } else {
@@ -3838,7 +4588,7 @@ fn task_panel_block(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Line::from(spans))
-        .title_bottom(Span::styled(status, Style::default().fg(palette.muted)));
+        .title_bottom(Span::styled(status, Style::default().fg(status_color)));
     let search_x = search_start.min(search_right);
     let controls = TaskControlsHitbox {
         sources: source_hitboxes,
@@ -3850,6 +4600,7 @@ fn task_panel_block(
         ),
         clear_search,
         enter_turns,
+        open_terminal,
         toggle_tree,
         collapse_all,
     };
@@ -4449,13 +5200,13 @@ fn attribution_summary_lines(
     let allocation = if has_local_denominator {
         if compact {
             format!(
-                "Local {} · EST ~{:.2}pp · codex gauge × local token share",
+                "Local {} · EST ~{:.2}pp · codex gauge × price-weighted share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
         } else {
             format!(
-                "{} local · ~{:.2}pp estimated · codex gauge × local token share",
+                "{} local · ~{:.2}pp estimated · codex gauge × price-weighted share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
@@ -4925,6 +5676,8 @@ mod tests {
     };
     use ratatui::backend::TestBackend;
 
+    const RESUMABLE_THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
+
     fn mouse_test_app(task_count: usize) -> App {
         interaction_test_app(task_count, 0)
     }
@@ -4934,6 +5687,7 @@ mod tests {
         let tasks = (0..task_count)
             .map(|index| TaskRecord {
                 thread_id: format!("task-thread-{index}"),
+                archived: false,
                 title: format!("task {index}"),
                 cwd: Some("/tmp/project".into()),
                 source: Some("desktop".to_string()),
@@ -5012,6 +5766,434 @@ mod tests {
             },
             Theme::Light,
         )
+    }
+
+    fn make_task_resumable(app: &mut App, index: usize, cwd: &std::path::Path) {
+        let old_thread_id = app.snapshot.tasks[index].thread_id.clone();
+        let thread_id = if index == 0 {
+            RESUMABLE_THREAD_ID.to_string()
+        } else {
+            format!("019f52ac-7a9f-7fd1-8dda-e775ef95078{index}")
+        };
+        let task = &mut app.snapshot.tasks[index];
+        task.thread_id = thread_id.clone();
+        task.parent_thread_id = None;
+        task.archived = false;
+        task.cwd = Some(cwd.to_path_buf());
+        task.source = Some("desktop".to_string());
+        task.status = TaskStatus::Completed;
+        for turn in &mut app.snapshot.turns {
+            if turn.thread_id == old_thread_id {
+                turn.thread_id = thread_id.clone();
+            }
+        }
+        app.zellij_environment = true;
+        app.open_config = OpenConfig::default();
+        app.open_config_error = None;
+    }
+
+    #[test]
+    fn open_control_supports_keyboard_mouse_search_priority_and_compact_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = interaction_test_app(2, 2);
+        make_task_resumable(&mut app, 0, temp.path());
+        app.snapshot.tasks[0].title = "visible\u{202e}hidden".to_string();
+        app.turns_default_visible = false;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let controls = app.task_controls_hitbox.unwrap();
+        assert_eq!(controls.open_terminal.width, 7);
+        assert!(controls.enter_turns.right() <= controls.open_terminal.x);
+        assert!(controls.open_terminal.right() <= controls.toggle_tree.x);
+        let shortcut =
+            &terminal.backend().buffer()[(controls.open_terminal.x + 1, controls.open_terminal.y)];
+        assert_eq!(shortcut.symbol(), "O");
+        assert_eq!(shortcut.fg, app.theme.palette().accent);
+        assert!(shortcut.modifier.contains(Modifier::BOLD));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert_eq!(
+            app.resume_confirmation
+                .as_ref()
+                .map(|modal| modal.thread_id.as_str()),
+            Some(RESUMABLE_THREAD_ID)
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Resume in new Codex terminal?"));
+        assert!(content.contains("Creates a new CLI frontend"));
+        assert!(!content.contains('\u{202e}'));
+
+        let selected = app.selected_task;
+        let background_row = app.task_table_hitbox.unwrap().rows.y.saturating_add(1);
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, background_row),
+        ));
+        assert_eq!(app.selected_task, selected);
+        let cancel = app.resume_confirmation_hitbox.unwrap().cancel;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                cancel.right() - 1,
+                cancel.y,
+            ),
+        ));
+        assert!(app.resume_confirmation.is_none());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let open = app.task_controls_hitbox.unwrap().open_terminal;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                open.right() - 1,
+                open.y,
+            ),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let confirm = app.resume_confirmation_hitbox.unwrap().confirm;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                confirm.right() - 1,
+                confirm.y,
+            ),
+        ));
+        assert!(app.resume_confirmation.is_none());
+        assert!(app.pending_resume.is_some());
+        app.pending_resume = None;
+        app.launching_threads.clear();
+
+        app.begin_task_search();
+        handle_key_event(&mut app, key_event(KeyCode::Char('o')));
+        assert_eq!(app.task_search, "o");
+        assert!(app.resume_confirmation.is_none());
+        app.cancel_task_search();
+        app.focus_turns();
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert!(app.resume_confirmation.is_none());
+        app.focus_tasks();
+
+        app.snapshot.tasks[0].status = TaskStatus::Running;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let disabled = app.task_controls_hitbox.unwrap().open_terminal;
+        assert_eq!(disabled, open);
+        assert_eq!(
+            terminal.backend().buffer()[(disabled.x + 1, disabled.y)].fg,
+            app.theme.palette().muted
+        );
+
+        app.snapshot.tasks[0].status = TaskStatus::Completed;
+        for theme in [Theme::Dark, Theme::Light] {
+            app.theme = theme;
+            let mut compact_terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            compact_terminal
+                .draw(|frame| render(frame, &mut app))
+                .unwrap();
+            let compact = app.task_controls_hitbox.unwrap().open_terminal;
+            assert_eq!(compact.width, 3);
+            assert_eq!(
+                compact_terminal.backend().buffer()[(compact.x + 1, compact.y)].symbol(),
+                "O"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_confirmation_revalidates_after_refresh_and_reuses_known_panes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = interaction_test_app(2, 1);
+        make_task_resumable(&mut app, 0, temp.path());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert!(app.resume_confirmation.is_some());
+        let mut snapshot = app.snapshot.clone();
+        snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.thread_id == RESUMABLE_THREAD_ID)
+            .unwrap()
+            .status = TaskStatus::WaitingInput;
+        snapshot.tasks.reverse();
+        app.replace(
+            CollectionResult {
+                snapshot,
+                account: app.account.clone(),
+            },
+            false,
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(app.pending_resume.is_none());
+        assert!(app.launching_threads.is_empty());
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Live attach is unavailable")
+        );
+
+        app.snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.thread_id == RESUMABLE_THREAD_ID)
+            .unwrap()
+            .status = TaskStatus::Completed;
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        let first = app.pending_resume.take().unwrap();
+        let ResumeLaunchRequest::Create { target, .. } = first else {
+            panic!("first Open should create a pane");
+        };
+        assert_eq!(target.thread_id, RESUMABLE_THREAD_ID);
+        assert!(app.launching_threads.contains(RESUMABLE_THREAD_ID));
+
+        let pane_id = PaneId::parse("terminal_42").unwrap();
+        app.apply_resume_completion(ResumeLaunchCompletion {
+            thread_id: RESUMABLE_THREAD_ID.to_string(),
+            result: Ok(ResumeLaunchOutcome::Created(pane_id.clone())),
+        });
+        assert_eq!(app.open_panes.get(RESUMABLE_THREAD_ID), Some(&pane_id));
+        assert!(!app.launching_threads.contains(RESUMABLE_THREAD_ID));
+        assert_eq!(
+            app.open_notice.as_ref().unwrap().tone,
+            OpenNoticeTone::Success
+        );
+
+        app.snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.thread_id == RESUMABLE_THREAD_ID)
+            .unwrap()
+            .status = TaskStatus::Running;
+        assert!(app.open_control_available());
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        let repeat = app.pending_resume.take().unwrap();
+        let ResumeLaunchRequest::Focus {
+            thread_id,
+            pane_id: repeat_pane,
+            ..
+        } = repeat
+        else {
+            panic!("known pane should be focused even after the task becomes active");
+        };
+        assert_eq!(thread_id, RESUMABLE_THREAD_ID);
+        assert_eq!(repeat_pane, pane_id);
+
+        app.apply_resume_completion(ResumeLaunchCompletion {
+            thread_id: RESUMABLE_THREAD_ID.to_string(),
+            result: Ok(ResumeLaunchOutcome::Missing(pane_id.clone())),
+        });
+        assert!(!app.open_panes.contains_key(RESUMABLE_THREAD_ID));
+        assert!(app.resume_confirmation.is_none());
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("press O again")
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Live attach is unavailable")
+        );
+
+        app.snapshot
+            .tasks
+            .iter_mut()
+            .find(|task| task.thread_id == RESUMABLE_THREAD_ID)
+            .unwrap()
+            .status = TaskStatus::Completed;
+        app.open_panes
+            .insert(RESUMABLE_THREAD_ID.to_string(), pane_id.clone());
+        app.launching_threads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        let _ = app.pending_resume.take().unwrap();
+        app.apply_resume_completion(ResumeLaunchCompletion {
+            thread_id: RESUMABLE_THREAD_ID.to_string(),
+            result: Ok(ResumeLaunchOutcome::Missing(pane_id)),
+        });
+        assert!(app.resume_confirmation.is_none());
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert!(app.resume_confirmation.is_some());
+    }
+
+    #[test]
+    fn open_rejections_explain_config_runtime_and_task_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = interaction_test_app(1, 0);
+        app.zellij_environment = true;
+        handle_key_event(&mut app, key_event(KeyCode::Char('O')));
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("resumable thread id")
+        );
+
+        make_task_resumable(&mut app, 0, temp.path());
+        app.zellij_environment = false;
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("inside Zellij")
+        );
+
+        app.zellij_environment = true;
+        app.open_config.enabled = false;
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("disabled")
+        );
+
+        app.open_config = OpenConfig::default();
+        app.snapshot.tasks[0].source = Some("subagent".to_string());
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("parent task")
+        );
+
+        app.snapshot.tasks[0].source = Some("desktop".to_string());
+        app.snapshot.tasks[0].archived = true;
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Unarchive")
+        );
+
+        app.snapshot.tasks[0].archived = false;
+        app.snapshot.tasks[0].cwd = None;
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("working directory")
+        );
+
+        app.snapshot.tasks[0].cwd = Some(temp.path().join("removed"));
+        app.activate_open();
+        assert!(
+            app.open_notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("no longer exists")
+        );
+        assert!(app.resume_confirmation.is_none());
+    }
+
+    #[test]
+    fn resume_modal_disables_open_but_keeps_cancel_available_when_tiny() {
+        let temp = tempfile::tempdir().unwrap();
+        for (width, height) in [(8, 1), (12, 5), (24, 8), (60, 12)] {
+            let mut app = interaction_test_app(1, 0);
+            make_task_resumable(&mut app, 0, temp.path());
+            app.activate_open();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let hitbox = app.resume_confirmation_hitbox.unwrap();
+            let can_confirm = !hitbox.confirm.is_empty();
+            assert_eq!(can_confirm, width >= 46 && height >= 12);
+            if can_confirm {
+                assert!(!hitbox.cancel.is_empty());
+            }
+            for button in [hitbox.confirm, hitbox.cancel] {
+                if !button.is_empty() {
+                    assert!(button.right() <= width);
+                    assert!(button.bottom() <= height);
+                }
+            }
+            if !can_confirm {
+                handle_key_event(&mut app, key_event(KeyCode::Enter));
+                assert!(app.resume_confirmation.is_some());
+                assert!(app.pending_resume.is_none());
+                if (width, height) == (24, 8) {
+                    let content = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(content.contains("Resize terminal"));
+                    assert!(!content.contains("Cwd:"));
+                }
+                if hitbox.cancel.is_empty() {
+                    handle_key_event(&mut app, key_event(KeyCode::Esc));
+                } else {
+                    assert!(handle_mouse_event(
+                        &mut app,
+                        mouse_event(
+                            MouseEventKind::Down(MouseButton::Left),
+                            hitbox.cancel.right() - 1,
+                            hitbox.cancel.y,
+                        ),
+                    ));
+                }
+            } else {
+                handle_key_event(&mut app, key_event(KeyCode::Esc));
+            }
+            assert!(app.resume_confirmation.is_none());
+        }
+    }
+
+    #[test]
+    fn resume_modal_preserves_the_checkout_tail_of_a_long_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp
+            .path()
+            .join("managed-worktrees-with-a-very-long-parent-directory-name".repeat(2))
+            .join("checkout-alpha");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut app = interaction_test_app(1, 0);
+        make_task_resumable(&mut app, 0, &cwd);
+        app.activate_open();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("checkout-alpha"));
+        assert!(!app.resume_confirmation_hitbox.unwrap().confirm.is_empty());
     }
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -5131,7 +6313,7 @@ mod tests {
                 attribution_coverage_percent: 0.0,
                 external_activity_possible: true,
                 confidence: Confidence::Low,
-                method: "current_codex_gauge_token_share_proxy".to_string(),
+                method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
                 settled: true,
             },
             partial: false,
@@ -5292,7 +6474,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_summary_explains_the_single_codex_share_formula() {
+    fn attribution_summary_explains_the_price_weighted_codex_share_formula() {
         let attribution = AttributionSummary {
             local_token_usage: TokenUsage {
                 total_tokens: 760_000_000,
@@ -5305,13 +6487,13 @@ mod tests {
 
         let compact = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, true);
         assert!(compact[1].contains("EST ~34.00pp"));
-        assert!(compact[1].contains("codex gauge × local token share"));
+        assert!(compact[1].contains("codex gauge × price-weighted share"));
         assert!(compact[2].contains("conf low"));
         assert!(compact[2].contains("relative allocation"));
 
         let wide = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false);
         assert!(wide[1].contains("~34.00pp estimated"));
-        assert!(wide[1].contains("codex gauge × local token share"));
+        assert!(wide[1].contains("codex gauge × price-weighted share"));
         assert!(wide[2].contains("low confidence"));
         assert!(!wide.join(" ").contains("evidence"));
         assert!(!wide.join(" ").contains("gap"));
@@ -5411,7 +6593,7 @@ mod tests {
         let content = render_models_content(&app.snapshot, 80, 8);
 
         assert!(content.contains("EST ~23.00pp"));
-        assert!(content.contains("codex gauge × local token share"));
+        assert!(content.contains("codex gauge × price-weighted share"));
         assert!(content.contains("conf low"));
         assert!(content.contains("external"));
         assert!(content.contains("settled"));
@@ -6248,10 +7430,12 @@ mod tests {
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let controls = app.task_controls_hitbox.unwrap();
             let initial = controls.toggle_tree;
+            let initial_open = controls.open_terminal;
             let initial_collapse = controls.collapse_all;
             assert_eq!(initial.width, expected_width);
             assert_eq!(initial_collapse.width, if width == 60 { 3 } else { 11 });
-            assert!(controls.enter_turns.right() <= initial.x);
+            assert!(controls.enter_turns.right() <= initial_open.x);
+            assert!(initial_open.right() <= initial.x);
             assert!(initial.right() <= initial_collapse.x);
             assert!(initial_collapse.right() <= controls.sources[0].x);
             assert_eq!(
@@ -7656,10 +8840,12 @@ mod tests {
 
         let controls = app.task_controls_hitbox.unwrap();
         assert!(!controls.enter_turns.is_empty());
+        assert!(!controls.open_terminal.is_empty());
         assert!(!controls.toggle_tree.is_empty());
         assert!(!controls.collapse_all.is_empty());
         assert!(!controls.search.is_empty());
-        assert!(controls.enter_turns.right() <= controls.toggle_tree.x);
+        assert!(controls.enter_turns.right() <= controls.open_terminal.x);
+        assert!(controls.open_terminal.right() <= controls.toggle_tree.x);
         assert!(controls.toggle_tree.right() <= controls.collapse_all.x);
         assert!(controls.collapse_all.right() <= controls.sources[0].x);
         for pair in controls.sources.windows(2) {
@@ -7675,6 +8861,10 @@ mod tests {
         assert_eq!(
             buffer[(controls.toggle_tree.x + 1, controls.toggle_tree.y)].symbol(),
             "R"
+        );
+        assert_eq!(
+            buffer[(controls.open_terminal.x + 1, controls.open_terminal.y)].symbol(),
+            "O"
         );
         assert_eq!(
             buffer[(controls.collapse_all.x + 1, controls.collapse_all.y)].symbol(),
@@ -7748,6 +8938,97 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.turn_table_hitbox.is_none());
+    }
+
+    #[test]
+    fn clicking_a_selected_task_again_matches_enter_navigation() {
+        for turns_default_visible in [true, false] {
+            let mut mouse_app = interaction_test_app(2, 2);
+            let mut keyboard_app = interaction_test_app(2, 2);
+            if !turns_default_visible {
+                mouse_app.toggle_turns_default_visibility();
+                keyboard_app.toggle_turns_default_visibility();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut mouse_app))
+                .unwrap();
+            let task_rows = mouse_app.task_table_hitbox.unwrap().rows;
+            let second_row = task_rows.y + 1;
+
+            assert!(handle_mouse_event(
+                &mut mouse_app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    task_rows.x,
+                    second_row,
+                ),
+            ));
+            assert_eq!(mouse_app.selected_task, 1);
+            assert_eq!(mouse_app.focus, Focus::Tasks);
+
+            handle_key_event(&mut keyboard_app, key_event(KeyCode::Down));
+            handle_key_event(&mut keyboard_app, key_event(KeyCode::Enter));
+            assert!(handle_mouse_event(
+                &mut mouse_app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    task_rows.x,
+                    second_row,
+                ),
+            ));
+            assert_eq!(mouse_app.focus, keyboard_app.focus);
+            assert_eq!(mouse_app.selected_task, keyboard_app.selected_task);
+            assert_eq!(
+                mouse_app.turns_temporarily_visible,
+                keyboard_app.turns_temporarily_visible
+            );
+            assert_eq!(mouse_app.turns_visible(), keyboard_app.turns_visible());
+        }
+    }
+
+    #[test]
+    fn repeated_task_click_respects_search_and_empty_turn_boundaries() {
+        let mut searching = interaction_test_app(1, 1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut searching))
+            .unwrap();
+        let selected_row = searching.task_table_hitbox.unwrap().rows;
+        handle_key_event(&mut searching, key_event(KeyCode::Char('/')));
+        assert_eq!(searching.focus, Focus::TaskSearch);
+        assert!(handle_mouse_event(
+            &mut searching,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                selected_row.x,
+                selected_row.y,
+            ),
+        ));
+        assert_eq!(searching.focus, Focus::Tasks);
+        assert!(handle_mouse_event(
+            &mut searching,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                selected_row.x,
+                selected_row.y,
+            ),
+        ));
+        assert_eq!(searching.focus, Focus::Turns);
+
+        let mut no_turns = interaction_test_app(2, 0);
+        no_turns.toggle_turns_default_visibility();
+        terminal.draw(|frame| render(frame, &mut no_turns)).unwrap();
+        let rows = no_turns.task_table_hitbox.unwrap().rows;
+        for _ in 0..2 {
+            assert!(handle_mouse_event(
+                &mut no_turns,
+                mouse_event(MouseEventKind::Down(MouseButton::Left), rows.x, rows.y + 1,),
+            ));
+        }
+        assert_eq!(no_turns.selected_task, 1);
+        assert_eq!(no_turns.focus, Focus::Tasks);
+        assert!(!no_turns.turns_visible());
     }
 
     #[test]
@@ -8988,6 +10269,7 @@ mod tests {
                 account_usage: None,
                 tasks: vec![TaskRecord {
                     thread_id: "task-thread".to_string(),
+                    archived: false,
                     title: "task".to_string(),
                     cwd: Some("/tmp/project".into()),
                     source: Some("desktop".to_string()),

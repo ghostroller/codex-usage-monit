@@ -14,7 +14,7 @@
 
 当前工具启动独立 App Server，只调用账户额度与账户用量读取方法。这个新 runtime 无法提供其他已经运行的 CLI/IDE/Desktop task 的精确 active flags，所以 v0.1 的 task 状态来自 rollout turn 边界与文件新鲜度，并明确标为 `inferred` 或 `stale`。官方 thread status API 是未来统一 runtime 模式的数据能力，不是当前实现已经声称拥有的能力。
 
-在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的本地 token share 做 Low-confidence 投影。该口径不依赖跨进程快照历史，因而一次性命令与 TUI 使用相同公式。
+在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的短上下文价格加权用量占比做 Low-confidence 投影。原始本地 token share 不加权；一次性命令与 TUI 使用相同公式。
 
 扫描不完整、lookback 不足或 task 状态 stale 会保留在 `partial` / `partialReasons` 和 provenance 中，但不会关闭仍可计算的 EST。只有没有当前 `codex` 窗口或窗口内没有本地非 Spark token 分母时，归因才不可用。
 
@@ -123,7 +123,7 @@ request_rate_limit_cost
 服务端只提供账户级 `usedPercent`，而本地提供 token。二者不能直接等同，原因包括：
 
 - 百分比是整数，存在取整；
-- 不同模型和服务层可能有未公开权重；
+- Codex 配额的模型/服务层权重不保证等同于公开 API 价格；
 - cached input、output、reasoning 或特殊工具的额度影响不一定线性；
 - 多个本地线程可能并发；
 - 其他设备、IDE、桌面端或云任务可能共享额度；
@@ -144,20 +144,36 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 ### 可以估算但不能精确归因
 
-当前实现采用单一、可解释的代理公式：
+当前实现采用单一、可解释的价格代理公式。它固化 [OpenAI API Pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=priority) 的短上下文 Standard/Priority 价格，单位均为美元/百万 token：
+
+| model | Standard input | Standard cached | Standard cache write | Standard output | Fast input | Fast cached | Fast cache write | Fast output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gpt-5.6-sol` | 5.00 | 0.50 | 6.25 | 30.00 | 10.00 | 1.00 | 12.50 | 60.00 |
+| `gpt-5.6-terra` | 2.50 | 0.25 | 3.125 | 15.00 | 5.00 | 0.50 | 6.25 | 30.00 |
+| `gpt-5.6-luna` | 1.00 | 0.10 | 1.25 | 6.00 | 2.00 | 0.20 | 2.50 | 12.00 |
+| `gpt-5.5` | 5.00 | 0.50 | - | 30.00 | 12.50 | 1.25 | - | 75.00 |
+| `gpt-5.4` | 2.50 | 0.25 | - | 15.00 | 5.00 | 0.50 | - | 30.00 |
+| `gpt-5.4-mini` | 0.75 | 0.075 | - | 4.50 | 1.50 | 0.15 | - | 9.00 |
+
+实现以 `$0.025/百万 token` 为一个整数价格单位，避免浮点累计误差。`priority` 使用 Fast 列，缺失、`default` 或其他 service tier 使用 Standard 列。模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100
-estimated_quota_percent = codex_used_percent * local_share_percent / 100
+cached = min(call_cached_input_tokens, call_input_tokens)
+uncached = call_input_tokens - cached
+call_price_units = uncached * input_rate + cached * cached_rate + call_output_tokens * output_rate
+estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units
 ```
 
-公式分别应用到 task、turn 和 model，并始终使用同一个分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有结果均标记为 Low confidence，TUI/text 使用 `~` 表示近似，并保留 `externalActivityPossible`。扫描不完整、lookback 不足或状态 stale 只会降低本地分母的可信度并标记 partial/stale，不会让公式在仍有分母时失效。
+`reasoning_output_tokens` 是 output 的子集，不能再次相加。rollout 当前不暴露 `cache_write_tokens`，因此上表的 GPT-5.6 cache-write 价格无法进入历史 EST；`input - cached` 只能按普通 input 价格处理。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
-该公式隐含“额度成本与本地 token 线性、且本机看到了账户活动”的强假设。不同模型/服务层的隐藏权重、其他设备或云 task、服务端取整与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方配额账单。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
+缺失或不在价目表中的非 Spark 模型仍保留 TOKENS/LOCAL，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 LOCAL 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有结果均标记为 Low confidence，TUI/text 使用 `~` 表示近似，并保留 `externalActivityPossible`。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
+
+该公式隐含“Codex 配额相对成本近似 API 短上下文价格，且本机看到了账户活动”的强假设。真实 Codex 配额权重、cache write、其他设备或云 task、服务端取整与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方配额账单。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
 
 ## 多窗口输出与交互
 
-TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 显示当前 `codex` gauge、本地非 Spark token、统一公式得到的 Low-confidence EST 与模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
+TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 显示当前 `codex` gauge、本地非 Spark token、短上下文价格加权公式得到的 Low-confidence EST 与模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
 
 TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree 和来源筛选保存为版本化的用户级 JSON。读取失败或内容损坏时回退到默认值；搜索、选择、滚动位置和具体 thread 折叠集合不持久化。写入采用同目录临时文件替换，未来版本文件不会被旧程序覆盖；`--theme` 显式值优先于保存值。CLI 一次性输出不参与此状态生命周期。
 
@@ -182,7 +198,7 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 
 - task/turn/model token 可以精确结算；
 - 扫描完整的当前 5 小时或周 reset cycle 本地 token share 可以精确结算；
-- 按当前 `codex` gauge 与本地 token share 得到的 estimated quota share 仍保持 Low；
+- 按当前 `codex` gauge 与短上下文价格加权用量占比得到的 estimated quota share 仍保持 Low；
 - 服务端 task/turn quota 仍然不能精确计算。
 
 取整、模型隐藏权重、快照间隙和外部活动不会因为本地任务停止而消失，所以 idle 不是把 estimated 变成 exact 的条件。
