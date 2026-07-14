@@ -1,5 +1,6 @@
 pub mod app_server;
 pub mod attribution;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod domain;

@@ -1,10 +1,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
-use codex_usage_monit::domain::{RolloutDataset, TaskStatus};
+use codex_usage_monit::domain::{RolloutDataset, TaskStatus, TurnStatus};
 use codex_usage_monit::rollout::{RolloutCache, scan_rollouts};
 use codex_usage_monit::startup::StartupTrace;
 use serde_json::{Value, json};
@@ -47,6 +48,24 @@ fn config(home: &std::path::Path) -> CollectConfig {
     }
 }
 
+fn persistent_config(home: &Path, cache_root: &Path) -> CollectConfig {
+    let mut config = config(home);
+    config.rollout_cache_dir = Some(cache_root.to_owned());
+    config
+}
+
+fn cache_entries(cache_root: &Path) -> Vec<PathBuf> {
+    let mut entries = walkdir::WalkDir::new(cache_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
 fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
     assert_eq!(left.tasks, right.tasks);
     assert_eq!(left.turns, right.turns);
@@ -54,6 +73,320 @@ fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
     assert_eq!(left.rate_observations, right.rate_observations);
     assert_eq!(left.stats, right.stats);
     assert_eq!(left.warnings, right.warnings);
+}
+
+#[test]
+fn persistent_cache_is_reused_by_a_new_instance_and_recomputes_freshness() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-persistent-active.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "persistent-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "persistent-turn"}
+            }),
+        ],
+    );
+    let mut scan_config = persistent_config(temp.path(), &cache_root);
+    scan_config.active_grace = Duration::from_secs(30);
+
+    let first = RolloutCache::new().scan(&scan_config, now).unwrap();
+    assert_eq!(first.tasks[0].status, TaskStatus::Running);
+    assert_eq!(cache_entries(&cache_root).len(), 1);
+
+    let mut reopened = RolloutCache::new();
+    let second = reopened
+        .scan(&scan_config, now + chrono::Duration::minutes(2))
+        .unwrap();
+    assert_eq!(second.tasks[0].status, TaskStatus::Stale);
+    assert_eq!(reopened.last_refresh().disk_reused_files, 1);
+    assert_eq!(reopened.last_refresh().reused_files, 1);
+    assert_eq!(reopened.last_refresh().reparsed_files, 0);
+    assert!(reopened.last_refresh().rebuilt);
+}
+
+#[test]
+fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let first_path = temp.path().join("sessions/rollout-persistent-a.jsonl");
+    let changed_path = temp.path().join("sessions/rollout-persistent-b.jsonl");
+    write_jsonl(
+        &first_path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "persistent-shared"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-a"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(10)}}}),
+        ],
+    );
+    write_jsonl(
+        &changed_path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "persistent-shared"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-b"}}),
+            json!({"timestamp": timestamp(now), "type": "turn_context", "payload": {"turn_id": "turn-b", "model": "gpt-persistent"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(15)}}}),
+        ],
+    );
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&scan_config, now).unwrap();
+
+    append_jsonl(
+        &changed_path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage(20)}}
+        })],
+    );
+    let mut reopened = RolloutCache::new();
+    let cached = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(reopened.last_refresh().disk_reused_files, 1);
+    assert_eq!(reopened.last_refresh().reused_files, 1);
+    assert_eq!(reopened.last_refresh().reparsed_files, 1);
+    assert_eq!(reopened.last_refresh().disk_written_files, 1);
+
+    let mut uncached_config = scan_config.clone();
+    uncached_config.rollout_cache_dir = None;
+    let fresh = scan_rollouts(&uncached_config, now + chrono::Duration::seconds(2)).unwrap();
+    assert_dataset_eq(&cached, &fresh);
+
+    fs::remove_file(&changed_path).unwrap();
+    let mut after_delete = RolloutCache::new();
+    let deleted = after_delete
+        .scan(&scan_config, now + chrono::Duration::seconds(3))
+        .unwrap();
+    assert_eq!(deleted.stats.scanned_files, 1);
+    assert!(deleted.turns.iter().all(|turn| turn.turn_id != "turn-b"));
+    assert_eq!(after_delete.last_refresh().disk_reused_files, 1);
+    assert_eq!(after_delete.last_refresh().reparsed_files, 0);
+}
+
+#[test]
+fn changed_in_memory_file_skips_the_stale_disk_entry() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-active-cache.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "active-cache-thread"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "active-cache-turn"}}),
+        ],
+    );
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    let mut cache = RolloutCache::new();
+    cache.scan(&scan_config, now).unwrap();
+    let entry = cache_entries(&cache_root).pop().unwrap();
+    fs::write(entry, b"{corrupt stale entry").unwrap();
+
+    append_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "active-cache-turn"}
+        })],
+    );
+    let dataset = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(dataset.turns[0].status, TurnStatus::Completed);
+    assert_eq!(cache.last_refresh().disk_corrupt_files, 0);
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+}
+
+#[test]
+fn successful_persistent_write_debounces_a_changed_active_file() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-write-debounce.jsonl");
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "write-debounce-thread"}
+        })],
+    );
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    let mut cache = RolloutCache::new();
+    cache.scan(&scan_config, now).unwrap();
+    assert_eq!(cache.last_refresh().disk_written_files, 1);
+
+    append_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "write-debounce-turn"}
+        })],
+    );
+    cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+    assert_eq!(cache.last_refresh().disk_written_files, 0);
+    assert_eq!(cache.last_refresh().disk_deferred_files, 1);
+    assert!(cache.last_refresh().disk_write_retry_ms > 0);
+}
+
+#[test]
+fn corrupt_and_future_persistent_entries_fall_back_and_are_repaired() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-cache-repair.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "repair-thread"}
+        })],
+    );
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&scan_config, now).unwrap();
+    let entry = cache_entries(&cache_root).pop().unwrap();
+
+    fs::write(&entry, b"{truncated").unwrap();
+    let mut corrupt = RolloutCache::new();
+    let repaired = corrupt.scan(&scan_config, now).unwrap();
+    assert_eq!(repaired.tasks[0].thread_id, "repair-thread");
+    assert_eq!(corrupt.last_refresh().disk_corrupt_files, 1);
+    assert_eq!(corrupt.last_refresh().reparsed_files, 1);
+    assert_eq!(corrupt.last_refresh().disk_written_files, 1);
+
+    let mut future: Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+    future["formatVersion"] = json!(u32::MAX);
+    fs::write(&entry, serde_json::to_vec(&future).unwrap()).unwrap();
+    let mut incompatible = RolloutCache::new();
+    incompatible.scan(&scan_config, now).unwrap();
+    assert_eq!(incompatible.last_refresh().disk_misses, 1);
+    assert_eq!(incompatible.last_refresh().disk_corrupt_files, 0);
+    assert_eq!(incompatible.last_refresh().reparsed_files, 1);
+}
+
+#[test]
+fn redacted_persistent_cache_is_isolated_and_contains_no_message_preview() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let private_message = "private persistent cache message";
+    write_jsonl(
+        &temp.path().join("sessions/rollout-cache-redaction.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "redaction-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": private_message}
+            }),
+        ],
+    );
+    let visible_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&visible_config, now).unwrap();
+    let visible_entries = cache_entries(&cache_root)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut redacted_config = visible_config.clone();
+    redacted_config.redact_content = true;
+    let mut redacted_cache = RolloutCache::new();
+    let redacted = redacted_cache.scan(&redacted_config, now).unwrap();
+    assert_eq!(redacted.tasks[0].title, "[redacted]");
+    assert_eq!(redacted_cache.last_refresh().disk_reused_files, 0);
+    assert_eq!(redacted_cache.last_refresh().reparsed_files, 1);
+
+    let redacted_entry = cache_entries(&cache_root)
+        .into_iter()
+        .find(|path| !visible_entries.contains(path))
+        .unwrap();
+    let contents = fs::read_to_string(redacted_entry).unwrap();
+    assert!(!contents.contains(private_message));
+}
+
+#[test]
+fn persistent_write_failure_does_not_fail_the_rollout_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp
+            .path()
+            .join("sessions/rollout-cache-write-failure.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "write-failure-thread"}
+        })],
+    );
+    let unusable_root = temp.path().join("cache-file");
+    fs::write(&unusable_root, b"not a directory").unwrap();
+    let scan_config = persistent_config(temp.path(), &unusable_root);
+    let mut cache = RolloutCache::new();
+
+    let dataset = cache.scan(&scan_config, now).unwrap();
+
+    assert_eq!(dataset.tasks[0].thread_id, "write-failure-thread");
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+    assert_eq!(cache.last_refresh().disk_write_failures, 1);
+
+    cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(cache.last_refresh().disk_write_failures, 0);
+    assert_eq!(cache.last_refresh().disk_deferred_files, 1);
+    assert!(cache.last_refresh().disk_write_retry_ms > 0);
+}
+
+#[test]
+fn persistent_cache_reuses_the_intersection_when_file_selection_expands() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    for index in 0..2 {
+        write_jsonl(
+            &temp
+                .path()
+                .join(format!("sessions/rollout-selection-{index}.jsonl")),
+            &[json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": format!("selection-thread-{index}")}
+            })],
+        );
+    }
+    let mut narrow = persistent_config(temp.path(), &cache_root);
+    narrow.max_files = 1;
+    RolloutCache::new().scan(&narrow, now).unwrap();
+
+    let mut expanded = narrow.clone();
+    expanded.max_files = 2;
+    let mut cache = RolloutCache::new();
+    let dataset = cache.scan(&expanded, now).unwrap();
+
+    assert_eq!(dataset.tasks.len(), 2);
+    assert_eq!(cache.last_refresh().disk_reused_files, 1);
+    assert_eq!(cache.last_refresh().reused_files, 1);
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
 }
 
 #[test]
@@ -584,7 +917,10 @@ fn cold_scan_emits_aggregate_startup_stages_without_session_content() {
     for expected in [
         "rollout.discover",
         "rollout.session_titles",
+        "rollout.cache_maintenance",
+        "rollout.cache_load",
         "rollout.parse_files",
+        "rollout.cache_save",
         "rollout.reduce",
         "rollout.materialize",
         "rollout.total",
@@ -601,6 +937,12 @@ fn cold_scan_emits_aggregate_startup_stages_without_session_content() {
         .unwrap();
     assert!(parse.detail.contains("reparsed=1"));
     assert!(parse.detail.contains("lines=2"));
+    let cache_load = report
+        .events
+        .iter()
+        .find(|event| event.stage == "rollout.cache_load")
+        .unwrap();
+    assert!(cache_load.detail.contains("enabled=false"));
 
     let serialized = trace.render_json().unwrap();
     assert!(!serialized.contains("private-thread-id"));

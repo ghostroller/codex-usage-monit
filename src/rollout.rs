@@ -1,14 +1,17 @@
-use std::collections::HashMap;
-use std::fs::{File, Metadata};
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::{self, File, Metadata};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use crate::cache::write_private_atomically;
 use crate::config::CollectConfig;
 use crate::domain::{
     Confidence, LimitWindow, Provenance, RateObservation, RolloutDataset, TaskRecord, TaskStatus,
@@ -17,6 +20,18 @@ use crate::domain::{
 use crate::session_index::load_thread_titles;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
+const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
+// Bump when the projected event schema or replay semantics change.
+const ROLLOUT_PARSER_REVISION: u32 = 1;
+const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
+const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PERSISTENT_CACHE_ENTRIES: usize = 2_000;
+const PERSISTENT_WRITE_DEBOUNCE: Duration = Duration::from_secs(30);
+const PERSISTENT_WRITE_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const PERSISTENT_WRITE_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -25,7 +40,7 @@ struct RolloutFile {
     fingerprint: FileFingerprint,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFingerprint {
     len: u64,
     modified: SystemTime,
@@ -37,12 +52,18 @@ struct FileFingerprint {
     ctime: i64,
     #[cfg(unix)]
     ctime_nsec: i64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
 }
 
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> std::io::Result<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt;
 
         Ok(Self {
             len: metadata.len(),
@@ -55,6 +76,10 @@ impl FileFingerprint {
             ctime: metadata.ctime(),
             #[cfg(unix)]
             ctime_nsec: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            creation_time: metadata.creation_time(),
+            #[cfg(windows)]
+            last_write_time: metadata.last_write_time(),
         })
     }
 }
@@ -65,7 +90,7 @@ struct SelectedFile {
     fingerprint: FileFingerprint,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum ParsedEvent {
     SessionMeta {
         timestamp: DateTime<Utc>,
@@ -90,7 +115,7 @@ enum ParsedEvent {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ParsedFile {
     owner_thread_id: Option<String>,
     activity_updated_at: Option<DateTime<Utc>>,
@@ -102,13 +127,13 @@ struct ParsedFile {
     complete: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedFile {
     fingerprint: FileFingerprint,
     parsed: ParsedFile,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheKey {
     codex_home: PathBuf,
     redact_content: bool,
@@ -125,6 +150,26 @@ struct ReducedRollouts {
 pub struct RolloutCacheRefresh {
     pub reused_files: usize,
     pub reparsed_files: usize,
+    /// Files hydrated from the user-level parsed rollout cache.
+    pub disk_reused_files: usize,
+    /// Persistent entries that were absent or stale for the current fingerprint.
+    pub disk_misses: usize,
+    /// Persistent entries that could not be decoded or validated.
+    pub disk_corrupt_files: usize,
+    /// Parsed entries successfully persisted during this refresh.
+    pub disk_written_files: usize,
+    /// Best-effort persistent writes that failed without affecting the snapshot.
+    pub disk_write_failures: usize,
+    /// Dirty entries deferred while a previous write failure is backing off.
+    pub disk_deferred_files: usize,
+    /// Entries that exceeded the per-file cache safety limit and were not written.
+    pub disk_oversized_files: usize,
+    /// Milliseconds until deferred persistent writes are eligible to retry.
+    pub disk_write_retry_ms: u64,
+    /// Old persistent entries removed by best-effort size pruning.
+    pub disk_pruned_files: usize,
+    /// Stale atomic-write temporary files removed during maintenance.
+    pub disk_pruned_temp_files: usize,
     /// Number of files parsed a second time after changing during the first read.
     pub stability_retries: usize,
     pub rebuilt: bool,
@@ -143,7 +188,195 @@ pub struct RolloutCache {
     selected: Vec<SelectedFile>,
     reduced: Option<ReducedRollouts>,
     session_titles: SessionTitleCache,
+    dirty_files: HashSet<PathBuf>,
+    unpersistable_files: HashMap<PathBuf, u64>,
+    disk_last_write: HashMap<PathBuf, Instant>,
+    disk_write_retry_after: Option<Instant>,
+    disk_write_backoff: Duration,
+    last_disk_prune: Option<Instant>,
     last_refresh: RolloutCacheRefresh,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentFileEntry {
+    format_version: u32,
+    parser_revision: u32,
+    key: CacheKey,
+    source_path: PathBuf,
+    cached: CachedFile,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentFileEntryRef<'a> {
+    format_version: u32,
+    parser_revision: u32,
+    key: &'a CacheKey,
+    source_path: &'a Path,
+    cached: &'a CachedFile,
+}
+
+enum PersistentLoad {
+    Hit(CachedFile),
+    Miss,
+    Corrupt,
+}
+
+enum PersistentWriteError {
+    Oversized,
+    Other,
+}
+
+#[derive(Default)]
+struct PersistentWriteSummary {
+    written: usize,
+    failures: usize,
+    deferred: usize,
+    oversized: usize,
+    retry_ms: u64,
+    pruned_entries: usize,
+    pruned_temps: usize,
+    maintenance_ran: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PersistentCacheUsage {
+    entries: usize,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct PersistentPruneSummary {
+    entries: usize,
+    stale_temps: usize,
+    usage: PersistentCacheUsage,
+}
+
+struct PersistentCacheBudget {
+    directory: PathBuf,
+    usage: PersistentCacheUsage,
+    max_entries: usize,
+    max_bytes: u64,
+    pruned_entries: usize,
+    pruned_temps: usize,
+}
+
+struct LimitedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl LimitedBuffer {
+    fn new(limit: u64) -> Self {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        Self {
+            bytes: Vec::with_capacity(limit.min(64 * 1024)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for LimitedBuffer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "parsed rollout cache entry exceeds the safety limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl PersistentCacheBudget {
+    fn new(directory: PathBuf, usage: PersistentCacheUsage) -> Self {
+        Self {
+            directory,
+            usage,
+            max_entries: MAX_PERSISTENT_CACHE_ENTRIES,
+            max_bytes: MAX_PERSISTENT_CACHE_BYTES,
+            pruned_entries: 0,
+            pruned_temps: 0,
+        }
+    }
+
+    fn reserve(&mut self, target: &Path, new_bytes: u64) -> std::io::Result<Option<u64>> {
+        let old_bytes = existing_cache_file_len(target);
+        if self.can_write_atomically(old_bytes, new_bytes) {
+            return Ok(old_bytes);
+        }
+
+        let added_entries = usize::from(old_bytes.is_none());
+        let pruned = prune_cache_directory(
+            &self.directory,
+            Some(target),
+            self.max_entries.saturating_sub(added_entries),
+            // Atomic replacement temporarily keeps both the old target and
+            // the complete new temporary file on disk.
+            self.max_bytes.saturating_sub(new_bytes),
+            stale_cache_temp_cutoff(),
+        );
+        self.usage = pruned.usage;
+        self.pruned_entries += pruned.entries;
+        self.pruned_temps += pruned.stale_temps;
+
+        let old_bytes = existing_cache_file_len(target);
+        if self.can_write_atomically(old_bytes, new_bytes) {
+            Ok(old_bytes)
+        } else {
+            Err(std::io::Error::other(
+                "could not reserve space within the persistent cache limit",
+            ))
+        }
+    }
+
+    fn commit(&mut self, old_bytes: Option<u64>, new_bytes: u64) {
+        self.usage.entries = self
+            .usage
+            .entries
+            .saturating_sub(usize::from(old_bytes.is_some()))
+            .saturating_add(1);
+        self.usage.bytes = self
+            .usage
+            .bytes
+            .saturating_sub(old_bytes.unwrap_or(0))
+            .saturating_add(new_bytes);
+    }
+
+    fn projected_usage(&self, old_bytes: Option<u64>, new_bytes: u64) -> PersistentCacheUsage {
+        PersistentCacheUsage {
+            entries: self
+                .usage
+                .entries
+                .saturating_sub(usize::from(old_bytes.is_some()))
+                .saturating_add(1),
+            bytes: self
+                .usage
+                .bytes
+                .saturating_sub(old_bytes.unwrap_or(0))
+                .saturating_add(new_bytes),
+        }
+    }
+
+    fn can_write_atomically(&self, old_bytes: Option<u64>, new_bytes: u64) -> bool {
+        self.projected_usage(old_bytes, new_bytes)
+            .is_within(self.max_entries, self.max_bytes)
+            && self.usage.bytes.saturating_add(new_bytes) <= self.max_bytes
+    }
+}
+
+impl PersistentCacheUsage {
+    fn is_within(self, max_entries: usize, max_bytes: u64) -> bool {
+        self.entries <= max_entries && self.bytes <= max_bytes
+    }
 }
 
 #[derive(Debug, Default)]
@@ -230,7 +463,13 @@ impl RolloutCache {
             self.selected.clear();
             self.reduced = None;
             self.session_titles = SessionTitleCache::default();
-            self.key = Some(key);
+            self.dirty_files.clear();
+            self.unpersistable_files.clear();
+            self.disk_last_write.clear();
+            self.disk_write_retry_after = None;
+            self.disk_write_backoff = Duration::ZERO;
+            self.last_disk_prune = None;
+            self.key = Some(key.clone());
         }
 
         let mut discovery = RolloutDataset::default();
@@ -275,6 +514,55 @@ impl RolloutCache {
                 config.redact_content
             )
         });
+
+        let maintenance_due = self
+            .last_disk_prune
+            .is_none_or(|last| last.elapsed() >= PERSISTENT_MAINTENANCE_INTERVAL);
+        let mut cache_usage = None;
+        let maintenance_span = config.startup_trace.span("rollout.cache_maintenance");
+        if config.rollout_cache_dir.is_some() && maintenance_due {
+            let pruned = prune_persistent_files(config, &key, None);
+            refresh.disk_pruned_files = pruned.entries;
+            refresh.disk_pruned_temp_files = pruned.stale_temps;
+            cache_usage = Some(pruned.usage);
+            self.last_disk_prune = Some(Instant::now());
+        }
+        maintenance_span.finish_with(|| {
+            format!(
+                "enabled={} due={} pruned={} temp_pruned={}",
+                config.rollout_cache_dir.is_some(),
+                maintenance_due,
+                refresh.disk_pruned_files,
+                refresh.disk_pruned_temp_files
+            )
+        });
+
+        let cache_load_span = config.startup_trace.span("rollout.cache_load");
+        if let Some(cache_root) = config.rollout_cache_dir.as_deref() {
+            for file in &files {
+                if self.files.contains_key(&file.path) {
+                    continue;
+                }
+                match load_persistent_file(cache_root, &key, file) {
+                    PersistentLoad::Hit(cached) => {
+                        self.files.insert(file.path.clone(), cached);
+                        refresh.disk_reused_files += 1;
+                    }
+                    PersistentLoad::Miss => refresh.disk_misses += 1,
+                    PersistentLoad::Corrupt => refresh.disk_corrupt_files += 1,
+                }
+            }
+        }
+        cache_load_span.finish_with(|| {
+            format!(
+                "enabled={} loaded={} misses={} corrupt={}",
+                config.rollout_cache_dir.is_some(),
+                refresh.disk_reused_files,
+                refresh.disk_misses,
+                refresh.disk_corrupt_files
+            )
+        });
+
         let parse_span = config.startup_trace.span("rollout.parse_files");
         let mut slowest_parse_us = 0_u128;
         let mut slowest_file_bytes = 0_u64;
@@ -296,7 +584,21 @@ impl RolloutCache {
                     slowest_file_bytes = file.fingerprint.len;
                 }
             }
+            let cacheable = cached.parsed.complete;
+            let fingerprint_len = cached.fingerprint.len;
             self.files.insert(file.path.clone(), cached);
+            if cacheable && config.rollout_cache_dir.is_some() {
+                let still_too_large = self
+                    .unpersistable_files
+                    .get(&file.path)
+                    .is_some_and(|previous_len| fingerprint_len >= *previous_len);
+                if still_too_large {
+                    refresh.disk_oversized_files += 1;
+                } else {
+                    self.unpersistable_files.remove(&file.path);
+                    self.dirty_files.insert(file.path.clone());
+                }
+            }
             refresh.reparsed_files += 1;
             refresh.stability_retries += stability_retries;
         }
@@ -310,12 +612,39 @@ impl RolloutCache {
             0
         };
         parse_span.finish_with(|| format!(
-            "files={} reparsed={} reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
+            "files={} reparsed={} reused={} disk_reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
             files.len(),
             refresh.reparsed_files,
             refresh.reused_files,
+            refresh.disk_reused_files,
             refresh.stability_retries
         ));
+
+        let cache_save_span = config.startup_trace.span("rollout.cache_save");
+        let write = self.persist_dirty_files(config, &key, cache_usage);
+        refresh.disk_written_files = write.written;
+        refresh.disk_write_failures = write.failures;
+        refresh.disk_deferred_files = write.deferred;
+        refresh.disk_oversized_files += write.oversized;
+        refresh.disk_write_retry_ms = write.retry_ms;
+        refresh.disk_pruned_files += write.pruned_entries;
+        refresh.disk_pruned_temp_files += write.pruned_temps;
+        if write.maintenance_ran {
+            self.last_disk_prune = Some(Instant::now());
+        }
+        cache_save_span.finish_with(|| {
+            format!(
+                "enabled={} written={} failures={} deferred={} oversized={} retry_ms={} pruned={} temp_pruned={}",
+                config.rollout_cache_dir.is_some(),
+                refresh.disk_written_files,
+                refresh.disk_write_failures,
+                refresh.disk_deferred_files,
+                refresh.disk_oversized_files,
+                refresh.disk_write_retry_ms,
+                refresh.disk_pruned_files,
+                refresh.disk_pruned_temp_files
+            )
+        });
 
         let selected = files
             .iter()
@@ -356,6 +685,12 @@ impl RolloutCache {
             .collect::<std::collections::HashSet<_>>();
         self.files
             .retain(|path, _| selected_paths.contains(path.as_path()));
+        self.disk_last_write
+            .retain(|path, _| selected_paths.contains(path.as_path()));
+        self.unpersistable_files
+            .retain(|path, _| selected_paths.contains(path.as_path()));
+        self.dirty_files
+            .retain(|path| selected_paths.contains(path.as_path()));
         self.last_refresh = refresh;
 
         let materialize_span = config.startup_trace.span("rollout.materialize");
@@ -382,17 +717,168 @@ impl RolloutCache {
                 .startup_trace
                 .record_with("rollout.total", scan_started, || {
                 format!(
-                "files={} lines={} bytes={selected_bytes} reparsed={} reused={} retries={} rebuilt={}",
+                "files={} lines={} bytes={selected_bytes} reparsed={} reused={} disk_reused={} disk_written={} disk_failures={} disk_deferred={} disk_oversized={} disk_retry_ms={} disk_pruned={} disk_temp_pruned={} retries={} rebuilt={}",
                 dataset.stats.scanned_files,
                 dataset.stats.parsed_lines,
                 refresh.reparsed_files,
                 refresh.reused_files,
+                refresh.disk_reused_files,
+                refresh.disk_written_files,
+                refresh.disk_write_failures,
+                refresh.disk_deferred_files,
+                refresh.disk_oversized_files,
+                refresh.disk_write_retry_ms,
+                refresh.disk_pruned_files,
+                refresh.disk_pruned_temp_files,
                 refresh.stability_retries,
                 refresh.rebuilt
                 )
             });
         }
         Ok(dataset)
+    }
+
+    fn persist_dirty_files(
+        &mut self,
+        config: &CollectConfig,
+        key: &CacheKey,
+        cache_usage: Option<PersistentCacheUsage>,
+    ) -> PersistentWriteSummary {
+        self.persist_dirty_files_inner(config, key, MAX_PERSISTENT_ENTRY_BYTES, cache_usage)
+    }
+
+    #[cfg(test)]
+    fn persist_dirty_files_with_limit(
+        &mut self,
+        config: &CollectConfig,
+        key: &CacheKey,
+        max_entry_bytes: u64,
+    ) -> PersistentWriteSummary {
+        self.persist_dirty_files_inner(config, key, max_entry_bytes, None)
+    }
+
+    fn persist_dirty_files_inner(
+        &mut self,
+        config: &CollectConfig,
+        key: &CacheKey,
+        max_entry_bytes: u64,
+        cache_usage: Option<PersistentCacheUsage>,
+    ) -> PersistentWriteSummary {
+        let Some(cache_root) = config.rollout_cache_dir.as_deref() else {
+            self.dirty_files.clear();
+            self.unpersistable_files.clear();
+            self.disk_last_write.clear();
+            self.disk_write_retry_after = None;
+            self.disk_write_backoff = Duration::ZERO;
+            return PersistentWriteSummary::default();
+        };
+
+        let mut summary = PersistentWriteSummary::default();
+        if self.dirty_files.is_empty() {
+            return summary;
+        }
+
+        let now = Instant::now();
+        if let Some(retry_after) = self.disk_write_retry_after
+            && let Some(remaining) = retry_after.checked_duration_since(now)
+        {
+            summary.deferred = self.dirty_files.len();
+            summary.retry_ms = duration_millis(remaining);
+            return summary;
+        }
+        self.disk_write_retry_after = None;
+        let namespace = persistent_namespace_path(cache_root, key);
+        let mut budget =
+            cache_usage.map(|usage| PersistentCacheBudget::new(namespace.clone(), usage));
+
+        let mut paths = std::mem::take(&mut self.dirty_files)
+            .into_iter()
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            if let Some(last_write) = self.disk_last_write.get(&path)
+                && let Some(remaining) = PERSISTENT_WRITE_DEBOUNCE
+                    .checked_sub(now.saturating_duration_since(*last_write))
+                && !remaining.is_zero()
+            {
+                summary.deferred += 1;
+                record_earliest_retry(&mut summary.retry_ms, remaining);
+                self.dirty_files.insert(path);
+                continue;
+            }
+            let Some(cached) = self
+                .files
+                .get(&path)
+                .filter(|cached| cached.parsed.complete)
+            else {
+                continue;
+            };
+            if self
+                .unpersistable_files
+                .get(&path)
+                .is_some_and(|previous_len| cached.fingerprint.len >= *previous_len)
+            {
+                summary.oversized += 1;
+                continue;
+            }
+            self.unpersistable_files.remove(&path);
+            let contents = match serialize_persistent_entry(key, &path, cached, max_entry_bytes) {
+                Ok(contents) => contents,
+                Err(PersistentWriteError::Oversized) => {
+                    summary.oversized += 1;
+                    self.unpersistable_files
+                        .insert(path, cached.fingerprint.len);
+                    continue;
+                }
+                Err(PersistentWriteError::Other) => {
+                    summary.failures += 1;
+                    self.dirty_files.insert(path);
+                    continue;
+                }
+            };
+            if budget.is_none() {
+                let pruned = prune_persistent_files(config, key, None);
+                summary.pruned_entries += pruned.entries;
+                summary.pruned_temps += pruned.stale_temps;
+                summary.maintenance_ran = true;
+                budget = Some(PersistentCacheBudget::new(namespace.clone(), pruned.usage));
+            }
+            let budget = budget
+                .as_mut()
+                .expect("a persistent write always initializes its cache budget");
+            let target = persistent_entry_path(cache_root, key, &path);
+            let old_bytes = match budget.reserve(&target, contents.len() as u64) {
+                Ok(old_bytes) => old_bytes,
+                Err(_) => {
+                    summary.failures += 1;
+                    self.dirty_files.insert(path);
+                    continue;
+                }
+            };
+            if write_private_atomically(&target, &contents).is_err() {
+                summary.failures += 1;
+                self.dirty_files.insert(path);
+                continue;
+            }
+            budget.commit(old_bytes, contents.len() as u64);
+            summary.written += 1;
+            self.disk_last_write.insert(path, Instant::now());
+        }
+
+        if let Some(budget) = budget {
+            summary.pruned_entries += budget.pruned_entries;
+            summary.pruned_temps += budget.pruned_temps;
+        }
+
+        if summary.failures > 0 {
+            self.disk_write_backoff = next_write_backoff(self.disk_write_backoff);
+            self.disk_write_retry_after = Instant::now().checked_add(self.disk_write_backoff);
+            summary.retry_ms = duration_millis(self.disk_write_backoff);
+        } else {
+            self.disk_write_backoff = Duration::ZERO;
+            self.disk_write_retry_after = None;
+        }
+        summary
     }
 
     fn refresh_session_titles(
@@ -460,6 +946,250 @@ impl RolloutCache {
             }
         }
     }
+}
+
+fn load_persistent_file(cache_root: &Path, key: &CacheKey, file: &RolloutFile) -> PersistentLoad {
+    let entry_path = persistent_entry_path(cache_root, key, &file.path);
+    let metadata = match entry_path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return PersistentLoad::Miss,
+        Err(_) => return PersistentLoad::Corrupt,
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PERSISTENT_ENTRY_BYTES {
+        return PersistentLoad::Corrupt;
+    }
+    let contents = match fs::read(&entry_path) {
+        Ok(contents) => contents,
+        Err(_) => return PersistentLoad::Corrupt,
+    };
+    let entry: PersistentFileEntry = match serde_json::from_slice(&contents) {
+        Ok(entry) => entry,
+        Err(_) => return PersistentLoad::Corrupt,
+    };
+    if entry.format_version != ROLLOUT_CACHE_FORMAT_VERSION
+        || entry.parser_revision != ROLLOUT_PARSER_REVISION
+        || entry.key != *key
+        || entry.source_path != file.path
+        || entry.cached.fingerprint != file.fingerprint
+        || !entry.cached.parsed.complete
+    {
+        return PersistentLoad::Miss;
+    }
+    if inspect_rollout_file(&file.path)
+        .map(|current| current.fingerprint != file.fingerprint)
+        .unwrap_or(true)
+    {
+        return PersistentLoad::Miss;
+    }
+    PersistentLoad::Hit(entry.cached)
+}
+
+#[cfg(test)]
+fn persist_file_entry(
+    cache_root: &Path,
+    key: &CacheKey,
+    source_path: &Path,
+    cached: &CachedFile,
+    max_entry_bytes: u64,
+) -> std::result::Result<(), PersistentWriteError> {
+    let contents = serialize_persistent_entry(key, source_path, cached, max_entry_bytes)?;
+    write_private_atomically(
+        &persistent_entry_path(cache_root, key, source_path),
+        &contents,
+    )
+    .map_err(|_| PersistentWriteError::Other)
+}
+
+fn serialize_persistent_entry(
+    key: &CacheKey,
+    source_path: &Path,
+    cached: &CachedFile,
+    max_entry_bytes: u64,
+) -> std::result::Result<Vec<u8>, PersistentWriteError> {
+    let entry = PersistentFileEntryRef {
+        format_version: ROLLOUT_CACHE_FORMAT_VERSION,
+        parser_revision: ROLLOUT_PARSER_REVISION,
+        key,
+        source_path,
+        cached,
+    };
+    let mut contents = LimitedBuffer::new(max_entry_bytes);
+    if serde_json::to_writer(&mut contents, &entry).is_err() {
+        return Err(if contents.exceeded {
+            PersistentWriteError::Oversized
+        } else {
+            PersistentWriteError::Other
+        });
+    }
+    Ok(contents.bytes)
+}
+
+fn next_write_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        PERSISTENT_WRITE_RETRY_INITIAL
+    } else {
+        current.saturating_mul(2).min(PERSISTENT_WRITE_RETRY_MAX)
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_earliest_retry(slot: &mut u64, duration: Duration) {
+    let candidate = duration_millis(duration);
+    if *slot == 0 || candidate < *slot {
+        *slot = candidate;
+    }
+}
+
+fn prune_persistent_files(
+    config: &CollectConfig,
+    key: &CacheKey,
+    protected: Option<&Path>,
+) -> PersistentPruneSummary {
+    let Some(cache_root) = config.rollout_cache_dir.as_deref() else {
+        return PersistentPruneSummary::default();
+    };
+    let directory = persistent_namespace_path(cache_root, key);
+    prune_cache_directory(
+        &directory,
+        protected,
+        MAX_PERSISTENT_CACHE_ENTRIES,
+        MAX_PERSISTENT_CACHE_BYTES,
+        stale_cache_temp_cutoff(),
+    )
+}
+
+fn prune_cache_directory(
+    directory: &Path,
+    protected: Option<&Path>,
+    max_entries: usize,
+    max_bytes: u64,
+    stale_temp_before: SystemTime,
+) -> PersistentPruneSummary {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return PersistentPruneSummary::default();
+    };
+    let mut cache_entries = Vec::new();
+    let mut summary = PersistentPruneSummary::default();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            cache_entries.push((path, metadata.len(), modified));
+        } else if is_cache_temporary_file(path.file_name())
+            && modified <= stale_temp_before
+            && fs::remove_file(&path).is_ok()
+        {
+            summary.stale_temps += 1;
+        }
+    }
+    let mut entries = cache_entries;
+    entries.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+    let mut entry_count = entries.len();
+    let mut total_bytes = entries
+        .iter()
+        .map(|(_, bytes, _)| *bytes)
+        .fold(0_u64, u64::saturating_add);
+    for (path, bytes, _) in entries {
+        if entry_count <= max_entries && total_bytes <= max_bytes {
+            break;
+        }
+        if protected == Some(path.as_path()) {
+            continue;
+        }
+        if fs::remove_file(path).is_ok() {
+            entry_count = entry_count.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(bytes);
+            summary.entries += 1;
+        }
+    }
+    summary.usage = PersistentCacheUsage {
+        entries: entry_count,
+        bytes: total_bytes,
+    };
+    summary
+}
+
+fn stale_cache_temp_cutoff() -> SystemTime {
+    SystemTime::now()
+        .checked_sub(STALE_CACHE_TEMP_AGE)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn existing_cache_file_len(path: &Path) -> Option<u64> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|metadata| metadata.len())
+}
+
+fn is_cache_temporary_file(file_name: Option<&OsStr>) -> bool {
+    let Some(file_name) = file_name.and_then(OsStr::to_str) else {
+        return false;
+    };
+    let parts = file_name.split('.').collect::<Vec<_>>();
+    parts.len() == 6
+        && parts[0].is_empty()
+        && parts[1].len() == 16
+        && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && parts[2] == "json"
+        && parts[3].parse::<u32>().is_ok()
+        && parts[4].parse::<u64>().is_ok()
+        && parts[5] == "tmp"
+}
+
+fn persistent_entry_path(cache_root: &Path, key: &CacheKey, source_path: &Path) -> PathBuf {
+    persistent_namespace_path(cache_root, key)
+        .join(format!("{:016x}.json", stable_path_hash(source_path)))
+}
+
+fn persistent_namespace_path(cache_root: &Path, key: &CacheKey) -> PathBuf {
+    cache_root
+        .join(ROLLOUT_CACHE_DIRECTORY)
+        .join(cache_namespace(key))
+}
+
+fn cache_namespace(key: &CacheKey) -> String {
+    let home = key.codex_home.to_string_lossy();
+    let redaction = if key.redact_content {
+        b"redacted".as_slice()
+    } else {
+        b"visible".as_slice()
+    };
+    format!(
+        "{:016x}-{}",
+        stable_hash(&[home.as_bytes(), redaction]),
+        if key.redact_content { "r" } else { "v" }
+    )
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    let path = path.to_string_lossy();
+    stable_hash(&[path.as_bytes()])
+}
+
+fn stable_hash(parts: &[&[u8]]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for part in parts {
+        for byte in *part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn reduce_cached_files(
@@ -1847,5 +2577,239 @@ fn set_min_timestamp(slot: &mut Option<DateTime<Utc>>, value: DateTime<Utc>) {
 fn set_max_timestamp(slot: &mut Option<DateTime<Utc>>, value: DateTime<Utc>) {
     if slot.is_none_or(|current| value > current) {
         *slot = Some(value);
+    }
+}
+
+#[cfg(test)]
+mod persistent_cache_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_removes_entries_until_within_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a.json");
+        let second = temp.path().join("b.json");
+        let third = temp.path().join("c.json");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        fs::write(&third, b"three").unwrap();
+
+        let pruned = prune_cache_directory(temp.path(), None, 1, u64::MAX, SystemTime::UNIX_EPOCH);
+
+        assert_eq!(pruned.entries, 2);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pruning_removes_only_stale_cache_temporary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join(".0123456789abcdef.json.42.7.tmp");
+        let unrelated = temp.path().join("notes.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let pruned = prune_cache_directory(
+            temp.path(),
+            None,
+            usize::MAX,
+            u64::MAX,
+            SystemTime::now() + Duration::from_secs(1),
+        );
+
+        assert_eq!(pruned.stale_temps, 1);
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn write_budget_reserves_atomic_temporary_file_space_before_each_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a.json");
+        let target = temp.path().join("b.json");
+        fs::write(&first, [0_u8; 8]).unwrap();
+        fs::write(&target, [0_u8; 8]).unwrap();
+        let mut budget = PersistentCacheBudget {
+            directory: temp.path().to_owned(),
+            usage: PersistentCacheUsage {
+                entries: 2,
+                bytes: 16,
+            },
+            max_entries: 2,
+            max_bytes: 16,
+            pruned_entries: 0,
+            pruned_temps: 0,
+        };
+
+        let old_bytes = budget.reserve(&target, 8).unwrap();
+
+        assert_eq!(old_bytes, Some(8));
+        assert_eq!(budget.usage.bytes, 8);
+        assert_eq!(budget.pruned_entries, 1);
+        assert!(!first.exists());
+        assert!(target.exists());
+        budget.commit(old_bytes, 8);
+        assert_eq!(budget.usage.entries, 1);
+        assert_eq!(budget.usage.bytes, 8);
+    }
+
+    #[test]
+    fn oversized_entry_is_suppressed_after_the_first_serialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("rollout.jsonl");
+        fs::write(&source, b"{}\n").unwrap();
+        let fingerprint = FileFingerprint::from_metadata(&source.metadata().unwrap()).unwrap();
+        let key = CacheKey {
+            codex_home: temp.path().join("home"),
+            redact_content: false,
+        };
+        let config = CollectConfig {
+            rollout_cache_dir: Some(temp.path().join("cache")),
+            ..CollectConfig::default()
+        };
+        let mut cache = RolloutCache::new();
+        cache.files.insert(
+            source.clone(),
+            CachedFile {
+                fingerprint,
+                parsed: ParsedFile {
+                    complete: true,
+                    ..ParsedFile::default()
+                },
+            },
+        );
+        cache.dirty_files.insert(source.clone());
+
+        let first = cache.persist_dirty_files_with_limit(&config, &key, 0);
+        assert_eq!(first.oversized, 1);
+        assert_eq!(first.failures, 0);
+        assert!(cache.unpersistable_files.contains_key(&source));
+
+        cache.dirty_files.insert(source.clone());
+        let second = cache.persist_dirty_files_with_limit(&config, &key, 0);
+        assert_eq!(second.oversized, 1);
+        assert_eq!(second.failures, 0);
+
+        fs::write(&source, b"").unwrap();
+        let fingerprint = FileFingerprint::from_metadata(&source.metadata().unwrap()).unwrap();
+        cache.files.insert(
+            source.clone(),
+            CachedFile {
+                fingerprint,
+                parsed: ParsedFile {
+                    complete: true,
+                    ..ParsedFile::default()
+                },
+            },
+        );
+        cache.dirty_files.insert(source);
+        let after_shrink = cache.persist_dirty_files_with_limit(&config, &key, 1024);
+        assert_eq!(after_shrink.written, 1);
+        assert!(cache.unpersistable_files.is_empty());
+    }
+
+    #[test]
+    fn persistent_hit_is_rejected_if_source_changed_after_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("rollout.jsonl");
+        fs::write(&source, b"{}\n").unwrap();
+        let discovered = inspect_rollout_file(&source).unwrap();
+        let key = CacheKey {
+            codex_home: temp.path().join("home"),
+            redact_content: false,
+        };
+        let cached = CachedFile {
+            fingerprint: discovered.fingerprint.clone(),
+            parsed: ParsedFile {
+                complete: true,
+                ..ParsedFile::default()
+            },
+        };
+        let cache_root = temp.path().join("cache");
+        assert!(
+            persist_file_entry(
+                &cache_root,
+                &key,
+                &source,
+                &cached,
+                MAX_PERSISTENT_ENTRY_BYTES,
+            )
+            .is_ok()
+        );
+
+        fs::write(&source, b"{}\n{}\n").unwrap();
+
+        assert!(matches!(
+            load_persistent_file(&cache_root, &key, &discovered),
+            PersistentLoad::Miss
+        ));
+    }
+
+    #[test]
+    fn incomplete_in_memory_entry_is_reparsed_instead_of_hydrated_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let source = sessions.join("rollout-incomplete.jsonl");
+        let now = Utc::now();
+        fs::write(
+            &source,
+            format!(
+                "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"incomplete-thread\"}}}}\n",
+                now.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        let discovered = inspect_rollout_file(&source).unwrap();
+        let key = CacheKey {
+            codex_home: temp.path().to_owned(),
+            redact_content: false,
+        };
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            rollout_cache_dir: Some(temp.path().join("cache")),
+            ..CollectConfig::default()
+        };
+        let (complete, _) = parse_stable_rollout_file(&discovered, &config);
+        assert!(
+            persist_file_entry(
+                config.rollout_cache_dir.as_deref().unwrap(),
+                &key,
+                &source,
+                &complete,
+                MAX_PERSISTENT_ENTRY_BYTES,
+            )
+            .is_ok()
+        );
+
+        let mut cache = RolloutCache::new();
+        cache.key = Some(key);
+        cache.files.insert(
+            source.clone(),
+            CachedFile {
+                fingerprint: discovered.fingerprint.clone(),
+                parsed: ParsedFile::default(),
+            },
+        );
+        cache.selected = vec![SelectedFile {
+            path: source,
+            fingerprint: discovered.fingerprint,
+        }];
+        cache.reduced = Some(ReducedRollouts::default());
+
+        let dataset = cache.scan(&config, now).unwrap();
+
+        assert_eq!(cache.last_refresh().disk_reused_files, 0);
+        assert_eq!(cache.last_refresh().reparsed_files, 1);
+        assert!(cache.last_refresh().rebuilt);
+        assert_eq!(dataset.tasks[0].thread_id, "incomplete-thread");
+    }
+
+    #[test]
+    fn persistent_write_backoff_is_bounded() {
+        let mut backoff = Duration::ZERO;
+        for _ in 0..16 {
+            backoff = next_write_backoff(backoff);
+        }
+        assert_eq!(backoff, PERSISTENT_WRITE_RETRY_MAX);
     }
 }

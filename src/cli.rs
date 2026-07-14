@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(long)]
     redact_content: bool,
 
+    /// Disable the user-level parsed rollout cache.
+    #[arg(long, global = true)]
+    no_rollout_cache: bool,
+
     /// TUI color theme; `bright` is an alias for `light`.
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
@@ -214,10 +218,15 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     config.active_grace = active_grace(cli.active_grace_minutes);
     config.offline = cli.offline;
     config.redact_content = cli.redact_content;
+    config.rollout_cache_dir = if cli.no_rollout_cache {
+        None
+    } else {
+        crate::cache::default_rollout_cache_dir()
+    };
     config.startup_trace = trace.clone();
     config_span.finish_with(|| {
         format!(
-            "build={} days={} max_files={} offline={} redact_content={}",
+            "build={} days={} max_files={} offline={} redact_content={} cache={}",
             if cfg!(debug_assertions) {
                 "debug"
             } else {
@@ -226,7 +235,12 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
             config.lookback_days,
             config.max_files,
             config.offline,
-            config.redact_content
+            config.redact_content,
+            if config.rollout_cache_dir.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     });
 
@@ -436,6 +450,20 @@ mod tests {
             .unwrap_err();
 
         assert!(error.use_stderr());
+    }
+
+    #[test]
+    fn rollout_cache_can_be_disabled_as_a_global_option() {
+        let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
+        assert!(!default.no_rollout_cache);
+
+        let before_subcommand =
+            Cli::try_parse_from(["codex-usage-monit", "--no-rollout-cache", "snapshot"]).unwrap();
+        assert!(before_subcommand.no_rollout_cache);
+
+        let after_subcommand =
+            Cli::try_parse_from(["codex-usage-monit", "snapshot", "--no-rollout-cache"]).unwrap();
+        assert!(after_subcommand.no_rollout_cache);
     }
 
     #[test]

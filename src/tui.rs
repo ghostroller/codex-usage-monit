@@ -2647,7 +2647,11 @@ fn prepare_initial_tui(
     state_span.finish("source=user_state");
     let cache_span = config.startup_trace.span("tui.cache_create");
     let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
-    cache_span.finish("kind=in_memory cold=true");
+    cache_span.finish(if config.rollout_cache_dir.is_some() {
+        "kind=persistent"
+    } else {
+        "kind=in_memory"
+    });
     let snapshot_span = config.startup_trace.span("tui.initial_snapshot");
     let initial = {
         let mut cache = rollout_cache

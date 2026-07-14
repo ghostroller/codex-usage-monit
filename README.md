@@ -46,6 +46,7 @@ codex-usage-monit
 codex-usage-monit --days 2 --max-files 200
 codex-usage-monit --offline
 codex-usage-monit --redact-content
+codex-usage-monit --no-rollout-cache
 codex-usage-monit --codex-home /path/to/.codex
 codex-usage-monit --theme light
 ```
@@ -70,6 +71,8 @@ codex-usage-monit --startup-log /tmp/codex-usage-startup.jsonl snapshot --sectio
 ```
 
 默认不开启 profiler，也不创建日志。trace header 另含绝对 `startedAt` 和进程 `pid`，阶段记录则只含阶段名、相对时间、文件/字节/行/task/turn 等聚合计数和状态；两者都不含 Codex home 路径、thread/turn ID、标题或消息内容。`rollout.parse_files` 用于判断 JSONL 解析成本，`rollout.reduce` / `rollout.materialize` 分别显示事件回放与实体构造，`app_server.initialize` / `app_server.account_reads` / `app_server.shutdown` 则拆分进程与 RPC 等待；`startup.ready` 表示首帧已经成功绘制。
+
+CLI 默认使用用户级持久化 rollout 解析缓存，避免每次冷启动重新解析未变化的历史 JSONL。macOS 路径为 `~/Library/Caches/codex-usage-monit`，Linux 为 `$XDG_CACHE_HOME/codex-usage-monit`（未设置时为 `~/.cache/codex-usage-monit`），Windows 为 `%LOCALAPPDATA%\codex-usage-monit\cache`；`CODEX_USAGE_MONIT_CACHE_DIR` 可覆盖目录。`--no-rollout-cache` 禁用磁盘读写并恢复纯进程内缓存。缓存按 Codex home 和 redaction 模式隔离，每个 namespace 会尽力把磁盘分片收敛到 2,000 个和 512 MiB 以内，并清理超过 24 小时的中断写入临时文件；写入批次会在落盘前按当前字节预算腾出空间，而不是等整批结束后再清理。启动追踪中的 `rollout.cache_maintenance` / `rollout.cache_load` / `rollout.cache_save` 会报告维护、命中、缺失、损坏、写入、延后、退避和清理计数。
 
 报告同时保留 `tui.bootstrap`、`snapshot.total`、`rollout.total` 等外层计时与其内部阶段，这些时长会重叠，不能逐行相加；成功的 TUI / `debug-startup` 以 `startup.ready` 为端到端总耗时，成功的一次性命令以 `startup.complete` 为准。缺少终点事件表示进程在完成前返回错误或被中断；一次性输出写入失败会显式记录 `startup.failed`。
 
@@ -118,7 +121,7 @@ codex-usage-monit attribution --format text
 - `t`：在 dark 与 light 主题间切换；
 - `q`、`Ctrl-C`：直接退出；非搜索状态的 `Esc` 打开退出确认，弹窗内 `Enter` 确认、`Esc` 取消；搜索输入状态中的 `Esc` 仍只取消本次编辑。
 
-本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。`RolloutCache` 只在当前 TUI 进程内复用，重新启动仍是冷扫描；冷启动成本主要取决于入选 JSONL 的总字节数而不是文件数，少量包含长历史的 rollout 也可能很大。使用 `debug-startup` 查看当前机器与数据集的真实分解，不应把某个固定文件数的旧基准当作启动时延保证。
+本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。进程内 `RolloutCache` 负责增量刷新，用户级持久化缓存则复用跨进程未变化文件的解析结果；首次运行、缓存缺失/损坏或源文件变化时仍会按需解析。活跃文件的成功缓存写入按路径合并到最多每 30 秒一次，I/O 失败会从 30 秒起指数退避到 15 分钟，均不阻塞当前 snapshot。冷启动成本主要取决于未命中 JSONL 的总字节数而不是文件数，少量包含长历史的 rollout 也可能很大。使用 `debug-startup` 查看当前机器与数据集的真实分解，不应把某个固定文件数的旧基准当作启动时延保证。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
 Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 默认保持 Flat 排序；Tree 模式把已知直接父会话且父节点也在当前过滤结果中的 subagent 递归缩进到父节点下，缺失或被过滤的父节点不会被强行补回。拥有子节点的行显示可点击的 `[-]` / `[+]`，并可在 Tasks 焦点下用 `-` / `+` 收起或展开；大写 `E` 和可点击的 `[E]Collapse` 会一次收起当前过滤树的所有父节点，包括已藏在折叠祖先下的嵌套父节点；全部收起后按钮变为 `[E]Expand` 并展开同一过滤范围。折叠状态跨数据刷新保留。节点收起时，父行会汇总当前过滤树中所有被隐藏后代的 token，并按普通 `codex` 分母重算 local share 与 EST；Spark 后代继续从两者中排除。展开后各行恢复独立显示。挂在父节点下的 child 省略重复项目名，作为 orphan root 显示时仍保留项目名。树根和同层分支由最近活动的后代带动排序，因此新活动的 subagent 仍会把整组带到顶部。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；非空筛选右侧的 `[Del]` 整块可点击，非输入状态下也可按 `Delete` 清空当前焦点面板的查询。焦点从 Turns 返回 Tasks 时会自动清空 Turns 查询并恢复完整 turn 列表，但 Tasks 查询保持不变。Codex 标记为 Fast 的 turn 会在模型名称后额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Overview 的 Models 面板显示所选 5h/Week `codex` gauge、本地非 Spark token、统一公式得到的 Low-confidence EST，以及按 token 降序的模型表；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充；面板隐藏后仍可从最上方的 `[M]Models` 恢复。
 
@@ -131,7 +134,8 @@ TUI 会把稳定菜单偏好保存到用户级状态目录：macOS 为 `~/Librar
 - 只读 `CODEX_HOME/sessions`、`CODEX_HOME/archived_sessions`、`CODEX_HOME/session_index.jsonl` 和 Codex App Server；
 - 不读取 `auth.json`，认证完全由 App Server 管理；
 - 不修改、恢复或终止 Codex task；
-- rollout 缓存仅存在于 TUI 进程内，不写入索引数据库；TUI 只另行写入上述不含会话内容的菜单偏好文件；
+- CLI 默认把解析后的 rollout 元数据、token 事件和有限长度的 task/turn 消息摘要写入上述用户级缓存目录；`--redact-content` 模式使用不含这些摘要的独立缓存且不会读取可见缓存，但不会删除之前生成的可见缓存。`--no-rollout-cache` 只禁用后续磁盘读写；需要擦除时可直接删除缓存目录。Unix 新建目录和文件分别使用 `0700`、`0600` 权限，缓存会自动重建；
+- TUI 另行写入上述不含会话内容的菜单偏好文件；
 - 进程内保留 `session_index.jsonl` 的当前会话标题；索引没有对应标题时，才回退到最多 96 字符的首条用户消息。每个 turn 最多保留 72 字符的用户消息摘要，不保存完整消息、reasoning 或工具内容；缺少显式 `turn_id` 时只归入当前 active turn，没有 active turn 则不猜测归属。
 - 部分 subagent turn 没有明文 `user_message`，消息摘要会显示 `-`，不会从注入上下文反推。
 - TUI 与 text 输出会剥离动态文本中的终端控制字符；JSON 使用标准转义。
