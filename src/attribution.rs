@@ -82,7 +82,7 @@ struct SelectedWindow<'a> {
 /// the current normal Codex five-hour and weekly rate-limit windows.
 ///
 /// Spark calls are excluded. EST uses the published short-context Standard or
-/// Fast token prices, while raw token totals and LOCAL shares remain unchanged.
+/// Fast token prices, while raw token totals and TOKEN% shares remain unchanged.
 pub fn analyze_windows(
     tasks: &[TaskRecord],
     _turns: &[TurnRecord],

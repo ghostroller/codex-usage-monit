@@ -14,7 +14,7 @@
 
 当前工具启动独立 App Server，只调用账户额度与账户用量读取方法。这个新 runtime 无法提供其他已经运行的 CLI/IDE/Desktop task 的精确 active flags，所以 v0.1 的 task 状态来自 rollout turn 边界与文件新鲜度，并明确标为 `inferred` 或 `stale`。官方 thread status API 是未来统一 runtime 模式的数据能力，不是当前实现已经声称拥有的能力。
 
-在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的短上下文价格加权用量占比做 Low-confidence 投影。原始本地 token share 不加权；一次性命令与 TUI 使用相同公式。
+在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的短上下文价格加权用量占比做 Low-confidence 投影。主要显示口径 `TOKEN%` 是未加权的本地可观察 token 占比；一次性命令与 TUI 使用相同定义。
 
 扫描不完整、lookback 不足或 task 状态 stale 会保留在 `partial` / `partialReasons` 和 provenance 中，但不会关闭仍可计算的 EST。只有没有当前 `codex` 窗口或窗口内没有本地非 Spark token 分母时，归因才不可用。
 
@@ -104,7 +104,7 @@ Rollout JSONL 中可利用以下事件重建历史：
 
 近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。`thread_settings_applied.thread_settings.service_tier=priority` 可以为下一次激活的 turn 提供 Fast 标识，TUI 把 `FAST` 放在模型名称后，普通 turn 不显示。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
 
-subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。Tree 模式收起父节点时，父行会在渲染层汇总当前过滤树内隐藏后代的 token、所选 reset cycle local share 与 estimated quota；它不改变底层 task/turn 归属，也不会影响一次性输出。
+subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。Tree 模式收起父节点时，父行会在渲染层汇总当前过滤树内隐藏后代的 token、所选 reset cycle `TOKEN%` 与 estimated quota；它不改变底层 task/turn 归属，也不会影响一次性输出。
 
 工具最多保留每个 turn 首条用户消息的 72 字符摘要。有显式 `turn_id` 时直接归属；没有时只归入当前 active turn，若当前没有 active turn，则不猜测归属。部分 subagent turn 没有明文 `user_message`，摘要显示 `-`，不会从注入上下文反推。
 
@@ -138,7 +138,7 @@ request_rate_limit_cost
 turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 ```
 
-该值必须标记为 `local token share`，不能称为官方额度贡献。
+该值在界面中标记为 `TOKEN%` / `TOKEN SHARE`，含义是本地可观察 token 占比，不能称为官方额度贡献。
 
 同一公式同时适用于当前 5 小时和周 reset cycle。周周期只有在本地扫描覆盖服务端周期起点，且没有 `max-files` 截断、坏行、不可读文件或歧义 counter reset 时才能标为本地精确。`--days 7` 表示本地扫描 lookback，不定义周窗口；若配置的 `--days` 不足以覆盖 `resetsAt - 10080m`，只有周分析标为 partial，完整的 5h 分析不受污染。每项 `windowAnalyses` 通过自己的 `partial` / `partialReasons` 表达这一点；额度 gauge 仍可保持服务端完整，因为它不依赖 rollout lookback。
 
@@ -167,7 +167,7 @@ estimated_quota_percent = codex_used_percent * entity_price_units / all_price_un
 
 `reasoning_output_tokens` 是 output 的子集，不能再次相加。rollout 当前不暴露 `cache_write_tokens`，因此上表的 GPT-5.6 cache-write 价格无法进入历史 EST；`input - cached` 只能按普通 input 价格处理。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
-缺失或不在价目表中的非 Spark 模型仍保留 TOKENS/LOCAL，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 LOCAL 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有结果均标记为 Low confidence，TUI/text 使用 `~` 表示近似，并保留 `externalActivityPossible`。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
+缺失或不在价目表中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有结果均标记为 Low confidence，TUI/text 使用 `~` 表示近似，并保留 `externalActivityPossible`。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
 该公式隐含“Codex 配额相对成本近似 API 短上下文价格，且本机看到了账户活动”的强假设。真实 Codex 配额权重、cache write、其他设备或云 task、服务端取整与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方配额账单。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
 
@@ -197,7 +197,7 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 当没有 active 或 stale task 时，最终服务端快照可以把 `settled` 标为 true。此时：
 
 - task/turn/model token 可以精确结算；
-- 扫描完整的当前 5 小时或周 reset cycle 本地 token share 可以精确结算；
+- 扫描完整的当前 5 小时或周 reset cycle `TOKEN%` 可以精确结算；
 - 按当前 `codex` gauge 与短上下文价格加权用量占比得到的 estimated quota share 仍保持 Low；
 - 服务端 task/turn quota 仍然不能精确计算。
 

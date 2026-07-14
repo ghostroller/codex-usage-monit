@@ -60,7 +60,7 @@ const FILTER_CLEAR_GAP_WIDTH: u16 = 1;
 const FILTER_MIN_QUERY_WIDTH: u16 = 1;
 const RESUME_CONFIRM_MIN_INNER_WIDTH: u16 = 44;
 const TASK_TOKENS_WIDTH: u16 = 10;
-const TASK_LOCAL_WIDTH: u16 = 8;
+const TASK_TOKEN_SHARE_WIDTH: u16 = 8;
 const TASK_QUOTA_WIDTH: u16 = 8;
 const TASK_COLUMN_SPACING: u16 = 1;
 const TASK_HIGHLIGHT_WIDTH: u16 = 1;
@@ -231,10 +231,10 @@ impl WindowScope {
         }
     }
 
-    fn local_header(self) -> &'static str {
+    fn token_share_header(self) -> &'static str {
         match self {
-            Self::FiveHours => "LOCAL5H",
-            Self::Week => "LOCALWK",
+            Self::FiveHours => "TOKEN5H%",
+            Self::Week => "TOKENWK%",
         }
     }
 
@@ -4178,7 +4178,7 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         task_rows,
         [
             Constraint::Length(TASK_TOKENS_WIDTH),
-            Constraint::Length(TASK_LOCAL_WIDTH),
+            Constraint::Length(TASK_TOKEN_SHARE_WIDTH),
             Constraint::Length(TASK_QUOTA_WIDTH),
             Constraint::Min(12),
         ],
@@ -4189,9 +4189,9 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         [
             "TOKENS",
             if window_only {
-                app.window_scope.local_header()
+                app.window_scope.token_share_header()
             } else {
-                WindowScope::FiveHours.local_header()
+                WindowScope::FiveHours.token_share_header()
             },
             if window_only {
                 app.window_scope.quota_header()
@@ -4890,7 +4890,7 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
                 Constraint::Length(7),
             ],
             table_header(
-                ["MODEL", "EFFORT", "MESSAGE", "TOKENS", "LOCAL", "EST.Q"],
+                ["MODEL", "EFFORT", "MESSAGE", "TOKENS", "TOKEN%", "EST.Q"],
                 theme,
             ),
         )
@@ -4905,7 +4905,7 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
                 Constraint::Length(7),
             ],
             table_header(
-                ["EFFORT/MODEL", "MESSAGE", "TOKENS", "LOCAL", "EST.Q"],
+                ["EFFORT/MODEL", "MESSAGE", "TOKENS", "TOKEN%", "EST.Q"],
                 theme,
             ),
         )
@@ -5082,7 +5082,7 @@ fn render_turn_detail(
         Line::from(first_tokens),
         Line::from(second_tokens),
         Line::from(format!(
-            "local={:.1}% · est.quota={} · confidence={}",
+            "token.share={:.1}% · est.quota={} · confidence={}",
             if window_only {
                 selected_window_usage.local_token_share_percent
             } else {
@@ -5200,30 +5200,30 @@ fn attribution_summary_lines(
     let allocation = if has_local_denominator {
         if compact {
             format!(
-                "Local {} · EST ~{:.2}pp · codex gauge × price-weighted share",
+                "Tokens {} · EST ~{:.2}pp · codex gauge × price-weighted share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
         } else {
             format!(
-                "{} local · ~{:.2}pp estimated · codex gauge × price-weighted share",
+                "{} token total · ~{:.2}pp estimated · codex gauge × price-weighted share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
         }
     } else if compact {
-        "Local 0 · EST - · no local token denominator".to_string()
+        "Tokens 0 · EST - · no token denominator".to_string()
     } else {
-        "0 local tokens · estimate unavailable without a local token denominator".to_string()
+        "0 token total · estimate unavailable without a token denominator".to_string()
     };
     let mut quality = if compact {
         format!(
-            "conf {} · relative allocation",
+            "conf {} · price-weighted quota estimate",
             confidence_label(attribution.confidence)
         )
     } else {
         format!(
-            "{} confidence · relative allocation, not server per-task accounting",
+            "{} confidence · price-weighted quota estimate, not server per-task accounting",
             confidence_label(attribution.confidence),
         )
     };
@@ -5332,7 +5332,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if models.is_empty() {
         let message = if attribution.is_some() {
             format!(
-                "No local model usage in the current {} window",
+                "No token usage in the current {} window",
                 scope.as_deref().unwrap_or(window_scope.label())
             )
         } else if window_scope == WindowScope::FiveHours
@@ -5374,7 +5374,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ],
     )
     .header(table_header(
-        ["MODEL", "TOKENS", "LOCAL SHARE", "EST. QUOTA", "CONF"],
+        ["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA", "CONF"],
         theme,
     ));
     frame.render_widget(table, model_area);
@@ -5556,7 +5556,7 @@ fn task_table_columns(area: Rect) -> [Rect; 4] {
     .areas(area);
     Layout::horizontal([
         Constraint::Length(TASK_TOKENS_WIDTH),
-        Constraint::Length(TASK_LOCAL_WIDTH),
+        Constraint::Length(TASK_TOKEN_SHARE_WIDTH),
         Constraint::Length(TASK_QUOTA_WIDTH),
         Constraint::Min(12),
     ])
@@ -6489,7 +6489,7 @@ mod tests {
         assert!(compact[1].contains("EST ~34.00pp"));
         assert!(compact[1].contains("codex gauge × price-weighted share"));
         assert!(compact[2].contains("conf low"));
-        assert!(compact[2].contains("relative allocation"));
+        assert!(compact[2].contains("price-weighted quota estimate"));
 
         let wide = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false);
         assert!(wide[1].contains("~34.00pp estimated"));
@@ -6550,7 +6550,7 @@ mod tests {
         let content = render_models_content(&app.snapshot, 100, 8);
 
         assert!(content.contains("Models · 5h"));
-        assert!(content.contains("No local model usage in the current 5h window"));
+        assert!(content.contains("No token usage in the current 5h window"));
         assert!(!content.contains("5h unavailable"));
     }
 
@@ -6672,7 +6672,7 @@ mod tests {
     }
 
     #[test]
-    fn models_panel_reports_missing_local_denominator_without_a_fake_estimate() {
+    fn models_panel_reports_missing_token_denominator_without_a_fake_estimate() {
         let mut app = interaction_test_app(1, 1);
         add_window_analysis(&mut app, WindowScope::Week, 0, 0.0);
         let analysis = &mut app.snapshot.window_analyses[0];
@@ -6681,8 +6681,8 @@ mod tests {
         analysis.models.clear();
 
         let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 120, 10);
-        assert!(content.contains("local token denominator"));
-        assert!(content.contains("No local model usage in the current week window"));
+        assert!(content.contains("token denominator"));
+        assert!(content.contains("No token usage in the current week window"));
         assert!(!content.contains("EST ~"));
     }
     #[test]
@@ -7784,6 +7784,8 @@ mod tests {
 
         handle_key_event(&mut app, key_event(KeyCode::Char('W')));
         assert_eq!(app.window_scope, WindowScope::Week);
+        assert_eq!(WindowScope::FiveHours.token_share_header(), "TOKEN5H%");
+        assert_eq!(WindowScope::Week.token_share_header(), "TOKENWK%");
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let content = terminal
             .backend()
@@ -7794,7 +7796,7 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("week reset cycle"));
         assert!(content.contains("Week-cycle tasks"));
-        assert!(content.contains("LOCALWK"));
+        assert!(content.contains("TOKENWK%"));
         assert!(content.contains("777"));
         assert!(content.contains("63.0%"));
         assert!(content.contains("gpt-window"));
@@ -8059,7 +8061,7 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Week reset cycle unavailable"));
         assert!(content.contains("Models · Week unavailable"));
-        assert!(!content.contains("No local model usage in the current Week window"));
+        assert!(!content.contains("No token usage in the current Week window"));
     }
 
     #[test]
@@ -10381,7 +10383,7 @@ mod tests {
                         assert!(content.contains("total=42"));
                         assert!(content.contains("1ms"));
                         assert!(content.contains("D 42"));
-                        assert!(content.contains("LOCAL"));
+                        assert!(content.contains("TOKEN"));
                         assert!(content.contains("EST.Q"));
                         assert!(content.contains("DONE"));
                         assert!(content.contains("STALE"));

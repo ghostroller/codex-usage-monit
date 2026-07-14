@@ -231,7 +231,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         let _ = writeln!(
             output,
             "  {:<15} {:>12} {:>8} {:>8} {:<12}  TITLE",
-            "STATUS/EVIDENCE", "TOKENS", "LOCAL5H", "EST.Q5H", "SOURCE"
+            "STATUS/EVIDENCE", "TOKENS", "TOKEN5H%", "EST.Q5H", "SOURCE"
         );
         for task in &snapshot.tasks {
             let _ = writeln!(
@@ -256,7 +256,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         let _ = writeln!(
             output,
             "  {:<11} {:<16} {:<7} {:>12} {:>8} {:>8}  THREAD   MESSAGE",
-            "STATUS", "MODEL", "EFFORT", "TOKENS", "LOCAL%", "EST.Q%"
+            "STATUS", "MODEL", "EFFORT", "TOKENS", "TOKEN%", "EST.Q%"
         );
         for turn in snapshot.turns.iter().filter(|turn| {
             request
@@ -284,7 +284,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
         for model in &snapshot.models {
             let _ = writeln!(
                 output,
-                "  {:<24} {:>12}  {:>7.2}% local  {:>8} estimated quota  {:?}",
+                "  {:<24} {:>12}  {:>7.2}% token share  {:>8} estimated quota  {:?}",
                 terminal_safe_text(&model.model),
                 compact_tokens(model.token_usage),
                 model.local_token_share_percent,
@@ -412,7 +412,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             && analysis.turns.is_empty()
             && analysis.models.is_empty()
         {
-            let _ = writeln!(output, "  no local token events in this reset cycle");
+            let _ = writeln!(output, "  no token events in this reset cycle");
             continue;
         }
 
@@ -436,7 +436,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(
                 output,
                 "    {:>8} {:>8} {:>12} {:<8}  TITLE",
-                "LOCAL%", "EST.Q%", "TOKENS", "THREAD"
+                "TOKEN%", "EST.Q%", "TOKENS", "THREAD"
             );
             for thread in threads {
                 let title = snapshot
@@ -481,7 +481,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(
                 output,
                 "    {:>8} {:>8} {:>12} {:<16} {:<7} {:<17}  MESSAGE",
-                "LOCAL%", "EST.Q%", "TOKENS", "MODEL", "EFFORT", "THREAD/TURN"
+                "TOKEN%", "EST.Q%", "TOKENS", "MODEL", "EFFORT", "THREAD/TURN"
             );
             for window_turn in turns {
                 let turn = snapshot.turns.iter().find(|turn| {
@@ -535,7 +535,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(
                 output,
                 "    {:>8} {:>8} {:>12}  MODEL",
-                "LOCAL%", "EST.Q%", "TOKENS"
+                "TOKEN%", "EST.Q%", "TOKENS"
             );
             for model in models {
                 let _ = writeln!(
@@ -563,26 +563,26 @@ fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) 
     let local_tokens = compact_tokens(attribution.local_token_usage);
     let Some(window) = attribution.window.as_ref() else {
         return format!(
-            "  local tokens {local_tokens} | estimated - | codex quota window unavailable"
+            "  token total {local_tokens} | estimated - | codex quota window unavailable"
         );
     };
 
     if attribution.local_token_usage.total_tokens == 0 {
         return format!(
-            "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated - (no local token denominator)",
+            "  token total {local_tokens} | codex gauge {:.2}% used | estimated - (no token denominator)",
             window.used_percent
         );
     }
 
     if attribution.confidence == Confidence::Unknown {
         return format!(
-            "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated - (estimation unavailable)",
+            "  token total {local_tokens} | codex gauge {:.2}% used | estimated - (estimation unavailable)",
             window.used_percent
         );
     }
 
     format!(
-        "  local tokens {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x short-context price share)",
+        "  token total {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x short-context price share)",
         window.used_percent, attribution.proxy_projected_percent
     )
 }
@@ -706,6 +706,7 @@ mod tests {
         };
 
         let allocation = attribution_allocation_line(&attribution);
+        assert!(allocation.contains("token total 760.00M"));
         assert!(allocation.contains("estimated ~34.00pp"));
         assert!(allocation.contains("codex gauge 34.00% used"));
         assert!(allocation.contains("gauge x short-context price share"));
@@ -747,7 +748,7 @@ mod tests {
         };
         let allocation = attribution_allocation_line(&no_denominator);
         assert!(allocation.contains("codex gauge 12.00% used"));
-        assert!(allocation.contains("estimated - (no local token denominator)"));
+        assert!(allocation.contains("estimated - (no token denominator)"));
     }
 
     #[test]
@@ -981,6 +982,9 @@ mod tests {
         assert!(text.contains("xhigh"));
         assert!(text.contains("in_progress"));
         assert!(text.contains("message preview"));
+        assert!(text.contains("TOKEN5H%"));
+        assert!(text.contains("TOKEN%"));
+        assert!(!text.contains("LOCAL5H"));
 
         let mut five_hour_partial = snapshot.clone();
         five_hour_partial.partial = false;
@@ -1070,6 +1074,7 @@ mod tests {
         assert!(windows_text.contains("message preview"));
         assert!(windows_text.contains("100.00%"));
         assert!(windows_text.contains("        -"));
+        assert!(windows_text.contains("TOKEN%"));
 
         let mut partial_window = snapshot.clone();
         partial_window.window_analyses[0].partial = true;
@@ -1105,7 +1110,7 @@ mod tests {
                 }
             )
             .unwrap()
-            .contains("no local token events in this reset cycle")
+            .contains("no token events in this reset cycle")
         );
 
         let mut no_windows = snapshot.clone();
