@@ -10,7 +10,7 @@
 - 当前 5 小时或周重置周期内 task、turn、model 的本地 token 占比；
 - 基于当前 `codex` gauge 与模型/服务层短上下文价格加权用量占比的 Low-confidence 额度百分点估算；
 - 完整或按 section 输出的一次性 text/JSON 快照；
-- 从 TUI 把选中的已停止 root task 恢复到当前 Zellij session 的新 Codex CLI pane；
+- 从 TUI 为选中的已停止 root task 自动打开 Zellij pane，或在其他终端复制完整的 `codex resume` 命令；
 - 文件指纹缓存，TUI 刷新只重读变化的 rollout。
 
 ## 精度边界
@@ -28,6 +28,24 @@ TUI 的 `TOKEN5H%` / `TOKENWK%` 分别表示该 task/turn 在当前 5 小时或�
 即使所有任务都已结束，也只能得到精确 token 与更稳定的最终估算，不能变成 OpenAI 服务端意义上的精确任务额度账单。`settled=true` 不会把 EST 提高到 Medium 或 exact，估算仍保持 Low。
 
 ## 构建运行
+
+macOS 与 Linux 的 x86_64 / ARM64 可以直接安装 GitHub Release；Linux 使用静态 musl 构建，避免依赖宿主机的 glibc 版本。先下载并检查安装脚本，再运行：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSLO \
+  https://github.com/ghostroller/codex-usage-monit/releases/latest/download/install.sh
+sh install.sh
+```
+
+安装器会校验 Release 中的 SHA-256，默认安装到 `~/.local/bin`，并为 zsh、bash 或 POSIX shell 在对应的用户配置文件中幂等加入 PATH。无法安全识别配置文件或配置文件是符号链接时，只安装程序并给出手动 PATH 提示。也可以固定版本、自定义目录或禁止修改 PATH：
+
+```bash
+sh install.sh --version v0.1.0
+sh install.sh --install-dir "$HOME/bin"
+sh install.sh --no-modify-path
+```
+
+从源码构建：
 
 ```bash
 cargo build --release
@@ -109,7 +127,7 @@ codex-usage-monit attribution --format text
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
 - `Enter`：从 Tasks 进入所选 task 的 Turns；`Backspace`：从 Turns 返回 Tasks；标题中的 `↵` / `←` 也可用鼠标点击；
-- `O`：在 Tasks 焦点下打开 `[O]Open` 确认弹窗；确认后在当前 Zellij session 创建新 pane，并以同一 `CODEX_HOME` 执行 `codex resume --cd <cwd> <thread-id>`。弹窗中的 `Enter` / `[↵] Open` 确认，`Esc` / `[Esc] Cancel` 取消；终端空间不足以完整显示 cwd 等关键信息时会保留 Cancel 并禁用确认，避免误启动。Filter 正在输入时 `O` 仍优先写入查询。Open 恢复 thread 的最新状态，不会定位到选中的历史 turn，也不是附着到原 Desktop/CLI 进程。Running/Waiting、subagent、archived、缺少有效 cwd 或非 canonical UUID 的 task 会被阻止；当前进程已经登记的 pane 是例外，此时 `O` 只校验并聚焦该 pane，不创建第二个前端。若 pane 已被删除，映射会被清理，用户再次按 `O` 后才按最新 task 状态重新进入确认流程；
+- `O`：在 Tasks 焦点下打开 `[O]Open` 确认弹窗。位于 Zellij 时可用 `Enter` / `[↵] Open` 在当前 session 创建新 pane，也可用 `C` / `[C] Copy` 复制完整的 POSIX resume 命令；不在 Zellij 时仍可打开弹窗，但只提供 Copy 与 `[Esc] Cancel`。复制命令保留本次扫描的 `CODEX_HOME`、task cwd 和完整 UUID，但不复制 monitor 的整段 `PATH`；`codexBin` 为空时由粘贴目标终端自己的 `PATH` 解析 `codex`，显式配置时才使用该绝对路径。OSC 52 写入成功后弹窗关闭。终端空间不足以完整显示 cwd 等关键信息时会保留 Cancel 并禁用操作，避免误启动。Filter 正在输入时 `O` 仍优先写入查询。Open 恢复 thread 的最新状态，不会定位到选中的历史 turn，也不是附着到原 Desktop/CLI 进程。Running/Waiting、subagent、archived、缺少有效 cwd 或非 canonical UUID 的 task 会被阻止；当前进程已经登记的 pane 是例外，此时 Zellij 内的 `O` 只校验并聚焦该 pane，不创建第二个前端。若 pane 已被删除，映射会被清理，用户再次按 `O` 后才按最新 task 状态重新进入确认流程；
 - `V`：切换 Turns 的默认显隐；首次启动默认显示，顶栏中的 `[V]Turns` 也可点击。默认隐藏时，`Enter` / `↵` 会临时展开 Turns，`Backspace` / `←` 返回 Tasks 时自动收起；
 - `M`：切换 Models 面板显隐；最上方的 `[M]Models` 也可用鼠标点击；
 - `R`：在 Recent tasks 的 Flat 与 Tree 视图间切换；标题中的 `[R]Tree` 也可用鼠标点击。Tree 中大写 `E` 或 `[E]Collapse` 收起当前过滤树的全部父会话；全部收起后同一按钮变为 `[E]Expand`，再次触发展开全部。选中拥有子节点的 task 后，`-` 收起、`+` 展开，行内固定宽度的 `[-]` / `[+]` 也可直接点击；
@@ -156,7 +174,9 @@ TUI 启动时读取用户级 `open.json`；文件不存在时立即写入默认�
 }
 ```
 
-`codexBin: null` 表示从 monitor 进程的 `PATH` 解析 Codex；需要固定版本时建议配置绝对路径。`floating: false` 改为当前 tab 的 tiled pane；宽高必须在 `1..=100`，仅用于 floating pane。`closeOnExit: false` 会在 Codex 退出后保留 pane，便于查看错误。当前唯一 backend 是 `zellij`，且 monitor 必须已经运行在 Zellij 内。
+`codexBin: null` 时，Zellij Open 从 monitor 进程的 `PATH` 解析 Codex，而 Copy 留给粘贴目标终端解析 `codex`；需要让两条路径都固定版本时建议配置绝对路径。`floating: false` 改为当前 tab 的 tiled pane；宽高必须在 `1..=100`，仅用于 floating pane。`closeOnExit: false` 会在 Codex 退出后保留 pane，便于查看错误。当前唯一的自动启动 backend 是 `zellij`，因此 `[↵] Open` 只在 monitor 已运行于 Zellij 内时出现；`[C] Copy` 是通用的手动终端路径，不会创建或选择 backend。
+
+Copy 通过 OSC 52 把单行 POSIX shell 命令交给当前终端。终端是否接受 OSC 52 取决于其实现和配置；该协议没有确认剪贴板已更新的回执，因此成功提示只表示序列已写给终端。[VS Code 1.91 起支持 OSC 52](https://code.visualstudio.com/updates/v1_91#_support-for-copy-and-paste-escape-sequence-osc-52)，包括 Remote-SSH 终端把远端程序的复制请求送到本地剪贴板的场景。
 
 配置只在 TUI 启动时加载，修改后需要重启 monitor。语法损坏、缺少 `version`、包含未知或拼错的字段、使用未来或其他不支持的版本、非法尺寸或读取失败时，工具不会覆盖原文件，而是禁用 Open，并在触发 `[O]Open` 时显示原因。Unix 上自动创建的目录和文件分别使用 `0700`、`0600` 权限。
 
@@ -164,7 +184,7 @@ TUI 启动时读取用户级 `open.json`；文件不存在时立即写入默认�
 
 - 只读 `CODEX_HOME/sessions`、`CODEX_HOME/archived_sessions`、`CODEX_HOME/session_index.jsonl` 和 Codex App Server；
 - 不读取 `auth.json`，认证完全由 App Server 管理；
-- 监控采集与一次性输出不修改、恢复或终止 Codex task；只有用户在 TUI 中主动触发并确认 `[O]Open` 时，工具才会启动新的 `codex resume` CLI 前端。Open 不携带 prompt，不自动 unarchive、fork、checkout、stash、恢复 worktree，也不更改 sandbox/approval 配置；
+- 监控采集与一次性输出不修改、恢复或终止 Codex task；只有用户在 TUI 中主动触发 `[O]Open` 并在 Zellij 内确认 `[↵] Open` 时，工具才会启动新的 `codex resume` CLI 前端。`[C] Copy` 只把命令发送给终端剪贴板，由用户在另一个终端执行。两条路径都不携带 prompt，不自动 unarchive、fork、checkout、stash、恢复 worktree，也不更改 sandbox/approval 配置；
 - CLI 默认把解析后的 rollout 元数据、token 事件和有限长度的 task/turn 消息摘要写入上述用户级缓存目录；`--redact-content` 模式使用不含这些摘要的独立缓存且不会读取可见缓存，但不会删除之前生成的可见缓存。`--no-rollout-cache` 只禁用后续磁盘读写；需要擦除时可直接删除缓存目录。Unix 新建目录和文件分别使用 `0700`、`0600` 权限，缓存会自动重建；
 - TUI 另行写入上述不含会话内容的菜单偏好文件，以及不含 thread、标题、cwd 或消息内容的 `open.json`；
 - 进程内保留 `session_index.jsonl` 的当前会话标题；索引没有对应标题时，才回退到最多 96 字符的首条用户消息。每个 turn 最多保留 72 字符的用户消息摘要，不保存完整消息、reasoning 或工具内容；缺少显式 `turn_id` 时只归入当前 active turn，没有 active turn 则不猜测归属。

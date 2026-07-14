@@ -210,6 +210,7 @@ pub(crate) enum PrepareError {
     CurrentDirectory(io::Error),
     InvalidMonitorCwd(PathBuf),
     InvalidCodexHome(PathBuf),
+    UnrepresentableShellCommand,
     InvalidDimension { name: &'static str, value: u8 },
     ExecutableNotFound(&'static str),
     ExecutableUnavailable { name: &'static str, path: PathBuf },
@@ -238,6 +239,10 @@ impl fmt::Display for PrepareError {
             Self::InvalidCodexHome(path) => {
                 write!(formatter, "Codex home is unavailable: {}", path.display())
             }
+            Self::UnrepresentableShellCommand => write!(
+                formatter,
+                "Resume command contains non-UTF-8 or control characters and cannot be copied"
+            ),
             Self::InvalidDimension { name, value } => {
                 write!(
                     formatter,
@@ -279,6 +284,21 @@ pub(crate) struct CommandPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeCommandPlan {
+    pub(crate) thread_id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) command: CommandPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeCopyPlan {
+    pub(crate) thread_id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) codex_home: PathBuf,
+    pub(crate) command: CommandPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ZellijLaunchPlan {
     pub(crate) thread_id: String,
     pub(crate) pane_name: String,
@@ -286,17 +306,13 @@ pub(crate) struct ZellijLaunchPlan {
     pub(crate) command: CommandPlan,
 }
 
-pub(crate) fn prepare_zellij_launch(
+pub(crate) fn prepare_resume_command(
     target: &ResumeTarget,
     context: &LaunchContext,
-    options: &ZellijOptions,
-) -> Result<ZellijLaunchPlan, PrepareError> {
-    let cwd = check_eligibility(target)?;
-    let zellij_bin = prepare_zellij_focus(context)?;
-    validate_percentage("width", options.width_percent)?;
-    validate_percentage("height", options.height_percent)?;
+) -> Result<ResumeCommandPlan, PrepareError> {
+    let cwd = check_eligibility(target)?.to_path_buf();
 
-    // A relative --codex-home is relative to the monitor, not the new pane cwd.
+    // A relative --codex-home is relative to the monitor, not the target cwd.
     let codex_home = absolute_from(&context.codex_home, &context.monitor_cwd);
     if !codex_home.is_dir() {
         return Err(PrepareError::InvalidCodexHome(codex_home));
@@ -307,6 +323,67 @@ pub(crate) fn prepare_zellij_launch(
         &context.path,
         &context.monitor_cwd,
     )?;
+    let mut args = vec![
+        env_assignment("PATH", &context.path),
+        env_assignment("CODEX_HOME", codex_home.as_os_str()),
+        codex_bin.as_os_str().to_owned(),
+    ];
+    args.extend(resume_arguments(&cwd, &target.thread_id));
+
+    Ok(ResumeCommandPlan {
+        thread_id: target.thread_id.clone(),
+        cwd,
+        command: CommandPlan {
+            program: PathBuf::from(ENV_BIN),
+            args,
+        },
+    })
+}
+
+pub(crate) fn prepare_resume_copy_command(
+    target: &ResumeTarget,
+    context: &LaunchContext,
+) -> Result<ResumeCopyPlan, PrepareError> {
+    let cwd = check_eligibility(target)?.to_path_buf();
+    let codex_home = absolute_from(&context.codex_home, &context.monitor_cwd);
+    if !codex_home.is_dir() {
+        return Err(PrepareError::InvalidCodexHome(codex_home));
+    }
+    let codex_bin = match context.codex_bin.as_deref() {
+        Some(path) => resolve_executable("codex", Some(path), &context.path, &context.monitor_cwd)?,
+        None => PathBuf::from("codex"),
+    };
+
+    Ok(ResumeCopyPlan {
+        thread_id: target.thread_id.clone(),
+        cwd: cwd.clone(),
+        codex_home,
+        command: CommandPlan {
+            program: codex_bin,
+            args: resume_arguments(&cwd, &target.thread_id),
+        },
+    })
+}
+
+pub(crate) fn render_posix_resume_command(plan: &ResumeCopyPlan) -> Result<String, PrepareError> {
+    let codex_home = posix_shell_word(plan.codex_home.as_os_str())?;
+    let command = std::iter::once(plan.command.program.as_os_str())
+        .chain(plan.command.args.iter().map(OsString::as_os_str))
+        .map(posix_shell_word)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|words| words.join(" "))?;
+    Ok(format!("CODEX_HOME={codex_home} {command}"))
+}
+
+pub(crate) fn prepare_zellij_launch(
+    target: &ResumeTarget,
+    context: &LaunchContext,
+    options: &ZellijOptions,
+) -> Result<ZellijLaunchPlan, PrepareError> {
+    let zellij_bin = prepare_zellij_focus(context)?;
+    validate_percentage("width", options.width_percent)?;
+    validate_percentage("height", options.height_percent)?;
+    let resume = prepare_resume_command(target, context)?;
     let pane_name = pane_name(&target.thread_id, &target.title);
 
     let mut args = vec![OsString::from("action"), OsString::from("new-pane")];
@@ -327,17 +404,11 @@ pub(crate) fn prepare_zellij_launch(
         OsString::from("--name"),
         OsString::from(&pane_name),
         OsString::from("--cwd"),
-        cwd.as_os_str().to_owned(),
+        resume.cwd.as_os_str().to_owned(),
         OsString::from("--"),
-        OsString::from(ENV_BIN),
-        env_assignment("PATH", &context.path),
-        env_assignment("CODEX_HOME", codex_home.as_os_str()),
-        codex_bin.as_os_str().to_owned(),
-        OsString::from("resume"),
-        OsString::from("--cd"),
-        cwd.as_os_str().to_owned(),
-        OsString::from(&target.thread_id),
+        resume.command.program.as_os_str().to_owned(),
     ]);
+    args.extend(resume.command.args);
 
     Ok(ZellijLaunchPlan {
         thread_id: target.thread_id.clone(),
@@ -348,6 +419,39 @@ pub(crate) fn prepare_zellij_launch(
             args,
         },
     })
+}
+
+fn posix_shell_word(value: &OsStr) -> Result<String, PrepareError> {
+    let value = value
+        .to_str()
+        .ok_or(PrepareError::UnrepresentableShellCommand)?;
+    if value
+        .chars()
+        .any(|character| character.is_control() || is_bidi_control(character))
+    {
+        return Err(PrepareError::UnrepresentableShellCommand);
+    }
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        })
+    {
+        return Ok(value.to_owned());
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+fn resume_arguments(cwd: &Path, thread_id: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("resume"),
+        OsString::from("--cd"),
+        cwd.as_os_str().to_owned(),
+        OsString::from(thread_id),
+    ]
 }
 
 /// Resolves the current-session Zellij client without touching task, cwd, or
@@ -911,6 +1015,183 @@ mod tests {
     }
 
     #[test]
+    fn resume_command_does_not_require_a_zellij_context() {
+        let (_temp, target, mut context) = fixture();
+        context.in_zellij = false;
+
+        let plan = prepare_resume_command(&target, &context).unwrap();
+
+        assert_eq!(plan.thread_id, THREAD_ID);
+        assert_eq!(plan.cwd, target.cwd.as_ref().unwrap().as_path());
+        assert_eq!(plan.command.program, Path::new(ENV_BIN));
+        assert_eq!(plan.command.args[0], env_assignment("PATH", &context.path));
+        assert_eq!(
+            plan.command.args[1],
+            env_assignment(
+                "CODEX_HOME",
+                context.monitor_cwd.join("relative home").as_os_str()
+            )
+        );
+        assert!(Path::new(&plan.command.args[2]).is_absolute());
+        assert_eq!(
+            &plan.command.args[3..],
+            [
+                OsString::from("resume"),
+                OsString::from("--cd"),
+                target.cwd.as_ref().unwrap().as_os_str().to_owned(),
+                OsString::from(THREAD_ID),
+            ]
+        );
+    }
+
+    #[test]
+    fn copied_resume_command_uses_the_target_shell_without_inheriting_path() {
+        let (_temp, target, mut context) = fixture();
+        context.in_zellij = false;
+
+        let plan = prepare_resume_copy_command(&target, &context).unwrap();
+        let rendered = render_posix_resume_command(&plan).unwrap();
+
+        assert_eq!(plan.thread_id, THREAD_ID);
+        assert_eq!(plan.cwd, target.cwd.as_ref().unwrap().as_path());
+        assert_eq!(plan.command.program, Path::new("codex"));
+        assert_eq!(
+            plan.command.args,
+            resume_arguments(target.cwd.as_ref().unwrap(), THREAD_ID)
+        );
+        assert!(rendered.starts_with("CODEX_HOME="));
+        assert!(rendered.contains(" codex resume --cd "));
+        assert!(rendered.ends_with(THREAD_ID));
+        assert!(!rendered.contains("PATH="));
+        assert!(!rendered.contains(context.path.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_resume_command_round_trips_environment_and_arguments_through_sh() {
+        let (_temp, target, context) = fixture();
+        let bin = env::split_paths(&context.path).next().unwrap();
+        executable_script(
+            &bin.join("codex"),
+            "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME\" \"$@\"\n",
+        );
+        let rendered =
+            render_posix_resume_command(&prepare_resume_copy_command(&target, &context).unwrap())
+                .unwrap();
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &rendered])
+            .env("PATH", &context.path)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                context
+                    .monitor_cwd
+                    .join("relative home")
+                    .to_string_lossy()
+                    .as_ref(),
+                "resume",
+                "--cd",
+                target.cwd.as_ref().unwrap().to_string_lossy().as_ref(),
+                THREAD_ID,
+            ]
+        );
+    }
+
+    #[test]
+    fn zellij_launch_reuses_the_exact_resume_command() {
+        let (_temp, target, context) = fixture();
+        let resume = prepare_resume_command(&target, &context).unwrap();
+        let zellij = prepare_zellij_launch(&target, &context, &ZellijOptions::default()).unwrap();
+        let separator = zellij
+            .command
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap();
+        let expected = std::iter::once(resume.command.program.as_os_str().to_owned())
+            .chain(resume.command.args)
+            .collect::<Vec<_>>();
+
+        assert_eq!(&zellij.command.args[separator + 1..], expected);
+    }
+
+    #[test]
+    fn renders_every_resume_argument_as_a_posix_shell_word() {
+        let plan = ResumeCopyPlan {
+            thread_id: THREAD_ID.to_owned(),
+            cwd: PathBuf::from("/tmp/project '雪 $;`cwd`"),
+            codex_home: PathBuf::from("/tmp/codex home/'quoted 雪"),
+            command: CommandPlan {
+                program: PathBuf::from("/opt/codex $;`fast`"),
+                args: vec![
+                    OsString::from("resume"),
+                    OsString::from("--cd"),
+                    OsString::from("/tmp/project '雪 $;`cwd`"),
+                    OsString::from(THREAD_ID),
+                ],
+            },
+        };
+
+        assert_eq!(
+            render_posix_resume_command(&plan).unwrap(),
+            r#"CODEX_HOME='/tmp/codex home/'"'"'quoted 雪' '/opt/codex $;`fast`' resume --cd '/tmp/project '"'"'雪 $;`cwd`' 019f52ac-7a9f-7fd1-8dda-e775ef950785"#
+        );
+    }
+
+    #[test]
+    fn copied_resume_command_rejects_controls_and_bidi_overrides() {
+        let mut plan = ResumeCopyPlan {
+            thread_id: THREAD_ID.to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            codex_home: PathBuf::from("/tmp"),
+            command: CommandPlan {
+                program: PathBuf::from(ENV_BIN),
+                args: vec![OsString::from("line\nbreak")],
+            },
+        };
+
+        assert!(matches!(
+            render_posix_resume_command(&plan),
+            Err(PrepareError::UnrepresentableShellCommand)
+        ));
+
+        plan.command.args[0] = OsString::from("safe-looking\u{202e}txt");
+        assert!(matches!(
+            render_posix_resume_command(&plan),
+            Err(PrepareError::UnrepresentableShellCommand)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_resume_command_rejects_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let plan = ResumeCopyPlan {
+            thread_id: THREAD_ID.to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            codex_home: PathBuf::from("/tmp"),
+            command: CommandPlan {
+                program: PathBuf::from(ENV_BIN),
+                args: vec![OsString::from_vec(b"invalid-\xff".to_vec())],
+            },
+        };
+
+        assert!(matches!(
+            render_posix_resume_command(&plan),
+            Err(PrepareError::UnrepresentableShellCommand)
+        ));
+    }
+
+    #[test]
     fn relative_codex_override_is_resolved_against_monitor_cwd() {
         let (_temp, target, mut context) = fixture();
         let tools = context.monitor_cwd.join("tools");
@@ -928,6 +1209,16 @@ mod tests {
         assert_eq!(
             PathBuf::from(&plan.command.args[separator + 4]),
             fs::canonicalize(tools.join("custom-codex")).unwrap()
+        );
+        let copy = prepare_resume_copy_command(&target, &context).unwrap();
+        assert_eq!(
+            copy.command.program,
+            fs::canonicalize(tools.join("custom-codex")).unwrap()
+        );
+        assert!(
+            !render_posix_resume_command(&copy)
+                .unwrap()
+                .contains("PATH=")
         );
     }
 

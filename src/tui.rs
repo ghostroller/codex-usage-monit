@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Local;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -39,7 +41,8 @@ use crate::rollout::RolloutCache;
 use crate::session_launch::{
     FocusResult, LaunchContext, LaunchResult, PaneId, ResumeTarget, ZellijOptions,
     check_eligibility, check_eligibility_without_cwd_probe, execute_zellij_launch,
-    focus_existing_pane, prepare_zellij_focus, prepare_zellij_launch,
+    focus_existing_pane, prepare_resume_copy_command, prepare_zellij_focus, prepare_zellij_launch,
+    render_posix_resume_command,
 };
 use crate::snapshot::{CollectionResult, collect_snapshot_cached};
 use crate::ui_state::{
@@ -59,6 +62,7 @@ const CLEAR_FILTER_LABEL: &str = "[Del]";
 const FILTER_CLEAR_GAP_WIDTH: u16 = 1;
 const FILTER_MIN_QUERY_WIDTH: u16 = 1;
 const RESUME_CONFIRM_MIN_INNER_WIDTH: u16 = 44;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const TASK_TOKENS_WIDTH: u16 = 10;
 const TASK_TOKEN_SHARE_WIDTH: u16 = 8;
 const TASK_QUOTA_WIDTH: u16 = 8;
@@ -619,12 +623,20 @@ struct QuitConfirmationHitbox {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResumeConfirmationHitbox {
     confirm: Rect,
+    copy: Rect,
     cancel: Rect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResumeConfirmation {
     thread_id: String,
+    copy_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipboardRequest {
+    thread_id: String,
+    text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -783,6 +795,7 @@ struct App {
     zellij_environment: bool,
     resume_confirmation: Option<ResumeConfirmation>,
     resume_confirmation_hitbox: Option<ResumeConfirmationHitbox>,
+    pending_clipboard: Option<ClipboardRequest>,
     pending_resume: Option<ResumeLaunchRequest>,
     launching_threads: HashSet<String>,
     open_panes: HashMap<String, PaneId>,
@@ -843,6 +856,7 @@ impl App {
             zellij_environment: std::env::var_os("ZELLIJ").is_some(),
             resume_confirmation: None,
             resume_confirmation_hitbox: None,
+            pending_clipboard: None,
             pending_resume: None,
             launching_threads: HashSet::new(),
             open_panes: HashMap::new(),
@@ -907,9 +921,6 @@ impl App {
         if !self.open_config.enabled {
             return Some("Open is disabled in the user configuration".to_string());
         }
-        if !self.zellij_environment {
-            return Some("Open requires codex-usage-monit to run inside Zellij".to_string());
-        }
         None
     }
 
@@ -971,7 +982,9 @@ impl App {
             );
             return;
         }
-        if let Some(pane_id) = self.open_panes.get(&task.thread_id).cloned() {
+        if self.zellij_environment
+            && let Some(pane_id) = self.open_panes.get(&task.thread_id).cloned()
+        {
             self.start_focus_request(task.thread_id, pane_id);
             return;
         }
@@ -988,6 +1001,7 @@ impl App {
         self.open_notice = None;
         self.resume_confirmation = Some(ResumeConfirmation {
             thread_id: target.thread_id,
+            copy_error: None,
         });
     }
 
@@ -1021,6 +1035,9 @@ impl App {
     }
 
     fn confirm_resume(&mut self) {
+        if !self.zellij_environment {
+            return;
+        }
         if self
             .resume_confirmation_hitbox
             .is_none_or(|hitbox| hitbox.confirm.is_empty())
@@ -1086,6 +1103,98 @@ impl App {
             format!("Opening {} in Zellij...", short_thread_id(&thread_id)),
             OpenNoticeTone::Info,
         );
+    }
+
+    fn request_resume_command_copy(&mut self) {
+        if self
+            .resume_confirmation_hitbox
+            .is_none_or(|hitbox| hitbox.copy.is_empty())
+        {
+            return;
+        }
+        let Some(thread_id) = self
+            .resume_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.thread_id.clone())
+        else {
+            return;
+        };
+        if self.pending_clipboard.is_some() {
+            self.set_resume_copy_error(&thread_id, "Another copy request is still pending");
+            return;
+        }
+        let Some(task) = self
+            .snapshot
+            .tasks
+            .iter()
+            .find(|task| task.thread_id == thread_id)
+            .cloned()
+        else {
+            self.set_resume_copy_error(&thread_id, "The selected task is no longer available");
+            return;
+        };
+        let target = ResumeTarget::from_task(&task);
+        if let Some(reason) = self.target_open_unavailable_reason(&target, true) {
+            self.set_resume_copy_error(&thread_id, reason);
+            return;
+        }
+        let result = LaunchContext::capture(
+            self.snapshot.codex_home.clone(),
+            self.open_config.codex_bin.clone(),
+        )
+        .and_then(|context| prepare_resume_copy_command(&target, &context))
+        .and_then(|plan| render_posix_resume_command(&plan));
+        match result {
+            Ok(text) if text.len() <= MAX_CLIPBOARD_TEXT_BYTES => {
+                if let Some(confirmation) = self.resume_confirmation.as_mut() {
+                    confirmation.copy_error = None;
+                }
+                self.pending_clipboard = Some(ClipboardRequest { thread_id, text });
+            }
+            Ok(_) => self.set_resume_copy_error(
+                &thread_id,
+                format!(
+                    "Resume command exceeds the {} KiB clipboard limit",
+                    MAX_CLIPBOARD_TEXT_BYTES / 1024
+                ),
+            ),
+            Err(error) => self.set_resume_copy_error(&thread_id, error.to_string()),
+        }
+    }
+
+    fn set_resume_copy_error(&mut self, thread_id: &str, message: impl Into<String>) {
+        if let Some(confirmation) = self
+            .resume_confirmation
+            .as_mut()
+            .filter(|confirmation| confirmation.thread_id == thread_id)
+        {
+            confirmation.copy_error = Some(message.into());
+        }
+    }
+
+    fn apply_clipboard_result(&mut self, request: ClipboardRequest, result: io::Result<()>) {
+        match result {
+            Ok(()) => {
+                if self
+                    .resume_confirmation
+                    .as_ref()
+                    .is_some_and(|confirmation| confirmation.thread_id == request.thread_id)
+                {
+                    self.close_resume_confirmation();
+                }
+                self.set_open_notice(
+                    format!(
+                        "Resume command sent to terminal clipboard for {}",
+                        short_thread_id(&request.thread_id)
+                    ),
+                    OpenNoticeTone::Success,
+                );
+            }
+            Err(error) => self.set_resume_copy_error(
+                &request.thread_id,
+                format!("Could not send resume command to terminal clipboard: {error}"),
+            ),
+        }
     }
 
     fn apply_resume_completion(&mut self, completion: ResumeLaunchCompletion) {
@@ -2477,6 +2586,11 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 app.confirm_resume();
             } else if app
                 .resume_confirmation_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.copy, event.column, event.row))
+            {
+                app.request_resume_command_copy();
+            } else if app
+                .resume_confirmation_hitbox
                 .is_some_and(|hitbox| rect_contains(hitbox.cancel, event.column, event.row))
             {
                 app.close_resume_confirmation();
@@ -2756,6 +2870,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if app.resume_confirmation.is_some() {
         match key.code {
             KeyCode::Enter => app.confirm_resume(),
+            KeyCode::Char('c') | KeyCode::Char('C') => app.request_resume_command_copy(),
             KeyCode::Esc => app.close_resume_confirmation(),
             _ => {}
         }
@@ -3227,6 +3342,11 @@ fn run_loop(
             });
         }
 
+        if let Some(request) = app.pending_clipboard.take() {
+            let result = write_osc52_clipboard(terminal.backend_mut(), &request.text);
+            app.apply_clipboard_result(request, result);
+        }
+
         if !app.worker_running && app.last_local_refresh.elapsed() >= LOCAL_REFRESH {
             let refresh_account =
                 !config.offline && app.last_account_refresh.elapsed() >= ACCOUNT_REFRESH;
@@ -3251,6 +3371,23 @@ fn run_loop(
             });
         }
     }
+}
+
+fn write_osc52_clipboard<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
+    if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "clipboard text exceeds the {} KiB limit",
+                MAX_CLIPBOARD_TEXT_BYTES / 1024
+            ),
+        ));
+    }
+    let payload = BASE64_STANDARD.encode(text.as_bytes());
+    writer.write_all(b"\x1b]52;c;")?;
+    writer.write_all(payload.as_bytes())?;
+    writer.write_all(b"\x07")?;
+    writer.flush()
 }
 
 fn execute_resume_request(request: ResumeLaunchRequest) -> ResumeLaunchCompletion {
@@ -3585,7 +3722,9 @@ fn render_resume_confirmation(
                 .as_deref()
                 .map(|path| terminal_safe_text(path.to_string_lossy().as_ref()))
                 .unwrap_or_else(|| "-".to_string());
-            let target = if app.open_config.zellij.floating {
+            let target = if !app.zellij_environment {
+                "clipboard · run in another terminal".to_string()
+            } else if app.open_config.zellij.floating {
                 format!(
                     "zellij floating pane · {}% x {}% · current session",
                     app.open_config.zellij.width_percent, app.open_config.zellij.height_percent
@@ -3649,13 +3788,29 @@ fn render_resume_confirmation(
                 Style::default().fg(palette.warning),
             ));
         }
-        lines.push(Line::styled(
-            truncate_display_text(
-                "Creates a new CLI frontend and uses the current working tree.",
-                width,
-            ),
-            Style::default().fg(palette.warning),
-        ));
+        let copy_error = app
+            .resume_confirmation
+            .as_ref()
+            .and_then(|confirmation| confirmation.copy_error.as_deref());
+        if let Some(error) = copy_error {
+            lines.push(Line::styled(
+                truncate_display_text(
+                    &format!("Copy failed: {}", terminal_safe_text(error)),
+                    width,
+                ),
+                Style::default().fg(palette.error),
+            ));
+        } else {
+            let instruction = if app.zellij_environment {
+                "Open creates a new CLI frontend; Copy prepares the command."
+            } else {
+                "Copy the command, then run it in a new terminal."
+            };
+            lines.push(Line::styled(
+                truncate_display_text(instruction, width),
+                Style::default().fg(palette.warning),
+            ));
+        }
         confirmation_content_fits = task.is_some()
             && inner.width >= RESUME_CONFIRM_MIN_INNER_WIDTH
             && usize::from(content_height) >= lines.len();
@@ -3671,47 +3826,72 @@ fn render_resume_confirmation(
         );
     }
 
-    let full = inner.width >= 25;
+    let full = inner.width >= RESUME_CONFIRM_MIN_INNER_WIDTH;
     let confirm_label = if full { "[↵] Open" } else { "[↵]" };
+    let copy_label = if full { "[C] Copy" } else { "[C]" };
     let cancel_label = if full { "[Esc] Cancel" } else { "[Esc]" };
     let gap = if full { "   " } else { " " };
     let confirm_width = u16::try_from(UnicodeWidthStr::width(confirm_label)).unwrap_or(u16::MAX);
+    let copy_width = u16::try_from(UnicodeWidthStr::width(copy_label)).unwrap_or(u16::MAX);
     let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
     let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
-    let both_width = confirm_width
-        .saturating_add(gap_width)
-        .saturating_add(cancel_width);
+    let button_count = if app.zellij_environment { 3u16 } else { 2u16 };
+    let controls_width = copy_width
+        .saturating_add(cancel_width)
+        .saturating_add(if app.zellij_environment {
+            confirm_width
+        } else {
+            0
+        })
+        .saturating_add(gap_width.saturating_mul(button_count.saturating_sub(1)));
     let button_y = inner.bottom().saturating_sub(1);
     let button_style = Style::default()
         .fg(palette.foreground)
         .bg(palette.gauge_track);
     let shortcut_style = button_style.fg(palette.accent).add_modifier(Modifier::BOLD);
     let mut confirm = Rect::default();
+    let mut copy = Rect::default();
     let mut cancel = Rect::default();
-    if confirmation_content_fits && inner.height > 0 && both_width <= inner.width {
+    if confirmation_content_fits && inner.height > 0 && controls_width <= inner.width {
         let group_x = inner
             .x
-            .saturating_add(inner.width.saturating_sub(both_width) / 2);
-        confirm = Rect::new(group_x, button_y, confirm_width, 1);
-        cancel = Rect::new(
+            .saturating_add(inner.width.saturating_sub(controls_width) / 2);
+        let copy_x = if app.zellij_environment {
+            confirm = Rect::new(group_x, button_y, confirm_width, 1);
             group_x
                 .saturating_add(confirm_width)
-                .saturating_add(gap_width),
+                .saturating_add(gap_width)
+        } else {
+            group_x
+        };
+        copy = Rect::new(copy_x, button_y, copy_width, 1);
+        cancel = Rect::new(
+            copy_x.saturating_add(copy_width).saturating_add(gap_width),
             button_y,
             cancel_width,
             1,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
+        let mut spans = Vec::new();
+        if app.zellij_environment {
+            spans.extend([
                 Span::styled("[", button_style),
                 Span::styled("↵", shortcut_style),
                 Span::styled(if full { "] Open" } else { "]" }, button_style),
                 Span::raw(gap),
-                Span::styled("[", button_style),
-                Span::styled("Esc", shortcut_style),
-                Span::styled(if full { "] Cancel" } else { "]" }, button_style),
-            ])),
-            Rect::new(group_x, button_y, both_width, 1),
+            ]);
+        }
+        spans.extend([
+            Span::styled("[", button_style),
+            Span::styled("C", shortcut_style),
+            Span::styled(if full { "] Copy" } else { "]" }, button_style),
+            Span::raw(gap),
+            Span::styled("[", button_style),
+            Span::styled("Esc", shortcut_style),
+            Span::styled(if full { "] Cancel" } else { "]" }, button_style),
+        ]);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(group_x, button_y, controls_width, 1),
         );
     } else if inner.height > 0 && cancel_width <= inner.width {
         let cancel_x = inner
@@ -3728,7 +3908,11 @@ fn render_resume_confirmation(
         );
     }
 
-    ResumeConfirmationHitbox { confirm, cancel }
+    ResumeConfirmationHitbox {
+        confirm,
+        copy,
+        cancel,
+    }
 }
 
 fn render_quit_confirmation(
@@ -5790,6 +5974,7 @@ mod tests {
         app.zellij_environment = true;
         app.open_config = OpenConfig::default();
         app.open_config_error = None;
+        app.snapshot.codex_home = cwd.to_path_buf();
     }
 
     #[test]
@@ -5828,8 +6013,39 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Resume in new Codex terminal?"));
-        assert!(content.contains("Creates a new CLI frontend"));
+        assert!(content.contains("Open creates a new CLI frontend"));
         assert!(!content.contains('\u{202e}'));
+        let copy = app.resume_confirmation_hitbox.unwrap().copy;
+        assert!(!copy.is_empty());
+        assert_eq!(
+            terminal.backend().buffer()[(copy.x + 1, copy.y)].symbol(),
+            "C"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(copy.x + 1, copy.y)].fg,
+            app.theme.palette().accent
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('C')));
+        let request = app.pending_clipboard.take().unwrap();
+        assert!(request.text.starts_with("CODEX_HOME="));
+        assert!(request.text.contains(" codex resume --cd "));
+        assert!(request.text.contains(RESUMABLE_THREAD_ID));
+        assert!(!request.text.contains("PATH="));
+        assert!(!request.text.contains("visible"));
+        app.apply_clipboard_result(
+            request,
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure")),
+        );
+        assert!(app.resume_confirmation.is_some());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let failed_content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(failed_content.contains("Copy failed"));
 
         let selected = app.selected_task;
         let background_row = app.task_table_hitbox.unwrap().rows.y.saturating_add(1);
@@ -5907,6 +6123,90 @@ mod tests {
                 "O"
             );
         }
+    }
+
+    #[test]
+    fn open_outside_zellij_copies_with_mouse_and_never_launches_on_enter() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = interaction_test_app(1, 0);
+        make_task_resumable(&mut app, 0, temp.path());
+        app.zellij_environment = false;
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+
+        app.activate_open();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let hitbox = app.resume_confirmation_hitbox.unwrap();
+        assert!(hitbox.confirm.is_empty());
+        assert!(!hitbox.copy.is_empty());
+        assert!(!hitbox.cancel.is_empty());
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("clipboard · run in another terminal"));
+        assert!(content.contains("[C] Copy"));
+        assert!(!content.contains("[↵] Open"));
+
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(app.resume_confirmation.is_some());
+        assert!(app.pending_resume.is_none());
+        assert!(app.pending_clipboard.is_none());
+
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                hitbox.copy.right() - 1,
+                hitbox.copy.y,
+            ),
+        ));
+        let request = app.pending_clipboard.take().unwrap();
+        assert_eq!(request.thread_id, RESUMABLE_THREAD_ID);
+        assert!(request.text.contains(" codex resume --cd "));
+        assert!(request.text.contains(RESUMABLE_THREAD_ID));
+        assert!(!request.text.contains("PATH="));
+        app.apply_clipboard_result(request, Ok(()));
+        assert!(app.resume_confirmation.is_none());
+        assert_eq!(
+            app.open_notice.as_ref().unwrap().tone,
+            OpenNoticeTone::Success
+        );
+        assert!(app.pending_resume.is_none());
+    }
+
+    #[test]
+    fn osc52_clipboard_writer_frames_base64_and_rejects_oversized_text() {
+        let command = "codex resume --cd '/tmp/a b' 019f";
+        let mut output = Vec::new();
+        write_osc52_clipboard(&mut output, command).unwrap();
+        assert!(output.starts_with(b"\x1b]52;c;"));
+        assert_eq!(output.last(), Some(&b'\x07'));
+        let encoded = &output[b"\x1b]52;c;".len()..output.len() - 1];
+        assert_eq!(BASE64_STANDARD.decode(encoded).unwrap(), command.as_bytes());
+
+        let oversized = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1);
+        let error = write_osc52_clipboard(&mut Vec::new(), &oversized).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        struct FailingWriter;
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            write_osc52_clipboard(&mut FailingWriter, command)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -6051,14 +6351,10 @@ mod tests {
 
         make_task_resumable(&mut app, 0, temp.path());
         app.zellij_environment = false;
+        assert!(app.open_control_available());
         app.activate_open();
-        assert!(
-            app.open_notice
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("inside Zellij")
-        );
+        assert!(app.resume_confirmation.is_some());
+        app.close_resume_confirmation();
 
         app.zellij_environment = true;
         app.open_config.enabled = false;
@@ -6128,10 +6424,11 @@ mod tests {
             let hitbox = app.resume_confirmation_hitbox.unwrap();
             let can_confirm = !hitbox.confirm.is_empty();
             assert_eq!(can_confirm, width >= 46 && height >= 12);
+            assert_eq!(!hitbox.copy.is_empty(), can_confirm);
             if can_confirm {
                 assert!(!hitbox.cancel.is_empty());
             }
-            for button in [hitbox.confirm, hitbox.cancel] {
+            for button in [hitbox.confirm, hitbox.copy, hitbox.cancel] {
                 if !button.is_empty() {
                     assert!(button.right() <= width);
                     assert!(button.bottom() <= height);

@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Local-first TUI and CLI monitor for Codex tasks, token usage, and quota windows"
 license = "MIT"
+repository = "https://github.com/ghostroller/codex-usage-monit"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
