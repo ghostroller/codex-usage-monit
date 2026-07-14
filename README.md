@@ -52,6 +52,29 @@ codex-usage-monit --theme light
 
 `--offline` 不启动 App Server，额度改用 rollout 中每个 `limit_id` 最近的本地快照并标记为 stale/partial，避免离线时丢失账户 gauge；实体 EST 仍只使用其中的 `codex` 窗口。`--redact-content` 不保留 task 标题预览或 turn 消息摘要。首次启动 TUI 使用 `dark` 主题，之后恢复上次保存的主题；`--theme light` 显式覆盖已保存主题，`bright` 是 `light` 的别名。主题仅影响 TUI 渲染，不改变数据采集或一次性 text/JSON 输出。
 
+## 冷启动诊断
+
+`debug-startup` 执行与 TUI 相同的用户状态读取、冷 rollout 扫描、App Server 查询、Snapshot/App 构造，并用指定尺寸的 headless backend 完成一次真实首帧渲染，随后输出分阶段耗时而不进入 alternate screen：
+
+```bash
+codex-usage-monit debug-startup
+codex-usage-monit --offline --redact-content debug-startup --format json
+codex-usage-monit debug-startup --width 100 --height 30
+```
+
+普通 TUI 或一次性命令也可用 `--startup-log <FILE>` 开启同一套追踪。文件采用增量 JSONL；可能阻塞的 span（包括 `app_server.total`）会写 `stage_start` / `stage_finish`，`rollout.total`、`snapshot.total` 等回顾性汇总只写 `stage_finish`。每行都会立即 flush，因此启动卡住时最后一条 `stage_start` 能指出正在等待的部分。指定文件会在每次启动时重建，只保留最近一次运行：
+
+```bash
+codex-usage-monit --startup-log /tmp/codex-usage-startup.jsonl
+codex-usage-monit --startup-log /tmp/codex-usage-startup.jsonl snapshot --section health
+```
+
+默认不开启 profiler，也不创建日志。trace header 另含绝对 `startedAt` 和进程 `pid`，阶段记录则只含阶段名、相对时间、文件/字节/行/task/turn 等聚合计数和状态；两者都不含 Codex home 路径、thread/turn ID、标题或消息内容。`rollout.parse_files` 用于判断 JSONL 解析成本，`rollout.reduce` / `rollout.materialize` 分别显示事件回放与实体构造，`app_server.initialize` / `app_server.account_reads` / `app_server.shutdown` 则拆分进程与 RPC 等待；`startup.ready` 表示首帧已经成功绘制。
+
+报告同时保留 `tui.bootstrap`、`snapshot.total`、`rollout.total` 等外层计时与其内部阶段，这些时长会重叠，不能逐行相加；成功的 TUI / `debug-startup` 以 `startup.ready` 为端到端总耗时，成功的一次性命令以 `startup.complete` 为准。缺少终点事件表示进程在完成前返回错误或被中断；一次性输出写入失败会显式记录 `startup.failed`。
+
+完整在线刷新会把 `snapshot.local_scan` 与 `snapshot.account_fetch` 作为并发的 sibling span 调度，两者的起止区间可能重叠，不能相加。`--offline`、`limits` 的无本地扫描路径，以及复用缓存账户数据的路径不会额外创建采集线程。
+
 ## 一次性输出
 
 ```bash
@@ -95,7 +118,7 @@ codex-usage-monit attribution --format text
 - `t`：在 dark 与 light 主题间切换；
 - `q`、`Ctrl-C`：直接退出；非搜索状态的 `Esc` 打开退出确认，弹窗内 `Enter` 确认、`Esc` 取消；搜索输入状态中的 `Esc` 仍只取消本次编辑。
 
-本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。真实 235 文件、约 23.2 万行的 debug 基准中，冷扫约 5.7 秒，无文件变化的缓存刷新约 55ms。
+本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。`RolloutCache` 只在当前 TUI 进程内复用，重新启动仍是冷扫描；冷启动成本主要取决于入选 JSONL 的总字节数而不是文件数，少量包含长历史的 rollout 也可能很大。使用 `debug-startup` 查看当前机器与数据集的真实分解，不应把某个固定文件数的旧基准当作启动时延保证。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
 Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Turns 面板底部显示统一状态图例，以减少状态列占用并兼容无色终端。Recent tasks 默认保持 Flat 排序；Tree 模式把已知直接父会话且父节点也在当前过滤结果中的 subagent 递归缩进到父节点下，缺失或被过滤的父节点不会被强行补回。拥有子节点的行显示可点击的 `[-]` / `[+]`，并可在 Tasks 焦点下用 `-` / `+` 收起或展开；大写 `E` 和可点击的 `[E]Collapse` 会一次收起当前过滤树的所有父节点，包括已藏在折叠祖先下的嵌套父节点；全部收起后按钮变为 `[E]Expand` 并展开同一过滤范围。折叠状态跨数据刷新保留。节点收起时，父行会汇总当前过滤树中所有被隐藏后代的 token，并按普通 `codex` 分母重算 local share 与 EST；Spark 后代继续从两者中排除。展开后各行恢复独立显示。挂在父节点下的 child 省略重复项目名，作为 orphan root 显示时仍保留项目名。树根和同层分支由最近活动的后代带动排序，因此新活动的 subagent 仍会把整组带到顶部。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；非空筛选右侧的 `[Del]` 整块可点击，非输入状态下也可按 `Delete` 清空当前焦点面板的查询。焦点从 Turns 返回 Tasks 时会自动清空 Turns 查询并恢复完整 turn 列表，但 Tasks 查询保持不变。Codex 标记为 Fast 的 turn 会在模型名称后额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、占比、置信度、turn ID 与本地保存的最多 72 字消息摘要。Overview 的 Models 面板显示所选 5h/Week `codex` gauge、本地非 Spark token、统一公式得到的 Low-confidence EST，以及按 token 降序的模型表；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充；面板隐藏后仍可从最上方的 `[M]Models` 恢复。
 

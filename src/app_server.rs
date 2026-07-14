@@ -14,6 +14,7 @@ use crate::domain::{
     AccountSnapshot, AccountTokenUsage, CreditsSnapshot, DailyTokenBucket, LimitBucket,
     LimitWindow, Provenance,
 };
+use crate::startup::StartupTrace;
 
 const INITIALIZE_ID: u64 = 1;
 const RATE_LIMITS_ID: u64 = 2;
@@ -28,6 +29,7 @@ enum ReaderEvent {
 
 struct ChildGuard {
     child: Child,
+    startup_trace: StartupTrace,
 }
 
 impl ChildGuard {
@@ -44,7 +46,9 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        let shutdown_span = self.startup_trace.span("app_server.shutdown");
         self.terminate_and_reap();
+        shutdown_span.finish("status=reaped");
     }
 }
 
@@ -53,13 +57,16 @@ impl Drop for ChildGuard {
 /// Authentication remains owned by `codex app-server`; this adapter does not read
 /// `auth.json` and does not call any write or control methods.
 pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot> {
+    let total_span = config.startup_trace.span("app_server.total");
     if config.offline {
+        total_span.finish("status=offline");
         return Ok(AccountSnapshot {
             warnings: vec!["Codex app-server collection is disabled in offline mode".to_string()],
             ..AccountSnapshot::default()
         });
     }
 
+    let spawn_span = config.startup_trace.span("app_server.spawn");
     let child = Command::new("codex")
         .args(["app-server", "--stdio"])
         .env("CODEX_HOME", &config.codex_home)
@@ -68,8 +75,13 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn `codex app-server --stdio`")?;
+    spawn_span.finish("command=codex_app_server");
 
-    let mut child = ChildGuard { child };
+    let io_span = config.startup_trace.span("app_server.io_setup");
+    let mut child = ChildGuard {
+        child,
+        startup_trace: config.startup_trace.clone(),
+    };
     let stdin = child
         .child
         .stdin
@@ -98,37 +110,47 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         .context("app-server timeout exceeds the platform's supported range")?;
     let mut stdin = stdin;
     let mut protocol_warnings = Vec::new();
+    io_span.finish_with(|| format!("timeout_ms={}", config.app_server_timeout.as_millis()));
 
     let result = (|| {
-        write_message(
-            &mut stdin,
-            &json!({
-                "method": "initialize",
-                "id": INITIALIZE_ID,
-                "params": {
-                    "clientInfo": {
-                        "name": "codex-usage-monit",
-                        "title": "Codex Usage Monitor",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "capabilities": null
-                }
-            }),
-        )
-        .context("failed to initialize codex app-server")?;
+        let initialize_span = config.startup_trace.span("app_server.initialize");
+        let initialize_result = (|| -> Result<()> {
+            write_message(
+                &mut stdin,
+                &json!({
+                    "method": "initialize",
+                    "id": INITIALIZE_ID,
+                    "params": {
+                        "clientInfo": {
+                            "name": "codex-usage-monit",
+                            "title": "Codex Usage Monitor",
+                            "version": env!("CARGO_PKG_VERSION")
+                        },
+                        "capabilities": null
+                    }
+                }),
+            )
+            .context("failed to initialize codex app-server")?;
 
-        match wait_for_response(
-            INITIALIZE_ID,
-            "initialize",
-            deadline,
-            &reader_rx,
-            &mut protocol_warnings,
-            &stderr_output,
-        )? {
-            Ok(_) => {}
-            Err(message) => bail!("codex app-server initialize failed: {message}"),
+            match wait_for_response(
+                INITIALIZE_ID,
+                "initialize",
+                deadline,
+                &reader_rx,
+                &mut protocol_warnings,
+                &stderr_output,
+            )? {
+                Ok(_) => Ok(()),
+                Err(message) => bail!("codex app-server initialize failed: {message}"),
+            }
+        })();
+        if let Err(error) = initialize_result {
+            initialize_span.finish("status=error");
+            return Err(error);
         }
+        initialize_span.finish("status=ok");
 
+        let account_span = config.startup_trace.span("app_server.account_reads");
         write_message(&mut stdin, &json!({ "method": "initialized" }))?;
         write_message(
             &mut stdin,
@@ -150,7 +172,10 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                     ));
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    account_span.finish("status=error kind=receive");
+                    return Err(error);
+                }
             };
             match event {
                 ReaderEvent::Message(message) => {
@@ -171,6 +196,7 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                         ));
                         break;
                     }
+                    account_span.finish("status=error kind=eof");
                     bail!(
                         "codex app-server closed stdout before returning the account snapshot{}",
                         stderr_suffix(&stderr_output)
@@ -178,7 +204,21 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                 }
             }
         }
+        account_span.finish_with(|| {
+            format!(
+                "status={} rate_limits={} usage={} warnings={}",
+                if account_usage.is_some() {
+                    "ok"
+                } else {
+                    "partial"
+                },
+                rate_limits.is_some(),
+                account_usage.is_some(),
+                protocol_warnings.len()
+            )
+        });
 
+        let parse_span = config.startup_trace.span("app_server.parse_responses");
         let mut snapshot = AccountSnapshot {
             warnings: protocol_warnings,
             ..AccountSnapshot::default()
@@ -208,11 +248,22 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
             }
         }
 
+        parse_span.finish_with(|| {
+            format!(
+                "buckets={} usage={} warnings={} errors={}",
+                snapshot.limits.len(),
+                snapshot.usage.is_some(),
+                snapshot.warnings.len(),
+                snapshot.errors.len()
+            )
+        });
+
         Ok(snapshot)
     })();
 
     drop(stdin);
     drop(child);
+    total_span.finish_with(|| format!("status={}", if result.is_ok() { "ok" } else { "error" }));
     result
 }
 

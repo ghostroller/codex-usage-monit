@@ -249,13 +249,17 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
 "#;
 
     with_mock_codex(script, |directory| {
+        let trace =
+            codex_usage_monit::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
         let config = CollectConfig {
             codex_home: directory.join("home"),
             app_server_timeout: Duration::from_secs(2),
+            startup_trace: trace.clone(),
             ..CollectConfig::default()
         };
 
         let snapshot = fetch_account_snapshot(&config).unwrap();
+        trace.stop();
 
         assert_eq!(snapshot.limits.len(), 1);
         assert_eq!(snapshot.limits[0].limit_id, "codex");
@@ -277,6 +281,22 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
                 .iter()
                 .any(|warning| warning.contains("malformed"))
         );
+        let stages = trace
+            .report()
+            .events
+            .into_iter()
+            .map(|event| event.stage)
+            .collect::<Vec<_>>();
+        for expected in [
+            "app_server.spawn",
+            "app_server.initialize",
+            "app_server.account_reads",
+            "app_server.parse_responses",
+            "app_server.shutdown",
+            "app_server.total",
+        ] {
+            assert!(stages.iter().any(|stage| stage == expected));
+        }
     });
 }
 
@@ -328,16 +348,35 @@ while IFS= read -r ignored; do :; done
 "#;
 
     with_mock_codex(script, |directory| {
+        let trace =
+            codex_usage_monit::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
         let config = CollectConfig {
             codex_home: directory.join("home"),
             app_server_timeout: Duration::from_millis(80),
+            startup_trace: trace.clone(),
             ..CollectConfig::default()
         };
         let started = Instant::now();
 
         let error = fetch_account_snapshot(&config).unwrap_err();
+        trace.stop();
 
         assert!(format!("{error:#}").contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+        let report = trace.report();
+        assert!(report.events.iter().any(|event| {
+            event.stage == "app_server.initialize" && event.detail == "status=error"
+        }));
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.stage == "app_server.shutdown")
+        );
+        assert!(
+            report.events.iter().any(|event| {
+                event.stage == "app_server.total" && event.detail == "status=error"
+            })
+        );
     });
 }

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use chrono::Local;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -17,7 +17,7 @@ use crossterm::terminal::{
 };
 use ratatui::Frame;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -56,6 +56,7 @@ const TASK_QUOTA_WIDTH: u16 = 8;
 const TASK_COLUMN_SPACING: u16 = 1;
 const TASK_HIGHLIGHT_WIDTH: u16 = 1;
 const TASK_TREE_MARKER_WIDTH: u16 = 3;
+const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Theme {
@@ -2610,22 +2611,15 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
 }
 
 fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>) -> Result<()> {
-    let mut ui_state_store = UiStateStore::discover();
-    let ui_state = ui_state_store.load();
-    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
-    let initial = {
-        let mut cache = rollout_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        collect_snapshot_cached(&config, None, true, &mut cache)
-    };
-    let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
-    let mut app = App::new(initial, initial_theme);
-    app.apply_ui_state(&ui_state, theme_override);
+    let (ui_state_store, rollout_cache, mut app) = prepare_initial_tui(&config, theme_override);
+    let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
     let _guard = TerminalGuard::enter()?;
+    terminal_enter_span.finish("backend=crossterm");
+    let terminal_setup_span = config.startup_trace.span("tui.terminal_setup");
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    terminal_setup_span.finish("clear=true");
 
     let (sender, receiver) = mpsc::channel::<(CollectionResult, bool)>();
     let result = run_loop(
@@ -2642,6 +2636,76 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     result
 }
 
+fn prepare_initial_tui(
+    config: &CollectConfig,
+    theme_override: Option<Theme>,
+) -> (UiStateStore, Arc<Mutex<RolloutCache>>, App) {
+    let bootstrap_span = config.startup_trace.span("tui.bootstrap");
+    let state_span = config.startup_trace.span("tui.ui_state_load");
+    let mut ui_state_store = UiStateStore::discover();
+    let ui_state = ui_state_store.load();
+    state_span.finish("source=user_state");
+    let cache_span = config.startup_trace.span("tui.cache_create");
+    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
+    cache_span.finish("kind=in_memory cold=true");
+    let snapshot_span = config.startup_trace.span("tui.initial_snapshot");
+    let initial = {
+        let mut cache = rollout_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        collect_snapshot_cached(config, None, true, &mut cache)
+    };
+    snapshot_span.finish_with(|| {
+        format!(
+            "tasks={} turns={} files={} lines={}",
+            initial.snapshot.tasks.len(),
+            initial.snapshot.turns.len(),
+            initial.snapshot.stats.scanned_files,
+            initial.snapshot.stats.parsed_lines
+        )
+    });
+    let app_span = config.startup_trace.span("tui.app_create");
+    let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
+    let mut app = App::new(initial, initial_theme);
+    app.apply_ui_state(&ui_state, theme_override);
+    app_span.finish_with(|| {
+        format!(
+            "theme={} turns_visible={} models_visible={} tree={}",
+            match initial_theme {
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+            },
+            app.turns_visible(),
+            app.models_visible,
+            matches!(app.task_list_mode, TaskListMode::Tree)
+        )
+    });
+    bootstrap_span.finish("status=ready_to_render");
+    (ui_state_store, rollout_cache, app)
+}
+
+pub fn debug_startup(
+    config: CollectConfig,
+    theme_override: Option<Theme>,
+    width: u16,
+    height: u16,
+) -> Result<()> {
+    ensure!(
+        u32::from(width) * u32::from(height) <= MAX_DEBUG_STARTUP_CELLS,
+        "debug-startup canvas exceeds {MAX_DEBUG_STARTUP_CELLS} cells"
+    );
+    let trace = config.startup_trace.clone();
+    let (_ui_state_store, _rollout_cache, mut app) = prepare_initial_tui(&config, theme_override);
+    let terminal_span = trace.span("tui.headless_terminal_setup");
+    let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+    terminal_span.finish_with(|| format!("width={width} height={height}"));
+    let draw_span = trace.span("tui.first_frame");
+    terminal.draw(|frame| render(frame, &mut app))?;
+    draw_span.finish_with(|| format!("backend=test width={width} height={height}"));
+    trace.finish("startup.ready", "mode=debug_startup backend=test");
+    Ok(())
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -2651,12 +2715,23 @@ fn run_loop(
     rollout_cache: Arc<Mutex<RolloutCache>>,
     ui_state_store: &UiStateStore,
 ) -> Result<()> {
+    let mut first_frame = true;
     loop {
         while let Ok((result, refreshed_account)) = receiver.try_recv() {
             app.replace(result, refreshed_account);
         }
 
-        terminal.draw(|frame| render(frame, app))?;
+        if first_frame {
+            let draw_span = config.startup_trace.span("tui.first_frame");
+            terminal.draw(|frame| render(frame, app))?;
+            draw_span.finish("backend=crossterm");
+            config
+                .startup_trace
+                .finish("startup.ready", "mode=tui backend=crossterm");
+            first_frame = false;
+        } else {
+            terminal.draw(|frame| render(frame, app))?;
+        }
 
         if event::poll(Duration::from_millis(100))? {
             let previous_ui_state = app.ui_state();

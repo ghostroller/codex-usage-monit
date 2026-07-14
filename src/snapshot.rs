@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::Instant;
 
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::app_server::fetch_account_snapshot;
@@ -15,6 +18,133 @@ use crate::rollout::{RolloutCache, scan_rollouts};
 pub struct CollectionResult {
     pub snapshot: Snapshot,
     pub account: AccountSnapshot,
+}
+
+struct LocalCollection {
+    dataset: RolloutDataset,
+    source: Option<SourceStatus>,
+    error: Option<String>,
+}
+
+fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: bool) -> bool {
+    scan_local && refresh_account && !offline
+}
+
+fn run_sources_in_parallel<Local, Account, LocalFn, AccountFn>(
+    local: LocalFn,
+    account: AccountFn,
+) -> (Local, thread::Result<Account>)
+where
+    LocalFn: FnOnce() -> Local,
+    AccountFn: FnOnce() -> Account + Send,
+    Account: Send,
+{
+    thread::scope(|scope| {
+        let account = scope.spawn(account);
+        let local = local();
+        (local, account.join())
+    })
+}
+
+fn collect_local_source(
+    config: &CollectConfig,
+    now: DateTime<Utc>,
+    scan_local: bool,
+    rollout_cache: Option<&mut RolloutCache>,
+) -> LocalCollection {
+    let span = config.startup_trace.span("snapshot.local_scan");
+    let collection = if scan_local {
+        let scan_result = match rollout_cache {
+            Some(cache) => cache.scan(config, now),
+            None => scan_rollouts(config, now),
+        };
+        match scan_result {
+            Ok(dataset) => {
+                let truncated = dataset.stats.truncated_files;
+                let unreadable = dataset.stats.unreadable_files;
+                let skipped = dataset.stats.skipped_lines;
+                let ambiguous_resets = dataset.stats.ambiguous_token_resets;
+                let rollout_partial =
+                    truncated > 0 || unreadable > 0 || skipped > 0 || ambiguous_resets > 0;
+                LocalCollection {
+                    source: Some(SourceStatus {
+                        source: "rollout_jsonl".to_string(),
+                        status: if rollout_partial {
+                            "partial".to_string()
+                        } else {
+                            "ok".to_string()
+                        },
+                        as_of: now,
+                        message: Some(if rollout_partial {
+                            format!(
+                                "{} files, {truncated} truncated, {unreadable} unreadable, {skipped} lines skipped, {ambiguous_resets} ambiguous token resets",
+                                dataset.stats.scanned_files
+                            )
+                        } else {
+                            format!("{} files", dataset.stats.scanned_files)
+                        }),
+                    }),
+                    dataset,
+                    error: None,
+                }
+            }
+            Err(error) => LocalCollection {
+                dataset: RolloutDataset::default(),
+                source: Some(SourceStatus {
+                    source: "rollout_jsonl".to_string(),
+                    status: "error".to_string(),
+                    as_of: now,
+                    message: Some(error.to_string()),
+                }),
+                error: Some(format!("rollout scan failed: {error:#}")),
+            },
+        }
+    } else {
+        LocalCollection {
+            dataset: RolloutDataset::default(),
+            source: None,
+            error: None,
+        }
+    };
+    span.finish_with(|| {
+        format!(
+            "status={} files={} lines={} tasks={} turns={}",
+            collection
+                .source
+                .as_ref()
+                .map_or("skipped", |source| source.status.as_str()),
+            collection.dataset.stats.scanned_files,
+            collection.dataset.stats.parsed_lines,
+            collection.dataset.tasks.len(),
+            collection.dataset.turns.len()
+        )
+    });
+    collection
+}
+
+fn fetch_account_source(config: &CollectConfig) -> Result<AccountSnapshot> {
+    let span = config.startup_trace.span("snapshot.account_fetch");
+    let result = fetch_account_snapshot(config);
+    span.finish_with(|| match &result {
+        Ok(account) => format!(
+            "status={} refresh=true parallel=true buckets={} usage={}",
+            if account.errors.is_empty() && account.warnings.is_empty() {
+                "ok"
+            } else {
+                "partial"
+            },
+            account.limits.len(),
+            account.usage.is_some()
+        ),
+        Err(_) => "status=error refresh=true parallel=true buckets=0 usage=false".to_string(),
+    });
+    result
+}
+
+fn flatten_account_thread(
+    result: thread::Result<Result<AccountSnapshot>>,
+) -> Result<AccountSnapshot> {
+    result.unwrap_or_else(|_| Err(anyhow!("app-server collector thread panicked")))
 }
 
 pub fn collect_snapshot(
@@ -55,62 +185,41 @@ fn collect_snapshot_with_local(
     scan_local: bool,
     rollout_cache: Option<&mut RolloutCache>,
 ) -> CollectionResult {
+    let total_started = config.startup_trace.is_active().then(Instant::now);
     let now = Utc::now();
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    let mut dataset = if scan_local {
-        let scan_result = match rollout_cache {
-            Some(cache) => cache.scan(config, now),
-            None => scan_rollouts(config, now),
-        };
-        match scan_result {
-            Ok(dataset) => {
-                let truncated = dataset.stats.truncated_files;
-                let unreadable = dataset.stats.unreadable_files;
-                let skipped = dataset.stats.skipped_lines;
-                let ambiguous_resets = dataset.stats.ambiguous_token_resets;
-                let rollout_partial =
-                    truncated > 0 || unreadable > 0 || skipped > 0 || ambiguous_resets > 0;
-                sources.push(SourceStatus {
-                source: "rollout_jsonl".to_string(),
-                status: if rollout_partial {
-                    "partial".to_string()
-                } else {
-                    "ok".to_string()
-                },
-                as_of: now,
-                message: Some(if rollout_partial {
-                    format!(
-                        "{} files, {truncated} truncated, {unreadable} unreadable, {skipped} lines skipped, {ambiguous_resets} ambiguous token resets",
-                        dataset.stats.scanned_files
-                    )
-                } else {
-                    format!("{} files", dataset.stats.scanned_files)
-                }),
-            });
-                dataset
-            }
-            Err(error) => {
-                errors.push(format!("rollout scan failed: {error:#}"));
-                sources.push(SourceStatus {
-                    source: "rollout_jsonl".to_string(),
-                    status: "error".to_string(),
-                    as_of: now,
-                    message: Some(error.to_string()),
-                });
-                RolloutDataset::default()
-            }
-        }
+    let parallel_sources = sources_run_in_parallel(scan_local, refresh_account, config.offline);
+    let (local, prefetched_account) = if parallel_sources {
+        let (local, account) = run_sources_in_parallel(
+            || collect_local_source(config, now, scan_local, rollout_cache),
+            || fetch_account_source(config),
+        );
+        (local, Some(flatten_account_thread(account)))
     } else {
-        RolloutDataset::default()
+        (
+            collect_local_source(config, now, scan_local, rollout_cache),
+            None,
+        )
     };
+    if let Some(source) = local.source {
+        sources.push(source);
+    }
+    if let Some(error) = local.error {
+        errors.push(error);
+    }
+    let mut dataset = local.dataset;
     warnings.append(&mut dataset.warnings);
 
+    let account_span =
+        (!parallel_sources).then(|| config.startup_trace.span("snapshot.account_fetch"));
     let mut account = cached_account.unwrap_or_default();
     let previous_account_observations = account.rate_observations.clone();
+    let account_status;
     if config.offline {
+        account_status = "offline";
         sources.push(SourceStatus {
             source: "app_server".to_string(),
             status: "offline".to_string(),
@@ -118,8 +227,14 @@ fn collect_snapshot_with_local(
             message: Some("disabled by --offline".to_string()),
         });
     } else if refresh_account {
-        match fetch_account_snapshot(config) {
+        let refresh_result = prefetched_account.unwrap_or_else(|| fetch_account_snapshot(config));
+        match refresh_result {
             Ok(mut fresh) => {
+                account_status = if fresh.errors.is_empty() && fresh.warnings.is_empty() {
+                    "ok"
+                } else {
+                    "partial"
+                };
                 merge_account_observations(&mut fresh, previous_account_observations, now);
                 preserve_cached_account_data(&mut fresh, &account);
                 account = fresh;
@@ -135,6 +250,7 @@ fn collect_snapshot_with_local(
                 });
             }
             Err(error) => {
+                account_status = "error";
                 let warning = format!("app-server refresh failed: {error:#}");
                 if !account.warnings.contains(&warning) {
                     account.warnings.push(warning);
@@ -153,6 +269,7 @@ fn collect_snapshot_with_local(
             }
         }
     } else {
+        account_status = "cached";
         sources.push(SourceStatus {
             source: "app_server".to_string(),
             status: if account.limits.is_empty() {
@@ -170,7 +287,17 @@ fn collect_snapshot_with_local(
             },
         });
     }
+    if let Some(account_span) = account_span {
+        account_span.finish_with(|| {
+            format!(
+                "status={account_status} refresh={refresh_account} parallel=false buckets={} usage={}",
+                account.limits.len(),
+                account.usage.is_some()
+            )
+        });
+    }
 
+    let derive_span = config.startup_trace.span("snapshot.derive");
     warnings.extend(account.warnings.clone());
     errors.extend(account.errors.clone());
 
@@ -192,6 +319,7 @@ fn collect_snapshot_with_local(
         && dataset.stats.unreadable_files == 0
         && dataset.stats.skipped_lines == 0
         && dataset.stats.ambiguous_token_resets == 0;
+    let analysis_span = config.startup_trace.span("snapshot.window_analysis");
     let mut window_analyses = analyze_windows(&tasks, &turns, &dataset.calls, &[], &limits, now);
     let rollout_source_degraded = sources.iter().any(|source| {
         source.source == "rollout_jsonl"
@@ -217,9 +345,20 @@ fn collect_snapshot_with_local(
     }
     let (models, attribution) =
         project_five_hour_analysis(&mut tasks, &mut turns, &window_analyses);
+    analysis_span.finish_with(|| {
+        format!(
+            "windows={} models={} tasks={} turns={}",
+            window_analyses.len(),
+            models.len(),
+            tasks.len(),
+            turns.len()
+        )
+    });
 
+    let sort_span = config.startup_trace.span("snapshot.sort");
     tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     turns.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    sort_span.finish_with(|| format!("tasks={} turns={}", tasks.len(), turns.len()));
 
     let partial = !errors.is_empty()
         || limits.is_empty()
@@ -235,7 +374,7 @@ fn collect_snapshot_with_local(
             .iter()
             .any(|source| matches!(source.status.as_str(), "error" | "partial" | "stale"));
 
-    CollectionResult {
+    let result = CollectionResult {
         snapshot: Snapshot {
             schema_version: 1,
             as_of: now,
@@ -254,7 +393,29 @@ fn collect_snapshot_with_local(
             errors,
         },
         account,
+    };
+    derive_span.finish_with(|| {
+        format!(
+            "partial={} limits={} windows={} warnings={} errors={}",
+            result.snapshot.partial,
+            result.snapshot.limits.len(),
+            result.snapshot.window_analyses.len(),
+            result.snapshot.warnings.len(),
+            result.snapshot.errors.len()
+        )
+    });
+    if let Some(total_started) = total_started {
+        config
+            .startup_trace
+            .record_with("snapshot.total", total_started, || {
+                format!(
+                    "local={scan_local} refresh_account={refresh_account} parallel_sources={parallel_sources} tasks={} turns={}",
+                    result.snapshot.tasks.len(),
+                    result.snapshot.turns.len()
+                )
+            });
     }
+    result
 }
 
 fn mark_incomplete_window_coverage(
@@ -411,6 +572,45 @@ fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBuc
 mod tests {
     use super::*;
     use crate::domain::{AccountTokenUsage, Confidence, TokenUsage, UsageCall};
+
+    #[test]
+    fn only_full_online_refresh_runs_sources_in_parallel() {
+        assert!(sources_run_in_parallel(true, true, false));
+        assert!(!sources_run_in_parallel(false, true, false));
+        assert!(!sources_run_in_parallel(true, false, false));
+        assert!(!sources_run_in_parallel(true, true, true));
+    }
+
+    #[test]
+    fn source_collectors_overlap_with_a_bounded_handshake() {
+        let (account_started_tx, account_started_rx) = std::sync::mpsc::channel();
+        let (account_release_tx, account_release_rx) = std::sync::mpsc::channel();
+        let timeout = std::time::Duration::from_secs(5);
+
+        let (local_saw_account, account) = run_sources_in_parallel(
+            move || {
+                let saw_account = account_started_rx.recv_timeout(timeout).is_ok();
+                account_release_tx.send(()).unwrap();
+                saw_account
+            },
+            move || {
+                account_started_tx.send(()).unwrap();
+                account_release_rx.recv_timeout(timeout).is_ok()
+            },
+        );
+
+        assert!(local_saw_account);
+        assert!(account.unwrap());
+    }
+
+    #[test]
+    fn account_collector_panic_becomes_a_refresh_error() {
+        let account: thread::Result<Result<AccountSnapshot>> =
+            Err(Box::new("simulated account collector panic") as Box<dyn std::any::Any + Send>);
+
+        let error = flatten_account_thread(account).unwrap_err();
+        assert_eq!(error.to_string(), "app-server collector thread panicked");
+    }
 
     fn weekly_limit(
         now: DateTime<Utc>,

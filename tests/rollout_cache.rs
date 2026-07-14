@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{RolloutDataset, TaskStatus};
 use codex_usage_monit::rollout::{RolloutCache, scan_rollouts};
+use codex_usage_monit::startup::StartupTrace;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -544,6 +545,67 @@ fn cached_refresh_preserves_truncated_file_stats() {
     assert_eq!(second.stats.discovered_files, 3);
     assert_eq!(second.stats.scanned_files, 2);
     assert_eq!(second.stats.truncated_files, 1);
+}
+
+#[test]
+fn cold_scan_emits_aggregate_startup_stages_without_session_content() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-profiled.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "private-thread-id"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "private message text"}
+            }),
+        ],
+    );
+    let trace = StartupTrace::enabled(Instant::now(), None).unwrap();
+    let mut scan_config = config(temp.path());
+    scan_config.startup_trace = trace.clone();
+
+    let mut cache = RolloutCache::new();
+    cache.scan(&scan_config, now).unwrap();
+    trace.stop();
+
+    let report = trace.report();
+    let stages = report
+        .events
+        .iter()
+        .map(|event| event.stage.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "rollout.discover",
+        "rollout.session_titles",
+        "rollout.parse_files",
+        "rollout.reduce",
+        "rollout.materialize",
+        "rollout.total",
+    ] {
+        assert!(
+            stages.contains(&expected),
+            "missing startup stage {expected}"
+        );
+    }
+    let parse = report
+        .events
+        .iter()
+        .find(|event| event.stage == "rollout.parse_files")
+        .unwrap();
+    assert!(parse.detail.contains("reparsed=1"));
+    assert!(parse.detail.contains("lines=2"));
+
+    let serialized = trace.render_json().unwrap();
+    assert!(!serialized.contains("private-thread-id"));
+    assert!(!serialized.contains("private message text"));
+    assert!(!serialized.contains(&temp.path().display().to_string()));
 }
 
 #[cfg(unix)]

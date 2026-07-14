@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, Metadata};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -125,6 +125,8 @@ struct ReducedRollouts {
 pub struct RolloutCacheRefresh {
     pub reused_files: usize,
     pub reparsed_files: usize,
+    /// Number of files parsed a second time after changing during the first read.
+    pub stability_retries: usize,
     pub rebuilt: bool,
     /// Number of `session_index.jsonl` content-read attempts.
     pub session_index_reads: usize,
@@ -217,6 +219,8 @@ impl RolloutCache {
     /// Scans recent rollouts, reparsing rollout files and reloading the session
     /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
+        let trace_active = config.startup_trace.is_active();
+        let scan_started = trace_active.then(Instant::now);
         let key = CacheKey {
             codex_home: config.codex_home.clone(),
             redact_content: config.redact_content,
@@ -230,18 +234,50 @@ impl RolloutCache {
         }
 
         let mut discovery = RolloutDataset::default();
+        let discovery_span = config.startup_trace.span("rollout.discover");
         let mut files = discover_rollout_files(config, now, &mut discovery);
+        let (selected_bytes, largest_file_bytes) = if trace_active {
+            files
+                .iter()
+                .map(|file| file.fingerprint.len)
+                .fold((0_u64, 0_u64), |(total, largest), bytes| {
+                    (total.saturating_add(bytes), largest.max(bytes))
+                })
+        } else {
+            (0, 0)
+        };
+        discovery_span.finish_with(|| format!(
+            "discovered={} selected={} truncated={} bytes={selected_bytes} largest_bytes={largest_file_bytes}",
+            discovery.stats.discovered_files,
+            files.len(),
+            discovery.stats.truncated_files
+        ));
 
         // Parsing older files first preserves cumulative counter order when a
         // thread happens to span more than one rollout file.
+        let sort_span = config.startup_trace.span("rollout.sort_selected");
         files.sort_by(|left, right| {
             left.modified_at
                 .cmp(&right.modified_at)
                 .then_with(|| left.path.cmp(&right.path))
         });
+        sort_span.finish_with(|| format!("files={}", files.len()));
 
         let mut refresh = RolloutCacheRefresh::default();
+        let title_span = config.startup_trace.span("rollout.session_titles");
         self.refresh_session_titles(config, &mut discovery, &mut refresh);
+        title_span.finish_with(|| {
+            format!(
+                "reads={} reused={} titles={} redacted={}",
+                refresh.session_index_reads,
+                refresh.session_index_reused,
+                self.session_titles.titles.len(),
+                config.redact_content
+            )
+        });
+        let parse_span = config.startup_trace.span("rollout.parse_files");
+        let mut slowest_parse_us = 0_u128;
+        let mut slowest_file_bytes = 0_u64;
         for file in &files {
             let reusable = self.files.get(&file.path).is_some_and(|cached| {
                 cached.fingerprint == file.fingerprint && cached.parsed.complete
@@ -251,10 +287,35 @@ impl RolloutCache {
                 continue;
             }
 
-            let cached = parse_stable_rollout_file(file, config);
+            let file_started = trace_active.then(Instant::now);
+            let (cached, stability_retries) = parse_stable_rollout_file(file, config);
+            if let Some(file_started) = file_started {
+                let parse_us = file_started.elapsed().as_micros();
+                if parse_us > slowest_parse_us {
+                    slowest_parse_us = parse_us;
+                    slowest_file_bytes = file.fingerprint.len;
+                }
+            }
             self.files.insert(file.path.clone(), cached);
             refresh.reparsed_files += 1;
+            refresh.stability_retries += stability_retries;
         }
+        let parsed_lines = if trace_active {
+            files
+                .iter()
+                .filter_map(|file| self.files.get(&file.path))
+                .map(|cached| cached.parsed.parsed_lines)
+                .fold(0_usize, usize::saturating_add)
+        } else {
+            0
+        };
+        parse_span.finish_with(|| format!(
+            "files={} reparsed={} reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
+            files.len(),
+            refresh.reparsed_files,
+            refresh.reused_files,
+            refresh.stability_retries
+        ));
 
         let selected = files
             .iter()
@@ -268,10 +329,25 @@ impl RolloutCache {
         let selected_changed = selected != self.selected;
         let must_rebuild = self.reduced.is_none() || selected_changed || refresh.reparsed_files > 0;
 
+        let reduce_span = config.startup_trace.span("rollout.reduce");
         if must_rebuild {
             self.reduced = Some(reduce_cached_files(&files, &self.files, config));
             refresh.rebuilt = true;
         }
+        let (reduced_threads, reduced_calls) = if trace_active {
+            self.reduced
+                .as_ref()
+                .map(|reduced| (reduced.threads.len(), reduced.dataset.calls.len()))
+                .unwrap_or_default()
+        } else {
+            (0, 0)
+        };
+        reduce_span.finish_with(|| {
+            format!(
+                "rebuilt={} threads={reduced_threads} calls={reduced_calls}",
+                refresh.rebuilt
+            )
+        });
         self.selected = selected;
 
         let selected_paths = files
@@ -282,7 +358,8 @@ impl RolloutCache {
             .retain(|path, _| selected_paths.contains(path.as_path()));
         self.last_refresh = refresh;
 
-        Ok(materialize_dataset(
+        let materialize_span = config.startup_trace.span("rollout.materialize");
+        let dataset = materialize_dataset(
             self.reduced
                 .as_ref()
                 .expect("a scan always initializes reduced rollout state"),
@@ -290,7 +367,32 @@ impl RolloutCache {
             config,
             now,
             &self.session_titles.titles,
-        ))
+        );
+        materialize_span.finish_with(|| {
+            format!(
+                "tasks={} turns={} calls={} observations={}",
+                dataset.tasks.len(),
+                dataset.turns.len(),
+                dataset.calls.len(),
+                dataset.rate_observations.len()
+            )
+        });
+        if let Some(scan_started) = scan_started {
+            config
+                .startup_trace
+                .record_with("rollout.total", scan_started, || {
+                format!(
+                "files={} lines={} bytes={selected_bytes} reparsed={} reused={} retries={} rebuilt={}",
+                dataset.stats.scanned_files,
+                dataset.stats.parsed_lines,
+                refresh.reparsed_files,
+                refresh.reused_files,
+                refresh.stability_retries,
+                refresh.rebuilt
+                )
+            });
+        }
+        Ok(dataset)
     }
 
     fn refresh_session_titles(
@@ -516,7 +618,7 @@ fn discover_rollout_files(
     files
 }
 
-fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> CachedFile {
+fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> (CachedFile, usize) {
     let mut candidate = file.clone();
     for attempt in 0..2 {
         let mut parsed = parse_rollout_file(&candidate, config);
@@ -529,18 +631,24 @@ fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> Cach
                     "could not inspect {} after reading: {error}",
                     candidate.path.display()
                 ));
-                return CachedFile {
-                    fingerprint: candidate.fingerprint,
-                    parsed,
-                };
+                return (
+                    CachedFile {
+                        fingerprint: candidate.fingerprint,
+                        parsed,
+                    },
+                    attempt,
+                );
             }
         };
 
         if after.fingerprint == candidate.fingerprint {
-            return CachedFile {
-                fingerprint: after.fingerprint,
-                parsed,
-            };
+            return (
+                CachedFile {
+                    fingerprint: after.fingerprint,
+                    parsed,
+                },
+                attempt,
+            );
         }
         if attempt == 0 {
             candidate = after;
@@ -553,10 +661,13 @@ fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> Cach
             "{} changed repeatedly while being read; the snapshot contains a stable parsed prefix",
             candidate.path.display()
         ));
-        return CachedFile {
-            fingerprint: after.fingerprint,
-            parsed,
-        };
+        return (
+            CachedFile {
+                fingerprint: after.fingerprint,
+                parsed,
+            },
+            attempt,
+        );
     }
     unreachable!("stable rollout parsing attempts are bounded")
 }

@@ -2,6 +2,8 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::startup::StartupTrace;
+
 #[derive(Clone, Debug)]
 pub struct CollectConfig {
     pub codex_home: PathBuf,
@@ -11,6 +13,7 @@ pub struct CollectConfig {
     pub redact_content: bool,
     pub offline: bool,
     pub app_server_timeout: Duration,
+    pub startup_trace: StartupTrace,
 }
 
 impl Default for CollectConfig {
@@ -23,6 +26,7 @@ impl Default for CollectConfig {
             redact_content: false,
             offline: false,
             app_server_timeout: Duration::from_secs(12),
+            startup_trace: StartupTrace::default(),
         }
     }
 }

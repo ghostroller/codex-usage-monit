@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,6 +11,7 @@ use crate::output::{
     OutputFormat, OutputRequest, Section, render_output, request_is_failure, request_is_partial,
 };
 use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
+use crate::startup::StartupTrace;
 use crate::tui::Theme;
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,10 @@ pub struct Cli {
     #[arg(long, value_enum)]
     theme: Option<ThemeArg>,
 
+    /// Write incremental cold-start timing events as JSONL.
+    #[arg(long, value_name = "FILE")]
+    startup_log: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -62,6 +67,22 @@ enum Command {
     Attribution(OutputArgs),
     /// Print per-task, turn, and model usage for each current reset cycle.
     Windows(OutputArgs),
+    /// Profile the normal TUI cold-start path without entering interactive mode.
+    DebugStartup(DebugStartupArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct DebugStartupArgs {
+    #[arg(long, value_enum, default_value_t = FormatArg::Text)]
+    format: FormatArg,
+
+    /// Width of the headless first-frame render.
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(20..=1000))]
+    width: u16,
+
+    /// Height of the headless first-frame render.
+    #[arg(long, default_value_t = 40, value_parser = clap::value_parser!(u16).range(8..=500))]
+    height: u16,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -148,6 +169,7 @@ impl From<ThemeArg> for Theme {
 }
 
 pub fn run() -> Result<i32> {
+    let process_started = Instant::now();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -156,10 +178,33 @@ pub fn run() -> Result<i32> {
             return Ok(exit_code);
         }
     };
-    run_with(cli)
+    let parsed_at = Instant::now();
+    run_with(cli, process_started, parsed_at)
 }
 
-fn run_with(cli: Cli) -> Result<i32> {
+fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i32> {
+    let trace_init_started = Instant::now();
+    let debug_startup = matches!(cli.command.as_ref(), Some(Command::DebugStartup(_)));
+    let trace = if debug_startup || cli.startup_log.is_some() {
+        StartupTrace::enabled(process_started, cli.startup_log.as_deref())?
+    } else {
+        StartupTrace::default()
+    };
+    let trace_initialized_at = Instant::now();
+    trace.record_interval(
+        "cli.parse",
+        process_started,
+        parsed_at,
+        format!("command={}", command_name(cli.command.as_ref())),
+    );
+    trace.record_interval(
+        "startup.trace_init",
+        trace_init_started,
+        trace_initialized_at,
+        format!("file={}", cli.startup_log.is_some()),
+    );
+
+    let config_span = trace.span("cli.config");
     let mut config = CollectConfig::default();
     if let Some(codex_home) = cli.codex_home {
         config.codex_home = codex_home;
@@ -169,6 +214,21 @@ fn run_with(cli: Cli) -> Result<i32> {
     config.active_grace = active_grace(cli.active_grace_minutes);
     config.offline = cli.offline;
     config.redact_content = cli.redact_content;
+    config.startup_trace = trace.clone();
+    config_span.finish_with(|| {
+        format!(
+            "build={} days={} max_files={} offline={} redact_content={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            config.lookback_days,
+            config.max_files,
+            config.offline,
+            config.redact_content
+        )
+    });
 
     let Some(command) = cli.command else {
         if let Some(theme) = cli.theme {
@@ -178,6 +238,16 @@ fn run_with(cli: Cli) -> Result<i32> {
         }
         return Ok(0);
     };
+
+    if let Command::DebugStartup(args) = &command {
+        crate::tui::debug_startup(config, cli.theme.map(Into::into), args.width, args.height)?;
+        let output = match args.format {
+            FormatArg::Text => trace.render_text(),
+            FormatArg::Json => trace.render_json()?,
+        };
+        write_stdout(&output)?;
+        return Ok(0);
+    }
 
     let request = match command {
         Command::Snapshot(args) => OutputRequest {
@@ -201,6 +271,7 @@ fn run_with(cli: Cli) -> Result<i32> {
         Command::Models(args) => request_for(args, Section::Models),
         Command::Attribution(args) => request_for(args, Section::Attribution),
         Command::Windows(args) => request_for(args, Section::Windows),
+        Command::DebugStartup(_) => unreachable!("debug-startup returned before output routing"),
     };
     let limits_only = request.sections.len() == 1 && request.sections.contains(&Section::Limits);
     let mut result = if limits_only && !config.offline {
@@ -212,14 +283,27 @@ fn run_with(cli: Cli) -> Result<i32> {
         result = collect_snapshot(&config, Some(result.account), false);
     }
 
+    let render_span = trace.span("output.render");
     let output = render_output(&result.snapshot, &request)?;
+    render_span.finish_with(|| format!("bytes={}", output.len()));
     let mut stdout = io::stdout().lock();
-    if let Err(error) = write_output(&mut stdout, &output) {
-        if error.kind() == io::ErrorKind::BrokenPipe {
+    let write_span = trace.span("output.write");
+    match write_output(&mut stdout, &output) {
+        Ok(()) => {
+            write_span.finish_with(|| format!("status=ok bytes={}", output.len().saturating_add(1)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+            write_span.finish("status=broken_pipe");
+            trace.finish("startup.complete", "mode=one_shot status=broken_pipe");
             return Ok(0);
         }
-        return Err(error.into());
+        Err(error) => {
+            write_span.finish("status=error");
+            trace.finish("startup.failed", "mode=one_shot stage=output.write");
+            return Err(error.into());
+        }
     }
+    trace.finish("startup.complete", "mode=one_shot status=ok");
 
     Ok(if request_is_failure(&result.snapshot, &request) {
         1
@@ -228,6 +312,29 @@ fn run_with(cli: Cli) -> Result<i32> {
     } else {
         0
     })
+}
+
+fn write_stdout(output: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match write_output(&mut stdout, output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn command_name(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "tui",
+        Some(Command::Snapshot(_)) => "snapshot",
+        Some(Command::Limits(_)) => "limits",
+        Some(Command::Tasks(_)) => "tasks",
+        Some(Command::Turns(_)) => "turns",
+        Some(Command::Models(_)) => "models",
+        Some(Command::Attribution(_)) => "attribution",
+        Some(Command::Windows(_)) => "windows",
+        Some(Command::DebugStartup(_)) => "debug_startup",
+    }
 }
 
 fn write_output(writer: &mut impl Write, output: &str) -> io::Result<()> {
@@ -294,6 +401,41 @@ mod tests {
             Some(Command::Snapshot(SnapshotArgs { section, .. }))
                 if matches!(section.as_slice(), [SectionArg::Windows])
         ));
+    }
+
+    #[test]
+    fn debug_startup_accepts_headless_dimensions_and_log_path() {
+        let cli = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--startup-log",
+            "/tmp/startup.jsonl",
+            "debug-startup",
+            "--format",
+            "json",
+            "--width",
+            "100",
+            "--height",
+            "30",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.startup_log, Some(PathBuf::from("/tmp/startup.jsonl")));
+        assert!(matches!(
+            cli.command,
+            Some(Command::DebugStartup(DebugStartupArgs {
+                format: FormatArg::Json,
+                width: 100,
+                height: 30,
+            }))
+        ));
+    }
+
+    #[test]
+    fn debug_startup_rejects_unbounded_headless_dimensions() {
+        let error = Cli::try_parse_from(["codex-usage-monit", "debug-startup", "--width", "1001"])
+            .unwrap_err();
+
+        assert!(error.use_stderr());
     }
 
     #[test]
