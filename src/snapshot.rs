@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::Instant;
@@ -356,8 +357,8 @@ fn collect_snapshot_with_local(
     });
 
     let sort_span = config.startup_trace.span("snapshot.sort");
-    tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    turns.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    tasks.sort_by_key(|task| Reverse(task.updated_at));
+    turns.sort_by_key(|turn| Reverse(turn.started_at));
     sort_span.finish_with(|| format!("tasks={} turns={}", tasks.len(), turns.len()));
 
     let partial = !errors.is_empty()
