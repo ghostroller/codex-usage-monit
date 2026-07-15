@@ -197,6 +197,14 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
 fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
     let mut output = String::new();
     let partial = request_is_partial(snapshot, request);
+    let estimate_summary_section = [
+        Section::Attribution,
+        Section::Models,
+        Section::Tasks,
+        Section::Turns,
+    ]
+    .into_iter()
+    .find(|section| request.sections.contains(section));
     let _ = writeln!(
         output,
         "Codex usage snapshot  {}{}",
@@ -228,6 +236,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
 
     if request.sections.contains(&Section::Tasks) {
         let _ = writeln!(output, "\nTasks");
+        if estimate_summary_section == Some(Section::Tasks) {
+            render_attribution_summary(
+                &mut output,
+                &snapshot.attribution,
+                preferred_partial_reasons(snapshot),
+            );
+        }
         let _ = writeln!(
             output,
             "  {:<15} {:>12} {:>8} {:>8} {:<12}  TITLE",
@@ -253,6 +268,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
 
     if request.sections.contains(&Section::Turns) {
         let _ = writeln!(output, "\nTurns");
+        if estimate_summary_section == Some(Section::Turns) {
+            render_attribution_summary(
+                &mut output,
+                &snapshot.attribution,
+                preferred_partial_reasons(snapshot),
+            );
+        }
         let _ = writeln!(
             output,
             "  {:<11} {:<16} {:<7} {:>12} {:>8} {:>8}  THREAD   MESSAGE",
@@ -281,15 +303,21 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
 
     if request.sections.contains(&Section::Models) {
         let _ = writeln!(output, "\nModels (current window)");
+        if estimate_summary_section == Some(Section::Models) {
+            render_attribution_summary(
+                &mut output,
+                &snapshot.attribution,
+                preferred_partial_reasons(snapshot),
+            );
+        }
         for model in &snapshot.models {
             let _ = writeln!(
                 output,
-                "  {:<24} {:>12}  {:>7.2}% token share  {:>8} estimated quota  {:?}",
+                "  {:<24} {:>12}  {:>7.2}% token share  {:>8} estimated quota",
                 terminal_safe_text(&model.model),
                 compact_tokens(model.token_usage),
                 model.local_token_share_percent,
-                estimated_percent(model.estimated_quota_percent, model.quota_confidence),
-                model.quota_confidence
+                estimated_percent(model.estimated_quota_percent, model.quota_confidence)
             );
         }
     }
@@ -307,8 +335,11 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 window.used_percent
             );
         }
-        let _ = writeln!(output, "{}", attribution_allocation_line(attribution));
-        let _ = writeln!(output, "{}", attribution_quality_line(attribution));
+        render_attribution_summary(
+            &mut output,
+            attribution,
+            preferred_partial_reasons(snapshot),
+        );
     }
 
     if request.sections.contains(&Section::Windows) {
@@ -554,9 +585,40 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
 fn estimated_percent(value: f64, confidence: Confidence) -> String {
     match confidence {
         Confidence::Unknown => "-".to_string(),
-        Confidence::Low => format!("~{value:.2}%"),
-        Confidence::Medium | Confidence::High => format!("{value:.2}%"),
+        Confidence::Low | Confidence::Medium | Confidence::High => format!("~{value:.2}%"),
     }
+}
+
+fn preferred_partial_reasons(snapshot: &Snapshot) -> &[String] {
+    snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| {
+            analysis.duration_mins == 300
+                && analysis
+                    .attribution
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
+        })
+        .map(|analysis| analysis.partial_reasons.as_slice())
+        .unwrap_or_default()
+}
+
+fn render_attribution_summary(
+    output: &mut String,
+    attribution: &crate::domain::AttributionSummary,
+    partial_reasons: &[String],
+) {
+    let _ = writeln!(output, "{}", attribution_allocation_line(attribution));
+    if !partial_reasons.is_empty() {
+        let _ = writeln!(
+            output,
+            "  partial reasons: {}",
+            terminal_safe_text(&partial_reasons.join(", "))
+        );
+    }
+    let _ = writeln!(output, "{}", attribution_quality_line(attribution));
 }
 
 fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) -> String {
@@ -589,8 +651,7 @@ fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) 
 
 fn attribution_quality_line(attribution: &crate::domain::AttributionSummary) -> String {
     format!(
-        "  confidence {:?} | normal Codex bucket only (Spark excluded) | external activity possible {} | settled {} | method {}",
-        attribution.confidence,
+        "  price-weighted quota proxy, not server per-task accounting | normal Codex bucket only (Spark excluded) | external activity possible {} | settled {} | method {}",
         attribution.external_activity_possible,
         attribution.settled,
         terminal_safe_text(&attribution.method)
@@ -673,11 +734,13 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_estimates_are_marked_as_approximate() {
+    fn every_available_estimate_is_marked_as_approximate() {
         assert_eq!(estimated_percent(2.26, Confidence::Unknown), "-");
+        assert_eq!(estimated_percent(99.0, Confidence::Unknown), "-");
+        assert_eq!(estimated_percent(0.0, Confidence::Low), "~0.00%");
         assert_eq!(estimated_percent(2.26, Confidence::Low), "~2.26%");
-        assert_eq!(estimated_percent(2.26, Confidence::Medium), "2.26%");
-        assert_eq!(estimated_percent(2.26, Confidence::High), "2.26%");
+        assert_eq!(estimated_percent(2.26, Confidence::Medium), "~2.26%");
+        assert_eq!(estimated_percent(2.26, Confidence::High), "~2.26%");
     }
 
     #[test]
@@ -716,7 +779,9 @@ mod tests {
         assert!(!allocation.contains("unattributed"));
 
         let quality = attribution_quality_line(&attribution);
-        assert!(quality.contains("confidence Low"));
+        assert!(quality.contains("price-weighted quota proxy"));
+        assert!(quality.contains("not server per-task accounting"));
+        assert!(!quality.contains("confidence"));
         assert!(quality.contains("normal Codex bucket only (Spark excluded)"));
         assert!(!quality.contains("coverage"));
         assert!(!quality.contains("observed"));
@@ -889,8 +954,28 @@ mod tests {
                 estimated_quota_percent: 0.0,
                 quota_confidence: Confidence::Unknown,
             }],
-            models: Vec::new(),
-            attribution: AttributionSummary::default(),
+            models: vec![ModelUsage {
+                model: "gpt-test".to_string(),
+                token_usage: window_usage.token_usage,
+                local_token_share_percent: 100.0,
+                estimated_quota_percent: 1.25,
+                quota_confidence: Confidence::Medium,
+            }],
+            attribution: AttributionSummary {
+                window: Some(WindowDescriptor {
+                    limit_id: "codex".to_string(),
+                    label: "5h".to_string(),
+                    starts_at: now - chrono::Duration::hours(4),
+                    ends_at: now + chrono::Duration::hours(1),
+                    used_percent: 10.0,
+                }),
+                local_token_usage: window_usage.token_usage,
+                proxy_projected_percent: 10.0,
+                external_activity_possible: true,
+                confidence: Confidence::Medium,
+                method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
+                ..AttributionSummary::default()
+            },
             window_analyses: vec![WindowAnalysis {
                 duration_mins: 10_080,
                 attribution: AttributionSummary {
@@ -920,8 +1005,8 @@ mod tests {
                     model: "gpt-test".to_string(),
                     token_usage: window_usage.token_usage,
                     local_token_share_percent: 100.0,
-                    estimated_quota_percent: 0.0,
-                    quota_confidence: Confidence::Unknown,
+                    estimated_quota_percent: 1.25,
+                    quota_confidence: Confidence::Medium,
                 }],
             }],
             stats: CollectionStats::default(),
@@ -985,6 +1070,39 @@ mod tests {
         assert!(text.contains("TOKEN5H%"));
         assert!(text.contains("TOKEN%"));
         assert!(!text.contains("LOCAL5H"));
+        assert_eq!(text.matches("price-weighted quota proxy").count(), 1);
+        assert!(text.contains("external activity possible true"));
+        assert!(!text.contains("confidence Medium"));
+
+        let turns_text = render_output(
+            &snapshot,
+            &OutputRequest {
+                format: OutputFormat::Text,
+                compact: false,
+                sections: BTreeSet::from([Section::Turns]),
+                thread_filter: None,
+            },
+        )
+        .unwrap();
+        assert!(turns_text.contains("price-weighted quota proxy"));
+        assert!(turns_text.contains("external activity possible true"));
+
+        let models_text = render_output(
+            &snapshot,
+            &OutputRequest {
+                format: OutputFormat::Text,
+                compact: false,
+                sections: BTreeSet::from([Section::Models]),
+                thread_filter: None,
+            },
+        )
+        .unwrap();
+        assert!(models_text.contains("~1.25% estimated quota"));
+        assert!(models_text.contains("price-weighted quota proxy"));
+        assert!(models_text.contains("not server per-task accounting"));
+        assert!(models_text.contains("external activity possible true"));
+        assert!(!models_text.contains("Medium"));
+        assert!(!models_text.contains("confidence"));
 
         let mut five_hour_partial = snapshot.clone();
         five_hour_partial.partial = false;
@@ -1036,6 +1154,14 @@ mod tests {
             windows_json["windowAnalyses"][0]["threads"][0]["usage"]["localTokenSharePercent"],
             100.0
         );
+        assert_eq!(
+            windows_json["windowAnalyses"][0]["threads"][0]["usage"]["quotaConfidence"],
+            "medium"
+        );
+        assert_eq!(
+            windows_json["windowAnalyses"][0]["models"][0]["quotaConfidence"],
+            "medium"
+        );
         assert!(windows_json.get("tasks").is_none());
         assert!(windows_json.get("turns").is_none());
         assert!(windows_json.get("models").is_none());
@@ -1073,7 +1199,7 @@ mod tests {
         assert!(windows_text.contains("xhigh"));
         assert!(windows_text.contains("message preview"));
         assert!(windows_text.contains("100.00%"));
-        assert!(windows_text.contains("        -"));
+        assert!(windows_text.contains("~1.25%"));
         assert!(windows_text.contains("TOKEN%"));
 
         let mut partial_window = snapshot.clone();

@@ -167,17 +167,17 @@ estimated_quota_percent = codex_used_percent * entity_price_units / all_price_un
 
 `reasoning_output_tokens` 是 output 的子集，不能再次相加。rollout 当前不暴露 `cache_write_tokens`，因此上表的 GPT-5.6 cache-write 价格无法进入历史 EST；`input - cached` 只能按普通 input 价格处理。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
-缺失或不在价目表中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有结果均标记为 Low confidence，TUI/text 使用 `~` 表示近似，并保留 `externalActivityPossible`。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
+缺失或不在价目表中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
 该公式隐含“Codex 配额相对成本近似 API 短上下文价格，且本机看到了账户活动”的强假设。真实 Codex 配额权重、cache write、其他设备或云 task、服务端取整与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方配额账单。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
 
 ## 多窗口输出与交互
 
-TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 显示当前 `codex` gauge、本地非 Spark token、短上下文价格加权公式得到的 Low-confidence EST 与模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
+TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 先显示当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST 和 scope 级方法/external/partial-reasons 摘要，再显示不含独立 confidence 列的模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
 
 TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree 和来源筛选保存为版本化的用户级 JSON。读取失败或内容损坏时回退到默认值；搜索、选择、滚动位置和具体 thread 折叠集合不持久化。写入采用同目录临时文件替换，未来版本文件不会被旧程序覆盖；`--theme` 显式值优先于保存值。CLI 一次性输出不参与此状态生命周期。
 
-一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。
+一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。此次展示简化不改变 `statusConfidence`、task/turn/model/窗口 usage 的 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
 
 ## 状态可信度
 
@@ -211,7 +211,7 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 - 只读 Codex JSONL 与 App Server，不写入或修改其状态；v0.1 不查询 SQLite。
 - 不直接读取、复制或缓存 `auth.json`。
 - 默认索引聚合字段，不持久化提示词、回复、工具输出或 secrets。
-- TUI 的 Recent tasks 与 Turns 使用轻量背景色及单字符标记表达状态，Turns 底部显示统一图例；一次性 text 输出包含消息摘要，JSON 使用 `messagePreview`。
+- TUI 的 Recent tasks 与 Turns 使用轻量背景色及单字符标记表达状态，Tasks 底部始终显示统一图例，Turns 收起时仍可见；一次性 text 输出包含消息摘要，JSON 使用 `messagePreview`。
 - `--redact-content` 不保留 task 标题或 turn 消息摘要。
 
 ## 官方依据

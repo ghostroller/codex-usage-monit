@@ -375,7 +375,7 @@ fn aggregate_task_row_usage(
             aggregate.token_usage.add_assign(thread.usage.token_usage);
             aggregate.local_token_share_percent += thread.usage.local_token_share_percent;
             aggregate.estimated_quota_percent += thread.usage.estimated_quota_percent;
-            if !thread.usage.token_usage.is_zero() {
+            if quota_estimate_participates(&thread.usage) {
                 quota_confidence = Some(match quota_confidence {
                     None => thread.usage.quota_confidence,
                     Some(current) => {
@@ -394,7 +394,7 @@ fn aggregate_task_row_usage(
     }
     let parent_confidence = aggregate.quota_confidence;
     let mut quota_confidence =
-        (aggregate.estimated_quota_percent > 0.0).then_some(aggregate.quota_confidence);
+        quota_estimate_participates(&aggregate).then_some(aggregate.quota_confidence);
     for index in row.hidden_descendants.iter().copied() {
         let Some(descendant) = snapshot.tasks.get(index) else {
             continue;
@@ -403,7 +403,7 @@ fn aggregate_task_row_usage(
         aggregate.token_usage.add_assign(usage.token_usage);
         aggregate.local_token_share_percent += usage.local_token_share_percent;
         aggregate.estimated_quota_percent += usage.estimated_quota_percent;
-        if usage.estimated_quota_percent > 0.0 {
+        if quota_estimate_participates(&usage) {
             quota_confidence = Some(match quota_confidence {
                 None => usage.quota_confidence,
                 Some(current) => weakest_quota_confidence(current, usage.quota_confidence),
@@ -412,6 +412,12 @@ fn aggregate_task_row_usage(
     }
     aggregate.quota_confidence = quota_confidence.unwrap_or(parent_confidence);
     aggregate
+}
+
+fn quota_estimate_participates(usage: &WindowUsage) -> bool {
+    !usage.token_usage.is_zero()
+        || usage.estimated_quota_percent > 0.0
+        || usage.quota_confidence != Confidence::Unknown
 }
 
 fn weakest_quota_confidence(left: Confidence, right: Confidence) -> Confidence {
@@ -4768,11 +4774,18 @@ fn task_panel_block(
     } else {
         palette.border
     };
-    let block = Block::default()
+    let status_width = u16::try_from(UnicodeWidthStr::width(status.as_str())).unwrap_or(u16::MAX);
+    let (legend, show_status) = task_footer_legend(app.theme, area.width, status_width);
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Line::from(spans))
-        .title_bottom(Span::styled(status, Style::default().fg(status_color)));
+        .title_bottom(legend);
+    if show_status {
+        block = block.title_bottom(
+            Line::from(Span::styled(status, Style::default().fg(status_color))).right_aligned(),
+        );
+    }
     let search_x = search_start.min(search_right);
     let controls = TaskControlsHitbox {
         sources: source_hitboxes,
@@ -4928,8 +4941,7 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         } else {
             palette.border
         }))
-        .title(Line::from(spans))
-        .title_bottom(status_legend(app.theme, area.width));
+        .title(Line::from(spans));
     (
         block,
         TurnControlsHitbox {
@@ -5266,14 +5278,13 @@ fn render_turn_detail(
         Line::from(first_tokens),
         Line::from(second_tokens),
         Line::from(format!(
-            "token.share={:.1}% · est.quota={} · confidence={}",
+            "token.share={:.1}% · est.quota={}",
             if window_only {
                 selected_window_usage.local_token_share_percent
             } else {
                 turn.local_token_share_percent
             },
-            estimated_quota,
-            confidence_label(quota_confidence)
+            estimated_quota
         )),
         Line::from(format!(
             "start={started} · end={completed} · duration={duration}"
@@ -5356,6 +5367,7 @@ fn attribution_summary_lines(
     attribution: Option<&AttributionSummary>,
     window_scope: WindowScope,
     selected_partial: bool,
+    partial_reasons: &[String],
     compact: bool,
 ) -> Vec<String> {
     let Some(attribution) = attribution else {
@@ -5380,8 +5392,11 @@ fn attribution_summary_lines(
             )
         })
         .unwrap_or_else(|| format!("{} reset cycle unavailable", window_scope.label()));
+    let has_window = attribution.window.is_some();
     let has_local_denominator = attribution.local_token_usage.total_tokens > 0;
-    let allocation = if has_local_denominator {
+    let estimate_available =
+        has_window && has_local_denominator && attribution.confidence != Confidence::Unknown;
+    let allocation = if estimate_available {
         if compact {
             format!(
                 "Tokens {} · EST ~{:.2}pp · codex gauge × price-weighted share",
@@ -5395,21 +5410,35 @@ fn attribution_summary_lines(
                 attribution.proxy_projected_percent,
             )
         }
-    } else if compact {
+    } else if !has_window && compact {
+        format!(
+            "Tokens {} · EST - · no quota window",
+            format_tokens(attribution.local_token_usage)
+        )
+    } else if !has_window {
+        format!(
+            "{} token total · estimate unavailable without a quota window",
+            format_tokens(attribution.local_token_usage)
+        )
+    } else if !has_local_denominator && compact {
         "Tokens 0 · EST - · no token denominator".to_string()
-    } else {
+    } else if !has_local_denominator {
         "0 token total · estimate unavailable without a token denominator".to_string()
+    } else if compact {
+        format!(
+            "Tokens {} · EST - · estimate unavailable",
+            format_tokens(attribution.local_token_usage)
+        )
+    } else {
+        format!(
+            "{} token total · estimate unavailable",
+            format_tokens(attribution.local_token_usage)
+        )
     };
     let mut quality = if compact {
-        format!(
-            "conf {} · price-weighted quota estimate",
-            confidence_label(attribution.confidence)
-        )
+        "Price-weighted quota proxy · not server accounting".to_string()
     } else {
-        format!(
-            "{} confidence · price-weighted quota estimate, not server per-task accounting",
-            confidence_label(attribution.confidence),
-        )
+        "Price-weighted quota proxy, not server per-task accounting".to_string()
     };
     if attribution.external_activity_possible {
         quality.push_str(if compact {
@@ -5423,6 +5452,10 @@ fn attribution_summary_lines(
     }
     if selected_partial {
         quality.push_str(" · partial");
+        if !partial_reasons.is_empty() {
+            quality.push_str(": ");
+            quality.push_str(&terminal_safe_text(&partial_reasons.join(", ")));
+        }
     }
     vec![format!("Attribution  {window}"), allocation, quality]
 }
@@ -5467,10 +5500,14 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let selected_partial = analysis
         .map(|analysis| analysis.partial)
         .unwrap_or(window_scope == WindowScope::FiveHours && app.snapshot.partial);
+    let partial_reasons = analysis
+        .map(|analysis| analysis.partial_reasons.as_slice())
+        .unwrap_or_default();
     let attribution_lines = attribution_summary_lines(
         attribution,
         window_scope,
         selected_partial,
+        partial_reasons,
         panel_inner.width < 100,
     );
     let attribution_height = u16::try_from(wrapped_text_height(
@@ -5544,7 +5581,6 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 model.estimated_quota_percent,
                 model.quota_confidence,
             )),
-            Cell::from(confidence_label(model.quota_confidence)),
         ])
     });
     let table = Table::new(
@@ -5554,11 +5590,10 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
-            Constraint::Length(8),
         ],
     )
     .header(table_header(
-        ["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA", "CONF"],
+        ["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA"],
         theme,
     ));
     frame.render_widget(table, model_area);
@@ -5732,6 +5767,29 @@ fn status_legend(theme: Theme, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+fn task_footer_legend(theme: Theme, width: u16, status_width: u16) -> (Line<'static>, bool) {
+    let inner_width = width.saturating_sub(2);
+    let full = status_legend(theme, u16::MAX);
+    let compact = status_legend(theme, 0);
+    let full_width = u16::try_from(full.width()).unwrap_or(u16::MAX);
+    let full_with_status = full_width.saturating_add(1).saturating_add(status_width);
+    if full_with_status <= inner_width {
+        return (full, true);
+    }
+
+    let compact_with_status = u16::try_from(compact.width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1)
+        .saturating_add(status_width);
+    if compact_with_status <= inner_width {
+        (compact, true)
+    } else if full_width <= inner_width {
+        (full, false)
+    } else {
+        (compact, false)
+    }
+}
+
 fn task_table_columns(area: Rect) -> [Rect; 4] {
     let [_highlight, columns] = Layout::horizontal([
         Constraint::Length(TASK_HIGHLIGHT_WIDTH),
@@ -5790,20 +5848,10 @@ fn count_statuses(tasks: &[TaskRecord]) -> (usize, usize, usize) {
     (active, completed, uncertain)
 }
 
-fn confidence_label(confidence: Confidence) -> &'static str {
-    match confidence {
-        Confidence::High => "high",
-        Confidence::Medium => "medium",
-        Confidence::Low => "low",
-        Confidence::Unknown => "unknown",
-    }
-}
-
 fn format_estimated_quota(value: f64, confidence: Confidence) -> String {
     match confidence {
         Confidence::Unknown => "-".to_string(),
-        Confidence::Low => format!("~{value:.1}%"),
-        Confidence::Medium | Confidence::High => format!("{value:.1}%"),
+        Confidence::Low | Confidence::Medium | Confidence::High => format!("~{value:.1}%"),
     }
 }
 
@@ -6762,17 +6810,45 @@ mod tests {
     }
 
     #[test]
-    fn confidence_labels_are_stable() {
-        assert_eq!(confidence_label(Confidence::Medium), "medium");
+    fn task_footer_prioritizes_the_legend_and_keeps_status_when_space_allows() {
+        let status_width = 27;
+        let (narrow, narrow_status) = task_footer_legend(Theme::Light, 46, status_width);
+        let (split, split_status) = task_footer_legend(Theme::Light, 62, status_width);
+        let (medium, medium_status) = task_footer_legend(Theme::Light, 80, status_width);
+        let (wide, wide_status) = task_footer_legend(Theme::Light, 120, status_width);
+
+        assert!(narrow.width() <= 44);
+        assert!(!narrow_status);
+        assert!(split.width() > narrow.width());
+        assert!(split.width() <= 60);
+        assert!(!split_status);
+        assert!(medium.width() + 1 + usize::from(status_width) <= 78);
+        assert!(medium_status);
+        assert!(wide.width() > medium.width());
+        assert!(wide_status);
+    }
+
+    #[test]
+    fn every_available_estimate_is_marked_as_approximate() {
         assert_eq!(format_estimated_quota(0.0, Confidence::Unknown), "-");
+        assert_eq!(format_estimated_quota(99.0, Confidence::Unknown), "-");
+        assert_eq!(format_estimated_quota(0.0, Confidence::Low), "~0.0%");
         assert_eq!(format_estimated_quota(2.26, Confidence::Low), "~2.3%");
-        assert_eq!(format_estimated_quota(2.26, Confidence::Medium), "2.3%");
-        assert_eq!(format_estimated_quota(2.26, Confidence::High), "2.3%");
+        assert_eq!(format_estimated_quota(2.26, Confidence::Medium), "~2.3%");
+        assert_eq!(format_estimated_quota(2.26, Confidence::High), "~2.3%");
     }
 
     #[test]
     fn attribution_summary_explains_the_price_weighted_codex_share_formula() {
+        let now = chrono::Utc::now();
         let attribution = AttributionSummary {
+            window: Some(WindowDescriptor {
+                limit_id: "codex".to_string(),
+                label: "week".to_string(),
+                starts_at: now - chrono::Duration::days(7),
+                ends_at: now,
+                used_percent: 34.0,
+            }),
             local_token_usage: TokenUsage {
                 total_tokens: 760_000_000,
                 ..TokenUsage::default()
@@ -6782,18 +6858,44 @@ mod tests {
             ..AttributionSummary::default()
         };
 
-        let compact = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, true);
+        let compact =
+            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, &[], true);
         assert!(compact[1].contains("EST ~34.00pp"));
         assert!(compact[1].contains("codex gauge × price-weighted share"));
-        assert!(compact[2].contains("conf low"));
-        assert!(compact[2].contains("price-weighted quota estimate"));
+        assert!(compact[2].contains("Price-weighted quota proxy"));
+        assert!(compact[2].contains("not server accounting"));
+        assert!(!compact[2].contains("confidence"));
 
-        let wide = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, false);
+        let wide =
+            attribution_summary_lines(Some(&attribution), WindowScope::Week, false, &[], false);
         assert!(wide[1].contains("~34.00pp estimated"));
         assert!(wide[1].contains("codex gauge × price-weighted share"));
-        assert!(wide[2].contains("low confidence"));
+        assert!(wide[2].contains("Price-weighted quota proxy"));
+        assert!(wide[2].contains("not server per-task accounting"));
+        assert!(!wide[2].contains("confidence"));
         assert!(!wide.join(" ").contains("evidence"));
         assert!(!wide.join(" ").contains("gap"));
+
+        let unavailable = AttributionSummary {
+            confidence: Confidence::Unknown,
+            ..attribution
+        };
+        let unavailable_lines =
+            attribution_summary_lines(Some(&unavailable), WindowScope::Week, false, &[], true);
+        assert!(unavailable_lines[1].contains("EST -"));
+        assert!(unavailable_lines[1].contains("estimate unavailable"));
+        assert!(!unavailable_lines[1].contains("EST ~"));
+
+        let no_window = AttributionSummary {
+            window: None,
+            confidence: Confidence::Low,
+            ..unavailable
+        };
+        let no_window_lines =
+            attribution_summary_lines(Some(&no_window), WindowScope::Week, false, &[], true);
+        assert!(no_window_lines[1].contains("EST -"));
+        assert!(no_window_lines[1].contains("no quota window"));
+        assert!(!no_window_lines[1].contains("EST ~"));
     }
 
     #[test]
@@ -6886,17 +6988,40 @@ mod tests {
         let mut app = interaction_test_app(1, 1);
         add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
         app.snapshot.window_analyses[0].partial = true;
+        app.snapshot.window_analyses[0]
+            .partial_reasons
+            .push("rollout_scan_incomplete".to_string());
 
         let content = render_models_content(&app.snapshot, 80, 8);
 
         assert!(content.contains("EST ~23.00pp"));
         assert!(content.contains("codex gauge × price-weighted share"));
-        assert!(content.contains("conf low"));
+        assert!(content.contains("Price-weighted quota proxy"));
+        assert!(content.contains("not server accounting"));
+        assert!(!content.contains("confidence"));
         assert!(content.contains("external"));
         assert!(content.contains("settled"));
         assert!(content.contains("partial"));
+        assert!(content.contains("rollout_scan_incomplete"));
+        assert!(!content.contains("CONF"));
         assert!(!content.contains("evidence"));
         assert!(!content.contains("gap"));
+    }
+
+    #[test]
+    fn compact_models_table_uses_four_columns_without_confidence() {
+        let mut app = interaction_test_app(1, 1);
+        add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
+
+        let content = render_models_content(&app.snapshot, 60, 12);
+
+        assert!(content.contains("MODEL"));
+        assert!(content.contains("TOKENS"));
+        assert!(content.contains("TOKEN SHARE"));
+        assert!(content.contains("EST. QUOTA"));
+        assert!(content.contains("gpt-window"));
+        assert!(content.contains("~23.0%"));
+        assert!(!content.contains("CONF"));
     }
 
     #[test]
@@ -7347,6 +7472,34 @@ mod tests {
         assert_eq!(week.local_token_share_percent, 60.0);
         assert_eq!(week.estimated_quota_percent, 6.0);
         assert_eq!(week.quota_confidence, Confidence::Low);
+
+        for task in &mut app.snapshot.tasks {
+            task.estimated_quota_percent = 0.0;
+            task.quota_confidence = Confidence::Low;
+        }
+        let known_zero =
+            aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, root, true);
+        assert_eq!(known_zero.estimated_quota_percent, 0.0);
+        assert_eq!(known_zero.quota_confidence, Confidence::Low);
+        assert_eq!(
+            format_estimated_quota(
+                known_zero.estimated_quota_percent,
+                known_zero.quota_confidence
+            ),
+            "~0.0%"
+        );
+
+        app.snapshot.tasks[1].quota_confidence = Confidence::Unknown;
+        let unavailable =
+            aggregate_task_row_usage(&app.snapshot, WindowScope::FiveHours, root, true);
+        assert_eq!(unavailable.quota_confidence, Confidence::Unknown);
+        assert_eq!(
+            format_estimated_quota(
+                unavailable.estimated_quota_percent,
+                unavailable.quota_confidence
+            ),
+            "-"
+        );
 
         assert!(app.set_task_collapsed(2, false));
         assert!(app.set_task_collapsed(0, true));
@@ -9027,6 +9180,8 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("turn=turn-0-6"));
         assert!(content.contains("message=message 0/6"));
+        assert!(content.contains("est.quota="));
+        assert!(!content.contains("confidence="));
 
         app.turn_search = "no matching turn".to_string();
         app.reconcile_turn_filter(true, None);
@@ -9088,6 +9243,55 @@ mod tests {
         assert!(app.turns_visible());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.turn_table_hitbox.is_some());
+    }
+
+    #[test]
+    fn status_legend_stays_under_tasks_when_turns_are_hidden() {
+        fn row_text(terminal: &Terminal<TestBackend>, width: u16, row: u16) -> String {
+            (0..width)
+                .map(|column| terminal.backend().buffer()[(column, row)].symbol())
+                .collect()
+        }
+
+        fn assert_has_legend(text: &str) {
+            for (marker, label) in [
+                ("R", "RUN"),
+                ("W", "WAIT"),
+                ("D", "DONE"),
+                ("X", "STOP"),
+                ("F", "FAIL"),
+                ("?", "STALE"),
+            ] {
+                assert!(
+                    text.contains(&format!("{marker}:{label}"))
+                        || text.contains(&format!("{marker} {label}")),
+                    "missing {marker}/{label} legend in: {text}"
+                );
+            }
+        }
+
+        for (width, height) in [(60, 24), (80, 24), (100, 30), (120, 40)] {
+            let mut app = interaction_test_app(1, 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let task_footer = app.task_table_hitbox.unwrap().viewport.bottom();
+            let turn_footer = app.turn_table_hitbox.unwrap().viewport.bottom();
+            assert_has_legend(&row_text(&terminal, width, task_footer));
+            let turn_footer_text = row_text(&terminal, width, turn_footer);
+            assert!(!turn_footer_text.contains("R:RUN"));
+            assert!(!turn_footer_text.contains("R RUN"));
+
+            app.toggle_turns_default_visibility();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(app.turn_table_hitbox.is_none());
+            let task_footer = app.task_table_hitbox.unwrap().viewport.bottom();
+            let task_footer_text = row_text(&terminal, width, task_footer);
+            assert_has_legend(&task_footer_text);
+            if width == 120 {
+                assert!(task_footer_text.contains("EXACT/H"));
+            }
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@
 - 300/10080 分钟窗口显示为 5 小时/周，其他时长使用通用标签；
 - 周窗口严格表示服务端 `resetsAt - 10080 分钟` 到 `resetsAt` 的当前 reset cycle，不是滚动过去 7 天，也不是按星期一等日历边界定义的自然周；
 - task/turn 额度贡献是 `estimated`，不是服务端账单；
-- 同时显示 exact/partial 的本地可观察 token 占比（`TOKEN%`）、基于当前 `codex` gauge 的 estimated quota、Low confidence 和 external activity risk；
+- 同时显示 exact/partial 的本地可观察 token 占比（`TOKEN%`）与基于当前 `codex` gauge 的 estimated quota；实体行以 `~` / `-` 表达估算可用性，估算方法、external activity risk 与 partial 状态在 scope 摘要中统一展示；
 - 所有任务结束后可以把 `settled` 标为 true，但 estimated quota 仍保持 Low，任何结果都不能标为 exact quota；
 - 5 小时和周窗口都按 `resetsAt - windowDurationMins` 计算，不使用简单的 `now - duration`。
 
@@ -30,7 +30,7 @@
 TUI Overview 显示近期 tasks：
 
 - 状态使用轻量行背景色及单字符标记表达，Recent tasks 和 Turns 不单独占用状态列；
-- Turns 面板底部显示统一状态图例；
+- Tasks 面板底部始终显示统一状态图例，Turns 收起时也必须可见；
 - `live`、`exact`、`inferred`、`stale` 等证据和置信度；
 - task token 总量；
 - 当前选中 5h/Week reset cycle 的 `TOKEN5H%` / `TOKENWK%` 与 estimated quota；
@@ -41,7 +41,7 @@ TUI Overview 显示近期 tasks：
 - Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影。筛选编辑确认后，非输入状态下的 `Delete` 与可点击 `[Del]` 清空当前焦点面板的查询；从 Turns 切换回 Tasks 时自动清空 Turns 查询及编辑恢复状态、重置 Turns 筛选投影，同时保留 Tasks 查询；
 - `V` 切换 Turns 默认显隐。默认显示时 Turns 常显；默认隐藏时 Tasks 使用完整内容区域，`Enter` / `↵` 临时展开并聚焦 Turns，`Backspace` / `←` 返回 Tasks 后关闭临时面板；
 - rollout 中 `thread_settings_applied.thread_settings.service_tier=priority` 在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 在模型名称后增加醒目标识，普通 turn 保持原显示；
-- 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与所选 5h/Week reset cycle 的 token breakdown，并在空间允许时补充起止时间、占比、置信度和 turn ID，不回读或展示完整消息正文。
+- 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与所选 5h/Week reset cycle 的 token breakdown，并在空间允许时补充起止时间、占比、带 `~`/`-` 的 EST 和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
 
@@ -85,10 +85,10 @@ task/thread -> turn -> model token events
 - 仅 `serviceTier=priority` 使用 Fast 价格，其他服务层使用 Standard；`cached = min(cached_input, input)`，`uncached = input - cached`，`call_price_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；
 - rollout 未暴露 GPT-5.6 cache-write token，不能套用价目表的独立 cache-write 价格；只有 total 而缺少 input/output breakdown 时按 uncached input 降级，并增加 `token_breakdown_missing` partial reason；
 - 缺失或未定价的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast 价格降级，并增加 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
-- `estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units`；task、turn、model 的 EST 使用同一价格分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 都以 `~` 和 Low confidence 显示；
-- partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST，但必须保留数据质量标记；
+- `estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units`；task、turn、model 的 EST 使用同一价格分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
+- 每个 scope 的摘要统一说明估算方法、`external activity possible` 与 partial 状态；partial 时列出 `partialReasons`。partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；
-- 显式标记 external activity possible，不得把短上下文价格代理称为服务端账单；
+- 不得把短上下文价格代理称为服务端账单；
 - 服务端不提供当前 300 分钟窗口时，不得用周窗口冒充 5 小时归因；Models 面板必须显示明确的 unavailable 原因，不能只留下空表或把不可用表达成零模型使用量。
 - 任何 scope 不可用时不得回退到另一 duration 冒充；旧顶层 window 字段固定兼容首选 5h 结果，周结果只进入多窗口分析结构。
 
@@ -128,7 +128,7 @@ codex-usage-monit models
 codex-usage-monit attribution
 ```
 
-TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `codex` 5h/Week reset cycles；`snapshot --section windows` 输出 `windowAnalyses`。JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。原有 task/turn 顶层 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 以及顶层 `models`、`attribution` 和旧 attribution 汇总字段保持 schema 兼容，始终表示首选 5h 分析，不得因 TUI 选择 Week 而改变语义。Turns 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。
+TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `codex` 5h/Week reset cycles；`snapshot --section windows` 输出 `windowAnalyses`。JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。原有 task/turn 顶层 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 以及顶层 `models`、`attribution` 和旧 attribution 汇总字段保持 schema 兼容，始终表示首选 5h 分析，不得因 TUI 选择 Week 而改变语义。此次仅调整 TUI/text 展示；JSON v1 继续序列化现有 `statusConfidence`、各层 `quotaConfidence` 与 attribution `confidence`，字段名和枚举值不变。Turns 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。
 
 退出码：`0` 完整、`1` 失败、`2` partial、`64` 参数错误。局部命令只根据与所请求 section 相关的数据源决定 partial。
 
@@ -141,7 +141,7 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 - 所选当前 reset cycle 的 duration、实际起止时间和额度；
 - 使用所选 scope 的 task 表；
 - 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
-- Models 面板先显示所选 `codex` scope 的当前 gauge、本地非 Spark token、Low-confidence EST 与数据质量摘要，再显示按 token 降序的模型表；空间不足时标记 `top N/M`，并区分“scope 不可用”和“窗口内没有本地非 Spark 模型调用”；
+- Models 面板先显示所选 `codex` scope 的当前 gauge、本地非 Spark token、带 `~`/`-` 的 EST，以及方法、external activity 与具体 partial reasons，再显示按 token 降序且不含独立 confidence 列的模型表；空间不足时标记 `top N/M`，并区分“scope 不可用”和“窗口内没有本地非 Spark 模型调用”；
 - `M` 与最顶栏中可点击的 `[M]Models` 切换 Models 面板显隐；隐藏后 Tasks/Turns 使用释放的空间，顶栏恢复控件始终可达；
 - `V` 与最顶栏中可点击的 `[V]Turns` 切换 Turns 默认显隐；首次启动默认显示，隐藏后仍可临时进入 Turns，顶栏恢复控件始终可达；
 - 非搜索状态的 `Esc` 打开退出确认弹窗，弹窗内 `Enter` 确认、`Esc` 取消；`Ctrl-C` 与 `q` 保持直接退出，搜索输入中的 `Esc` 只取消编辑。
@@ -158,7 +158,7 @@ Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因�
 
 宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的 Tree、名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。Flat/Tree 的显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；切换模式保留所选 thread/turn 并 reveal 新位置，刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
-Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Turns 底部提供统一图例。Overview、Data Health 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Data Health 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 

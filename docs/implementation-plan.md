@@ -101,7 +101,7 @@ turn/model metadata
 
 Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最后回退到 rollout `source`。Turn 的 reasoning effort 从 `turn_context` 保留到 JSON、text 和 TUI；窄 TUI 面板将 effort 前置合并到 model 单元格，Fast 标识始终追加在模型名称后。
 
-Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Turns 底部渲染统一图例，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
+Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Tasks 底部始终渲染统一图例，空间足够时在右侧保留选中 task 的状态证据，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
 
 Overview 维护独立 `WindowScope`，在最顶栏中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope 的 `windowAnalyses` 读取，标题和列名不得硬编码成 5h。切换 scope 保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
 
@@ -113,7 +113,7 @@ Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投�
 
 Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时记录并跳过完整后代集合，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。大写 `E` / `[E]Collapse` 以空折叠集合构造当前过滤条件下的完整展开投影，再把所有 `has_children` 节点加入折叠集合，因此不会漏掉嵌套在已折叠祖先下的父节点；若这些节点已经全部折叠，则固定宽度标签切为 `[E]Expand` 并只从集合中移除当前过滤树的父节点。渲染折叠父行时，用父节点及隐藏后代对 `TokenUsage` 分量求和，并按当前 `codex` scope 的非 Spark 本地 token 分母重算 `TOKEN%` 与 estimated quota。展开行与 `Snapshot` 原始实体保持不变。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
 
-Turns 与 Models 首次启动默认可见，`V` / `[V]Turns` 和 `M` / `[M]Models` 在最顶栏共同切换对应面板显隐；隐藏时主布局接管释放的空间，顶栏恢复入口与 scope 控件保持可用。Models 使用单一外框，内容先渲染当前 `codex` scope 的 gauge、本地非 Spark token、Low-confidence EST 与数据质量摘要，再渲染无嵌套边框的模型表；即使模型为空，unavailable/归因信息仍然存在。其他额度桶继续由顶部 gauge 和 Data Health 展示，不进入 Models attribution。
+Turns 与 Models 首次启动默认可见，`V` / `[V]Turns` 和 `M` / `[M]Models` 在最顶栏共同切换对应面板显隐；隐藏时主布局接管释放的空间，顶栏恢复入口与 scope 控件保持可用。Models 使用单一外框，内容先渲染当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST，以及方法、external activity 与具体 partial reasons，再渲染无嵌套边框且不含 confidence 列的模型表；即使模型为空，unavailable/归因信息仍然存在。其他额度桶继续由顶部 gauge 和 Data Health 展示，不进入 Models attribution。
 
 非搜索状态的 `Esc` 打开覆盖式退出确认弹窗，弹窗吞掉底层键鼠事件，`Enter` 确认、`Esc` 取消；`Ctrl-C` 和既有 `q` 仍直接退出。搜索输入状态继续优先消费 `Esc`，只恢复编辑前查询。
 
@@ -129,7 +129,7 @@ TUI 颜色集中到 dark/light palette；首次运行默认 dark，CLI 的 `--th
 
 Exact 部分：按窗口时间筛选本地 token events，聚合到 model、turn、task。
 
-Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage；同一 duration 最多一个普通 `codex` 分析。`windows` 子命令和 `snapshot --section windows` 输出该结构。为保持 JSON v1 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution` 和旧 summary 字段继续保留；首选字段固定投影 5h `codex` 分析，没有可用 5h 时保持 unavailable/empty，绝不投影 Week。
+Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage；同一 duration 最多一个普通 `codex` 分析。`windows` 子命令和 `snapshot --section windows` 输出该结构。为保持 JSON v1 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution` 和旧 summary 字段继续保留；首选字段固定投影 5h `codex` 分析，没有可用 5h 时保持 unavailable/empty，绝不投影 Week。TUI/text 的展示简化不改变 `statusConfidence`、各层 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
 
 本地可观察 token 占比只有在 rollout 扫描覆盖窗口起点且数据完整时才标为 exact。采集器除现有 truncated/unreadable/skipped/counter-reset 检查外，还比较 `--days` cutoff 与各 scope 的 `startsAt`；lookback 不足时只将对应分析标为 partial，limits gauge 仍可保持服务端完整。完整扫描下 `TOKENWK%` 可精确结算，quota share 仍走 estimated 口径。
 
@@ -138,8 +138,8 @@ Estimated 部分：
 1. 读取所选当前 `codex` 窗口的 `usedPercent`；
 2. `TOKEN%` 对 task/turn/model 分别计算原始 `entity_non_spark_tokens / all_local_non_spark_tokens`；
 3. EST 按模型与 `priority`/Standard 的短上下文 input、cached input、output 价格生成整数成本单位，计算 `estimatedQuotaPercent = usedPercent * entityPriceUnits / allPriceUnits`；
-4. 所有可用实体结果标为 Low，TUI/text 加 `~`，summary 保留 `externalActivityPossible`；
-5. partial、lookback 不完整与 stale 继续记录质量问题，但不清空仍可计算的 estimate；
+4. 所有可用实体结果在 Snapshot/JSON 中标为 Low；TUI/text 只用 `~`/`-`，不显示独立 quota confidence；
+5. scope summary 统一显示方法、`externalActivityPossible` 与具体 partial reasons；partial、lookback 不完整与 stale 不清空仍可计算的 estimate；
 6. 当前 `codex` 窗口或本地非 Spark 分母不存在时保持 unavailable。
 
 这不是官方配额账单。
@@ -160,8 +160,8 @@ Estimated 部分：
 - rollout：duplicate/reset、嵌套 turn、消息归属、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry；
 - attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、Spark 精确模型名大小写不敏感排除、缺失模型纳入、task/turn/model 公式求和、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
-- output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、Low estimate 的 `~`、旧 5h 字段和 attribution summary schema 兼容、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` 的键盘与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、Turns/Models 显隐与布局回收、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
+- output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、可用 EST 的 `~`、不可用的 `-`、无独立 quota-confidence 文本、scope 级 method/external/partial reasons、旧 confidence/5h attribution schema 兼容、section partial/failure、broken pipe、help/usage；
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` 的键盘与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、Turns/Models 显隐与布局回收、Tasks 底部图例在 Turns 收起时仍可见、Models 无 CONF 列、turn 详情无 quota-confidence 文本、scope summary 在 compact/wide 下保留 method/external/partial reasons、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 
