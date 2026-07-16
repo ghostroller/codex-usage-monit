@@ -90,7 +90,7 @@ struct SelectedFile {
     fingerprint: FileFingerprint,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum ParsedEvent {
     SessionMeta {
         timestamp: DateTime<Utc>,
@@ -1210,6 +1210,9 @@ fn reduce_cached_files(
         reduced.dataset.stats.skipped_lines += parsed.skipped_lines;
         reduced.dataset.stats.unreadable_files += parsed.unreadable_files;
         reduced.dataset.warnings.extend(parsed.warnings.clone());
+        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
+            continue;
+        }
         replay_rollout_file(
             &file.path,
             parsed,
@@ -1219,6 +1222,35 @@ fn reduce_cached_files(
         );
     }
     reduced
+}
+
+fn archived_rollout_is_subsumed_by_active(
+    file: &RolloutFile,
+    parsed: &ParsedFile,
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    config: &CollectConfig,
+) -> bool {
+    if !parsed.complete
+        || !file
+            .path
+            .starts_with(config.codex_home.join("archived_sessions"))
+    {
+        return false;
+    }
+    let Some(owner_thread_id) = parsed.owner_thread_id.as_deref() else {
+        return false;
+    };
+    let active_root = config.codex_home.join("sessions");
+
+    files.iter().any(|candidate| {
+        candidate.path.starts_with(&active_root)
+            && cache.get(&candidate.path).is_some_and(|candidate| {
+                candidate.parsed.complete
+                    && candidate.parsed.owner_thread_id.as_deref() == Some(owner_thread_id)
+                    && candidate.parsed.events.starts_with(&parsed.events)
+            })
+    })
 }
 
 fn materialize_dataset(
@@ -2201,6 +2233,9 @@ fn parse_rate_observation(
 fn parse_limit_window(value: &Value) -> Option<LimitWindow> {
     let value = value.as_object()?;
     let used_percent = f64_field_in(value, &["used_percent", "usedPercent"])?;
+    if !used_percent.is_finite() {
+        return None;
+    }
     let duration = i64_field_in(
         value,
         &[

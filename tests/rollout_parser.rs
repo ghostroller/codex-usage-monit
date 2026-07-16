@@ -321,6 +321,46 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
 }
 
 #[test]
+fn ignores_non_finite_string_quota_percentages() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-non-finite.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "thread-non-finite"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(8, 2, 2, 1, 10)},
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {
+                            "used_percent": "NaN",
+                            "window_minutes": 300,
+                            "resets_at": (now + chrono::Duration::hours(2)).timestamp()
+                        }
+                    }
+                }
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 10);
+    assert_eq!(dataset.rate_observations.len(), 1);
+    assert!(dataset.rate_observations[0].primary.is_none());
+}
+
+#[test]
 fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -1358,22 +1398,45 @@ fn scans_archived_sessions_filters_old_mtime_and_redacts_active_task_titles() {
 fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
+    let records = [
+        json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {
+                "id": "shared-thread",
+                "timestamp": timestamp(now),
+                "cwd": "/tmp/project",
+                "originator": "codex_cli_rs"
+            }
+        }),
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "shared-turn"}
+        }),
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(2)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage(8, 2, 2, 1, 10)}}
+        }),
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(3)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage(16, 4, 4, 2, 20)}}
+        }),
+        json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(4)),
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "shared-turn"}
+        }),
+    ];
     for directory in ["archived_sessions", "sessions"] {
         write_jsonl(
             &temp
                 .path()
                 .join(directory)
                 .join(format!("rollout-{directory}.jsonl")),
-            &[json!({
-                "timestamp": timestamp(now),
-                "type": "session_meta",
-                "payload": {
-                    "id": "shared-thread",
-                    "timestamp": timestamp(now),
-                    "cwd": "/tmp/project",
-                    "originator": "codex_cli_rs"
-                }
-            })],
+            &records,
             false,
         );
     }
@@ -1383,6 +1446,9 @@ fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.tasks[0].thread_id, "shared-thread");
     assert!(!dataset.tasks[0].archived);
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 20);
+    assert_eq!(dataset.calls.len(), 2);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 0);
 }
 
 #[test]
