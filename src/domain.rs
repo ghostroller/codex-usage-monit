@@ -193,6 +193,38 @@ pub struct CreditsSnapshot {
     pub balance: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCreditsSnapshot {
+    pub available_count: u64,
+    /// `None` means only the count is known; `Some([])` means details were fetched and empty.
+    #[serde(default)]
+    pub credits: Option<Vec<RateLimitResetCredit>>,
+    pub provenance: Provenance,
+    pub as_of: DateTime<Utc>,
+}
+
+impl RateLimitResetCreditsSnapshot {
+    pub fn details_are_truncated(&self) -> bool {
+        self.credits
+            .as_ref()
+            .is_some_and(|credits| (credits.len() as u64) < self.available_count)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCredit {
+    pub granted_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Raw protocol value, preserved so future App Server variants remain visible.
+    pub status: String,
+    /// Raw protocol value, preserved so future App Server variants remain visible.
+    pub reset_type: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitBucket {
@@ -404,6 +436,10 @@ pub struct Snapshot {
     pub codex_home: PathBuf,
     pub sources: Vec<SourceStatus>,
     pub limits: Vec<LimitBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reset_credits: Option<RateLimitResetCreditsSnapshot>,
+    #[serde(default, skip_serializing)]
+    pub rate_limit_reset_credits_partial: bool,
     pub account_usage: Option<AccountTokenUsage>,
     pub tasks: Vec<TaskRecord>,
     pub turns: Vec<TurnRecord>,
@@ -460,6 +496,8 @@ pub struct RolloutDataset {
 #[derive(Clone, Debug, Default)]
 pub struct AccountSnapshot {
     pub limits: Vec<LimitBucket>,
+    pub rate_limit_reset_credits: Option<RateLimitResetCreditsSnapshot>,
+    pub rate_limit_reset_credits_partial: bool,
     pub usage: Option<AccountTokenUsage>,
     pub rate_observations: Vec<RateObservation>,
     pub warnings: Vec<String>,

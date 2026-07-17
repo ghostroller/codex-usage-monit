@@ -128,16 +128,20 @@ fn fetch_account_source(config: &CollectConfig) -> Result<AccountSnapshot> {
     let result = fetch_account_snapshot(config);
     span.finish_with(|| match &result {
         Ok(account) => format!(
-            "status={} refresh=true parallel=true buckets={} usage={}",
+            "status={} refresh=true parallel=true buckets={} reset_credits={} usage={}",
             if account.errors.is_empty() && account.warnings.is_empty() {
                 "ok"
             } else {
                 "partial"
             },
             account.limits.len(),
+            account.rate_limit_reset_credits.is_some(),
             account.usage.is_some()
         ),
-        Err(_) => "status=error refresh=true parallel=true buckets=0 usage=false".to_string(),
+        Err(_) => {
+            "status=error refresh=true parallel=true buckets=0 reset_credits=false usage=false"
+                .to_string()
+        }
     });
     result
 }
@@ -256,7 +260,7 @@ fn collect_snapshot_with_local(
                 if !account.warnings.contains(&warning) {
                     account.warnings.push(warning);
                 }
-                mark_limits_stale(&mut account.limits);
+                mark_account_data_stale(&mut account);
                 sources.push(SourceStatus {
                     source: "app_server".to_string(),
                     status: if account.limits.is_empty() {
@@ -291,8 +295,9 @@ fn collect_snapshot_with_local(
     if let Some(account_span) = account_span {
         account_span.finish_with(|| {
             format!(
-                "status={account_status} refresh={refresh_account} parallel=false buckets={} usage={}",
+                "status={account_status} refresh={refresh_account} parallel=false buckets={} reset_credits={} usage={}",
                 account.limits.len(),
+                account.rate_limit_reset_credits.is_some(),
                 account.usage.is_some()
             )
         });
@@ -383,6 +388,8 @@ fn collect_snapshot_with_local(
             codex_home: config.codex_home.clone(),
             sources,
             limits,
+            rate_limit_reset_credits: account.rate_limit_reset_credits.clone(),
+            rate_limit_reset_credits_partial: account.rate_limit_reset_credits_partial,
             account_usage: account.usage.clone(),
             tasks,
             turns,
@@ -455,9 +462,18 @@ fn mark_analysis_partial(analysis: &mut WindowAnalysis, reason: &str) {
 }
 
 fn preserve_cached_account_data(fresh: &mut AccountSnapshot, cached: &AccountSnapshot) {
+    let limits_refresh_failed = fresh.limits.is_empty() && !fresh.errors.is_empty();
     if fresh.limits.is_empty() && !cached.limits.is_empty() {
         fresh.limits = cached.limits.clone();
         mark_limits_stale(&mut fresh.limits);
+    }
+    if limits_refresh_failed && fresh.rate_limit_reset_credits.is_none() {
+        fresh
+            .rate_limit_reset_credits
+            .clone_from(&cached.rate_limit_reset_credits);
+        if let Some(reset_credits) = &mut fresh.rate_limit_reset_credits {
+            reset_credits.provenance = Provenance::Stale;
+        }
     }
     if fresh.usage.is_none() {
         fresh.usage.clone_from(&cached.usage);
@@ -467,6 +483,13 @@ fn preserve_cached_account_data(fresh: &mut AccountSnapshot, cached: &AccountSna
 fn mark_limits_stale(limits: &mut [LimitBucket]) {
     for bucket in limits {
         bucket.provenance = Provenance::Stale;
+    }
+}
+
+fn mark_account_data_stale(account: &mut AccountSnapshot) {
+    mark_limits_stale(&mut account.limits);
+    if let Some(reset_credits) = &mut account.rate_limit_reset_credits {
+        reset_credits.provenance = Provenance::Stale;
     }
 }
 
@@ -572,7 +595,10 @@ fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBuc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountTokenUsage, Confidence, TokenUsage, UsageCall};
+    use crate::domain::{
+        AccountTokenUsage, Confidence, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
+        TokenUsage, UsageCall,
+    };
 
     #[test]
     fn only_full_online_refresh_runs_sources_in_parallel() {
@@ -653,6 +679,20 @@ mod tests {
         }
     }
 
+    fn reset_credit(
+        granted_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> RateLimitResetCredit {
+        RateLimitResetCredit {
+            granted_at,
+            expires_at,
+            status: "available".to_string(),
+            reset_type: "codexRateLimits".to_string(),
+            title: Some("Reset Codex limits".to_string()),
+            description: Some("One reset opportunity".to_string()),
+        }
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-9,
@@ -663,6 +703,7 @@ mod tests {
     #[test]
     fn failed_fresh_fields_preserve_cached_data_as_stale() {
         let now = Utc::now();
+        let cached_credit = reset_credit(now - Duration::hours(1), Some(now + Duration::days(30)));
         let cached = AccountSnapshot {
             limits: vec![LimitBucket {
                 limit_id: "codex".to_string(),
@@ -683,6 +724,12 @@ mod tests {
                 lifetime_tokens: Some(42),
                 ..AccountTokenUsage::default()
             }),
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 3,
+                credits: Some(vec![cached_credit.clone()]),
+                provenance: Provenance::ServerSnapshot,
+                as_of: now,
+            }),
             ..AccountSnapshot::default()
         };
         let mut fresh = AccountSnapshot {
@@ -694,7 +741,109 @@ mod tests {
 
         assert_eq!(fresh.limits.len(), 1);
         assert_eq!(fresh.limits[0].provenance, Provenance::Stale);
+        assert_eq!(
+            fresh.rate_limit_reset_credits.as_ref().unwrap().provenance,
+            Provenance::Stale
+        );
+        assert_eq!(
+            fresh
+                .rate_limit_reset_credits
+                .as_ref()
+                .unwrap()
+                .credits
+                .as_deref(),
+            Some([cached_credit.clone()].as_slice())
+        );
         assert_eq!(fresh.usage.unwrap().lifetime_tokens, Some(42));
+
+        let mut successful_without_reset_credits = AccountSnapshot {
+            limits: cached.limits.clone(),
+            ..AccountSnapshot::default()
+        };
+        preserve_cached_account_data(&mut successful_without_reset_credits, &cached);
+        assert!(
+            successful_without_reset_credits
+                .rate_limit_reset_credits
+                .is_none()
+        );
+
+        let mut successful_with_unknown_details = AccountSnapshot {
+            limits: cached.limits.clone(),
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 2,
+                credits: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: now + Duration::minutes(1),
+            }),
+            ..AccountSnapshot::default()
+        };
+        preserve_cached_account_data(&mut successful_with_unknown_details, &cached);
+        assert!(
+            successful_with_unknown_details
+                .rate_limit_reset_credits
+                .as_ref()
+                .unwrap()
+                .credits
+                .is_none()
+        );
+
+        let mut successful_with_empty_details = AccountSnapshot {
+            limits: cached.limits.clone(),
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 0,
+                credits: Some(Vec::new()),
+                provenance: Provenance::ServerSnapshot,
+                as_of: now + Duration::minutes(2),
+            }),
+            ..AccountSnapshot::default()
+        };
+        preserve_cached_account_data(&mut successful_with_empty_details, &cached);
+        assert_eq!(
+            successful_with_empty_details
+                .rate_limit_reset_credits
+                .as_ref()
+                .unwrap()
+                .credits
+                .as_deref(),
+            Some([].as_slice())
+        );
+
+        let mut stale = cached;
+        mark_account_data_stale(&mut stale);
+        assert_eq!(
+            stale.rate_limit_reset_credits.as_ref().unwrap().provenance,
+            Provenance::Stale
+        );
+        assert_eq!(
+            stale.rate_limit_reset_credits.unwrap().credits.as_deref(),
+            Some([cached_credit].as_slice())
+        );
+    }
+
+    #[test]
+    fn cached_reset_credits_flow_into_the_final_snapshot() {
+        let now = Utc::now();
+        let cached_credit = reset_credit(now - Duration::hours(1), None);
+        let cached = AccountSnapshot {
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 2,
+                credits: Some(vec![cached_credit.clone()]),
+                provenance: Provenance::ServerSnapshot,
+                as_of: now,
+            }),
+            ..AccountSnapshot::default()
+        };
+        let config = CollectConfig {
+            offline: true,
+            ..CollectConfig::default()
+        };
+
+        let result = collect_limits_snapshot(&config, Some(cached), false);
+
+        let reset_credits = result.snapshot.rate_limit_reset_credits.unwrap();
+        assert_eq!(reset_credits.available_count, 2);
+        assert_eq!(reset_credits.as_of, now);
+        assert_eq!(reset_credits.credits, Some(vec![cached_credit]));
     }
 
     #[test]

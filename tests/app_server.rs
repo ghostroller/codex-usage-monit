@@ -13,10 +13,11 @@ use std::time::Instant;
 
 use chrono::{TimeZone, Utc};
 use codex_usage_monit::app_server::{
-    fetch_account_snapshot, parse_account_usage_result, parse_rate_limits_result,
+    fetch_account_snapshot, parse_account_usage_result, parse_rate_limit_reset_credits_result,
+    parse_rate_limits_result,
 };
 use codex_usage_monit::config::CollectConfig;
-use codex_usage_monit::domain::Provenance;
+use codex_usage_monit::domain::{Provenance, RateLimitResetCreditsSnapshot};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -158,6 +159,281 @@ fn parses_legacy_rate_limit_and_millisecond_reset_timestamp() {
 }
 
 #[test]
+fn parses_rate_limit_reset_credits_with_provenance_and_timestamp() {
+    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let credits = parse_rate_limit_reset_credits_result(
+        &json!({
+            "id": 2,
+            "result": {
+                "rateLimitResetCredits": {
+                    "availableCount": 3,
+                    "credits": [
+                        {
+                            "id": "opaque-sensitive-id",
+                            "grantedAt": 1783834200,
+                            "expiresAt": 1784439000,
+                            "status": "available",
+                            "resetType": "codexRateLimits",
+                            "title": "Reset Codex limits",
+                            "description": "One reset opportunity"
+                        },
+                        {
+                            "id": "another-sensitive-id",
+                            "grantedAt": 1783834300,
+                            "expiresAt": null,
+                            "status": "scheduled_by_future_server",
+                            "resetType": "futureResetType",
+                            "title": null,
+                            "description": null
+                        }
+                    ]
+                }
+            }
+        }),
+        as_of,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(credits.available_count, 3);
+    assert_eq!(credits.provenance, Provenance::ServerSnapshot);
+    assert_eq!(credits.as_of, as_of);
+    assert!(credits.details_are_truncated());
+    let details = credits.credits.as_ref().unwrap();
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].granted_at.timestamp(), 1_783_834_200);
+    assert_eq!(details[0].expires_at.unwrap().timestamp(), 1_784_439_000);
+    assert_eq!(details[0].status, "available");
+    assert_eq!(details[0].reset_type, "codexRateLimits");
+    assert_eq!(details[0].title.as_deref(), Some("Reset Codex limits"));
+    assert_eq!(
+        details[0].description.as_deref(),
+        Some("One reset opportunity")
+    );
+    assert_eq!(details[1].expires_at, None);
+    assert_eq!(details[1].status, "scheduled_by_future_server");
+    assert_eq!(details[1].reset_type, "futureResetType");
+
+    let serialized = serde_json::to_value(&credits).unwrap();
+    assert!(serialized["credits"][0].get("id").is_none());
+    assert!(!serialized.to_string().contains("opaque-sensitive-id"));
+
+    for result in [json!({}), json!({ "rateLimitResetCredits": null })] {
+        assert_eq!(
+            parse_rate_limit_reset_credits_result(&result, as_of).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn distinguishes_unavailable_empty_and_truncated_reset_credit_details() {
+    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let unavailable = parse_rate_limit_reset_credits_result(
+        &json!({
+            "rateLimitResetCredits": { "availableCount": 2, "credits": null }
+        }),
+        as_of,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(unavailable.credits, None);
+    assert!(!unavailable.details_are_truncated());
+    assert_eq!(
+        serde_json::to_value(&unavailable).unwrap()["credits"],
+        json!(null)
+    );
+
+    let empty = parse_rate_limit_reset_credits_result(
+        &json!({
+            "rateLimitResetCredits": { "availableCount": 0, "credits": [] }
+        }),
+        as_of,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(empty.credits, Some(Vec::new()));
+    assert!(!empty.details_are_truncated());
+    assert_eq!(serde_json::to_value(&empty).unwrap()["credits"], json!([]));
+
+    let omitted = parse_rate_limit_reset_credits_result(
+        &json!({
+            "rateLimitResetCredits": { "availableCount": 1 }
+        }),
+        as_of,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(omitted.credits, None);
+
+    let legacy: RateLimitResetCreditsSnapshot = serde_json::from_value(json!({
+        "availableCount": 1,
+        "provenance": "server_snapshot",
+        "asOf": as_of,
+    }))
+    .unwrap();
+    assert_eq!(legacy.credits, None);
+}
+
+#[test]
+fn rejects_malformed_rate_limit_reset_credit_details_with_field_context() {
+    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let malformed = [
+        (
+            json!(true),
+            "rateLimitResetCredits.credits must be an array or null",
+        ),
+        (json!([null]), "rateLimitResetCredits.credits[0]"),
+        (
+            json!([{
+                "id": "opaque",
+                "grantedAt": null,
+                "status": "available",
+                "resetType": "codexRateLimits"
+            }]),
+            "rateLimitResetCredits.credits[0].grantedAt",
+        ),
+        (
+            json!([{
+                "id": "opaque",
+                "grantedAt": 1783834200,
+                "expiresAt": "not-a-time",
+                "status": "available",
+                "resetType": "codexRateLimits"
+            }]),
+            "rateLimitResetCredits.credits[0].expiresAt",
+        ),
+        (
+            json!([{
+                "id": "opaque",
+                "grantedAt": 1783834200,
+                "status": 42,
+                "resetType": "codexRateLimits"
+            }]),
+            "rateLimitResetCredits.credits[0].status",
+        ),
+        (
+            json!([{
+                "id": "opaque",
+                "grantedAt": 1783834200,
+                "status": "available",
+                "resetType": {}
+            }]),
+            "rateLimitResetCredits.credits[0].resetType",
+        ),
+    ];
+
+    for (credits, expected) in malformed {
+        let error = parse_rate_limit_reset_credits_result(
+            &json!({
+                "rateLimitResetCredits": {
+                    "availableCount": 1,
+                    "credits": credits
+                }
+            }),
+            as_of,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected),
+            "unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn parses_reset_credit_timestamps_as_strict_unix_seconds() {
+    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let credits = parse_rate_limit_reset_credits_result(
+        &json!({
+            "rateLimitResetCredits": {
+                "availableCount": 1,
+                "credits": [{
+                    "id": "opaque",
+                    "grantedAt": 1_783_834_200_123_i64,
+                    "expiresAt": null,
+                    "status": "available",
+                    "resetType": "codexRateLimits"
+                }]
+            }
+        }),
+        as_of,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        credits.credits.as_ref().unwrap()[0].granted_at.timestamp(),
+        1_783_834_200_123
+    );
+
+    for (timestamp, expected) in [
+        (
+            json!("1783834200"),
+            "rateLimitResetCredits.credits[0].grantedAt",
+        ),
+        (
+            json!(i64::MAX),
+            "rateLimitResetCredits.credits[0].grantedAt",
+        ),
+        (
+            json!(9_223_372_036_854_775_808_u64),
+            "rateLimitResetCredits.credits[0].grantedAt",
+        ),
+    ] {
+        let error = parse_rate_limit_reset_credits_result(
+            &json!({
+                "rateLimitResetCredits": {
+                    "availableCount": 1,
+                    "credits": [{
+                        "id": "opaque",
+                        "grantedAt": timestamp,
+                        "status": "available",
+                        "resetType": "codexRateLimits"
+                    }]
+                }
+            }),
+            as_of,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected),
+            "unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_rate_limit_reset_credit_counts_with_field_context() {
+    let as_of = Utc.with_ymd_and_hms(2026, 7, 12, 4, 30, 0).unwrap();
+    let invalid_counts = [
+        None,
+        Some(json!(null)),
+        Some(json!(-1)),
+        Some(json!(1.5)),
+        Some(json!(9_223_372_036_854_775_808_u64)),
+        Some(json!("18446744073709551616")),
+    ];
+
+    for available_count in invalid_counts {
+        let mut reset_credits = serde_json::Map::new();
+        if let Some(available_count) = available_count {
+            reset_credits.insert("availableCount".to_string(), available_count);
+        }
+        let error = parse_rate_limit_reset_credits_result(
+            &json!({
+                "rateLimitResetCredits": reset_credits
+            }),
+            as_of,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("rateLimitResetCredits.availableCount"),
+            "unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
 fn parses_account_usage_numbers_and_nullable_buckets() {
     let usage = parse_account_usage_result(&json!({
         "summary": {
@@ -245,7 +521,7 @@ IFS= read -r usage || exit 49
 case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 50 ;; esac
 printf '%s\n' 'this is not json'
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null}}'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":3,"credits":[{"id":"opaque-sensitive-id","grantedAt":1783834200,"expiresAt":1784439000,"status":"available","resetType":"codexRateLimits","title":"Reset Codex limits","description":"One reset opportunity"},{"id":"bad-detail","grantedAt":"not-seconds","status":"available","resetType":"codexRateLimits"}]}}}'
 "#;
 
     with_mock_codex(script, |directory| {
@@ -267,6 +543,17 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
             snapshot.limits[0].primary.as_ref().unwrap().used_percent,
             42.0
         );
+        let reset_credits = snapshot.rate_limit_reset_credits.as_ref().unwrap();
+        assert_eq!(reset_credits.available_count, 3);
+        assert_eq!(reset_credits.provenance, Provenance::ServerSnapshot);
+        assert!(reset_credits.details_are_truncated());
+        assert!(snapshot.rate_limit_reset_credits_partial);
+        let credit = &reset_credits.credits.as_ref().unwrap()[0];
+        assert_eq!(credit.granted_at.timestamp(), 1_783_834_200);
+        assert_eq!(credit.expires_at.unwrap().timestamp(), 1_784_439_000);
+        assert_eq!(credit.status, "available");
+        assert_eq!(credit.reset_type, "codexRateLimits");
+        assert_eq!(credit.title.as_deref(), Some("Reset Codex limits"));
         assert!(snapshot.usage.is_none());
         assert!(snapshot.errors.is_empty());
         assert!(
@@ -280,6 +567,12 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("malformed"))
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("rateLimitResetCredits.credits[1].grantedAt") })
         );
         let stages = trace
             .report()
@@ -297,6 +590,76 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
         ] {
             assert!(stages.iter().any(|stage| stage == expected));
         }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_limits_when_reset_credit_count_is_invalid() {
+    let script = r#"#!/bin/sh
+IFS= read -r initialize || exit 71
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 72
+IFS= read -r limits || exit 73
+IFS= read -r usage || exit 74
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":-1}}}'
+"#;
+
+    with_mock_codex(script, |directory| {
+        let config = CollectConfig {
+            codex_home: directory.join("home"),
+            app_server_timeout: Duration::from_secs(2),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert_eq!(snapshot.limits.len(), 1);
+        assert_eq!(snapshot.limits[0].limit_id, "codex");
+        assert!(snapshot.rate_limit_reset_credits.is_none());
+        assert!(snapshot.rate_limit_reset_credits_partial);
+        assert!(snapshot.errors.is_empty());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("rateLimitResetCredits.availableCount") })
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_reset_credit_count_when_the_details_container_is_invalid() {
+    let script = r#"#!/bin/sh
+IFS= read -r initialize || exit 81
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 82
+IFS= read -r limits || exit 83
+IFS= read -r usage || exit 84
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":true}}}'
+"#;
+
+    with_mock_codex(script, |directory| {
+        let config = CollectConfig {
+            codex_home: directory.join("home"),
+            app_server_timeout: Duration::from_secs(2),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert_eq!(snapshot.limits.len(), 1);
+        let reset_credits = snapshot.rate_limit_reset_credits.as_ref().unwrap();
+        assert_eq!(reset_credits.available_count, 2);
+        assert_eq!(reset_credits.credits, None);
+        assert!(snapshot.rate_limit_reset_credits_partial);
+        assert!(snapshot.errors.is_empty());
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.contains("rateLimitResetCredits.credits must be an array or null")
+        }));
     });
 }
 

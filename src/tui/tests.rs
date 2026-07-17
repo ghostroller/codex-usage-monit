@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{
-    AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage, ThreadWindowUsage,
+    AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage,
+    RateLimitResetCredit, RateLimitResetCreditsSnapshot, SourceStatus, ThreadWindowUsage,
     TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
 use ratatui::backend::TestBackend;
@@ -81,6 +82,8 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 codex_home: "/tmp/.codex".into(),
                 sources: Vec::new(),
                 limits: Vec::new(),
+                rate_limit_reset_credits: None,
+                rate_limit_reset_credits_partial: false,
                 account_usage: None,
                 tasks,
                 turns,
@@ -2445,23 +2448,24 @@ fn top_window_controls_keep_stable_compact_geometry() {
         }
     }
 
-    for width in 31..46 {
+    for width in 20..40 {
         let app = interaction_test_app(1, 1);
         let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
         let mut controls = None;
         terminal
             .draw(|frame| controls = Some(render_overview_controls(frame, frame.area(), &app)))
             .unwrap();
-        let rendered = (30..width)
+        let controls_start =
+            view_tabs_hitbox(Rect::new(0, 0, width, 1)).tabs[View::Health.index()].right();
+        let rendered = (controls_start..width)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect::<String>();
-        let expected = match width {
-            31..=33 => "",
-            34..=36 => " [V]",
-            37..=39 => " [V][M]",
-            40..=42 => " [V][M][5]",
-            43..=45 => " [V][M][5][W]",
-            _ => unreachable!(),
+        let expected = match width.saturating_sub(controls_start) {
+            0..=3 => "",
+            4..=6 => " [V]",
+            7..=9 => " [V][M]",
+            10..=12 => " [V][M][5]",
+            _ => " [V][M][5][W]",
         };
         assert_eq!(rendered.trim_end(), expected, "width={width}");
         let controls = controls.unwrap();
@@ -4217,7 +4221,7 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let tabs = app.view_tabs_hitbox.expect("view tabs should render");
     assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 12, 1));
-    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(15, 0, 15, 1));
+    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(15, 0, 9, 1));
 
     let divider = tabs.tabs[View::Overview.index()].right();
     assert!(!handle_mouse_event(
@@ -4257,6 +4261,387 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
                 .all(|tab| tab.x >= area.x && tab.right() <= area.right())
         );
     }
+}
+
+#[test]
+fn other_view_lists_every_reset_time_and_available_reset_credits() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    app.snapshot.sources = ["rollout_jsonl", "app_server"]
+        .into_iter()
+        .map(|source| SourceStatus {
+            source: source.to_string(),
+            status: "ok".to_string(),
+            as_of: now,
+            message: None,
+        })
+        .collect();
+    let primary_reset = now + chrono::Duration::hours(2);
+    let secondary_reset = now + chrono::Duration::days(4);
+    let expired_reset = now - chrono::Duration::hours(1);
+    let first_credit_granted = now - chrono::Duration::hours(3);
+    let first_credit_expires = now + chrono::Duration::days(7);
+    let second_credit_granted = now - chrono::Duration::minutes(45);
+    let second_credit_expires = now + chrono::Duration::days(14);
+    let third_credit_granted = now - chrono::Duration::minutes(5);
+    app.snapshot.limits = vec![
+        LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: Some("Codex".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(25.0, Some(300), Some(primary_reset))),
+            secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(secondary_reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+        LimitBucket {
+            limit_id: "reviews".to_string(),
+            limit_name: Some("Reviews".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(60.0, Some(1_440), Some(expired_reset))),
+            secondary: Some(LimitWindow::new(0.0, Some(60), None)),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+    ];
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 4,
+        credits: Some(vec![
+            RateLimitResetCredit {
+                granted_at: first_credit_granted,
+                expires_at: Some(first_credit_expires),
+                status: "available".to_string(),
+                reset_type: "codexRateLimits".to_string(),
+                title: Some("First reset".to_string()),
+                description: None,
+            },
+            RateLimitResetCredit {
+                granted_at: second_credit_granted,
+                expires_at: Some(second_credit_expires),
+                status: "redeeming".to_string(),
+                reset_type: "unknown".to_string(),
+                title: None,
+                description: Some("Second reset".to_string()),
+            },
+            RateLimitResetCredit {
+                granted_at: third_credit_granted,
+                expires_at: None,
+                status: "ok\u{7}x".to_string(),
+                reset_type: "futureResetType".to_string(),
+                title: Some("A\u{1b}B".to_string()),
+                description: None,
+            },
+        ]),
+        provenance: Provenance::ServerSnapshot,
+        as_of: now,
+    });
+    app.view = View::Health;
+
+    let expected_resets = [primary_reset, secondary_reset, expired_reset].map(|reset| {
+        reset
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+            .to_string()
+    });
+    let expected_credit_resets = [first_credit_expires, second_credit_expires].map(|time| {
+        time.with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+            .to_string()
+    });
+    let credit_granted_times = [
+        first_credit_granted,
+        second_credit_granted,
+        third_credit_granted,
+    ];
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(60, 24), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            assert!(content.contains("Other"));
+            assert!(!content.contains("Data health"));
+            assert!(content.contains("Resets"));
+            assert!(content.contains("4 available"));
+            assert!(content.contains("SERVER"));
+            assert!(content.contains("DETAILS 3/4"));
+            assert!(!content.contains("SHOWING"));
+            assert!(!content.contains("PARTIAL DETAILS"));
+            assert!(content.contains("GRANTED"));
+            assert!(content.contains("RESET TIME (LOCAL)"));
+            assert!(!content.contains("EXPIRES"));
+            assert!(content.matches("codex").count() >= 2);
+            assert!(content.matches("reviews").count() >= 2);
+            for expected in &expected_resets {
+                assert!(
+                    content.contains(expected),
+                    "missing exact reset {expected} at {width}x{height}/{theme:?}: {content}"
+                );
+            }
+            for expected in &expected_credit_resets {
+                assert!(
+                    content.contains(expected),
+                    "missing exact credit reset {expected} at {width}x{height}/{theme:?}: {content}"
+                );
+            }
+            let expected_grants = credit_granted_times.map(|time| {
+                time.with_timezone(&Local)
+                    .format(if width < 80 {
+                        "%m-%d %H:%M"
+                    } else {
+                        "%Y-%m-%d %H:%M:%S %:z"
+                    })
+                    .to_string()
+            });
+            for expected in &expected_grants {
+                assert!(
+                    content.contains(expected),
+                    "missing credit grant {expected} at {width}x{height}/{theme:?}: {content}"
+                );
+            }
+            assert!(content.contains("available"));
+            assert!(content.contains("redeeming"));
+            assert!(content.contains("unknown"));
+            assert!(content.contains("A B"));
+            assert!(content.contains("ok x"));
+            assert!(content.contains("never"));
+            assert!(content.contains("unavailable"));
+            assert!(!content.contains('\u{1b}'));
+            assert!(!content.contains('\u{7}'));
+            if width < 80 {
+                for slot in ["P/5h", "S/week", "P/1440m", "S/60m"] {
+                    assert!(content.contains(slot));
+                }
+            } else {
+                assert!(content.contains("First reset"));
+                assert!(content.matches("primary").count() >= 2);
+                assert!(content.matches("secondary").count() >= 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
+    let mut app = interaction_test_app(0, 0);
+    let now = app.snapshot.as_of;
+    app.snapshot.sources = ["rollout_jsonl", "app_server"]
+        .into_iter()
+        .map(|source| SourceStatus {
+            source: source.to_string(),
+            status: "ok".to_string(),
+            as_of: now,
+            message: None,
+        })
+        .collect();
+    let primary_reset = now + chrono::Duration::hours(2);
+    let secondary_reset = now + chrono::Duration::hours(3);
+    let review_primary_reset = now + chrono::Duration::hours(4);
+    let review_secondary_reset = now + chrono::Duration::hours(5);
+    app.snapshot.limits = vec![
+        LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: Some("Codex".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(25.0, Some(300), Some(primary_reset))),
+            secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(secondary_reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+        LimitBucket {
+            limit_id: "reviews".to_string(),
+            limit_name: Some("Reviews".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(
+                10.0,
+                Some(1_440),
+                Some(review_primary_reset),
+            )),
+            secondary: Some(LimitWindow::new(
+                20.0,
+                Some(60),
+                Some(review_secondary_reset),
+            )),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+    ];
+    let credit_times = (0..8)
+        .map(|index| {
+            (
+                now - chrono::Duration::minutes(index),
+                now + chrono::Duration::days(index + 1),
+            )
+        })
+        .collect::<Vec<_>>();
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 8,
+        credits: Some(
+            credit_times
+                .iter()
+                .enumerate()
+                .map(|(index, (granted_at, expires_at))| RateLimitResetCredit {
+                    granted_at: *granted_at,
+                    expires_at: Some(*expires_at),
+                    status: "available".to_string(),
+                    reset_type: "codexRateLimits".to_string(),
+                    title: Some(format!("credit-{index}")),
+                    description: None,
+                })
+                .collect(),
+        ),
+        provenance: Provenance::ServerSnapshot,
+        as_of: now,
+    });
+    app.view = View::Health;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(content.contains("SHOWING 4/8"));
+    assert!(content.contains("WINDOWS 3/4"));
+    for (index, (granted_at, expires_at)) in credit_times.iter().take(4).enumerate() {
+        assert!(content.contains(&format!("credit-{index}")));
+        assert!(
+            content.contains(
+                &granted_at
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            )
+        );
+        assert!(
+            content.contains(
+                &expires_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string()
+            )
+        );
+    }
+    for index in 4..8 {
+        assert!(!content.contains(&format!("credit-{index}")));
+    }
+    for reset in [primary_reset, secondary_reset, review_primary_reset] {
+        assert!(
+            content.contains(
+                &reset
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string()
+            )
+        );
+    }
+    assert!(
+        !content.contains(
+            &review_secondary_reset
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        )
+    );
+    assert!(content.contains("Diagnostics"));
+    assert!(content.contains("No collection issues"));
+}
+
+#[test]
+fn other_view_reports_when_reset_data_is_unavailable() {
+    let mut app = interaction_test_app(0, 0);
+    app.view = View::Health;
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(content.contains("Other"));
+    assert!(content.contains("Resets"));
+    assert!(content.contains("credits unavailable"));
+    assert!(content.contains("No reset-window data"));
+
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 2,
+        credits: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: app.snapshot.as_of,
+    });
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("2 available"));
+    assert!(content.contains("DETAILS UNAVAILABLE"));
+    assert!(!content.contains("SHOWING"));
+}
+
+#[test]
+fn other_view_distinguishes_zero_stale_and_partial_reset_credits() {
+    let mut app = interaction_test_app(0, 0);
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 0,
+        credits: Some(Vec::new()),
+        provenance: Provenance::Stale,
+        as_of: app.snapshot.as_of,
+    });
+    app.snapshot.rate_limit_reset_credits_partial = true;
+    app.view = View::Health;
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(content.contains("0 available"));
+    assert!(content.contains("STALE"));
+    assert!(content.contains("PARTIAL"));
+    assert!(!content.contains("credits unavailable"));
+
+    app.snapshot.rate_limit_reset_credits = None;
+    app.snapshot.rate_limit_reset_credits_partial = true;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("credits unavailable"));
+    assert!(content.contains("PARTIAL"));
 }
 
 #[test]
@@ -4893,6 +5278,8 @@ fn renders_all_views_at_common_terminal_sizes() {
                 provenance: Provenance::ServerSnapshot,
                 as_of: now,
             }],
+            rate_limit_reset_credits: None,
+            rate_limit_reset_credits_partial: false,
             account_usage: None,
             tasks: vec![TaskRecord {
                 thread_id: "task-thread".to_string(),
@@ -5052,7 +5439,8 @@ fn renders_all_views_at_common_terminal_sizes() {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(content.contains("Data health"));
+            assert!(content.contains("Other"));
+            assert!(content.contains("Resets"));
 
             if theme == Theme::Light {
                 let light_background = theme.palette().background;

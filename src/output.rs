@@ -69,6 +69,13 @@ pub fn request_is_partial(snapshot: &Snapshot, request: &OutputRequest) -> bool 
             .limits
             .iter()
             .any(|bucket| matches!(bucket.provenance, Provenance::Stale | Provenance::Unknown));
+    let reset_credits_degraded = snapshot.rate_limit_reset_credits_partial
+        || snapshot
+            .rate_limit_reset_credits
+            .as_ref()
+            .is_some_and(|credits| {
+                matches!(credits.provenance, Provenance::Stale | Provenance::Unknown)
+            });
     let five_hour_partial = snapshot
         .window_analyses
         .iter()
@@ -76,7 +83,7 @@ pub fn request_is_partial(snapshot: &Snapshot, request: &OutputRequest) -> bool 
         .is_some_and(|analysis| analysis.partial);
 
     request.sections.iter().any(|section| match section {
-        Section::Limits => limits_degraded,
+        Section::Limits => limits_degraded || reset_credits_degraded,
         Section::Tasks => {
             rollout_degraded
                 || (!snapshot.tasks.is_empty() && (limits_degraded || five_hour_partial))
@@ -114,7 +121,9 @@ pub fn request_is_failure(snapshot: &Snapshot, request: &OutputRequest) -> bool 
 
     for section in &request.sections {
         let has_usable_data = match section {
-            Section::Limits => !snapshot.limits.is_empty(),
+            Section::Limits => {
+                !snapshot.limits.is_empty() || snapshot.rate_limit_reset_credits.is_some()
+            }
             Section::Tasks => !snapshot.tasks.is_empty() || rollout_complete,
             Section::Turns => {
                 snapshot.turns.iter().any(|turn| {
@@ -166,6 +175,10 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
             object.remove(key);
         }
     }
+    if !request.sections.contains(&Section::Limits) {
+        object.remove("rateLimitResetCredits");
+        object.remove("rateLimitResetCreditsPartial");
+    }
     if !request.sections.contains(&Section::Health) {
         for key in ["stats", "accountUsage"] {
             object.remove(key);
@@ -215,7 +228,68 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
     if request.sections.contains(&Section::Limits) {
         let _ = writeln!(output, "\nLimits");
         if snapshot.limits.is_empty() {
-            let _ = writeln!(output, "  unavailable");
+            let _ = writeln!(output, "  quota windows  unavailable");
+        }
+        if let Some(reset_credits) = &snapshot.rate_limit_reset_credits {
+            let _ = writeln!(
+                output,
+                "  reset credits  {} available  ({:?}, as of {})",
+                reset_credits.available_count,
+                reset_credits.provenance,
+                reset_credits.as_of.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            match &reset_credits.credits {
+                None => {
+                    let _ = writeln!(output, "  reset credit details  unavailable");
+                }
+                Some(credits) => {
+                    if credits.is_empty() {
+                        let _ = writeln!(output, "  reset credit details  fetched, none returned");
+                    }
+                    for (index, credit) in credits.iter().enumerate() {
+                        let label = credit
+                            .title
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| {
+                                credit
+                                    .description
+                                    .as_deref()
+                                    .filter(|value| !value.trim().is_empty())
+                            })
+                            .unwrap_or("untitled");
+                        let reset_time = credit.expires_at.as_ref().map_or_else(
+                            || "never".to_string(),
+                            |expires_at| expires_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                        );
+                        let _ = writeln!(
+                            output,
+                            "  reset credit {}  {}  status {}  type {}  granted {}  reset time {}",
+                            index + 1,
+                            terminal_safe_text(label),
+                            terminal_safe_text(&credit.status),
+                            terminal_safe_text(&credit.reset_type),
+                            credit.granted_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                            reset_time
+                        );
+                    }
+                    if reset_credits.details_are_truncated() {
+                        let _ = writeln!(
+                            output,
+                            "  reset credit details  showing {}/{}",
+                            credits.len(),
+                            reset_credits.available_count
+                        );
+                    }
+                    if snapshot.rate_limit_reset_credits_partial {
+                        let _ = writeln!(output, "  reset credit details  partial");
+                    }
+                }
+            }
+        } else if snapshot.rate_limit_reset_credits_partial {
+            let _ = writeln!(output, "  reset credits  unavailable (partial)");
+        } else {
+            let _ = writeln!(output, "  reset credits  unavailable");
         }
         for bucket in &snapshot.limits {
             for window in [&bucket.primary, &bucket.secondary].into_iter().flatten() {

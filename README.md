@@ -7,6 +7,7 @@
 - 近期 task/thread 状态，以轻量行背景色和图例表达状态，选中项保留证据来源与置信度；
 - 选中 task 下的 turns、模型、推理强度、消息摘要和 token；
 - 所有可用 5 小时、周及非标准额度桶；
+- 每个窗口的完整 reset time，以及 App Server 可用时返回的重置机会数、状态、获得时间和具体 reset time；
 - 当前 5 小时或周重置周期内 task、turn、model 的本地 token 占比；
 - 基于当前 `codex` gauge 与模型/服务层短上下文价格加权用量占比的 Low-confidence 额度百分点估算；
 - 完整或按 section 输出的一次性 text/JSON 快照；
@@ -19,7 +20,7 @@ Task、turn 和模型的 token 来自 Codex 累计计数的单调增量；在扫
 
 5 小时和周额度的账户总百分比来自 `codex app-server`。周窗口指服务端当前 reset cycle：从 `resetsAt - 10080 分钟` 到 `resetsAt`，不是滚动的过去 7 天，也不一定是自然周。Codex 不提供 task/turn 级官方配额账单，因此额度归因始终是估算。当前实现只分析普通 `codex` 桶；`TOKEN%` 直接表示原始 token 占比，而 `EST.Q` 是次要的额度估算，按 [OpenAI 短上下文 Standard/Priority 价格](https://developers.openai.com/api/docs/pricing?latest-pricing=priority)分别计算 uncached input、cached input 与 output 的相对成本：`entity_estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units`。`serviceTier=priority` 对应 Fast 价格，其他服务层按 Standard 价格。
 
-模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用不进入原始或价格分母，也不生成 task/turn/model EST；`codex_bengalfox` 仍显示账户 gauge 和 Data Health 信息，但不生成 `windowAnalyses` 或实体归因。价目表覆盖 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`；缺失或未定价模型按 Luna 的对应 Standard/Fast 价格降级，并把窗口标记为 `unpriced_model_rate_fallback` partial。rollout 没有 cache-write token，无法应用 GPT-5.6 的独立 cache-write 价格；reasoning token 已包含在 output 中，不重复计费。完整费率与降级规则见 [数据能力边界](docs/codex-data-capabilities.md)。
+模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用不进入原始或价格分母，也不生成 task/turn/model EST；`codex_bengalfox` 仍显示账户 gauge 和 Other 中的健康/reset 信息，但不生成 `windowAnalyses` 或实体归因。价目表覆盖 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`；缺失或未定价模型按 Luna 的对应 Standard/Fast 价格降级，并把窗口标记为 `unpriced_model_rate_fallback` partial。rollout 没有 cache-write token，无法应用 GPT-5.6 的独立 cache-write 价格；reasoning token 已包含在 output 中，不重复计费。完整费率与降级规则见 [数据能力边界](docs/codex-data-capabilities.md)。
 
 TUI 的 `TOKEN5H%` / `TOKENWK%` 分别表示该 task/turn 在当前 5 小时或周 reset cycle 内的本地可观察 token 占比，这是主要的占比口径。`EST.Q5H` / `EST.QWK` 才是估算额度百分点，不是 token 占比。所有可计算的 EST 在数据模型中仍保持 Low confidence；TUI/text 只用 `~` 前缀表达这种固定的近似语义，不再逐行显示独立的 quota-confidence 标签或列，不可计算时显示 `-`。估算方法、外部活动风险与 `partialReasons` 在所选 scope 的摘要中统一说明。扫描不完整、lookback 不足或状态 stale 时仍计算 EST，同时把对应分析标为 partial/stale；只有当前 scope 没有 `codex` 窗口或没有任何可作为分母的本地非 Spark token 时才显示 `-`。JSON v1 为兼容已有消费者，仍保留 `localTokenSharePercent` 字段名。
 
@@ -111,7 +112,7 @@ codex-usage-monit models --format json
 codex-usage-monit attribution --format text
 ```
 
-`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。`windows` 输出可分析的当前 `codex` reset cycles；`snapshot --section windows` 在 JSON 中使用 `windowAnalyses` 字段。为兼容既有消费者，task/turn 上原有的 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models` 和 `attribution`，继续表示首选 5h 分析，不改成周数据；旧 attribution 汇总字段也继续保留，但当前实体 EST 统一来自 `codex` gauge 与短上下文价格加权用量占比的乘积。本次仅简化 TUI/text 展示；JSON v1 继续序列化 `statusConfidence`、task/turn/model 和 `windowAnalyses.*.usage` 的 `quotaConfidence`，以及 attribution `confidence`，字段名、枚举值与 5h 兼容语义均不变。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段；已知时 `serviceTier` 给出 turn 激活时的服务等级，其中 `priority` 对应 TUI 的 Fast。subagent task 已知直接父会话时，JSON 额外输出可选的 `parentThreadId`；task 的 `archived` 表示该 thread 只在 `archived_sessions` 中出现，同一 thread 仍有 active rollout 副本时为 `false`。JSON schema 当前为 v1，字段统一使用 camelCase。
+`limits` 优先走轻量 App Server 查询，不扫描 rollout；仅在额度读取失败时扫描本地日志降级。该输出还会显示服务端 `rateLimitResetCredits.availableCount` 提供的可用重置机会数，以及可用时的 `credits` 明细；每项包含 `status`、`resetType`、`title`、`description`、`grantedAt` 和 `expiresAt`，但不会保留或输出服务端的不透明 credit id。JSON 将其放在只属于 Limits section 的可选 `rateLimitResetCredits` 字段中：`credits: null` 表示只知道数量，`credits: []` 表示明细已读取且为空，`expiresAt: null` 表示不会过期。服务端可能截断明细，因此 `availableCount` 始终是权威数量，不能用数组长度替代。旧 summary JSON 没有 `credits` 时按 `null` 兼容读取。`windows` 输出可分析的当前 `codex` reset cycles；`snapshot --section windows` 在 JSON 中使用 `windowAnalyses` 字段。为兼容既有消费者，task/turn 上原有的 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models` 和 `attribution`，继续表示首选 5h 分析，不改成周数据；旧 attribution 汇总字段也继续保留，但当前实体 EST 统一来自 `codex` gauge 与短上下文价格加权用量占比的乘积。本次仅简化 TUI/text 展示；JSON v1 继续序列化 `statusConfidence`、task/turn/model 和 `windowAnalyses.*.usage` 的 `quotaConfidence`，以及 attribution `confidence`，字段名、枚举值与 5h 兼容语义均不变。`turns` 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段；已知时 `serviceTier` 给出 turn 激活时的服务等级，其中 `priority` 对应 TUI 的 Fast。subagent task 已知直接父会话时，JSON 额外输出可选的 `parentThreadId`；task 的 `archived` 表示该 thread 只在 `archived_sessions` 中出现，同一 thread 仍有 active rollout 副本时为 `false`。JSON schema 当前为 v1，字段统一使用 camelCase。
 
 退出码：
 
@@ -122,7 +123,7 @@ codex-usage-monit attribution --format text
 
 ## TUI 操作
 
-- `1` / `2`：Overview、Data Health；
+- `1` / `2`：Overview、Other；Other 包含 Sources、Collection、Resets 与 Diagnostics。Resets 在同一张表中显示每个额度窗口和每个重置机会；窗口缺少 `resetsAt` 时显示 `unavailable`，机会的 `expiresAt` 为 `null` 时显示 `never`。`RESET TIME` 使用本地 `YYYY-MM-DD HH:MM:SS ±HH:MM`，宽布局的 `GRANTED` 使用相同格式，窄布局缩短为 `MM-DD HH:MM`；标题同时显示权威的可用数、provenance、`DETAILS UNAVAILABLE` / `SHOWING n/N`，数据异常时另标 `PARTIAL`；
 - Overview 顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`；按钮均可用鼠标左键点击，Tasks、Turns、Models 及其中的归因摘要同步使用所选 reset cycle；
 - `Tab`、左右方向键：切换视图；
 - 默认键盘焦点在 Recent tasks；`j` / `k`、上下方向键选择当前焦点面板的数据行，`Home` / `End` 跳到首尾；
@@ -147,7 +148,7 @@ Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Tas
 
 TUI 会把稳定菜单偏好保存到用户级状态目录：macOS 为 `~/Library/Application Support/codex-usage-monit/tui-state.json`，Linux 为 `$XDG_STATE_HOME/codex-usage-monit/tui-state.json`（未设置时使用 `~/.local/state/...`）。`CODEX_USAGE_MONIT_STATE_DIR` 可覆盖目录。保存项包括主题、顶层视图、5h/Week、Turns/Models 显隐、Flat/Tree 和 task 来源筛选；搜索、选择、滚动位置及具体 thread 的折叠状态不会跨进程保存。一次性输出不会读取或写入该文件。
 
-额度展示与额度归因是两条边界明确的路径：所有 App Server 桶都可以显示 gauge，但 `windowAnalyses`、Tasks、Turns 和 Models 的 EST 只选择当前普通 `codex` 窗口。`gpt-5.3-codex-spark`（忽略大小写、精确匹配）完全跳过归因，`codex_bengalfox` 只保留 gauge/Data Health。每个 `windowAnalyses` 独立给出 `partial` 和 `partialReasons`，所以 Week 扫描不完整不会污染完整的 5h 标记，也不会取消仍可计算的 Low estimate。
+额度展示与额度归因是两条边界明确的路径：所有 App Server 桶都可以显示 gauge，并在 Other 的 Resets 分组列出 primary/secondary 及具体 reset time；同一分组还显示服务端 `availableCount` 给出的可用重置机会数和已返回的明细。明细少于 `availableCount` 会明确标为截断，不会把已返回行数冒充总数。`windowAnalyses`、Tasks、Turns 和 Models 的 EST 只选择当前普通 `codex` 窗口。`gpt-5.3-codex-spark`（忽略大小写、精确匹配）完全跳过归因，`codex_bengalfox` 只保留 gauge 与 Other 信息。每个 `windowAnalyses` 独立给出 `partial` 和 `partialReasons`，所以 Week 扫描不完整不会污染完整的 5h 标记，也不会取消仍可计算的 Low estimate。
 
 ## Open 配置
 
@@ -184,6 +185,7 @@ Copy 通过 OSC 52 把单行 POSIX shell 命令交给当前终端。终端是否
 
 - 只读 `CODEX_HOME/sessions`、`CODEX_HOME/archived_sessions`、`CODEX_HOME/session_index.jsonl` 和 Codex App Server；
 - 不读取 `auth.json`，认证完全由 App Server 管理；
+- 只读取重置机会，不调用 `account/rateLimitResetCredit/consume` 或其他会消耗机会的写接口；
 - 监控采集与一次性输出不修改、恢复或终止 Codex task；只有用户在 TUI 中主动触发 `[O]Open` 并在 Zellij 内确认 `[↵] Open` 时，工具才会启动新的 `codex resume` CLI 前端。`[C] Copy` 只把命令发送给终端剪贴板，由用户在另一个终端执行。两条路径都不携带 prompt，不自动 unarchive、fork、checkout、stash、恢复 worktree，也不更改 sandbox/approval 配置；
 - CLI 默认把解析后的 rollout 元数据、token 事件和有限长度的 task/turn 消息摘要写入上述用户级缓存目录；`--redact-content` 模式使用不含这些摘要的独立缓存且不会读取可见缓存，但不会删除之前生成的可见缓存。`--no-rollout-cache` 只禁用后续磁盘读写；需要擦除时可直接删除缓存目录。Unix 新建目录和文件分别使用 `0700`、`0600` 权限，缓存会自动重建；
 - TUI 另行写入上述不含会话内容的菜单偏好文件，以及不含 thread、标题、cwd 或消息内容的 `open.json`；

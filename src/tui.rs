@@ -747,7 +747,7 @@ impl View {
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
-            Self::Health => "Data health",
+            Self::Health => "Other",
         }
     }
 
@@ -3874,12 +3874,35 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let palette = app.theme.palette();
+    let source_height = u16::try_from(app.snapshot.sources.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3)
+        .clamp(3, 7);
+    let desired_reset_height = u16::try_from(reset_window_count(&app.snapshot))
+        .unwrap_or(u16::MAX)
+        .saturating_add(
+            app.snapshot
+                .rate_limit_reset_credits
+                .as_ref()
+                .and_then(|credits| credits.credits.as_ref())
+                .map_or(0, Vec::len)
+                .try_into()
+                .unwrap_or(u16::MAX),
+        )
+        .saturating_add(3)
+        .max(3);
+    let available_reset_height = area
+        .height
+        .saturating_sub(source_height.saturating_add(8))
+        .max(3);
+    let reset_height = desired_reset_height.min(available_reset_height);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(source_height),
             Constraint::Length(5),
-            Constraint::Min(6),
+            Constraint::Length(reset_height),
+            Constraint::Min(3),
         ])
         .split(area);
 
@@ -3919,7 +3942,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let status_counts = count_statuses(&app.snapshot.tasks);
     let stats_text = vec![
         Line::from(format!(
-            "Files  {}/{} scanned ({} truncated, {} unreadable)    Lines  {} parsed / {} skipped    Resets  {} ambiguous",
+            "Files  {}/{} scanned ({} truncated, {} unreadable)    Lines  {} parsed / {} skipped    Token counters  {} ambiguous resets",
             stats.scanned_files,
             stats.discovered_files,
             stats.truncated_files,
@@ -3943,6 +3966,8 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(stats_text).block(panel("Collection", app.theme)),
         rows[1],
     );
+
+    render_resets(frame, rows[2], &app.snapshot, app.theme);
 
     let issues = app
         .snapshot
@@ -3973,7 +3998,215 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(issues)
             .block(panel("Diagnostics", app.theme))
             .wrap(Wrap { trim: true }),
-        rows[2],
+        rows[3],
+    );
+}
+
+fn reset_window_count(snapshot: &Snapshot) -> usize {
+    snapshot
+        .limits
+        .iter()
+        .map(|bucket| {
+            usize::from(bucket.primary.is_some()) + usize::from(bucket.secondary.is_some())
+        })
+        .sum()
+}
+
+fn local_full_time_label(value: Option<chrono::DateTime<chrono::Utc>>, missing: &str) -> String {
+    value
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|| missing.to_string())
+}
+
+fn local_granted_time_label(value: chrono::DateTime<chrono::Utc>, compact: bool) -> String {
+    value
+        .with_timezone(&Local)
+        .format(if compact {
+            "%m-%d %H:%M"
+        } else {
+            "%Y-%m-%d %H:%M:%S %:z"
+        })
+        .to_string()
+}
+
+fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
+    let palette = theme.palette();
+    let windows = snapshot
+        .limits
+        .iter()
+        .flat_map(|bucket| {
+            [
+                ("primary", "P", bucket.primary.as_ref()),
+                ("secondary", "S", bucket.secondary.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(move |(slot, compact_slot, window)| {
+                window.map(|window| (bucket, slot, compact_slot, window))
+            })
+        })
+        .collect::<Vec<_>>();
+    let reset_credit_details = snapshot
+        .rate_limit_reset_credits
+        .as_ref()
+        .and_then(|credits| credits.credits.as_deref())
+        .unwrap_or_default();
+    let row_capacity = usize::from(area.height.saturating_sub(3));
+    let mut visible_credit_count = if reset_credit_details.is_empty() || windows.is_empty() {
+        reset_credit_details.len().min(row_capacity)
+    } else {
+        reset_credit_details
+            .len()
+            .min(row_capacity.saturating_add(1) / 2)
+    };
+    let mut visible_window_count = windows
+        .len()
+        .min(row_capacity.saturating_sub(visible_credit_count));
+    let remaining = row_capacity
+        .saturating_sub(visible_credit_count)
+        .saturating_sub(visible_window_count);
+    visible_credit_count = visible_credit_count.saturating_add(
+        reset_credit_details
+            .len()
+            .saturating_sub(visible_credit_count)
+            .min(remaining),
+    );
+    visible_window_count = visible_window_count.saturating_add(
+        windows.len().saturating_sub(visible_window_count).min(
+            row_capacity
+                .saturating_sub(visible_credit_count)
+                .saturating_sub(visible_window_count),
+        ),
+    );
+
+    let mut title = match &snapshot.rate_limit_reset_credits {
+        Some(reset_credits) => {
+            let mut title = format!(
+                "Resets · {} available · {}",
+                reset_credits.available_count,
+                provenance_label(reset_credits.provenance)
+            );
+            match &reset_credits.credits {
+                None => title.push_str(" · DETAILS UNAVAILABLE"),
+                Some(details) => {
+                    let returned_count = u64::try_from(details.len()).unwrap_or(u64::MAX);
+                    if returned_count < reset_credits.available_count {
+                        title.push_str(&format!(
+                            " · DETAILS {returned_count}/{}",
+                            reset_credits.available_count
+                        ));
+                    }
+                    if visible_credit_count < details.len() {
+                        title.push_str(&format!(
+                            " · SHOWING {visible_credit_count}/{}",
+                            details.len()
+                        ));
+                    }
+                }
+            }
+            title
+        }
+        None => "Resets · credits unavailable".to_string(),
+    };
+    if visible_window_count < windows.len() {
+        title.push_str(&format!(
+            " · WINDOWS {visible_window_count}/{}",
+            windows.len()
+        ));
+    }
+    if snapshot.rate_limit_reset_credits_partial {
+        title.push_str(" · PARTIAL");
+    }
+    let block = panel(&title, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    if windows.is_empty() && reset_credit_details.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No reset-window data").style(Style::default().fg(palette.muted)),
+            inner,
+        );
+        return;
+    }
+
+    let compact = area.width < 80;
+    let mut rows = reset_credit_details
+        .iter()
+        .take(visible_credit_count)
+        .map(|credit| {
+            let item = terminal_safe_text(
+                credit
+                    .title
+                    .as_deref()
+                    .unwrap_or(credit.reset_type.as_str()),
+            );
+            let status = terminal_safe_text(&credit.status);
+            Row::new(vec![
+                Cell::from(item),
+                Cell::from(status),
+                Cell::from(local_granted_time_label(credit.granted_at, compact)),
+                Cell::from(local_full_time_label(credit.expires_at, "never")),
+            ])
+        })
+        .collect::<Vec<_>>();
+    rows.extend(windows.into_iter().take(visible_window_count).map(
+        |(bucket, slot, compact_slot, window)| {
+            let limit_id = terminal_safe_text(&bucket.limit_id);
+            let window_label = window.label();
+            let reset_time = local_full_time_label(window.resets_at, "unavailable");
+            if compact {
+                Row::new(vec![
+                    Cell::from(limit_id),
+                    Cell::from(format!("{compact_slot}/{window_label}")),
+                    Cell::from("-"),
+                    Cell::from(reset_time),
+                ])
+            } else {
+                Row::new(vec![
+                    Cell::from(limit_id),
+                    Cell::from(format!("{slot} {window_label} {:.0}%", window.used_percent)),
+                    Cell::from("-"),
+                    Cell::from(reset_time),
+                ])
+            }
+        },
+    ));
+    let (constraints, header) = if compact {
+        (
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(11),
+                Constraint::Length(26),
+            ],
+            table_header(["ITEM", "STATE", "GRANTED", "RESET TIME (LOCAL)"], theme),
+        )
+    } else {
+        (
+            vec![
+                Constraint::Min(11),
+                Constraint::Length(9),
+                Constraint::Length(26),
+                Constraint::Length(26),
+            ],
+            table_header(
+                ["ITEM", "STATE", "GRANTED (LOCAL)", "RESET TIME (LOCAL)"],
+                theme,
+            ),
+        )
+    };
+    frame.render_widget(
+        Table::new(rows, constraints)
+            .column_spacing(1)
+            .header(header),
+        inner,
     );
 }
 

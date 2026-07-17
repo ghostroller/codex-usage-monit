@@ -55,8 +55,14 @@ TUI 和 CLI 显示所有 App Server 返回的额度桶：
 - limit id；
 - server/stale provenance；
 - 可用时包含 plan、credits 和 reached 状态的 JSON 字段。
+- 可选的 `rateLimitResetCredits.availableCount` 重置机会数；缺失或 `null` 表示 unavailable，明确的 `0` 必须保留，不得用可能被截断的 credit 详情数量代替；
+- 可选的 `rateLimitResetCredits.credits` 明细：字段缺失或 `null` 表示只知道数量，`[]` 表示明细已获取且为空；旧 summary 缺少该字段时必须兼容为 unknown details；
+- 每条明细保留原始字符串 `status` / `resetType`、可选 `title` / `description`、`grantedAt` 和可空 `expiresAt`。JSON 时间使用 RFC 3339，`expiresAt: null` 保持 null，TUI/text 显示 `never`；服务端不透明 id 不进入 Snapshot 或输出；
+- 服务端允许截断详情数组。`credits.len() < availableCount` 时显示中性的 `SHOWING n/N`，不得据此把权威数量改成 n，也不得仅因正常截断把数据称为错误。
 
-同一 duration 的账户百分比不得跨桶混合。TUI/CLI 继续显示 App Server 返回的全部额度 gauge，但 task/turn/model 归因只使用规范化 `limit_id == codex` 的当前窗口。模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用必须从归因分母和实体结果中排除；其他调用（包括缺失/空模型名）进入普通 `codex` 分母。`codex_bengalfox` 和其他桶只显示 gauge/Data Health，不生成 `windowAnalyses` 或 estimated quota。
+单条 reset-credit 明细非法时只丢弃该行，保留 count 和其他有效行，并将 Limits section 标为 partial、保留 warning；汇总容器或 count 非法时可丢弃 reset-credit 汇总，但不得丢弃同一响应里已经解析成功的额度窗口，也不得污染 Tasks/Turns/Models 的归因完整性。整个账户刷新失败时缓存的 count 和明细一起保留并标为 stale；成功响应明确返回 summary、`credits: null` 或 `credits: []` 时使用 fresh 值，不回填旧 summary 或旧明细。
+
+同一 duration 的账户百分比不得跨桶混合。TUI/CLI 继续显示 App Server 返回的全部额度 gauge，TUI Other 还必须逐项显示这些窗口的 reset 数据，但 task/turn/model 归因只使用规范化 `limit_id == codex` 的当前窗口。模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用必须从归因分母和实体结果中排除；其他调用（包括缺失/空模型名）进入普通 `codex` 分母。`codex_bengalfox` 和其他桶只显示 gauge/Other 信息，不生成 `windowAnalyses` 或 estimated quota。
 
 App Server 失败时仍显示本地 tasks/tokens，并按 `limit_id` 分别使用 rollout 最近快照提供 stale quota，不能因为另一桶快照时间更新就丢弃 `codex` 或 `codex_bengalfox`。过期窗口不能进入当前窗口归因。
 
@@ -148,17 +154,20 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 
 Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要，并作为稳定菜单偏好跨 TUI 进程保存；旧 JSON v1 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
 
-### Data Health
+### Other
 
 - 数据源状态；
 - scanned/discovered/truncated/unreadable 文件数；
 - parsed/skipped 行数与 ambiguous token reset 数；
 - active/completed/uncertain task 数；
+- Resets 分组使用同一张 `ITEM / STATE / GRANTED / RESET TIME (LOCAL)` 表：先列重置机会明细，再按 bucket 展开每个 primary/secondary 窗口；窗口行显示 limit id、slot、duration，宽布局额外显示 used percent，`GRANTED` 为 `-`；
+- `RESET TIME` 固定使用本地 `YYYY-MM-DD HH:MM:SS ±HH:MM`，窗口缺少 `resetsAt` 时明确显示 `unavailable`，不得推算；机会 `expiresAt: null` 显示 `never`。宽度小于 80 时机会的 `GRANTED` 可缩短为本地 `MM-DD HH:MM`，其他宽度使用完整本地时间和 offset；
+- Resets 标题显示 `availableCount` 对应的权威可用数及 server/stale provenance；缺值显示 `credits unavailable`，`0` 显示 `0 available`，明细未知显示 `DETAILS UNAVAILABLE`，正常截断显示 `SHOWING n/N`，解析异常另标 `PARTIAL`；
 - partial 与 diagnostics。
 
 宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的 Tree、名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。Flat/Tree 的显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；切换模式保留所选 thread/turn 并 reveal 新位置，刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
-Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Data Health 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Other 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -173,7 +182,8 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 ### 隐私与安全
 
 - Codex 数据源只读；
-- 不读取 `auth.json`；
+- 不调用 `account/rateLimitResetCredit/consume` 或其他会消耗重置机会的写接口；
+- 不读取、复制或缓存 `auth.json`，包括 reset-credit 明细采集；认证完全交给 App Server；
 - 可在进程内缓存 `session_index.jsonl` 的当前会话标题；索引缺失时只保留最多 96 字符的首条用户消息回退标题；
 - 不保存完整 prompt、assistant、reasoning 或工具内容；
 - `--redact-content` 禁用 task 标题预览和 turn 消息摘要；
@@ -188,6 +198,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - 真实 subagent parent replay 不重复计数；
 - 真实 80x24 与 120x40 TUI 中筛选控件、Tasks/Turns 焦点与键鼠交互不重叠、不崩溃，并能恢复终端；
 - 多额度桶读取成功；
+- 可用重置机会的正数、`0`、unavailable 与 stale 状态显示正确；明细 null/空/截断、`grantedAt`、具体 reset time、never、未知状态和非法单行降级均有覆盖；
 - 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
 - 5h/Week 使用服务端 reset cycle 边界；`--days` 覆盖不足时对应 `windowAnalyses` 为 partial；

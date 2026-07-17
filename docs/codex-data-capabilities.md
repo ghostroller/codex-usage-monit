@@ -54,11 +54,15 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 - `rateLimits`：兼容视图；
 - `rateLimitsByLimitId`：多额度桶；
 - `primary` / `secondary`：`usedPercent`、`windowDurationMins`、`resetsAt`；
+- `rateLimitResetCredits`：可空汇总；`availableCount` 是可用重置机会的权威数量，不能用可能被服务端截断的 `credits` 详情数组长度代替；`credits: null`（或旧响应缺字段）表示只知道数量，`credits: []` 表示明细已读取且为空；
+- `rateLimitResetCredits.credits[]`：每项保留原始 `status`、`resetType`、可选 `title` / `description`，以及 `grantedAt` / 可空 `expiresAt`；输出将时间规范化为 RFC 3339，`expiresAt: null` 表示不会过期。服务端的不透明 `id` 只做输入校验，不进入 Snapshot 或输出；
 - `planType`、`credits`、`individualLimit`、`rateLimitReachedType`。
 
 工具必须按 `windowDurationMins == 300` 和 `10080` 识别 5 小时/周窗口。若服务端返回其他时长，应显示通用窗口名称，而不是把 primary/secondary 硬编码为 5 小时/周。
 
-同一 duration 的多个账户百分比不能混合。额度列表继续保留 App Server 返回的全部桶，但归因只选择规范化 `limit_id == codex` 的当前 5 小时或周窗口。模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用从归因中排除；其他调用（包括缺失或空模型名）都进入普通 `codex` 的本地 token 分母。`codex_bengalfox` 和其他桶只用于 gauge/Data Health，不生成 task、turn 或 model attribution。
+单条 reset-credit 明细非法时，采集器保留 `availableCount` 和其他有效明细，丢弃坏行并把 Limits 标为 partial；汇总容器或 `availableCount` 非法时才丢弃整个 reset-credit 汇总，已解析的额度窗口仍然保留。服务端允许限制返回的明细数，因而数组长度小于 `availableCount` 只表示明细截断，不改变权威数量。整个账户刷新失败时，缓存的 count 和明细一起保留并标为 stale；成功刷新明确返回 `credits: null` 或 `credits: []` 时以新值为准，不回填旧明细。
+
+同一 duration 的多个账户百分比不能混合。额度列表继续保留 App Server 返回的全部桶，并在 TUI Other 的 Resets 分组逐项显示 primary/secondary 的具体 reset time；同一张表还显示已返回的重置机会明细，分组标题独立显示 `availableCount` 及 provenance。归因只选择规范化 `limit_id == codex` 的当前 5 小时或周窗口。模型名去除首尾空白后与 `gpt-5.3-codex-spark` 大小写不敏感精确相等的调用从归因中排除；其他调用（包括缺失或空模型名）都进入普通 `codex` 的本地 token 分母。`codex_bengalfox` 和其他桶只用于 gauge/Other，不生成 task、turn 或 model attribution。监控器只读取 reset credits，不调用 consume 接口。
 
 ### Thread 与 Turn 状态
 
@@ -173,7 +177,7 @@ estimated_quota_percent = codex_used_percent * entity_price_units / all_price_un
 
 ## 多窗口输出与交互
 
-TUI 只保留 Overview 与 Data Health 两个顶层视图。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 先显示当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST 和 scope 级方法/external/partial-reasons 摘要，再显示不含独立 confidence 列的模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
+TUI 只保留 Overview 与 Other 两个顶层视图。Other 保留数据健康信息，并新增 Resets 分组：同一张 `ITEM / STATE / GRANTED / RESET TIME` 表先显示重置机会，再按 bucket 展开所有 primary/secondary 窗口。`RESET TIME` 使用本地 `YYYY-MM-DD HH:MM:SS ±HH:MM`，宽布局的 `GRANTED` 使用相同格式，窄布局缩短为 `MM-DD HH:MM`。窗口缺少 `resetsAt` 时显示 unavailable，机会的 `expiresAt` 为 `null` 时显示 never；标题显示权威的可用数、provenance，并区分 `DETAILS UNAVAILABLE`、正常截断的 `SHOWING n/N` 与解析异常的 `PARTIAL`。明确的零显示 `0 available`，整个刷新失败保留的旧汇总和明细都标为 stale。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]` 与 `[Week]`，分别由 `V`、`M`、`5`、`W` 或鼠标左键操作；Turns 首次启动默认显示。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次切换中使用同一个 `codex` reset cycle，不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 先显示当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST 和 scope 级方法/external/partial-reasons 摘要，再显示不含独立 confidence 列的模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope 控件仍然可达，归因信息不再占用独立 TUI 面板。
 
 TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree 和来源筛选保存为版本化的用户级 JSON。读取失败或内容损坏时回退到默认值；搜索、选择、滚动位置和具体 thread 折叠集合不持久化。写入采用同目录临时文件替换，未来版本文件不会被旧程序覆盖；`--theme` 显式值优先于保存值。CLI 一次性输出不参与此状态生命周期。
 
@@ -208,8 +212,8 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 - 使用默认 stable API surface；MVP 不依赖 `thread/turns/list` 等 experimental 方法。
 - 启动时检测 Codex 版本，并为协议解析保留兼容层和未知字段容忍。
 - 可用 `codex app-server generate-json-schema` 生成与安装版本严格匹配的 schema。
-- 只读 Codex JSONL 与 App Server，不写入或修改其状态；v0.1 不查询 SQLite。
-- 不直接读取、复制或缓存 `auth.json`。
+- 只读 Codex JSONL 与 App Server，不写入或修改其状态；reset-credit 明细也只通过 `account/rateLimits/read` 获取，不调用 consume；v0.1 不查询 SQLite。
+- 不直接读取、复制或缓存 `auth.json`，App Server 自行处理认证。
 - 默认索引聚合字段，不持久化提示词、回复、工具输出或 secrets。
 - TUI 的 Recent tasks 与 Turns 使用轻量背景色及单字符标记表达状态，Tasks 底部始终显示统一图例，Turns 收起时仍可见；一次性 text 输出包含消息摘要，JSON 使用 `messagePreview`。
 - `--redact-content` 不保留 task 标题或 turn 消息摘要。

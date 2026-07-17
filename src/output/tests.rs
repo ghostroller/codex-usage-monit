@@ -1,8 +1,8 @@
 use super::*;
 use crate::domain::{
-    AttributionSummary, CollectionStats, LimitBucket, ModelUsage, Provenance, SourceStatus,
-    TaskRecord, TaskStatus, ThreadWindowUsage, TurnRecord, TurnStatus, TurnWindowUsage,
-    WindowAnalysis, WindowDescriptor, WindowUsage,
+    AttributionSummary, CollectionStats, LimitBucket, ModelUsage, Provenance, RateLimitResetCredit,
+    RateLimitResetCreditsSnapshot, SourceStatus, TaskRecord, TaskStatus, ThreadWindowUsage,
+    TurnRecord, TurnStatus, TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
 
 #[test]
@@ -198,6 +198,20 @@ fn partial_status_is_scoped_to_requested_sections() {
             provenance: Provenance::ServerSnapshot,
             as_of: now,
         }],
+        rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+            available_count: 3,
+            credits: Some(vec![RateLimitResetCredit {
+                granted_at: now - chrono::Duration::hours(2),
+                expires_at: None,
+                status: "available".to_string(),
+                reset_type: "codexRateLimits".to_string(),
+                title: Some("Reset\u{1b}[2J Codex limits".to_string()),
+                description: Some("One reset opportunity".to_string()),
+            }]),
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }),
+        rate_limit_reset_credits_partial: false,
         account_usage: None,
         tasks: vec![TaskRecord {
             thread_id: "task-thread".to_string(),
@@ -315,6 +329,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     assert_eq!(tasks_json["tasks"][0]["source"], "desktop");
     assert!(tasks_json.get("windowAnalyses").is_none());
     assert!(tasks_json.get("accountUsage").is_none());
+    assert!(tasks_json.get("rateLimitResetCredits").is_none());
     assert!(tasks_json.get("errors").is_some());
     let turns_json: Value = serde_json::from_str(
         &render_output(
@@ -333,7 +348,129 @@ fn partial_status_is_scoped_to_requested_sections() {
     let limits_json: Value =
         serde_json::from_str(&render_output(&snapshot, &limits).unwrap()).unwrap();
     assert_eq!(limits_json["partial"], true);
+    assert_eq!(limits_json["rateLimitResetCredits"]["availableCount"], 3);
+    assert_eq!(
+        limits_json["rateLimitResetCredits"]["provenance"],
+        "server_snapshot"
+    );
+    let reset_credit = &limits_json["rateLimitResetCredits"]["credits"][0];
+    assert!(reset_credit["grantedAt"].is_string());
+    assert!(reset_credit["expiresAt"].is_null());
+    assert_eq!(reset_credit["status"], "available");
+    assert_eq!(reset_credit["resetType"], "codexRateLimits");
+    assert!(reset_credit.get("id").is_none());
     assert!(limits_json.get("errors").is_some());
+    let limits_text = render_output(
+        &snapshot,
+        &OutputRequest {
+            format: OutputFormat::Text,
+            compact: false,
+            sections: BTreeSet::from([Section::Limits]),
+            thread_filter: None,
+        },
+    )
+    .unwrap();
+    assert!(limits_text.contains("reset credits  3 available"));
+    assert!(limits_text.contains("reset time never"));
+    assert!(limits_text.contains("reset credit details  showing 1/3"));
+    assert!(limits_text.contains("Reset [2J Codex limits"));
+    assert!(!limits_text.contains('\u{1b}'));
+
+    let mut unknown_reset_credit_details = snapshot.clone();
+    unknown_reset_credit_details
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap()
+        .credits = None;
+    let unknown_details_json: Value =
+        serde_json::from_str(&render_output(&unknown_reset_credit_details, &limits).unwrap())
+            .unwrap();
+    assert!(
+        unknown_details_json["rateLimitResetCredits"]["credits"].is_null(),
+        "None must remain JSON null so it is distinguishable from a fetched empty list"
+    );
+
+    let mut empty_reset_credit_details = snapshot.clone();
+    let empty_summary = empty_reset_credit_details
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap();
+    empty_summary.available_count = 0;
+    empty_summary.credits = Some(Vec::new());
+    let empty_details_json: Value =
+        serde_json::from_str(&render_output(&empty_reset_credit_details, &limits).unwrap())
+            .unwrap();
+    assert_eq!(
+        empty_details_json["rateLimitResetCredits"]["credits"],
+        serde_json::json!([])
+    );
+    let empty_details_text = render_output(
+        &empty_reset_credit_details,
+        &OutputRequest {
+            format: OutputFormat::Text,
+            compact: false,
+            sections: BTreeSet::from([Section::Limits]),
+            thread_filter: None,
+        },
+    )
+    .unwrap();
+    assert!(empty_details_text.contains("reset credit details  fetched, none returned"));
+
+    let mut legacy_value = serde_json::to_value(&snapshot).unwrap();
+    legacy_value["rateLimitResetCredits"]
+        .as_object_mut()
+        .unwrap()
+        .remove("credits");
+    let legacy_snapshot: Snapshot = serde_json::from_value(legacy_value).unwrap();
+    assert!(
+        legacy_snapshot
+            .rate_limit_reset_credits
+            .unwrap()
+            .credits
+            .is_none(),
+        "old cached summaries without credits must deserialize as detail-unavailable"
+    );
+
+    let mut stale_reset_credits_only = snapshot.clone();
+    stale_reset_credits_only.partial = false;
+    stale_reset_credits_only.errors.clear();
+    for source in &mut stale_reset_credits_only.sources {
+        source.status = "ok".to_string();
+        source.message = None;
+    }
+    stale_reset_credits_only
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap()
+        .provenance = Provenance::Stale;
+    assert!(request_is_partial(&stale_reset_credits_only, &limits));
+    assert!(!request_is_partial(&stale_reset_credits_only, &tasks));
+
+    let mut invalid_reset_credits_only = stale_reset_credits_only.clone();
+    invalid_reset_credits_only.rate_limit_reset_credits = None;
+    invalid_reset_credits_only.rate_limit_reset_credits_partial = true;
+    invalid_reset_credits_only
+        .warnings
+        .push("invalid reset credits".to_string());
+    assert!(request_is_partial(&invalid_reset_credits_only, &limits));
+    assert!(!request_is_partial(&invalid_reset_credits_only, &tasks));
+    let invalid_limits_json: Value =
+        serde_json::from_str(&render_output(&invalid_reset_credits_only, &limits).unwrap())
+            .unwrap();
+    assert_eq!(invalid_limits_json["partial"], true);
+    assert!(
+        invalid_limits_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str() == Some("invalid reset credits"))
+    );
+    assert!(
+        invalid_limits_json
+            .get("rateLimitResetCreditsPartial")
+            .is_none()
+    );
+
     let text = render_output(
         &snapshot,
         &OutputRequest {
@@ -551,6 +688,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     let mut unavailable = snapshot;
     unavailable.sources[0].status = "error".to_string();
     unavailable.limits.clear();
+    unavailable.rate_limit_reset_credits = None;
     unavailable.tasks.clear();
     assert!(request_is_failure(&unavailable, &tasks));
     assert!(request_is_failure(&unavailable, &limits));

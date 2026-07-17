@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, AccountTokenUsage, CreditsSnapshot, DailyTokenBucket, LimitBucket,
-    LimitWindow, Provenance,
+    LimitWindow, Provenance, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
 };
 use crate::startup::StartupTrace;
 
@@ -224,12 +224,34 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
             ..AccountSnapshot::default()
         };
         match rate_limits.expect("rate-limit response must be present") {
-            Ok(result) => match parse_rate_limits_result(&result, Utc::now()) {
-                Ok(limits) => snapshot.limits = limits,
-                Err(error) => snapshot.errors.push(format!(
-                    "account/rateLimits/read returned invalid data: {error:#}"
-                )),
-            },
+            Ok(result) => {
+                let as_of = Utc::now();
+                match parse_rate_limits_result(&result, as_of) {
+                    Ok(limits) => snapshot.limits = limits,
+                    Err(error) => snapshot.errors.push(format!(
+                        "account/rateLimits/read returned invalid data: {error:#}"
+                    )),
+                }
+                match parse_rate_limit_reset_credits_result_lossy(&result, as_of) {
+                    Ok((reset_credits, detail_errors)) => {
+                        snapshot.rate_limit_reset_credits = reset_credits;
+                        if !detail_errors.is_empty() {
+                            snapshot.rate_limit_reset_credits_partial = true;
+                            snapshot.warnings.extend(detail_errors.into_iter().map(|error| {
+                                format!(
+                                    "account/rateLimits/read ignored invalid reset credit detail: {error}"
+                                )
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        snapshot.rate_limit_reset_credits_partial = true;
+                        snapshot.warnings.push(format!(
+                            "account/rateLimits/read returned invalid reset credits: {error:#}"
+                        ));
+                    }
+                }
+            }
             Err(message) => snapshot
                 .errors
                 .push(format!("account/rateLimits/read failed: {message}")),
@@ -250,8 +272,9 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
 
         parse_span.finish_with(|| {
             format!(
-                "buckets={} usage={} warnings={} errors={}",
+                "buckets={} reset_credits={} usage={} warnings={} errors={}",
                 snapshot.limits.len(),
+                snapshot.rate_limit_reset_credits.is_some(),
                 snapshot.usage.is_some(),
                 snapshot.warnings.len(),
                 snapshot.errors.len()
@@ -314,6 +337,89 @@ pub fn parse_rate_limits_result(result: &Value, as_of: DateTime<Utc>) -> Result<
         .into_iter()
         .map(|(fallback_id, snapshot)| parse_limit_bucket(snapshot, &fallback_id, as_of))
         .collect()
+}
+
+/// Parses the reset opportunities returned alongside `account/rateLimits/read`.
+pub fn parse_rate_limit_reset_credits_result(
+    result: &Value,
+    as_of: DateTime<Utc>,
+) -> Result<Option<RateLimitResetCreditsSnapshot>> {
+    let Some(reset_credits) = rate_limit_reset_credits_object(result)? else {
+        return Ok(None);
+    };
+    let available_count = required_u64(reset_credits, "availableCount")
+        .context("rateLimitResetCredits.availableCount is invalid")?;
+    if available_count > i64::MAX as u64 {
+        bail!("rateLimitResetCredits.availableCount exceeds the protocol int64 range");
+    }
+    let credits = optional_reset_credits(reset_credits)?;
+
+    Ok(Some(RateLimitResetCreditsSnapshot {
+        available_count,
+        credits,
+        provenance: Provenance::ServerSnapshot,
+        as_of,
+    }))
+}
+
+fn parse_rate_limit_reset_credits_result_lossy(
+    result: &Value,
+    as_of: DateTime<Utc>,
+) -> Result<(Option<RateLimitResetCreditsSnapshot>, Vec<String>)> {
+    let Some(reset_credits) = rate_limit_reset_credits_object(result)? else {
+        return Ok((None, Vec::new()));
+    };
+    let available_count = required_u64(reset_credits, "availableCount")
+        .context("rateLimitResetCredits.availableCount is invalid")?;
+    if available_count > i64::MAX as u64 {
+        bail!("rateLimitResetCredits.availableCount exceeds the protocol int64 range");
+    }
+
+    let mut detail_errors = Vec::new();
+    let credits = match optional_reset_credit_values(reset_credits) {
+        Ok(None) => None,
+        Ok(Some(values)) => {
+            let mut credits = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                match parse_reset_credit(value, index) {
+                    Ok(credit) => credits.push(credit),
+                    Err(error) => detail_errors.push(format!("{error:#}")),
+                }
+            }
+            Some(credits)
+        }
+        Err(error) => {
+            detail_errors.push(format!("{error:#}"));
+            None
+        }
+    };
+
+    Ok((
+        Some(RateLimitResetCreditsSnapshot {
+            available_count,
+            credits,
+            provenance: Provenance::ServerSnapshot,
+            as_of,
+        }),
+        detail_errors,
+    ))
+}
+
+fn rate_limit_reset_credits_object(result: &Value) -> Result<Option<&Map<String, Value>>> {
+    let result = unwrap_result(result);
+    let object = result
+        .as_object()
+        .context("rate-limit result must be an object")?;
+    let Some(value) = object.get("rateLimitResetCredits") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_object()
+        .map(Some)
+        .context("rateLimitResetCredits must be an object or null")
 }
 
 /// Parses the `result` object returned by `account/usage/read`.
@@ -421,6 +527,84 @@ fn optional_credits(object: &Map<String, Value>) -> Result<Option<CreditsSnapsho
         unlimited: required_bool(credits, "unlimited")?,
         balance: optional_scalar_string(credits, "balance")?,
     }))
+}
+
+fn optional_reset_credits(
+    object: &Map<String, Value>,
+) -> Result<Option<Vec<RateLimitResetCredit>>> {
+    let Some(credits) = optional_reset_credit_values(object)? else {
+        return Ok(None);
+    };
+    credits
+        .iter()
+        .enumerate()
+        .map(|(index, credit)| parse_reset_credit(credit, index))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn optional_reset_credit_values(object: &Map<String, Value>) -> Result<Option<&[Value]>> {
+    let Some(value) = object.get("credits") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let credits = value
+        .as_array()
+        .context("rateLimitResetCredits.credits must be an array or null")?;
+    Ok(Some(credits))
+}
+
+fn parse_reset_credit(value: &Value, index: usize) -> Result<RateLimitResetCredit> {
+    let path = format!("rateLimitResetCredits.credits[{index}]");
+    let object = value
+        .as_object()
+        .with_context(|| format!("{path} must be an object"))?;
+
+    match object.get("id") {
+        Some(Value::String(_)) => {}
+        _ => bail!("{path}.id is required and must be a string"),
+    }
+
+    let granted_at = optional_unix_seconds_timestamp(object, "grantedAt")
+        .with_context(|| format!("{path}.grantedAt is invalid"))?
+        .with_context(|| format!("{path}.grantedAt is required"))?;
+    let expires_at = optional_unix_seconds_timestamp(object, "expiresAt")
+        .with_context(|| format!("{path}.expiresAt is invalid"))?;
+    let status =
+        required_string(object, "status").with_context(|| format!("{path}.status is invalid"))?;
+    let reset_type = required_string(object, "resetType")
+        .with_context(|| format!("{path}.resetType is invalid"))?;
+
+    Ok(RateLimitResetCredit {
+        granted_at,
+        expires_at,
+        status,
+        reset_type,
+        title: optional_string(object, "title")
+            .with_context(|| format!("{path}.title is invalid"))?,
+        description: optional_string(object, "description")
+            .with_context(|| format!("{path}.description is invalid"))?,
+    })
+}
+
+fn optional_unix_seconds_timestamp(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    match object.get(key) {
+        Some(Value::Number(value)) => {
+            let seconds = value
+                .as_i64()
+                .ok_or_else(|| anyhow!("{key} must be Unix seconds as an int64"))?;
+            DateTime::from_timestamp(seconds, 0)
+                .map(Some)
+                .ok_or_else(|| anyhow!("{key} is outside the supported timestamp range"))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => bail!("{key} must be Unix seconds as an integer or null"),
+    }
 }
 
 fn unwrap_result(value: &Value) -> &Value {
