@@ -1,6 +1,6 @@
 [package]
 name = "codex-usage-monit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Local-first TUI and CLI monitor for Codex tasks, token usage, and quota windows"
 license = "MIT"

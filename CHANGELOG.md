@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-07-18
+
+### Added
+
+- Added opt-in `--perf-log <FILE>` JSONL diagnostics for refresh stages, redraws, event wakeups, process CPU, memory footprint, page-ins, and disk I/O.
+
+### Changed
+
+- Parsed append-only rollout tails and incrementally reduced only affected threads, while safely falling back to a full parse for rewrites, truncation, replacement, or unstable files.
+- Skipped materialization and snapshot derivation when rollout data and freshness state are unchanged.
+- Replaced fixed-rate TUI drawing with dirty, event-driven redraws and ignored passive mouse motion.
+- Compacted cached rollout events and collapsed consecutive foreign token baselines to reduce steady-state memory use.
+
+### Internal
+
+- Added cache fast-path, incremental-equivalence, redraw-state, mouse-capture, and performance-log coverage.
+- Expanded refresh metrics with cache size, parsed-line, tail/full parse, incremental-reduce, and per-stage timing counters.
+
+### Compatibility
+
+- Snapshot JSON remains schema version 1. The rollout parser cache revision is bumped, so the first run rebuilds parsed rollout cache entries once before returning to the incremental path.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added
@@ -31,4 +53,5 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
+[0.2.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.1.1...v0.2.0
