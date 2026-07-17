@@ -6,6 +6,7 @@ pub mod config;
 pub mod domain;
 mod open_config;
 pub mod output;
+pub mod perf;
 pub mod rollout;
 mod session_index;
 mod session_launch;

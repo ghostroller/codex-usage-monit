@@ -98,6 +98,16 @@ CLI 默认使用用户级持久化 rollout 解析缓存，避免每次冷启动�
 
 完整在线刷新会把 `snapshot.local_scan` 与 `snapshot.account_fetch` 作为并发的 sibling span 调度，两者的起止区间可能重叠，不能相加。`--offline`、`limits` 的无本地扫描路径，以及复用缓存账户数据的路径不会额外创建采集线程。
 
+## 运行期性能日志
+
+TUI 可用 `--perf-log <FILE>` 开启低开销的运行期性能监测；默认关闭。日志为 JSONL，每次 refresh 写一条无内容的汇总记录，每 30 秒再聚合写入 draw、事件唤醒和 refresh 次数、总耗时、最大耗时，以及最近一次 refresh 的计数和分阶段耗时。refresh 记录包含 discover/cache load/parse/cache save/reduce/materialize/snapshot derive 等耗时，以及 tail/full parse、增量 reduce、文件/字节/行数、紧凑事件数和 foreign baseline 数。macOS 还会记录当前 RSS、physical footprint、峰值 footprint、进程 CPU 时间、page-in 与磁盘 I/O；Linux 记录 `/proc/self/statm` 的 RSS/虚拟内存及 `getrusage` 的峰值 RSS 和 CPU 时间。
+
+```bash
+codex-usage-monit --perf-log /tmp/codex-usage-perf.jsonl
+```
+
+性能日志不包含 Codex home 路径、thread/turn ID、标题或消息内容。指定文件会在启动时重建；记录失败只会停用性能日志，不会中断采集或 TUI。draw 和事件只更新进程内计数；refresh 汇总先进入缓冲区，随 30 秒 sample 一起 flush，不做逐阶段或逐帧写盘，因此日志本身对被测性能的影响保持较低。
+
 ## 一次性输出
 
 ```bash
@@ -142,7 +152,7 @@ codex-usage-monit attribution --format text
 - `t`：在 dark 与 light 主题间切换；
 - `q`、`Ctrl-C`：直接退出；非搜索状态的 `Esc` 打开退出确认，弹窗内 `Enter` 确认、`Esc` 取消；搜索输入状态中的 `Esc` 仍只取消本次编辑。
 
-本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。进程内 `RolloutCache` 负责增量刷新，用户级持久化缓存则复用跨进程未变化文件的解析结果；首次运行、缓存缺失/损坏或源文件变化时仍会按需解析。活跃文件的成功缓存写入按路径合并到最多每 30 秒一次，I/O 失败会从 30 秒起指数退避到 15 分钟，均不阻塞当前 snapshot。冷启动成本主要取决于未命中 JSONL 的总字节数而不是文件数，少量包含长历史的 rollout 也可能很大。使用 `debug-startup` 查看当前机器与数据集的真实分解，不应把某个固定文件数的旧基准当作启动时延保证。
+本地数据每 2 秒检查一次，账户额度每 45 秒刷新一次。进程内 `RolloutCache` 对 append-only 活跃文件只解析新增尾部，并只重放受影响的 thread；无 rollout、标题、发现状态或 task freshness 变化时，不再 materialize/派生 Snapshot，也不会触发 TUI 重绘。TUI 本身按输入和数据变化进行 dirty redraw，空闲时不会固定 10 FPS 全量刷新。用户级持久化缓存复用跨进程未变化文件的解析结果；首次运行、缓存缺失/损坏、源文件被替换/截断或尾部边界校验失败时会安全回退完整解析。活跃文件的成功缓存写入按路径合并到最多每 30 秒一次，I/O 失败会从 30 秒起指数退避到 15 分钟，均不阻塞当前 snapshot。冷启动成本主要取决于未命中 JSONL 的总字节数而不是文件数，少量包含长历史的 rollout 也可能很大。使用 `debug-startup` 查看当前机器与数据集的真实分解，不应把某个固定文件数的旧基准当作启动时延保证。
 TUI 中的绝对时间使用系统本地时区；text 输出中带 `UTC` 后缀的时间保持 UTC。
 Recent tasks 和 Turns 使用轻量背景色及单字符标记表示状态，Tasks 面板底部始终显示统一状态图例，因此 Turns 收起后仍可查看；空间足够时同一底边右侧继续显示选中 task 的状态证据。Recent tasks 默认保持 Flat 排序；Tree 模式把已知直接父会话且父节点也在当前过滤结果中的 subagent 递归缩进到父节点下，缺失或被过滤的父节点不会被强行补回。拥有子节点的行显示可点击的 `[-]` / `[+]`，并可在 Tasks 焦点下用 `-` / `+` 收起或展开；大写 `E` 和可点击的 `[E]Collapse` 会一次收起当前过滤树的所有父节点，包括已藏在折叠祖先下的嵌套父节点；全部收起后按钮变为 `[E]Expand` 并展开同一过滤范围。折叠状态跨数据刷新保留。节点收起时，父行会汇总当前过滤树中所有被隐藏后代的 token，`TOKEN%` 继续按原始 token 分母累加，`EST.Q` 则累加短上下文价格加权后的实体值；Spark 后代继续从两者中排除。展开后各行恢复独立显示。挂在父节点下的 child 省略重复项目名，作为 orphan root 显示时仍保留项目名。树根和同层分支由最近活动的后代带动排序，因此新活动的 subagent 仍会把整组带到顶部。Recent tasks 最后一列优先显示 Codex 当前会话标题；标题来自 `session_index.jsonl` 中该 thread 最新的重命名记录，索引缺失时才回退到 rollout 首条消息摘要。顶栏按该标题或项目名（`cwd` basename）执行大小写不敏感的子串筛选，并可与 All、Desktop、Subagent、CLI 单选来源筛选组合使用；历史 `vscode` 标签归入 Desktop，其他未知来源只出现在 All。Turns 的独立 Filter 可匹配 turn ID、模型、推理强度、消息、状态以及 `fast`；非空筛选右侧的 `[Del]` 整块可点击，非输入状态下也可按 `Delete` 清空当前面板查询。焦点从 Turns 返回 Tasks 时会自动清空 Turns 查询并恢复完整 turn 列表，但 Tasks 查询保持不变。Codex 标记为 Fast 的 turn 会在模型名称后额外显示醒目的 `FAST`，普通 turn 的显示保持不变。醒目的 `▌` 表示当前键盘焦点，较弱的 `▏` 保留另一面板的上下文选择；筛选无结果时 Turns 不显示旧 task 数据。选中的 turn 会在表格下方显示详情：紧凑终端优先保留状态、时长、模型、推理强度和 token breakdown，空间允许时再显示起止时间、token 占比、带 `~`/`-` 的 EST、turn ID 与本地保存的最多 72 字消息摘要。Overview 的 Models 面板先在所选 5h/Week `codex` scope 摘要中显示 gauge、token total、带 `~`/`-` 的次要 `EST. QUOTA`、估算方法、external activity risk 与具体 `partialReasons`，再显示按 token 降序且不含独立 confidence 列的模型表；容量不足时标出 `top N/M`。当所选 scope 不可分析时，面板明确显示 unavailable，不会用另一时长的数据冒充；面板隐藏后仍可从最上方的 `[M]Models` 恢复。
 

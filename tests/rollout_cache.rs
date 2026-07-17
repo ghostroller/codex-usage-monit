@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{RolloutDataset, TaskStatus, TurnStatus};
 use codex_usage_monit::rollout::{RolloutCache, scan_rollouts};
+use codex_usage_monit::snapshot::{collect_snapshot_cached, collect_snapshot_cached_if_changed};
 use codex_usage_monit::startup::StartupTrace;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -73,6 +74,45 @@ fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
     assert_eq!(left.rate_observations, right.rate_observations);
     assert_eq!(left.stats, right.stats);
     assert_eq!(left.warnings, right.warnings);
+}
+
+#[test]
+fn cached_snapshot_skips_derive_until_rollout_changes() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-snapshot-fast-path.jsonl");
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "snapshot-fast-path-thread", "timestamp": timestamp(now)}
+        })],
+    );
+    let mut scan_config = config(temp.path());
+    scan_config.offline = true;
+    let mut cache = RolloutCache::new();
+
+    let first = collect_snapshot_cached(&scan_config, None, false, &mut cache);
+    assert_eq!(first.snapshot.tasks.len(), 1);
+    assert!(
+        collect_snapshot_cached_if_changed(&scan_config, Some(first.account.clone()), &mut cache,)
+            .is_none()
+    );
+
+    append_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "snapshot-fast-path-turn"}
+        })],
+    );
+    let changed = collect_snapshot_cached_if_changed(&scan_config, Some(first.account), &mut cache)
+        .expect("an appended rollout record must produce a new snapshot");
+    assert_eq!(changed.snapshot.turns.len(), 1);
 }
 
 #[test]
@@ -425,6 +465,93 @@ fn unchanged_scan_reuses_files_and_recomputes_freshness() {
     assert_eq!(cache.last_refresh().reused_files, 1);
     assert_eq!(cache.last_refresh().reparsed_files, 0);
     assert!(!cache.last_refresh().rebuilt);
+}
+
+#[test]
+fn scan_if_changed_skips_warm_materialization_until_freshness_crosses() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-conditional.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "conditional-thread"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "conditional-turn"}}),
+        ],
+    );
+    let mut scan_config = config(temp.path());
+    scan_config.active_grace = Duration::from_secs(30);
+    let mut cache = RolloutCache::new();
+
+    let initial = cache.scan_if_changed(&scan_config, now).unwrap().unwrap();
+    assert_eq!(initial.tasks[0].status, TaskStatus::Running);
+    assert!(
+        cache
+            .scan_if_changed(&scan_config, now + chrono::Duration::seconds(10))
+            .unwrap()
+            .is_none()
+    );
+
+    let stale = cache
+        .scan_if_changed(&scan_config, now + chrono::Duration::seconds(31))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.tasks[0].status, TaskStatus::Stale);
+    assert!(
+        cache
+            .scan_if_changed(&scan_config, now + chrono::Duration::seconds(32))
+            .unwrap()
+            .is_none()
+    );
+
+    append_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(33)),
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "conditional-turn"}
+        })],
+    );
+    let completed = cache
+        .scan_if_changed(&scan_config, now + chrono::Duration::seconds(33))
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.tasks[0].status, TaskStatus::Completed);
+    assert_eq!(cache.last_refresh().tail_parsed_files, 1);
+    assert_eq!(cache.last_refresh().materialize_us, 0);
+}
+
+#[test]
+fn tail_parse_falls_back_when_the_cached_prefix_was_rewritten() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-rewritten.jsonl");
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "before-rewrite"}
+        })],
+    );
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    cache.scan(&scan_config, now).unwrap();
+
+    write_jsonl(
+        &path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "after-rewrite-with-longer-id"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "rewritten-turn"}}),
+        ],
+    );
+    let rewritten = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(cache.last_refresh().tail_parsed_files, 0);
+    assert_eq!(cache.last_refresh().full_parsed_files, 1);
+    assert_eq!(rewritten.tasks[0].thread_id, "after-rewrite-with-longer-id");
 }
 
 #[test]
@@ -801,6 +928,10 @@ fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     assert_eq!(cache.last_refresh().reparsed_files, 1);
     assert_eq!(cache.last_refresh().reused_files, 2);
     assert!(cache.last_refresh().rebuilt);
+    assert_eq!(cache.last_refresh().tail_parsed_files, 1);
+    assert_eq!(cache.last_refresh().full_parsed_files, 0);
+    assert_eq!(cache.last_refresh().incrementally_reduced_threads, 1);
+    assert!(!cache.last_refresh().full_rebuild);
 
     let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
     assert_dataset_eq(&cached, &fresh);
@@ -831,6 +962,7 @@ fn cache_preserves_foreign_parent_counter_baseline() {
         &[
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": child_id, "timestamp": timestamp(now)}}),
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "019f52ac-7a9f-7fd1-8dda-e775ef950785"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(75)}}}),
             json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(100)}}}),
             json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": child_turn}}),
             json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(125)}}}),
@@ -842,6 +974,7 @@ fn cache_preserves_foreign_parent_counter_baseline() {
     let first = cache.scan(&scan_config, now).unwrap();
     assert_eq!(first.tasks[0].token_usage.total_tokens, 25);
     assert_eq!(first.turns[0].token_usage.total_tokens, 25);
+    assert_eq!(cache.metrics().foreign_baseline_events, 1);
 
     let second = cache.scan(&scan_config, now).unwrap();
     assert_eq!(cache.last_refresh().reused_files, 1);

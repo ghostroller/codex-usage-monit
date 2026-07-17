@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -14,15 +14,15 @@ use walkdir::WalkDir;
 use crate::cache::write_private_atomically;
 use crate::config::CollectConfig;
 use crate::domain::{
-    Confidence, LimitWindow, Provenance, RateObservation, RolloutDataset, TaskRecord, TaskStatus,
-    TokenUsage, TurnRecord, TurnStatus, UsageCall,
+    CollectionStats, Confidence, LimitWindow, Provenance, RateObservation, RolloutDataset,
+    TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, UsageCall,
 };
 use crate::session_index::load_thread_titles;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 1;
+const ROLLOUT_PARSER_REVISION: u32 = 2;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -32,6 +32,7 @@ const PERSISTENT_WRITE_RETRY_INITIAL: Duration = Duration::from_secs(30);
 const PERSISTENT_WRITE_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TAIL_GUARD_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -82,6 +83,19 @@ impl FileFingerprint {
             last_write_time: metadata.last_write_time(),
         })
     }
+
+    fn same_source_identity(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            return self.dev == other.dev && self.ino == other.ino;
+        }
+        #[cfg(windows)]
+        {
+            return self.creation_time == other.creation_time;
+        }
+        #[allow(unreachable_code)]
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,11 +122,43 @@ enum ParsedEvent {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
     },
-    EventMessage {
+    TaskStarted {
+        timestamp: DateTime<Utc>,
+        turn_id: String,
+        started_at: Option<DateTime<Utc>>,
+    },
+    TaskComplete {
+        timestamp: DateTime<Utc>,
+        turn_id: String,
+        completed_at: Option<DateTime<Utc>>,
+        duration_ms: Option<u64>,
+    },
+    TurnAborted {
+        timestamp: DateTime<Utc>,
+        turn_id: String,
+        completed_at: Option<DateTime<Utc>>,
+        duration_ms: Option<u64>,
+        failed: bool,
+    },
+    TokenCount {
         timestamp: DateTime<Utc>,
         line_number: usize,
-        payload: Map<String, Value>,
+        total_usage: Option<TokenUsage>,
+        rate_limits: Option<CachedRateLimits>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CachedRateLimits {
+    limit_id: String,
+    primary: Option<LimitWindow>,
+    secondary: Option<LimitWindow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TailGuard {
+    len: u16,
+    hash: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -125,6 +171,18 @@ struct ParsedFile {
     unreadable_files: usize,
     warnings: Vec<String>,
     complete: bool,
+    #[serde(default)]
+    source_lines: usize,
+    #[serde(default)]
+    owning_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    replaying_foreign_history: bool,
+    #[serde(default)]
+    ends_with_newline: bool,
+    #[serde(default)]
+    tail_guard: TailGuard,
+    #[serde(default)]
+    foreign_baseline_events: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +201,8 @@ struct CacheKey {
 struct ReducedRollouts {
     threads: HashMap<String, ThreadBuilder>,
     dataset: RolloutDataset,
+    replay_warnings: HashMap<PathBuf, Vec<String>>,
+    ambiguous_token_resets: HashMap<PathBuf, usize>,
 }
 
 /// Diagnostics for the most recent cached scan.
@@ -150,6 +210,12 @@ struct ReducedRollouts {
 pub struct RolloutCacheRefresh {
     pub reused_files: usize,
     pub reparsed_files: usize,
+    /// Changed append-only files parsed from their previous byte boundary.
+    pub tail_parsed_files: usize,
+    /// New bytes consumed by successful append-only tail parsing.
+    pub tail_parsed_bytes: u64,
+    /// Files parsed from byte zero, including new/replaced/truncated files.
+    pub full_parsed_files: usize,
     /// Files hydrated from the user-level parsed rollout cache.
     pub disk_reused_files: usize,
     /// Persistent entries that were absent or stale for the current fingerprint.
@@ -173,10 +239,36 @@ pub struct RolloutCacheRefresh {
     /// Number of files parsed a second time after changing during the first read.
     pub stability_retries: usize,
     pub rebuilt: bool,
+    /// Threads replayed without rebuilding unrelated thread state.
+    pub incrementally_reduced_threads: usize,
+    /// Whether this refresh rebuilt all selected rollout state.
+    pub full_rebuild: bool,
+    pub discover_us: u64,
+    pub cache_load_us: u64,
+    pub parse_us: u64,
+    pub cache_save_us: u64,
+    pub reduce_us: u64,
+    pub materialize_us: u64,
     /// Number of `session_index.jsonl` content-read attempts.
     pub session_index_reads: usize,
     /// Whether the cached session-title snapshot was reused unchanged.
     pub session_index_reused: bool,
+}
+
+/// Cheap, content-free counters for runtime performance diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RolloutCacheMetrics {
+    pub selected_files: usize,
+    pub selected_bytes: u64,
+    pub parsed_lines: usize,
+    pub cached_events: usize,
+    pub foreign_baseline_events: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveryState {
+    stats: CollectionStats,
+    warnings: Vec<String>,
 }
 
 /// Reuses parsed rollout files across refreshes while preserving global token
@@ -195,6 +287,10 @@ pub struct RolloutCache {
     disk_write_backoff: Duration,
     last_disk_prune: Option<Instant>,
     last_refresh: RolloutCacheRefresh,
+    metrics: RolloutCacheMetrics,
+    last_materialized_at: Option<DateTime<Utc>>,
+    last_materialized_active_grace: Option<Duration>,
+    last_discovery: Option<DiscoveryState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,7 +314,7 @@ struct PersistentFileEntryRef<'a> {
 }
 
 enum PersistentLoad {
-    Hit(CachedFile),
+    Hit(Box<CachedFile>),
     Miss,
     Corrupt,
 }
@@ -451,11 +547,38 @@ impl RolloutCache {
         self.last_refresh
     }
 
+    pub fn metrics(&self) -> RolloutCacheMetrics {
+        self.metrics
+    }
+
     /// Scans recent rollouts, reparsing rollout files and reloading the session
     /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
+        Ok(self
+            .scan_inner(config, now, true)?
+            .expect("a forced rollout scan always materializes a dataset"))
+    }
+
+    /// Returns a new dataset only when rollout/title/discovery state changed or
+    /// an active task crossed its freshness deadline since the prior result.
+    pub fn scan_if_changed(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+    ) -> Result<Option<RolloutDataset>> {
+        self.scan_inner(config, now, false)
+    }
+
+    fn scan_inner(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+        force_materialize: bool,
+    ) -> Result<Option<RolloutDataset>> {
         let trace_active = config.startup_trace.is_active();
+        let perf_active = config.perf_log.is_enabled();
         let scan_started = trace_active.then(Instant::now);
+        let mut refresh = RolloutCacheRefresh::default();
         let key = CacheKey {
             codex_home: config.codex_home.clone(),
             redact_content: config.redact_content,
@@ -471,22 +594,24 @@ impl RolloutCache {
             self.disk_write_retry_after = None;
             self.disk_write_backoff = Duration::ZERO;
             self.last_disk_prune = None;
+            self.metrics = RolloutCacheMetrics::default();
+            self.last_materialized_at = None;
+            self.last_materialized_active_grace = None;
+            self.last_discovery = None;
             self.key = Some(key.clone());
         }
 
         let mut discovery = RolloutDataset::default();
+        let discovery_started = perf_active.then(Instant::now);
         let discovery_span = config.startup_trace.span("rollout.discover");
         let mut files = discover_rollout_files(config, now, &mut discovery);
-        let (selected_bytes, largest_file_bytes) = if trace_active {
-            files
-                .iter()
-                .map(|file| file.fingerprint.len)
-                .fold((0_u64, 0_u64), |(total, largest), bytes| {
-                    (total.saturating_add(bytes), largest.max(bytes))
-                })
-        } else {
-            (0, 0)
-        };
+        let (selected_bytes, largest_file_bytes) = files
+            .iter()
+            .map(|file| file.fingerprint.len)
+            .fold((0_u64, 0_u64), |(total, largest), bytes| {
+                (total.saturating_add(bytes), largest.max(bytes))
+            });
+        refresh.discover_us = elapsed_micros(discovery_started);
         discovery_span.finish_with(|| format!(
             "discovered={} selected={} truncated={} bytes={selected_bytes} largest_bytes={largest_file_bytes}",
             discovery.stats.discovered_files,
@@ -504,7 +629,6 @@ impl RolloutCache {
         });
         sort_span.finish_with(|| format!("files={}", files.len()));
 
-        let mut refresh = RolloutCacheRefresh::default();
         let title_span = config.startup_trace.span("rollout.session_titles");
         self.refresh_session_titles(config, &mut discovery, &mut refresh);
         title_span.finish_with(|| {
@@ -539,6 +663,7 @@ impl RolloutCache {
             )
         });
 
+        let cache_load_started = perf_active.then(Instant::now);
         let cache_load_span = config.startup_trace.span("rollout.cache_load");
         if let Some(cache_root) = config.rollout_cache_dir.as_deref() {
             for file in &files {
@@ -547,7 +672,7 @@ impl RolloutCache {
                 }
                 match load_persistent_file(cache_root, &key, file) {
                     PersistentLoad::Hit(cached) => {
-                        self.files.insert(file.path.clone(), cached);
+                        self.files.insert(file.path.clone(), *cached);
                         refresh.disk_reused_files += 1;
                     }
                     PersistentLoad::Miss => refresh.disk_misses += 1,
@@ -555,6 +680,7 @@ impl RolloutCache {
                 }
             }
         }
+        refresh.cache_load_us = elapsed_micros(cache_load_started);
         cache_load_span.finish_with(|| {
             format!(
                 "enabled={} loaded={} misses={} corrupt={}",
@@ -565,9 +691,11 @@ impl RolloutCache {
             )
         });
 
+        let parse_started = perf_active.then(Instant::now);
         let parse_span = config.startup_trace.span("rollout.parse_files");
         let mut slowest_parse_us = 0_u128;
         let mut slowest_file_bytes = 0_u64;
+        let mut changed_thread_ids = HashSet::new();
         for file in &files {
             let reusable = self.files.get(&file.path).is_some_and(|cached| {
                 cached.fingerprint == file.fingerprint && cached.parsed.complete
@@ -577,14 +705,33 @@ impl RolloutCache {
                 continue;
             }
 
+            let previous = self.files.remove(&file.path);
+            if let Some(thread_id) = previous
+                .as_ref()
+                .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+            {
+                changed_thread_ids.insert(thread_id.clone());
+            }
             let file_started = trace_active.then(Instant::now);
-            let (cached, stability_retries) = parse_stable_rollout_file(file, config);
+            let parsed = refresh_stable_rollout_file(file, config, previous);
+            let cached = parsed.cached;
             if let Some(file_started) = file_started {
                 let parse_us = file_started.elapsed().as_micros();
                 if parse_us > slowest_parse_us {
                     slowest_parse_us = parse_us;
                     slowest_file_bytes = file.fingerprint.len;
                 }
+            }
+            if let Some(thread_id) = cached.parsed.owner_thread_id.as_ref() {
+                changed_thread_ids.insert(thread_id.clone());
+            }
+            if parsed.tail_parsed {
+                refresh.tail_parsed_files += 1;
+                refresh.tail_parsed_bytes = refresh
+                    .tail_parsed_bytes
+                    .saturating_add(parsed.parsed_bytes);
+            } else {
+                refresh.full_parsed_files += 1;
             }
             let cacheable = cached.parsed.complete;
             let fingerprint_len = cached.fingerprint.len;
@@ -602,26 +749,41 @@ impl RolloutCache {
                 }
             }
             refresh.reparsed_files += 1;
-            refresh.stability_retries += stability_retries;
+            refresh.stability_retries += parsed.stability_retries;
         }
-        let parsed_lines = if trace_active {
-            files
-                .iter()
-                .filter_map(|file| self.files.get(&file.path))
-                .map(|cached| cached.parsed.parsed_lines)
-                .fold(0_usize, usize::saturating_add)
-        } else {
-            0
+        refresh.parse_us = elapsed_micros(parse_started);
+        let (parsed_lines, cached_events, foreign_baseline_events) = files
+            .iter()
+            .filter_map(|file| self.files.get(&file.path))
+            .fold((0_usize, 0_usize, 0_usize), |totals, cached| {
+                (
+                    totals.0.saturating_add(cached.parsed.parsed_lines),
+                    totals.1.saturating_add(cached.parsed.events.len()),
+                    totals
+                        .2
+                        .saturating_add(cached.parsed.foreign_baseline_events),
+                )
+            });
+        self.metrics = RolloutCacheMetrics {
+            selected_files: files.len(),
+            selected_bytes,
+            parsed_lines,
+            cached_events,
+            foreign_baseline_events,
         };
         parse_span.finish_with(|| format!(
-            "files={} reparsed={} reused={} disk_reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
+            "files={} reparsed={} tail_parsed={} tail_bytes={} full_parsed={} reused={} disk_reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
             files.len(),
             refresh.reparsed_files,
+            refresh.tail_parsed_files,
+            refresh.tail_parsed_bytes,
+            refresh.full_parsed_files,
             refresh.reused_files,
             refresh.disk_reused_files,
             refresh.stability_retries
         ));
 
+        let cache_save_started = perf_active.then(Instant::now);
         let cache_save_span = config.startup_trace.span("rollout.cache_save");
         let write = self.persist_dirty_files(config, &key, cache_usage);
         refresh.disk_written_files = write.written;
@@ -634,6 +796,7 @@ impl RolloutCache {
         if write.maintenance_ran {
             self.last_disk_prune = Some(Instant::now());
         }
+        refresh.cache_save_us = elapsed_micros(cache_save_started);
         cache_save_span.finish_with(|| {
             format!(
                 "enabled={} written={} failures={} deferred={} oversized={} retry_ms={} pruned={} temp_pruned={}",
@@ -657,14 +820,63 @@ impl RolloutCache {
                 })
             })
             .collect::<Vec<_>>();
+        {
+            let previous_by_path = self
+                .selected
+                .iter()
+                .map(|file| (file.path.as_path(), &file.fingerprint))
+                .collect::<HashMap<_, _>>();
+            let current_by_path = selected
+                .iter()
+                .map(|file| (file.path.as_path(), &file.fingerprint))
+                .collect::<HashMap<_, _>>();
+            for previous in &self.selected {
+                if current_by_path
+                    .get(previous.path.as_path())
+                    .is_none_or(|fingerprint| **fingerprint != previous.fingerprint)
+                    && let Some(thread_id) = self
+                        .files
+                        .get(&previous.path)
+                        .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+                {
+                    changed_thread_ids.insert(thread_id.clone());
+                }
+            }
+            for current in &selected {
+                if previous_by_path
+                    .get(current.path.as_path())
+                    .is_none_or(|fingerprint| **fingerprint != current.fingerprint)
+                    && let Some(thread_id) = self
+                        .files
+                        .get(&current.path)
+                        .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+                {
+                    changed_thread_ids.insert(thread_id.clone());
+                }
+            }
+        }
         let selected_changed = selected != self.selected;
         let must_rebuild = self.reduced.is_none() || selected_changed || refresh.reparsed_files > 0;
 
+        let reduce_started = perf_active.then(Instant::now);
         let reduce_span = config.startup_trace.span("rollout.reduce");
         if must_rebuild {
-            self.reduced = Some(reduce_cached_files(&files, &self.files, config));
+            if let Some(reduced) = self.reduced.as_mut() {
+                incrementally_reduce_cached_files(
+                    reduced,
+                    &changed_thread_ids,
+                    &files,
+                    &self.files,
+                    config,
+                );
+                refresh.incrementally_reduced_threads = changed_thread_ids.len();
+            } else {
+                self.reduced = Some(reduce_cached_files(&files, &self.files, config));
+                refresh.full_rebuild = true;
+            }
             refresh.rebuilt = true;
         }
+        refresh.reduce_us = elapsed_micros(reduce_started);
         let (reduced_threads, reduced_calls) = if trace_active {
             self.reduced
                 .as_ref()
@@ -675,8 +887,10 @@ impl RolloutCache {
         };
         reduce_span.finish_with(|| {
             format!(
-                "rebuilt={} threads={reduced_threads} calls={reduced_calls}",
-                refresh.rebuilt
+                "rebuilt={} full_rebuild={} incremental_threads={} threads={reduced_threads} calls={reduced_calls}",
+                refresh.rebuilt,
+                refresh.full_rebuild,
+                refresh.incrementally_reduced_threads
             )
         });
         self.selected = selected;
@@ -693,8 +907,37 @@ impl RolloutCache {
             .retain(|path, _| selected_paths.contains(path.as_path()));
         self.dirty_files
             .retain(|path| selected_paths.contains(path.as_path()));
-        self.last_refresh = refresh;
+        let discovery_state = DiscoveryState {
+            stats: discovery.stats.clone(),
+            warnings: discovery.warnings.clone(),
+        };
+        let discovery_changed = self.last_discovery.as_ref() != Some(&discovery_state);
+        let title_changed = !config.redact_content && !refresh.session_index_reused;
+        let freshness_changed = self.last_materialized_at.is_some_and(|last| last > now)
+            || self.last_materialized_active_grace != Some(config.active_grace)
+            || self.last_materialized_at.is_some_and(|last| {
+                crossed_freshness_deadline(
+                    self.reduced
+                        .as_ref()
+                        .expect("a scan always initializes reduced rollout state"),
+                    last,
+                    now,
+                    config.active_grace,
+                )
+            });
+        let should_materialize = force_materialize
+            || self.last_materialized_at.is_none()
+            || refresh.rebuilt
+            || discovery_changed
+            || title_changed
+            || freshness_changed;
+        self.last_discovery = Some(discovery_state);
+        if !should_materialize {
+            self.last_refresh = refresh;
+            return Ok(None);
+        }
 
+        let materialize_started = perf_active.then(Instant::now);
         let materialize_span = config.startup_trace.span("rollout.materialize");
         let dataset = materialize_dataset(
             self.reduced
@@ -705,6 +948,10 @@ impl RolloutCache {
             now,
             &self.session_titles.titles,
         );
+        refresh.materialize_us = elapsed_micros(materialize_started);
+        self.last_refresh = refresh;
+        self.last_materialized_at = Some(now);
+        self.last_materialized_active_grace = Some(config.active_grace);
         materialize_span.finish_with(|| {
             format!(
                 "tasks={} turns={} calls={} observations={}",
@@ -737,7 +984,7 @@ impl RolloutCache {
                 )
             });
         }
-        Ok(dataset)
+        Ok(Some(dataset))
     }
 
     fn persist_dirty_files(
@@ -983,7 +1230,7 @@ fn load_persistent_file(cache_root: &Path, key: &CacheKey, file: &RolloutFile) -
     {
         return PersistentLoad::Miss;
     }
-    PersistentLoad::Hit(entry.cached)
+    PersistentLoad::Hit(Box::new(entry.cached))
 }
 
 #[cfg(test)]
@@ -1036,6 +1283,12 @@ fn next_write_backoff(current: Duration) -> Duration {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_micros(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 fn record_earliest_retry(slot: &mut u64, duration: Duration) {
@@ -1201,6 +1454,114 @@ fn reduce_cached_files(
 ) -> ReducedRollouts {
     let mut reduced = ReducedRollouts::default();
     for file in files {
+        let Some(cached) = cache.get(&file.path) else {
+            continue;
+        };
+        let parsed = &cached.parsed;
+        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
+            continue;
+        }
+        replay_file_into_reduced(&mut reduced, file, parsed, config);
+    }
+    rebuild_reduced_metadata(&mut reduced, files, cache);
+    reduced
+}
+
+fn incrementally_reduce_cached_files(
+    reduced: &mut ReducedRollouts,
+    changed_thread_ids: &HashSet<String>,
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    config: &CollectConfig,
+) {
+    for thread_id in changed_thread_ids {
+        reduced.threads.remove(thread_id);
+    }
+    reduced
+        .dataset
+        .calls
+        .retain(|call| !changed_thread_ids.contains(&call.thread_id));
+    reduced
+        .dataset
+        .rate_observations
+        .retain(|observation| !changed_thread_ids.contains(&observation.thread_id));
+
+    let selected_paths = files
+        .iter()
+        .map(|file| file.path.as_path())
+        .collect::<HashSet<_>>();
+    reduced.replay_warnings.retain(|path, _| {
+        selected_paths.contains(path.as_path())
+            && cache
+                .get(path)
+                .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+                .is_none_or(|thread_id| !changed_thread_ids.contains(thread_id))
+    });
+    reduced.ambiguous_token_resets.retain(|path, _| {
+        selected_paths.contains(path.as_path())
+            && cache
+                .get(path)
+                .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+                .is_none_or(|thread_id| !changed_thread_ids.contains(thread_id))
+    });
+
+    for file in files {
+        let Some(cached) = cache.get(&file.path) else {
+            continue;
+        };
+        let parsed = &cached.parsed;
+        if !parsed
+            .owner_thread_id
+            .as_ref()
+            .is_some_and(|thread_id| changed_thread_ids.contains(thread_id))
+            || archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config)
+        {
+            continue;
+        }
+        replay_file_into_reduced(reduced, file, parsed, config);
+    }
+    rebuild_reduced_metadata(reduced, files, cache);
+}
+
+fn replay_file_into_reduced(
+    reduced: &mut ReducedRollouts,
+    file: &RolloutFile,
+    parsed: &ParsedFile,
+    config: &CollectConfig,
+) {
+    let mut replay = RolloutDataset::default();
+    replay_rollout_file(
+        &file.path,
+        parsed,
+        config,
+        &mut reduced.threads,
+        &mut replay,
+    );
+    reduced.dataset.calls.extend(replay.calls);
+    reduced
+        .dataset
+        .rate_observations
+        .extend(replay.rate_observations);
+    if !replay.warnings.is_empty() {
+        reduced
+            .replay_warnings
+            .insert(file.path.clone(), replay.warnings);
+    }
+    if replay.stats.ambiguous_token_resets > 0 {
+        reduced
+            .ambiguous_token_resets
+            .insert(file.path.clone(), replay.stats.ambiguous_token_resets);
+    }
+}
+
+fn rebuild_reduced_metadata(
+    reduced: &mut ReducedRollouts,
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+) {
+    reduced.dataset.stats = Default::default();
+    reduced.dataset.warnings.clear();
+    for file in files {
         reduced.dataset.stats.scanned_files += 1;
         let Some(cached) = cache.get(&file.path) else {
             continue;
@@ -1210,18 +1571,15 @@ fn reduce_cached_files(
         reduced.dataset.stats.skipped_lines += parsed.skipped_lines;
         reduced.dataset.stats.unreadable_files += parsed.unreadable_files;
         reduced.dataset.warnings.extend(parsed.warnings.clone());
-        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
-            continue;
+        if let Some(warnings) = reduced.replay_warnings.get(&file.path) {
+            reduced.dataset.warnings.extend(warnings.clone());
         }
-        replay_rollout_file(
-            &file.path,
-            parsed,
-            config,
-            &mut reduced.threads,
-            &mut reduced.dataset,
-        );
+        reduced.dataset.stats.ambiguous_token_resets += reduced
+            .ambiguous_token_resets
+            .get(&file.path)
+            .copied()
+            .unwrap_or_default();
     }
-    reduced
 }
 
 fn archived_rollout_is_subsumed_by_active(
@@ -1268,14 +1626,27 @@ fn materialize_dataset(
     discovery.warnings.extend(reduced.dataset.warnings.clone());
     discovery.calls = reduced.dataset.calls.clone();
     discovery.rate_observations = reduced.dataset.rate_observations.clone();
-    finish_dataset(
-        config,
-        now,
-        reduced.threads.clone(),
-        thread_titles,
-        &mut discovery,
-    );
+    finish_dataset(config, now, &reduced.threads, thread_titles, &mut discovery);
     discovery
+}
+
+fn crossed_freshness_deadline(
+    reduced: &ReducedRollouts,
+    last_materialized_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    active_grace: Duration,
+) -> bool {
+    let Ok(active_grace) = ChronoDuration::from_std(active_grace) else {
+        return false;
+    };
+    reduced.threads.values().any(|thread| {
+        !thread.active_turn_ids.is_empty()
+            && thread.updated_at.is_some_and(|updated_at| {
+                updated_at
+                    .checked_add_signed(active_grace)
+                    .is_some_and(|deadline| deadline >= last_materialized_at && deadline < now)
+            })
+    })
 }
 
 fn discover_rollout_files(
@@ -1382,10 +1753,31 @@ fn discover_rollout_files(
     files
 }
 
+struct StableParse {
+    cached: CachedFile,
+    stability_retries: usize,
+    tail_parsed: bool,
+    parsed_bytes: u64,
+}
+
+#[cfg(test)]
 fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> (CachedFile, usize) {
+    let parsed = refresh_stable_rollout_file(file, config, None);
+    (parsed.cached, parsed.stability_retries)
+}
+
+fn refresh_stable_rollout_file(
+    file: &RolloutFile,
+    config: &CollectConfig,
+    previous: Option<CachedFile>,
+) -> StableParse {
     let mut candidate = file.clone();
+    let mut previous = previous;
+    let mut parsed_bytes = 0_u64;
     for attempt in 0..2 {
-        let mut parsed = parse_rollout_file(&candidate, config);
+        let (mut parsed, tail_parsed, bytes_read) =
+            parse_rollout_candidate(&candidate, config, previous.take());
+        parsed_bytes = parsed_bytes.saturating_add(bytes_read);
         let after = match inspect_rollout_file(&candidate.path) {
             Ok(after) => after,
             Err(error) => {
@@ -1395,24 +1787,52 @@ fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> (Cac
                     "could not inspect {} after reading: {error}",
                     candidate.path.display()
                 ));
-                return (
-                    CachedFile {
+                return StableParse {
+                    cached: CachedFile {
                         fingerprint: candidate.fingerprint,
                         parsed,
                     },
-                    attempt,
-                );
+                    stability_retries: attempt,
+                    tail_parsed: false,
+                    parsed_bytes,
+                };
             }
         };
 
         if after.fingerprint == candidate.fingerprint {
-            return (
-                CachedFile {
-                    fingerprint: after.fingerprint,
-                    parsed,
-                },
-                attempt,
-            );
+            if parsed.complete
+                && let Err(error) =
+                    update_tail_guard(&candidate.path, &mut parsed, after.fingerprint.len)
+            {
+                parsed.complete = false;
+                parsed.unreadable_files += 1;
+                parsed.warnings.push(format!(
+                    "could not fingerprint parsed tail for {}: {error}",
+                    candidate.path.display()
+                ));
+            }
+            let final_fingerprint = inspect_rollout_file(&candidate.path)
+                .map(|final_file| final_file.fingerprint)
+                .unwrap_or_else(|_| after.fingerprint.clone());
+            if final_fingerprint == after.fingerprint {
+                return StableParse {
+                    cached: CachedFile {
+                        fingerprint: after.fingerprint,
+                        parsed,
+                    },
+                    stability_retries: attempt,
+                    tail_parsed,
+                    parsed_bytes,
+                };
+            }
+            if attempt == 0 {
+                candidate = RolloutFile {
+                    path: candidate.path,
+                    modified_at: DateTime::<Utc>::from(final_fingerprint.modified),
+                    fingerprint: final_fingerprint,
+                };
+                continue;
+            }
         }
         if attempt == 0 {
             candidate = after;
@@ -1425,15 +1845,117 @@ fn parse_stable_rollout_file(file: &RolloutFile, config: &CollectConfig) -> (Cac
             "{} changed repeatedly while being read; the snapshot contains a stable parsed prefix",
             candidate.path.display()
         ));
-        return (
-            CachedFile {
+        return StableParse {
+            cached: CachedFile {
                 fingerprint: after.fingerprint,
                 parsed,
             },
-            attempt,
-        );
+            stability_retries: attempt,
+            tail_parsed: false,
+            parsed_bytes,
+        };
     }
     unreachable!("stable rollout parsing attempts are bounded")
+}
+
+fn parse_rollout_candidate(
+    file: &RolloutFile,
+    config: &CollectConfig,
+    previous: Option<CachedFile>,
+) -> (ParsedFile, bool, u64) {
+    if let Some(previous) = previous {
+        let previous_len = previous.fingerprint.len;
+        if can_tail_parse(&previous, file)
+            && let Some(parsed) = parse_rollout_tail(file, config, previous)
+        {
+            return (
+                parsed,
+                true,
+                file.fingerprint.len.saturating_sub(previous_len),
+            );
+        }
+    }
+    (
+        parse_rollout_file(file, config),
+        false,
+        file.fingerprint.len,
+    )
+}
+
+fn can_tail_parse(previous: &CachedFile, file: &RolloutFile) -> bool {
+    previous.parsed.complete
+        && previous.parsed.ends_with_newline
+        && previous.fingerprint.len < file.fingerprint.len
+        && previous.fingerprint.same_source_identity(&file.fingerprint)
+        && (previous.fingerprint.len == 0 || previous.parsed.tail_guard.len > 0)
+}
+
+fn parse_rollout_tail(
+    file: &RolloutFile,
+    config: &CollectConfig,
+    mut previous: CachedFile,
+) -> Option<ParsedFile> {
+    let mut handle = match File::open(&file.path) {
+        Ok(handle) => handle,
+        Err(_) => return None,
+    };
+    if !tail_guard_matches(
+        &mut handle,
+        previous.fingerprint.len,
+        previous.parsed.tail_guard,
+    ) {
+        return None;
+    }
+    if handle
+        .seek(SeekFrom::Start(previous.fingerprint.len))
+        .is_err()
+    {
+        return None;
+    }
+    previous.parsed.complete = false;
+    Some(parse_rollout_reader(
+        file,
+        config,
+        previous.parsed,
+        BufReader::new(handle),
+    ))
+}
+
+fn tail_guard_matches(handle: &mut File, prefix_len: u64, expected: TailGuard) -> bool {
+    let guard_len = usize::from(expected.len);
+    if prefix_len == 0 {
+        return guard_len == 0;
+    }
+    if guard_len == 0 || u64::from(expected.len) > prefix_len {
+        return false;
+    }
+    if handle
+        .seek(SeekFrom::Start(prefix_len - u64::from(expected.len)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut bytes = vec![0_u8; guard_len];
+    handle.read_exact(&mut bytes).is_ok() && stable_hash(&[&bytes]) == expected.hash
+}
+
+fn update_tail_guard(path: &Path, parsed: &mut ParsedFile, file_len: u64) -> std::io::Result<()> {
+    if file_len == 0 {
+        parsed.ends_with_newline = false;
+        parsed.tail_guard = TailGuard::default();
+        return Ok(());
+    }
+    let guard_len = usize::try_from(file_len.min(TAIL_GUARD_BYTES as u64)).unwrap_or(0);
+    let mut handle = File::open(path)?;
+    handle.seek(SeekFrom::Start(file_len - guard_len as u64))?;
+    let mut bytes = vec![0_u8; guard_len];
+    handle.read_exact(&mut bytes)?;
+    parsed.ends_with_newline = bytes.last() == Some(&b'\n');
+    parsed.tail_guard = TailGuard {
+        len: guard_len as u16,
+        hash: stable_hash(&[&bytes]),
+    };
+    Ok(())
 }
 
 fn inspect_rollout_file(path: &Path) -> std::io::Result<RolloutFile> {
@@ -1447,10 +1969,10 @@ fn inspect_rollout_file(path: &Path) -> std::io::Result<RolloutFile> {
 }
 
 fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile {
-    let mut parsed = ParsedFile::default();
     let handle = match File::open(&file.path) {
         Ok(handle) => handle,
         Err(error) => {
+            let mut parsed = ParsedFile::default();
             parsed.unreadable_files += 1;
             parsed
                 .warnings
@@ -1459,11 +1981,22 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
         }
     };
 
-    let mut owning_thread_id: Option<String> = None;
-    let mut owning_created_at: Option<DateTime<Utc>> = None;
-    let mut replaying_foreign_history = false;
-    for (line_index, line) in BufReader::new(handle).lines().enumerate() {
-        let line_number = line_index + 1;
+    parse_rollout_reader(file, config, ParsedFile::default(), BufReader::new(handle))
+}
+
+fn parse_rollout_reader<R: BufRead>(
+    file: &RolloutFile,
+    config: &CollectConfig,
+    mut parsed: ParsedFile,
+    reader: R,
+) -> ParsedFile {
+    let mut owning_thread_id = parsed.owner_thread_id.clone();
+    let mut owning_created_at = parsed.owning_created_at;
+    let mut replaying_foreign_history = parsed.replaying_foreign_history;
+
+    for line in reader.lines() {
+        parsed.source_lines = parsed.source_lines.saturating_add(1);
+        let line_number = parsed.source_lines;
         let line = match line {
             Ok(line) => line,
             Err(error) => {
@@ -1596,10 +2129,9 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                     && let Some(payload) = object_at(&record, &["payload"])
                     && string_field_in(payload, &["type"]) == Some("token_count")
                     && let Some(total_usage) = total_token_usage(payload)
+                    && retain_latest_foreign_baseline(&mut parsed.events, total_usage)
                 {
-                    parsed
-                        .events
-                        .push(ParsedEvent::ForeignCounterBaseline(total_usage));
+                    parsed.foreign_baseline_events += 1;
                 }
                 continue;
             }
@@ -1654,39 +2186,99 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
                                 service_tier: service_tier.to_owned(),
                             });
                         }
-                    } else if should_cache_event_message(payload) {
-                        parsed.events.push(ParsedEvent::EventMessage {
-                            timestamp,
-                            line_number,
-                            payload: projected_payload(
-                                payload,
-                                &[
-                                    "type",
-                                    "turn_id",
-                                    "turnId",
-                                    "started_at",
-                                    "startedAt",
-                                    "completed_at",
-                                    "completedAt",
-                                    "duration_ms",
-                                    "durationMs",
-                                    "reason",
-                                    "info",
-                                    "total_token_usage",
-                                    "totalTokenUsage",
-                                    "rate_limits",
-                                    "rateLimits",
-                                ],
-                            ),
-                        });
+                    } else {
+                        cache_event_message(&mut parsed.events, payload, timestamp, line_number);
                     }
                 }
             }
             _ => {}
         }
     }
+    parsed.owning_created_at = owning_created_at;
+    parsed.replaying_foreign_history = replaying_foreign_history;
     parsed.complete = true;
     parsed
+}
+
+fn retain_latest_foreign_baseline(events: &mut Vec<ParsedEvent>, total_usage: TokenUsage) -> bool {
+    if let Some(ParsedEvent::ForeignCounterBaseline(previous)) = events.last_mut() {
+        *previous = total_usage;
+        false
+    } else {
+        events.push(ParsedEvent::ForeignCounterBaseline(total_usage));
+        true
+    }
+}
+
+fn cache_event_message(
+    events: &mut Vec<ParsedEvent>,
+    payload: &Map<String, Value>,
+    timestamp: DateTime<Utc>,
+    line_number: usize,
+) {
+    let turn_id = || string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned);
+    match string_field_in(payload, &["type"]) {
+        Some("task_started") => {
+            let Some(turn_id) = turn_id() else {
+                return;
+            };
+            events.push(ParsedEvent::TaskStarted {
+                timestamp,
+                turn_id,
+                started_at: payload
+                    .get("started_at")
+                    .or_else(|| payload.get("startedAt"))
+                    .and_then(parse_timestamp),
+            });
+        }
+        Some("task_complete") => {
+            let Some(turn_id) = turn_id() else {
+                return;
+            };
+            events.push(ParsedEvent::TaskComplete {
+                timestamp,
+                turn_id,
+                completed_at: payload
+                    .get("completed_at")
+                    .or_else(|| payload.get("completedAt"))
+                    .and_then(parse_timestamp),
+                duration_ms: u64_field_in(payload, &["duration_ms", "durationMs"]),
+            });
+        }
+        Some("turn_aborted") => {
+            let Some(turn_id) = turn_id() else {
+                return;
+            };
+            let reason = string_field_in(payload, &["reason"]).unwrap_or_default();
+            events.push(ParsedEvent::TurnAborted {
+                timestamp,
+                turn_id,
+                completed_at: payload
+                    .get("completed_at")
+                    .or_else(|| payload.get("completedAt"))
+                    .and_then(parse_timestamp),
+                duration_ms: u64_field_in(payload, &["duration_ms", "durationMs"]),
+                failed: reason.contains("fail") || reason.contains("error"),
+            });
+        }
+        Some("token_count") => {
+            let total_usage = total_token_usage(payload);
+            let rate_limits = payload
+                .get("rate_limits")
+                .or_else(|| payload.get("rateLimits"))
+                .and_then(Value::as_object)
+                .and_then(parse_cached_rate_limits);
+            if total_usage.is_some() || rate_limits.is_some() {
+                events.push(ParsedEvent::TokenCount {
+                    timestamp,
+                    line_number,
+                    total_usage,
+                    rate_limits,
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_forked_session(payload: &Map<String, Value>) -> bool {
@@ -1781,13 +2373,6 @@ fn valid_parent_thread_id<'a>(
         .filter(|candidate| owner_thread_id != Some(*candidate))
 }
 
-fn should_cache_event_message(payload: &Map<String, Value>) -> bool {
-    matches!(
-        string_field_in(payload, &["type"]),
-        Some("task_started" | "task_complete" | "turn_aborted" | "token_count")
-    )
-}
-
 fn projected_payload(payload: &Map<String, Value>, fields: &[&str]) -> Map<String, Value> {
     fields
         .iter()
@@ -1839,21 +2424,54 @@ fn replay_rollout_file(
             ParsedEvent::TurnContext { timestamp, payload } => {
                 apply_turn_context(thread, payload, *timestamp);
             }
-            ParsedEvent::EventMessage {
+            ParsedEvent::TaskStarted {
+                timestamp,
+                turn_id,
+                started_at,
+            } => activate_turn(thread, turn_id, started_at.unwrap_or(*timestamp)),
+            ParsedEvent::TaskComplete {
+                timestamp,
+                turn_id,
+                completed_at,
+                duration_ms,
+            } => finish_turn(
+                thread,
+                turn_id,
+                completed_at.unwrap_or(*timestamp),
+                *duration_ms,
+                TurnStatus::Completed,
+            ),
+            ParsedEvent::TurnAborted {
+                timestamp,
+                turn_id,
+                completed_at,
+                duration_ms,
+                failed,
+            } => finish_turn(
+                thread,
+                turn_id,
+                completed_at.unwrap_or(*timestamp),
+                *duration_ms,
+                if *failed {
+                    TurnStatus::Failed
+                } else {
+                    TurnStatus::Interrupted
+                },
+            ),
+            ParsedEvent::TokenCount {
                 timestamp,
                 line_number,
-                payload,
-            } => {
-                apply_event_msg(
-                    thread,
-                    payload,
-                    *timestamp,
-                    config,
-                    path,
-                    *line_number,
-                    dataset,
-                );
-            }
+                total_usage,
+                rate_limits,
+            } => apply_token_count(
+                thread,
+                *total_usage,
+                rate_limits.as_ref(),
+                *timestamp,
+                path,
+                *line_number,
+                dataset,
+            ),
         }
     }
     if let Some(updated_at) = parsed.activity_updated_at {
@@ -1939,80 +2557,6 @@ fn apply_turn_context(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_event_msg(
-    thread: &mut ThreadBuilder,
-    payload: &Map<String, Value>,
-    timestamp: DateTime<Utc>,
-    config: &CollectConfig,
-    path: &Path,
-    line_number: usize,
-    dataset: &mut RolloutDataset,
-) {
-    match string_field_in(payload, &["type"]) {
-        Some("user_message") => {
-            if thread.title.is_none() && !config.redact_content {
-                thread.title = payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .and_then(title_preview);
-            }
-        }
-        Some("task_started") => {
-            let Some(turn_id) = string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned)
-            else {
-                return;
-            };
-            let started_at = payload
-                .get("started_at")
-                .or_else(|| payload.get("startedAt"))
-                .and_then(parse_timestamp)
-                .unwrap_or(timestamp);
-            activate_turn(thread, &turn_id, started_at);
-        }
-        Some("task_complete") => {
-            let Some(turn_id) = string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned)
-            else {
-                return;
-            };
-            let completed_at = payload
-                .get("completed_at")
-                .or_else(|| payload.get("completedAt"))
-                .and_then(parse_timestamp)
-                .unwrap_or(timestamp);
-            finish_turn(
-                thread,
-                &turn_id,
-                payload,
-                completed_at,
-                TurnStatus::Completed,
-            );
-        }
-        Some("turn_aborted") => {
-            let Some(turn_id) = string_field_in(payload, &["turn_id", "turnId"]).map(str::to_owned)
-            else {
-                return;
-            };
-            let completed_at = payload
-                .get("completed_at")
-                .or_else(|| payload.get("completedAt"))
-                .and_then(parse_timestamp)
-                .unwrap_or(timestamp);
-            let reason = string_field_in(payload, &["reason"]).unwrap_or_default();
-            let status = if reason.contains("fail") || reason.contains("error") {
-                TurnStatus::Failed
-            } else {
-                TurnStatus::Interrupted
-            };
-            finish_turn(thread, &turn_id, payload, completed_at, status);
-        }
-        Some("token_count") => {
-            apply_token_count(thread, payload, timestamp, path, line_number, dataset);
-        }
-        _ => {}
-    }
-}
-
 fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime<Utc>) {
     let service_tier = thread.service_tier.clone();
     let turn = ensure_turn(thread, turn_id);
@@ -2037,14 +2581,14 @@ fn activate_turn(thread: &mut ThreadBuilder, turn_id: &str, started_at: DateTime
 fn finish_turn(
     thread: &mut ThreadBuilder,
     turn_id: &str,
-    payload: &Map<String, Value>,
     completed_at: DateTime<Utc>,
+    duration_ms: Option<u64>,
     status: TurnStatus,
 ) {
     let turn = ensure_turn(thread, turn_id);
     turn.completed_at = Some(completed_at);
     turn.status = status;
-    turn.duration_ms = u64_field_in(payload, &["duration_ms", "durationMs"]).or_else(|| {
+    turn.duration_ms = duration_ms.or_else(|| {
         turn.started_at.and_then(|started_at| {
             completed_at
                 .signed_duration_since(started_at)
@@ -2059,31 +2603,29 @@ fn finish_turn(
 
 fn apply_token_count(
     thread: &mut ThreadBuilder,
-    payload: &Map<String, Value>,
+    total_usage: Option<TokenUsage>,
+    rate_limits: Option<&CachedRateLimits>,
     timestamp: DateTime<Utc>,
     path: &Path,
     line_number: usize,
     dataset: &mut RolloutDataset,
 ) {
-    if let Some(rate_limits) = payload
-        .get("rate_limits")
-        .or_else(|| payload.get("rateLimits"))
-        .and_then(Value::as_object)
-        && let Some(observation) = parse_rate_observation(
-            rate_limits,
+    if let Some(rate_limits) = rate_limits {
+        dataset.rate_observations.push(RateObservation {
             timestamp,
-            &thread.thread_id,
-            thread
+            thread_id: thread.thread_id.clone(),
+            turn_id: thread
                 .active_turn_ids
                 .last()
-                .map(String::as_str)
-                .or(thread.last_turn_id.as_deref()),
-        )
-    {
-        dataset.rate_observations.push(observation);
+                .cloned()
+                .or_else(|| thread.last_turn_id.clone()),
+            limit_id: rate_limits.limit_id.clone(),
+            primary: rate_limits.primary.clone(),
+            secondary: rate_limits.secondary.clone(),
+            provenance: Provenance::LocalExact,
+        });
     }
 
-    let total_usage = total_token_usage(payload);
     let Some(total_usage) = total_usage else {
         return;
     };
@@ -2199,12 +2741,7 @@ fn uuid_v7_timestamp_ms(value: &str) -> Option<u64> {
     u64::from_str_radix(&timestamp, 16).ok()
 }
 
-fn parse_rate_observation(
-    value: &Map<String, Value>,
-    timestamp: DateTime<Utc>,
-    thread_id: &str,
-    turn_id: Option<&str>,
-) -> Option<RateObservation> {
+fn parse_cached_rate_limits(value: &Map<String, Value>) -> Option<CachedRateLimits> {
     let primary = value.get("primary").and_then(parse_limit_window);
     let secondary = value.get("secondary").and_then(parse_limit_window);
     let limit_id = string_field_in(value, &["limit_id", "limitId"])
@@ -2219,14 +2756,10 @@ fn parse_rate_observation(
         return None;
     }
 
-    Some(RateObservation {
-        timestamp,
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.map(str::to_owned),
+    Some(CachedRateLimits {
         limit_id,
         primary,
         secondary,
-        provenance: Provenance::LocalExact,
     })
 }
 
@@ -2291,26 +2824,17 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
 fn finish_dataset(
     config: &CollectConfig,
     now: DateTime<Utc>,
-    threads: HashMap<String, ThreadBuilder>,
+    threads: &HashMap<String, ThreadBuilder>,
     thread_titles: &HashMap<String, String>,
     dataset: &mut RolloutDataset,
 ) {
-    for mut thread in threads.into_values() {
+    for thread in threads.values() {
         let active_is_fresh = !thread.active_turn_ids.is_empty()
             && timestamp_is_fresh(thread.updated_at, now, config.active_grace);
-        for active_turn_id in &thread.active_turn_ids {
-            if let Some(turn) = thread.turns.get_mut(active_turn_id) {
-                turn.status = if active_is_fresh {
-                    TurnStatus::InProgress
-                } else {
-                    TurnStatus::Stale
-                };
-            }
-        }
 
-        let (status, status_provenance, status_confidence) = task_status(&thread, active_is_fresh);
+        let (status, status_provenance, status_confidence) = task_status(thread, active_is_fresh);
         let turn_count = thread.turns.len();
-        for turn in thread.turns.into_values() {
+        for turn in thread.turns.values() {
             let duration_ms = turn.duration_ms.or_else(|| {
                 turn.started_at
                     .zip(turn.completed_at)
@@ -2321,17 +2845,30 @@ fn finish_dataset(
                             .ok()
                     })
             });
+            let turn_status = if thread
+                .active_turn_ids
+                .iter()
+                .any(|turn_id| turn_id == &turn.turn_id)
+            {
+                if active_is_fresh {
+                    TurnStatus::InProgress
+                } else {
+                    TurnStatus::Stale
+                }
+            } else {
+                turn.status
+            };
             dataset.turns.push(TurnRecord {
                 thread_id: thread.thread_id.clone(),
-                turn_id: turn.turn_id,
-                model: turn.model,
-                reasoning_effort: turn.reasoning_effort,
-                service_tier: turn.service_tier,
-                message_preview: turn.message_preview,
+                turn_id: turn.turn_id.clone(),
+                model: turn.model.clone(),
+                reasoning_effort: turn.reasoning_effort.clone(),
+                service_tier: turn.service_tier.clone(),
+                message_preview: turn.message_preview.clone(),
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
                 duration_ms,
-                status: turn.status,
+                status: turn_status,
                 token_usage: turn.token_usage,
                 window_token_usage: TokenUsage::default(),
                 local_token_share_percent: 0.0,
@@ -2346,16 +2883,16 @@ fn finish_dataset(
             thread_titles
                 .get(&thread.thread_id)
                 .cloned()
-                .or(thread.title)
+                .or_else(|| thread.title.clone())
                 .unwrap_or_else(|| "Untitled task".to_owned())
         };
         dataset.tasks.push(TaskRecord {
-            thread_id: thread.thread_id,
-            parent_thread_id: thread.parent_thread_id,
+            thread_id: thread.thread_id.clone(),
+            parent_thread_id: thread.parent_thread_id.clone(),
             archived: thread.seen_archived_file && !thread.seen_active_file,
             title,
-            cwd: thread.cwd,
-            source: thread.source,
+            cwd: thread.cwd.clone(),
+            source: thread.source.clone(),
             created_at: thread.created_at,
             updated_at: thread.updated_at,
             status,

@@ -13,7 +13,8 @@ use crate::domain::{
     AccountSnapshot, LimitBucket, LimitWindow, Provenance, RateObservation, RolloutDataset,
     Snapshot, SourceStatus, WindowAnalysis,
 };
-use crate::rollout::{RolloutCache, scan_rollouts};
+use crate::perf::{RefreshMetrics, RefreshStageMetrics};
+use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
 
 #[derive(Clone, Debug)]
 pub struct CollectionResult {
@@ -25,6 +26,9 @@ struct LocalCollection {
     dataset: RolloutDataset,
     source: Option<SourceStatus>,
     error: Option<String>,
+    unchanged: bool,
+    rollout_refresh: Option<RolloutCacheRefresh>,
+    rollout_metrics: Option<RolloutCacheMetrics>,
 }
 
 fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: bool) -> bool {
@@ -52,15 +56,23 @@ fn collect_local_source(
     now: DateTime<Utc>,
     scan_local: bool,
     rollout_cache: Option<&mut RolloutCache>,
+    only_if_changed: bool,
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
     let collection = if scan_local {
-        let scan_result = match rollout_cache {
-            Some(cache) => cache.scan(config, now),
-            None => scan_rollouts(config, now),
+        let (scan_result, rollout_refresh, rollout_metrics) = match rollout_cache {
+            Some(cache) => {
+                let result = if only_if_changed {
+                    cache.scan_if_changed(config, now)
+                } else {
+                    cache.scan(config, now).map(Some)
+                };
+                (result, Some(cache.last_refresh()), Some(cache.metrics()))
+            }
+            None => (scan_rollouts(config, now).map(Some), None, None),
         };
         match scan_result {
-            Ok(dataset) => {
+            Ok(Some(dataset)) => {
                 let truncated = dataset.stats.truncated_files;
                 let unreadable = dataset.stats.unreadable_files;
                 let skipped = dataset.stats.skipped_lines;
@@ -87,8 +99,19 @@ fn collect_local_source(
                     }),
                     dataset,
                     error: None,
+                    unchanged: false,
+                    rollout_refresh,
+                    rollout_metrics,
                 }
             }
+            Ok(None) => LocalCollection {
+                dataset: RolloutDataset::default(),
+                source: None,
+                error: None,
+                unchanged: true,
+                rollout_refresh,
+                rollout_metrics,
+            },
             Err(error) => LocalCollection {
                 dataset: RolloutDataset::default(),
                 source: Some(SourceStatus {
@@ -98,6 +121,9 @@ fn collect_local_source(
                     message: Some(error.to_string()),
                 }),
                 error: Some(format!("rollout scan failed: {error:#}")),
+                unchanged: false,
+                rollout_refresh,
+                rollout_metrics,
             },
         }
     } else {
@@ -105,6 +131,9 @@ fn collect_local_source(
             dataset: RolloutDataset::default(),
             source: None,
             error: None,
+            unchanged: false,
+            rollout_refresh: None,
+            rollout_metrics: None,
         }
     };
     span.finish_with(|| {
@@ -157,7 +186,8 @@ pub fn collect_snapshot(
     cached_account: Option<AccountSnapshot>,
     refresh_account: bool,
 ) -> CollectionResult {
-    collect_snapshot_with_local(config, cached_account, refresh_account, true, None)
+    collect_snapshot_with_local(config, cached_account, refresh_account, true, None, false)
+        .expect("a forced snapshot collection always returns a result")
 }
 
 pub fn collect_snapshot_cached(
@@ -172,6 +202,25 @@ pub fn collect_snapshot_cached(
         refresh_account,
         true,
         Some(rollout_cache),
+        false,
+    )
+    .expect("a forced cached snapshot collection always returns a result")
+}
+
+/// Performs the lightweight cached discovery pass and returns `None` when no
+/// rollout, title, discovery, or task-freshness state requires a new snapshot.
+pub fn collect_snapshot_cached_if_changed(
+    config: &CollectConfig,
+    cached_account: Option<AccountSnapshot>,
+    rollout_cache: &mut RolloutCache,
+) -> Option<CollectionResult> {
+    collect_snapshot_with_local(
+        config,
+        cached_account,
+        false,
+        true,
+        Some(rollout_cache),
+        true,
     )
 }
 
@@ -180,7 +229,8 @@ pub fn collect_limits_snapshot(
     cached_account: Option<AccountSnapshot>,
     refresh_account: bool,
 ) -> CollectionResult {
-    collect_snapshot_with_local(config, cached_account, refresh_account, false, None)
+    collect_snapshot_with_local(config, cached_account, refresh_account, false, None, false)
+        .expect("a forced limits collection always returns a result")
 }
 
 fn collect_snapshot_with_local(
@@ -189,8 +239,11 @@ fn collect_snapshot_with_local(
     refresh_account: bool,
     scan_local: bool,
     rollout_cache: Option<&mut RolloutCache>,
-) -> CollectionResult {
+    only_if_changed: bool,
+) -> Option<CollectionResult> {
+    debug_assert!(!only_if_changed || !refresh_account);
     let total_started = config.startup_trace.is_active().then(Instant::now);
+    let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let now = Utc::now();
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
@@ -199,16 +252,33 @@ fn collect_snapshot_with_local(
     let parallel_sources = sources_run_in_parallel(scan_local, refresh_account, config.offline);
     let (local, prefetched_account) = if parallel_sources {
         let (local, account) = run_sources_in_parallel(
-            || collect_local_source(config, now, scan_local, rollout_cache),
+            || collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
             || fetch_account_source(config),
         );
         (local, Some(flatten_account_thread(account)))
     } else {
         (
-            collect_local_source(config, now, scan_local, rollout_cache),
+            collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
             None,
         )
     };
+    if local.unchanged {
+        record_refresh_performance(
+            config,
+            perf_started,
+            false,
+            false,
+            local.rollout_refresh,
+            local.rollout_metrics,
+            0,
+            0,
+            0,
+            RefreshStageMetrics::default(),
+        );
+        return None;
+    }
+    let rollout_refresh = local.rollout_refresh;
+    let rollout_metrics = local.rollout_metrics;
     if let Some(source) = local.source {
         sources.push(source);
     }
@@ -218,6 +288,8 @@ fn collect_snapshot_with_local(
     let mut dataset = local.dataset;
     warnings.append(&mut dataset.warnings);
 
+    let account_perf_started =
+        (!parallel_sources && config.perf_log.is_enabled()).then(Instant::now);
     let account_span =
         (!parallel_sources).then(|| config.startup_trace.span("snapshot.account_fetch"));
     let mut account = cached_account.unwrap_or_default();
@@ -302,7 +374,9 @@ fn collect_snapshot_with_local(
             )
         });
     }
+    let account_us = elapsed_us(account_perf_started);
 
+    let derive_perf_started = config.perf_log.is_enabled().then(Instant::now);
     let derive_span = config.startup_trace.span("snapshot.derive");
     warnings.extend(account.warnings.clone());
     errors.extend(account.errors.clone());
@@ -325,6 +399,8 @@ fn collect_snapshot_with_local(
         && dataset.stats.unreadable_files == 0
         && dataset.stats.skipped_lines == 0
         && dataset.stats.ambiguous_token_resets == 0;
+    let calls_count = dataset.calls.len();
+    let analysis_perf_started = config.perf_log.is_enabled().then(Instant::now);
     let analysis_span = config.startup_trace.span("snapshot.window_analysis");
     let mut window_analyses = analyze_windows(&tasks, &turns, &dataset.calls, &[], &limits, now);
     let rollout_source_degraded = sources.iter().any(|source| {
@@ -360,11 +436,14 @@ fn collect_snapshot_with_local(
             turns.len()
         )
     });
+    let window_analysis_us = elapsed_us(analysis_perf_started);
 
+    let sort_perf_started = config.perf_log.is_enabled().then(Instant::now);
     let sort_span = config.startup_trace.span("snapshot.sort");
     tasks.sort_by_key(|task| Reverse(task.updated_at));
     turns.sort_by_key(|turn| Reverse(turn.started_at));
     sort_span.finish_with(|| format!("tasks={} turns={}", tasks.len(), turns.len()));
+    let sort_us = elapsed_us(sort_perf_started);
 
     let partial = !errors.is_empty()
         || limits.is_empty()
@@ -412,6 +491,25 @@ fn collect_snapshot_with_local(
             result.snapshot.errors.len()
         )
     });
+    let snapshot_derive_us = elapsed_us(derive_perf_started);
+    record_refresh_performance(
+        config,
+        perf_started,
+        true,
+        refresh_account,
+        rollout_refresh,
+        rollout_metrics,
+        result.snapshot.tasks.len(),
+        result.snapshot.turns.len(),
+        calls_count,
+        RefreshStageMetrics {
+            account_us,
+            snapshot_derive_us,
+            window_analysis_us,
+            sort_us,
+            ..RefreshStageMetrics::default()
+        },
+    );
     if let Some(total_started) = total_started {
         config
             .startup_trace
@@ -423,7 +521,65 @@ fn collect_snapshot_with_local(
                 )
             });
     }
-    result
+    Some(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_refresh_performance(
+    config: &CollectConfig,
+    started: Option<Instant>,
+    changed: bool,
+    account_refreshed: bool,
+    rollout_refresh: Option<RolloutCacheRefresh>,
+    rollout_metrics: Option<RolloutCacheMetrics>,
+    tasks: usize,
+    turns: usize,
+    calls: usize,
+    mut stages: RefreshStageMetrics,
+) {
+    let Some(started) = started else {
+        return;
+    };
+    let refresh = rollout_refresh.unwrap_or_default();
+    let cache = rollout_metrics.unwrap_or_default();
+    stages.discover_us = refresh.discover_us;
+    stages.cache_load_us = refresh.cache_load_us;
+    stages.parse_us = refresh.parse_us;
+    stages.cache_save_us = refresh.cache_save_us;
+    stages.reduce_us = refresh.reduce_us;
+    stages.materialize_us = refresh.materialize_us;
+    config.perf_log.record_refresh(RefreshMetrics {
+        duration_us: elapsed_us(Some(started)),
+        account_refreshed,
+        changed,
+        reduced_rebuilt: refresh.rebuilt,
+        selected_files: saturating_u64(cache.selected_files),
+        selected_bytes: cache.selected_bytes,
+        parsed_lines: saturating_u64(cache.parsed_lines),
+        cached_events: saturating_u64(cache.cached_events),
+        foreign_baseline_events: saturating_u64(cache.foreign_baseline_events),
+        reparsed_files: saturating_u64(refresh.reparsed_files),
+        tail_parsed_files: saturating_u64(refresh.tail_parsed_files),
+        tail_parsed_bytes: refresh.tail_parsed_bytes,
+        full_parsed_files: saturating_u64(refresh.full_parsed_files),
+        reused_files: saturating_u64(refresh.reused_files),
+        incrementally_reduced_threads: saturating_u64(refresh.incrementally_reduced_threads),
+        full_rebuild: refresh.full_rebuild,
+        tasks: saturating_u64(tasks),
+        turns: saturating_u64(turns),
+        calls: saturating_u64(calls),
+        stages,
+    });
+}
+
+fn elapsed_us(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn mark_incomplete_window_coverage(

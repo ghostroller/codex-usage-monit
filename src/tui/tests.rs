@@ -8,6 +8,110 @@ use ratatui::backend::TestBackend;
 
 const RESUMABLE_THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
 
+#[cfg(not(windows))]
+#[test]
+fn button_mouse_capture_keeps_click_drag_and_wide_coordinates_without_hover_events() {
+    let mut output = Vec::new();
+    enable_button_mouse_capture(&mut output).unwrap();
+
+    let encoded = String::from_utf8(output).unwrap();
+    assert!(encoded.contains("?1000h"));
+    assert!(encoded.contains("?1002h"));
+    assert!(encoded.contains("?1006h"));
+    assert!(!encoded.contains("?1003h"));
+
+    let mut output = Vec::new();
+    disable_button_mouse_capture(&mut output).unwrap();
+    let encoded = String::from_utf8(output).unwrap();
+    assert!(encoded.contains("?1002l"));
+    assert!(!encoded.contains("?1003l"));
+}
+
+#[test]
+fn redraw_reasons_are_coalesced_for_one_logged_frame() {
+    let mut reasons = RedrawReasons::default();
+    assert!(reasons.is_empty());
+
+    reasons.insert(RedrawReasons::INPUT);
+    reasons.insert(RedrawReasons::SNAPSHOT);
+    reasons.insert(RedrawReasons::NOTICE);
+    assert_eq!(reasons.label(), "input+snapshot+notice");
+
+    reasons.clear();
+    assert!(reasons.is_empty());
+}
+
+#[test]
+fn run_loop_poll_timeout_sleeps_until_work_and_checks_workers_promptly() {
+    let mut app = mouse_test_app(1);
+    let now = Instant::now();
+    app.last_local_refresh = now.checked_sub(Duration::from_millis(500)).unwrap();
+
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, now),
+        Duration::from_millis(1_500)
+    );
+
+    app.worker_running = true;
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, now),
+        BACKGROUND_CHANNEL_POLL
+    );
+
+    app.worker_running = false;
+    app.launching_threads.insert("opening".to_string());
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, now),
+        BACKGROUND_CHANNEL_POLL
+    );
+
+    app.launching_threads.clear();
+    app.open_notice = Some(OpenNotice {
+        message: "brief".to_string(),
+        tone: OpenNoticeTone::Info,
+        created_at: now.checked_sub(Duration::from_millis(7_900)).unwrap(),
+    });
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, now),
+        Duration::from_millis(100)
+    );
+}
+
+#[test]
+fn mouse_moves_never_request_a_redraw_and_notices_expire_once() {
+    let mut app = mouse_test_app(1);
+    app.open_quit_confirmation();
+    let moved = mouse_event(MouseEventKind::Moved, 1, 1);
+    let handled = handle_mouse_event(&mut app, moved);
+    assert!(
+        handled,
+        "the modal still consumes background mouse movement"
+    );
+    assert!(!mouse_event_requests_redraw(MouseEventKind::Moved, handled));
+    assert!(mouse_event_requests_redraw(
+        MouseEventKind::ScrollDown,
+        true
+    ));
+    assert!(mouse_event_requests_redraw(
+        MouseEventKind::Down(MouseButton::Left),
+        false
+    ));
+    assert!(!mouse_event_requests_redraw(
+        MouseEventKind::ScrollDown,
+        false
+    ));
+
+    let now = Instant::now();
+    app.open_notice = Some(OpenNotice {
+        message: "expired".to_string(),
+        tone: OpenNoticeTone::Info,
+        created_at: now.checked_sub(OPEN_NOTICE_DURATION).unwrap(),
+    });
+    assert!(app.expire_open_notice_at(now));
+    assert!(app.open_notice.is_none());
+    assert!(!app.expire_open_notice_at(now));
+}
+
 fn mouse_test_app(task_count: usize) -> App {
     interaction_test_app(task_count, 0)
 }

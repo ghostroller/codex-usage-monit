@@ -11,9 +11,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Local;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
+#[cfg(windows)]
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -53,13 +55,16 @@ use crate::session_launch::{
     focus_existing_pane, prepare_resume_copy_command, prepare_zellij_focus, prepare_zellij_launch,
     render_posix_resume_command,
 };
-use crate::snapshot::{CollectionResult, collect_snapshot_cached};
+use crate::snapshot::{
+    CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
+};
 use crate::ui_state::{
     UiState, UiStateStore, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
+const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
 const OPEN_NOTICE_DURATION: Duration = Duration::from_secs(8);
@@ -697,11 +702,55 @@ struct ResumeLaunchCompletion {
     result: Result<ResumeLaunchOutcome, String>,
 }
 
+struct RefreshCompletion {
+    result: Option<CollectionResult>,
+    refreshed_account: bool,
+}
+
 struct RunLoopChannels<'a> {
-    refresh_sender: &'a mpsc::Sender<(CollectionResult, bool)>,
-    refresh_receiver: &'a Receiver<(CollectionResult, bool)>,
+    refresh_sender: &'a mpsc::Sender<RefreshCompletion>,
+    refresh_receiver: &'a Receiver<RefreshCompletion>,
     resume_sender: &'a mpsc::Sender<ResumeLaunchCompletion>,
     resume_receiver: &'a Receiver<ResumeLaunchCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RedrawReasons(u8);
+
+impl RedrawReasons {
+    const INPUT: u8 = 1 << 0;
+    const SNAPSHOT: u8 = 1 << 1;
+    const RESUME: u8 = 1 << 2;
+    const NOTICE: u8 = 1 << 3;
+    const RESIZE: u8 = 1 << 4;
+
+    fn insert(&mut self, reason: u8) {
+        self.0 |= reason;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
+
+    fn label(self) -> String {
+        let mut labels = Vec::with_capacity(5);
+        for (reason, label) in [
+            (Self::INPUT, "input"),
+            (Self::SNAPSHOT, "snapshot"),
+            (Self::RESUME, "resume"),
+            (Self::NOTICE, "notice"),
+            (Self::RESIZE, "resize"),
+        ] {
+            if self.0 & reason != 0 {
+                labels.push(label);
+            }
+        }
+        labels.join("+")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -927,6 +976,16 @@ impl App {
             tone,
             created_at: Instant::now(),
         });
+    }
+
+    fn expire_open_notice_at(&mut self, now: Instant) -> bool {
+        let expired = self.open_notice.as_ref().is_some_and(|notice| {
+            now.saturating_duration_since(notice.created_at) >= OPEN_NOTICE_DURATION
+        });
+        if expired {
+            self.open_notice = None;
+        }
+        expired
     }
 
     fn open_config_unavailable_reason(&self) -> Option<String> {
@@ -2047,6 +2106,11 @@ impl App {
         }
     }
 
+    fn finish_unchanged_refresh(&mut self) {
+        self.worker_running = false;
+        self.last_local_refresh = Instant::now();
+    }
+
     fn select_next(&mut self) {
         let filtered = self.filtered_task_indices();
         let Some(position) = filtered
@@ -2970,7 +3034,7 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     terminal.clear()?;
     terminal_setup_span.finish("clear=true");
 
-    let (sender, receiver) = mpsc::channel::<(CollectionResult, bool)>();
+    let (sender, receiver) = mpsc::channel::<RefreshCompletion>();
     let (resume_sender, resume_receiver) = mpsc::channel::<ResumeLaunchCompletion>();
     let channels = RunLoopChannels {
         refresh_sender: &sender,
@@ -2987,6 +3051,7 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
         &ui_state_store,
     );
     let _ = ui_state_store.save(&app.ui_state());
+    config.perf_log.finish();
     terminal.show_cursor()?;
     result
 }
@@ -3098,41 +3163,67 @@ fn run_loop(
     ui_state_store: &UiStateStore,
 ) -> Result<()> {
     let mut first_frame = true;
+    let mut redraw_reasons = RedrawReasons::default();
     loop {
-        while let Ok((result, refreshed_account)) = channels.refresh_receiver.try_recv() {
-            app.replace(result, refreshed_account);
+        while let Ok(completion) = channels.refresh_receiver.try_recv() {
+            if let Some(result) = completion.result {
+                app.replace(result, completion.refreshed_account);
+                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+            } else {
+                app.finish_unchanged_refresh();
+            }
         }
         while let Ok(completion) = channels.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
+            redraw_reasons.insert(RedrawReasons::RESUME);
+        }
+        if app.expire_open_notice_at(Instant::now()) {
+            redraw_reasons.insert(RedrawReasons::NOTICE);
         }
 
         if first_frame {
             let draw_span = config.startup_trace.span("tui.first_frame");
+            let draw_started = Instant::now();
             terminal.draw(|frame| render(frame, app))?;
+            config.perf_log.record_draw(draw_started.elapsed());
             draw_span.finish("backend=crossterm");
             config
                 .startup_trace
                 .finish("startup.ready", "mode=tui backend=crossterm");
             first_frame = false;
-        } else {
+            redraw_reasons.clear();
+        } else if !redraw_reasons.is_empty() {
+            let reasons = redraw_reasons;
+            let draw_span = config.startup_trace.span("tui.draw");
+            let draw_started = Instant::now();
             terminal.draw(|frame| render(frame, app))?;
+            config.perf_log.record_draw(draw_started.elapsed());
+            draw_span.finish_with(|| format!("backend=crossterm reason={}", reasons.label()));
+            redraw_reasons.clear();
         }
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(next_run_loop_poll_timeout(app, Instant::now()))? {
+            config.perf_log.record_event_wakeup();
             let previous_ui_state = app.ui_state();
             let mut should_quit = false;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    redraw_reasons.insert(RedrawReasons::INPUT);
                     if handle_key_event(app, key) {
                         should_quit = true;
                     }
                 }
                 Event::Mouse(mouse) => {
-                    handle_mouse_event(app, mouse);
+                    let kind = mouse.kind;
+                    let handled = handle_mouse_event(app, mouse);
+                    if mouse_event_requests_redraw(kind, handled) {
+                        redraw_reasons.insert(RedrawReasons::INPUT);
+                    }
                     if app.quit_requested {
                         should_quit = true;
                     }
                 }
+                Event::Resize(_, _) => redraw_reasons.insert(RedrawReasons::RESIZE),
                 _ => {}
             }
             let current_ui_state = app.ui_state();
@@ -3169,17 +3260,53 @@ fn run_loop(
                     let mut cache = worker_cache
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    collect_snapshot_cached(
-                        &worker_config,
-                        Some(cached_account),
-                        refresh_account,
-                        &mut cache,
-                    )
+                    if refresh_account {
+                        Some(collect_snapshot_cached(
+                            &worker_config,
+                            Some(cached_account),
+                            true,
+                            &mut cache,
+                        ))
+                    } else {
+                        collect_snapshot_cached_if_changed(
+                            &worker_config,
+                            Some(cached_account),
+                            &mut cache,
+                        )
+                    }
                 };
-                let _ = worker_sender.send((result, refresh_account));
+                let _ = worker_sender.send(RefreshCompletion {
+                    result,
+                    refreshed_account: refresh_account,
+                });
             });
         }
+        config.perf_log.maybe_sample();
     }
+}
+
+fn mouse_event_requests_redraw(kind: MouseEventKind, handled: bool) -> bool {
+    !matches!(kind, MouseEventKind::Moved)
+        && (handled || matches!(kind, MouseEventKind::Down(MouseButton::Left)))
+}
+
+fn next_run_loop_poll_timeout(app: &App, now: Instant) -> Duration {
+    let local_refresh_wait =
+        LOCAL_REFRESH.saturating_sub(now.saturating_duration_since(app.last_local_refresh));
+    let mut timeout = if app.worker_running {
+        BACKGROUND_CHANNEL_POLL
+    } else {
+        local_refresh_wait
+    };
+    if !app.launching_threads.is_empty() {
+        timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
+    }
+    if let Some(notice) = app.open_notice.as_ref() {
+        let notice_wait =
+            OPEN_NOTICE_DURATION.saturating_sub(now.saturating_duration_since(notice.created_at));
+        timeout = timeout.min(notice_wait);
+    }
+    timeout
 }
 
 fn write_osc52_clipboard<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
@@ -5916,11 +6043,42 @@ fn provenance_label(provenance: Provenance) -> &'static str {
 
 struct TerminalGuard;
 
+#[cfg(not(windows))]
+const BUTTON_MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
+#[cfg(not(windows))]
+const BUTTON_MOUSE_CAPTURE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1000l";
+
+fn enable_button_mouse_capture<W: Write>(writer: &mut W) -> io::Result<()> {
+    #[cfg(windows)]
+    execute!(writer, EnableMouseCapture)?;
+    #[cfg(not(windows))]
+    {
+        writer.write_all(BUTTON_MOUSE_CAPTURE_ENABLE)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn disable_button_mouse_capture<W: Write>(writer: &mut W) -> io::Result<()> {
+    #[cfg(windows)]
+    execute!(writer, DisableMouseCapture)?;
+    #[cfg(not(windows))]
+    {
+        writer.write_all(BUTTON_MOUSE_CAPTURE_DISABLE)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let mut stdout = io::stdout();
+        let entered = execute!(stdout, EnterAlternateScreen)
+            .and_then(|()| enable_button_mouse_capture(&mut stdout));
+        if let Err(error) = entered {
+            let _ = disable_button_mouse_capture(&mut stdout);
+            let _ = execute!(stdout, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -5930,7 +6088,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let mut stdout = io::stdout();
+        let _ = disable_button_mouse_capture(&mut stdout);
+        let _ = execute!(stdout, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }

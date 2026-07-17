@@ -10,9 +10,18 @@ use crate::config::CollectConfig;
 use crate::output::{
     OutputFormat, OutputRequest, Section, render_output, request_is_failure, request_is_partial,
 };
+use crate::perf::PerfLog;
 use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
 use crate::startup::StartupTrace;
 use crate::tui::Theme;
+
+struct PerfLogGuard(PerfLog);
+
+impl Drop for PerfLogGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,6 +59,10 @@ pub struct Cli {
     /// Write incremental cold-start timing events as JSONL.
     #[arg(long, value_name = "FILE")]
     startup_log: Option<PathBuf>,
+
+    /// Write low-overhead runtime performance samples as JSONL.
+    #[arg(long, global = true, value_name = "FILE")]
+    perf_log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -195,6 +208,12 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         StartupTrace::default()
     };
     let trace_initialized_at = Instant::now();
+    let perf_log = cli
+        .perf_log
+        .as_deref()
+        .map(PerfLog::enabled)
+        .unwrap_or_default();
+    let _perf_log_guard = PerfLogGuard(perf_log.clone());
     trace.record_interval(
         "cli.parse",
         process_started,
@@ -223,6 +242,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     } else {
         crate::cache::default_rollout_cache_dir()
     };
+    config.perf_log = perf_log;
     config.startup_trace = trace.clone();
     config_span.finish_with(|| {
         format!(
@@ -442,6 +462,30 @@ mod tests {
                 height: 30,
             }))
         ));
+    }
+
+    #[test]
+    fn runtime_perf_log_is_optional_and_global() {
+        let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
+        assert_eq!(default.perf_log, None);
+
+        let before = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--perf-log",
+            "/tmp/perf.jsonl",
+            "snapshot",
+        ])
+        .unwrap();
+        assert_eq!(before.perf_log, Some(PathBuf::from("/tmp/perf.jsonl")));
+
+        let after = Cli::try_parse_from([
+            "codex-usage-monit",
+            "snapshot",
+            "--perf-log",
+            "/tmp/perf.jsonl",
+        ])
+        .unwrap();
+        assert_eq!(after.perf_log, Some(PathBuf::from("/tmp/perf.jsonl")));
     }
 
     #[test]

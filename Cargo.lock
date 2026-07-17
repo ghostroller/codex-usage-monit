@@ -191,6 +191,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "pretty_assertions",
  "ratatui",
  "serde",
