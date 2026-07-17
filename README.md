@@ -41,7 +41,7 @@ sh install.sh
 安装器会校验 Release 中的 SHA-256，默认安装到 `~/.local/bin`，并为 zsh、bash 或 POSIX shell 在对应的用户配置文件中幂等加入 PATH。无法安全识别配置文件或配置文件是符号链接时，只安装程序并给出手动 PATH 提示。也可以固定版本、自定义目录或禁止修改 PATH：
 
 ```bash
-sh install.sh --version v0.1.1
+sh install.sh --version v0.2.0
 sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
