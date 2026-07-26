@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-07-12T04:30:00Z",
+  "partial": true,
+  "codexHome": "/fixtures/.codex",
+  "sources": [
+    {
+      "source": "rollout_jsonl",
+      "status": "ok",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": "0 files"
+    },
+    {
+      "source": "app_server",
+      "status": "offline",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": "disabled by --offline"
+    }
+  ],
+  "limits": [],
+  "rateLimitResetCreditsPartial": false,
+  "accountUsage": null,
+  "tasks": [],
+  "turns": [],
+  "models": [],
+  "attribution": {
+    "window": null,
+    "localTokenUsage": {
+      "inputTokens": 0,
+      "cachedInputTokens": 0,
+      "outputTokens": 0,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 0
+    },
+    "observedDeltaPercent": 0.0,
+    "estimatedAssignedPercent": 0.0,
+    "proxyProjectedPercent": 0.0,
+    "unattributedPercent": 0.0,
+    "attributionCoveragePercent": 0.0,
+    "externalActivityPossible": false,
+    "confidence": "unknown",
+    "method": "unavailable",
+    "settled": false
+  },
+  "windowAnalyses": [],
+  "stats": {
+    "discoveredFiles": 0,
+    "scannedFiles": 0,
+    "truncatedFiles": 0,
+    "unreadableFiles": 0,
+    "parsedLines": 0,
+    "skippedLines": 0,
+    "ambiguousTokenResets": 0
+  },
+  "warnings": ["No Codex rollout files were found"],
+  "errors": []
+}

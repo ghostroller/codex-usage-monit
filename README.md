@@ -342,6 +342,7 @@ The first run, a parser-version change, or a disabled cache can be slower becaus
 
 - [Data capabilities and limits](docs/codex-data-capabilities.md)
 - [Terminal resume behavior](docs/codex-terminal-resume.md)
+- [TUI integration testing](docs/tui-integration-testing.md)
 - [Changelog](CHANGELOG.md)
 
 ## License

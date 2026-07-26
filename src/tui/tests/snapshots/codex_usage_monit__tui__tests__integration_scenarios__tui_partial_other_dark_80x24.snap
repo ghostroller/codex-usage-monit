@@ -1,0 +1,94 @@
+---
+source: src/tui/tests/integration_scenarios.rs
+expression: diagnostics.frame().snapshot_text()
+---
+size=80x24
+rows:
+00| 1 Overview  |  2 Other
+01|┌Sources───────────────────────────────────────────────────────────────────────┐
+02|│SOURCE             STATE      AS OF      DETAIL                               │
+03|│rollout_jsonl      partial    04:30:00   4 files, 1 truncated, 1 line skipped │
+04|│app_server         error      04:30:00   mock app-server unavailable          │
+05|└──────────────────────────────────────────────────────────────────────────────┘
+06|┌Collection────────────────────────────────────────────────────────────────────┐
+07|│Files  4/4 scanned (1 truncated, 0 unreadable)    Lines  81 parsed / 1 skipped│
+08|│Tasks  0 running    0 completed    0 stale/unknown                            │
+09|│Snapshot  2026-07-12 04:30:00 UTC    Schema v1    Partial true                │
+10|└──────────────────────────────────────────────────────────────────────────────┘
+11|┌Resets · credits unavailable · PARTIAL────────────────────────────────────────┐
+12|│No reset-window data                                                          │
+13|└──────────────────────────────────────────────────────────────────────────────┘
+14|┌Diagnostics───────────────────────────────────────────────────────────────────┐
+15|│mock malformed rollout tail                                                   │
+16|│rollout scan was incomplete                                                   │
+17|│app-server refresh failed                                                     │
+18|│                                                                              │
+19|│                                                                              │
+20|│                                                                              │
+21|│                                                                              │
+22|│                                                                              │
+23|└──────────────────────────────────────────────────────────────────────────────┘
+styles:
+00:001+001 fg=#3fb9c0 bg=#121417 mods=bold text="1"
+00:002+014 fg=#7e8691 bg=#121417 mods=none text=" Overview  |  "
+00:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="2"
+00:018+005 fg=#f4f6f8 bg=#121417 mods=bold text="Other"
+01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
+01:001+007 fg=#f4f6f8 bg=#121417 mods=bold text="Sources"
+01:008+072 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────────────────────────────────────┐"
+02:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+02:001+078 fg=#3fb9c0 bg=#121417 mods=bold text="SOURCE             STATE      AS OF      DETAIL                               "
+02:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+03:001+078 fg=#dadee4 bg=#121417 mods=none text="rollout_jsonl      partial    04:30:00   4 files, 1 truncated, 1 line skipped "
+03:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+04:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+04:001+078 fg=#dadee4 bg=#121417 mods=none text="app_server         error      04:30:00   mock app-server unavailable          "
+04:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+05:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+06:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
+06:001+010 fg=#f4f6f8 bg=#121417 mods=bold text="Collection"
+06:011+069 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────────────────────┐"
+07:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+07:001+078 fg=#dadee4 bg=#121417 mods=none text="Files  4/4 scanned (1 truncated, 0 unreadable)    Lines  81 parsed / 1 skipped"
+07:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+08:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+08:001+078 fg=#dadee4 bg=#121417 mods=none text="Tasks  0 running    0 completed    0 stale/unknown                            "
+08:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+09:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+09:001+078 fg=#dadee4 bg=#121417 mods=none text="Snapshot  2026-07-12 04:30:00 UTC    Schema v1    Partial true                "
+09:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+10:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+11:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
+11:001+038 fg=#f4f6f8 bg=#121417 mods=bold text="Resets · credits unavailable · PARTIAL"
+11:039+041 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────┐"
+12:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+12:001+078 fg=#7e8691 bg=#121417 mods=none text="No reset-window data                                                          "
+12:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+13:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+14:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
+14:001+011 fg=#f4f6f8 bg=#121417 mods=bold text="Diagnostics"
+14:012+068 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────────────────────────────────┐"
+15:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+15:001+027 fg=#f87171 bg=#121417 mods=none text="mock malformed rollout tail"
+15:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+16:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+16:001+027 fg=#facc15 bg=#121417 mods=none text="rollout scan was incomplete"
+16:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+17:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+17:001+025 fg=#facc15 bg=#121417 mods=none text="app-server refresh failed"
+17:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+18:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+18:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+19:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+19:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+20:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+20:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+21:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+21:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+22:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+22:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+23:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+controls:
+ViewOverview binding=1 rect=0,0,12,1
+ViewOther binding=2 rect=15,0,9,1

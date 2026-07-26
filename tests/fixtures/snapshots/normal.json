@@ -1,0 +1,420 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-07-12T04:30:00Z",
+  "partial": false,
+  "codexHome": "/fixtures/.codex",
+  "sources": [
+    {
+      "source": "rollout_jsonl",
+      "status": "ok",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": "3 files"
+    },
+    {
+      "source": "app_server",
+      "status": "ok",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": null
+    }
+  ],
+  "limits": [
+    {
+      "limitId": "codex",
+      "limitName": "Codex",
+      "planType": "plus",
+      "primary": {
+        "usedPercent": 37.5,
+        "remainingPercent": 62.5,
+        "windowDurationMins": 300,
+        "resetsAt": "2026-07-12T06:30:00Z"
+      },
+      "secondary": {
+        "usedPercent": 42.0,
+        "remainingPercent": 58.0,
+        "windowDurationMins": 10080,
+        "resetsAt": "2026-07-16T04:30:00Z"
+      },
+      "credits": null,
+      "rateLimitReachedType": null,
+      "provenance": "server_snapshot",
+      "asOf": "2026-07-12T04:30:00Z"
+    }
+  ],
+  "rateLimitResetCredits": {
+    "availableCount": 1,
+    "credits": [
+      {
+        "grantedAt": "2026-07-11T04:30:00Z",
+        "expiresAt": "2026-07-14T04:30:00Z",
+        "status": "available",
+        "resetType": "codexRateLimits",
+        "title": "Reset Codex limits",
+        "description": "One reset opportunity"
+      }
+    ],
+    "provenance": "server_snapshot",
+    "asOf": "2026-07-12T04:30:00Z"
+  },
+  "rateLimitResetCreditsPartial": false,
+  "accountUsage": null,
+  "tasks": [
+    {
+      "threadId": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+      "archived": false,
+      "title": "Build the integration test harness",
+      "cwd": "/work/codex-usage-monit",
+      "source": "desktop",
+      "createdAt": "2026-07-12T01:00:00Z",
+      "updatedAt": "2026-07-12T04:20:00Z",
+      "status": "completed",
+      "statusProvenance": "local_exact",
+      "statusConfidence": "high",
+      "tokenUsage": {
+        "inputTokens": 12000,
+        "cachedInputTokens": 4000,
+        "outputTokens": 3000,
+        "reasoningOutputTokens": 1000,
+        "totalTokens": 15000
+      },
+      "turnCount": 2,
+      "windowTokenUsage": {
+        "inputTokens": 8000,
+        "cachedInputTokens": 2500,
+        "outputTokens": 2000,
+        "reasoningOutputTokens": 700,
+        "totalTokens": 10000
+      },
+      "localTokenSharePercent": 66.7,
+      "estimatedQuotaPercent": 25.0,
+      "quotaConfidence": "low"
+    },
+    {
+      "threadId": "subagent-layout",
+      "parentThreadId": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+      "archived": false,
+      "title": "检查紧凑布局与快捷键 🎛",
+      "cwd": "/work/codex-usage-monit",
+      "source": "subagent",
+      "createdAt": "2026-07-12T02:00:00Z",
+      "updatedAt": "2026-07-12T04:10:00Z",
+      "status": "waiting_input",
+      "statusProvenance": "inferred",
+      "statusConfidence": "medium",
+      "tokenUsage": {
+        "inputTokens": 3500,
+        "cachedInputTokens": 1000,
+        "outputTokens": 1500,
+        "reasoningOutputTokens": 500,
+        "totalTokens": 5000
+      },
+      "turnCount": 1,
+      "windowTokenUsage": {
+        "inputTokens": 3500,
+        "cachedInputTokens": 1000,
+        "outputTokens": 1500,
+        "reasoningOutputTokens": 500,
+        "totalTokens": 5000
+      },
+      "localTokenSharePercent": 33.3,
+      "estimatedQuotaPercent": 12.5,
+      "quotaConfidence": "low"
+    },
+    {
+      "threadId": "cli-audit",
+      "archived": false,
+      "title": "Audit output and diagnostics",
+      "cwd": "/work/codex-usage-monit",
+      "source": "cli",
+      "createdAt": "2026-07-11T22:00:00Z",
+      "updatedAt": "2026-07-12T03:50:00Z",
+      "status": "failed",
+      "statusProvenance": "local_exact",
+      "statusConfidence": "high",
+      "tokenUsage": {
+        "inputTokens": 1500,
+        "cachedInputTokens": 200,
+        "outputTokens": 500,
+        "reasoningOutputTokens": 100,
+        "totalTokens": 2000
+      },
+      "turnCount": 1,
+      "windowTokenUsage": {
+        "inputTokens": 0,
+        "cachedInputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 0
+      },
+      "localTokenSharePercent": 0.0,
+      "estimatedQuotaPercent": 0.0,
+      "quotaConfidence": "unknown"
+    }
+  ],
+  "turns": [
+    {
+      "threadId": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+      "turnId": "turn-main-2",
+      "model": "gpt-5.3-codex",
+      "reasoningEffort": "high",
+      "serviceTier": null,
+      "messagePreview": "Add deterministic TUI scenarios and snapshots",
+      "startedAt": "2026-07-12T04:00:00Z",
+      "completedAt": "2026-07-12T04:20:00Z",
+      "durationMs": 1200000,
+      "status": "completed",
+      "tokenUsage": {
+        "inputTokens": 7000,
+        "cachedInputTokens": 2500,
+        "outputTokens": 2000,
+        "reasoningOutputTokens": 700,
+        "totalTokens": 9000
+      },
+      "windowTokenUsage": {
+        "inputTokens": 7000,
+        "cachedInputTokens": 2500,
+        "outputTokens": 2000,
+        "reasoningOutputTokens": 700,
+        "totalTokens": 9000
+      },
+      "localTokenSharePercent": 60.0,
+      "estimatedQuotaPercent": 22.5,
+      "quotaConfidence": "low"
+    },
+    {
+      "threadId": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+      "turnId": "turn-main-1",
+      "model": "gpt-5.3-codex",
+      "reasoningEffort": "medium",
+      "serviceTier": "priority",
+      "messagePreview": "Inspect the existing TUI architecture",
+      "startedAt": "2026-07-12T01:00:00Z",
+      "completedAt": "2026-07-12T01:10:00Z",
+      "durationMs": 600000,
+      "status": "completed",
+      "tokenUsage": {
+        "inputTokens": 5000,
+        "cachedInputTokens": 1500,
+        "outputTokens": 1000,
+        "reasoningOutputTokens": 300,
+        "totalTokens": 6000
+      },
+      "windowTokenUsage": {
+        "inputTokens": 1000,
+        "cachedInputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 1000
+      },
+      "localTokenSharePercent": 6.7,
+      "estimatedQuotaPercent": 2.5,
+      "quotaConfidence": "low"
+    },
+    {
+      "threadId": "subagent-layout",
+      "turnId": "turn-subagent-1",
+      "model": "gpt-5.3-codex-spark",
+      "reasoningEffort": "high",
+      "serviceTier": null,
+      "messagePreview": "Exercise compact and Unicode layouts",
+      "startedAt": "2026-07-12T03:30:00Z",
+      "completedAt": null,
+      "durationMs": null,
+      "status": "in_progress",
+      "tokenUsage": {
+        "inputTokens": 3500,
+        "cachedInputTokens": 1000,
+        "outputTokens": 1500,
+        "reasoningOutputTokens": 500,
+        "totalTokens": 5000
+      },
+      "windowTokenUsage": {
+        "inputTokens": 3500,
+        "cachedInputTokens": 1000,
+        "outputTokens": 1500,
+        "reasoningOutputTokens": 500,
+        "totalTokens": 5000
+      },
+      "localTokenSharePercent": 33.3,
+      "estimatedQuotaPercent": 12.5,
+      "quotaConfidence": "low"
+    }
+  ],
+  "models": [
+    {
+      "model": "gpt-5.3-codex",
+      "tokenUsage": {
+        "inputTokens": 8000,
+        "cachedInputTokens": 2500,
+        "outputTokens": 2000,
+        "reasoningOutputTokens": 700,
+        "totalTokens": 10000
+      },
+      "localTokenSharePercent": 100.0,
+      "estimatedQuotaPercent": 37.5,
+      "quotaConfidence": "low"
+    }
+  ],
+  "attribution": {
+    "window": {
+      "limitId": "codex",
+      "label": "5h",
+      "startsAt": "2026-07-12T01:30:00Z",
+      "endsAt": "2026-07-12T06:30:00Z",
+      "usedPercent": 37.5
+    },
+    "localTokenUsage": {
+      "inputTokens": 8000,
+      "cachedInputTokens": 2500,
+      "outputTokens": 2000,
+      "reasoningOutputTokens": 700,
+      "totalTokens": 10000
+    },
+    "observedDeltaPercent": 37.5,
+    "estimatedAssignedPercent": 37.5,
+    "proxyProjectedPercent": 37.5,
+    "unattributedPercent": 0.0,
+    "attributionCoveragePercent": 100.0,
+    "externalActivityPossible": false,
+    "confidence": "low",
+    "method": "price_weighted_local_share",
+    "settled": false
+  },
+  "windowAnalyses": [
+    {
+      "durationMins": 300,
+      "attribution": {
+        "window": {
+          "limitId": "codex",
+          "label": "5h",
+          "startsAt": "2026-07-12T01:30:00Z",
+          "endsAt": "2026-07-12T06:30:00Z",
+          "usedPercent": 37.5
+        },
+        "localTokenUsage": {
+          "inputTokens": 8000,
+          "cachedInputTokens": 2500,
+          "outputTokens": 2000,
+          "reasoningOutputTokens": 700,
+          "totalTokens": 10000
+        },
+        "observedDeltaPercent": 37.5,
+        "estimatedAssignedPercent": 37.5,
+        "proxyProjectedPercent": 37.5,
+        "unattributedPercent": 0.0,
+        "attributionCoveragePercent": 100.0,
+        "externalActivityPossible": false,
+        "confidence": "low",
+        "method": "price_weighted_local_share",
+        "settled": false
+      },
+      "partial": false,
+      "partialReasons": [],
+      "threads": [
+        {
+          "threadId": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+          "usage": {
+            "tokenUsage": {
+              "inputTokens": 8000,
+              "cachedInputTokens": 2500,
+              "outputTokens": 2000,
+              "reasoningOutputTokens": 700,
+              "totalTokens": 10000
+            },
+            "localTokenSharePercent": 66.7,
+            "estimatedQuotaPercent": 25.0,
+            "quotaConfidence": "low"
+          }
+        },
+        {
+          "threadId": "subagent-layout",
+          "usage": {
+            "tokenUsage": {
+              "inputTokens": 3500,
+              "cachedInputTokens": 1000,
+              "outputTokens": 1500,
+              "reasoningOutputTokens": 500,
+              "totalTokens": 5000
+            },
+            "localTokenSharePercent": 33.3,
+            "estimatedQuotaPercent": 12.5,
+            "quotaConfidence": "low"
+          }
+        }
+      ],
+      "turns": [],
+      "models": [
+        {
+          "model": "gpt-5.3-codex",
+          "tokenUsage": {
+            "inputTokens": 8000,
+            "cachedInputTokens": 2500,
+            "outputTokens": 2000,
+            "reasoningOutputTokens": 700,
+            "totalTokens": 10000
+          },
+          "localTokenSharePercent": 100.0,
+          "estimatedQuotaPercent": 37.5,
+          "quotaConfidence": "low"
+        }
+      ]
+    },
+    {
+      "durationMins": 10080,
+      "attribution": {
+        "window": {
+          "limitId": "codex",
+          "label": "week",
+          "startsAt": "2026-07-09T04:30:00Z",
+          "endsAt": "2026-07-16T04:30:00Z",
+          "usedPercent": 42.0
+        },
+        "localTokenUsage": {
+          "inputTokens": 14000,
+          "cachedInputTokens": 4200,
+          "outputTokens": 4000,
+          "reasoningOutputTokens": 1300,
+          "totalTokens": 19000
+        },
+        "observedDeltaPercent": 42.0,
+        "estimatedAssignedPercent": 42.0,
+        "proxyProjectedPercent": 42.0,
+        "unattributedPercent": 0.0,
+        "attributionCoveragePercent": 100.0,
+        "externalActivityPossible": false,
+        "confidence": "low",
+        "method": "price_weighted_local_share",
+        "settled": false
+      },
+      "partial": false,
+      "partialReasons": [],
+      "threads": [],
+      "turns": [],
+      "models": [
+        {
+          "model": "gpt-5.3-codex",
+          "tokenUsage": {
+            "inputTokens": 14000,
+            "cachedInputTokens": 4200,
+            "outputTokens": 4000,
+            "reasoningOutputTokens": 1300,
+            "totalTokens": 19000
+          },
+          "localTokenSharePercent": 100.0,
+          "estimatedQuotaPercent": 42.0,
+          "quotaConfidence": "low"
+        }
+      ]
+    }
+  ],
+  "stats": {
+    "discoveredFiles": 3,
+    "scannedFiles": 3,
+    "truncatedFiles": 0,
+    "unreadableFiles": 0,
+    "parsedLines": 128,
+    "skippedLines": 0,
+    "ambiguousTokenResets": 0
+  },
+  "warnings": [],
+  "errors": []
+}

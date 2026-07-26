@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use chrono::Local;
+#[cfg(test)]
+use chrono::FixedOffset;
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -84,6 +86,38 @@ const TASK_COLUMN_SPACING: u16 = 1;
 const TASK_HIGHLIGHT_WIDTH: u16 = 1;
 const TASK_TREE_MARKER_WIDTH: u16 = 3;
 const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DISPLAY_OFFSET: std::cell::Cell<Option<FixedOffset>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn format_local_time(value: DateTime<Utc>, format: &str) -> String {
+    #[cfg(test)]
+    if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
+        return value.with_timezone(&offset).format(format).to_string();
+    }
+
+    value.with_timezone(&Local).format(format).to_string()
+}
+
+#[cfg(test)]
+struct TestDisplayOffsetGuard(Option<FixedOffset>);
+
+#[cfg(test)]
+impl Drop for TestDisplayOffsetGuard {
+    fn drop(&mut self) {
+        TEST_DISPLAY_OFFSET.with(|current| current.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn with_test_display_offset<T>(offset: FixedOffset, render: impl FnOnce() -> T) -> T {
+    let _guard =
+        TestDisplayOffsetGuard(TEST_DISPLAY_OFFSET.with(|current| current.replace(Some(offset))));
+    render()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Theme {
@@ -4074,16 +4108,8 @@ fn reset_expiry_gauge_alert_lines(reminder: ResetExpiryReminder, width: u16) -> 
         }
     }
 
-    let date = reminder
-        .expires_at
-        .with_timezone(&Local)
-        .format("%Y-%m-%d")
-        .to_string();
-    let time = reminder
-        .expires_at
-        .with_timezone(&Local)
-        .format("%H:%M:%S %:z")
-        .to_string();
+    let date = format_local_time(reminder.expires_at, "%Y-%m-%d");
+    let time = format_local_time(reminder.expires_at, "%H:%M:%S %:z");
     let date_line = format!("! EXP {date}");
     if UnicodeWidthStr::width(date_line.as_str()) <= max_width
         && UnicodeWidthStr::width(time.as_str()) <= max_width
@@ -4204,13 +4230,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Row::new([
             Cell::from(terminal_safe_text(&source.source)),
             Cell::from(terminal_safe_text(&source.status)),
-            Cell::from(
-                source
-                    .as_of
-                    .with_timezone(&Local)
-                    .format("%H:%M:%S")
-                    .to_string(),
-            ),
+            Cell::from(format_local_time(source.as_of, "%H:%M:%S")),
             Cell::from(terminal_safe_text(
                 source.message.as_deref().unwrap_or_default(),
             )),
@@ -4308,24 +4328,19 @@ fn reset_window_count(snapshot: &Snapshot) -> usize {
 
 fn local_full_time_label(value: Option<chrono::DateTime<chrono::Utc>>, missing: &str) -> String {
     value
-        .map(|value| {
-            value
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        })
+        .map(|value| format_local_time(value, "%Y-%m-%d %H:%M:%S %:z"))
         .unwrap_or_else(|| missing.to_string())
 }
 
 fn local_granted_time_label(value: chrono::DateTime<chrono::Utc>, compact: bool) -> String {
-    value
-        .with_timezone(&Local)
-        .format(if compact {
+    format_local_time(
+        value,
+        if compact {
             "%m-%d %H:%M"
         } else {
             "%Y-%m-%d %H:%M:%S %:z"
-        })
-        .to_string()
+        },
+    )
 }
 
 fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
@@ -4542,16 +4557,11 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
     for (index, (bucket, window)) in windows.iter().enumerate() {
         let reset = window
             .resets_at
-            .map(|value| {
-                value
-                    .with_timezone(&Local)
-                    .format("%m-%d %H:%M")
-                    .to_string()
-            })
+            .map(|value| format_local_time(value, "%m-%d %H:%M"))
             .unwrap_or_else(|| "unknown".to_string());
         let reset_time = window
             .resets_at
-            .map(|value| value.with_timezone(&Local).format("%H:%M").to_string())
+            .map(|value| format_local_time(value, "%H:%M"))
             .unwrap_or_else(|| "?".to_string());
         let color = quota_color(window.used_percent, theme);
         let title = format!(
@@ -5748,12 +5758,7 @@ fn format_duration(duration_ms: Option<u64>) -> String {
 
 fn format_turn_timestamp(value: Option<&chrono::DateTime<chrono::Utc>>) -> String {
     value
-        .map(|value| {
-            value
-                .with_timezone(&Local)
-                .format("%m-%d %H:%M:%S")
-                .to_string()
-        })
+        .map(|value| format_local_time(*value, "%m-%d %H:%M:%S"))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -5781,8 +5786,8 @@ fn attribution_summary_lines(
                 "{} reset cycle · {:.1}% used · {} to {}",
                 terminal_safe_text(&window.label),
                 window.used_percent,
-                window.starts_at.with_timezone(&Local).format("%m-%d %H:%M"),
-                window.ends_at.with_timezone(&Local).format("%m-%d %H:%M")
+                format_local_time(window.starts_at, "%m-%d %H:%M"),
+                format_local_time(window.ends_at, "%m-%d %H:%M")
             )
         })
         .unwrap_or_else(|| format!("{} reset cycle unavailable", window_scope.label()));

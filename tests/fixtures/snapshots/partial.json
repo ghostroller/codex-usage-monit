@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-07-12T04:30:00Z",
+  "partial": true,
+  "codexHome": "/fixtures/.codex",
+  "sources": [
+    {
+      "source": "rollout_jsonl",
+      "status": "partial",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": "4 files, 1 truncated, 1 line skipped"
+    },
+    {
+      "source": "app_server",
+      "status": "error",
+      "asOf": "2026-07-12T04:30:00Z",
+      "message": "mock app-server unavailable"
+    }
+  ],
+  "limits": [],
+  "rateLimitResetCreditsPartial": true,
+  "accountUsage": null,
+  "tasks": [],
+  "turns": [],
+  "models": [],
+  "attribution": {
+    "window": null,
+    "localTokenUsage": {
+      "inputTokens": 0,
+      "cachedInputTokens": 0,
+      "outputTokens": 0,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 0
+    },
+    "observedDeltaPercent": 0.0,
+    "estimatedAssignedPercent": 0.0,
+    "proxyProjectedPercent": 0.0,
+    "unattributedPercent": 0.0,
+    "attributionCoveragePercent": 0.0,
+    "externalActivityPossible": true,
+    "confidence": "unknown",
+    "method": "unavailable",
+    "settled": false
+  },
+  "windowAnalyses": [],
+  "stats": {
+    "discoveredFiles": 4,
+    "scannedFiles": 4,
+    "truncatedFiles": 1,
+    "unreadableFiles": 0,
+    "parsedLines": 81,
+    "skippedLines": 1,
+    "ambiguousTokenResets": 0
+  },
+  "warnings": [
+    "rollout scan was incomplete",
+    "app-server refresh failed"
+  ],
+  "errors": [
+    "mock malformed rollout tail"
+  ]
+}
