@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added an exact local expiry reminder inside the Overview weekly quota gauge when the earliest complete, current, available Codex reset credit expires before the ordinary Codex weekly reset.
+
 ## [0.2.1] - 2026-07-18
 
 ### Added
@@ -53,5 +59,6 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.1.1...v0.2.0

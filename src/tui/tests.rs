@@ -886,6 +886,43 @@ fn add_window_analysis(
     });
 }
 
+fn set_window_reset(app: &mut App, scope: WindowScope, reset_at: chrono::DateTime<chrono::Utc>) {
+    add_window_analysis(app, scope, 100, 100.0);
+    let window = app
+        .snapshot
+        .window_analyses
+        .iter_mut()
+        .find(|analysis| analysis.duration_mins == scope.duration_mins())
+        .and_then(|analysis| analysis.attribution.window.as_mut())
+        .expect("window analysis");
+    window.ends_at = reset_at;
+    window.starts_at = reset_at - chrono::Duration::minutes(scope.duration_mins());
+}
+
+fn reset_credit(
+    now: chrono::DateTime<chrono::Utc>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> RateLimitResetCredit {
+    RateLimitResetCredit {
+        granted_at: now - chrono::Duration::hours(1),
+        expires_at,
+        status: "available".to_string(),
+        reset_type: "codexRateLimits".to_string(),
+        title: Some("Reset Codex limits".to_string()),
+        description: None,
+    }
+}
+
+fn set_reset_credits(app: &mut App, available_count: u64, credits: Vec<RateLimitResetCredit>) {
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count,
+        credits: Some(credits),
+        provenance: Provenance::ServerSnapshot,
+        as_of: app.snapshot.as_of,
+    });
+    app.snapshot.rate_limit_reset_credits_partial = false;
+}
+
 fn add_spark_window_analysis(app: &mut App, scope: WindowScope, total_tokens: u64) {
     let mut analysis = app
         .snapshot
@@ -935,6 +972,429 @@ fn quota_thresholds_are_distinct() {
         assert_eq!(quota_color(75.0, theme), palette.warning);
         assert_eq!(quota_color(95.0, theme), palette.error);
     }
+}
+
+#[test]
+fn reset_expiry_reminder_uses_strict_weekly_boundary() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let weekly_reset = now + chrono::Duration::days(4);
+    set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+
+    for (expires_at, expected) in [
+        (Some(now - chrono::Duration::seconds(1)), false),
+        (Some(now), false),
+        (Some(now + chrono::Duration::seconds(1)), true),
+        (Some(weekly_reset - chrono::Duration::seconds(1)), true),
+        (Some(weekly_reset), false),
+        (Some(weekly_reset + chrono::Duration::seconds(1)), false),
+        (None, false),
+    ] {
+        set_reset_credits(&mut app, 1, vec![reset_credit(now, expires_at)]);
+        let reminder = reset_expiry_reminder(&app.snapshot);
+        assert_eq!(reminder.is_some(), expected, "expires_at={expires_at:?}");
+        if expected {
+            assert_eq!(
+                reminder,
+                Some(ResetExpiryReminder {
+                    expires_at: expires_at.unwrap(),
+                    weekly_reset_at: weekly_reset,
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn reset_expiry_gauge_alert_preserves_the_exact_expiry_at_narrow_widths() {
+    let now = chrono::Utc::now();
+    let reminder = ResetExpiryReminder {
+        expires_at: now + chrono::Duration::days(2) + chrono::Duration::seconds(47),
+        weekly_reset_at: now + chrono::Duration::days(4) + chrono::Duration::seconds(29),
+    };
+    let local_expiry = reminder.expires_at.with_timezone(&Local);
+    let expected_date = local_expiry.format("%Y-%m-%d").to_string();
+    let expected_time = local_expiry.format("%H:%M:%S %:z").to_string();
+
+    for width in [58, 38, 28, 18, 12, 1] {
+        let lines = reset_expiry_gauge_alert_lines(reminder, width);
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= usize::from(width.max(1)))
+        );
+        let joined = lines.join(" ");
+        assert!(
+            joined.contains(&expected_date) || lines.concat().contains(&expected_date),
+            "width={width}: {joined}"
+        );
+        assert!(
+            joined.contains(&expected_time) || lines.concat().contains(&expected_time),
+            "width={width}: {joined}"
+        );
+    }
+}
+
+#[test]
+fn reset_expiry_reminder_selects_the_earliest_reliable_available_credit() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let weekly_reset = now + chrono::Duration::days(5);
+    let earliest = now + chrono::Duration::days(2);
+    set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+
+    let mut wrong_status = reset_credit(now, Some(now + chrono::Duration::hours(1)));
+    wrong_status.status = "redeeming".to_string();
+    let mut wrong_type = reset_credit(now, Some(now + chrono::Duration::hours(2)));
+    wrong_type.reset_type = "futureResetType".to_string();
+    let credits = vec![
+        reset_credit(now, Some(now - chrono::Duration::minutes(1))),
+        reset_credit(now, None),
+        reset_credit(now, Some(weekly_reset + chrono::Duration::days(1))),
+        reset_credit(now, Some(now + chrono::Duration::days(3))),
+        reset_credit(now, Some(earliest)),
+        wrong_status,
+        wrong_type,
+    ];
+    set_reset_credits(&mut app, credits.len() as u64, credits);
+
+    assert_eq!(
+        reset_expiry_reminder(&app.snapshot),
+        Some(ResetExpiryReminder {
+            expires_at: earliest,
+            weekly_reset_at: weekly_reset,
+        })
+    );
+
+    app.snapshot
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap()
+        .available_count += 1;
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+    app.snapshot
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap()
+        .available_count -= 1;
+
+    app.snapshot.rate_limit_reset_credits_partial = true;
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+    app.snapshot.rate_limit_reset_credits_partial = false;
+
+    app.snapshot
+        .rate_limit_reset_credits
+        .as_mut()
+        .unwrap()
+        .provenance = Provenance::Stale;
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+}
+
+#[test]
+fn reset_expiry_reminder_requires_a_current_codex_week_window() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let expires_at = now + chrono::Duration::days(1);
+    set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
+
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+
+    set_window_reset(
+        &mut app,
+        WindowScope::FiveHours,
+        now + chrono::Duration::hours(2),
+    );
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+
+    set_window_reset(&mut app, WindowScope::Week, now + chrono::Duration::days(4));
+    let weekly_index = app
+        .snapshot
+        .window_analyses
+        .iter()
+        .position(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+        .unwrap();
+    app.snapshot.window_analyses[weekly_index]
+        .attribution
+        .window
+        .as_mut()
+        .unwrap()
+        .limit_id = "codex_bengalfox".to_string();
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+
+    app.snapshot.window_analyses[weekly_index]
+        .attribution
+        .window
+        .as_mut()
+        .unwrap()
+        .limit_id = "codex".to_string();
+    app.snapshot.window_analyses[weekly_index]
+        .attribution
+        .window
+        .as_mut()
+        .unwrap()
+        .ends_at = now;
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+
+    app.snapshot.window_analyses[weekly_index]
+        .attribution
+        .window
+        .as_mut()
+        .unwrap()
+        .ends_at = now + chrono::Duration::days(4);
+    app.snapshot.window_analyses[weekly_index]
+        .partial_reasons
+        .push("quota_window_stale".to_string());
+    assert_eq!(reset_expiry_reminder(&app.snapshot), None);
+}
+
+#[test]
+fn weekly_gauge_renders_exact_reset_expiry_reminder() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for width in [40, 60, 80, 120] {
+            let mut app = interaction_test_app(1, 1);
+            app.theme = theme;
+            let now = app.snapshot.as_of;
+            let five_hour_reset = now + chrono::Duration::hours(2) + chrono::Duration::seconds(13);
+            let weekly_reset = now + chrono::Duration::days(4) + chrono::Duration::seconds(29);
+            let expires_at = now + chrono::Duration::days(2) + chrono::Duration::seconds(47);
+            set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
+            set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+            set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
+            app.snapshot.limits = vec![LimitBucket {
+                limit_id: "codex".to_string(),
+                limit_name: Some("Codex".to_string()),
+                plan_type: Some("test".to_string()),
+                primary: Some(LimitWindow::new(25.0, Some(300), Some(five_hour_reset))),
+                secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(weekly_reset))),
+                credits: None,
+                rate_limit_reached_type: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: now,
+            }];
+
+            let quota_height = overview_quota_height(&app.snapshot, width, 3);
+            let mut terminal = Terminal::new(TestBackend::new(width, quota_height)).unwrap();
+            terminal
+                .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme))
+                .unwrap();
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .split(Rect::new(0, 0, width, quota_height));
+            let buffer = terminal.backend().buffer();
+            let five_hour_text = buffer_rect_text(buffer, columns[0]);
+            let weekly_text = buffer_rect_text(buffer, columns[1]);
+            let local_expiry = expires_at.with_timezone(&Local);
+            let expected_date = local_expiry.format("%Y-%m-%d").to_string();
+            let expected_time = local_expiry.format("%H:%M:%S %:z").to_string();
+
+            assert!(!five_hour_text.contains(&expected_date));
+            assert!(!five_hour_text.contains(&expected_time));
+            assert!(
+                weekly_text.contains(&expected_date),
+                "missing expiry date at {width}x{quota_height}/{theme:?}: {weekly_text}"
+            );
+            assert!(
+                weekly_text.contains(&expected_time),
+                "missing expiry time at {width}x{quota_height}/{theme:?}: {weekly_text}"
+            );
+            assert!(
+                weekly_text.contains("40/60%")
+                    || weekly_text.contains("40%/60%")
+                    || weekly_text.contains("40% used"),
+                "missing weekly usage label at {width}x{quota_height}/{theme:?}: {weekly_text}"
+            );
+            assert!(!rect_has_foreground(
+                buffer,
+                columns[0],
+                theme.palette().warning
+            ));
+            assert!(
+                rect_has_foreground(buffer, columns[1], theme.palette().warning),
+                "missing warning style at {width}x{quota_height}/{theme:?}"
+            );
+            let weekly_inner = panel("", theme).inner(columns[1]);
+            let usage_y = weekly_inner.y + weekly_inner.height / 2;
+            let usage_row = buffer_rect_row_text(buffer, weekly_inner, usage_y);
+            assert!(
+                usage_row.contains("40/60%")
+                    || usage_row.contains("40%/60%")
+                    || usage_row.contains("40% used"),
+                "usage must stay centered at {width}x{quota_height}/{theme:?}: {usage_row}"
+            );
+            let warning_rows = rect_foreground_rows(buffer, columns[1], theme.palette().warning);
+            assert_eq!(
+                warning_rows.first().copied(),
+                Some(usage_y + 1),
+                "reminder must start below the centered usage row at {width}x{quota_height}/{theme:?}"
+            );
+        }
+    }
+
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let weekly_reset = now + chrono::Duration::days(4);
+    set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+    set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(weekly_reset))]);
+    app.snapshot.limits = vec![LimitBucket {
+        limit_id: "codex".to_string(),
+        limit_name: Some("Codex".to_string()),
+        plan_type: Some("test".to_string()),
+        primary: None,
+        secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(weekly_reset))),
+        credits: None,
+        rate_limit_reached_type: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: now,
+    }];
+    let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+    terminal
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!content.contains("EXP"));
+}
+
+#[test]
+fn reset_expiry_reminder_only_marks_the_matching_codex_weekly_gauge() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let five_hour_reset = now + chrono::Duration::hours(2);
+    let weekly_reset = now + chrono::Duration::days(4);
+    let expires_at = now + chrono::Duration::days(2);
+    set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
+    set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+    set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
+    app.snapshot.limits = vec![
+        LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: Some("Codex".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(25.0, Some(300), Some(five_hour_reset))),
+            secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(weekly_reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+        LimitBucket {
+            limit_id: "codex_bengalfox".to_string(),
+            limit_name: Some("Codex Spark".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(10.0, Some(10_080), Some(weekly_reset))),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+    ];
+
+    let width = 120;
+    let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
+    terminal
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .unwrap();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(Rect::new(0, 0, width, 5));
+    let buffer = terminal.backend().buffer();
+
+    assert!(!rect_has_foreground(
+        buffer,
+        columns[0],
+        app.theme.palette().warning
+    ));
+    assert!(rect_has_foreground(
+        buffer,
+        columns[1],
+        app.theme.palette().warning
+    ));
+    assert!(!rect_has_foreground(
+        buffer,
+        columns[2],
+        app.theme.palette().warning
+    ));
+}
+
+#[test]
+fn overview_keeps_reset_expiry_reminder_inside_the_quota_panel() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let five_hour_reset = now + chrono::Duration::hours(2);
+    let weekly_reset = now + chrono::Duration::days(4);
+    let expires_at = now + chrono::Duration::days(2) + chrono::Duration::seconds(47);
+    set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
+    set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+    set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
+    app.snapshot.limits = vec![LimitBucket {
+        limit_id: "codex".to_string(),
+        limit_name: Some("Codex".to_string()),
+        plan_type: Some("test".to_string()),
+        primary: Some(LimitWindow::new(25.0, Some(300), Some(five_hour_reset))),
+        secondary: Some(LimitWindow::new(40.0, Some(10_080), Some(weekly_reset))),
+        credits: None,
+        rate_limit_reached_type: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: now,
+    }];
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(app.task_table_hitbox.is_some());
+    assert_eq!(overview_quota_height(&app.snapshot, 40, 3), 7);
+}
+
+fn buffer_rect_text(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn buffer_rect_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, y: u16) -> String {
+    (area.x..area.right())
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn rect_has_foreground(buffer: &ratatui::buffer::Buffer, area: Rect, foreground: Color) -> bool {
+    (area.y..area.bottom()).any(|y| {
+        (area.x..area.right()).any(|x| {
+            let cell = &buffer[(x, y)];
+            cell.fg == foreground && !cell.symbol().trim().is_empty()
+        })
+    })
+}
+
+fn rect_foreground_rows(
+    buffer: &ratatui::buffer::Buffer,
+    area: Rect,
+    foreground: Color,
+) -> Vec<u16> {
+    (area.y..area.bottom())
+        .filter(|y| {
+            (area.x..area.right()).any(|x| {
+                let cell = &buffer[(x, *y)];
+                cell.fg == foreground && !cell.symbol().trim().is_empty()
+            })
+        })
+        .collect()
 }
 
 #[test]

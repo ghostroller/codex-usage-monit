@@ -16,6 +16,7 @@
 
 - **账户用量一目了然** — 查看已用/剩余额度、所有可用额度桶和服务端返回的重置时间。
 - **重置机会详情** — 查看权威的可用数量，以及服务端返回明细时每次机会的获得和过期时间。
+- **过期提醒** — 如果最早且信息完整的可用重置机会会在普通 Codex 周自然重置前过期，Overview 的周用量进度条会显示提醒和准确的本地过期时间。
 - **本地用量拆分** — 按当前 5 小时或周重置周期查看 task、turn、模型、token 总量和 token 占比。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 导出便于阅读的文本或带 schema 版本的 camelCase JSON，选择指定 section，或按 thread 筛选 turn。
@@ -171,7 +172,7 @@ codex-usage-monit --redact-content tasks --format json
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。**Other** tab 显示数据源健康状态、采集统计、诊断信息、额度窗口，以及 App Server 返回的重置机会详情（包括获得和过期时间）。
+**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Other** tab 显示数据源健康状态、采集统计、诊断信息、额度窗口，以及 App Server 返回的重置机会详情（包括获得和过期时间）。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -212,6 +213,8 @@ codex-usage-monit --redact-content tasks --format json
 | JSON 中的 `resetType` | 服务端返回的原始重置机会类型。 |
 
 服务端可能返回少于可用数量的明细行。这种情况下，`DETAILS n/N` 表示服务端只提供了 `N` 次可用机会中的 `n` 条详情；可用数量仍然是权威值。`SHOWING n/N` 表示当前终端高度不足，无法展示已经收到的所有机会详情；`WINDOWS n/N` 表示无法展示所有额度窗口行。
+
+Overview 提醒采用保守规则：只使用完整且未过期的数据，其中机会状态必须为 `available`，`resetType` 必须为 `codexRateLimits`。程序会判断最早的未来过期时间是否严格早于普通 `codex` 周窗口的重置时间；明细被截断、标记为 partial 或 stale 时不显示提醒。
 
 TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asOf` 时间仍使用 UTC。一次性文本输出使用 UTC，JSON 使用 RFC 3339 时间戳。
 

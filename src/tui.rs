@@ -30,7 +30,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
     Wrap,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod geometry;
 mod text;
@@ -279,6 +279,58 @@ fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAna
                 .window
                 .as_ref()
                 .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResetExpiryReminder {
+    expires_at: chrono::DateTime<chrono::Utc>,
+    weekly_reset_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn reset_expiry_reminder(snapshot: &Snapshot) -> Option<ResetExpiryReminder> {
+    let reset_credits = snapshot.rate_limit_reset_credits.as_ref()?;
+    if reset_credits.available_count == 0
+        || snapshot.rate_limit_reset_credits_partial
+        || !matches!(
+            reset_credits.provenance,
+            Provenance::Live | Provenance::ServerSnapshot
+        )
+        || reset_credits.details_are_truncated()
+    {
+        return None;
+    }
+    let credits = reset_credits.credits.as_deref()?;
+
+    let weekly_analysis = window_analysis(snapshot, WindowScope::Week)?;
+    if weekly_analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == "quota_window_stale")
+    {
+        return None;
+    }
+    let weekly_reset_at = weekly_analysis.attribution.window.as_ref()?.ends_at;
+    if weekly_reset_at <= snapshot.as_of {
+        return None;
+    }
+
+    let expires_at = credits
+        .iter()
+        .filter(|credit| {
+            credit.status.trim().eq_ignore_ascii_case("available")
+                && credit
+                    .reset_type
+                    .trim()
+                    .eq_ignore_ascii_case("codexRateLimits")
+        })
+        .filter_map(|credit| credit.expires_at)
+        .filter(|expires_at| *expires_at > snapshot.as_of)
+        .min()?;
+
+    (expires_at < weekly_reset_at).then_some(ResetExpiryReminder {
+        expires_at,
+        weekly_reset_at,
     })
 }
 
@@ -3962,18 +4014,28 @@ fn render_quit_confirmation(
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let compact = area.height < 30;
-    let mut constraints = vec![
-        Constraint::Length(if compact { 3 } else { 5 }),
-        Constraint::Min(9),
-    ];
+    let base_quota_height = if compact { 3 } else { 5 };
+    let quota_height = overview_quota_height(&app.snapshot, area.width, base_quota_height);
+    let mut constraints = vec![Constraint::Length(quota_height)];
+    constraints.push(Constraint::Min(9));
     if app.models_visible {
-        constraints.push(Constraint::Length(if compact { 8 } else { 10 }));
+        let desired_height = if compact { 8 } else { 10 };
+        let model_height = if compact && quota_height > base_quota_height {
+            desired_height.min(area.height.saturating_sub(quota_height).saturating_sub(9))
+        } else {
+            desired_height
+        };
+        constraints.push(Constraint::Length(model_height));
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-    render_limits(frame, rows[0], &app.snapshot, app.theme);
+    let mut row_index = 0;
+    render_limits(frame, rows[row_index], &app.snapshot, app.theme);
+    row_index += 1;
+    let task_area = rows[row_index];
+    row_index += 1;
 
     if app.turns_visible() {
         let narrow = area.width < 100;
@@ -3988,15 +4050,120 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 [Constraint::Percentage(52), Constraint::Percentage(48)]
             })
-            .split(rows[1]);
+            .split(task_area);
         render_tasks(frame, body[0], app, true);
         render_turns(frame, body[1], app, true);
     } else {
-        render_tasks(frame, rows[1], app, true);
+        render_tasks(frame, task_area, app, true);
     }
     if app.models_visible {
-        render_models(frame, rows[2], app);
+        render_models(frame, rows[row_index], app);
     }
+}
+
+fn reset_expiry_gauge_alert_lines(reminder: ResetExpiryReminder, width: u16) -> Vec<String> {
+    let expires_at = local_full_time_label(Some(reminder.expires_at), "unavailable");
+    let full = format!("! RESET CREDIT EXPIRES {expires_at}");
+    let compact = format!("! EXP {expires_at}");
+    let minimal = format!("! {expires_at}");
+    let max_width = usize::from(width.max(1));
+
+    for candidate in [full, compact, minimal] {
+        if UnicodeWidthStr::width(candidate.as_str()) <= max_width {
+            return vec![candidate];
+        }
+    }
+
+    let date = reminder
+        .expires_at
+        .with_timezone(&Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    let time = reminder
+        .expires_at
+        .with_timezone(&Local)
+        .format("%H:%M:%S %:z")
+        .to_string();
+    let date_line = format!("! EXP {date}");
+    if UnicodeWidthStr::width(date_line.as_str()) <= max_width
+        && UnicodeWidthStr::width(time.as_str()) <= max_width
+    {
+        return vec![date_line, time];
+    }
+
+    split_exact_display_lines(&format!("! {expires_at}"), width)
+}
+
+fn split_exact_display_lines(value: &str, width: u16) -> Vec<String> {
+    let max_width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if !line.is_empty() && line_width.saturating_add(character_width) > max_width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        line.push(character);
+        line_width = line_width.saturating_add(character_width);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn is_reset_expiry_gauge(
+    bucket: &crate::domain::LimitBucket,
+    window: &crate::domain::LimitWindow,
+    reminder: ResetExpiryReminder,
+) -> bool {
+    bucket.limit_id.trim().eq_ignore_ascii_case("codex")
+        && window.window_duration_mins == Some(WindowScope::Week.duration_mins())
+        && window.resets_at == Some(reminder.weekly_reset_at)
+}
+
+fn reset_expiry_gauge_inner_width(
+    snapshot: &Snapshot,
+    area_width: u16,
+    reminder: ResetExpiryReminder,
+) -> Option<u16> {
+    let windows = snapshot
+        .limits
+        .iter()
+        .flat_map(|bucket| {
+            [bucket.primary.as_ref(), bucket.secondary.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(move |window| (bucket, window))
+        })
+        .collect::<Vec<_>>();
+    let target = windows
+        .iter()
+        .position(|(bucket, window)| is_reset_expiry_gauge(bucket, window, reminder))?;
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            windows
+                .iter()
+                .map(|_| Constraint::Ratio(1, windows.len() as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(Rect::new(0, 0, area_width, 1));
+    Some(columns[target].width.saturating_sub(2))
+}
+
+fn overview_quota_height(snapshot: &Snapshot, area_width: u16, base_height: u16) -> u16 {
+    let Some(reminder) = reset_expiry_reminder(snapshot) else {
+        return base_height;
+    };
+    let Some(inner_width) = reset_expiry_gauge_inner_width(snapshot, area_width, reminder) else {
+        return base_height;
+    };
+    let alert_height = u16::try_from(reset_expiry_gauge_alert_lines(reminder, inner_width).len())
+        .unwrap_or(u16::MAX);
+    base_height.max(alert_height.saturating_mul(2).saturating_add(3))
 }
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -4339,6 +4506,8 @@ fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
 
 fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
     let palette = theme.palette();
+    let reset_reminder = reset_expiry_reminder(snapshot);
+    let mut reset_reminder_rendered = false;
     let windows = snapshot
         .limits
         .iter()
@@ -4408,13 +4577,75 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
                 window.used_percent, window.remaining_percent
             )
         };
+        let reminder = reset_reminder.filter(|reminder| {
+            !reset_reminder_rendered && is_reset_expiry_gauge(bucket, window, *reminder)
+        });
+        if reminder.is_some() {
+            reset_reminder_rendered = true;
+        }
+        let block = panel(&title, theme);
+        let inner = block.inner(columns[index]);
         let gauge = Gauge::default()
-            .block(panel(&title, theme))
+            .block(block)
             .gauge_style(Style::default().fg(color).bg(palette.gauge_track))
             .ratio((window.used_percent / 100.0).clamp(0.0, 1.0))
-            .label(label);
+            .label(if reminder.is_some() { "" } else { &label });
         frame.render_widget(gauge, columns[index]);
+        if let Some(reminder) = reminder {
+            render_reset_expiry_gauge_label(frame, inner, &label, reminder, theme);
+        }
     }
+}
+
+fn render_reset_expiry_gauge_label(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    usage_label: &str,
+    reminder: ResetExpiryReminder,
+    theme: Theme,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let palette = theme.palette();
+    let alert_lines = reset_expiry_gauge_alert_lines(reminder, area.width);
+    let alert_height = u16::try_from(alert_lines.len()).unwrap_or(u16::MAX);
+    let centered_usage_y = area.y.saturating_add(area.height / 2);
+    let latest_usage_y = area
+        .bottom()
+        .saturating_sub(alert_height)
+        .saturating_sub(1)
+        .max(area.y);
+    let usage_y = centered_usage_y.min(latest_usage_y);
+    let usage_style = Style::default().add_modifier(Modifier::BOLD);
+    let warning_style = Style::default()
+        .fg(palette.warning)
+        .add_modifier(Modifier::BOLD);
+
+    render_centered_gauge_span(frame, area, usage_y, usage_label, usage_style);
+    for (index, line) in alert_lines.iter().enumerate() {
+        let y = usage_y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if y >= area.bottom() {
+            break;
+        }
+        render_centered_gauge_span(frame, area, y, line, warning_style);
+    }
+}
+
+fn render_centered_gauge_span(frame: &mut Frame<'_>, area: Rect, y: u16, text: &str, style: Style) {
+    if y >= area.bottom() {
+        return;
+    }
+    let text_width = u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX);
+    let visible_width = text_width.min(area.width);
+    let x = area
+        .x
+        .saturating_add(area.width.saturating_sub(visible_width) / 2);
+    frame
+        .buffer_mut()
+        .set_span(x, y, &Span::styled(text, style), visible_width);
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: bool) {

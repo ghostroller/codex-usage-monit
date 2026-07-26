@@ -16,6 +16,7 @@ It is local-first and terminal-native: no desktop application, browser, daemon, 
 
 - **Account usage at a glance** — See used/remaining percentages, all available quota buckets, and server-reported reset times.
 - **Reset-credit details** — See the authoritative available count plus grant and expiry times when the server returns per-credit details.
+- **Expiry reminder** — The weekly Overview gauge warns when the earliest fully known available reset credit expires before the ordinary Codex weekly reset, with the exact local expiry time.
 - **Local usage breakdown** — Explore tasks, turns, models, token totals, and token share for the current 5-hour or weekly reset cycle.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export human-readable text or schema-versioned camelCase JSON, select individual sections, and filter turns by thread.
@@ -171,7 +172,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, and Models. The **Other** tab shows source health, collection statistics, diagnostics, quota windows, and reset-credit details returned by the App Server, including grant and expiry times.
+The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. The **Other** tab shows source health, collection statistics, diagnostics, quota windows, and reset-credit details returned by the App Server, including grant and expiry times.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -212,6 +213,8 @@ Printable keys are consumed by a focused text field before global shortcuts. Mou
 | `resetType` in JSON | The raw reset-credit type returned by the server. |
 
 The service can return fewer detail rows than the available count. In that case, `DETAILS n/N` means the server supplied details for only `n` of `N` available credits; the count remains authoritative. `SHOWING n/N` means the terminal is currently too short to display all credit details already received, and `WINDOWS n/N` means it is too short to display all quota-window rows.
+
+The Overview reminder is conservative: it uses only complete, current details whose status is `available` and whose `resetType` is `codexRateLimits`. It compares the earliest future expiry strictly before the ordinary `codex` weekly reset. Truncated, partial, or stale details do not produce a reminder.
 
 Reset and turn timestamps in the TUI are shown in local time; Collection/Snapshot `asOf` timestamps remain UTC. One-shot text output uses UTC, and JSON uses RFC 3339 timestamps.
 
