@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.2.2] - 2026-07-26
 
 ### Added
 
@@ -59,6 +59,6 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.1...HEAD
+[0.2.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.1.1...v0.2.0
