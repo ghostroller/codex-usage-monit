@@ -1265,6 +1265,105 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
 }
 
 #[test]
+fn quota_labels_invert_inside_the_filled_gauge_including_reset_credit_warning() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = interaction_test_app(1, 1);
+        app.theme = theme;
+        let now = app.snapshot.as_of;
+        let five_hour_reset = now + chrono::Duration::hours(2);
+        let weekly_reset = now + chrono::Duration::days(4);
+        let expires_at = now + chrono::Duration::days(2);
+        set_window_reset(&mut app, WindowScope::FiveHours, five_hour_reset);
+        set_window_reset(&mut app, WindowScope::Week, weekly_reset);
+        set_reset_credits(&mut app, 1, vec![reset_credit(now, Some(expires_at))]);
+        app.snapshot.limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: Some("Codex".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(38.0, Some(300), Some(five_hour_reset))),
+            secondary: Some(LimitWindow::new(42.0, Some(10_080), Some(weekly_reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }];
+
+        let width = 120;
+        let height = overview_quota_height(&app.snapshot, width, 3);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme))
+            .unwrap();
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(Rect::new(0, 0, width, height));
+        let buffer = terminal.backend().buffer();
+        let palette = theme.palette();
+
+        for (column, used_percent) in [(columns[0], 38.0), (columns[1], 42.0)] {
+            let inner = panel("", theme).inner(column);
+            let usage_y = inner.y + inner.height / 2;
+            let gauge_color = quota_color(used_percent, theme);
+            let filled_end =
+                inner.x + (f64::from(inner.width) * used_percent / 100.0).round() as u16;
+
+            assert!(
+                row_has_text_style(
+                    buffer,
+                    usage_y,
+                    inner.x,
+                    filled_end,
+                    palette.gauge_track,
+                    gauge_color
+                ),
+                "covered usage text must invert at {theme:?}/{used_percent}%"
+            );
+            assert!(
+                row_has_text_style(
+                    buffer,
+                    usage_y,
+                    filled_end,
+                    inner.right(),
+                    gauge_color,
+                    palette.gauge_track
+                ),
+                "uncovered usage text must keep the gauge colors at {theme:?}/{used_percent}%"
+            );
+        }
+
+        let weekly_inner = panel("", theme).inner(columns[1]);
+        let weekly_usage_y = weekly_inner.y + weekly_inner.height / 2;
+        let weekly_warning_y = weekly_usage_y + 1;
+        let weekly_color = quota_color(42.0, theme);
+        let weekly_filled_end =
+            weekly_inner.x + (f64::from(weekly_inner.width) * 0.42).round() as u16;
+        assert!(
+            row_has_text_style(
+                buffer,
+                weekly_warning_y,
+                weekly_inner.x,
+                weekly_filled_end,
+                palette.gauge_track,
+                weekly_color
+            ),
+            "covered reset-credit warning must invert at {theme:?}"
+        );
+        assert!(
+            row_has_text_style(
+                buffer,
+                weekly_warning_y,
+                weekly_filled_end,
+                weekly_inner.right(),
+                palette.warning,
+                palette.gauge_track
+            ),
+            "uncovered reset-credit warning must retain warning color at {theme:?}"
+        );
+    }
+}
+
+#[test]
 fn reset_expiry_reminder_only_marks_the_matching_codex_weekly_gauge() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
@@ -1398,6 +1497,20 @@ fn rect_foreground_rows(
             })
         })
         .collect()
+}
+
+fn row_has_text_style(
+    buffer: &ratatui::buffer::Buffer,
+    y: u16,
+    start: u16,
+    end: u16,
+    foreground: Color,
+    background: Color,
+) -> bool {
+    (start..end).any(|x| {
+        let cell = &buffer[(x, y)];
+        !cell.symbol().trim().is_empty() && cell.fg == foreground && cell.bg == background
+    })
 }
 
 #[test]

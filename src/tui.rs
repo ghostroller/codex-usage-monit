@@ -4593,16 +4593,17 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
         if reminder.is_some() {
             reset_reminder_rendered = true;
         }
+        let ratio = (window.used_percent / 100.0).clamp(0.0, 1.0);
         let block = panel(&title, theme);
         let inner = block.inner(columns[index]);
         let gauge = Gauge::default()
             .block(block)
             .gauge_style(Style::default().fg(color).bg(palette.gauge_track))
-            .ratio((window.used_percent / 100.0).clamp(0.0, 1.0))
+            .ratio(ratio)
             .label(if reminder.is_some() { "" } else { &label });
         frame.render_widget(gauge, columns[index]);
         if let Some(reminder) = reminder {
-            render_reset_expiry_gauge_label(frame, inner, &label, reminder, theme);
+            render_reset_expiry_gauge_label(frame, inner, &label, reminder, theme, color, ratio);
         }
     }
 }
@@ -4613,6 +4614,8 @@ fn render_reset_expiry_gauge_label(
     usage_label: &str,
     reminder: ResetExpiryReminder,
     theme: Theme,
+    gauge_color: Color,
+    ratio: f64,
 ) {
     if area.is_empty() {
         return;
@@ -4627,12 +4630,26 @@ fn render_reset_expiry_gauge_label(
         .saturating_sub(1)
         .max(area.y);
     let usage_y = centered_usage_y.min(latest_usage_y);
-    let usage_style = Style::default().add_modifier(Modifier::BOLD);
+    let usage_style = Style::default();
     let warning_style = Style::default()
         .fg(palette.warning)
         .add_modifier(Modifier::BOLD);
+    let covered_text_style = Style::default().fg(palette.gauge_track).bg(gauge_color);
+    let filled_end = area.x.saturating_add(
+        (f64::from(area.width) * ratio)
+            .round()
+            .clamp(0.0, f64::from(area.width)) as u16,
+    );
 
-    render_centered_gauge_span(frame, area, usage_y, usage_label, usage_style);
+    render_centered_gauge_span(
+        frame,
+        area,
+        usage_y,
+        usage_label,
+        usage_style,
+        filled_end,
+        covered_text_style,
+    );
     for (index, line) in alert_lines.iter().enumerate() {
         let y = usage_y
             .saturating_add(1)
@@ -4640,11 +4657,27 @@ fn render_reset_expiry_gauge_label(
         if y >= area.bottom() {
             break;
         }
-        render_centered_gauge_span(frame, area, y, line, warning_style);
+        render_centered_gauge_span(
+            frame,
+            area,
+            y,
+            line,
+            warning_style,
+            filled_end,
+            covered_text_style,
+        );
     }
 }
 
-fn render_centered_gauge_span(frame: &mut Frame<'_>, area: Rect, y: u16, text: &str, style: Style) {
+fn render_centered_gauge_span(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    y: u16,
+    text: &str,
+    style: Style,
+    filled_end: u16,
+    covered_text_style: Style,
+) {
     if y >= area.bottom() {
         return;
     }
@@ -4653,9 +4686,15 @@ fn render_centered_gauge_span(frame: &mut Frame<'_>, area: Rect, y: u16, text: &
     let x = area
         .x
         .saturating_add(area.width.saturating_sub(visible_width) / 2);
-    frame
-        .buffer_mut()
-        .set_span(x, y, &Span::styled(text, style), visible_width);
+    let buffer = frame.buffer_mut();
+    buffer.set_span(x, y, &Span::styled(text, style), visible_width);
+    let covered_right = x.saturating_add(visible_width).min(filled_end);
+    if covered_right > x {
+        buffer.set_style(
+            Rect::new(x, y, covered_right.saturating_sub(x), 1),
+            covered_text_style,
+        );
+    }
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: bool) {
