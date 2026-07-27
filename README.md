@@ -12,6 +12,12 @@
 
 It is local-first and terminal-native: no desktop application, browser, daemon, database, or listening port is required. Prebuilt binaries run on macOS and Linux, including headless development servers over SSH.
 
+## TUI preview
+
+[![Codex usage monitor TUI overview in a 120 by 40 dark terminal](docs/assets/tui/overview-dark-120x40.svg)](docs/assets/tui/overview-dark-120x40.svg)
+
+_Deterministically rendered from the integration-test fixture. The synchronization check in CI prevents this preview from drifting from the current TUI._
+
 ## Highlights
 
 - **Account usage at a glance** — See used/remaining percentages, all available quota buckets, and server-reported reset times.

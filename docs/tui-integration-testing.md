@@ -45,6 +45,28 @@ generated from the same semantic frame representation used by the snapshot
 assertions. CI uploads the directory as the `tui-layout-gallery` artifact even
 when another verification step fails.
 
+### Published README preview
+
+`target/tui-gallery` is ignored by Git and cannot be referenced directly from a
+README rendered on GitHub. The canonical wide, dark Overview is therefore
+copied to the tracked file
+`docs/assets/tui/overview-dark-120x40.svg`, which both README variants embed
+with a repository-relative image path.
+
+After an intentional TUI change, run:
+
+```bash
+cargo test --locked --all-targets
+sh scripts/update-tui-preview.sh
+git diff -- docs/assets/tui/overview-dark-120x40.svg
+sh scripts/update-tui-preview.sh --check
+```
+
+The update command regenerates the gallery with the focused integration test
+before copying the canonical image. CI runs the same command with `--check` and
+fails when the generated image differs from the committed preview. The full
+gallery remains a CI artifact; only the stable README preview is committed.
+
 Semantic baselines are stored in `src/tui/tests/snapshots`. When an intentional
 layout change makes a snapshot fail:
 
