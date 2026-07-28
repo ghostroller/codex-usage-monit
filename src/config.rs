@@ -37,8 +37,60 @@ impl Default for CollectConfig {
 }
 
 pub fn default_codex_home() -> PathBuf {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    resolve_codex_home(
+        env::var_os("CODEX_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+        cfg!(windows),
+    )
+}
+
+fn resolve_codex_home(
+    codex_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    windows: bool,
+) -> PathBuf {
+    if let Some(codex_home) = codex_home {
+        return codex_home;
+    }
+    home.or_else(|| windows.then_some(user_profile).flatten())
+        .map(|home| home.join(".codex"))
         .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_home_resolver_uses_windows_user_profile_as_a_fallback() {
+        assert_eq!(
+            resolve_codex_home(None, None, Some(PathBuf::from(r"C:\Users\developer")), true,),
+            PathBuf::from(r"C:\Users\developer").join(".codex")
+        );
+        assert_eq!(
+            resolve_codex_home(
+                None,
+                None,
+                Some(PathBuf::from(r"C:\Users\developer")),
+                false,
+            ),
+            PathBuf::from(".codex")
+        );
+    }
+
+    #[test]
+    fn codex_home_override_keeps_its_exact_path() {
+        let override_path = PathBuf::from("custom-codex-home");
+        assert_eq!(
+            resolve_codex_home(
+                Some(override_path.clone()),
+                Some(PathBuf::from("ignored-home")),
+                Some(PathBuf::from("ignored-profile")),
+                true,
+            ),
+            override_path
+        );
+    }
 }

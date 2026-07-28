@@ -43,11 +43,34 @@ jobs:
       - name: Run installer tests
         run: sh tests/install.sh
 
+  verify-windows:
+    name: Verify release on Windows
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --locked --all-targets
+
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs:
+      - verify
+      - verify-windows
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +83,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -78,7 +103,8 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target "$TARGET"
 
-      - name: Strip and package binary
+      - name: Strip and package Unix binary
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           binary="target/$TARGET/release/codex-usage-monit"
@@ -86,11 +112,21 @@ jobs:
           mkdir -p dist
           tar -czf "dist/codex-usage-monit-$TARGET.tar.gz" -C "$(dirname "$binary")" codex-usage-monit
 
+      - name: Stage Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/$env:TARGET/release/codex-usage-monit.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $binary "dist/codex-usage-monit-$env:TARGET.exe"
+
       - name: Upload packaged binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: release-${{ matrix.target }}
-          path: dist/codex-usage-monit-${{ matrix.target }}.tar.gz
+          path: |
+            dist/codex-usage-monit-${{ matrix.target }}.tar.gz
+            dist/codex-usage-monit-${{ matrix.target }}.exe
           if-no-files-found: error
           retention-days: 1
 
@@ -117,7 +153,7 @@ jobs:
         run: |
           cp scripts/install.sh dist/install.sh
           cd dist
-          sha256sum codex-usage-monit-*.tar.gz install.sh | sort -k 2 > SHA256SUMS
+          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe install.sh | sort -k 2 > SHA256SUMS
 
       - name: Create GitHub Release
         env:

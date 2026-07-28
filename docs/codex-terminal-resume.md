@@ -10,7 +10,7 @@
 
 这个能力可以实现，但首版应准确命名为 **resume 到新的 Codex CLI 前端**，不能称为附着到原来的 Desktop/CLI 进程。
 
-当前首版行为是：在 codex-usage-monit 的 Tasks 面板选择一个非活跃 root task，通过 `[O]Open` 进入确认弹窗。monitor 位于 Zellij 时，可以创建一个默认接近全屏的 floating pane；其他运行环境也可通过 `[C] Copy` 请求复制一条完整的 POSIX shell 命令，再由用户在目标终端执行：
+当前首版行为是：在 codex-usage-monit 的 Tasks 面板选择一个非活跃 root task，通过 `[O]Open` 进入确认弹窗。monitor 位于 Zellij 时，可以创建一个默认接近全屏的 floating pane；其他运行环境也可通过 `[C] Copy` 请求复制一条完整命令（Unix 使用 POSIX shell，Windows 使用 PowerShell），再由用户在目标终端执行：
 
 ```text
 CODEX_HOME=<snapshot-CODEX_HOME> codex resume --cd <task.cwd> <thread_uuid>
@@ -134,7 +134,7 @@ Target:  zellij floating pane · current session
 [↵] Open   [C] Copy   [Esc] Cancel
 ```
 
-不在 Zellij 时，Target 改为手动终端命令，并只显示 `[C] Copy   [Esc] Cancel`；`Enter` 不会启动进程。Copy 使用完整、严格引用的单行 POSIX shell 命令，通过 OSC 52 交给当前终端，写入成功后关闭弹窗。OSC 52 没有剪贴板更新回执，因此成功只表示控制序列已经写给终端；若写入失败则保留弹窗并显示错误。
+不在 Zellij 时，Target 改为手动终端命令，并只显示 `[C] Copy   [Esc] Cancel`；`Enter` 不会启动进程。Copy 使用完整、严格引用的单行平台 shell 命令（Unix 为 POSIX shell，Windows 为 PowerShell），通过 OSC 52 交给当前终端，写入成功后关闭弹窗。OSC 52 没有剪贴板更新回执，因此成功只表示控制序列已经写给终端；若写入失败则保留弹窗并显示错误。
 
 Stale/Unknown 使用 warning 文案；active、subagent、archived 或无效 cwd 不进入可确认状态。弹窗优先处理键鼠事件，不能把 `O`、`C`、筛选键或导航键泄漏给底层面板；`Ctrl-C` 延续现有直接退出规则。终端空间不足以完整显示关键信息时只显示 Resize 提示并保留 `[Esc] Cancel`（空间允许时），不渲染可点击的 Open/Copy，也不让 `Enter` 启动，避免 cwd 被截掉后误确认。
 
@@ -311,7 +311,7 @@ src/session_launch.rs
 - `open_config.rs`：发现并加载用户配置、缺失时安全创建默认文件、拒绝损坏或未来版本；
 - `tui.rs::App`：选择、弹窗、launching/clipboard request、pane registry、状态文案和 hitbox；
 - `tui.rs::run_loop`：启动 worker、接收 `LaunchResult`、向 terminal backend 写 OSC 52，并保持 UI 响应；
-- `session_launch.rs`：验证 UUID/cwd/source，共用 resume 参数，分别构造 Zellij 与 Copy plan，安全序列化 POSIX 命令，并调用/解析 Zellij；
+- `session_launch.rs`：验证 UUID/cwd/source，共用 resume 参数，分别构造 Zellij 与 Copy plan，安全序列化 POSIX shell 或 PowerShell 命令，并调用/解析 Zellij；
 - `ui_state.rs`：首版不持久化 pane id、确认弹窗或 launching 状态；
 - `cli.rs`：首版无新子命令，后续可复用同一 launcher 增加 `open --thread <uuid>`。
 
@@ -322,7 +322,7 @@ flowchart LR
   A["Selected TaskRecord"] --> B["Resume eligibility"]
   B --> C["Confirmation modal"]
   C --> D["Zellij: Launch worker"]
-  C --> I["Any terminal: POSIX serialize"]
+  C --> I["Any terminal: platform-shell serialize"]
   D --> E["Zellij action new-pane"]
   E --> F["PTY: codex resume UUID"]
   E --> G["pane id / immediate status"]
@@ -342,7 +342,7 @@ flowchart LR
 | cwd 缺失/删除 | 显示原路径和 Desktop restore 建议 | 否 |
 | archived | 提示先 unarchive | 否 |
 | 不在 Zellij | 弹窗只显示 Copy/Cancel；不响应 Enter | 否 |
-| POSIX 命令不可安全表示或超过上限 | 弹窗保留并显示复制错误 | 否 |
+| 平台 shell 命令不可安全表示或超过上限 | 弹窗保留并显示复制错误 | 否 |
 | OSC 52 写入失败 | 弹窗保留并显示复制错误 | 否 |
 | `zellij`/`codex` 不可执行 | 显示 executable 与修复方向 | 否 |
 | Zellij action 非零 | 显示简短 stderr | 未知 |
@@ -354,7 +354,7 @@ flowchart LR
 ## 10. 安全与隐私
 
 - 只接受本地 rollout 中的 canonical UUID，不把 task title 当 session name；
-- 自动启动的所有动态值保持为独立 argv；Copy 对 CODEX_HOME、显式 Codex 路径、cwd 和 UUID 做严格 POSIX 引用，拒绝非 UTF-8、控制字符和双向文本控制符；
+- 自动启动的所有动态值保持为独立 argv；Copy 对 CODEX_HOME、显式 Codex 路径、cwd 和 UUID 做严格的平台 shell 引用，拒绝非 UTF-8、控制字符和双向文本控制符；
 - cwd 必须存在且是目录，保留记录路径，不静默 canonicalize 到另一个 checkout；
 - 不传 `--dangerously-bypass-approvals-and-sandbox`，不改用户的 sandbox/approval 配置；
 - 不自动 unarchive、fork、checkout、stash、restore worktree 或发送 prompt；
@@ -369,7 +369,7 @@ flowchart LR
 
 - UUID、root/subagent、status、archive 和 cwd eligibility；
 - 路径含空格、引号、Unicode、`$`、分号、反引号或以 `-` 开头时，argv 和复制命令仍保持边界；
-- Copy 的 POSIX quoting、非 UTF-8/控制/bidi 拒绝、64 KiB 上限和无 prompt/title；
+- Copy 的 POSIX/PowerShell quoting、非 UTF-8/控制/bidi 拒绝、64 KiB 上限和无 prompt/title；
 - OSC 52 的 framing、base64 payload、成功关闭弹窗与写入失败保留弹窗；
 - title 含换行、ESC、BEL、C0/C1 和 bidi 控制符时 pane name 安全；
 - `ZellijLaunchPlan` 精确包含同一 cwd、CODEX_HOME、绝对 codex path，且无 prompt；
@@ -420,7 +420,7 @@ flowchart LR
 - root、非 active、有效 cwd；
 - `[O]Open`、确认弹窗、Open/Copy/Cancel 键鼠交互和异步 launcher；
 - 90% floating pane、相同 CODEX_HOME、无 prompt；
-- 非 Zellij 终端通过 OSC 52 复制仅保留 CODEX_HOME/cwd/UUID 的精简 POSIX 命令，由目标终端 PATH 解析 Codex；
+- 非 Zellij 终端通过 OSC 52 复制仅保留 CODEX_HOME/cwd/UUID 的精简平台 shell 命令，由目标终端 PATH 解析 Codex；
 - 进程内 pane 去重、聚焦和 held 错误反馈；
 - 用户级 `open.json`、缺失时默认创建、Zellij pane 选项和 `codexBin`；
 - launcher/config/TUI 自动化测试；Desktop/CLI stopped task 的真实 smoke test 继续作为发布验收。

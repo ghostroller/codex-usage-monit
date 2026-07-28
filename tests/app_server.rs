@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Mutex;
 #[cfg(unix)]
 use std::time::Instant;
@@ -21,13 +21,13 @@ use codex_usage_monit::domain::{Provenance, RateLimitResetCreditsSnapshot};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct PathRestore(Option<OsString>);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for PathRestore {
     fn drop(&mut self) {
         // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
@@ -56,6 +56,30 @@ fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> 
         path.push(":");
         path.push(old_path);
     }
+    // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
+    unsafe { std::env::set_var("PATH", path) };
+    let _restore = PathRestore(old_path);
+
+    run(directory.path())
+}
+
+#[cfg(windows)]
+fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> T {
+    let _lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("codex.cmd");
+    fs::write(&executable, script).unwrap();
+
+    let old_path = std::env::var_os("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(directory.path().to_path_buf()).chain(
+            old_path
+                .as_deref()
+                .into_iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
     // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
     unsafe { std::env::set_var("PATH", path) };
     let _restore = PathRestore(old_path);
@@ -502,6 +526,40 @@ fn offline_mode_returns_without_starting_codex() {
     assert!(snapshot.usage.is_none());
     assert_eq!(snapshot.warnings.len(), 1);
     assert!(snapshot.warnings[0].contains("offline mode"));
+}
+
+#[cfg(windows)]
+#[test]
+fn fetches_limits_through_a_codex_cmd_shim() {
+    let script = r#"@echo off
+if not "%~1"=="app-server" exit /b 41
+if not "%~2"=="--stdio" exit /b 42
+set /p initialize=
+echo {"id":1,"result":{"userAgent":"mock"}}
+set /p initialized=
+set /p limits=
+set /p usage=
+echo {"id":3,"error":{"code":-32601,"message":"usage disabled"}}
+echo {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300}},"rateLimitsByLimitId":null}}
+"#;
+
+    with_mock_codex(script, |directory| {
+        let config = CollectConfig {
+            codex_home: directory.join("home"),
+            app_server_timeout: Duration::from_secs(2),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert_eq!(snapshot.limits.len(), 1);
+        assert_eq!(snapshot.limits[0].limit_id, "codex");
+        assert_eq!(
+            snapshot.limits[0].primary.as_ref().unwrap().used_percent,
+            42.0
+        );
+        assert!(snapshot.usage.is_none());
+    });
 }
 
 #[cfg(unix)]

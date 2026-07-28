@@ -290,6 +290,29 @@ fn renders_every_resume_argument_as_a_posix_shell_word() {
 }
 
 #[test]
+fn renders_every_resume_argument_as_a_powershell_word() {
+    let plan = ResumeCopyPlan {
+        thread_id: THREAD_ID.to_owned(),
+        cwd: PathBuf::from(r"C:\work\project '雪 $;`cwd`"),
+        codex_home: PathBuf::from(r"C:\Users\Dev User\.codex '雪"),
+        command: CommandPlan {
+            program: PathBuf::from(r"C:\Program Files\Codex\codex.cmd"),
+            args: vec![
+                OsString::from("resume"),
+                OsString::from("--cd"),
+                OsString::from(r"C:\work\project '雪 $;`cwd`"),
+                OsString::from(THREAD_ID),
+            ],
+        },
+    };
+
+    assert_eq!(
+        render_powershell_resume_command(&plan).unwrap(),
+        r#"& { param($codexHome) $previous = $env:CODEX_HOME; try { $env:CODEX_HOME = $codexHome; & 'C:\Program Files\Codex\codex.cmd' 'resume' '--cd' 'C:\work\project ''雪 $;`cwd`' '019f52ac-7a9f-7fd1-8dda-e775ef950785' } finally { $env:CODEX_HOME = $previous } } 'C:\Users\Dev User\.codex ''雪'"#
+    );
+}
+
+#[test]
 fn copied_resume_command_rejects_controls_and_bidi_overrides() {
     let mut plan = ResumeCopyPlan {
         thread_id: THREAD_ID.to_owned(),
@@ -302,13 +325,13 @@ fn copied_resume_command_rejects_controls_and_bidi_overrides() {
     };
 
     assert!(matches!(
-        render_posix_resume_command(&plan),
+        render_resume_command(&plan),
         Err(PrepareError::UnrepresentableShellCommand)
     ));
 
     plan.command.args[0] = OsString::from("safe-looking\u{202e}txt");
     assert!(matches!(
-        render_posix_resume_command(&plan),
+        render_resume_command(&plan),
         Err(PrepareError::UnrepresentableShellCommand)
     ));
 }
@@ -329,7 +352,7 @@ fn copied_resume_command_rejects_non_utf8_arguments() {
     };
 
     assert!(matches!(
-        render_posix_resume_command(&plan),
+        render_resume_command(&plan),
         Err(PrepareError::UnrepresentableShellCommand)
     ));
 }
@@ -358,11 +381,7 @@ fn relative_codex_override_is_resolved_against_monitor_cwd() {
         copy.command.program,
         fs::canonicalize(tools.join("custom-codex")).unwrap()
     );
-    assert!(
-        !render_posix_resume_command(&copy)
-            .unwrap()
-            .contains("PATH=")
-    );
+    assert!(!render_resume_command(&copy).unwrap().contains("PATH="));
 }
 
 #[test]

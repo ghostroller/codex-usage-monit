@@ -10,7 +10,7 @@
 
 `codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型和本地可观察 token 用量。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
 
-它以本地数据和终端为核心：不需要桌面程序、浏览器、守护进程、数据库或监听端口。预编译程序支持 macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
+它以本地数据和终端为核心：不需要桌面程序、浏览器、守护进程、数据库或监听端口。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
 
 ## TUI 预览
 
@@ -34,7 +34,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 
 ### 安装 Release 程序
 
-安装器支持 x86_64 和 ARM64 架构的 macOS 与 Linux。它会使用 `SHA256SUMS` 校验 Release 压缩包；默认安装无需 `sudo`，目标目录是 `~/.local/bin`。
+Shell 安装器支持 x86_64 和 ARM64 架构的 macOS 与 Linux。它会使用 `SHA256SUMS` 校验 Release 压缩包；默认安装无需 `sudo`，目标目录是 `~/.local/bin`。
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
@@ -59,6 +59,17 @@ sh install.sh --no-modify-path
 
 升级时，重新下载并运行最新版安装器，然后重启正在运行的 TUI。程序不提供自更新功能。
 
+64 位 Windows 用户可以从[最新 Release](https://github.com/ghostroller/codex-usage-monit/releases/latest)下载 `codex-usage-monit-x86_64-pc-windows-msvc.exe` 和 `SHA256SUMS`。在 PowerShell 中校验后可按需改名，然后把 `codex-usage-monit.exe` 所在目录加入 `PATH`：
+
+```powershell
+$binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
+$actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+$expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
+if ($actual -ne $expected) { throw "checksum mismatch" }
+Move-Item $binary codex-usage-monit.exe
+.\codex-usage-monit.exe --version
+```
+
 ### 从源码安装
 
 仓库固定使用 Rust 1.97.0。
@@ -76,6 +87,8 @@ codex-usage-monit
 cargo build --locked --release
 ./target/release/codex-usage-monit
 ```
+
+Windows 下的仓库内构建产物位于 `.\target\release\codex-usage-monit.exe`。
 
 ## 快速开始
 
@@ -309,6 +322,7 @@ Token 用量包含 `inputTokens`、`cachedInputTokens`、`outputTokens`、`reaso
 
 - macOS：`~/Library/Caches/codex-usage-monit`
 - Linux：`$XDG_CACHE_HOME/codex-usage-monit`；未设置 `XDG_CACHE_HOME` 时为 `~/.cache/codex-usage-monit`
+- Windows：`%LOCALAPPDATA%\codex-usage-monit\cache`
 
 设置 `CODEX_USAGE_MONIT_CACHE_DIR` 可以覆盖缓存目录。
 

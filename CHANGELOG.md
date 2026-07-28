@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Added native 64-bit Windows CI and direct GitHub Release distribution as a checksummed `x86_64-pc-windows-msvc` executable.
+- Added PowerShell-safe copied resume commands and Windows `codex.cmd`/`PATHEXT` command discovery.
+
+### Fixed
+
+- Used `%USERPROFILE%\.codex` when Windows does not provide `HOME`, and made persisted TUI state replacement work on Windows.
+
 ## [0.2.2] - 2026-07-26
 
 ### Added

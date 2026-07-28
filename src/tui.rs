@@ -55,7 +55,7 @@ use crate::session_launch::{
     FocusResult, LaunchContext, LaunchResult, PaneId, ResumeTarget, ZellijOptions,
     check_eligibility, check_eligibility_without_cwd_probe, execute_zellij_launch,
     focus_existing_pane, prepare_resume_copy_command, prepare_zellij_focus, prepare_zellij_launch,
-    render_posix_resume_command,
+    render_resume_command,
 };
 use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
@@ -1303,7 +1303,7 @@ impl App {
             self.open_config.codex_bin.clone(),
         )
         .and_then(|context| prepare_resume_copy_command(&target, &context))
-        .and_then(|plan| render_posix_resume_command(&plan));
+        .and_then(|plan| render_resume_command(&plan));
         match result {
             Ok(text) if text.len() <= MAX_CLIPBOARD_TEXT_BYTES => {
                 if let Some(confirmation) = self.resume_confirmation.as_mut() {

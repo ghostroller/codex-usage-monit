@@ -10,7 +10,7 @@
 
 `codex-usage-monit` tracks Codex quota windows, reset times, reset credits, tasks, turns, models, and locally observed token usage. Run it as an interactive TUI, or use its non-interactive CLI to produce plain text or JSON for scripts, cron jobs, and CI.
 
-It is local-first and terminal-native: no desktop application, browser, daemon, database, or listening port is required. Prebuilt binaries run on macOS and Linux, including headless development servers over SSH.
+It is local-first and terminal-native: no desktop application, browser, daemon, database, or listening port is required. Prebuilt binaries run on Windows, macOS, and Linux, including headless development servers over SSH.
 
 ## TUI preview
 
@@ -34,7 +34,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 
 ### Install a release binary
 
-The installer supports macOS and Linux on x86_64 and ARM64. It verifies the release archive against `SHA256SUMS`; the default installation requires no `sudo` and uses `~/.local/bin`.
+The shell installer supports macOS and Linux on x86_64 and ARM64. It verifies the release archive against `SHA256SUMS`; the default installation requires no `sudo` and uses `~/.local/bin`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
@@ -59,6 +59,17 @@ sh install.sh --no-modify-path
 
 To upgrade, download the latest installer again and rerun it, then restart any running TUI. The application does not provide a self-update function.
 
+On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, rename it if desired, and place it in a directory on `PATH`:
+
+```powershell
+$binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
+$actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+$expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
+if ($actual -ne $expected) { throw "checksum mismatch" }
+Move-Item $binary codex-usage-monit.exe
+.\codex-usage-monit.exe --version
+```
+
 ### Install from source
 
 The repository pins Rust 1.97.0.
@@ -76,6 +87,8 @@ For a repository-local build instead:
 cargo build --locked --release
 ./target/release/codex-usage-monit
 ```
+
+On Windows, the repository-local binary is `.\target\release\codex-usage-monit.exe`.
 
 ## Quick start
 
@@ -309,6 +322,7 @@ Default cache locations:
 
 - macOS: `~/Library/Caches/codex-usage-monit`
 - Linux: `$XDG_CACHE_HOME/codex-usage-monit`, or `~/.cache/codex-usage-monit` when `XDG_CACHE_HOME` is unset
+- Windows: `%LOCALAPPDATA%\codex-usage-monit\cache`
 
 Set `CODEX_USAGE_MONIT_CACHE_DIR` to override the cache directory.
 

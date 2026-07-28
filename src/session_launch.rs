@@ -365,7 +365,15 @@ pub(crate) fn prepare_resume_copy_command(
     })
 }
 
-pub(crate) fn render_posix_resume_command(plan: &ResumeCopyPlan) -> Result<String, PrepareError> {
+pub(crate) fn render_resume_command(plan: &ResumeCopyPlan) -> Result<String, PrepareError> {
+    if cfg!(windows) {
+        render_powershell_resume_command(plan)
+    } else {
+        render_posix_resume_command(plan)
+    }
+}
+
+fn render_posix_resume_command(plan: &ResumeCopyPlan) -> Result<String, PrepareError> {
     let codex_home = posix_shell_word(plan.codex_home.as_os_str())?;
     let command = std::iter::once(plan.command.program.as_os_str())
         .chain(plan.command.args.iter().map(OsString::as_os_str))
@@ -373,6 +381,18 @@ pub(crate) fn render_posix_resume_command(plan: &ResumeCopyPlan) -> Result<Strin
         .collect::<Result<Vec<_>, _>>()
         .map(|words| words.join(" "))?;
     Ok(format!("CODEX_HOME={codex_home} {command}"))
+}
+
+fn render_powershell_resume_command(plan: &ResumeCopyPlan) -> Result<String, PrepareError> {
+    let codex_home = powershell_word(plan.codex_home.as_os_str())?;
+    let command = std::iter::once(plan.command.program.as_os_str())
+        .chain(plan.command.args.iter().map(OsString::as_os_str))
+        .map(powershell_word)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|words| words.join(" "))?;
+    Ok(format!(
+        "& {{ param($codexHome) $previous = $env:CODEX_HOME; try {{ $env:CODEX_HOME = $codexHome; & {command} }} finally {{ $env:CODEX_HOME = $previous }} }} {codex_home}"
+    ))
 }
 
 pub(crate) fn prepare_zellij_launch(
@@ -422,15 +442,7 @@ pub(crate) fn prepare_zellij_launch(
 }
 
 fn posix_shell_word(value: &OsStr) -> Result<String, PrepareError> {
-    let value = value
-        .to_str()
-        .ok_or(PrepareError::UnrepresentableShellCommand)?;
-    if value
-        .chars()
-        .any(|character| character.is_control() || is_bidi_control(character))
-    {
-        return Err(PrepareError::UnrepresentableShellCommand);
-    }
+    let value = representable_shell_text(value)?;
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
@@ -443,6 +455,24 @@ fn posix_shell_word(value: &OsStr) -> Result<String, PrepareError> {
         return Ok(value.to_owned());
     }
     Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+fn powershell_word(value: &OsStr) -> Result<String, PrepareError> {
+    let value = representable_shell_text(value)?;
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+fn representable_shell_text(value: &OsStr) -> Result<&str, PrepareError> {
+    let value = value
+        .to_str()
+        .ok_or(PrepareError::UnrepresentableShellCommand)?;
+    if value
+        .chars()
+        .any(|character| character.is_control() || is_bidi_control(character))
+    {
+        return Err(PrepareError::UnrepresentableShellCommand);
+    }
+    Ok(value)
 }
 
 fn resume_arguments(cwd: &Path, thread_id: &str) -> Vec<OsString> {
@@ -740,14 +770,38 @@ fn resolve_executable(
 
     for directory in env::split_paths(path) {
         let directory = absolute_from(&directory, monitor_cwd);
-        let candidate = directory.join(name);
-        if is_executable_file(&candidate)
-            && let Ok(candidate) = fs::canonicalize(candidate)
-        {
-            return Ok(candidate);
+        for candidate in executable_candidates(&directory, name) {
+            if is_executable_file(&candidate)
+                && let Ok(candidate) = fs::canonicalize(candidate)
+            {
+                return Ok(candidate);
+            }
         }
     }
     Err(PrepareError::ExecutableNotFound(name))
+}
+
+fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    let base = directory.join(name);
+    #[cfg(not(windows))]
+    {
+        vec![base]
+    }
+    #[cfg(windows)]
+    {
+        let mut candidates = vec![base.clone()];
+        if base.extension().is_none() {
+            let path_ext =
+                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+            for extension in path_ext.to_string_lossy().split(';') {
+                let extension = extension.trim().trim_start_matches('.');
+                if !extension.is_empty() {
+                    candidates.push(base.with_extension(extension));
+                }
+            }
+        }
+        candidates
+    }
 }
 
 fn absolute_from(path: &Path, base: &Path) -> PathBuf {
