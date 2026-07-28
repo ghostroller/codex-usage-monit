@@ -112,6 +112,7 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Co
         path.push(":");
         path.push(existing);
     }
+    let perf_log = temp.path().join("perf.jsonl");
     let output = isolated_command(temp.path())
         .env("PATH", path)
         .args([
@@ -120,6 +121,8 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Co
             "--days",
             "3650",
             "--no-rollout-cache",
+            "--perf-log",
+            perf_log.to_str().unwrap(),
             "snapshot",
             "--format",
             "json",
@@ -148,5 +151,18 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Co
             .any(|warning| warning
                 .as_str()
                 .is_some_and(|warning| warning.contains("usage disabled in fixture")))
+    );
+
+    let refresh = fs::read_to_string(perf_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|record| record["event"] == "refresh")
+        .expect("online fixture collection must emit a refresh performance event");
+    assert!(
+        refresh["metrics"]["stages"]["accountUs"]
+            .as_u64()
+            .is_some_and(|account_us| account_us > 0),
+        "parallel App Server collection must retain its elapsed time: {refresh}"
     );
 }

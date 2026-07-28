@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.codex-usage-monit/
 *.log
 *.sqlite3

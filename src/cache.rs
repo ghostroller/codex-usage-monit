@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::atomic_file::replace_file;
+
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const CACHE_DIRECTORY_ENV: &str = "CODEX_USAGE_MONIT_CACHE_DIR";
 const TEMP_FILE_ATTEMPTS: usize = 128;
@@ -42,30 +44,6 @@ pub(crate) fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Resu
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        fs::rename(temporary, target)
-    }
-    #[cfg(windows)]
-    {
-        match fs::rename(temporary, target) {
-            Ok(()) => Ok(()),
-            Err(error)
-                if target.is_file()
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
-                    ) =>
-            {
-                fs::remove_file(target)?;
-                fs::rename(temporary, target)
-            }
-            Err(error) => Err(error),
-        }
-    }
 }
 
 fn nonempty_env(name: &str) -> Option<PathBuf> {

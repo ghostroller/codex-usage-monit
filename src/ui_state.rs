@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_file::replace_file;
+
 pub const UI_STATE_VERSION: u32 = 1;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
@@ -265,30 +267,6 @@ fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        fs::rename(temporary, target)
-    }
-    #[cfg(windows)]
-    {
-        match fs::rename(temporary, target) {
-            Ok(()) => Ok(()),
-            Err(error)
-                if target.is_file()
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
-                    ) =>
-            {
-                fs::remove_file(target)?;
-                fs::rename(temporary, target)
-            }
-            Err(error) => Err(error),
-        }
-    }
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {

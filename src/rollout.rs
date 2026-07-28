@@ -855,6 +855,12 @@ impl RolloutCache {
                 }
             }
         }
+        mark_threads_with_changed_file_order(
+            &self.selected,
+            &selected,
+            &self.files,
+            &mut changed_thread_ids,
+        );
         let selected_changed = selected != self.selected;
         let must_rebuild = self.reduced.is_none() || selected_changed || refresh.reparsed_files > 0;
 
@@ -1465,6 +1471,38 @@ fn reduce_cached_files(
     }
     rebuild_reduced_metadata(&mut reduced, files, cache);
     reduced
+}
+
+fn mark_threads_with_changed_file_order(
+    previous: &[SelectedFile],
+    current: &[SelectedFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    changed_thread_ids: &mut HashSet<String>,
+) {
+    let paths_by_thread = |selected: &[SelectedFile]| {
+        let mut paths = HashMap::<String, Vec<PathBuf>>::new();
+        for file in selected {
+            let Some(thread_id) = cache
+                .get(&file.path)
+                .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
+            else {
+                continue;
+            };
+            paths
+                .entry(thread_id.clone())
+                .or_default()
+                .push(file.path.clone());
+        }
+        paths
+    };
+    let previous_paths = paths_by_thread(previous);
+    let current_paths = paths_by_thread(current);
+
+    for thread_id in previous_paths.keys().chain(current_paths.keys()) {
+        if previous_paths.get(thread_id) != current_paths.get(thread_id) {
+            changed_thread_ids.insert(thread_id.clone());
+        }
+    }
 }
 
 fn incrementally_reduce_cached_files(

@@ -31,6 +31,11 @@ struct LocalCollection {
     rollout_metrics: Option<RolloutCacheMetrics>,
 }
 
+struct AccountCollection {
+    result: Result<AccountSnapshot>,
+    elapsed_us: u64,
+}
+
 fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: bool) -> bool {
     scan_local && refresh_account && !offline
 }
@@ -152,7 +157,8 @@ fn collect_local_source(
     collection
 }
 
-fn fetch_account_source(config: &CollectConfig) -> Result<AccountSnapshot> {
+fn fetch_account_source(config: &CollectConfig) -> AccountCollection {
+    let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let span = config.startup_trace.span("snapshot.account_fetch");
     let result = fetch_account_snapshot(config);
     span.finish_with(|| match &result {
@@ -172,13 +178,17 @@ fn fetch_account_source(config: &CollectConfig) -> Result<AccountSnapshot> {
                 .to_string()
         }
     });
-    result
+    AccountCollection {
+        result,
+        elapsed_us: elapsed_us(perf_started),
+    }
 }
 
-fn flatten_account_thread(
-    result: thread::Result<Result<AccountSnapshot>>,
-) -> Result<AccountSnapshot> {
-    result.unwrap_or_else(|_| Err(anyhow!("app-server collector thread panicked")))
+fn flatten_account_thread(result: thread::Result<AccountCollection>) -> AccountCollection {
+    result.unwrap_or_else(|_| AccountCollection {
+        result: Err(anyhow!("app-server collector thread panicked")),
+        elapsed_us: 0,
+    })
 }
 
 pub fn collect_snapshot(
@@ -250,16 +260,18 @@ fn collect_snapshot_with_local(
     let mut errors = Vec::new();
 
     let parallel_sources = sources_run_in_parallel(scan_local, refresh_account, config.offline);
-    let (local, prefetched_account) = if parallel_sources {
+    let (local, prefetched_account, parallel_account_us) = if parallel_sources {
         let (local, account) = run_sources_in_parallel(
             || collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
             || fetch_account_source(config),
         );
-        (local, Some(flatten_account_thread(account)))
+        let account = flatten_account_thread(account);
+        (local, Some(account.result), account.elapsed_us)
     } else {
         (
             collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
             None,
+            0,
         )
     };
     if local.unchanged {
@@ -374,7 +386,11 @@ fn collect_snapshot_with_local(
             )
         });
     }
-    let account_us = elapsed_us(account_perf_started);
+    let account_us = if parallel_sources {
+        parallel_account_us
+    } else {
+        elapsed_us(account_perf_started)
+    };
 
     let derive_perf_started = config.perf_log.is_enabled().then(Instant::now);
     let derive_span = config.startup_trace.span("snapshot.derive");
@@ -788,11 +804,13 @@ mod tests {
 
     #[test]
     fn account_collector_panic_becomes_a_refresh_error() {
-        let account: thread::Result<Result<AccountSnapshot>> =
+        let account: thread::Result<AccountCollection> =
             Err(Box::new("simulated account collector panic") as Box<dyn std::any::Any + Send>);
 
-        let error = flatten_account_thread(account).unwrap_err();
+        let account = flatten_account_thread(account);
+        let error = account.result.unwrap_err();
         assert_eq!(error.to_string(), "app-server collector thread panicked");
+        assert_eq!(account.elapsed_us, 0);
     }
 
     fn weekly_limit(

@@ -1,4 +1,5 @@
 pub mod app_server;
+mod atomic_file;
 pub mod attribution;
 pub mod cache;
 pub mod cli;

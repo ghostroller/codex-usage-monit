@@ -221,6 +221,49 @@ fn incomplete_in_memory_entry_is_reparsed_instead_of_hydrated_from_disk() {
 }
 
 #[test]
+fn file_reordering_marks_only_threads_whose_internal_replay_order_changed() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.jsonl");
+    let second = temp.path().join("second.jsonl");
+    let unrelated = temp.path().join("unrelated.jsonl");
+    for path in [&first, &second, &unrelated] {
+        fs::write(path, b"{}\n").unwrap();
+    }
+    let mut cache = HashMap::new();
+    for (path, owner_thread_id) in [
+        (&first, "shared-thread"),
+        (&second, "shared-thread"),
+        (&unrelated, "other-thread"),
+    ] {
+        cache.insert(
+            path.clone(),
+            CachedFile {
+                fingerprint: FileFingerprint::from_metadata(&path.metadata().unwrap()).unwrap(),
+                parsed: ParsedFile {
+                    owner_thread_id: Some(owner_thread_id.to_string()),
+                    complete: true,
+                    ..ParsedFile::default()
+                },
+            },
+        );
+    }
+    let selected = |path: &Path| SelectedFile {
+        path: path.to_owned(),
+        fingerprint: cache.get(path).unwrap().fingerprint.clone(),
+    };
+    let previous = vec![selected(&first), selected(&unrelated), selected(&second)];
+    let current = vec![selected(&second), selected(&unrelated), selected(&first)];
+    let mut changed_thread_ids = HashSet::new();
+
+    mark_threads_with_changed_file_order(&previous, &current, &cache, &mut changed_thread_ids);
+
+    assert_eq!(
+        changed_thread_ids,
+        HashSet::from(["shared-thread".to_string()])
+    );
+}
+
+#[test]
 fn persistent_write_backoff_is_bounded() {
     let mut backoff = Duration::ZERO;
     for _ in 0..16 {

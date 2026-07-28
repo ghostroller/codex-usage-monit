@@ -220,6 +220,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "vt100",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

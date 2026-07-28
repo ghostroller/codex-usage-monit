@@ -15,11 +15,48 @@ use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
 use crate::startup::StartupTrace;
 use crate::tui::Theme;
 
-struct PerfLogGuard(PerfLog);
+struct PerfLogGuard {
+    log: PerfLog,
+    path: Option<PathBuf>,
+    reported_error: Option<String>,
+}
+
+impl PerfLogGuard {
+    fn new(log: PerfLog, path: Option<PathBuf>) -> Self {
+        Self {
+            log,
+            path,
+            reported_error: None,
+        }
+    }
+
+    fn report_error(&mut self) {
+        let mut stderr = io::stderr().lock();
+        let _ = self.report_error_to(&mut stderr);
+    }
+
+    fn report_error_to(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        let Some(error) = self.log.log_error() else {
+            return Ok(());
+        };
+        if self.reported_error.as_deref() == Some(error.as_str()) {
+            return Ok(());
+        }
+
+        if let Some(path) = self.path.as_deref() {
+            writeln!(writer, "warning: --perf-log disabled for {path:?}: {error}")?;
+        } else {
+            writeln!(writer, "warning: --perf-log disabled: {error}")?;
+        }
+        self.reported_error = Some(error);
+        Ok(())
+    }
+}
 
 impl Drop for PerfLogGuard {
     fn drop(&mut self) {
-        self.0.finish();
+        self.log.finish();
+        self.report_error();
     }
 }
 
@@ -208,12 +245,13 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         StartupTrace::default()
     };
     let trace_initialized_at = Instant::now();
-    let perf_log = cli
-        .perf_log
+    let perf_log_path = cli.perf_log.clone();
+    let perf_log = perf_log_path
         .as_deref()
         .map(PerfLog::enabled)
         .unwrap_or_default();
-    let _perf_log_guard = PerfLogGuard(perf_log.clone());
+    let mut perf_log_guard = PerfLogGuard::new(perf_log.clone(), perf_log_path);
+    perf_log_guard.report_error();
     trace.record_interval(
         "cli.parse",
         process_started,
@@ -486,6 +524,23 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(after.perf_log, Some(PathBuf::from("/tmp/perf.jsonl")));
+    }
+
+    #[test]
+    fn runtime_perf_log_initialization_errors_are_reported_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = PerfLog::enabled(temp.path());
+        assert!(!log.is_enabled());
+        let mut guard = PerfLogGuard::new(log, Some(temp.path().to_owned()));
+        let mut warnings = Vec::new();
+
+        guard.report_error_to(&mut warnings).unwrap();
+        guard.report_error_to(&mut warnings).unwrap();
+
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert_eq!(warnings.lines().count(), 1);
+        assert!(warnings.contains("--perf-log disabled"));
+        assert!(warnings.contains(&format!("{:?}", temp.path())));
     }
 
     #[test]

@@ -29,8 +29,75 @@ fn executable_script(path: &Path, script: &str) {
     }
 }
 
+fn executable_path(directory: &Path, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        directory.join(format!("{name}.cmd"))
+    }
+    #[cfg(not(windows))]
+    {
+        directory.join(name)
+    }
+}
+
 fn executable(path: &Path) {
+    #[cfg(windows)]
+    executable_script(path, "@echo off\r\nexit /b 0\r\n");
+    #[cfg(not(windows))]
     executable_script(path, "#!/bin/sh\nexit 0\n");
+}
+
+fn create_pane_script() -> &'static str {
+    #[cfg(windows)]
+    {
+        r#"@echo off
+if "%~2"=="new-pane" (
+  echo terminal_42
+  exit /b 0
+)
+exit /b 2
+"#
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\nif [ \"$2\" = \"new-pane\" ]; then printf 'terminal_42\\n'; exit 0; fi\nexit 2\n"
+    }
+}
+
+fn focus_pane_script() -> &'static str {
+    #[cfg(windows)]
+    {
+        r#"@echo off
+if "%~2"=="list-panes" (
+  echo [{"id":42,"is_plugin":false}]
+  exit /b 0
+)
+if "%~2"=="focus-pane-id" if "%~3"=="terminal_42" exit /b 0
+exit /b 3
+"#
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\nif [ \"$2\" = \"list-panes\" ]; then printf '[{\"id\":42,\"is_plugin\":false}]'; exit 0; fi\nif [ \"$2\" = \"focus-pane-id\" ] && [ \"$3\" = \"terminal_42\" ]; then exit 0; fi\nexit 3\n"
+    }
+}
+
+fn rejected_action_script() -> &'static str {
+    #[cfg(windows)]
+    {
+        r#"@echo off
+if "%~2"=="list-panes" (
+  echo []
+  exit /b 0
+)
+>&2 echo bad output[31m
+exit /b 7
+"#
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\nif [ \"$2\" = \"list-panes\" ]; then printf '[]'; exit 0; fi\nprintf 'bad\\noutput\\033[31m' >&2\nexit 7\n"
+    }
 }
 
 fn fixture() -> (TempDir, ResumeTarget, LaunchContext) {
@@ -43,8 +110,8 @@ fn fixture() -> (TempDir, ResumeTarget, LaunchContext) {
     fs::create_dir_all(&task_cwd).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&bin).unwrap();
-    executable(&bin.join("codex"));
-    executable(&bin.join("zellij"));
+    executable(&executable_path(&bin, "codex"));
+    executable(&executable_path(&bin, "zellij"));
     let context = LaunchContext::new(
         PathBuf::from("relative home"),
         None,
@@ -434,7 +501,10 @@ fn focus_preflight_does_not_require_codex_or_task_state() {
 
     let zellij = prepare_zellij_focus(&context).unwrap();
     assert!(zellij.is_absolute());
-    assert_eq!(zellij.file_name().and_then(OsStr::to_str), Some("zellij"));
+    assert_eq!(
+        zellij.file_name(),
+        executable_path(Path::new(""), "zellij").file_name()
+    );
 }
 
 #[test]
@@ -481,10 +551,7 @@ fn parses_flat_and_nested_zellij_pane_lists() {
 fn executes_new_pane_and_focuses_an_existing_terminal() {
     let (_temp, target, context) = fixture();
     let plan = prepare_zellij_launch(&target, &context, &ZellijOptions::default()).unwrap();
-    executable_script(
-        &plan.zellij_bin,
-        "#!/bin/sh\nif [ \"$2\" = \"new-pane\" ]; then printf 'terminal_42\\n'; exit 0; fi\nexit 2\n",
-    );
+    executable_script(&plan.zellij_bin, create_pane_script());
     assert_eq!(
         execute_zellij_launch(&plan).unwrap(),
         LaunchResult::Created {
@@ -492,10 +559,7 @@ fn executes_new_pane_and_focuses_an_existing_terminal() {
         }
     );
 
-    executable_script(
-        &plan.zellij_bin,
-        "#!/bin/sh\nif [ \"$2\" = \"list-panes\" ]; then printf '[{\"id\":42,\"is_plugin\":false}]'; exit 0; fi\nif [ \"$2\" = \"focus-pane-id\" ] && [ \"$3\" = \"terminal_42\" ]; then exit 0; fi\nexit 3\n",
-    );
+    executable_script(&plan.zellij_bin, focus_pane_script());
     assert_eq!(
         focus_existing_pane(&plan.zellij_bin, &PaneId::parse("terminal_42").unwrap()).unwrap(),
         FocusResult::Focused
@@ -506,10 +570,7 @@ fn executes_new_pane_and_focuses_an_existing_terminal() {
 fn missing_panes_and_rejected_actions_are_structured() {
     let (_temp, target, context) = fixture();
     let plan = prepare_zellij_launch(&target, &context, &ZellijOptions::default()).unwrap();
-    executable_script(
-        &plan.zellij_bin,
-        "#!/bin/sh\nif [ \"$2\" = \"list-panes\" ]; then printf '[]'; exit 0; fi\nprintf 'bad\\noutput\\033[31m' >&2\nexit 7\n",
-    );
+    executable_script(&plan.zellij_bin, rejected_action_script());
     assert_eq!(
         focus_existing_pane(&plan.zellij_bin, &PaneId::parse("terminal_99").unwrap()).unwrap(),
         FocusResult::Missing
