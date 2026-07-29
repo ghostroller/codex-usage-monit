@@ -539,17 +539,18 @@ if not "%~1"=="app-server" exit /b 41
 if not "%~2"=="--stdio" exit /b 42
 set /p initialize=
 echo {"id":1,"result":{"userAgent":"mock"}}
-set /p initialized=
-set /p limits=
-set /p usage=
+set /p account_requests=
 echo {"id":3,"error":{"code":-32601,"message":"usage disabled"}}
 echo {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300}},"rateLimitsByLimitId":null}}
+rem Keep the shim alive while the client writes the remaining RPC messages.
+rem A redirected set /p can read ahead and consume multiple LF-delimited messages.
+more >nul
 "#;
 
     with_mock_codex(script, |directory| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
-            app_server_timeout: Duration::from_secs(2),
+            app_server_timeout: Duration::from_secs(5),
             ..CollectConfig::default()
         };
 
@@ -562,6 +563,12 @@ echo {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":
             42.0
         );
         assert!(snapshot.usage.is_none());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("usage disabled (code -32601)"))
+        );
     });
 }
 
