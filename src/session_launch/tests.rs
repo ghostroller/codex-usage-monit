@@ -47,6 +47,43 @@ fn executable(path: &Path) {
     executable_script(path, "#!/bin/sh\nexit 0\n");
 }
 
+#[test]
+fn windows_pathext_candidates_prefer_cmd_over_a_bare_npm_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("codex");
+    fs::write(&base, "#!/bin/sh\nexit 91\n").unwrap();
+    fs::write(base.with_extension("cmd"), "@echo off\r\nexit /b 0\r\n").unwrap();
+
+    let selected = pathext_executable_candidates(base.clone(), OsStr::new(".com;.exe;.bat;.cmd"))
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+
+    assert_eq!(selected, Some(base.with_extension("cmd")));
+}
+
+#[test]
+fn windows_pathext_candidates_keep_an_explicit_extension_unchanged() {
+    let explicit = PathBuf::from(r"C:\tools\custom-codex.cmd");
+
+    assert_eq!(
+        pathext_executable_candidates(explicit.clone(), OsStr::new(".EXE;.CMD")),
+        vec![explicit]
+    );
+}
+
+#[test]
+fn explicit_executable_override_bypasses_pathext_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let explicit = temp.path().join("custom-codex.cmd");
+    executable(&explicit);
+    executable(&temp.path().join("custom-codex.exe"));
+    let path = env::join_paths([temp.path()]).unwrap();
+
+    let resolved = resolve_executable("codex", Some(&explicit), &path, temp.path()).unwrap();
+
+    assert_eq!(resolved, fs::canonicalize(explicit).unwrap());
+}
+
 fn create_pane_script() -> &'static str {
     #[cfg(windows)]
     {

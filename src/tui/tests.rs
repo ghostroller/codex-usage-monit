@@ -5253,6 +5253,168 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
 }
 
 #[test]
+fn latest_half_hour_window_uses_now_when_the_snapshot_clock_is_frozen() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(1, 1);
+    app.snapshot.as_of = now - ChronoDuration::hours(6);
+    let bucket = |starts_at, total_tokens| LocalHalfHourBucket {
+        starts_at,
+        ends_at: starts_at + ChronoDuration::minutes(30),
+        sampled_at: starts_at + ChronoDuration::minutes(30),
+        token_usage: TokenUsage {
+            total_tokens,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: u128::from(total_tokens),
+        estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        call_count: 1,
+        groups: Vec::new(),
+        partial_reasons: Vec::new(),
+    };
+    app.history.half_hour_buckets = vec![
+        bucket(now - ChronoDuration::hours(28), 100),
+        bucket(now - ChronoDuration::minutes(30), 200),
+    ];
+
+    let data = prepare_trend_data_at(&app, now);
+
+    assert_eq!(data.half_hour_bounds, trend_day_bounds(now, 0));
+    assert_ne!(
+        data.half_hour_bounds,
+        trend_day_bounds(app.snapshot.as_of, 0)
+    );
+    assert_eq!(
+        data.half_hour_tokens
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [200.0]
+    );
+}
+
+#[test]
+fn recorder_health_uses_now_instead_of_the_frozen_snapshot_clock() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(1, 1);
+    app.snapshot.as_of = now - ChronoDuration::hours(2);
+    let mut status = RecorderStatusFile::started_with_interval(
+        now - ChronoDuration::hours(1),
+        "test-history".to_string(),
+        60,
+    );
+    status.record_success(now - ChronoDuration::minutes(1));
+    assert!(!status.heartbeat_is_recent(app.snapshot.as_of));
+    app.recorder_health.status = Some(status);
+
+    assert!(recorder_panel_status_at(&app, now).starts_with("running "));
+    assert!(
+        recorder_panel_status_at(&app, now + ChronoDuration::minutes(13)).starts_with("stale ")
+    );
+}
+
+#[test]
+fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
+    let boundary = DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let previous_reset = boundary;
+    let current_reset = boundary + ChronoDuration::days(7);
+    let cross_reset_now = boundary + ChronoDuration::hours(12);
+    let bucket = |starts_at, cost_units| LocalHalfHourBucket {
+        starts_at,
+        ends_at: starts_at + ChronoDuration::minutes(30),
+        sampled_at: starts_at + ChronoDuration::minutes(30),
+        token_usage: TokenUsage {
+            total_tokens: u64::try_from(cost_units).unwrap(),
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: cost_units,
+        estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        call_count: 1,
+        groups: Vec::new(),
+        partial_reasons: Vec::new(),
+    };
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        quota_points: vec![
+            QuotaPoint {
+                observed_at: boundary - ChronoDuration::hours(2),
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: previous_reset,
+                used_percent: 35.0,
+                remaining_percent: 65.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: boundary - ChronoDuration::minutes(30),
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: previous_reset,
+                used_percent: 40.0,
+                remaining_percent: 60.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: boundary + ChronoDuration::hours(1),
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: current_reset,
+                used_percent: 10.0,
+                remaining_percent: 90.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: cross_reset_now,
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: current_reset,
+                used_percent: 20.0,
+                remaining_percent: 80.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+        ],
+        half_hour_buckets: vec![
+            bucket(boundary - ChronoDuration::hours(1), 100),
+            bucket(boundary + ChronoDuration::hours(1), 200),
+        ],
+        ..HistoryData::default()
+    };
+
+    let cross_reset = prepare_trend_data_at(&app, cross_reset_now);
+    assert_eq!(
+        cross_reset
+            .half_hour_estimated
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [40.0, 20.0]
+    );
+    assert!(
+        cross_reset
+            .half_hour_estimated
+            .iter()
+            .all(|point| !point.partial)
+    );
+
+    app.trend_day_offset = 1;
+    let older_day = prepare_trend_data_at(&app, boundary + ChronoDuration::hours(24));
+    assert_eq!(
+        older_day
+            .half_hour_estimated
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [40.0]
+    );
+    assert!(!older_day.half_hour_estimated[0].partial);
+}
+
+#[test]
 fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
     let mut app = interaction_test_app(1, 1);
     let reset = app.snapshot.as_of + ChronoDuration::days(3);

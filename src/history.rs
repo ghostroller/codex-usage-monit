@@ -1730,11 +1730,44 @@ fn resolve_history_root(
 
 pub fn history_namespace(codex_home: &Path) -> String {
     let normalized = normalized_path(codex_home);
-    let mut bytes = normalized.to_string_lossy().into_owned();
-    if cfg!(windows) {
-        bytes = bytes.replace('\\', "/").to_ascii_lowercase();
+    let bytes = history_namespace_bytes(&normalized);
+    format!("{:016x}", stable_hash(&bytes))
+}
+
+#[cfg(unix)]
+fn history_namespace_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn history_namespace_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if let Some(path) = path.to_str() {
+        // Preserve existing history namespaces for ordinary Windows paths.
+        return path.replace('\\', "/").to_ascii_lowercase().into_bytes();
     }
-    format!("{:016x}", stable_hash(bytes.as_bytes()))
+
+    // WTF-16 can contain unpaired surrogates, so encode code units explicitly.
+    // The invalid UTF-8 prefix keeps this representation disjoint from every
+    // legacy namespace input while remaining stable across Rust versions.
+    let mut bytes = vec![0xff, b'w', b't', b'f', b'1', b'6', 0];
+    for mut unit in path.as_os_str().encode_wide() {
+        if unit == u16::from(b'\\') {
+            unit = u16::from(b'/');
+        } else if unit <= 0x7f {
+            unit = u16::from((unit as u8).to_ascii_lowercase());
+        }
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(not(any(unix, windows)))]
+fn history_namespace_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_encoded_bytes().to_vec()
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
@@ -1888,9 +1921,35 @@ mod tests {
         let first = root.path().join("first/../first");
         let equivalent = root.path().join("first");
         let other = root.path().join("other");
+        let mut legacy_bytes = normalized_path(&first).to_string_lossy().into_owned();
+        if cfg!(windows) {
+            legacy_bytes = legacy_bytes.replace('\\', "/").to_ascii_lowercase();
+        }
         assert_eq!(history_namespace(&first), history_namespace(&equivalent));
         assert_ne!(history_namespace(&first), history_namespace(&other));
         assert_eq!(history_namespace(&first).len(), 16);
+        assert_eq!(
+            history_namespace(&first),
+            format!("{:016x}", stable_hash(legacy_bytes.as_bytes()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_home_namespace_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(
+            b"/tmp/codex-usage-monit-home-\xff".to_vec(),
+        ));
+        let second = PathBuf::from(OsString::from_vec(
+            b"/tmp/codex-usage-monit-home-\xfe".to_vec(),
+        ));
+
+        assert_ne!(first, second);
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(history_namespace(&first), history_namespace(&second));
     }
 
     #[test]

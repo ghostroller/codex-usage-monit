@@ -580,6 +580,55 @@ fn process_sample() -> ProcessSample {
     sample
 }
 
+#[cfg(windows)]
+fn process_sample() -> ProcessSample {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS,
+    };
+
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for the calling process.
+    let process = unsafe { GetCurrentProcess() };
+    let mut sample = ProcessSample::default();
+
+    let mut memory = PROCESS_MEMORY_COUNTERS {
+        cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap_or(u32::MAX),
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    // SAFETY: memory points to a writable structure whose byte size is supplied in `cb`.
+    if unsafe { GetProcessMemoryInfo(process, &mut memory, memory.cb) } != 0 {
+        sample.resident_bytes = u64::try_from(memory.WorkingSetSize).ok();
+        sample.peak_resident_bytes = u64::try_from(memory.PeakWorkingSetSize).ok();
+    }
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all FILETIME pointers refer to initialized writable values.
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } != 0 {
+        sample.user_cpu_time_ns = Some(filetime_nanoseconds(user));
+        sample.system_cpu_time_ns = Some(filetime_nanoseconds(kernel));
+    }
+
+    let mut io = IO_COUNTERS::default();
+    // SAFETY: io points to a writable IO_COUNTERS structure.
+    if unsafe { GetProcessIoCounters(process, &mut io) } != 0 {
+        sample.disk_read_bytes = Some(io.ReadTransferCount);
+        sample.disk_written_bytes = Some(io.WriteTransferCount);
+    }
+
+    sample
+}
+
+#[cfg(windows)]
+fn filetime_nanoseconds(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32 | u64::from(value.dwLowDateTime)).saturating_mul(100)
+}
+
 #[cfg(target_os = "macos")]
 fn getrusage_cpu_times() -> (Option<u64>, Option<u64>) {
     // SAFETY: `usage` is a valid writable rusage structure for RUSAGE_SELF.
@@ -602,7 +651,7 @@ fn timeval_ns(value: libc::timeval) -> Option<u64> {
     )
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_sample() -> ProcessSample {
     ProcessSample::default()
 }
@@ -730,5 +779,22 @@ mod tests {
                 .peak_physical_footprint_bytes
                 .is_some_and(|bytes| bytes > 0)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_sample_reports_current_resources() {
+        let sample = process_sample();
+        assert!(sample.resident_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(
+            sample
+                .peak_resident_bytes
+                .zip(sample.resident_bytes)
+                .is_some_and(|(peak, current)| peak >= current)
+        );
+        assert!(sample.user_cpu_time_ns.is_some());
+        assert!(sample.system_cpu_time_ns.is_some());
+        assert!(sample.disk_read_bytes.is_some());
+        assert!(sample.disk_written_bytes.is_some());
     }
 }

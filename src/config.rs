@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use crate::startup::StartupTrace;
 pub struct CollectConfig {
     pub codex_home: PathBuf,
     pub codex_bin: Option<PathBuf>,
+    pub app_server_path: Option<OsString>,
     pub rollout_cache_dir: Option<PathBuf>,
     pub lookback_days: i64,
     pub max_files: usize,
@@ -25,6 +27,7 @@ impl Default for CollectConfig {
         Self {
             codex_home: default_codex_home(),
             codex_bin: None,
+            app_server_path: None,
             rollout_cache_dir: None,
             lookback_days: 7,
             max_files: 500,

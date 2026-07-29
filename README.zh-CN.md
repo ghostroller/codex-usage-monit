@@ -183,7 +183,7 @@ codex-usage-monit service install
 codex-usage-monit service status
 ```
 
-macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低权限的当前用户任务计划。在线记录时，注册项会固化当前监控程序和 Codex 可执行文件的绝对路径，保留安装时的采集选项，并运行 `record --foreground`；launchd 和 systemd 还会获得安装时的 `PATH`。程序自身不会 daemonize。可以在 `service install` 前传入 `--codex-bin <FILE>` 覆盖自动发现的 Codex；离线 recorder 不要求安装 Codex。Windows 任务按用户 SID 隔离，不受默认 72 小时运行上限影响，允许电池供电，并会在失败后重启。删除服务不会删除历史：
+macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低权限的当前用户任务计划。在线记录时，注册项会固化当前监控程序和 Codex 可执行文件的绝对路径，保留安装时的采集选项和 `PATH`，并运行 `record --foreground`。程序自身不会 daemonize。可以在 `service install` 前传入 `--codex-bin <FILE>` 覆盖自动发现的 Codex；离线 recorder 不要求安装 Codex。Windows 任务按用户 SID 隔离，不受默认 72 小时运行上限影响，允许电池供电，并会在失败后重启。删除服务不会删除历史：
 
 ```bash
 codex-usage-monit service uninstall

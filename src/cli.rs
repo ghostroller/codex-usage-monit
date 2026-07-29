@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -115,6 +116,10 @@ pub struct Cli {
     /// Write low-overhead runtime performance samples as JSONL.
     #[arg(long, global = true, value_name = "FILE")]
     perf_log: Option<PathBuf>,
+
+    /// Internal PATH override preserved by service registrations.
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    service_path: Option<OsString>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -329,6 +334,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         config.codex_home = codex_home;
     }
     config.codex_bin = cli.codex_bin;
+    config.app_server_path = cli.service_path;
     config.lookback_days = cli.days.max(1);
     config.max_files = cli.max_files.max(1);
     config.active_grace = active_grace(cli.active_grace_minutes);
@@ -554,8 +560,17 @@ fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
     let mut next_local = Instant::now();
     let mut next_account = Instant::now();
     let mut account_issue = None;
-    let mut recorder_status =
-        RecorderStatusFile::started(Utc::now(), history_store.namespace().to_string());
+    let heartbeat_interval_seconds = if config.offline {
+        args.local_interval_seconds
+    } else {
+        args.local_interval_seconds
+            .min(args.account_interval_seconds)
+    };
+    let mut recorder_status = RecorderStatusFile::started_with_interval(
+        Utc::now(),
+        history_store.namespace().to_string(),
+        heartbeat_interval_seconds,
+    );
     write_recorder_status(&status_file, &recorder_status)
         .map_err(|error| anyhow::anyhow!("could not initialize recorder status: {error}"))?;
 
@@ -784,10 +799,13 @@ mod tests {
     #[test]
     fn record_and_service_commands_parse_cross_platform_paths() {
         let codex_bin = PathBuf::from("tools with spaces/codex.cmd");
+        let service_path = OsString::from(r"C:\Portable Node & Tools;C:\Windows\System32");
         let record = Cli::try_parse_from([
             "codex-usage-monit",
             "--codex-bin",
             codex_bin.to_str().unwrap(),
+            "--service-path",
+            service_path.to_str().unwrap(),
             "record",
             "--foreground",
             "--history-dir",
@@ -797,6 +815,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(record.codex_bin, Some(codex_bin));
+        assert_eq!(record.service_path, Some(service_path));
         assert!(matches!(
             record.command,
             Some(Command::Record(RecordArgs {

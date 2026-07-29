@@ -16,8 +16,9 @@ use crate::history::history_namespace;
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
 const WINDOWS_TASK_PREFIX: &str = r"\CodexUsageMonitRecorder";
-const STATUS_SCHEMA_VERSION: u32 = 1;
-const RECORDER_STALE_MINUTES: i64 = 12;
+const STATUS_SCHEMA_VERSION: u32 = 2;
+const LEGACY_RECORDER_STALE_SECONDS: u64 = 12 * 60;
+const RECORDER_STALE_GRACE_SECONDS: u64 = 2 * 60;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -148,6 +149,8 @@ pub struct RecorderStatusFile {
     pub last_attempt_at: DateTime<Utc>,
     pub last_history_heartbeat: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_seconds: Option<u64>,
 }
 
 impl RecorderStatusFile {
@@ -160,6 +163,18 @@ impl RecorderStatusFile {
             last_attempt_at: now,
             last_history_heartbeat: None,
             last_error: None,
+            heartbeat_interval_seconds: None,
+        }
+    }
+
+    pub fn started_with_interval(
+        now: DateTime<Utc>,
+        history_namespace: String,
+        heartbeat_interval_seconds: u64,
+    ) -> Self {
+        Self {
+            heartbeat_interval_seconds: Some(heartbeat_interval_seconds.max(1)),
+            ..Self::started(now, history_namespace)
         }
     }
 
@@ -187,8 +202,16 @@ impl RecorderStatusFile {
 
     pub fn heartbeat_is_recent(&self, now: DateTime<Utc>) -> bool {
         self.last_history_heartbeat.is_some_and(|heartbeat| {
-            let age = now.signed_duration_since(heartbeat);
-            age >= Duration::minutes(-1) && age <= Duration::minutes(RECORDER_STALE_MINUTES)
+            let age_seconds = now.signed_duration_since(heartbeat).num_seconds();
+            let stale_after_seconds =
+                self.heartbeat_interval_seconds
+                    .map_or(LEGACY_RECORDER_STALE_SECONDS, |interval| {
+                        interval
+                            .saturating_add(RECORDER_STALE_GRACE_SECONDS)
+                            .max(LEGACY_RECORDER_STALE_SECONDS)
+                    });
+            let stale_after_seconds = i64::try_from(stale_after_seconds).unwrap_or(i64::MAX);
+            age_seconds >= -Duration::minutes(1).num_seconds() && age_seconds <= stale_after_seconds
         })
     }
 }
@@ -438,24 +461,120 @@ fn install_launchd(options: &ServiceOptions) -> Result<()> {
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LaunchdOperation {
+    BootoutRegistration { domain: String, path: PathBuf },
+    BootoutService { target: String },
+    PrintService { target: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaunchdOperationResult {
+    success: bool,
+    detail: String,
+}
+
+fn run_launchd_operation(operation: LaunchdOperation) -> Result<LaunchdOperationResult> {
+    let (mut command, description) = match operation {
+        LaunchdOperation::BootoutRegistration { domain, path } => {
+            let mut command = Command::new("launchctl");
+            command.args(["bootout", &domain]).arg(path);
+            (command, "launchctl bootout registration")
+        }
+        LaunchdOperation::BootoutService { target } => {
+            let mut command = Command::new("launchctl");
+            command.args(["bootout", &target]);
+            (command, "launchctl bootout service")
+        }
+        LaunchdOperation::PrintService { target } => {
+            let mut command = Command::new("launchctl");
+            command.args(["print", &target]);
+            (command, "launchctl print service")
+        }
+    };
+    let output = command
+        .output()
+        .with_context(|| format!("could not run {description}"))?;
+    let success = output.status.success();
+    Ok(LaunchdOperationResult {
+        success,
+        detail: if success {
+            String::new()
+        } else {
+            output_detail(&output)
+        },
+    })
+}
+
 fn uninstall_launchd(_options: &ServiceOptions) -> Result<()> {
     let path = launchd_registration_path()?;
     let domain = launchd_domain();
-    let output = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(&path)
-        .output()
-        .context("could not run launchctl bootout")?;
-    if !output.status.success() && path.exists() {
-        let detail = output_detail(&output);
-        if !detail.contains("Could not find service") && !detail.contains("No such process") {
-            bail!("launchctl bootout failed: {detail}");
+    uninstall_launchd_registration(&path, &domain, run_launchd_operation)
+}
+
+fn uninstall_launchd_registration(
+    path: &Path,
+    domain: &str,
+    mut run: impl FnMut(LaunchdOperation) -> Result<LaunchdOperationResult>,
+) -> Result<()> {
+    let target = format!("{domain}/{SERVICE_LABEL}");
+    let mut failures = Vec::new();
+    let registration_booted_out = if path.exists() {
+        let result = run(LaunchdOperation::BootoutRegistration {
+            domain: domain.to_string(),
+            path: path.to_path_buf(),
+        })?;
+        if !result.success {
+            failures.push(format!("registration bootout failed: {}", result.detail));
+        }
+        result.success
+    } else {
+        false
+    };
+    if !registration_booted_out {
+        let result = run(LaunchdOperation::BootoutService {
+            target: target.clone(),
+        })?;
+        if !result.success {
+            failures.push(format!("service bootout failed: {}", result.detail));
         }
     }
+
+    let inspection = run(LaunchdOperation::PrintService {
+        target: target.clone(),
+    })?;
+    if inspection.success {
+        let detail = std::iter::once(
+            "launchctl reported success, but the service remains loaded".to_string(),
+        )
+        .chain(failures)
+        .collect::<Vec<_>>()
+        .join("; ");
+        bail!("could not unload launchd service {target}: {detail}");
+    }
+    if !launchd_print_reports_missing(&inspection.detail) {
+        bail!(
+            "could not verify that launchd service {target} was unloaded: {}",
+            inspection.detail
+        );
+    }
+
     if path.exists() {
-        fs::remove_file(&path).with_context(|| format!("could not remove {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("could not remove {}", path.display()))?;
     }
     Ok(())
+}
+
+fn launchd_print_reports_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "could not find service",
+        "service not found",
+        "no such process",
+        "service is not loaded",
+    ]
+    .iter()
+    .any(|message| detail.contains(message))
 }
 
 fn launchd_status(
@@ -815,8 +934,13 @@ fn windows_task_xml(options: &ServiceOptions, user_sid: &str) -> String {
 }
 
 fn windows_recorder_arguments(options: &ServiceOptions) -> String {
-    options
-        .recorder_arguments()
+    let mut arguments = Vec::new();
+    if let Some(path) = options.environment_path.as_ref() {
+        arguments.push(OsString::from("--service-path"));
+        arguments.push(path.clone());
+    }
+    arguments.extend(options.recorder_arguments());
+    arguments
         .iter()
         .map(OsString::as_os_str)
         .map(quote_windows_argument)
@@ -1216,13 +1340,16 @@ mod tests {
         );
         let options = options(Path::new(r"C:\Users\A B"));
         let arguments = windows_recorder_arguments(&options);
-        assert!(arguments.starts_with(r#"--codex-home "C:\Users\A B/"#));
+        assert!(arguments.starts_with(
+            r#"--service-path "/opt/codex & tools/bin:/usr/bin" --codex-home "C:\Users\A B/"#
+        ));
         assert!(arguments.contains(r#"--codex-bin "C:\Users\A B/Codex & $% tools/codex.cmd""#));
         assert!(arguments.contains("--days 11 --max-files 777 --active-grace-minutes 9"));
         assert!(arguments.contains("--redact-content --no-rollout-cache"));
         assert!(arguments.contains("record --foreground"));
         let xml = windows_task_xml(&options, "S-1-5-21-1234");
         assert!(xml.contains(r#"<Command>C:\Users\A B/bin/codex usage monit.exe</Command>"#));
+        assert!(xml.contains(r#"--service-path &quot;/opt/codex &amp; tools/bin:/usr/bin&quot;"#));
         assert!(xml.contains("Codex &amp; $% tools/codex.cmd"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
@@ -1237,6 +1364,10 @@ mod tests {
             windows_task_name("S-1-5-21-1234"),
             windows_task_name("S-1-5-21-5678")
         );
+
+        let mut inherited_path = options;
+        inherited_path.environment_path = None;
+        assert!(!windows_recorder_arguments(&inherited_path).contains("--service-path"));
     }
 
     #[test]
@@ -1279,6 +1410,141 @@ mod tests {
         );
         status.record_success(now + Duration::minutes(4));
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn status_file_v2_tracks_long_intervals_and_reads_v1_files() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("recorder-status.json");
+        let now = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        let mut status =
+            RecorderStatusFile::started_with_interval(now, "test-history".to_string(), 3_600);
+        status.record_success(now);
+        write_recorder_status(&path, &status).unwrap();
+
+        let loaded = read_recorder_status(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.heartbeat_interval_seconds, Some(3_600));
+        assert!(loaded.heartbeat_is_recent(now + Duration::minutes(62)));
+        assert!(!loaded.heartbeat_is_recent(now + Duration::seconds(3_721)));
+
+        let v1 = serde_json::json!({
+            "schemaVersion": 1,
+            "historyNamespace": "test-history",
+            "pid": 42,
+            "startedAt": now,
+            "lastAttemptAt": now,
+            "lastHistoryHeartbeat": now,
+            "lastError": null
+        });
+        fs::write(&path, serde_json::to_vec(&v1).unwrap()).unwrap();
+        let loaded = read_recorder_status(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.heartbeat_interval_seconds, None);
+        assert!(loaded.heartbeat_is_recent(now + Duration::minutes(12)));
+        assert!(!loaded.heartbeat_is_recent(now + Duration::seconds(721)));
+    }
+
+    #[test]
+    fn launchd_uninstall_falls_back_to_the_service_target_and_is_idempotent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("missing.plist");
+        let domain = "gui/501";
+        let target = format!("{domain}/{SERVICE_LABEL}");
+        let mut operations = Vec::new();
+
+        uninstall_launchd_registration(&path, domain, |operation| {
+            operations.push(operation.clone());
+            Ok(match operation {
+                LaunchdOperation::BootoutService { .. } => LaunchdOperationResult {
+                    success: false,
+                    detail: "service is not loaded".to_string(),
+                },
+                LaunchdOperation::PrintService { .. } => LaunchdOperationResult {
+                    success: false,
+                    detail: "Could not find service in domain".to_string(),
+                },
+                LaunchdOperation::BootoutRegistration { .. } => {
+                    panic!("a missing registration must not be booted out by path")
+                }
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            operations,
+            vec![
+                LaunchdOperation::BootoutService {
+                    target: target.clone(),
+                },
+                LaunchdOperation::PrintService { target },
+            ]
+        );
+    }
+
+    #[test]
+    fn launchd_uninstall_preserves_registration_when_the_job_remains_loaded() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("recorder.plist");
+        fs::write(&path, "registration").unwrap();
+        let domain = "gui/501";
+        let mut operations = Vec::new();
+
+        let error = uninstall_launchd_registration(&path, domain, |operation| {
+            operations.push(operation.clone());
+            Ok(match operation {
+                LaunchdOperation::PrintService { .. } => LaunchdOperationResult {
+                    success: true,
+                    detail: String::new(),
+                },
+                LaunchdOperation::BootoutRegistration { .. }
+                | LaunchdOperation::BootoutService { .. } => LaunchdOperationResult {
+                    success: false,
+                    detail: "permission denied".to_string(),
+                },
+            })
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("service remains loaded"));
+        assert!(error.to_string().contains("permission denied"));
+        assert!(path.exists());
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                LaunchdOperation::BootoutRegistration { .. },
+                LaunchdOperation::BootoutService { .. },
+                LaunchdOperation::PrintService { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn launchd_uninstall_preserves_registration_when_inspection_fails() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("recorder.plist");
+        fs::write(&path, "registration").unwrap();
+
+        let error = uninstall_launchd_registration(&path, "gui/501", |operation| {
+            Ok(match operation {
+                LaunchdOperation::BootoutRegistration { .. } => LaunchdOperationResult {
+                    success: true,
+                    detail: String::new(),
+                },
+                LaunchdOperation::PrintService { .. } => LaunchdOperationResult {
+                    success: false,
+                    detail: "permission denied".to_string(),
+                },
+                LaunchdOperation::BootoutService { .. } => {
+                    panic!("a successful registration bootout needs no target fallback")
+                }
+            })
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("could not verify"));
+        assert!(error.to_string().contains("permission denied"));
+        assert!(path.exists());
     }
 
     #[test]

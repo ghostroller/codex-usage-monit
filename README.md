@@ -183,7 +183,7 @@ codex-usage-monit service install
 codex-usage-monit service status
 ```
 
-The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and a least-privilege current-user Task Scheduler task on Windows. For online recording it registers absolute paths for both the running monitor and the Codex executable, preserves the install-time collection options, and starts `record --foreground`; launchd and systemd also receive the install-time `PATH`. The application does not daemonize itself. Use `--codex-bin <FILE>` before `service install` to override automatic Codex discovery; an offline recorder does not require Codex. The Windows task is isolated by user SID, has no 72-hour execution limit, may run on battery power, and restarts after failures. Registration is always explicit and can be removed without deleting history:
+The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and a least-privilege current-user Task Scheduler task on Windows. For online recording it registers absolute paths for both the running monitor and the Codex executable, preserves the install-time collection options and `PATH`, and starts `record --foreground`. The application does not daemonize itself. Use `--codex-bin <FILE>` before `service install` to override automatic Codex discovery; an offline recorder does not require Codex. The Windows task is isolated by user SID, has no 72-hour execution limit, may run on battery power, and restarts after failures. Registration is always explicit and can be removed without deleting history:
 
 ```bash
 codex-usage-monit service uninstall

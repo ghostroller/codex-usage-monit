@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -4674,9 +4674,13 @@ fn append_trend_control(
 }
 
 fn prepare_trend_data(app: &App) -> PreparedTrendData {
+    prepare_trend_data_at(app, Utc::now())
+}
+
+fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let five_hour_remaining = current_remaining_trend(&app.history, 300);
     let weekly_remaining = current_remaining_trend(&app.history, 10_080);
-    let half_hour_bounds = trend_day_bounds(app.snapshot.as_of, app.trend_day_offset);
+    let half_hour_bounds = trend_day_bounds(now, app.trend_day_offset);
     let weekly_reset = app.history.latest_weekly_reset();
 
     let weekly_cumulative = weekly_reset
@@ -4719,21 +4723,7 @@ fn prepare_trend_data(app: &App) -> PreparedTrendData {
             partial: !bucket.partial_reasons.is_empty(),
         })
         .collect();
-    let half_hour_estimated = weekly_reset
-        .map(|reset| app.history.estimated_half_hour_series(reset))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|point| {
-            point.starts_at >= half_hour_bounds[0] && point.starts_at < half_hour_bounds[1]
-        })
-        .filter_map(|point| {
-            point.estimated_quota_percent.map(|value| TrendPoint {
-                at: point.starts_at + (point.ends_at - point.starts_at) / 2,
-                value,
-                partial: !point.partial_reasons.is_empty(),
-            })
-        })
-        .collect();
+    let half_hour_estimated = half_hour_estimated_trend(&app.history, half_hour_bounds);
 
     PreparedTrendData {
         five_hour_remaining,
@@ -4748,6 +4738,80 @@ fn prepare_trend_data(app: &App) -> PreparedTrendData {
         history_warning_count: app.history.warnings.len(),
         history_read_only: app.history.read_only,
     }
+}
+
+fn half_hour_estimated_trend(history: &HistoryData, bounds: [DateTime<Utc>; 2]) -> Vec<TrendPoint> {
+    let mut points = BTreeMap::new();
+    for reset in weekly_resets_overlapping(history, bounds) {
+        for point in history
+            .estimated_half_hour_series(reset)
+            .into_iter()
+            .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
+        {
+            let Some(value) = point.estimated_quota_percent else {
+                continue;
+            };
+            let at = point.starts_at + (point.ends_at - point.starts_at) / 2;
+            let candidate = TrendPoint {
+                at,
+                value,
+                partial: !point.partial_reasons.is_empty(),
+            };
+            points
+                .entry(at)
+                .and_modify(|existing: &mut TrendPoint| {
+                    if existing.partial && !candidate.partial {
+                        *existing = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+    points.into_values().collect()
+}
+
+fn weekly_resets_overlapping(
+    history: &HistoryData,
+    bounds: [DateTime<Utc>; 2],
+) -> Vec<DateTime<Utc>> {
+    const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
+    const RESET_DRIFT_SECONDS: i64 = 120;
+
+    let candidates = history
+        .quota_points
+        .iter()
+        .filter(|point| point.duration_mins == WEEKLY_WINDOW_MINUTES)
+        .map(|point| (point.resets_at, point.observed_at))
+        .chain(
+            history
+                .weekly_local_points
+                .iter()
+                .map(|point| (point.resets_at, point.observed_at)),
+        );
+    let mut resets = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
+    for (reset, observed_at) in candidates {
+        if let Some((representative_reset, representative_observed_at)) = resets
+            .iter_mut()
+            .find(|(candidate, _)| (reset - *candidate).num_seconds().abs() <= RESET_DRIFT_SECONDS)
+        {
+            if observed_at > *representative_observed_at {
+                *representative_reset = reset;
+                *representative_observed_at = observed_at;
+            }
+            continue;
+        }
+        resets.push((reset, observed_at));
+    }
+    resets.sort_by_key(|(reset, _)| *reset);
+
+    resets
+        .into_iter()
+        .map(|(reset, _)| reset)
+        .filter(|reset| {
+            let starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
+            starts_at < bounds[1] && *reset > bounds[0]
+        })
+        .collect()
 }
 
 fn current_remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
@@ -5542,6 +5606,10 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn recorder_panel_status(app: &App) -> String {
+    recorder_panel_status_at(app, Utc::now())
+}
+
+fn recorder_panel_status_at(app: &App, now: DateTime<Utc>) -> String {
     if app.recorder_health.error.is_some() {
         return "error".to_string();
     }
@@ -5550,7 +5618,7 @@ fn recorder_panel_status(app: &App) -> String {
     };
     let state = if status.last_error.is_some() {
         "error"
-    } else if status.heartbeat_is_recent(app.snapshot.as_of) {
+    } else if status.heartbeat_is_recent(now) {
         "running"
     } else {
         "stale"

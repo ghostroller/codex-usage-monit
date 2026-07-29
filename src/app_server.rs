@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::env;
-#[cfg(windows)]
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(windows)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -73,7 +71,11 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     }
 
     let spawn_span = config.startup_trace.span("app_server.spawn");
-    let child = codex_command(config)
+    let mut command = codex_command(config);
+    if let Some(path) = config.app_server_path.as_deref() {
+        command.env("PATH", path);
+    }
+    let child = command
         .args(["app-server", "--stdio"])
         .env("CODEX_HOME", &config.codex_home)
         .stdin(Stdio::piped())
@@ -306,36 +308,17 @@ fn codex_command(config: &CollectConfig) -> Command {
     }
     #[cfg(windows)]
     {
+        let path = config
+            .app_server_path
+            .clone()
+            .or_else(|| env::var_os("PATH"))
+            .unwrap_or_default();
+        let monitor_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Command::new(
-            find_windows_executable("codex", env::var_os("PATH").as_deref())
-                .unwrap_or_else(|| PathBuf::from("codex")),
+            crate::session_launch::resolve_executable("codex", None, &path, &monitor_cwd)
+                .unwrap_or_else(|_| PathBuf::from("codex")),
         )
     }
-}
-
-#[cfg(windows)]
-fn find_windows_executable(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    let path = path?;
-    let path_ext = env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-    for directory in env::split_paths(path) {
-        let base = directory.join(name);
-        if base.is_file() {
-            return Some(base);
-        }
-        if Path::new(name).extension().is_none() {
-            for extension in path_ext.to_string_lossy().split(';') {
-                let extension = extension.trim().trim_start_matches('.');
-                if extension.is_empty() {
-                    continue;
-                }
-                let candidate = base.with_extension(extension);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Parses the `result` object returned by `account/rateLimits/read`.

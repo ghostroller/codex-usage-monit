@@ -67,6 +67,9 @@ fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> 
 fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> T {
     let _lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let directory = tempfile::tempdir().unwrap();
+    // npm's Windows cmd-shim creates all three siblings. The bare one is a
+    // POSIX shell script and must not shadow the executable `.cmd` shim.
+    fs::write(directory.path().join("codex"), "#!/bin/sh\nexit 91\n").unwrap();
     let executable = directory.path().join("codex.cmd");
     fs::write(&executable, script).unwrap();
 

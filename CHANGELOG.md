@@ -8,10 +8,20 @@ All notable changes to this project are documented in this file.
 
 - Added native 64-bit Windows CI and direct GitHub Release distribution as a checksummed `x86_64-pc-windows-msvc` executable.
 - Added PowerShell-safe copied resume commands and Windows `codex.cmd`/`PATHEXT` command discovery.
+- Added persistent 90-day quota, local-token, and estimated-usage history with weekly trajectories and 30-minute bars in the new Trends view.
+- Added an optional foreground recorder and per-user launchd, systemd, or Windows Task Scheduler service so quota history can continue while the TUI is closed.
+
+### Changed
+
+- Collapsed every task-tree node by default while preserving explicit expansion choices across refreshes.
 
 ### Fixed
 
 - Used `%USERPROFILE%\.codex` when Windows does not provide `HOME`, and made persisted TUI state replacement work on Windows.
+- Kept the latest Trends window and recorder-health age tied to wall-clock time, and included both weekly cycles when a 30-minute estimate view crosses a reset.
+- Preserved distinct history namespaces for non-UTF-8 Codex home paths.
+- Made recorder health account for custom collection intervals, preserved the install-time `PATH` on Windows, and unloaded launchd services even when their plist was already missing.
+- Reported native Windows process CPU, memory, peak-memory, and disk-I/O counters in performance logs.
 
 ## [0.2.2] - 2026-07-26
 

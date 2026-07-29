@@ -789,19 +789,30 @@ fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     }
     #[cfg(windows)]
     {
-        let mut candidates = vec![base.clone()];
-        if base.extension().is_none() {
-            let path_ext =
-                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-            for extension in path_ext.to_string_lossy().split(';') {
-                let extension = extension.trim().trim_start_matches('.');
-                if !extension.is_empty() {
-                    candidates.push(base.with_extension(extension));
-                }
-            }
-        }
-        candidates
+        let path_ext =
+            env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        pathext_executable_candidates(base, &path_ext)
     }
+}
+
+#[cfg(any(windows, test))]
+fn pathext_executable_candidates(base: PathBuf, path_ext: &OsStr) -> Vec<PathBuf> {
+    if base.extension().is_some() {
+        return vec![base];
+    }
+    let mut candidates = path_ext
+        .to_string_lossy()
+        .split(';')
+        .filter_map(|extension| {
+            let extension = extension.trim().trim_start_matches('.');
+            (!extension.is_empty()).then(|| base.with_extension(extension))
+        })
+        .collect::<Vec<_>>();
+    // Windows command discovery uses PATHEXT. Keep the bare file only as a
+    // last-resort compatibility candidate so npm's POSIX shim cannot shadow
+    // its executable `.cmd` sibling.
+    candidates.push(base);
+    candidates
 }
 
 fn absolute_from(path: &Path, base: &Path) -> PathBuf {
