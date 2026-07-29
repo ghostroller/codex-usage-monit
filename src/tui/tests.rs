@@ -310,6 +310,23 @@ fn make_task_resumable(app: &mut App, index: usize, cwd: &std::path::Path) {
     app.snapshot.codex_home = cwd.to_path_buf();
 }
 
+fn assert_resume_copy_command(command: &str) {
+    #[cfg(not(windows))]
+    {
+        assert!(command.starts_with("CODEX_HOME="));
+        assert!(command.contains(" codex resume --cd "));
+    }
+    #[cfg(windows)]
+    {
+        assert!(command.starts_with("& { param($codexHome) "));
+        assert!(command.contains("$env:CODEX_HOME = $codexHome"));
+        assert!(command.contains("& 'codex' 'resume' '--cd' "));
+    }
+    assert!(command.contains(RESUMABLE_THREAD_ID));
+    assert!(!command.contains("PATH="));
+    assert!(!command.contains("visible"));
+}
+
 #[test]
 fn open_control_supports_keyboard_mouse_search_priority_and_compact_rendering() {
     let temp = tempfile::tempdir().unwrap();
@@ -360,11 +377,7 @@ fn open_control_supports_keyboard_mouse_search_priority_and_compact_rendering() 
     );
     handle_key_event(&mut app, key_event(KeyCode::Char('C')));
     let request = app.pending_clipboard.take().unwrap();
-    assert!(request.text.starts_with("CODEX_HOME="));
-    assert!(request.text.contains(" codex resume --cd "));
-    assert!(request.text.contains(RESUMABLE_THREAD_ID));
-    assert!(!request.text.contains("PATH="));
-    assert!(!request.text.contains("visible"));
+    assert_resume_copy_command(&request.text);
     app.apply_clipboard_result(
         request,
         Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure")),
@@ -498,9 +511,7 @@ fn open_outside_zellij_copies_with_mouse_and_never_launches_on_enter() {
     ));
     let request = app.pending_clipboard.take().unwrap();
     assert_eq!(request.thread_id, RESUMABLE_THREAD_ID);
-    assert!(request.text.contains(" codex resume --cd "));
-    assert!(request.text.contains(RESUMABLE_THREAD_ID));
-    assert!(!request.text.contains("PATH="));
+    assert_resume_copy_command(&request.text);
     app.apply_clipboard_result(request, Ok(()));
     assert!(app.resume_confirmation.is_none());
     assert_eq!(

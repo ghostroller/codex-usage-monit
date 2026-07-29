@@ -1278,6 +1278,24 @@ mod tests {
         options
     }
 
+    fn windows_options() -> ServiceOptions {
+        let mut options = ServiceOptions::new(
+            PathBuf::from(r"C:\Users\A B\bin\codex usage monit.exe"),
+            PathBuf::from(r"C:\Users\A B\Codex Home"),
+            PathBuf::from(r"C:\Users\A B\State Dir\history-v1"),
+            PathBuf::from(r"C:\Users\A B\State Dir\recorder-status.json"),
+            Some(PathBuf::from(r"C:\Users\A B\State Dir\perf log.jsonl")),
+        );
+        options.codex_bin = Some(PathBuf::from(r"C:\Users\A B\Codex & $% tools\codex.cmd"));
+        options.environment_path = Some(OsString::from("/opt/codex & tools/bin:/usr/bin"));
+        options.lookback_days = 11;
+        options.max_files = 777;
+        options.active_grace_minutes = 9;
+        options.redact_content = true;
+        options.no_rollout_cache = true;
+        options
+    }
+
     #[test]
     fn recorder_arguments_preserve_paths_as_distinct_argv_elements() {
         let root = Path::new("/tmp/root with spaces");
@@ -1304,6 +1322,7 @@ mod tests {
         assert!(arguments.contains(&root.join("State Dir/perf log.jsonl").into_os_string()));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn launchd_and_systemd_render_escaped_argument_arrays() {
         let root = Path::new("/tmp/a & b");
@@ -1339,19 +1358,19 @@ mod tests {
             quote_windows_argument(OsStr::new(r"C:\path with space\")),
             r#""C:\path with space\\""#
         );
-        let options = options(Path::new(r"C:\Users\A B"));
+        let options = windows_options();
         let arguments = windows_recorder_arguments(&options);
         assert!(arguments.starts_with(
-            r#""--service-path=/opt/codex & tools/bin:/usr/bin" --codex-home "C:\Users\A B/"#
+            r#""--service-path=/opt/codex & tools/bin:/usr/bin" --codex-home "C:\Users\A B\Codex Home""#
         ));
-        assert!(arguments.contains(r#"--codex-bin "C:\Users\A B/Codex & $% tools/codex.cmd""#));
+        assert!(arguments.contains(r#"--codex-bin "C:\Users\A B\Codex & $% tools\codex.cmd""#));
         assert!(arguments.contains("--days 11 --max-files 777 --active-grace-minutes 9"));
         assert!(arguments.contains("--redact-content --no-rollout-cache"));
         assert!(arguments.contains("record --foreground"));
         let xml = windows_task_xml(&options, "S-1-5-21-1234");
-        assert!(xml.contains(r#"<Command>C:\Users\A B/bin/codex usage monit.exe</Command>"#));
+        assert!(xml.contains(r#"<Command>C:\Users\A B\bin\codex usage monit.exe</Command>"#));
         assert!(xml.contains(r#"&quot;--service-path=/opt/codex &amp; tools/bin:/usr/bin&quot;"#));
-        assert!(xml.contains("Codex &amp; $% tools/codex.cmd"));
+        assert!(xml.contains(r"Codex &amp; $% tools\codex.cmd"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
         assert!(xml.contains("<StopIfGoingOnBatteries>false"));
@@ -1373,15 +1392,14 @@ mod tests {
 
     #[test]
     fn windows_recorder_path_value_can_begin_with_a_hyphen() {
-        let root = Path::new(r"C:\Users\A B");
-        let mut options = options(root);
+        let mut options = windows_options();
         options.environment_path = Some(OsString::from(
             r"-C:\Portable Node & Tools;C:\Windows\System32",
         ));
 
         let arguments = windows_recorder_arguments(&options);
         assert!(arguments.starts_with(
-            r#""--service-path=-C:\Portable Node & Tools;C:\Windows\System32" --codex-home "C:\Users\A B/"#
+            r#""--service-path=-C:\Portable Node & Tools;C:\Windows\System32" --codex-home "C:\Users\A B\Codex Home""#
         ));
         let xml = windows_task_xml(&options, "S-1-5-21-1234");
         assert!(xml.contains(

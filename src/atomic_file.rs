@@ -33,6 +33,13 @@ fn replace_file_windows(temporary: &Path, target: &Path) -> io::Result<()> {
         Ok(encoded)
     }
 
+    if !std::fs::symlink_metadata(temporary)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replacement source must be a regular file",
+        ));
+    }
+
     let temporary = wide_path(temporary)?;
     let target = wide_path(target)?;
     // SAFETY: both buffers are NUL-terminated and remain alive for the call.
