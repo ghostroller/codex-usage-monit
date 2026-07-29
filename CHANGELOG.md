@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.3] - 2026-07-29
+
 ### Added
 
 - Added native 64-bit Windows CI and direct GitHub Release distribution as a checksummed `x86_64-pc-windows-msvc` executable.
@@ -14,6 +16,7 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - Collapsed every task-tree node by default while preserving explicit expansion choices across refreshes.
+- Reduced steady-state refresh overhead by caching rollout discovery, batching TUI history writes, retaining live staged data, and expanding performance diagnostics.
 
 ### Fixed
 
@@ -22,6 +25,7 @@ All notable changes to this project are documented in this file.
 - Preserved distinct history namespaces for non-UTF-8 Codex home paths.
 - Made recorder health account for custom collection intervals, preserved the install-time `PATH` on Windows, and unloaded launchd services even when their plist was already missing.
 - Reported native Windows process CPU, memory, peak-memory, and generic I/O counters in performance logs; renamed the cross-platform process counters to `ioReadBytes` and `ioWrittenBytes` under performance-log schema v2.
+- Preserved all loaded Quota Remaining reset cycles so resets appear as observed jumps while genuine recorder gaps remain disconnected.
 
 ## [0.2.2] - 2026-07-26
 
@@ -80,6 +84,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.1.1...v0.2.0
