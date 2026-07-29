@@ -853,6 +853,12 @@ fn set_task_parent(app: &mut App, child: usize, parent: usize) {
     task.parent_thread_id = Some(parent_thread_id);
 }
 
+fn expand_task_tree(app: &mut App) {
+    app.task_list_mode = TaskListMode::Tree;
+    let collapsible = app.filtered_collapsible_task_threads();
+    app.expanded_task_threads.extend(collapsible);
+}
+
 fn render_models_content(snapshot: &Snapshot, width: u16, height: u16) -> String {
     render_models_content_for_scope(snapshot, WindowScope::FiveHours, width, height)
 }
@@ -1644,13 +1650,32 @@ fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority(
     assert_eq!(app.selected_task, 1);
 
     app.task_search = "temporary query".to_string();
-    app.collapsed_task_threads
+    app.expanded_task_threads
         .insert("task-thread-1".to_string());
     assert_eq!(app.ui_state(), saved);
 
     app.apply_ui_state(&saved, Some(Theme::Dark));
     assert_eq!(app.theme, Theme::Dark);
     assert_eq!(app.ui_state().theme, UiTheme::Dark);
+}
+
+#[test]
+fn saved_tree_mode_starts_with_every_parent_collapsed() {
+    let mut app = interaction_test_app(3, 1);
+    set_task_parent(&mut app, 0, 2);
+    app.selected_task = 0;
+    let saved = UiState {
+        task_list_mode: UiTaskListMode::Tree,
+        ..UiState::default()
+    };
+
+    app.apply_ui_state(&saved, None);
+
+    assert_eq!(app.task_list_mode, TaskListMode::Tree);
+    assert!(app.expanded_task_threads.is_empty());
+    assert!(app.all_filtered_task_threads_collapsed());
+    assert_eq!(app.filtered_task_indices(), vec![2, 1]);
+    assert_eq!(app.selected_task, 2);
 }
 
 #[test]
@@ -2146,7 +2171,7 @@ fn tree_rows_group_visible_subagents_by_subtree_recency_and_break_cycles() {
     app.snapshot.tasks[4].parent_thread_id = Some("missing-parent".to_string());
     set_task_parent(&mut app, 6, 7);
     set_task_parent(&mut app, 7, 6);
-    app.task_list_mode = TaskListMode::Tree;
+    expand_task_tree(&mut app);
 
     let rows = app.filtered_task_rows();
     assert_eq!(
@@ -2189,7 +2214,7 @@ fn tree_collapse_hides_nested_rows_keeps_rank_and_promotes_filtered_orphans() {
     set_task_parent(&mut app, 3, 5);
     app.snapshot.tasks[4].source = Some("subagent".to_string());
     app.snapshot.tasks[4].parent_thread_id = Some("missing-parent".to_string());
-    app.task_list_mode = TaskListMode::Tree;
+    expand_task_tree(&mut app);
 
     let rows = app.filtered_task_rows();
     assert_eq!(
@@ -2340,7 +2365,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         models: Vec::new(),
     });
 
-    app.task_list_mode = TaskListMode::Tree;
+    expand_task_tree(&mut app);
     app.selected_task = 2;
     assert!(app.set_task_collapsed(2, true));
     let rows = app.filtered_task_rows();
@@ -2432,14 +2457,14 @@ fn tree_plus_minus_toggle_selected_parent_but_search_consumes_the_symbols() {
     app.task_list_mode = TaskListMode::Tree;
     app.selected_task = 2;
 
-    handle_key_event(&mut app, key_event(KeyCode::Char('-')));
-    assert!(app.collapsed_task_threads.contains("task-thread-2"));
+    assert!(!app.expanded_task_threads.contains("task-thread-2"));
     assert_eq!(app.filtered_task_indices(), vec![2, 1]);
     handle_key_event(&mut app, key_event(KeyCode::Char('+')));
-    assert!(!app.collapsed_task_threads.contains("task-thread-2"));
+    assert!(app.expanded_task_threads.contains("task-thread-2"));
     assert_eq!(app.filtered_task_indices(), vec![2, 0, 1]);
 
     handle_key_event(&mut app, key_event(KeyCode::Char('-')));
+    assert!(!app.expanded_task_threads.contains("task-thread-2"));
     app.begin_task_search();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -2455,7 +2480,7 @@ fn tree_plus_minus_toggle_selected_parent_but_search_consumes_the_symbols() {
     handle_key_event(&mut app, key_event(KeyCode::Char('-')));
     handle_key_event(&mut app, key_event(KeyCode::Char('+')));
     assert_eq!(app.task_search, "-+");
-    assert!(app.collapsed_task_threads.contains("task-thread-2"));
+    assert!(!app.expanded_task_threads.contains("task-thread-2"));
 }
 
 #[test]
@@ -2463,7 +2488,7 @@ fn tree_marker_mouse_click_selects_once_and_has_stable_geometry_and_placeholder(
     for theme in [Theme::Dark, Theme::Light] {
         let mut app = interaction_test_app(4, 2);
         set_task_parent(&mut app, 0, 3);
-        app.task_list_mode = TaskListMode::Tree;
+        expand_task_tree(&mut app);
         app.theme = theme;
         app.selected_task = 1;
         app.selected_turn = 1;
@@ -2539,7 +2564,7 @@ fn tree_marker_mouse_click_selects_once_and_has_stable_geometry_and_placeholder(
 fn compact_tree_marker_hitbox_matches_all_three_clickable_cells() {
     let mut app = interaction_test_app(4, 1);
     set_task_parent(&mut app, 0, 3);
-    app.task_list_mode = TaskListMode::Tree;
+    expand_task_tree(&mut app);
     app.turns_default_visible = false;
     app.selected_task = 3;
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
@@ -2569,8 +2594,8 @@ fn compact_tree_marker_hitbox_matches_all_three_clickable_cells() {
             ),
         ));
         assert_eq!(
-            app.collapsed_task_threads.contains("task-thread-3"),
-            expected_before == "-"
+            app.expanded_task_threads.contains("task-thread-3"),
+            expected_before == "+"
         );
     }
 }
@@ -2582,8 +2607,6 @@ fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
     flat.selected_task = 0;
     flat.selected_turn = 1;
     flat.turn_offset = 1;
-    flat.collapsed_task_threads
-        .insert("task-thread-3".to_string());
     handle_key_event(&mut flat, key_event(KeyCode::Char('R')));
     assert_eq!(flat.task_list_mode, TaskListMode::Tree);
     assert_eq!(flat.selected_task, 3);
@@ -2596,9 +2619,6 @@ fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
     refreshed.selected_task = 0;
     refreshed.selected_turn = 1;
     refreshed.turn_offset = 1;
-    refreshed
-        .collapsed_task_threads
-        .insert("task-thread-3".to_string());
     let mut snapshot = refreshed.snapshot.clone();
     snapshot.tasks[0].source = Some("subagent".to_string());
     snapshot.tasks[0].parent_thread_id = Some("task-thread-3".to_string());
@@ -2618,12 +2638,12 @@ fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
 }
 
 #[test]
-fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
+fn refresh_retains_live_expansions_and_drops_removed_parent_state() {
     let mut app = interaction_test_app(4, 1);
     set_task_parent(&mut app, 0, 3);
     app.task_list_mode = TaskListMode::Tree;
     app.selected_task = 3;
-    assert!(app.set_task_collapsed(3, true));
+    assert!(app.set_task_collapsed(3, false));
     let parent_id = app.snapshot.tasks[3].thread_id.clone();
     let child_id = app.snapshot.tasks[0].thread_id.clone();
 
@@ -2635,9 +2655,9 @@ fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
         },
         false,
     );
-    assert!(app.collapsed_task_threads.contains(&parent_id));
+    assert!(app.expanded_task_threads.contains(&parent_id));
     assert!(
-        !app.filtered_task_indices()
+        app.filtered_task_indices()
             .iter()
             .any(|index| app.snapshot.tasks[*index].thread_id == child_id)
     );
@@ -2652,7 +2672,7 @@ fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
         },
         false,
     );
-    assert!(!app.collapsed_task_threads.contains(&parent_id));
+    assert!(!app.expanded_task_threads.contains(&parent_id));
     let child = app
         .filtered_task_rows()
         .into_iter()
@@ -2664,7 +2684,7 @@ fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
 }
 
 #[test]
-fn tree_keyboard_toggle_preserves_selection_and_search_consumes_the_shortcut() {
+fn tree_keyboard_toggle_defaults_to_collapsed_and_search_consumes_the_shortcut() {
     let mut app = interaction_test_app(6, 2);
     set_task_parent(&mut app, 0, 4);
     app.selected_task = 0;
@@ -2674,9 +2694,9 @@ fn tree_keyboard_toggle_preserves_selection_and_search_consumes_the_shortcut() {
 
     handle_key_event(&mut app, key_event(KeyCode::Char('R')));
     assert_eq!(app.task_list_mode, TaskListMode::Tree);
-    assert_eq!(app.selected_task, 0);
-    assert_eq!(app.selected_turn, 1);
-    assert_eq!(app.turn_offset, 1);
+    assert_eq!(app.selected_task, 4);
+    assert_eq!(app.selected_turn, 0);
+    assert_eq!(app.turn_offset, 0);
     assert_eq!(app.task_table_offset, 0);
     assert!(app.task_reveal_pending);
 
@@ -2695,7 +2715,7 @@ fn tree_keyboard_toggle_preserves_selection_and_search_consumes_the_shortcut() {
     assert_eq!(app.task_list_mode, TaskListMode::Tree);
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
     assert_eq!(app.turn_search, "RE");
-    assert!(app.collapsed_task_threads.is_empty());
+    assert!(app.expanded_task_threads.is_empty());
 }
 
 #[test]
@@ -2707,17 +2727,29 @@ fn collapse_all_toggles_nested_parents_and_moves_hidden_selection_to_its_root() 
     app.selected_task = 0;
     app.selected_turn = 1;
     app.turn_offset = 1;
+    app.reconcile_task_filter(true);
+
+    assert!(app.all_filtered_task_threads_collapsed());
+    assert!(app.expanded_task_threads.is_empty());
+    assert_eq!(app.selected_task, 5);
+    assert_eq!(app.selected_turn, 0);
+    assert_eq!(app.turn_offset, 0);
+    handle_key_event(&mut app, key_event(KeyCode::Char('E')));
+    assert!(app.expanded_task_threads.contains("task-thread-3"));
+    assert!(app.expanded_task_threads.contains("task-thread-5"));
+    assert!(!app.all_filtered_task_threads_collapsed());
+    assert_eq!(app.filtered_task_rows().len(), 6);
 
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
-    assert!(app.collapsed_task_threads.contains("task-thread-3"));
-    assert!(app.collapsed_task_threads.contains("task-thread-5"));
+    assert!(app.expanded_task_threads.is_empty());
     assert_eq!(app.selected_task, 5);
     assert_eq!(app.selected_turn, 0);
     assert_eq!(app.turn_offset, 0);
     assert!(app.all_filtered_task_threads_collapsed());
 
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
-    assert!(app.collapsed_task_threads.is_empty());
+    assert!(app.expanded_task_threads.contains("task-thread-3"));
+    assert!(app.expanded_task_threads.contains("task-thread-5"));
     assert_eq!(app.filtered_task_rows().len(), 6);
 
     assert!(app.set_task_collapsed(3, true));
@@ -2732,8 +2764,10 @@ fn collapse_all_toggles_nested_parents_and_moves_hidden_selection_to_its_root() 
 
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
     assert!(app.all_filtered_task_threads_collapsed());
+    assert!(app.expanded_task_threads.is_empty());
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
-    assert!(app.collapsed_task_threads.is_empty());
+    assert!(app.expanded_task_threads.contains("task-thread-3"));
+    assert!(app.expanded_task_threads.contains("task-thread-5"));
 }
 
 #[test]
@@ -2746,7 +2780,7 @@ fn collapse_all_toggle_only_changes_parents_in_the_current_filter() {
     set_task_metadata(&mut app, 3, "hidden child", Some("subagent"));
     set_task_metadata(&mut app, 5, "hidden parent", Some("desktop"));
     app.task_list_mode = TaskListMode::Tree;
-    app.collapsed_task_threads
+    app.expanded_task_threads
         .insert("task-thread-5".to_string());
     app.task_search = "visible".to_string();
     app.reconcile_task_filter(true);
@@ -2756,12 +2790,12 @@ fn collapse_all_toggle_only_changes_parents_in_the_current_filter() {
         vec!["task-thread-2"]
     );
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
-    assert!(app.collapsed_task_threads.contains("task-thread-2"));
-    assert!(app.collapsed_task_threads.contains("task-thread-5"));
+    assert!(app.expanded_task_threads.contains("task-thread-2"));
+    assert!(app.expanded_task_threads.contains("task-thread-5"));
 
     handle_key_event(&mut app, key_event(KeyCode::Char('E')));
-    assert!(!app.collapsed_task_threads.contains("task-thread-2"));
-    assert!(app.collapsed_task_threads.contains("task-thread-5"));
+    assert!(!app.expanded_task_threads.contains("task-thread-2"));
+    assert!(app.expanded_task_threads.contains("task-thread-5"));
 }
 
 #[test]
@@ -2809,6 +2843,7 @@ fn tree_control_is_fully_clickable_stable_and_muted_while_searching() {
         let collapse_shortcut = &terminal.backend().buffer()[(collapse.x + 1, collapse.y)];
         assert_eq!(collapse_shortcut.fg, app.theme.palette().accent);
         assert!(collapse_shortcut.modifier.contains(Modifier::BOLD));
+        assert!(!app.expanded_task_threads.contains("task-thread-4"));
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(
@@ -2817,29 +2852,29 @@ fn tree_control_is_fully_clickable_stable_and_muted_while_searching() {
                 collapse.y,
             ),
         ));
-        assert!(app.collapsed_task_threads.contains("task-thread-4"));
+        assert!(app.expanded_task_threads.contains("task-thread-4"));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let expanded_control = app.task_controls_hitbox.unwrap().collapse_all;
-        assert_eq!(expanded_control, initial_collapse);
+        let collapse_control = app.task_controls_hitbox.unwrap().collapse_all;
+        assert_eq!(collapse_control, initial_collapse);
         if width == 120 {
-            let rendered = (expanded_control.x..expanded_control.right())
+            let rendered = (collapse_control.x..collapse_control.right())
                 .map(|x| {
-                    terminal.backend().buffer()[(x, expanded_control.y)]
+                    terminal.backend().buffer()[(x, collapse_control.y)]
                         .symbol()
                         .to_string()
                 })
                 .collect::<String>();
-            assert_eq!(rendered, "[E]Expand  ");
+            assert_eq!(rendered, "[E]Collapse");
         }
         assert!(handle_mouse_event(
             &mut app,
             mouse_event(
                 MouseEventKind::Down(MouseButton::Left),
-                expanded_control.right() - 1,
-                expanded_control.y,
+                collapse_control.right() - 1,
+                collapse_control.y,
             ),
         ));
-        assert!(!app.collapsed_task_threads.contains("task-thread-4"));
+        assert!(!app.expanded_task_threads.contains("task-thread-4"));
 
         handle_mouse_event(
             &mut app,
@@ -2920,7 +2955,7 @@ fn tree_click_scroll_and_refresh_keep_flattened_positions_mapped_by_thread() {
     let mut app = interaction_test_app(30, 1);
     set_task_parent(&mut app, 0, 10);
     set_task_parent(&mut app, 1, 10);
-    app.task_list_mode = TaskListMode::Tree;
+    expand_task_tree(&mut app);
     assert_eq!(&app.filtered_task_indices()[..4], &[10, 0, 1, 2]);
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

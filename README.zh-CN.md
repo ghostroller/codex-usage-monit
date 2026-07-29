@@ -279,7 +279,7 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
 | `SOURCE` | 记录的任务来源。TUI 筛选器包括 All（不限制来源）、Desktop（包含 `vscode`）、Subagent 和 CLI。 |
 
-收起任务树时，可见的父任务行会包含被隐藏后代的 token/占比。
+任务树默认全部收起；可见的父任务行会包含被隐藏后代的 token/占比。
 
 ### 状态标识
 

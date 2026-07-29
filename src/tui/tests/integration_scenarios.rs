@@ -27,7 +27,6 @@ fn semantic_frames_cover_full_compact_and_diagnostic_layouts() {
 
     let mut compact = TuiHarness::from_fixture("normal", 60, 24, Theme::Light);
     compact.key(KeyCode::Char('R'));
-    compact.key(KeyCode::Char('E'));
     insta::assert_snapshot!(
         "tui_compact_tree_light_60x24",
         compact.frame().snapshot_text()
@@ -194,7 +193,6 @@ fn svg_gallery_is_generated_from_the_same_semantic_frames() {
 
     let mut tree = TuiHarness::from_fixture("normal", 80, 24, Theme::Dark);
     tree.key(KeyCode::Char('R'));
-    tree.key(KeyCode::Char('E'));
     scenarios.push(("tree-collapsed-80x24", tree));
 
     let mut search = TuiHarness::from_fixture("normal", 80, 24, Theme::Light);

@@ -279,7 +279,7 @@ Reset and turn timestamps in the TUI are shown in local time; Collection/Snapsho
 | `MESSAGE` | A short local preview of the turn message, up to 72 characters. |
 | `SOURCE` | The recorded task source. TUI filters include All (no source filter), Desktop (including `vscode`), Subagent, and CLI. |
 
-When a task tree is collapsed, a visible parent row includes the tokens/share of its hidden descendants.
+Task trees start fully collapsed. A visible parent row includes the tokens/share of its hidden descendants.
 
 ### Status markers
 

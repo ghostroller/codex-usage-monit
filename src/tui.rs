@@ -1052,7 +1052,8 @@ struct App {
     focus: Focus,
     task_source_filter: TaskSourceFilter,
     task_list_mode: TaskListMode,
-    collapsed_task_threads: HashSet<String>,
+    // Tree parents are collapsed unless the user explicitly expands them.
+    expanded_task_threads: HashSet<String>,
     task_search: String,
     task_search_before_edit: String,
     task_search_cursor: usize,
@@ -1118,7 +1119,7 @@ impl App {
             focus: Focus::Tasks,
             task_source_filter: TaskSourceFilter::All,
             task_list_mode: TaskListMode::Flat,
-            collapsed_task_threads: HashSet::new(),
+            expanded_task_threads: HashSet::new(),
             task_search: String::new(),
             task_search_before_edit: String::new(),
             task_search_cursor: 0,
@@ -1178,6 +1179,7 @@ impl App {
         self.turns_temporarily_visible = false;
         self.models_visible = state.models_visible;
         self.task_list_mode = state.task_list_mode.into();
+        self.expanded_task_threads.clear();
         self.task_source_filter = state.task_source_filter.into();
         self.reconcile_task_filter(true);
         if self.view != View::Overview {
@@ -1569,12 +1571,12 @@ impl App {
     }
 
     fn filtered_task_rows(&self) -> Vec<TaskListRow> {
-        self.filtered_task_rows_with_collapsed(&self.collapsed_task_threads)
+        self.filtered_task_rows_with_expanded(Some(&self.expanded_task_threads))
     }
 
-    fn filtered_task_rows_with_collapsed(
+    fn filtered_task_rows_with_expanded(
         &self,
-        collapsed_task_threads: &HashSet<String>,
+        expanded_task_threads: Option<&HashSet<String>>,
     ) -> Vec<TaskListRow> {
         let query = self.task_search.to_lowercase();
         let filtered = self
@@ -1663,7 +1665,7 @@ impl App {
                 root,
                 &children,
                 &self.snapshot.tasks,
-                collapsed_task_threads,
+                expanded_task_threads,
                 &mut Vec::new(),
                 &mut rows,
             );
@@ -2141,9 +2143,9 @@ impl App {
             return false;
         };
         let changed = if collapsed {
-            self.collapsed_task_threads.insert(thread_id)
+            self.expanded_task_threads.remove(&thread_id)
         } else {
-            self.collapsed_task_threads.remove(&thread_id)
+            self.expanded_task_threads.insert(thread_id)
         };
         if changed {
             self.reconcile_task_filter(false);
@@ -2160,7 +2162,7 @@ impl App {
         if self.task_list_mode != TaskListMode::Tree {
             return Vec::new();
         }
-        self.filtered_task_rows_with_collapsed(&HashSet::new())
+        self.filtered_task_rows_with_expanded(None)
             .into_iter()
             .filter(|row| row.has_children)
             .filter_map(|row| {
@@ -2177,7 +2179,7 @@ impl App {
         !collapsible.is_empty()
             && collapsible
                 .iter()
-                .all(|thread_id| self.collapsed_task_threads.contains(thread_id))
+                .all(|thread_id| !self.expanded_task_threads.contains(thread_id))
     }
 
     fn toggle_all_task_threads(&mut self) -> bool {
@@ -2187,13 +2189,13 @@ impl App {
         }
         let expand = collapsible
             .iter()
-            .all(|thread_id| self.collapsed_task_threads.contains(thread_id));
+            .all(|thread_id| !self.expanded_task_threads.contains(thread_id));
         let mut changed = false;
         for thread_id in collapsible {
             changed |= if expand {
-                self.collapsed_task_threads.remove(&thread_id)
+                self.expanded_task_threads.insert(thread_id)
             } else {
-                self.collapsed_task_threads.insert(thread_id)
+                self.expanded_task_threads.remove(&thread_id)
             };
         }
         if changed {
@@ -2238,7 +2240,7 @@ impl App {
             .iter()
             .map(|task| task.thread_id.as_str())
             .collect::<HashSet<_>>();
-        self.collapsed_task_threads
+        self.expanded_task_threads
             .retain(|thread_id| existing_threads.contains(thread_id.as_str()));
         self.task_table_hitbox = None;
         self.turn_table_hitbox = None;
@@ -2899,7 +2901,7 @@ fn append_task_tree_rows(
     index: usize,
     children: &[Vec<usize>],
     tasks: &[TaskRecord],
-    collapsed_task_threads: &HashSet<String>,
+    expanded_task_threads: Option<&HashSet<String>>,
     guides: &mut Vec<bool>,
     rows: &mut Vec<TaskListRow>,
 ) {
@@ -2912,9 +2914,9 @@ fn append_task_tree_rows(
     }
     let has_children = !children[index].is_empty();
     let collapsed = has_children
-        && tasks
-            .get(index)
-            .is_some_and(|task| collapsed_task_threads.contains(&task.thread_id));
+        && tasks.get(index).is_some_and(|task| {
+            expanded_task_threads.is_some_and(|expanded| !expanded.contains(&task.thread_id))
+        });
     let mut hidden_descendants = Vec::new();
     if collapsed {
         collect_task_descendants(index, children, &mut hidden_descendants);
@@ -2934,7 +2936,7 @@ fn append_task_tree_rows(
     let child_count = children[index].len();
     for (position, &child) in children[index].iter().enumerate() {
         guides.push(position + 1 == child_count);
-        append_task_tree_rows(child, children, tasks, collapsed_task_threads, guides, rows);
+        append_task_tree_rows(child, children, tasks, expanded_task_threads, guides, rows);
         guides.pop();
     }
 }
