@@ -1038,6 +1038,10 @@ fn warm_discovery_reuses_inventory_and_detects_new_files() {
     assert!(!cache.last_refresh().discovery_full_scan);
     assert_eq!(cache.last_refresh().discovery_probed_files, 1);
 
+    // Directory timestamp resolution varies across filesystems. Cross a full
+    // second before mutating the directory so this exercises cache
+    // invalidation instead of the bounded periodic-rescan fallback.
+    std::thread::sleep(Duration::from_millis(1_100));
     write_jsonl(
         &temp.path().join("sessions/rollout-second.jsonl"),
         &[json!({
