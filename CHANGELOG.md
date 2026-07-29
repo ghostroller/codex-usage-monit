@@ -21,7 +21,7 @@ All notable changes to this project are documented in this file.
 - Kept the latest Trends window and recorder-health age tied to wall-clock time, and included both weekly cycles when a 30-minute estimate view crosses a reset.
 - Preserved distinct history namespaces for non-UTF-8 Codex home paths.
 - Made recorder health account for custom collection intervals, preserved the install-time `PATH` on Windows, and unloaded launchd services even when their plist was already missing.
-- Reported native Windows process CPU, memory, peak-memory, and disk-I/O counters in performance logs.
+- Reported native Windows process CPU, memory, peak-memory, and generic I/O counters in performance logs; renamed the cross-platform process counters to `ioReadBytes` and `ioWrittenBytes` under performance-log schema v2.
 
 ## [0.2.2] - 2026-07-26
 

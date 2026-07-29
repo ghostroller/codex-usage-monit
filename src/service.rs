@@ -936,8 +936,9 @@ fn windows_task_xml(options: &ServiceOptions, user_sid: &str) -> String {
 fn windows_recorder_arguments(options: &ServiceOptions) -> String {
     let mut arguments = Vec::new();
     if let Some(path) = options.environment_path.as_ref() {
-        arguments.push(OsString::from("--service-path"));
-        arguments.push(path.clone());
+        let mut service_path = OsString::from("--service-path=");
+        service_path.push(path);
+        arguments.push(service_path);
     }
     arguments.extend(options.recorder_arguments());
     arguments
@@ -1341,7 +1342,7 @@ mod tests {
         let options = options(Path::new(r"C:\Users\A B"));
         let arguments = windows_recorder_arguments(&options);
         assert!(arguments.starts_with(
-            r#"--service-path "/opt/codex & tools/bin:/usr/bin" --codex-home "C:\Users\A B/"#
+            r#""--service-path=/opt/codex & tools/bin:/usr/bin" --codex-home "C:\Users\A B/"#
         ));
         assert!(arguments.contains(r#"--codex-bin "C:\Users\A B/Codex & $% tools/codex.cmd""#));
         assert!(arguments.contains("--days 11 --max-files 777 --active-grace-minutes 9"));
@@ -1349,7 +1350,7 @@ mod tests {
         assert!(arguments.contains("record --foreground"));
         let xml = windows_task_xml(&options, "S-1-5-21-1234");
         assert!(xml.contains(r#"<Command>C:\Users\A B/bin/codex usage monit.exe</Command>"#));
-        assert!(xml.contains(r#"--service-path &quot;/opt/codex &amp; tools/bin:/usr/bin&quot;"#));
+        assert!(xml.contains(r#"&quot;--service-path=/opt/codex &amp; tools/bin:/usr/bin&quot;"#));
         assert!(xml.contains("Codex &amp; $% tools/codex.cmd"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
@@ -1368,6 +1369,24 @@ mod tests {
         let mut inherited_path = options;
         inherited_path.environment_path = None;
         assert!(!windows_recorder_arguments(&inherited_path).contains("--service-path"));
+    }
+
+    #[test]
+    fn windows_recorder_path_value_can_begin_with_a_hyphen() {
+        let root = Path::new(r"C:\Users\A B");
+        let mut options = options(root);
+        options.environment_path = Some(OsString::from(
+            r"-C:\Portable Node & Tools;C:\Windows\System32",
+        ));
+
+        let arguments = windows_recorder_arguments(&options);
+        assert!(arguments.starts_with(
+            r#""--service-path=-C:\Portable Node & Tools;C:\Windows\System32" --codex-home "C:\Users\A B/"#
+        ));
+        let xml = windows_task_xml(&options, "S-1-5-21-1234");
+        assert!(xml.contains(
+            r#"&quot;--service-path=-C:\Portable Node &amp; Tools;C:\Windows\System32&quot;"#
+        ));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const PERF_LOG_SCHEMA_VERSION: u32 = 1;
+const PERF_LOG_SCHEMA_VERSION: u32 = 2;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Per-stage timings for one refresh. Sibling stages may overlap when account
@@ -116,9 +116,9 @@ struct ProcessSample {
     #[serde(skip_serializing_if = "Option::is_none")]
     pageins: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    disk_read_bytes: Option<u64>,
+    io_read_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    disk_written_bytes: Option<u64>,
+    io_written_bytes: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -545,8 +545,8 @@ fn process_sample() -> ProcessSample {
         user_cpu_time_ns,
         system_cpu_time_ns,
         pageins: Some(info.ri_pageins),
-        disk_read_bytes: Some(info.ri_diskio_bytesread),
-        disk_written_bytes: Some(info.ri_diskio_byteswritten),
+        io_read_bytes: Some(info.ri_diskio_bytesread),
+        io_written_bytes: Some(info.ri_diskio_byteswritten),
         ..ProcessSample::default()
     }
 }
@@ -617,8 +617,8 @@ fn process_sample() -> ProcessSample {
     let mut io = IO_COUNTERS::default();
     // SAFETY: io points to a writable IO_COUNTERS structure.
     if unsafe { GetProcessIoCounters(process, &mut io) } != 0 {
-        sample.disk_read_bytes = Some(io.ReadTransferCount);
-        sample.disk_written_bytes = Some(io.WriteTransferCount);
+        sample.io_read_bytes = Some(io.ReadTransferCount);
+        sample.io_written_bytes = Some(io.WriteTransferCount);
     }
 
     sample
@@ -714,6 +714,11 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values[0]["event"], "perf_start");
+        assert!(
+            values
+                .iter()
+                .all(|value| value["schemaVersion"] == PERF_LOG_SCHEMA_VERSION)
+        );
         assert_eq!(values[1]["event"], "refresh");
         assert_eq!(values[1]["metrics"]["cachedEvents"], 42);
         assert_eq!(values[1]["metrics"]["foreignBaselineEvents"], 3);
@@ -764,6 +769,21 @@ mod tests {
         log.finish();
     }
 
+    #[test]
+    fn process_sample_serializes_generic_io_field_names() {
+        let value = serde_json::to_value(ProcessSample {
+            io_read_bytes: Some(123),
+            io_written_bytes: Some(456),
+            ..ProcessSample::default()
+        })
+        .unwrap();
+
+        assert_eq!(value["ioReadBytes"], 123);
+        assert_eq!(value["ioWrittenBytes"], 456);
+        assert!(value.get("diskReadBytes").is_none());
+        assert!(value.get("diskWrittenBytes").is_none());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_process_sample_reports_current_memory() {
@@ -794,7 +814,7 @@ mod tests {
         );
         assert!(sample.user_cpu_time_ns.is_some());
         assert!(sample.system_cpu_time_ns.is_some());
-        assert!(sample.disk_read_bytes.is_some());
-        assert!(sample.disk_written_bytes.is_some());
+        assert!(sample.io_read_bytes.is_some());
+        assert!(sample.io_written_bytes.is_some());
     }
 }

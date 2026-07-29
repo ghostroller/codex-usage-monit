@@ -3874,6 +3874,10 @@ fn execute_resume_request(request: ResumeLaunchRequest) -> ResumeLaunchCompletio
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    render_at(frame, app, Utc::now());
+}
+
+fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     let area = frame.area();
     app.task_table_hitbox = None;
     app.turn_table_hitbox = None;
@@ -3949,7 +3953,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
-        View::Trends => render_trends(frame, root[1], app),
+        View::Trends => render_trends_at(frame, root[1], app, now),
         View::Health => render_health(frame, root[1], app),
     };
     if app
@@ -4673,10 +4677,6 @@ fn append_trend_control(
     hitbox
 }
 
-fn prepare_trend_data(app: &App) -> PreparedTrendData {
-    prepare_trend_data_at(app, Utc::now())
-}
-
 fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let five_hour_remaining = current_remaining_trend(&app.history, 300);
     let weekly_remaining = current_remaining_trend(&app.history, 10_080);
@@ -4777,7 +4777,7 @@ fn weekly_resets_overlapping(
     const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
     const RESET_DRIFT_SECONDS: i64 = 120;
 
-    let candidates = history
+    let mut candidates = history
         .quota_points
         .iter()
         .filter(|point| point.duration_mins == WEEKLY_WINDOW_MINUTES)
@@ -4787,20 +4787,26 @@ fn weekly_resets_overlapping(
                 .weekly_local_points
                 .iter()
                 .map(|point| (point.resets_at, point.observed_at)),
-        );
+        )
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(reset, observed_at)| (*reset, *observed_at));
+
     let mut resets = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
+    let mut cluster_end = None;
+    let mut representative = None::<(DateTime<Utc>, DateTime<Utc>)>;
     for (reset, observed_at) in candidates {
-        if let Some((representative_reset, representative_observed_at)) = resets
-            .iter_mut()
-            .find(|(candidate, _)| (reset - *candidate).num_seconds().abs() <= RESET_DRIFT_SECONDS)
-        {
-            if observed_at > *representative_observed_at {
-                *representative_reset = reset;
-                *representative_observed_at = observed_at;
-            }
-            continue;
+        let joins_cluster = cluster_end
+            .is_some_and(|end| reset - end <= ChronoDuration::seconds(RESET_DRIFT_SECONDS));
+        if !joins_cluster && let Some(previous) = representative.take() {
+            resets.push(previous);
         }
-        resets.push((reset, observed_at));
+        cluster_end = Some(reset);
+        if representative.is_none_or(|current| (observed_at, reset) > (current.1, current.0)) {
+            representative = Some((reset, observed_at));
+        }
+    }
+    if let Some(last) = representative {
+        resets.push(last);
     }
     resets.sort_by_key(|(reset, _)| *reset);
 
@@ -4842,7 +4848,7 @@ fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2]
     [end - ChronoDuration::hours(24), end]
 }
 
-fn render_trends(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
     let compact = area.width < 120 || area.height < 29;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -4853,7 +4859,7 @@ fn render_trends(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if body.is_empty() {
         return;
     }
-    let data = prepare_trend_data(app);
+    let data = prepare_trend_data_at(app, now);
 
     if compact {
         match app.trend_section {

@@ -5207,7 +5207,9 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
 
     let bounds = trend_day_bounds(now, 0);
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
     let content = terminal
         .backend()
         .buffer()
@@ -5238,10 +5240,14 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
 
     app.trend_section = TrendSection::HalfHour;
     let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
-    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    compact
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
     handle_key_event(&mut app, key_event(KeyCode::Char('[')));
     assert_eq!(app.trend_day_offset, 1);
-    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    compact
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
     let previous_day = compact
         .backend()
         .buffer()
@@ -5412,6 +5418,57 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
         [40.0]
     );
     assert!(!older_day.half_hour_estimated[0].partial);
+}
+
+#[test]
+fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
+    let base_reset = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let observed_at = base_reset - ChronoDuration::days(1);
+    let resets = [
+        base_reset,
+        base_reset + ChronoDuration::seconds(120),
+        base_reset + ChronoDuration::seconds(240),
+    ];
+    let candidates = resets
+        .into_iter()
+        .enumerate()
+        .map(|(index, resets_at)| QuotaPoint {
+            observed_at: observed_at
+                + if index == 1 {
+                    ChronoDuration::minutes(3)
+                } else {
+                    ChronoDuration::minutes(i64::try_from(index).unwrap())
+                },
+            limit_id: "codex".to_string(),
+            duration_mins: 10_080,
+            resets_at,
+            used_percent: 25.0,
+            remaining_percent: 75.0,
+            provenance: Provenance::ServerSnapshot,
+        })
+        .collect::<Vec<_>>();
+    let bounds = [
+        base_reset - ChronoDuration::hours(1),
+        base_reset + ChronoDuration::hours(1),
+    ];
+
+    for order in [[0, 2, 1], [2, 0, 1], [1, 0, 2], [2, 1, 0]] {
+        let history = HistoryData {
+            quota_points: order
+                .into_iter()
+                .map(|index| candidates[index].clone())
+                .collect(),
+            ..HistoryData::default()
+        };
+
+        assert_eq!(
+            weekly_resets_overlapping(&history, bounds),
+            vec![resets[1]],
+            "unexpected representative for input order {order:?}"
+        );
+    }
 }
 
 #[test]

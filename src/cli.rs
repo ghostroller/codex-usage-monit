@@ -118,7 +118,13 @@ pub struct Cli {
     perf_log: Option<PathBuf>,
 
     /// Internal PATH override preserved by service registrations.
-    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        hide = true,
+        allow_hyphen_values = true
+    )]
     service_path: Option<OsString>,
 
     #[command(subcommand)]
@@ -830,6 +836,28 @@ mod tests {
             let service = Cli::try_parse_from(["codex-usage-monit", "service", action]).unwrap();
             assert!(matches!(service.command, Some(Command::Service(_))));
         }
+    }
+
+    #[test]
+    fn service_path_accepts_a_leading_hyphen() {
+        let service_path = OsString::from(r"-C:\Portable Node & Tools;C:\Windows\System32");
+        let cli = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--service-path",
+            service_path.to_str().unwrap(),
+            "record",
+            "--foreground",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.service_path, Some(service_path));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Record(RecordArgs {
+                foreground: true,
+                ..
+            }))
+        ));
     }
 
     #[test]
