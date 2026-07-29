@@ -32,6 +32,8 @@ const PERSISTENT_WRITE_RETRY_INITIAL: Duration = Duration::from_secs(30);
 const PERSISTENT_WRITE_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const DISCOVERY_FULL_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+const DISCOVERY_INCOMPLETE_RESCAN_INTERVAL: Duration = Duration::from_secs(10);
 const TAIL_GUARD_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +210,16 @@ struct ReducedRollouts {
 /// Diagnostics for the most recent cached scan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RolloutCacheRefresh {
+    /// Whether this refresh walked the complete rollout directory tree.
+    pub discovery_full_scan: bool,
+    /// Whether the in-memory discovery inventory was reused.
+    pub discovery_cache_hit: bool,
+    /// Whether a cached inventory was discarded after a metadata/config check.
+    pub discovery_invalidated: bool,
+    /// Rollout files probed directly during discovery.
+    pub discovery_probed_files: usize,
+    /// Rollout directories probed directly during discovery.
+    pub discovery_probed_dirs: usize,
     pub reused_files: usize,
     pub reparsed_files: usize,
     /// Changed append-only files parsed from their previous byte boundary.
@@ -271,6 +283,26 @@ struct DiscoveryState {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveryKey {
+    codex_home: PathBuf,
+    lookback_days: i64,
+    max_files: usize,
+}
+
+#[derive(Debug)]
+struct DiscoveryCache {
+    key: DiscoveryKey,
+    inventory: HashMap<PathBuf, RolloutFile>,
+    directories: HashMap<PathBuf, FileFingerprint>,
+    roots: Vec<(PathBuf, Option<FileFingerprint>)>,
+    warnings: Vec<String>,
+    unreadable_files: usize,
+    complete: bool,
+    full_scan_at: Instant,
+    logical_now: DateTime<Utc>,
+}
+
 /// Reuses parsed rollout files across refreshes while preserving global token
 /// counter semantics during reduction.
 #[derive(Debug, Default)]
@@ -291,6 +323,7 @@ pub struct RolloutCache {
     last_materialized_at: Option<DateTime<Utc>>,
     last_materialized_active_grace: Option<Duration>,
     last_discovery: Option<DiscoveryState>,
+    discovery_cache: Option<DiscoveryCache>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -551,6 +584,67 @@ impl RolloutCache {
         self.metrics
     }
 
+    fn discover_rollout_files(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+        dataset: &mut RolloutDataset,
+        refresh: &mut RolloutCacheRefresh,
+    ) -> Vec<RolloutFile> {
+        let key = DiscoveryKey {
+            codex_home: config.codex_home.clone(),
+            lookback_days: config.lookback_days,
+            max_files: config.max_files,
+        };
+        let selected = self.selected.clone();
+        let had_cache = self.discovery_cache.is_some();
+        let mut cache_hit = false;
+        let mut cache_invalidated = false;
+
+        if let Some(cache) = self.discovery_cache.as_mut() {
+            let rescan_interval = if cache.complete {
+                DISCOVERY_FULL_RESCAN_INTERVAL
+            } else {
+                DISCOVERY_INCOMPLETE_RESCAN_INTERVAL
+            };
+            let due = cache.full_scan_at.elapsed() >= rescan_interval;
+            let key_changed = cache.key != key;
+            let clock_rolled_back = now < cache.logical_now;
+            if !due && !key_changed && !clock_rolled_back {
+                if cache.complete {
+                    match refresh_cached_discovery(cache, &selected, now, refresh) {
+                        Ok(()) => cache_hit = true,
+                        Err(()) => cache_invalidated = true,
+                    }
+                } else {
+                    // Preserve the warning-bearing partial inventory without
+                    // repeating an expensive failing walk every two seconds,
+                    // while still following active selected-file appends.
+                    match refresh_selected_rollout_files(cache, &selected, now, refresh) {
+                        Ok(()) => cache_hit = true,
+                        Err(()) => cache_invalidated = true,
+                    }
+                }
+            } else if key_changed || clock_rolled_back {
+                cache_invalidated = true;
+            }
+        }
+
+        if !cache_hit {
+            self.discovery_cache = Some(discover_rollout_inventory(config, now, &key, refresh));
+            refresh.discovery_full_scan = true;
+            refresh.discovery_invalidated = had_cache && cache_invalidated;
+        } else {
+            refresh.discovery_cache_hit = true;
+        }
+
+        let cache = self
+            .discovery_cache
+            .as_ref()
+            .expect("discovery always initializes its inventory");
+        select_rollout_files(cache, config, now, dataset)
+    }
+
     /// Scans recent rollouts, reparsing rollout files and reloading the session
     /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
@@ -598,13 +692,14 @@ impl RolloutCache {
             self.last_materialized_at = None;
             self.last_materialized_active_grace = None;
             self.last_discovery = None;
+            self.discovery_cache = None;
             self.key = Some(key.clone());
         }
 
         let mut discovery = RolloutDataset::default();
         let discovery_started = perf_active.then(Instant::now);
         let discovery_span = config.startup_trace.span("rollout.discover");
-        let mut files = discover_rollout_files(config, now, &mut discovery);
+        let mut files = self.discover_rollout_files(config, now, &mut discovery, &mut refresh);
         let (selected_bytes, largest_file_bytes) = files
             .iter()
             .map(|file| file.fingerprint.len)
@@ -613,7 +708,12 @@ impl RolloutCache {
             });
         refresh.discover_us = elapsed_micros(discovery_started);
         discovery_span.finish_with(|| format!(
-            "discovered={} selected={} truncated={} bytes={selected_bytes} largest_bytes={largest_file_bytes}",
+            "full={} cache_hit={} invalidated={} probed_files={} probed_dirs={} discovered={} selected={} truncated={} bytes={selected_bytes} largest_bytes={largest_file_bytes}",
+            refresh.discovery_full_scan,
+            refresh.discovery_cache_hit,
+            refresh.discovery_invalidated,
+            refresh.discovery_probed_files,
+            refresh.discovery_probed_dirs,
             discovery.stats.discovered_files,
             files.len(),
             discovery.stats.truncated_files
@@ -1687,7 +1787,195 @@ fn crossed_freshness_deadline(
     })
 }
 
-fn discover_rollout_files(
+fn discover_rollout_inventory(
+    config: &CollectConfig,
+    now: DateTime<Utc>,
+    key: &DiscoveryKey,
+    refresh: &mut RolloutCacheRefresh,
+) -> DiscoveryCache {
+    let roots = [
+        config.codex_home.join("sessions"),
+        config.codex_home.join("archived_sessions"),
+    ];
+    let mut inventory = HashMap::new();
+    let mut directories = HashMap::new();
+    let mut root_fingerprints = Vec::with_capacity(roots.len());
+    let mut warnings = Vec::new();
+    let mut unreadable_files = 0_usize;
+    let mut complete = true;
+    let mut found_root = false;
+
+    for root in &roots {
+        match inspect_rollout_directory(root) {
+            Ok(Some(fingerprint)) => {
+                found_root = true;
+                root_fingerprints.push((root.clone(), Some(fingerprint)));
+            }
+            Ok(None) => root_fingerprints.push((root.clone(), None)),
+            Err(error) => {
+                complete = false;
+                unreadable_files += 1;
+                warnings.push(format!(
+                    "could not inspect rollout directory {}: {error}",
+                    root.display()
+                ));
+                root_fingerprints.push((root.clone(), None));
+            }
+        }
+    }
+
+    if !found_root {
+        unreadable_files += 1;
+        warnings.push(format!(
+            "no Codex rollout directories found under {}",
+            config.codex_home.display()
+        ));
+    }
+
+    for (root, fingerprint) in &root_fingerprints {
+        if fingerprint.is_none() {
+            continue;
+        }
+
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    complete = false;
+                    unreadable_files += 1;
+                    warnings.push(format!(
+                        "could not inspect rollout path under {}: {error}",
+                        root.display()
+                    ));
+                    continue;
+                }
+            };
+
+            if entry.file_type().is_dir() {
+                match entry.metadata() {
+                    Ok(metadata) => match FileFingerprint::from_metadata(&metadata) {
+                        Ok(fingerprint) => {
+                            refresh.discovery_probed_dirs += 1;
+                            directories.insert(entry.path().to_owned(), fingerprint);
+                        }
+                        Err(error) => {
+                            complete = false;
+                            unreadable_files += 1;
+                            warnings.push(format!(
+                                "could not fingerprint rollout directory {}: {error}",
+                                entry.path().display()
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        complete = false;
+                        unreadable_files += 1;
+                        warnings.push(format!(
+                            "could not fingerprint rollout directory {}: {error}",
+                            entry.path().display()
+                        ));
+                    }
+                }
+                continue;
+            }
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+
+            refresh.discovery_probed_files += 1;
+            match inspect_rollout_file(entry.path()) {
+                Ok(file) => {
+                    inventory.insert(file.path.clone(), file);
+                }
+                Err(error) => {
+                    complete = false;
+                    unreadable_files += 1;
+                    warnings.push(format!(
+                        "could not fingerprint {}: {error}",
+                        entry.path().display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // A directory changing while it is walked can otherwise make a new file
+    // invisible until the periodic full rescan. Mark this inventory incomplete
+    // so the next refresh retries the complete walk.
+    for (path, fingerprint) in &directories {
+        refresh.discovery_probed_dirs += 1;
+        if inspect_rollout_directory(path).ok().flatten().as_ref() != Some(fingerprint) {
+            complete = false;
+        }
+    }
+
+    DiscoveryCache {
+        key: key.clone(),
+        inventory,
+        directories,
+        roots: root_fingerprints,
+        warnings,
+        unreadable_files,
+        complete,
+        full_scan_at: Instant::now(),
+        logical_now: now,
+    }
+}
+
+fn refresh_cached_discovery(
+    cache: &mut DiscoveryCache,
+    selected: &[SelectedFile],
+    now: DateTime<Utc>,
+    refresh: &mut RolloutCacheRefresh,
+) -> Result<(), ()> {
+    for (path, expected) in &cache.roots {
+        refresh.discovery_probed_dirs += 1;
+        let current = inspect_rollout_directory(path).map_err(|_| ())?;
+        if current.as_ref() != expected.as_ref() {
+            return Err(());
+        }
+    }
+    for (path, expected) in &cache.directories {
+        refresh.discovery_probed_dirs += 1;
+        let current = inspect_rollout_directory(path).map_err(|_| ())?;
+        if current.as_ref() != Some(expected) {
+            return Err(());
+        }
+    }
+    refresh_selected_rollout_files(cache, selected, now, refresh)
+}
+
+fn refresh_selected_rollout_files(
+    cache: &mut DiscoveryCache,
+    selected: &[SelectedFile],
+    now: DateTime<Utc>,
+    refresh: &mut RolloutCacheRefresh,
+) -> Result<(), ()> {
+    for selected in selected {
+        refresh.discovery_probed_files += 1;
+        let current = inspect_rollout_file(&selected.path).map_err(|_| ())?;
+        cache.inventory.insert(current.path.clone(), current);
+    }
+    cache.logical_now = now;
+    Ok(())
+}
+
+fn inspect_rollout_directory(path: &Path) -> std::io::Result<Option<FileFingerprint>> {
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    FileFingerprint::from_metadata(&metadata).map(Some)
+}
+
+fn select_rollout_files(
+    cache: &DiscoveryCache,
     config: &CollectConfig,
     now: DateTime<Utc>,
     dataset: &mut RolloutDataset,
@@ -1696,90 +1984,15 @@ fn discover_rollout_files(
     let cutoff = ChronoDuration::try_days(lookback_days)
         .and_then(|lookback| now.checked_sub_signed(lookback))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let roots = [
-        config.codex_home.join("sessions"),
-        config.codex_home.join("archived_sessions"),
-    ];
-    let mut files = Vec::new();
-
-    if !roots.iter().any(|root| root.is_dir()) {
-        dataset.stats.unreadable_files += 1;
-        dataset.warnings.push(format!(
-            "no Codex rollout directories found under {}",
-            config.codex_home.display()
-        ));
-        return files;
-    }
-
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-
-        for entry in WalkDir::new(&root).follow_links(false) {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    dataset.stats.unreadable_files += 1;
-                    dataset.warnings.push(format!(
-                        "could not inspect rollout path under {}: {error}",
-                        root.display()
-                    ));
-                    continue;
-                }
-            };
-
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|v| v.to_str()) != Some("jsonl")
-            {
-                continue;
-            }
-
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    dataset.stats.unreadable_files += 1;
-                    dataset.warnings.push(format!(
-                        "could not read metadata for {}: {error}",
-                        entry.path().display()
-                    ));
-                    continue;
-                }
-            };
-            let modified_at = match metadata.modified() {
-                Ok(modified_at) => DateTime::<Utc>::from(modified_at),
-                Err(error) => {
-                    dataset.stats.unreadable_files += 1;
-                    dataset.warnings.push(format!(
-                        "could not read modification time for {}: {error}",
-                        entry.path().display()
-                    ));
-                    continue;
-                }
-            };
-            let fingerprint = match FileFingerprint::from_metadata(&metadata) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    dataset.stats.unreadable_files += 1;
-                    dataset.warnings.push(format!(
-                        "could not fingerprint {}: {error}",
-                        entry.path().display()
-                    ));
-                    continue;
-                }
-            };
-
-            if modified_at >= cutoff {
-                dataset.stats.discovered_files += 1;
-                files.push(RolloutFile {
-                    path: entry.into_path(),
-                    modified_at,
-                    fingerprint,
-                });
-            }
-        }
-    }
-
+    dataset.stats.unreadable_files = cache.unreadable_files;
+    dataset.warnings = cache.warnings.clone();
+    let mut files = cache
+        .inventory
+        .values()
+        .filter(|file| file.modified_at >= cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
+    dataset.stats.discovered_files = files.len();
     files.sort_by(|left, right| {
         right
             .modified_at

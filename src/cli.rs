@@ -617,6 +617,7 @@ fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
                 let history_elapsed = history_started.elapsed();
                 let mut history_metrics =
                     HistoryMetrics::with_durations(history_elapsed, history_elapsed, None);
+                history_metrics.record_performed = true;
                 history_metrics.quota_points =
                     u64::try_from(result.history_observation.quota_points.len())
                         .unwrap_or(u64::MAX);

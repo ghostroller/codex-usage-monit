@@ -70,6 +70,7 @@ use crate::ui_state::{
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
+const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -904,6 +905,30 @@ struct RefreshCompletion {
     history: Option<HistoryData>,
     recorder_health: Option<RecorderHealth>,
     refreshed_account: bool,
+}
+
+#[derive(Default)]
+struct RefreshWorker {
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl RefreshWorker {
+    fn start(&mut self, handle: thread::JoinHandle<()>) {
+        self.join();
+        self.handle = Some(handle);
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RefreshWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3376,9 +3401,10 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
         &config,
         &channels,
         rollout_cache,
-        history_store,
+        Arc::clone(&history_store),
         &ui_state_store,
     );
+    flush_staged_history_on_exit(&history_store, &config.perf_log);
     let _ = ui_state_store.save(&app.ui_state());
     config.perf_log.finish();
     terminal.show_cursor()?;
@@ -3447,11 +3473,12 @@ fn prepare_initial_tui(
     });
     let history_span = config.startup_trace.span("tui.history_load");
     let mut history_store = HistoryStore::discover(&config.codex_home);
-    let (history, recorder_health) = record_and_load_history(
+    let (history, recorder_health) = stage_and_load_history(
         &mut history_store,
         &initial.history_observation,
         initial.snapshot.as_of,
         &config.perf_log,
+        true,
     );
     history_span.finish_with(|| {
         format!(
@@ -3490,22 +3517,35 @@ fn prepare_initial_tui(
     )
 }
 
-fn record_and_load_history(
+fn stage_and_load_history(
     store: &mut HistoryStore,
     observation: &HistoryObservation,
     now: DateTime<Utc>,
     perf_log: &PerfLog,
+    force_flush: bool,
 ) -> (HistoryData, RecorderHealth) {
     let total_started = Instant::now();
+    let stage_started = Instant::now();
+    store.stage(observation);
+    let stage_elapsed = stage_started.elapsed();
     let record_started = Instant::now();
-    let write_result = store.record(observation);
+    let write_result = if force_flush {
+        store.flush_staged()
+    } else {
+        store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL)
+    };
     let record_elapsed = record_started.elapsed();
     let load_started = Instant::now();
-    let mut history = store.load_since(history_view_since(now));
+    let mut history = store.load_since_with_staged(history_view_since(now));
     let load_elapsed = load_started.elapsed();
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, Some(load_elapsed));
-    if let Ok(report) = &write_result {
+    metrics.stage_us = u64::try_from(stage_elapsed.as_micros()).unwrap_or(u64::MAX);
+    metrics.record_performed = match &write_result {
+        Ok(report) => report.is_some(),
+        Err(_) => true,
+    };
+    if let Ok(Some(report)) = &write_result {
         metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
         metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
         metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
@@ -3519,41 +3559,114 @@ fn record_and_load_history(
     metrics.weekly_local_points =
         u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
     match write_result {
-        Ok(report) => {
+        Ok(Some(report)) => {
             history.read_only |= report.read_only;
             history.warnings.extend(report.warnings);
         }
+        Ok(None) => {}
         Err(error) => history
             .warnings
             .push(format!("history persistence failed: {error}")),
     }
     history.warnings.sort();
     history.warnings.dedup();
-    perf_log.record_history(metrics);
+    if metrics.record_performed {
+        perf_log.record_history(metrics);
+    } else {
+        perf_log.record_history_runtime(total_started.elapsed());
+    }
     let recorder_health = load_recorder_health(store);
     (history, recorder_health)
 }
 
-fn reload_history_if_stale(
+fn flush_or_reload_history_if_due(
     store: &mut HistoryStore,
     now: DateTime<Utc>,
     perf_log: &PerfLog,
 ) -> Option<(HistoryData, RecorderHealth)> {
     let total_started = Instant::now();
+    let record_started = Instant::now();
+    let write_result = store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL);
+    let record_elapsed = record_started.elapsed();
+    let record_performed = match &write_result {
+        Ok(report) => report.is_some(),
+        Err(_) => true,
+    };
     let load_started = Instant::now();
-    let history = store.reload_since_if_stale(history_view_since(now))?;
-    let load_elapsed = load_started.elapsed();
+    let reloaded = store.reload_since_if_stale_with_staged(history_view_since(now));
+    let (mut history, load_elapsed) = match reloaded {
+        Some(history) => (history, Some(load_started.elapsed())),
+        None if record_performed => (
+            store.load_since_with_staged(history_view_since(now)),
+            Some(load_started.elapsed()),
+        ),
+        None => {
+            perf_log.record_history_runtime(total_started.elapsed());
+            return None;
+        }
+    };
     let mut metrics =
-        HistoryMetrics::with_durations(total_started.elapsed(), Duration::ZERO, Some(load_elapsed));
+        HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, load_elapsed);
+    metrics.record_performed = record_performed;
+    if let Ok(Some(report)) = &write_result {
+        metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
+        metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
+        metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
+        metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
+        metrics.read_only = report.read_only;
+    } else if write_result.is_err() {
+        metrics.warnings = 1;
+    }
     metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
     metrics.half_hour_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    metrics.warnings = u64::try_from(history.warnings.len()).unwrap_or(u64::MAX);
-    metrics.read_only = history.read_only;
+    match write_result {
+        Ok(Some(report)) => {
+            history.read_only |= report.read_only;
+            history.warnings.extend(report.warnings);
+        }
+        Ok(None) => {}
+        Err(error) => history
+            .warnings
+            .push(format!("history persistence failed: {error}")),
+    }
+    history.warnings.sort();
+    history.warnings.dedup();
+    metrics.warnings = metrics
+        .warnings
+        .max(u64::try_from(history.warnings.len()).unwrap_or(u64::MAX));
+    metrics.read_only |= history.read_only;
     perf_log.record_history(metrics);
     let recorder_health = load_recorder_health(store);
     Some((history, recorder_health))
+}
+
+fn flush_staged_history_on_exit(history_store: &Arc<Mutex<HistoryStore>>, perf_log: &PerfLog) {
+    let total_started = Instant::now();
+    let mut store = history_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let record_started = Instant::now();
+    let write_result = store.flush_staged();
+    if matches!(&write_result, Ok(None)) {
+        return;
+    }
+    let mut metrics =
+        HistoryMetrics::with_durations(total_started.elapsed(), record_started.elapsed(), None);
+    metrics.record_performed = true;
+    match write_result {
+        Ok(Some(report)) => {
+            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
+            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
+            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
+            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
+            metrics.read_only = report.read_only;
+        }
+        Ok(None) => {}
+        Err(_) => metrics.warnings = 1,
+    }
+    perf_log.record_history(metrics);
 }
 
 fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -3631,6 +3744,7 @@ fn run_loop(
 ) -> Result<()> {
     let mut first_frame = true;
     let mut redraw_reasons = RedrawReasons::default();
+    let mut refresh_worker = RefreshWorker::default();
     loop {
         while let Ok(completion) = channels.refresh_receiver.try_recv() {
             let mut refresh_changed = false;
@@ -3651,6 +3765,7 @@ fn run_loop(
             if refresh_changed {
                 redraw_reasons.insert(RedrawReasons::SNAPSHOT);
             }
+            refresh_worker.join();
         }
         while let Ok(completion) = channels.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
@@ -3710,6 +3825,7 @@ fn run_loop(
                 let _ = ui_state_store.save(&current_ui_state);
             }
             if should_quit {
+                refresh_worker.join();
                 return Ok(());
             }
         }
@@ -3735,7 +3851,7 @@ fn run_loop(
             let worker_cache = Arc::clone(&rollout_cache);
             let worker_history = Arc::clone(&history_store);
             app.worker_running = true;
-            thread::spawn(move || {
+            refresh_worker.start(thread::spawn(move || {
                 let result = {
                     let mut cache = worker_cache
                         .lock()
@@ -3760,13 +3876,14 @@ fn run_loop(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     match result.as_ref() {
-                        Some(result) => Some(record_and_load_history(
+                        Some(result) => Some(stage_and_load_history(
                             &mut history_store,
                             &result.history_observation,
                             result.snapshot.as_of,
                             &worker_config.perf_log,
+                            false,
                         )),
-                        None => reload_history_if_stale(
+                        None => flush_or_reload_history_if_due(
                             &mut history_store,
                             Utc::now(),
                             &worker_config.perf_log,
@@ -3783,7 +3900,7 @@ fn run_loop(
                     recorder_health,
                     refreshed_account: refresh_account,
                 });
-            });
+            }));
         }
         config.perf_log.maybe_sample();
     }

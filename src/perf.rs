@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const PERF_LOG_SCHEMA_VERSION: u32 = 2;
+const PERF_LOG_SCHEMA_VERSION: u32 = 3;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Per-stage timings for one refresh. Sibling stages may overlap when account
@@ -39,6 +39,11 @@ pub struct RefreshMetrics {
     pub account_refreshed: bool,
     pub changed: bool,
     pub reduced_rebuilt: bool,
+    pub discovery_full_scan: bool,
+    pub discovery_cache_hit: bool,
+    pub discovery_invalidated: bool,
+    pub discovery_probed_files: u64,
+    pub discovery_probed_dirs: u64,
     pub selected_files: u64,
     pub selected_bytes: u64,
     pub parsed_lines: u64,
@@ -62,7 +67,9 @@ pub struct RefreshMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryMetrics {
     pub duration_us: u64,
+    pub stage_us: u64,
     pub record_us: u64,
+    pub record_performed: bool,
     pub load_us: u64,
     pub load_performed: bool,
     pub shards_written: u64,
@@ -136,6 +143,9 @@ struct PerfInner {
     refresh_count: AtomicU64,
     refresh_total_us: AtomicU64,
     refresh_max_us: AtomicU64,
+    history_count: AtomicU64,
+    history_total_us: AtomicU64,
+    history_max_us: AtomicU64,
     event_wakeups: AtomicU64,
     sample_lock: Mutex<()>,
     state: Mutex<PerfState>,
@@ -240,6 +250,7 @@ impl PerfLog {
         let Some(inner) = self.active_inner() else {
             return;
         };
+        record_history_runtime_inner(inner, metrics.duration_us);
         {
             let mut state = inner
                 .state
@@ -260,6 +271,16 @@ impl PerfLog {
                 return;
             }
         }
+        self.maybe_sample_inner(inner);
+    }
+
+    /// Adds a history stage/flush/load pass to the aggregate sample without
+    /// writing a per-pass JSON event.
+    pub fn record_history_runtime(&self, duration: Duration) {
+        let Some(inner) = self.active_inner() else {
+            return;
+        };
+        record_history_runtime_inner(inner, duration_us(duration));
         self.maybe_sample_inner(inner);
     }
 
@@ -359,6 +380,9 @@ impl PerfLog {
                     refresh_count: AtomicU64::new(0),
                     refresh_total_us: AtomicU64::new(0),
                     refresh_max_us: AtomicU64::new(0),
+                    history_count: AtomicU64::new(0),
+                    history_total_us: AtomicU64::new(0),
+                    history_max_us: AtomicU64::new(0),
                     event_wakeups: AtomicU64::new(0),
                     sample_lock: Mutex::new(()),
                     state: Mutex::new(PerfState {
@@ -385,6 +409,9 @@ impl PerfLog {
                 refresh_count: AtomicU64::new(0),
                 refresh_total_us: AtomicU64::new(0),
                 refresh_max_us: AtomicU64::new(0),
+                history_count: AtomicU64::new(0),
+                history_total_us: AtomicU64::new(0),
+                history_max_us: AtomicU64::new(0),
                 event_wakeups: AtomicU64::new(0),
                 sample_lock: Mutex::new(()),
                 state: Mutex::new(PerfState {
@@ -428,6 +455,9 @@ impl PerfLog {
         let refresh_count = inner.refresh_count.swap(0, Ordering::AcqRel);
         let refresh_total_us = inner.refresh_total_us.swap(0, Ordering::AcqRel);
         let refresh_max_us = inner.refresh_max_us.swap(0, Ordering::AcqRel);
+        let history_count = inner.history_count.swap(0, Ordering::AcqRel);
+        let history_total_us = inner.history_total_us.swap(0, Ordering::AcqRel);
+        let history_max_us = inner.history_max_us.swap(0, Ordering::AcqRel);
         let event_wakeups = inner.event_wakeups.swap(0, Ordering::AcqRel);
         let process = process_sample();
 
@@ -453,6 +483,11 @@ impl PerfLog {
                 "totalDurationUs": refresh_total_us,
                 "maxDurationUs": refresh_max_us,
                 "latest": state.latest_refresh,
+            },
+            "history": {
+                "count": history_count,
+                "totalDurationUs": history_total_us,
+                "maxDurationUs": history_max_us,
             },
             "eventWakeups": event_wakeups,
             "process": process,
@@ -514,6 +549,14 @@ fn saturating_add(target: &AtomicU64, value: u64) {
     let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(value))
     });
+}
+
+fn record_history_runtime_inner(inner: &PerfInner, duration_us: u64) {
+    saturating_add(&inner.history_count, 1);
+    saturating_add(&inner.history_total_us, duration_us);
+    inner
+        .history_max_us
+        .fetch_max(duration_us, Ordering::Relaxed);
 }
 
 fn duration_us(duration: Duration) -> u64 {
@@ -674,6 +717,7 @@ mod tests {
             Duration::from_millis(2),
             Some(Duration::from_millis(1)),
         ));
+        log.record_history_runtime(Duration::from_micros(500));
         log.record_event_wakeup();
         log.sample_now();
         log.finish();
@@ -693,6 +737,9 @@ mod tests {
         log.record_draw(Duration::from_micros(300));
         let mut refresh = RefreshMetrics::with_duration(Duration::from_millis(9));
         refresh.changed = true;
+        refresh.discovery_cache_hit = true;
+        refresh.discovery_probed_files = 7;
+        refresh.discovery_probed_dirs = 3;
         refresh.cached_events = 42;
         refresh.foreign_baseline_events = 3;
         log.record_refresh(refresh);
@@ -701,9 +748,12 @@ mod tests {
             Duration::from_millis(2),
             Some(Duration::from_millis(1)),
         );
+        history.record_performed = true;
+        history.stage_us = 250;
         history.shards_written = 1;
         history.weekly_local_points = 12;
         log.record_history(history);
+        log.record_history_runtime(Duration::from_micros(500));
         log.record_event_wakeup();
         log.sample_now();
         log.finish();
@@ -720,10 +770,15 @@ mod tests {
                 .all(|value| value["schemaVersion"] == PERF_LOG_SCHEMA_VERSION)
         );
         assert_eq!(values[1]["event"], "refresh");
+        assert_eq!(values[1]["metrics"]["discoveryCacheHit"], true);
+        assert_eq!(values[1]["metrics"]["discoveryProbedFiles"], 7);
+        assert_eq!(values[1]["metrics"]["discoveryProbedDirs"], 3);
         assert_eq!(values[1]["metrics"]["cachedEvents"], 42);
         assert_eq!(values[1]["metrics"]["foreignBaselineEvents"], 3);
         assert_eq!(values[2]["event"], "history");
+        assert_eq!(values[2]["metrics"]["stageUs"], 250);
         assert_eq!(values[2]["metrics"]["recordUs"], 2_000);
+        assert_eq!(values[2]["metrics"]["recordPerformed"], true);
         assert_eq!(values[2]["metrics"]["loadUs"], 1_000);
         assert_eq!(values[2]["metrics"]["loadPerformed"], true);
         assert_eq!(values[2]["metrics"]["shardsWritten"], 1);
@@ -734,6 +789,9 @@ mod tests {
         assert_eq!(values[3]["draw"]["maxDurationUs"], 700);
         assert_eq!(values[3]["refresh"]["count"], 1);
         assert_eq!(values[3]["refresh"]["latest"]["cachedEvents"], 42);
+        assert_eq!(values[3]["history"]["count"], 2);
+        assert_eq!(values[3]["history"]["totalDurationUs"], 3_500);
+        assert_eq!(values[3]["history"]["maxDurationUs"], 3_000);
         assert_eq!(values[3]["eventWakeups"], 1);
         assert_eq!(values.last().unwrap()["event"], "perf_stop");
     }

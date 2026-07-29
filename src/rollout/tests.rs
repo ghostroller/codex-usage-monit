@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let now = Utc::now();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread\"}}}}\n",
+            now.to_rfc3339()
+        ),
+    )
+    .unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+    cache.scan(&config, now).unwrap();
+    let discovery = cache.discovery_cache.as_mut().unwrap();
+    discovery.complete = false;
+    discovery.unreadable_files = 1;
+    discovery.warnings = vec!["temporary discovery failure".to_string()];
+    discovery.full_scan_at = Instant::now();
+    let mut source = std::fs::OpenOptions::new()
+        .append(true)
+        .open(sessions.join("rollout.jsonl"))
+        .unwrap();
+    writeln!(
+        source,
+        "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn\"}}}}",
+        (now + ChronoDuration::seconds(1)).to_rfc3339()
+    )
+    .unwrap();
+
+    let cached = cache
+        .scan(&config, now + ChronoDuration::seconds(1))
+        .unwrap();
+    assert!(cache.last_refresh().discovery_cache_hit);
+    assert!(!cache.last_refresh().discovery_full_scan);
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+    assert_eq!(cached.turns.len(), 1);
+    assert_eq!(cached.stats.unreadable_files, 1);
+    assert_eq!(
+        cached.warnings,
+        vec!["temporary discovery failure".to_string()]
+    );
+
+    cache.discovery_cache.as_mut().unwrap().full_scan_at = Instant::now()
+        .checked_sub(DISCOVERY_INCOMPLETE_RESCAN_INTERVAL)
+        .unwrap();
+    let retried = cache.scan(&config, now).unwrap();
+    assert!(cache.last_refresh().discovery_full_scan);
+    assert_eq!(retried.stats.unreadable_files, 0);
+    assert!(retried.warnings.is_empty());
+}
+
+#[test]
 fn pruning_removes_entries_until_within_bounds() {
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("a.json");

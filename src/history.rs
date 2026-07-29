@@ -487,6 +487,9 @@ pub struct HistoryStore {
     cached_since: Option<DateTime<Utc>>,
     cached_data: Option<HistoryData>,
     cache_loaded_at: Option<Instant>,
+    staged_observation: Option<HistoryObservation>,
+    staged_force_full_merge: bool,
+    last_staged_flush_attempt: Option<Instant>,
 }
 
 impl HistoryStore {
@@ -511,6 +514,9 @@ impl HistoryStore {
             cached_since: None,
             cached_data: None,
             cache_loaded_at: None,
+            staged_observation: None,
+            staged_force_full_merge: false,
+            last_staged_flush_attempt: None,
         }
     }
 
@@ -531,6 +537,22 @@ impl HistoryStore {
     }
 
     pub fn record(&mut self, observation: &HistoryObservation) -> io::Result<HistoryWriteReport> {
+        let full_merge = self.full_merge_due(observation.observed_at);
+        self.record_with_merge_mode(observation, full_merge, full_merge)
+    }
+
+    fn full_merge_due(&self, observed_at: DateTime<Utc>) -> bool {
+        self.last_full_merge_at.is_none_or(|last| {
+            observed_at < last || observed_at - last >= Duration::seconds(FULL_HISTORY_MERGE_SECS)
+        })
+    }
+
+    fn record_with_merge_mode(
+        &mut self,
+        observation: &HistoryObservation,
+        full_merge: bool,
+        include_all_observation_points: bool,
+    ) -> io::Result<HistoryWriteReport> {
         let mut report = HistoryWriteReport::default();
         let Some(directory) = self.namespace_dir.as_deref() else {
             report
@@ -560,11 +582,7 @@ impl HistoryStore {
         }
 
         let cutoff = observation.observed_at - Duration::days(HISTORY_RETENTION_DAYS);
-        let full_merge = self.last_full_merge_at.is_none_or(|last| {
-            observation.observed_at < last
-                || observation.observed_at - last >= Duration::seconds(FULL_HISTORY_MERGE_SECS)
-        });
-        let additions = additions_by_day(observation, cutoff, full_merge);
+        let additions = additions_by_day(observation, cutoff, include_all_observation_points);
         for (day, additions) in additions {
             let path = shard_path(directory, day);
             let mut shard = match read_shard(&path, &self.namespace, day) {
@@ -615,11 +633,109 @@ impl HistoryStore {
         }
         report.read_only = self.read_only;
         if report.warnings.is_empty() {
-            self.merge_cached_observation(observation, full_merge);
+            self.merge_cached_observation(observation, include_all_observation_points);
         } else {
             self.cached_data = None;
         }
         Ok(report)
+    }
+
+    /// Stage a TUI observation for live display and a later batched write.
+    ///
+    /// Staging never acquires the on-disk history lock. Multiple observations
+    /// are compacted with the same replacement rules used by shard writes so
+    /// reset transitions, closed half-hours, and stronger external evidence
+    /// retain their normal semantics.
+    pub(crate) fn stage(&mut self, observation: &HistoryObservation) {
+        let pending_clock_rollback = self
+            .staged_observation
+            .as_ref()
+            .is_some_and(|staged| observation.observed_at < staged.observed_at);
+        self.staged_force_full_merge |=
+            self.full_merge_due(observation.observed_at) || pending_clock_rollback;
+        let full_merge = self.staged_force_full_merge;
+        match self.staged_observation.as_mut() {
+            Some(staged) => merge_history_observation(staged, observation, full_merge),
+            None => {
+                let mut staged = HistoryObservation {
+                    observed_at: observation.observed_at,
+                    ..HistoryObservation::default()
+                };
+                merge_history_observation(&mut staged, observation, full_merge);
+                self.staged_observation = Some(staged);
+            }
+        }
+    }
+
+    /// Flush a staged observation regardless of the normal batching interval.
+    ///
+    /// A failed, read-only, or warning-bearing write keeps the staged data so
+    /// the live view does not regress and a later attempt can recover it.
+    pub(crate) fn flush_staged(&mut self) -> io::Result<Option<HistoryWriteReport>> {
+        self.flush_staged_at(Instant::now())
+    }
+
+    /// Flush staged data once the monotonic batching interval has elapsed.
+    pub(crate) fn flush_staged_if_due(
+        &mut self,
+        interval: StdDuration,
+    ) -> io::Result<Option<HistoryWriteReport>> {
+        self.flush_staged_if_due_at(interval, Instant::now())
+    }
+
+    fn flush_staged_if_due_at(
+        &mut self,
+        interval: StdDuration,
+        now: Instant,
+    ) -> io::Result<Option<HistoryWriteReport>> {
+        if self.staged_observation.is_none()
+            || self
+                .last_staged_flush_attempt
+                .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return Ok(None);
+        }
+        self.flush_staged_at(now)
+    }
+
+    fn flush_staged_at(&mut self, attempted_at: Instant) -> io::Result<Option<HistoryWriteReport>> {
+        let Some(observation) = self.staged_observation.clone() else {
+            return Ok(None);
+        };
+        self.last_staged_flush_attempt = Some(attempted_at);
+        // The staged observation has already been reduced to the desired
+        // recent/full delta. Persist every staged point so a bucket cannot age
+        // past the overlap boundary while waiting for the batch deadline.
+        let result = self.record_with_merge_mode(&observation, self.staged_force_full_merge, true);
+        if let Ok(report) = &result
+            && !report.read_only
+            && report.warnings.is_empty()
+        {
+            self.staged_observation = None;
+            self.staged_force_full_merge = false;
+        }
+        result.map(Some)
+    }
+
+    /// Load persisted history and overlay any not-yet-flushed TUI observation.
+    pub(crate) fn load_since_with_staged(&mut self, since: DateTime<Utc>) -> HistoryData {
+        let mut data = self.load_since(since);
+        if let Some(observation) = self.staged_observation.as_ref() {
+            merge_observation_into_history(&mut data, observation, since);
+        }
+        data
+    }
+
+    /// Reload external writer changes when stale, then restore the staged view.
+    pub(crate) fn reload_since_if_stale_with_staged(
+        &mut self,
+        since: DateTime<Utc>,
+    ) -> Option<HistoryData> {
+        let mut data = self.reload_since_if_stale(since)?;
+        if let Some(observation) = self.staged_observation.as_ref() {
+            merge_observation_into_history(&mut data, observation, since);
+        }
+        Some(data)
     }
 
     pub fn load_since(&mut self, since: DateTime<Utc>) -> HistoryData {
@@ -723,7 +839,11 @@ impl HistoryStore {
         (!cache_is_fresh).then(|| self.load_since(since))
     }
 
-    fn merge_cached_observation(&mut self, observation: &HistoryObservation, full_merge: bool) {
+    fn merge_cached_observation(
+        &mut self,
+        observation: &HistoryObservation,
+        include_all_observation_points: bool,
+    ) {
         let (Some(since), Some(data)) = (self.cached_since, self.cached_data.as_mut()) else {
             return;
         };
@@ -734,12 +854,16 @@ impl HistoryStore {
         }
         let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
         for bucket in &observation.half_hour_buckets {
-            if bucket.ends_at > since && (full_merge || bucket.ends_at > recent_cutoff) {
+            if bucket.ends_at > since
+                && (include_all_observation_points || bucket.ends_at > recent_cutoff)
+            {
                 let _ = upsert_half_hour_bucket(&mut data.half_hour_buckets, bucket.clone());
             }
         }
         for point in &observation.weekly_local_points {
-            if point.observed_at >= since && (full_merge || point.observed_at > recent_cutoff) {
+            if point.observed_at >= since
+                && (include_all_observation_points || point.observed_at > recent_cutoff)
+            {
                 let _ = upsert_weekly_local_point(&mut data.weekly_local_points, point.clone());
             }
         }
@@ -748,9 +872,82 @@ impl HistoryStore {
             .retain(|bucket| bucket.ends_at > since);
         data.weekly_local_points
             .retain(|point| point.observed_at >= since);
-        normalize_loaded_data(data);
+        sort_history_data(data);
         data.read_only = self.read_only;
     }
+}
+
+fn merge_history_observation(
+    staged: &mut HistoryObservation,
+    incoming: &HistoryObservation,
+    full_merge: bool,
+) {
+    staged.observed_at = staged.observed_at.max(incoming.observed_at);
+    for point in &incoming.quota_points {
+        let _ = upsert_quota_point(&mut staged.quota_points, point.clone());
+    }
+    let recent_cutoff = incoming.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+    for bucket in &incoming.half_hour_buckets {
+        if full_merge || bucket.ends_at > recent_cutoff {
+            let _ = upsert_half_hour_bucket(&mut staged.half_hour_buckets, bucket.clone());
+        }
+    }
+    for point in &incoming.weekly_local_points {
+        if full_merge || point.observed_at > recent_cutoff {
+            let _ = upsert_weekly_local_point(&mut staged.weekly_local_points, point.clone());
+        }
+    }
+
+    let cutoff = staged.observed_at - Duration::days(HISTORY_RETENTION_DAYS);
+    staged
+        .quota_points
+        .retain(|point| point.observed_at >= cutoff);
+    staged
+        .half_hour_buckets
+        .retain(|bucket| bucket.ends_at > cutoff);
+    staged
+        .weekly_local_points
+        .retain(|point| point.observed_at >= cutoff);
+    staged.quota_points.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+            .then_with(|| left.resets_at.cmp(&right.resets_at))
+    });
+    staged
+        .half_hour_buckets
+        .sort_by_key(|bucket| bucket.starts_at);
+    staged
+        .weekly_local_points
+        .sort_by_key(|point| point.observed_at);
+}
+
+fn merge_observation_into_history(
+    data: &mut HistoryData,
+    observation: &HistoryObservation,
+    since: DateTime<Utc>,
+) {
+    for point in &observation.quota_points {
+        if point.observed_at >= since {
+            let _ = upsert_quota_point(&mut data.quota_points, point.clone());
+        }
+    }
+    for bucket in &observation.half_hour_buckets {
+        if bucket.ends_at > since {
+            let _ = upsert_half_hour_bucket(&mut data.half_hour_buckets, bucket.clone());
+        }
+    }
+    for point in &observation.weekly_local_points {
+        if point.observed_at >= since {
+            let _ = upsert_weekly_local_point(&mut data.weekly_local_points, point.clone());
+        }
+    }
+    data.quota_points.retain(|point| point.observed_at >= since);
+    data.half_hour_buckets
+        .retain(|bucket| bucket.ends_at > since);
+    data.weekly_local_points
+        .retain(|point| point.observed_at >= since);
+    sort_history_data(data);
 }
 
 #[derive(Default)]
@@ -763,7 +960,7 @@ struct DayAdditions {
 fn additions_by_day(
     observation: &HistoryObservation,
     cutoff: DateTime<Utc>,
-    full_merge: bool,
+    include_all_observation_points: bool,
 ) -> BTreeMap<NaiveDate, DayAdditions> {
     let mut additions: BTreeMap<NaiveDate, DayAdditions> = BTreeMap::new();
     for point in &observation.quota_points {
@@ -777,7 +974,9 @@ fn additions_by_day(
     }
     let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
     for bucket in &observation.half_hour_buckets {
-        if bucket.ends_at > cutoff && (full_merge || bucket.ends_at > recent_cutoff) {
+        if bucket.ends_at > cutoff
+            && (include_all_observation_points || bucket.ends_at > recent_cutoff)
+        {
             additions
                 .entry(bucket.starts_at.date_naive())
                 .or_default()
@@ -786,7 +985,9 @@ fn additions_by_day(
         }
     }
     for point in &observation.weekly_local_points {
-        if point.observed_at >= cutoff && (full_merge || point.observed_at > recent_cutoff) {
+        if point.observed_at >= cutoff
+            && (include_all_observation_points || point.observed_at > recent_cutoff)
+        {
             additions
                 .entry(point.observed_at.date_naive())
                 .or_default()
@@ -1469,18 +1670,12 @@ fn normalize_loaded_data(data: &mut HistoryData) {
     for point in std::mem::take(&mut data.quota_points) {
         let _ = upsert_quota_point(&mut quota, point);
     }
-    quota.sort_by(|left, right| {
-        left.observed_at
-            .cmp(&right.observed_at)
-            .then_with(|| left.duration_mins.cmp(&right.duration_mins))
-    });
     data.quota_points = quota;
 
     let mut buckets = Vec::new();
     for bucket in std::mem::take(&mut data.half_hour_buckets) {
         let _ = upsert_half_hour_bucket(&mut buckets, bucket);
     }
-    buckets.sort_by_key(|bucket| bucket.starts_at);
     data.half_hour_buckets = buckets;
 
     let mut loaded_weekly = std::mem::take(&mut data.weekly_local_points);
@@ -1489,8 +1684,21 @@ fn normalize_loaded_data(data: &mut HistoryData) {
     for point in loaded_weekly {
         let _ = upsert_weekly_local_point(&mut weekly, point);
     }
-    weekly.sort_by_key(|point| point.observed_at);
     data.weekly_local_points = weekly;
+    sort_history_data(data);
+}
+
+fn sort_history_data(data: &mut HistoryData) {
+    data.quota_points.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+            .then_with(|| left.resets_at.cmp(&right.resets_at))
+    });
+    data.half_hour_buckets
+        .sort_by_key(|bucket| bucket.starts_at);
+    data.weekly_local_points
+        .sort_by_key(|point| point.observed_at);
 }
 
 struct NamespaceInspection {
@@ -2218,6 +2426,392 @@ mod tests {
                 .token_usage
                 .total_tokens,
             30
+        );
+    }
+
+    #[test]
+    fn staged_history_updates_live_data_and_flushes_on_the_monotonic_deadline() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let since = starts_at - Duration::days(1);
+        let interval = StdDuration::from_secs(30);
+        let first_attempt = Instant::now();
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(5),
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(5),
+                10,
+                100,
+            )],
+            weekly_local_points: Vec::new(),
+        });
+        assert!(
+            store
+                .flush_staged_if_due_at(interval, first_attempt)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.staged_observation.is_none());
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(6),
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(6),
+                20,
+                200,
+            )],
+            weekly_local_points: Vec::new(),
+        });
+        assert!(
+            store
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(29),)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_since_with_staged(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        let mut persisted = HistoryStore::new(history_root.clone(), &codex_home);
+        assert_eq!(
+            persisted.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+
+        assert!(
+            store
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(30),)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.staged_observation.is_none());
+        let mut persisted = HistoryStore::new(history_root, &codex_home);
+        assert_eq!(
+            persisted.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+    }
+
+    #[test]
+    fn staged_history_keeps_recent_deltas_until_a_full_merge_is_due() {
+        let directory = tempdir().unwrap();
+        let observed_at = at(2026, 7, 28, 12, 5, 0);
+        let recent_start = at(2026, 7, 28, 12, 0, 0);
+        let old_start = at(2026, 7, 28, 9, 30, 0);
+        let reset = observed_at + Duration::days(7);
+        let observation = HistoryObservation {
+            observed_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![
+                local_bucket(old_start, old_start + Duration::minutes(30), 5, 50),
+                local_bucket(recent_start, observed_at, 10, 100),
+            ],
+            weekly_local_points: vec![
+                weekly_point(old_start + Duration::minutes(30), reset, 5, 50),
+                weekly_point(observed_at, reset, 10, 100),
+            ],
+        };
+        let mut store = HistoryStore::new(
+            directory.path().join("state"),
+            directory.path().join("codex").as_path(),
+        );
+        store.last_full_merge_at = Some(observed_at - Duration::minutes(5));
+
+        store.stage(&observation);
+        let staged = store.staged_observation.as_ref().unwrap();
+        assert_eq!(staged.half_hour_buckets.len(), 1);
+        assert_eq!(staged.weekly_local_points.len(), 1);
+        assert!(!store.staged_force_full_merge);
+
+        store.staged_observation = None;
+        store.last_full_merge_at = Some(observed_at - Duration::minutes(31));
+        store.stage(&observation);
+        let staged = store.staged_observation.as_ref().unwrap();
+        assert_eq!(staged.half_hour_buckets.len(), 2);
+        assert_eq!(staged.weekly_local_points.len(), 2);
+        assert!(store.staged_force_full_merge);
+    }
+
+    #[test]
+    fn staged_delta_is_persisted_after_crossing_the_recent_overlap_boundary() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let observed_at = at(2026, 7, 28, 12, 0, 0);
+        let edge_time = observed_at - Duration::minutes(59) - Duration::seconds(50);
+        let bucket_start = edge_time - Duration::minutes(30);
+        let reset = observed_at + Duration::days(7);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store.last_full_merge_at = Some(observed_at - Duration::minutes(5));
+
+        store.stage(&HistoryObservation {
+            observed_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(bucket_start, edge_time, 10, 100)],
+            weekly_local_points: vec![weekly_point(edge_time, reset, 10, 100)],
+        });
+        store.stage(&HistoryObservation {
+            observed_at: observed_at + Duration::seconds(30),
+            ..HistoryObservation::default()
+        });
+        assert!(store.flush_staged().unwrap().is_some());
+
+        let mut persisted = HistoryStore::new(history_root, &codex_home);
+        let data = persisted.load_since(bucket_start - Duration::minutes(1));
+        assert_eq!(data.half_hour_buckets.len(), 1);
+        assert_eq!(data.weekly_local_points.len(), 1);
+        assert_eq!(data.half_hour_buckets[0].starts_at, bucket_start);
+        assert_eq!(data.weekly_local_points[0].observed_at, edge_time);
+    }
+
+    #[test]
+    fn forced_staged_flush_persists_before_the_batch_deadline() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let since = starts_at - Duration::days(1);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(5),
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(5),
+                10,
+                100,
+            )],
+            weekly_local_points: Vec::new(),
+        });
+
+        assert!(store.flush_staged().unwrap().is_some());
+        assert!(store.staged_observation.is_none());
+        let mut persisted = HistoryStore::new(history_root, &codex_home);
+        assert_eq!(
+            persisted.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+    }
+
+    #[test]
+    fn failed_staged_flush_keeps_live_data_and_debounces_retries() {
+        let directory = tempdir().unwrap();
+        let unusable_root = directory.path().join("state-file");
+        fs::write(&unusable_root, b"not a directory").unwrap();
+        let codex_home = directory.path().join("codex");
+        let observed_at = at(2026, 7, 28, 12, 5, 0);
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let interval = StdDuration::from_secs(30);
+        let first_attempt = Instant::now();
+        let mut store = HistoryStore::new(unusable_root, &codex_home);
+        store.stage(&HistoryObservation {
+            observed_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(starts_at, observed_at, 10, 100)],
+            weekly_local_points: Vec::new(),
+        });
+
+        assert!(
+            store
+                .flush_staged_if_due_at(interval, first_attempt)
+                .is_err()
+        );
+        assert!(store.staged_observation.is_some());
+        assert!(
+            store
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(1),)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_since_with_staged(starts_at - Duration::hours(1))
+                .half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+    }
+
+    #[test]
+    fn staged_flush_preserves_reset_transitions_and_utc_day_shards() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let before_midnight = at(2026, 7, 28, 23, 59, 50);
+        let midnight = at(2026, 7, 29, 0, 0, 0);
+        let after_midnight = at(2026, 7, 29, 0, 0, 10);
+        let old_reset = midnight;
+        let new_reset = old_reset + Duration::days(7);
+        let mut store = HistoryStore::new(history_root, &codex_home);
+
+        store.stage(&HistoryObservation {
+            observed_at: before_midnight,
+            quota_points: vec![quota_point(before_midnight, old_reset, 90.0)],
+            half_hour_buckets: vec![local_bucket(at(2026, 7, 28, 23, 30, 0), midnight, 10, 100)],
+            weekly_local_points: vec![weekly_point(before_midnight, old_reset, 10, 100)],
+        });
+        store.stage(&HistoryObservation {
+            observed_at: after_midnight,
+            quota_points: vec![quota_point(after_midnight, new_reset, 1.0)],
+            half_hour_buckets: vec![local_bucket(midnight, after_midnight, 20, 200)],
+            weekly_local_points: vec![weekly_point(after_midnight, new_reset, 20, 200)],
+        });
+        let staged = store.staged_observation.as_ref().unwrap();
+        assert_eq!(staged.quota_points.len(), 2);
+        assert_eq!(staged.half_hour_buckets.len(), 2);
+        assert_eq!(staged.weekly_local_points.len(), 2);
+
+        assert!(store.flush_staged().unwrap().is_some());
+        let namespace_dir = store.namespace_dir().unwrap();
+        assert!(shard_path(namespace_dir, before_midnight.date_naive()).is_file());
+        assert!(shard_path(namespace_dir, after_midnight.date_naive()).is_file());
+        let data = store.load_since(before_midnight - Duration::hours(1));
+        assert_eq!(data.quota_points.len(), 2);
+        assert_eq!(data.half_hour_buckets.len(), 2);
+        assert_eq!(data.weekly_local_points.len(), 2);
+        assert_eq!(
+            data.quota_points
+                .iter()
+                .map(|point| point.resets_at)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([old_reset, new_reset])
+        );
+    }
+
+    #[test]
+    fn stale_reload_merges_external_writes_with_staged_evidence() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let since = at(2026, 7, 28, 0, 0, 0);
+        let first_start = at(2026, 7, 28, 12, 0, 0);
+        let second_start = first_start + Duration::minutes(30);
+        let third_start = second_start + Duration::minutes(30);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store
+            .record(&HistoryObservation {
+                observed_at: first_start + Duration::minutes(10),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![local_bucket(
+                    first_start,
+                    first_start + Duration::minutes(10),
+                    50,
+                    500,
+                )],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(store.load_since(since).half_hour_buckets.len(), 1);
+
+        let mut lower_quality =
+            local_bucket(first_start, first_start + Duration::minutes(20), 20, 200);
+        lower_quality.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        store.stage(&HistoryObservation {
+            observed_at: second_start + Duration::minutes(10),
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![
+                lower_quality,
+                local_bucket(second_start, second_start + Duration::minutes(10), 10, 100),
+            ],
+            weekly_local_points: Vec::new(),
+        });
+
+        let mut external = HistoryStore::new(history_root.clone(), &codex_home);
+        external
+            .record(&HistoryObservation {
+                observed_at: third_start + Duration::minutes(10),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![local_bucket(
+                    third_start,
+                    third_start + Duration::minutes(10),
+                    30,
+                    300,
+                )],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        store.cache_loaded_at =
+            Some(Instant::now() - HISTORY_READ_CACHE_TTL - StdDuration::from_secs(1));
+
+        let data = store
+            .reload_since_if_stale_with_staged(since)
+            .expect("the expired cache must reload");
+        assert_eq!(data.half_hour_buckets.len(), 3);
+        assert_eq!(data.half_hour_buckets[0].token_usage.total_tokens, 50);
+        assert_eq!(data.half_hour_buckets[1].token_usage.total_tokens, 10);
+        assert_eq!(data.half_hour_buckets[2].token_usage.total_tokens, 30);
+
+        assert!(store.flush_staged().unwrap().is_some());
+        let mut persisted = HistoryStore::new(history_root, &codex_home);
+        let data = persisted.load_since(since);
+        assert_eq!(data.half_hour_buckets.len(), 3);
+        assert_eq!(data.half_hour_buckets[0].token_usage.total_tokens, 50);
+    }
+
+    #[test]
+    fn staged_open_bucket_closes_and_clock_rollback_forces_a_full_merge() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let first_at = starts_at + Duration::minutes(10);
+        store.stage(&HistoryObservation {
+            observed_at: first_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(starts_at, first_at, 10, 100)],
+            weekly_local_points: Vec::new(),
+        });
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(30),
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(30),
+                10,
+                100,
+            )],
+            weekly_local_points: Vec::new(),
+        });
+        assert_eq!(
+            store.staged_observation.as_ref().unwrap().half_hour_buckets[0].sampled_at,
+            starts_at + Duration::minutes(30)
+        );
+        store.flush_staged().unwrap();
+        assert_eq!(
+            store.last_full_merge_at,
+            Some(starts_at + Duration::minutes(30))
+        );
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(40),
+            ..HistoryObservation::default()
+        });
+        store.stage(&HistoryObservation {
+            observed_at: starts_at - Duration::minutes(1),
+            ..HistoryObservation::default()
+        });
+        assert!(store.staged_force_full_merge);
+        store.flush_staged().unwrap();
+        assert_eq!(
+            store.last_full_merge_at,
+            Some(starts_at + Duration::minutes(40))
         );
     }
 

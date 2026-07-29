@@ -1014,6 +1014,76 @@ fn cached_refresh_preserves_truncated_file_stats() {
 }
 
 #[test]
+fn warm_discovery_reuses_inventory_and_detects_new_files() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-first.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "thread-first"}
+        })],
+    );
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+
+    let first = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(first.tasks.len(), 1);
+    assert!(cache.last_refresh().discovery_full_scan);
+
+    let unchanged = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(unchanged.tasks.len(), 1);
+    assert!(cache.last_refresh().discovery_cache_hit);
+    assert!(!cache.last_refresh().discovery_full_scan);
+    assert_eq!(cache.last_refresh().discovery_probed_files, 1);
+
+    write_jsonl(
+        &temp.path().join("sessions/rollout-second.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "session_meta",
+            "payload": {"id": "thread-second"}
+        })],
+    );
+    let changed = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(changed.tasks.len(), 2);
+    assert!(cache.last_refresh().discovery_full_scan);
+    assert!(cache.last_refresh().discovery_invalidated);
+}
+
+#[test]
+fn cached_discovery_detects_a_rollout_root_appearing() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+
+    let empty = cache.scan(&scan_config, now).unwrap();
+    assert!(empty.tasks.is_empty());
+    assert!(cache.last_refresh().discovery_full_scan);
+
+    write_jsonl(
+        &temp.path().join("sessions/rollout-new-root.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "session_meta",
+            "payload": {"id": "thread-new-root"}
+        })],
+    );
+    let changed = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(changed.tasks.len(), 1);
+    assert!(cache.last_refresh().discovery_full_scan);
+    assert!(cache.last_refresh().discovery_invalidated);
+}
+
+#[test]
 fn cold_scan_emits_aggregate_startup_stages_without_session_content() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -1140,14 +1210,19 @@ fn benchmark_real_codex_cache() {
     let warm_started = Instant::now();
     let warm = cache.scan(&scan_config, Utc::now()).unwrap();
     let warm_elapsed = warm_started.elapsed();
+    let refresh = cache.last_refresh();
     eprintln!(
-        "cold={cold_elapsed:?} warm={warm_elapsed:?} files={} lines={} calls={} turns={}",
+        "cold={cold_elapsed:?} warm={warm_elapsed:?} files={} lines={} calls={} turns={} discovery_hit={} probed_files={} probed_dirs={}",
         warm.stats.scanned_files,
         warm.stats.parsed_lines,
         warm.calls.len(),
-        warm.turns.len()
+        warm.turns.len(),
+        refresh.discovery_cache_hit,
+        refresh.discovery_probed_files,
+        refresh.discovery_probed_dirs
     );
     assert_eq!(cold.stats.parsed_lines, warm.stats.parsed_lines);
+    assert!(refresh.discovery_cache_hit);
     assert!(
         warm_elapsed < Duration::from_millis(200),
         "warm refresh took {warm_elapsed:?}"
