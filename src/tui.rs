@@ -11,7 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use chrono::FixedOffset;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -27,10 +27,11 @@ use ratatui::Terminal;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
-    Wrap,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, Gauge, GraphType, HighlightSpacing,
+    Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -49,8 +50,11 @@ use crate::domain::{
     TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage,
     terminal_safe_text,
 };
+use crate::history::{HistoryData, HistoryObservation, HistoryStore};
 use crate::open_config::{OpenConfig, OpenConfigStore};
+use crate::perf::{HistoryMetrics, PerfLog};
 use crate::rollout::RolloutCache;
+use crate::service::{RecorderStatusFile, default_status_file, read_recorder_status};
 use crate::session_launch::{
     FocusResult, LaunchContext, LaunchResult, PaneId, ResumeTarget, ZellijOptions,
     check_eligibility, check_eligibility_without_cwd_probe, execute_zellij_launch,
@@ -66,6 +70,7 @@ use crate::ui_state::{
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
+const HISTORY_VIEW_DAYS: i64 = 8;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
@@ -206,6 +211,7 @@ impl From<Theme> for UiTheme {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Overview,
+    Trends,
     Health,
 }
 
@@ -213,6 +219,7 @@ impl From<UiView> for View {
     fn from(value: UiView) -> Self {
         match value {
             UiView::Overview => Self::Overview,
+            UiView::Trends => Self::Trends,
             UiView::Health => Self::Health,
         }
     }
@@ -222,9 +229,72 @@ impl From<View> for UiView {
     fn from(value: View) -> Self {
         match value {
             View::Overview => Self::Overview,
+            View::Trends => Self::Trends,
             View::Health => Self::Health,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TrendSection {
+    #[default]
+    Remaining,
+    Weekly,
+    HalfHour,
+}
+
+impl TrendSection {
+    const ALL: [Self; 3] = [Self::Remaining, Self::Weekly, Self::HalfHour];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Remaining => "Remaining",
+            Self::Weekly => "Weekly",
+            Self::HalfHour => "Half-hour",
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::Remaining => 'R',
+            Self::Weekly => 'W',
+            Self::HalfHour => 'H',
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Remaining => 0,
+            Self::Weekly => 1,
+            Self::HalfHour => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrendPoint {
+    at: DateTime<Utc>,
+    value: f64,
+    partial: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TrendSeries<'a> {
+    name: &'static str,
+    points: &'a [TrendPoint],
+    color: Color,
+}
+
+#[derive(Clone, Copy)]
+enum TrendValueKind {
+    Percent,
+    Tokens,
+}
+
+#[derive(Clone, Copy)]
+enum TrendGraphKind {
+    Line { maximum_gap: chrono::Duration },
+    Bar { expected_step: chrono::Duration },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -710,7 +780,7 @@ struct TurnControlsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ViewTabsHitbox {
-    tabs: [Rect; 2],
+    tabs: [Rect; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,6 +788,14 @@ struct WindowControlsHitbox {
     toggle_turns: Rect,
     toggle_models: Rect,
     scopes: [Rect; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TrendControlsHitbox {
+    sections: [Rect; 3],
+    previous_day: Rect,
+    next_day: Rect,
+    now: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,6 +853,39 @@ enum ResumeLaunchRequest {
     },
 }
 
+struct PreparedTrendData {
+    five_hour_remaining: Vec<TrendPoint>,
+    weekly_remaining: Vec<TrendPoint>,
+    weekly_tokens: Vec<TrendPoint>,
+    weekly_estimated: Vec<TrendPoint>,
+    half_hour_tokens: Vec<TrendPoint>,
+    half_hour_estimated: Vec<TrendPoint>,
+    half_hour_bounds: [DateTime<Utc>; 2],
+    weekly_history_present: bool,
+    half_hour_history_present: bool,
+    history_warning_count: usize,
+    history_read_only: bool,
+}
+
+struct TrendPanelSpec<'a> {
+    title: &'a str,
+    graph_kind: TrendGraphKind,
+    value_kind: TrendValueKind,
+    fixed_y_bounds: Option<[f64; 2]>,
+    fixed_x_bounds: Option<[DateTime<Utc>; 2]>,
+    history_warning_count: usize,
+    history_read_only: bool,
+    theme: Theme,
+}
+
+struct TrendControlSpec<'a> {
+    shortcut: &'a str,
+    suffix: &'static str,
+    selected: bool,
+    shortcuts_active: bool,
+    theme: Theme,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ResumeLaunchOutcome {
     Created(PaneId),
@@ -790,7 +901,15 @@ struct ResumeLaunchCompletion {
 
 struct RefreshCompletion {
     result: Option<CollectionResult>,
+    history: Option<HistoryData>,
+    recorder_health: Option<RecorderHealth>,
     refreshed_account: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecorderHealth {
+    status: Option<RecorderStatusFile>,
+    error: Option<String>,
 }
 
 struct RunLoopChannels<'a> {
@@ -877,11 +996,12 @@ impl TableHitbox {
 }
 
 impl View {
-    const ALL: [Self; 2] = [Self::Overview, Self::Health];
+    const ALL: [Self; 3] = [Self::Overview, Self::Trends, Self::Health];
 
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Trends => "Trends",
             Self::Health => "Other",
         }
     }
@@ -889,20 +1009,23 @@ impl View {
     fn shortcut(self) -> char {
         match self {
             Self::Overview => '1',
-            Self::Health => '2',
+            Self::Trends => '2',
+            Self::Health => '3',
         }
     }
 
     fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Health => 1,
+            Self::Trends => 1,
+            Self::Health => 2,
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Overview => Self::Health,
+            Self::Overview => Self::Trends,
+            Self::Trends => Self::Health,
             Self::Health => Self::Overview,
         }
     }
@@ -910,7 +1033,8 @@ impl View {
     fn previous(self) -> Self {
         match self {
             Self::Overview => Self::Health,
-            Self::Health => Self::Overview,
+            Self::Trends => Self::Overview,
+            Self::Health => Self::Trends,
         }
     }
 }
@@ -918,9 +1042,13 @@ impl View {
 struct App {
     snapshot: Snapshot,
     account: AccountSnapshot,
+    history: HistoryData,
+    recorder_health: RecorderHealth,
     theme: Theme,
     view: View,
     window_scope: WindowScope,
+    trend_section: TrendSection,
+    trend_day_offset: u16,
     focus: Focus,
     task_source_filter: TaskSourceFilter,
     task_list_mode: TaskListMode,
@@ -961,6 +1089,7 @@ struct App {
     task_tree_marker_hitboxes: Vec<TaskTreeMarkerHitbox>,
     turn_controls_hitbox: Option<TurnControlsHitbox>,
     window_controls_hitbox: Option<WindowControlsHitbox>,
+    trend_controls_hitbox: Option<TrendControlsHitbox>,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
@@ -979,9 +1108,13 @@ impl App {
         Self {
             snapshot: result.snapshot,
             account: result.account,
+            history: HistoryData::default(),
+            recorder_health: RecorderHealth::default(),
             theme,
             view: View::Overview,
             window_scope: WindowScope::FiveHours,
+            trend_section: TrendSection::Remaining,
+            trend_day_offset: 0,
             focus: Focus::Tasks,
             task_source_filter: TaskSourceFilter::All,
             task_list_mode: TaskListMode::Flat,
@@ -1022,6 +1155,7 @@ impl App {
             task_tree_marker_hitboxes: Vec::new(),
             turn_controls_hitbox: None,
             window_controls_hitbox: None,
+            trend_controls_hitbox: None,
             view_tabs_hitbox: None,
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
@@ -1046,7 +1180,7 @@ impl App {
         self.task_list_mode = state.task_list_mode.into();
         self.task_source_filter = state.task_source_filter.into();
         self.reconcile_task_filter(true);
-        if self.view == View::Health {
+        if self.view != View::Overview {
             self.transition_to_tasks();
         }
     }
@@ -1054,6 +1188,14 @@ impl App {
     fn apply_open_config(&mut self, config: OpenConfig, error: Option<String>) {
         self.open_config = config;
         self.open_config_error = error;
+    }
+
+    fn replace_history(&mut self, history: HistoryData) {
+        self.history = history;
+    }
+
+    fn replace_recorder_health(&mut self, recorder_health: RecorderHealth) {
+        self.recorder_health = recorder_health;
     }
 
     fn set_open_notice(&mut self, message: impl Into<String>, tone: OpenNoticeTone) {
@@ -2316,7 +2458,7 @@ impl App {
     }
 
     fn focus_turns(&mut self) {
-        if self.view != View::Health && self.selected_task_raw_turn_count() > 0 {
+        if self.view == View::Overview && self.selected_task_raw_turn_count() > 0 {
             let was_visible = self.turns_visible();
             self.turns_temporarily_visible = !self.turns_default_visible;
             if !was_visible && self.turns_visible() {
@@ -2518,7 +2660,7 @@ impl App {
         if self.view != view && self.turns_temporarily_visible {
             self.close_temporary_turns();
         }
-        if view == View::Health {
+        if view != View::Overview {
             self.close_temporary_turns();
             self.transition_to_tasks();
         }
@@ -2527,6 +2669,43 @@ impl App {
 
     fn set_window_scope(&mut self, scope: WindowScope) {
         self.window_scope = scope;
+    }
+
+    fn set_trend_section(&mut self, section: TrendSection) {
+        self.trend_section = section;
+    }
+
+    fn trend_section_control_visible(&self, section: TrendSection) -> bool {
+        self.trend_controls_hitbox
+            .is_some_and(|hitbox| !hitbox.sections[section.index()].is_empty())
+    }
+
+    fn trend_previous_day_control_visible(&self) -> bool {
+        self.trend_controls_hitbox
+            .is_some_and(|hitbox| !hitbox.previous_day.is_empty())
+    }
+
+    fn trend_next_day_control_visible(&self) -> bool {
+        self.trend_controls_hitbox
+            .is_some_and(|hitbox| !hitbox.next_day.is_empty())
+    }
+
+    fn trend_now_control_visible(&self) -> bool {
+        self.trend_controls_hitbox
+            .is_some_and(|hitbox| !hitbox.now.is_empty())
+    }
+
+    fn show_previous_trend_day(&mut self) {
+        let maximum = u16::try_from(HISTORY_VIEW_DAYS.saturating_sub(1)).unwrap_or(u16::MAX);
+        self.trend_day_offset = self.trend_day_offset.saturating_add(1).min(maximum);
+    }
+
+    fn show_next_trend_day(&mut self) {
+        self.trend_day_offset = self.trend_day_offset.saturating_sub(1);
+    }
+
+    fn show_current_trend_day(&mut self) {
+        self.trend_day_offset = 0;
     }
 
     fn activate_window_control_at(&mut self, column: u16, row: u16) -> bool {
@@ -2555,6 +2734,35 @@ impl App {
         self.accept_active_search();
         self.set_window_scope(scope);
         true
+    }
+
+    fn activate_trend_control_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Trends {
+            return false;
+        }
+        let Some(hitbox) = self.trend_controls_hitbox else {
+            return false;
+        };
+        if let Some(section) = TrendSection::ALL
+            .into_iter()
+            .find(|section| rect_contains(hitbox.sections[section.index()], column, row))
+        {
+            self.set_trend_section(section);
+            return true;
+        }
+        if rect_contains(hitbox.previous_day, column, row) {
+            self.show_previous_trend_day();
+            return true;
+        }
+        if rect_contains(hitbox.next_day, column, row) {
+            self.show_next_trend_day();
+            return true;
+        }
+        if rect_contains(hitbox.now, column, row) {
+            self.show_current_trend_day();
+            return true;
+        }
+        false
     }
 
     fn open_quit_confirmation(&mut self) {
@@ -2786,6 +2994,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
             app.scroll_drag = None;
             if app.activate_view_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
+                || app.activate_trend_control_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
                 || app.activate_turn_control_at(event.column, event.row)
                 || app.activate_task_tree_marker_at(event.column, event.row)
@@ -2847,7 +3056,7 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
-    let mut tabs = [Rect::default(); 2];
+    let mut tabs = [Rect::default(); 3];
     let mut x = area.x;
     for (position, view) in View::ALL.into_iter().enumerate() {
         let width = UnicodeWidthStr::width(TAB_PADDING)
@@ -2975,22 +3184,52 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab | KeyCode::Right => app.set_view(app.view.next()),
         KeyCode::BackTab | KeyCode::Left => app.set_view(app.view.previous()),
         KeyCode::Char('1') => app.set_view(View::Overview),
-        KeyCode::Char('2') => app.set_view(View::Health),
+        KeyCode::Char('2') => app.set_view(View::Trends),
+        KeyCode::Char('3') => app.set_view(View::Health),
         KeyCode::Char('5') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::FiveHours);
         }
         KeyCode::Char('w' | 'W') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::Week);
         }
+        KeyCode::Char('r' | 'R')
+            if app.view == View::Trends
+                && app.trend_section_control_visible(TrendSection::Remaining) =>
+        {
+            app.set_trend_section(TrendSection::Remaining);
+        }
+        KeyCode::Char('w' | 'W')
+            if app.view == View::Trends
+                && app.trend_section_control_visible(TrendSection::Weekly) =>
+        {
+            app.set_trend_section(TrendSection::Weekly);
+        }
+        KeyCode::Char('h' | 'H')
+            if app.view == View::Trends
+                && app.trend_section_control_visible(TrendSection::HalfHour) =>
+        {
+            app.set_trend_section(TrendSection::HalfHour);
+        }
+        KeyCode::Char('[')
+            if app.view == View::Trends && app.trend_previous_day_control_visible() =>
+        {
+            app.show_previous_trend_day();
+        }
+        KeyCode::Char(']') if app.view == View::Trends && app.trend_next_day_control_visible() => {
+            app.show_next_trend_day();
+        }
+        KeyCode::Char('n' | 'N') if app.view == View::Trends && app.trend_now_control_visible() => {
+            app.show_current_trend_day();
+        }
         KeyCode::Char('t' | 'T') => app.toggle_theme(),
-        KeyCode::Char('/') | KeyCode::Char('f' | 'F') if app.view != View::Health => {
+        KeyCode::Char('/') | KeyCode::Char('f' | 'F') if app.view == View::Overview => {
             match app.focus {
                 Focus::Tasks => app.begin_task_search(),
                 Focus::Turns => app.begin_turn_search(),
                 Focus::TaskSearch | Focus::TurnSearch => {}
             }
         }
-        KeyCode::Char('v' | 'V') if app.view != View::Health => {
+        KeyCode::Char('v' | 'V') if app.view == View::Overview => {
             app.toggle_turns_default_visibility();
         }
         KeyCode::Char('m' | 'M') if app.view == View::Overview => {
@@ -2999,72 +3238,72 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('o' | 'O') if app.view == View::Overview && app.focus == Focus::Tasks => {
             app.activate_open();
         }
-        KeyCode::Char('r' | 'R') if app.view != View::Health => {
+        KeyCode::Char('r' | 'R') if app.view == View::Overview => {
             app.toggle_task_list_mode();
         }
         KeyCode::Char('E')
-            if app.view != View::Health && app.task_list_mode == TaskListMode::Tree =>
+            if app.view == View::Overview && app.task_list_mode == TaskListMode::Tree =>
         {
             app.toggle_all_task_threads();
         }
         KeyCode::Char('-')
-            if app.view != View::Health
+            if app.view == View::Overview
                 && app.focus == Focus::Tasks
                 && app.task_list_mode == TaskListMode::Tree =>
         {
             app.set_selected_task_collapsed(true);
         }
         KeyCode::Char('+')
-            if app.view != View::Health
+            if app.view == View::Overview
                 && app.focus == Focus::Tasks
                 && app.task_list_mode == TaskListMode::Tree =>
         {
             app.set_selected_task_collapsed(false);
         }
-        KeyCode::Char('a' | 'A') if app.view != View::Health => {
+        KeyCode::Char('a' | 'A') if app.view == View::Overview => {
             app.set_task_source_filter(TaskSourceFilter::All);
         }
-        KeyCode::Char('d' | 'D') if app.view != View::Health => {
+        KeyCode::Char('d' | 'D') if app.view == View::Overview => {
             app.set_task_source_filter(TaskSourceFilter::Desktop);
         }
-        KeyCode::Char('s' | 'S') if app.view != View::Health => {
+        KeyCode::Char('s' | 'S') if app.view == View::Overview => {
             app.set_task_source_filter(TaskSourceFilter::Subagent);
         }
-        KeyCode::Char('c' | 'C') if app.view != View::Health => {
+        KeyCode::Char('c' | 'C') if app.view == View::Overview => {
             app.set_task_source_filter(TaskSourceFilter::Cli);
         }
-        KeyCode::Char(']') if app.view != View::Health => {
+        KeyCode::Char(']') if app.view == View::Overview => {
             app.cycle_task_source_filter(true);
         }
-        KeyCode::Char('[') if app.view != View::Health => {
+        KeyCode::Char('[') if app.view == View::Overview => {
             app.cycle_task_source_filter(false);
         }
-        KeyCode::Delete if app.view != View::Health => match app.focus {
+        KeyCode::Delete if app.view == View::Overview => match app.focus {
             Focus::Tasks if !app.task_search.is_empty() => app.clear_task_search(),
             Focus::Turns if !app.turn_search.is_empty() => app.clear_turn_search(),
             Focus::TaskSearch | Focus::TurnSearch => {}
             Focus::Tasks | Focus::Turns => {}
         },
-        KeyCode::Enter if app.view != View::Health && app.focus == Focus::Tasks => {
+        KeyCode::Enter if app.view == View::Overview && app.focus == Focus::Tasks => {
             app.focus_turns();
         }
-        KeyCode::Backspace if app.view != View::Health && app.focus == Focus::Turns => {
+        KeyCode::Backspace if app.view == View::Overview && app.focus == Focus::Turns => {
             app.focus_tasks();
         }
-        KeyCode::Down | KeyCode::Char('j') if app.view != View::Health => {
+        KeyCode::Down | KeyCode::Char('j') if app.view == View::Overview => {
             app.select_next_focused();
         }
-        KeyCode::Up | KeyCode::Char('k') if app.view != View::Health => {
+        KeyCode::Up | KeyCode::Char('k') if app.view == View::Overview => {
             app.select_previous_focused();
         }
-        KeyCode::Home if app.view != View::Health => app.select_first_focused(),
-        KeyCode::End if app.view != View::Health => app.select_last_focused(),
-        KeyCode::PageDown if app.view != View::Health => match app.focus {
+        KeyCode::Home if app.view == View::Overview => app.select_first_focused(),
+        KeyCode::End if app.view == View::Overview => app.select_last_focused(),
+        KeyCode::PageDown if app.view == View::Overview => match app.focus {
             Focus::Tasks => app.scroll_tasks(true, PAGE_SCROLL_LINES),
             Focus::Turns => app.scroll_turns(true, PAGE_SCROLL_LINES),
             Focus::TaskSearch | Focus::TurnSearch => {}
         },
-        KeyCode::PageUp if app.view != View::Health => match app.focus {
+        KeyCode::PageUp if app.view == View::Overview => match app.focus {
             Focus::Tasks => app.scroll_tasks(false, PAGE_SCROLL_LINES),
             Focus::Turns => app.scroll_turns(false, PAGE_SCROLL_LINES),
             Focus::TaskSearch | Focus::TurnSearch => {}
@@ -3110,7 +3349,8 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
 }
 
 fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>) -> Result<()> {
-    let (ui_state_store, rollout_cache, mut app) = prepare_initial_tui(&config, theme_override);
+    let (ui_state_store, rollout_cache, history_store, mut app) =
+        prepare_initial_tui(&config, theme_override);
     let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
     let _guard = TerminalGuard::enter()?;
     terminal_enter_span.finish("backend=crossterm");
@@ -3134,6 +3374,7 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
         &config,
         &channels,
         rollout_cache,
+        history_store,
         &ui_state_store,
     );
     let _ = ui_state_store.save(&app.ui_state());
@@ -3145,7 +3386,12 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
 fn prepare_initial_tui(
     config: &CollectConfig,
     theme_override: Option<Theme>,
-) -> (UiStateStore, Arc<Mutex<RolloutCache>>, App) {
+) -> (
+    UiStateStore,
+    Arc<Mutex<RolloutCache>>,
+    Arc<Mutex<HistoryStore>>,
+    App,
+) {
     let bootstrap_span = config.startup_trace.span("tui.bootstrap");
     let state_span = config.startup_trace.span("tui.ui_state_load");
     let mut ui_state_store = UiStateStore::discover();
@@ -3197,9 +3443,28 @@ fn prepare_initial_tui(
             initial.snapshot.stats.parsed_lines
         )
     });
+    let history_span = config.startup_trace.span("tui.history_load");
+    let mut history_store = HistoryStore::discover(&config.codex_home);
+    let (history, recorder_health) = record_and_load_history(
+        &mut history_store,
+        &initial.history_observation,
+        initial.snapshot.as_of,
+        &config.perf_log,
+    );
+    history_span.finish_with(|| {
+        format!(
+            "quota_points={} half_hour_buckets={} warnings={} read_only={}",
+            history.quota_points.len(),
+            history.half_hour_buckets.len(),
+            history.warnings.len(),
+            history.read_only
+        )
+    });
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial, initial_theme);
+    app.replace_history(history);
+    app.replace_recorder_health(recorder_health);
     app.apply_ui_state(&ui_state, theme_override);
     app.apply_open_config(open_config, open_config_error);
     app_span.finish_with(|| {
@@ -3215,7 +3480,119 @@ fn prepare_initial_tui(
         )
     });
     bootstrap_span.finish("status=ready_to_render");
-    (ui_state_store, rollout_cache, app)
+    (
+        ui_state_store,
+        rollout_cache,
+        Arc::new(Mutex::new(history_store)),
+        app,
+    )
+}
+
+fn record_and_load_history(
+    store: &mut HistoryStore,
+    observation: &HistoryObservation,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+) -> (HistoryData, RecorderHealth) {
+    let total_started = Instant::now();
+    let record_started = Instant::now();
+    let write_result = store.record(observation);
+    let record_elapsed = record_started.elapsed();
+    let load_started = Instant::now();
+    let mut history = store.load_since(history_view_since(now));
+    let load_elapsed = load_started.elapsed();
+    let mut metrics =
+        HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, Some(load_elapsed));
+    if let Ok(report) = &write_result {
+        metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
+        metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
+        metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
+        metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
+        metrics.read_only = report.read_only;
+    } else {
+        metrics.warnings = 1;
+    }
+    metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
+    metrics.half_hour_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    metrics.weekly_local_points =
+        u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
+    match write_result {
+        Ok(report) => {
+            history.read_only |= report.read_only;
+            history.warnings.extend(report.warnings);
+        }
+        Err(error) => history
+            .warnings
+            .push(format!("history persistence failed: {error}")),
+    }
+    history.warnings.sort();
+    history.warnings.dedup();
+    perf_log.record_history(metrics);
+    let recorder_health = load_recorder_health(store);
+    (history, recorder_health)
+}
+
+fn reload_history_if_stale(
+    store: &mut HistoryStore,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+) -> Option<(HistoryData, RecorderHealth)> {
+    let total_started = Instant::now();
+    let load_started = Instant::now();
+    let history = store.reload_since_if_stale(history_view_since(now))?;
+    let load_elapsed = load_started.elapsed();
+    let mut metrics =
+        HistoryMetrics::with_durations(total_started.elapsed(), Duration::ZERO, Some(load_elapsed));
+    metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
+    metrics.half_hour_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    metrics.weekly_local_points =
+        u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
+    metrics.warnings = u64::try_from(history.warnings.len()).unwrap_or(u64::MAX);
+    metrics.read_only = history.read_only;
+    perf_log.record_history(metrics);
+    let recorder_health = load_recorder_health(store);
+    Some((history, recorder_health))
+}
+
+fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
+    let aligned_seconds = now.timestamp().div_euclid(30 * 60) * 30 * 60;
+    DateTime::from_timestamp(aligned_seconds, 0).unwrap_or(now)
+        - ChronoDuration::days(HISTORY_VIEW_DAYS)
+}
+
+fn load_recorder_health(store: &HistoryStore) -> RecorderHealth {
+    let Some(history_root) = store.history_root() else {
+        return RecorderHealth {
+            status: None,
+            error: Some("recorder state directory is unavailable".to_string()),
+        };
+    };
+    let path = default_status_file(history_root);
+    match read_recorder_status(&path) {
+        Ok(Some(status))
+            if status
+                .history_namespace
+                .as_deref()
+                .is_some_and(|namespace| namespace != store.namespace()) =>
+        {
+            RecorderHealth {
+                status: None,
+                error: Some(format!(
+                    "recorder targets history namespace {}, expected {}",
+                    status.history_namespace.as_deref().unwrap_or("unknown"),
+                    store.namespace()
+                )),
+            }
+        }
+        Ok(status) => RecorderHealth {
+            status,
+            error: None,
+        },
+        Err(error) => RecorderHealth {
+            status: None,
+            error: Some(format!("{}: {error}", path.display())),
+        },
+    }
 }
 
 pub fn debug_startup(
@@ -3229,7 +3606,8 @@ pub fn debug_startup(
         "debug-startup canvas exceeds {MAX_DEBUG_STARTUP_CELLS} cells"
     );
     let trace = config.startup_trace.clone();
-    let (_ui_state_store, _rollout_cache, mut app) = prepare_initial_tui(&config, theme_override);
+    let (_ui_state_store, _rollout_cache, _history_store, mut app) =
+        prepare_initial_tui(&config, theme_override);
     let terminal_span = trace.span("tui.headless_terminal_setup");
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal_span.finish_with(|| format!("width={width} height={height}"));
@@ -3246,17 +3624,30 @@ fn run_loop(
     config: &CollectConfig,
     channels: &RunLoopChannels<'_>,
     rollout_cache: Arc<Mutex<RolloutCache>>,
+    history_store: Arc<Mutex<HistoryStore>>,
     ui_state_store: &UiStateStore,
 ) -> Result<()> {
     let mut first_frame = true;
     let mut redraw_reasons = RedrawReasons::default();
     loop {
         while let Ok(completion) = channels.refresh_receiver.try_recv() {
+            let mut refresh_changed = false;
             if let Some(result) = completion.result {
                 app.replace(result, completion.refreshed_account);
-                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+                refresh_changed = true;
             } else {
                 app.finish_unchanged_refresh();
+            }
+            if let Some(history) = completion.history {
+                app.replace_history(history);
+                refresh_changed = true;
+            }
+            if let Some(recorder_health) = completion.recorder_health {
+                app.replace_recorder_health(recorder_health);
+                refresh_changed = true;
+            }
+            if refresh_changed {
+                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
             }
         }
         while let Ok(completion) = channels.resume_receiver.try_recv() {
@@ -3340,6 +3731,7 @@ fn run_loop(
             let cached_account = app.account.clone();
             let worker_sender = channels.refresh_sender.clone();
             let worker_cache = Arc::clone(&rollout_cache);
+            let worker_history = Arc::clone(&history_store);
             app.worker_running = true;
             thread::spawn(move || {
                 let result = {
@@ -3361,8 +3753,32 @@ fn run_loop(
                         )
                     }
                 };
+                let history_and_recorder = {
+                    let mut history_store = worker_history
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match result.as_ref() {
+                        Some(result) => Some(record_and_load_history(
+                            &mut history_store,
+                            &result.history_observation,
+                            result.snapshot.as_of,
+                            &worker_config.perf_log,
+                        )),
+                        None => reload_history_if_stale(
+                            &mut history_store,
+                            Utc::now(),
+                            &worker_config.perf_log,
+                        ),
+                    }
+                };
+                let (history, recorder_health) = history_and_recorder
+                    .map_or((None, None), |(history, recorder_health)| {
+                        (Some(history), Some(recorder_health))
+                    });
                 let _ = worker_sender.send(RefreshCompletion {
                     result,
+                    history,
+                    recorder_health,
                     refreshed_account: refresh_account,
                 });
             });
@@ -3463,6 +3879,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.task_tree_marker_hitboxes.clear();
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
+    app.trend_controls_hitbox = None;
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
@@ -3530,6 +3947,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
+        View::Trends => render_trends(frame, root[1], app),
         View::Health => render_health(frame, root[1], app),
     };
     if app
@@ -3548,7 +3966,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> WindowControlsHitbox {
     let palette = app.theme.palette();
     let tabs = view_tabs_hitbox(area);
-    let start_x = tabs.tabs[View::Health.index()].right();
+    let start_x = View::ALL
+        .last()
+        .map(|view| tabs.tabs[view.index()].right())
+        .unwrap_or(area.x);
     let remaining = usize::from(area.right().saturating_sub(start_x));
     let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week]");
     let compact = remaining < full_width;
@@ -4095,6 +4516,790 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+fn render_trend_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    compact: bool,
+) -> TrendControlsHitbox {
+    let palette = app.theme.palette();
+    let mut hitbox = TrendControlsHitbox::default();
+    if area.is_empty() {
+        return hitbox;
+    }
+
+    let full_width = TrendSection::ALL
+        .into_iter()
+        .map(|section| 3 + UnicodeWidthStr::width(section.label()))
+        .sum::<usize>()
+        + UnicodeWidthStr::width("[[]Prev")
+        + UnicodeWidthStr::width("[]]Next")
+        + UnicodeWidthStr::width("[N]Now")
+        + 5;
+    let terse = compact && full_width > usize::from(area.width);
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    if compact {
+        for section in TrendSection::ALL {
+            let suffix = if terse {
+                "]"
+            } else {
+                section_label_suffix(section)
+            };
+            let shortcut = section.shortcut().to_string();
+            hitbox.sections[section.index()] = append_trend_control(
+                &mut spans,
+                area,
+                &mut x,
+                TrendControlSpec {
+                    shortcut: &shortcut,
+                    suffix,
+                    selected: app.trend_section == section,
+                    shortcuts_active: app.shortcuts_active(),
+                    theme: app.theme,
+                },
+            );
+        }
+    }
+    if !compact || app.trend_section == TrendSection::HalfHour {
+        hitbox.previous_day = append_trend_control(
+            &mut spans,
+            area,
+            &mut x,
+            TrendControlSpec {
+                shortcut: "[",
+                suffix: if terse { "]" } else { "]Prev" },
+                selected: false,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+        hitbox.next_day = append_trend_control(
+            &mut spans,
+            area,
+            &mut x,
+            TrendControlSpec {
+                shortcut: "]",
+                suffix: if terse { "]" } else { "]Next" },
+                selected: false,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+        hitbox.now = append_trend_control(
+            &mut spans,
+            area,
+            &mut x,
+            TrendControlSpec {
+                shortcut: "N",
+                suffix: if terse { "]" } else { "]Now" },
+                selected: app.trend_day_offset == 0,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+
+        let offset_label = if app.trend_day_offset == 0 {
+            " · latest 24h".to_string()
+        } else {
+            format!(" · {}d back", app.trend_day_offset)
+        };
+        if x.saturating_add(
+            u16::try_from(UnicodeWidthStr::width(offset_label.as_str())).unwrap_or(u16::MAX),
+        ) <= area.right()
+        {
+            spans.push(Span::styled(
+                offset_label,
+                Style::default().fg(palette.muted),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hitbox
+}
+
+fn section_label_suffix(section: TrendSection) -> &'static str {
+    match section {
+        TrendSection::Remaining => "]Remaining",
+        TrendSection::Weekly => "]Weekly",
+        TrendSection::HalfHour => "]Half-hour",
+    }
+}
+
+fn append_trend_control(
+    spans: &mut Vec<Span<'static>>,
+    area: Rect,
+    x: &mut u16,
+    spec: TrendControlSpec<'_>,
+) -> Rect {
+    let gap_width = u16::from(*x > area.x);
+    let width = u16::try_from(
+        1 + UnicodeWidthStr::width(spec.shortcut) + UnicodeWidthStr::width(spec.suffix),
+    )
+    .unwrap_or(u16::MAX);
+    if x.saturating_add(gap_width).saturating_add(width) > area.right() {
+        return Rect::default();
+    }
+    if gap_width > 0 {
+        spans.push(Span::raw(" "));
+        *x = x.saturating_add(1);
+    }
+
+    let palette = spec.theme.palette();
+    let style = if spec.selected {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let shortcut_style = if !spec.shortcuts_active {
+        style
+    } else if spec.selected {
+        style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    let hitbox = clipped_horizontal_hitbox(area, *x, width);
+    spans.push(Span::styled("[", style));
+    spans.push(Span::styled(spec.shortcut.to_string(), shortcut_style));
+    spans.push(Span::styled(spec.suffix, style));
+    *x = x.saturating_add(width);
+    hitbox
+}
+
+fn prepare_trend_data(app: &App) -> PreparedTrendData {
+    let five_hour_remaining = current_remaining_trend(&app.history, 300);
+    let weekly_remaining = current_remaining_trend(&app.history, 10_080);
+    let half_hour_bounds = trend_day_bounds(app.snapshot.as_of, app.trend_day_offset);
+    let weekly_reset = app.history.latest_weekly_reset();
+
+    let weekly_cumulative = weekly_reset
+        .map(|reset| app.history.weekly_cumulative_series(reset))
+        .unwrap_or_default();
+    let weekly_history_present = weekly_cumulative.len() > 1;
+    let weekly_tokens = weekly_cumulative
+        .iter()
+        .map(|point| TrendPoint {
+            at: point.at,
+            value: point.token_usage.total_tokens as f64,
+            partial: !point.partial_reasons.is_empty(),
+        })
+        .collect();
+    let weekly_estimated = weekly_cumulative
+        .iter()
+        .filter_map(|point| {
+            point.estimated_quota_percent.map(|value| TrendPoint {
+                at: point.at,
+                value,
+                partial: !point.partial_reasons.is_empty(),
+            })
+        })
+        .collect();
+
+    let half_hour_buckets = app
+        .history
+        .half_hour_series()
+        .iter()
+        .filter(|bucket| {
+            bucket.starts_at >= half_hour_bounds[0] && bucket.starts_at < half_hour_bounds[1]
+        })
+        .collect::<Vec<_>>();
+    let half_hour_history_present = !half_hour_buckets.is_empty();
+    let half_hour_tokens = half_hour_buckets
+        .iter()
+        .map(|bucket| TrendPoint {
+            at: bucket.starts_at + ChronoDuration::minutes(15),
+            value: bucket.token_usage.total_tokens as f64,
+            partial: !bucket.partial_reasons.is_empty(),
+        })
+        .collect();
+    let half_hour_estimated = weekly_reset
+        .map(|reset| app.history.estimated_half_hour_series(reset))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|point| {
+            point.starts_at >= half_hour_bounds[0] && point.starts_at < half_hour_bounds[1]
+        })
+        .filter_map(|point| {
+            point.estimated_quota_percent.map(|value| TrendPoint {
+                at: point.starts_at + (point.ends_at - point.starts_at) / 2,
+                value,
+                partial: !point.partial_reasons.is_empty(),
+            })
+        })
+        .collect();
+
+    PreparedTrendData {
+        five_hour_remaining,
+        weekly_remaining,
+        weekly_tokens,
+        weekly_estimated,
+        half_hour_tokens,
+        half_hour_estimated,
+        half_hour_bounds,
+        weekly_history_present,
+        half_hour_history_present,
+        history_warning_count: app.history.warnings.len(),
+        history_read_only: app.history.read_only,
+    }
+}
+
+fn current_remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
+    let points = history.remaining_series(duration_mins);
+    let Some(latest) = points.iter().max_by_key(|point| point.observed_at) else {
+        return Vec::new();
+    };
+    let latest_reset = latest.resets_at;
+    points
+        .into_iter()
+        .filter(|point| (point.resets_at - latest_reset).num_seconds().abs() <= 120)
+        .map(|point| TrendPoint {
+            at: point.observed_at,
+            value: point.remaining_percent,
+            partial: false,
+        })
+        .collect()
+}
+
+fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2] {
+    let shifted = as_of - ChronoDuration::days(i64::from(day_offset));
+    let end_seconds = shifted
+        .timestamp()
+        .saturating_add(30 * 60 - 1)
+        .div_euclid(30 * 60)
+        .saturating_mul(30 * 60);
+    let end = DateTime::from_timestamp(end_seconds, 0).unwrap_or(shifted);
+    [end - ChronoDuration::hours(24), end]
+}
+
+fn render_trends(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let compact = area.width < 120 || area.height < 29;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    app.trend_controls_hitbox = Some(render_trend_controls(frame, rows[0], app, compact));
+    let body = rows[1];
+    if body.is_empty() {
+        return;
+    }
+    let data = prepare_trend_data(app);
+
+    if compact {
+        match app.trend_section {
+            TrendSection::Remaining => render_remaining_trend_panel(frame, body, &data, app.theme),
+            TrendSection::Weekly => {
+                let panels = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(body);
+                render_weekly_token_trend_panel(frame, panels[0], &data, app.theme);
+                render_weekly_estimated_trend_panel(frame, panels[1], &data, app.theme);
+            }
+            TrendSection::HalfHour => {
+                let panels = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(body);
+                render_half_hour_token_trend_panel(frame, panels[0], &data, app.theme);
+                render_half_hour_estimated_trend_panel(frame, panels[1], &data, app.theme);
+            }
+        }
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(body);
+    render_remaining_trend_panel(frame, rows[0], &data, app.theme);
+    let weekly = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_weekly_token_trend_panel(frame, weekly[0], &data, app.theme);
+    render_weekly_estimated_trend_panel(frame, weekly[1], &data, app.theme);
+    let half_hour = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[2]);
+    render_half_hour_token_trend_panel(frame, half_hour[0], &data, app.theme);
+    render_half_hour_estimated_trend_panel(frame, half_hour[1], &data, app.theme);
+}
+
+fn render_empty_trend_panel(frame: &mut Frame<'_>, area: Rect, title: &str, theme: Theme) {
+    render_trend_message_panel(frame, area, title, "No history recorded yet", theme, false);
+}
+
+fn render_trend_message_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    message: &str,
+    theme: Theme,
+    warning: bool,
+) {
+    frame.render_widget(
+        Paragraph::new(message)
+            .style(Style::default().fg(if warning {
+                theme.palette().warning
+            } else {
+                theme.palette().muted
+            }))
+            .alignment(Alignment::Center)
+            .block(panel(title, theme)),
+        area,
+    );
+}
+
+fn render_remaining_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &PreparedTrendData,
+    theme: Theme,
+) {
+    let palette = theme.palette();
+    render_time_series_panel(
+        frame,
+        area,
+        &[
+            TrendSeries {
+                name: "5h",
+                points: &data.five_hour_remaining,
+                color: palette.accent,
+            },
+            TrendSeries {
+                name: "Week",
+                points: &data.weekly_remaining,
+                color: palette.warning,
+            },
+        ],
+        TrendPanelSpec {
+            title: "Quota Remaining",
+            graph_kind: TrendGraphKind::Line {
+                maximum_gap: ChronoDuration::minutes(15),
+            },
+            value_kind: TrendValueKind::Percent,
+            fixed_y_bounds: Some([0.0, 100.0]),
+            fixed_x_bounds: None,
+            history_warning_count: data.history_warning_count,
+            history_read_only: data.history_read_only,
+            theme,
+        },
+    );
+}
+
+fn render_weekly_token_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &PreparedTrendData,
+    theme: Theme,
+) {
+    render_time_series_panel(
+        frame,
+        area,
+        &[TrendSeries {
+            name: "Tokens",
+            points: &data.weekly_tokens,
+            color: theme.palette().accent,
+        }],
+        TrendPanelSpec {
+            title: "Weekly Local Tokens",
+            graph_kind: TrendGraphKind::Line {
+                maximum_gap: ChronoDuration::minutes(45),
+            },
+            value_kind: TrendValueKind::Tokens,
+            fixed_y_bounds: None,
+            fixed_x_bounds: None,
+            history_warning_count: data.history_warning_count,
+            history_read_only: data.history_read_only,
+            theme,
+        },
+    );
+}
+
+fn render_weekly_estimated_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &PreparedTrendData,
+    theme: Theme,
+) {
+    if data.weekly_estimated.is_empty() && data.weekly_history_present {
+        let title = trend_panel_status_title(
+            "Weekly ~EST Usage",
+            data.history_warning_count,
+            data.history_read_only,
+        );
+        render_trend_message_panel(
+            frame,
+            area,
+            &title,
+            "Estimate unavailable: weekly calibration is incomplete",
+            theme,
+            true,
+        );
+        return;
+    }
+    render_time_series_panel(
+        frame,
+        area,
+        &[TrendSeries {
+            name: "~EST",
+            points: &data.weekly_estimated,
+            color: theme.palette().warning,
+        }],
+        TrendPanelSpec {
+            title: "Weekly ~EST Usage",
+            graph_kind: TrendGraphKind::Line {
+                maximum_gap: ChronoDuration::minutes(45),
+            },
+            value_kind: TrendValueKind::Percent,
+            fixed_y_bounds: Some([0.0, 100.0]),
+            fixed_x_bounds: None,
+            history_warning_count: data.history_warning_count,
+            history_read_only: data.history_read_only,
+            theme,
+        },
+    );
+}
+
+fn render_half_hour_token_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &PreparedTrendData,
+    theme: Theme,
+) {
+    render_time_series_panel(
+        frame,
+        area,
+        &[TrendSeries {
+            name: "Tokens",
+            points: &data.half_hour_tokens,
+            color: theme.palette().accent,
+        }],
+        TrendPanelSpec {
+            title: "30m Local Tokens",
+            graph_kind: TrendGraphKind::Bar {
+                expected_step: ChronoDuration::minutes(30),
+            },
+            value_kind: TrendValueKind::Tokens,
+            fixed_y_bounds: None,
+            fixed_x_bounds: Some(data.half_hour_bounds),
+            history_warning_count: data.history_warning_count,
+            history_read_only: data.history_read_only,
+            theme,
+        },
+    );
+}
+
+fn render_half_hour_estimated_trend_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &PreparedTrendData,
+    theme: Theme,
+) {
+    if data.half_hour_estimated.is_empty() && data.half_hour_history_present {
+        let title = trend_panel_status_title(
+            "30m ~EST Usage",
+            data.history_warning_count,
+            data.history_read_only,
+        );
+        render_trend_message_panel(
+            frame,
+            area,
+            &title,
+            "Estimate unavailable: weekly calibration is incomplete",
+            theme,
+            true,
+        );
+        return;
+    }
+    render_time_series_panel(
+        frame,
+        area,
+        &[TrendSeries {
+            name: "~EST",
+            points: &data.half_hour_estimated,
+            color: theme.palette().warning,
+        }],
+        TrendPanelSpec {
+            title: "30m ~EST Usage",
+            graph_kind: TrendGraphKind::Bar {
+                expected_step: ChronoDuration::minutes(30),
+            },
+            value_kind: TrendValueKind::Percent,
+            fixed_y_bounds: None,
+            fixed_x_bounds: Some(data.half_hour_bounds),
+            history_warning_count: data.history_warning_count,
+            history_read_only: data.history_read_only,
+            theme,
+        },
+    );
+}
+
+fn trend_panel_status_title(base: &str, warning_count: usize, read_only: bool) -> String {
+    let mut title = base.to_string();
+    if warning_count > 0 {
+        title.push_str(&format!(" · PARTIAL {warning_count}"));
+    }
+    if read_only {
+        title.push_str(" · READ-ONLY");
+    }
+    title
+}
+
+fn render_time_series_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    series: &[TrendSeries<'_>],
+    spec: TrendPanelSpec<'_>,
+) {
+    let nonempty_series = series
+        .iter()
+        .filter(|series| !series.points.is_empty())
+        .count();
+    let point_count = series
+        .iter()
+        .map(|series| series.points.len())
+        .sum::<usize>();
+    if point_count == 0 {
+        let title = trend_panel_status_title(
+            spec.title,
+            spec.history_warning_count,
+            spec.history_read_only,
+        );
+        render_empty_trend_panel(frame, area, &title, spec.theme);
+        return;
+    }
+
+    let mut minimum_time = spec.fixed_x_bounds.map(|bounds| bounds[0]);
+    let mut maximum_time = spec.fixed_x_bounds.map(|bounds| bounds[1]);
+    let mut maximum_value = 0.0_f64;
+    let mut partial = false;
+    for point in series.iter().flat_map(|series| series.points) {
+        minimum_time = Some(minimum_time.map_or(point.at, |value| value.min(point.at)));
+        maximum_time = Some(maximum_time.map_or(point.at, |value| value.max(point.at)));
+        if point.value.is_finite() {
+            maximum_value = maximum_value.max(point.value.max(0.0));
+        }
+        partial |= point.partial;
+    }
+    let minimum_time = minimum_time.unwrap_or_else(Utc::now);
+    let maximum_time = maximum_time.unwrap_or(minimum_time);
+    let mut x_bounds = [
+        minimum_time.timestamp() as f64,
+        maximum_time.timestamp() as f64,
+    ];
+    if x_bounds[0] >= x_bounds[1] {
+        x_bounds[0] -= 1_800.0;
+        x_bounds[1] += 1_800.0;
+    }
+    let y_bounds = spec.fixed_y_bounds.unwrap_or_else(|| {
+        let maximum = if maximum_value <= 0.0 {
+            1.0
+        } else {
+            nice_trend_maximum(maximum_value)
+        };
+        [0.0, maximum]
+    });
+
+    let mut prepared = Vec::with_capacity(series.len());
+    let mut gap_count = 0_usize;
+    for series in series {
+        let (segments, gaps) = prepare_trend_segments(series.points, spec.graph_kind);
+        prepared.push(segments);
+        gap_count = gap_count.saturating_add(gaps);
+    }
+    let mut datasets = Vec::new();
+    for (series, segments) in series.iter().zip(&prepared) {
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let graph_type = match spec.graph_kind {
+                TrendGraphKind::Line { .. } if segment.len() > 1 => GraphType::Line,
+                TrendGraphKind::Line { .. } => GraphType::Scatter,
+                TrendGraphKind::Bar { .. } => GraphType::Bar,
+            };
+            let marker = match spec.graph_kind {
+                TrendGraphKind::Line { .. } => Marker::Braille,
+                TrendGraphKind::Bar { .. } => Marker::Bar,
+            };
+            let mut dataset = Dataset::default()
+                .data(segment)
+                .graph_type(graph_type)
+                .marker(marker)
+                .style(Style::default().fg(series.color));
+            if nonempty_series > 1 && segment_index == 0 {
+                dataset = dataset.name(series.name);
+            }
+            datasets.push(dataset);
+        }
+    }
+
+    let palette = spec.theme.palette();
+    let x_labels = trend_time_axis_labels(minimum_time, maximum_time, area.width);
+    let y_labels = vec![
+        format_trend_axis_value(y_bounds[0], spec.value_kind),
+        format_trend_axis_value(y_bounds[1], spec.value_kind),
+    ];
+    let mut panel_title = format!(
+        "{} · {}",
+        trend_panel_status_title(
+            spec.title,
+            spec.history_warning_count,
+            spec.history_read_only,
+        ),
+        if point_count == 1 {
+            "1 sample".to_string()
+        } else {
+            format!("{point_count} samples")
+        }
+    );
+    if gap_count > 0 {
+        panel_title.push_str(&format!(" · {gap_count} gaps"));
+    }
+    if partial && spec.history_warning_count == 0 {
+        panel_title.push_str(" · PARTIAL");
+    }
+
+    let chart = Chart::new(datasets)
+        .style(spec.theme.base_style())
+        .block(panel(&panel_title, spec.theme))
+        .x_axis(
+            Axis::default()
+                .bounds(x_bounds)
+                .labels(x_labels)
+                .style(Style::default().fg(palette.muted)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds(y_bounds)
+                .labels(y_labels)
+                .style(Style::default().fg(palette.muted)),
+        )
+        .legend_position(
+            (nonempty_series > 1).then_some(ratatui::widgets::LegendPosition::TopRight),
+        );
+    frame.render_widget(chart, area);
+}
+
+fn prepare_trend_segments(
+    points: &[TrendPoint],
+    graph_kind: TrendGraphKind,
+) -> (Vec<Vec<(f64, f64)>>, usize) {
+    if points.is_empty() {
+        return (Vec::new(), 0);
+    }
+    if matches!(graph_kind, TrendGraphKind::Bar { .. }) {
+        let data = points
+            .iter()
+            .filter(|point| point.value.is_finite())
+            .map(|point| (point.at.timestamp() as f64, point.value.max(0.0)))
+            .collect::<Vec<_>>();
+        let expected_step = match graph_kind {
+            TrendGraphKind::Bar { expected_step } => expected_step.num_seconds().max(1),
+            TrendGraphKind::Line { .. } => 1,
+        };
+        let gaps = points
+            .windows(2)
+            .map(|pair| {
+                let elapsed = (pair[1].at - pair[0].at).num_seconds().max(0);
+                usize::try_from(elapsed / expected_step)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(1)
+            })
+            .sum();
+        return (
+            (data.is_empty())
+                .then(Vec::new)
+                .unwrap_or_else(|| vec![data]),
+            gaps,
+        );
+    }
+
+    let maximum_gap = match graph_kind {
+        TrendGraphKind::Line { maximum_gap } => maximum_gap,
+        TrendGraphKind::Bar { .. } => chrono::Duration::zero(),
+    };
+    let mut segments = Vec::new();
+    let mut segment = Vec::new();
+    let mut gaps = 0_usize;
+    let mut previous = None;
+    for point in points.iter().filter(|point| point.value.is_finite()) {
+        if previous.is_some_and(|previous| point.at - previous > maximum_gap) {
+            if !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+            }
+            gaps = gaps.saturating_add(1);
+        }
+        segment.push((point.at.timestamp() as f64, point.value.max(0.0)));
+        previous = Some(point.at);
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    (segments, gaps)
+}
+
+fn nice_trend_maximum(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+    let exponent = value.log10().floor();
+    let magnitude = 10_f64.powf(exponent);
+    let normalized = value / magnitude;
+    let rounded = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    rounded * magnitude
+}
+
+fn trend_time_axis_labels(start: DateTime<Utc>, end: DateTime<Utc>, width: u16) -> Vec<String> {
+    let format = if width < 50 { "%H:%M" } else { "%m-%d %H:%M" };
+    if width < 70 {
+        vec![
+            format_local_time(start, format),
+            format_local_time(end, format),
+        ]
+    } else {
+        let midpoint = start + (end - start) / 2;
+        vec![
+            format_local_time(start, format),
+            format_local_time(midpoint, format),
+            format_local_time(end, format),
+        ]
+    }
+}
+
+fn format_trend_axis_value(value: f64, kind: TrendValueKind) -> String {
+    match kind {
+        TrendValueKind::Percent => format!("{value:.0}%"),
+        TrendValueKind::Tokens => {
+            if value >= 1_000_000_000.0 {
+                format!("{:.1}B", value / 1_000_000_000.0)
+            } else if value >= 1_000_000.0 {
+                format!("{:.1}M", value / 1_000_000.0)
+            } else if value >= 1_000.0 {
+                format!("{:.0}K", value / 1_000.0)
+            } else {
+                format!("{value:.0}")
+            }
+        }
+    }
+}
+
 fn reset_expiry_gauge_alert_lines(reminder: ResetExpiryReminder, width: u16) -> Vec<String> {
     let expires_at = local_full_time_label(Some(reminder.expires_at), "unavailable");
     let full = format!("! RESET CREDIT EXPIRES {expires_at}");
@@ -4226,16 +5431,21 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let source_rows = app.snapshot.sources.iter().map(|source| {
-        Row::new([
-            Cell::from(terminal_safe_text(&source.source)),
-            Cell::from(terminal_safe_text(&source.status)),
-            Cell::from(format_local_time(source.as_of, "%H:%M:%S")),
-            Cell::from(terminal_safe_text(
-                source.message.as_deref().unwrap_or_default(),
-            )),
-        ])
-    });
+    let source_rows = app
+        .snapshot
+        .sources
+        .iter()
+        .map(|source| {
+            Row::new([
+                Cell::from(terminal_safe_text(&source.source)),
+                Cell::from(terminal_safe_text(&source.status)),
+                Cell::from(format_local_time(source.as_of, "%H:%M:%S")),
+                Cell::from(terminal_safe_text(
+                    source.message.as_deref().unwrap_or_default(),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
     let source_table = Table::new(
         source_rows,
         [
@@ -4276,8 +5486,9 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.snapshot.partial
         )),
     ];
+    let collection_title = format!("Collection · recorder {}", recorder_panel_status(app));
     frame.render_widget(
-        Paragraph::new(stats_text).block(panel("Collection", app.theme)),
+        Paragraph::new(stats_text).block(panel(&collection_title, app.theme)),
         rows[1],
     );
 
@@ -4299,6 +5510,18 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(palette.warning),
             ))
         }))
+        .chain(app.history.warnings.iter().map(|value| {
+            Line::from(Span::styled(
+                format!("history: {}", terminal_safe_text(value)),
+                Style::default().fg(palette.warning),
+            ))
+        }))
+        .chain(app.recorder_health.error.iter().map(|value| {
+            Line::from(Span::styled(
+                format!("recorder: {}", terminal_safe_text(value)),
+                Style::default().fg(palette.warning),
+            ))
+        }))
         .collect::<Vec<_>>();
     let issues = if issues.is_empty() {
         vec![Line::from(Span::styled(
@@ -4314,6 +5537,26 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .wrap(Wrap { trim: true }),
         rows[3],
     );
+}
+
+fn recorder_panel_status(app: &App) -> String {
+    if app.recorder_health.error.is_some() {
+        return "error".to_string();
+    }
+    let Some(status) = app.recorder_health.status.as_ref() else {
+        return "idle".to_string();
+    };
+    let state = if status.last_error.is_some() {
+        "error"
+    } else if status.heartbeat_is_recent(app.snapshot.as_of) {
+        "running"
+    } else {
+        "stale"
+    };
+    format!(
+        "{state} {}",
+        format_local_time(status.last_attempt_at, "%H:%M:%S")
+    )
 }
 
 fn reset_window_count(snapshot: &Snapshot) -> usize {

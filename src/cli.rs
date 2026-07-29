@@ -1,17 +1,28 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::CollectConfig;
+use crate::history::{HistoryStore, default_history_root};
 use crate::output::{
     OutputFormat, OutputRequest, Section, render_output, request_is_failure, request_is_partial,
 };
-use crate::perf::PerfLog;
-use crate::snapshot::{collect_limits_snapshot, collect_snapshot};
+use crate::perf::{HistoryMetrics, PerfLog};
+use crate::rollout::RolloutCache;
+use crate::service::{
+    RecorderStatusFile, ServiceOptions, default_status_file, install as install_service,
+    status as service_status, uninstall as uninstall_service, write_recorder_status,
+};
+use crate::snapshot::{
+    collect_limits_snapshot, collect_snapshot, collect_snapshot_cached,
+    collect_snapshot_cached_if_changed,
+};
 use crate::startup::StartupTrace;
 use crate::tui::Theme;
 
@@ -70,6 +81,10 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     codex_home: Option<PathBuf>,
 
+    /// Use this Codex executable for account collection.
+    #[arg(long, value_name = "FILE")]
+    codex_bin: Option<PathBuf>,
+
     #[arg(long, default_value_t = 7)]
     days: i64,
 
@@ -121,8 +136,51 @@ enum Command {
     Attribution(OutputArgs),
     /// Print per-task, turn, and model usage for each current reset cycle.
     Windows(OutputArgs),
+    /// Continuously record local usage and quota history without opening the TUI.
+    Record(RecordArgs),
+    /// Install, inspect, or remove the optional per-user background recorder.
+    Service(ServiceArgs),
     /// Profile the normal TUI cold-start path without entering interactive mode.
     DebugStartup(DebugStartupArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct RecordArgs {
+    /// Explicitly run as a foreground process; service managers supervise this process.
+    #[arg(long)]
+    foreground: bool,
+
+    /// Override the history directory selected from the platform state directory.
+    #[arg(long, value_name = "DIR")]
+    history_dir: Option<PathBuf>,
+
+    /// Write recorder health and heartbeat state to this file.
+    #[arg(long, value_name = "FILE")]
+    status_file: Option<PathBuf>,
+
+    /// Frequency for rescanning local rollout data.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(5..=3600))]
+    local_interval_seconds: u64,
+
+    /// Frequency for refreshing account quota data.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(30..=3600))]
+    account_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    action: ServiceAction,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum ServiceAction {
+    /// Install and start the current user's background recorder.
+    Install,
+    /// Show registration state and the recorder's latest heartbeat.
+    Status,
+    /// Stop and remove the current user's background recorder.
+    Uninstall,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -250,7 +308,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         .as_deref()
         .map(PerfLog::enabled)
         .unwrap_or_default();
-    let mut perf_log_guard = PerfLogGuard::new(perf_log.clone(), perf_log_path);
+    let mut perf_log_guard = PerfLogGuard::new(perf_log.clone(), perf_log_path.clone());
     perf_log_guard.report_error();
     trace.record_interval(
         "cli.parse",
@@ -270,6 +328,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     if let Some(codex_home) = cli.codex_home {
         config.codex_home = codex_home;
     }
+    config.codex_bin = cli.codex_bin;
     config.lookback_days = cli.days.max(1);
     config.max_files = cli.max_files.max(1);
     config.active_grace = active_grace(cli.active_grace_minutes);
@@ -321,6 +380,14 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         return Ok(0);
     }
 
+    let command = match command {
+        Command::Record(args) => return run_recorder(config, args),
+        Command::Service(args) => {
+            return run_service(&config, args, perf_log_path.as_deref());
+        }
+        command => command,
+    };
+
     let request = match command {
         Command::Snapshot(args) => OutputRequest {
             format: args.output.format.into(),
@@ -343,6 +410,9 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         Command::Models(args) => request_for(args, Section::Models),
         Command::Attribution(args) => request_for(args, Section::Attribution),
         Command::Windows(args) => request_for(args, Section::Windows),
+        Command::Record(_) | Command::Service(_) => {
+            unreachable!("record and service commands are handled before output routing")
+        }
         Command::DebugStartup(_) => unreachable!("debug-startup returned before output routing"),
     };
     let limits_only = request.sections.len() == 1 && request.sections.contains(&Section::Limits);
@@ -395,6 +465,240 @@ fn write_stdout(output: &str) -> Result<()> {
     }
 }
 
+fn run_service(config: &CollectConfig, args: ServiceArgs, perf_log: Option<&Path>) -> Result<i32> {
+    let history_dir = default_history_root()
+        .map(absolute_path)
+        .ok_or_else(|| anyhow::anyhow!("a user state directory is unavailable"))?;
+    let status_file = default_status_file(&history_dir);
+    let mut options = ServiceOptions::new(
+        std::env::current_exe().map_err(anyhow::Error::from)?,
+        absolute_path(config.codex_home.clone()),
+        history_dir,
+        status_file,
+        perf_log.map(|path| absolute_path(path.to_path_buf())),
+    );
+    options.lookback_days = config.lookback_days;
+    options.max_files = config.max_files;
+    options.active_grace_minutes = config.active_grace.as_secs().div_ceil(60);
+    options.offline = config.offline;
+    options.redact_content = config.redact_content;
+    options.no_rollout_cache = config.rollout_cache_dir.is_none();
+    if matches!(args.action, ServiceAction::Install) && !config.offline {
+        options.codex_bin = Some(resolve_service_codex(config)?);
+    }
+    if matches!(args.action, ServiceAction::Install) && perf_log.is_some() {
+        config.perf_log.finish();
+    }
+    let status = match args.action {
+        ServiceAction::Install => install_service(&options)?,
+        ServiceAction::Status => service_status(&options)?,
+        ServiceAction::Uninstall => uninstall_service(&options)?,
+    };
+    let mut lines = vec![
+        format!("recorder service: {}", status.state.label()),
+        format!("platform: {}", status.platform),
+    ];
+    if let Some(path) = status.registration_path.as_deref() {
+        lines.push(format!("registration: {}", path.display()));
+    }
+    lines.push(format!(
+        "last history heartbeat: {}",
+        status
+            .last_history_heartbeat
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| "unavailable".to_string())
+    ));
+    lines.push(format!(
+        "detail: {}",
+        crate::domain::terminal_safe_text(&status.detail)
+    ));
+    write_stdout(&lines.join("\n"))?;
+    Ok(0)
+}
+
+fn resolve_service_codex(config: &CollectConfig) -> Result<PathBuf> {
+    let current_dir = std::env::current_dir().map_err(anyhow::Error::from)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    crate::session_launch::resolve_executable(
+        "codex",
+        config.codex_bin.as_deref(),
+        &path,
+        &current_dir,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
+    if !args.foreground {
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "note: record always stays in the foreground; --foreground is used by service registrations"
+        );
+    }
+
+    let history_dir = absolute_path(
+        args.history_dir
+            .or_else(default_history_root)
+            .ok_or_else(|| anyhow::anyhow!("a history state directory is unavailable"))?,
+    );
+    let status_file = absolute_path(
+        args.status_file
+            .unwrap_or_else(|| default_status_file(&history_dir)),
+    );
+    let mut history_store = HistoryStore::new(history_dir, &config.codex_home);
+    let mut rollout_cache = RolloutCache::new();
+    let mut cached_account = None;
+    let local_interval = Duration::from_secs(args.local_interval_seconds);
+    let account_interval = Duration::from_secs(args.account_interval_seconds);
+    let mut next_local = Instant::now();
+    let mut next_account = Instant::now();
+    let mut account_issue = None;
+    let mut recorder_status =
+        RecorderStatusFile::started(Utc::now(), history_store.namespace().to_string());
+    write_recorder_status(&status_file, &recorder_status)
+        .map_err(|error| anyhow::anyhow!("could not initialize recorder status: {error}"))?;
+
+    loop {
+        let now = Instant::now();
+        let local_due = now >= next_local;
+        let account_due = !config.offline && now >= next_account;
+        if local_due || account_due {
+            let result = if account_due || cached_account.is_none() {
+                Some(collect_snapshot_cached(
+                    &config,
+                    cached_account.clone(),
+                    account_due,
+                    &mut rollout_cache,
+                ))
+            } else {
+                collect_snapshot_cached_if_changed(
+                    &config,
+                    cached_account.clone(),
+                    &mut rollout_cache,
+                )
+            };
+
+            let attempt_at = Utc::now();
+            if let Some(result) = result {
+                cached_account = Some(result.account.clone());
+                if account_due {
+                    account_issue = recorder_account_issue(&result.snapshot);
+                }
+                let collection_issue = result
+                    .snapshot
+                    .errors
+                    .first()
+                    .map(|error| format!("collection failed: {error}"))
+                    .or_else(|| account_issue.clone());
+                let history_started = Instant::now();
+                let history_result = history_store.record(&result.history_observation);
+                let history_elapsed = history_started.elapsed();
+                let mut history_metrics =
+                    HistoryMetrics::with_durations(history_elapsed, history_elapsed, None);
+                history_metrics.quota_points =
+                    u64::try_from(result.history_observation.quota_points.len())
+                        .unwrap_or(u64::MAX);
+                history_metrics.half_hour_buckets =
+                    u64::try_from(result.history_observation.half_hour_buckets.len())
+                        .unwrap_or(u64::MAX);
+                history_metrics.weekly_local_points =
+                    u64::try_from(result.history_observation.weekly_local_points.len())
+                        .unwrap_or(u64::MAX);
+                if let Ok(report) = &history_result {
+                    history_metrics.shards_written =
+                        u64::try_from(report.shards_written).unwrap_or(u64::MAX);
+                    history_metrics.shards_skipped =
+                        u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
+                    history_metrics.shards_pruned =
+                        u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
+                    history_metrics.warnings =
+                        u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
+                    history_metrics.read_only = report.read_only;
+                } else {
+                    history_metrics.warnings = 1;
+                }
+                config.perf_log.record_history(history_metrics);
+                match history_result {
+                    Ok(report) if !report.read_only => {
+                        let history_warning = report
+                            .warnings
+                            .first()
+                            .map(|warning| format!("history warning: {warning}"));
+                        if let Some(issue) = collection_issue.as_ref().or(history_warning.as_ref())
+                        {
+                            recorder_status.record_degraded(attempt_at, issue);
+                        } else {
+                            recorder_status.record_success(attempt_at);
+                        }
+                    }
+                    Ok(report) => recorder_status.record_error(
+                        attempt_at,
+                        report
+                            .warnings
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "history store is read-only".to_string()),
+                    ),
+                    Err(error) => recorder_status
+                        .record_error(attempt_at, format!("history persistence failed: {error}")),
+                }
+            } else {
+                recorder_status.record_heartbeat(attempt_at);
+            }
+            if let Err(error) = write_recorder_status(&status_file, &recorder_status) {
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "warning: recorder status write failed: {error}");
+            }
+            config.perf_log.maybe_sample();
+
+            if local_due {
+                next_local = advance_deadline(next_local, local_interval, Instant::now());
+            }
+            if account_due || config.offline {
+                next_account = advance_deadline(next_account, account_interval, Instant::now());
+            }
+        }
+
+        let wake_at = if config.offline {
+            next_local
+        } else {
+            next_local.min(next_account)
+        };
+        thread::sleep(wake_at.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn recorder_account_issue(snapshot: &crate::domain::Snapshot) -> Option<String> {
+    snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == "app_server" && source.status != "ok")
+        .map(|source| {
+            source.message.as_ref().map_or_else(
+                || format!("account collection is {}", source.status),
+                |message| format!("account collection is {}: {message}", source.status),
+            )
+        })
+}
+
+fn advance_deadline(mut deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    while deadline <= now {
+        deadline += interval;
+    }
+    deadline
+}
+
+fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(&path))
+            .unwrap_or(path)
+    }
+}
+
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "tui",
@@ -405,6 +709,8 @@ fn command_name(command: Option<&Command>) -> &'static str {
         Some(Command::Models(_)) => "models",
         Some(Command::Attribution(_)) => "attribution",
         Some(Command::Windows(_)) => "windows",
+        Some(Command::Record(_)) => "record",
+        Some(Command::Service(_)) => "service",
         Some(Command::DebugStartup(_)) => "debug_startup",
     }
 }
@@ -473,6 +779,38 @@ mod tests {
             Some(Command::Snapshot(SnapshotArgs { section, .. }))
                 if matches!(section.as_slice(), [SectionArg::Windows])
         ));
+    }
+
+    #[test]
+    fn record_and_service_commands_parse_cross_platform_paths() {
+        let codex_bin = PathBuf::from("tools with spaces/codex.cmd");
+        let record = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--codex-bin",
+            codex_bin.to_str().unwrap(),
+            "record",
+            "--foreground",
+            "--history-dir",
+            "state with spaces/history",
+            "--status-file",
+            "state with spaces/recorder-status.json",
+        ])
+        .unwrap();
+        assert_eq!(record.codex_bin, Some(codex_bin));
+        assert!(matches!(
+            record.command,
+            Some(Command::Record(RecordArgs {
+                foreground: true,
+                history_dir: Some(_),
+                status_file: Some(_),
+                ..
+            }))
+        ));
+
+        for action in ["install", "status", "uninstall"] {
+            let service = Cli::try_parse_from(["codex-usage-monit", "service", action]).unwrap();
+            assert!(matches!(service.command, Some(Command::Service(_))));
+        }
     }
 
     #[test]

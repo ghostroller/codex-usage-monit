@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
 
-pub const UI_STATE_VERSION: u32 = 1;
+pub const UI_STATE_VERSION: u32 = 2;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -29,6 +29,7 @@ pub enum UiTheme {
 pub enum UiView {
     #[default]
     Overview,
+    Trends,
     Health,
 }
 
@@ -325,7 +326,7 @@ mod tests {
         let expected = UiState {
             version: UI_STATE_VERSION,
             theme: UiTheme::Light,
-            view: UiView::Health,
+            view: UiView::Trends,
             window_scope: UiWindowScope::Week,
             turns_visible: false,
             models_visible: false,
@@ -336,6 +337,7 @@ mod tests {
         assert_eq!(store.load(), expected);
 
         let json = fs::read_to_string(path).unwrap();
+        assert!(json.contains("\"view\": \"trends\""));
         assert!(json.contains("\"windowScope\": \"week\""));
         assert!(json.contains("\"taskListMode\": \"tree\""));
         assert!(!json.contains("window_scope"));
@@ -345,6 +347,42 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn version_one_state_remains_compatible_with_the_trends_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tui-state.json");
+        fs::write(
+            &path,
+            br#"{
+  "version": 1,
+  "theme": "light",
+  "view": "health",
+  "windowScope": "week",
+  "turnsVisible": false,
+  "modelsVisible": false,
+  "taskListMode": "tree",
+  "taskSourceFilter": "cli"
+}"#,
+        )
+        .unwrap();
+
+        let mut store = UiStateStore::new(path);
+        assert_eq!(
+            store.load(),
+            UiState {
+                version: 1,
+                theme: UiTheme::Light,
+                view: UiView::Health,
+                window_scope: UiWindowScope::Week,
+                turns_visible: false,
+                models_visible: false,
+                task_list_mode: UiTaskListMode::Tree,
+                task_source_filter: UiTaskSourceFilter::Cli,
+            }
+        );
+        assert!(store.writes_allowed());
     }
 
     #[test]
@@ -365,6 +403,7 @@ mod tests {
         assert_eq!(
             store.load(),
             UiState {
+                version: 1,
                 window_scope: UiWindowScope::Week,
                 ..UiState::default()
             }

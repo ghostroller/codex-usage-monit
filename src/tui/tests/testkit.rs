@@ -15,6 +15,7 @@ use super::super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ControlId {
     ViewOverview,
+    ViewTrends,
     ViewOther,
     ToggleTurns,
     ToggleModels,
@@ -44,7 +45,8 @@ impl ControlId {
     pub(super) const fn binding(self) -> &'static str {
         match self {
             Self::ViewOverview => "1",
-            Self::ViewOther => "2",
+            Self::ViewTrends => "2",
+            Self::ViewOther => "3",
             Self::ToggleTurns => "V",
             Self::ToggleModels => "M",
             Self::ScopeFiveHours => "5",
@@ -267,6 +269,7 @@ impl TuiHarness {
             CollectionResult {
                 snapshot,
                 account: AccountSnapshot::default(),
+                history_observation: crate::history::HistoryObservation::default(),
             },
             theme,
         );
@@ -352,6 +355,11 @@ impl TuiHarness {
                 .app
                 .view_tabs_hitbox
                 .map(|hitbox| hitbox.tabs[View::Overview.index()])
+                .unwrap_or_default(),
+            ControlId::ViewTrends => self
+                .app
+                .view_tabs_hitbox
+                .map(|hitbox| hitbox.tabs[View::Trends.index()])
                 .unwrap_or_default(),
             ControlId::ViewOther => self
                 .app
@@ -485,6 +493,7 @@ impl TuiHarness {
     fn visible_controls(&self) -> Vec<ControlFrame> {
         let mut controls = [
             ControlId::ViewOverview,
+            ControlId::ViewTrends,
             ControlId::ViewOther,
             ControlId::ToggleTurns,
             ControlId::ToggleModels,

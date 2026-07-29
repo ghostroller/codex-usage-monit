@@ -57,6 +57,36 @@ pub struct RefreshMetrics {
     pub stages: RefreshStageMetrics,
 }
 
+/// Content-free timing and volume diagnostics for one history persistence pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMetrics {
+    pub duration_us: u64,
+    pub record_us: u64,
+    pub load_us: u64,
+    pub load_performed: bool,
+    pub shards_written: u64,
+    pub shards_skipped: u64,
+    pub shards_pruned: u64,
+    pub quota_points: u64,
+    pub half_hour_buckets: u64,
+    pub weekly_local_points: u64,
+    pub warnings: u64,
+    pub read_only: bool,
+}
+
+impl HistoryMetrics {
+    pub fn with_durations(duration: Duration, record: Duration, load: Option<Duration>) -> Self {
+        Self {
+            duration_us: duration_us(duration),
+            record_us: duration_us(record),
+            load_us: load.map(duration_us).unwrap_or_default(),
+            load_performed: load.is_some(),
+            ..Self::default()
+        }
+    }
+}
+
 impl RefreshMetrics {
     pub fn with_duration(duration: Duration) -> Self {
         Self {
@@ -192,6 +222,34 @@ impl PerfLog {
                 &json!({
                     "schemaVersion": PERF_LOG_SCHEMA_VERSION,
                     "event": "refresh",
+                    "at": Utc::now(),
+                    "atUs": duration_us(inner.origin.elapsed()),
+                    "metrics": metrics,
+                }),
+            ) && state.log_error.is_some()
+            {
+                inner.active.store(false, Ordering::Release);
+                return;
+            }
+        }
+        self.maybe_sample_inner(inner);
+    }
+
+    /// Appends one history record/load event without retaining paths or usage values.
+    pub fn record_history(&self, metrics: HistoryMetrics) {
+        let Some(inner) = self.active_inner() else {
+            return;
+        };
+        {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !write_json_line(
+                &mut state,
+                &json!({
+                    "schemaVersion": PERF_LOG_SCHEMA_VERSION,
+                    "event": "history",
                     "at": Utc::now(),
                     "atUs": duration_us(inner.origin.elapsed()),
                     "metrics": metrics,
@@ -562,6 +620,11 @@ mod tests {
         let log = PerfLog::default();
         log.record_draw(Duration::from_millis(2));
         log.record_refresh(RefreshMetrics::with_duration(Duration::from_millis(7)));
+        log.record_history(HistoryMetrics::with_durations(
+            Duration::from_millis(3),
+            Duration::from_millis(2),
+            Some(Duration::from_millis(1)),
+        ));
         log.record_event_wakeup();
         log.sample_now();
         log.finish();
@@ -584,6 +647,14 @@ mod tests {
         refresh.cached_events = 42;
         refresh.foreign_baseline_events = 3;
         log.record_refresh(refresh);
+        let mut history = HistoryMetrics::with_durations(
+            Duration::from_millis(3),
+            Duration::from_millis(2),
+            Some(Duration::from_millis(1)),
+        );
+        history.shards_written = 1;
+        history.weekly_local_points = 12;
+        log.record_history(history);
         log.record_event_wakeup();
         log.sample_now();
         log.finish();
@@ -597,13 +668,19 @@ mod tests {
         assert_eq!(values[1]["event"], "refresh");
         assert_eq!(values[1]["metrics"]["cachedEvents"], 42);
         assert_eq!(values[1]["metrics"]["foreignBaselineEvents"], 3);
-        assert_eq!(values[2]["event"], "sample");
-        assert_eq!(values[2]["draw"]["count"], 2);
-        assert_eq!(values[2]["draw"]["totalDurationUs"], 1_000);
-        assert_eq!(values[2]["draw"]["maxDurationUs"], 700);
-        assert_eq!(values[2]["refresh"]["count"], 1);
-        assert_eq!(values[2]["refresh"]["latest"]["cachedEvents"], 42);
-        assert_eq!(values[2]["eventWakeups"], 1);
+        assert_eq!(values[2]["event"], "history");
+        assert_eq!(values[2]["metrics"]["recordUs"], 2_000);
+        assert_eq!(values[2]["metrics"]["loadUs"], 1_000);
+        assert_eq!(values[2]["metrics"]["loadPerformed"], true);
+        assert_eq!(values[2]["metrics"]["shardsWritten"], 1);
+        assert_eq!(values[2]["metrics"]["weeklyLocalPoints"], 12);
+        assert_eq!(values[3]["event"], "sample");
+        assert_eq!(values[3]["draw"]["count"], 2);
+        assert_eq!(values[3]["draw"]["totalDurationUs"], 1_000);
+        assert_eq!(values[3]["draw"]["maxDurationUs"], 700);
+        assert_eq!(values[3]["refresh"]["count"], 1);
+        assert_eq!(values[3]["refresh"]["latest"]["cachedEvents"], 42);
+        assert_eq!(values[3]["eventWakeups"], 1);
         assert_eq!(values.last().unwrap()["event"], "perf_stop");
     }
 

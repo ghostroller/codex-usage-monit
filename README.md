@@ -8,9 +8,9 @@
 
 **Codex usage monitoring, entirely in your terminal.**
 
-`codex-usage-monit` tracks Codex quota windows, reset times, reset credits, tasks, turns, models, and locally observed token usage. Run it as an interactive TUI, or use its non-interactive CLI to produce plain text or JSON for scripts, cron jobs, and CI.
+`codex-usage-monit` tracks Codex quota windows, reset times, reset credits, tasks, turns, models, locally observed token usage, and usage history. Run it as an interactive TUI, or use its non-interactive CLI to produce plain text or JSON for scripts, cron jobs, and CI.
 
-It is local-first and terminal-native: no desktop application, browser, daemon, database, or listening port is required. Prebuilt binaries run on Windows, macOS, and Linux, including headless development servers over SSH.
+It is local-first and terminal-native: no desktop application, browser, database, or listening port is required. The TUI works as a standalone process; an optional per-user background recorder can keep quota history continuous while the TUI is closed. Prebuilt binaries run on Windows, macOS, and Linux, including headless development servers over SSH.
 
 ## TUI preview
 
@@ -24,6 +24,8 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **Reset-credit details** — See the authoritative available count plus grant and expiry times when the server returns per-credit details.
 - **Expiry reminder** — The weekly Overview gauge warns when the earliest fully known available reset credit expires before the ordinary Codex weekly reset, with the exact local expiry time.
 - **Local usage breakdown** — Explore tasks, turns, models, token totals, and token share for the current 5-hour or weekly reset cycle.
+- **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 30-minute token/estimate buckets in local state.
+- **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export human-readable text or schema-versioned camelCase JSON, select individual sections, and filter turns by thread.
 - **Server-friendly** — Works in SSH, tmux, and Zellij sessions; Linux release binaries are static musl builds with no host glibc dependency.
@@ -143,9 +145,11 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `models` | Print model usage for the preferred current quota window. |
 | `attribution` | Print quota-attribution and data-quality details. |
 | `windows` | Print task, turn, and model usage for every current reset cycle. |
+| `record` | Continuously record local and account history without opening the TUI. |
+| `service` | Install, inspect, or remove the optional per-user recorder. |
 | `debug-startup` | Profile the normal TUI cold-start path without entering interactive mode. |
 
-Every command above supports `--format text|json`. The data commands also support `--compact`, which writes JSON on one line instead of pretty-printing it; `debug-startup` instead provides `--width` and `--height` for its headless render.
+The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render.
 
 ```bash
 # Only selected snapshot sections
@@ -168,7 +172,30 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` is optional and is only used in the pipeline example above.
 
-The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI calls its second top-level tab **Other**; `health` remains the one-shot snapshot section name.
+The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, and **Other**; `health` remains the one-shot snapshot section name.
+
+### Continuous history recording
+
+The TUI records history while it is open. Local token buckets can usually be reconstructed from rollout files after a restart, but server quota gauges cannot be recovered retroactively. To keep the remaining-quota line continuous while the TUI is closed, install the optional user-level recorder:
+
+```bash
+codex-usage-monit service install
+codex-usage-monit service status
+```
+
+The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and a least-privilege current-user Task Scheduler task on Windows. For online recording it registers absolute paths for both the running monitor and the Codex executable, preserves the install-time collection options, and starts `record --foreground`; launchd and systemd also receive the install-time `PATH`. The application does not daemonize itself. Use `--codex-bin <FILE>` before `service install` to override automatic Codex discovery; an offline recorder does not require Codex. The Windows task is isolated by user SID, has no 72-hour execution limit, may run on battery power, and restarts after failures. Registration is always explicit and can be removed without deleting history:
+
+```bash
+codex-usage-monit service uninstall
+```
+
+Run `service install` again after moving or replacing either executable, changing `--codex-home`, or changing collection options. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
+
+On systems without a supported service manager, run the recorder under tmux, Zellij, or another supervisor:
+
+```bash
+codex-usage-monit record --foreground
+```
 
 ### Common options
 
@@ -177,6 +204,7 @@ Global options should appear before the subcommand.
 | Option | Meaning |
 | --- | --- |
 | `--codex-home <DIR>` | Read a custom Codex data directory instead of `$CODEX_HOME` or `~/.codex`. |
+| `--codex-bin <FILE>` | Use a specific Codex executable for App Server collection; service installation pins its resolved absolute path. |
 | `--days <N>` | Scan rollouts from the last N days; default: `7`. |
 | `--max-files <N>` | Scan at most N rollout files; default: `500`. |
 | `--active-grace-minutes <N>` | Freshness window used to infer active task state; default: `5`. |
@@ -191,7 +219,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. The **Other** tab shows source health, collection statistics, diagnostics, quota windows, and reset-credit details returned by the App Server, including grant and expiry times.
+The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 30-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -200,7 +228,9 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | Keys | Action |
 | --- | --- |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
-| `1`, `2` | Open Overview or Other. |
+| `1`, `2`, `3` | Open Overview, Trends, or Other. |
+| `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or Half-hour charts. |
+| `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
 | `5`, `w` | Select the 5-hour or weekly reset cycle. |
 | `↑` / `k`, `↓` / `j`, `Home`, `End`, `PgUp`, `PgDn` | Navigate lists. |
 | `Enter`, `Backspace` | Open a task's turns or return to Tasks. |
@@ -266,6 +296,18 @@ Task status evidence and confidence are separate JSON fields. Task `statusProven
 
 Quota-attribution confidence uses the same enum for schema consistency, but the current estimator emits only `low` when it can calculate an estimate and `unknown` when it cannot. The TUI intentionally communicates this as `~` or `-` instead of adding a confidence column to every row.
 
+### Trend fields
+
+| Chart | Meaning |
+| --- | --- |
+| `Quota Remaining` | Persisted server observations of `100 - usedPercent`. Five-hour and weekly reset cycles are separate series; gaps while no recorder was running are not interpolated. |
+| `Weekly Local Tokens` | A cumulative sum of eligible local token deltas inside the current server-defined weekly cycle. |
+| `Weekly ~EST Usage` | The latest weekly server gauge distributed across local price-weighted activity up to each point. It is a low-confidence allocation, not an independent server measurement. |
+| `30m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned half-hour buckets. |
+| `30m ~EST Usage` | The same weekly low-confidence allocation split across those half-hour price-weight buckets. |
+
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST history retains raw model, service-tier, and token components plus an estimator revision so pricing logic can be recomputed without silently mixing definitions. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls or a new server sample arrives. A `30m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+
 ## Accuracy and limitations
 
 - **Tokens are local observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within the scanned local data when the relevant logs are complete and counters have not reset ambiguously.
@@ -274,6 +316,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.
 - **Finished does not mean billable-exact.** Settled tasks can have exact locally observed token totals, while their quota estimate remains low confidence.
+- **History distinguishes zero from missing.** A program outage creates a gap in server quota history. Local half-hour buckets can be backfilled only while their rollout files remain inside the configured scan range and file cap.
 
 See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas, pricing fallbacks, counter handling, and detailed partial-reason semantics.
 
@@ -326,6 +369,14 @@ Default cache locations:
 
 Set `CODEX_USAGE_MONIT_CACHE_DIR` to override the cache directory.
 
+History and recorder state are user data rather than a rebuildable parse cache. They use:
+
+- macOS: `~/Library/Application Support/codex-usage-monit`
+- Linux: `$XDG_STATE_HOME/codex-usage-monit`, or `~/.local/state/codex-usage-monit`
+- Windows: `%LOCALAPPDATA%\codex-usage-monit`
+
+Set `CODEX_USAGE_MONIT_STATE_DIR` to override the state directory. History is retained for 90 days in namespaced UTC-day JSON shards. `--no-rollout-cache` does not disable history, and uninstalling the background service does not delete it.
+
 ## Troubleshooting and diagnostics
 
 ### `codex-usage-monit: command not found`
@@ -357,6 +408,7 @@ codex-usage-monit --perf-log /tmp/codex-usage-perf.jsonl
 ```
 
 The first run, a parser-version change, or a disabled cache can be slower because rollouts must be parsed from scratch.
+Runtime logs include collection refreshes, history record/load timings and shard counts, draw aggregates, and periodic CPU/memory/I/O samples without session content.
 
 ## Documentation
 

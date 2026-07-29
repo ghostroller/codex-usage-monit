@@ -8,9 +8,9 @@
 
 **完全运行在终端里的 Codex 用量监控工具。**
 
-`codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型和本地可观察 token 用量。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
+`codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型、本地可观察 token 用量和历史走势。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
 
-它以本地数据和终端为核心：不需要桌面程序、浏览器、守护进程、数据库或监听端口。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
+它以本地数据和终端为核心：不需要桌面程序、浏览器、数据库或监听端口。TUI 可以独立运行；也可以选择注册用户级后台记录服务，在 TUI 关闭后继续保存额度走势。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
 
 ## TUI 预览
 
@@ -24,6 +24,8 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **重置机会详情** — 查看权威的可用数量，以及服务端返回明细时每次机会的获得和过期时间。
 - **过期提醒** — 如果最早且信息完整的可用重置机会会在普通 Codex 周自然重置前过期，Overview 的周用量进度条会显示提醒和准确的本地过期时间。
 - **本地用量拆分** — 按当前 5 小时或周重置周期查看 task、turn、模型、token 总量和 token 占比。
+- **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及半小时 token/估算桶。
+- **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 导出便于阅读的文本或带 schema 版本的 camelCase JSON，选择指定 section，或按 thread 筛选 turn。
 - **适合服务器** — 支持 SSH、tmux 和 Zellij；Linux Release 是静态 musl 构建，不依赖宿主机 glibc。
@@ -143,9 +145,11 @@ codex-usage-monit --offline snapshot --format json --compact
 | `models` | 输出当前首选重置周期内的模型用量。 |
 | `attribution` | 输出额度归因和数据质量详情。 |
 | `windows` | 输出每个当前重置周期内 task、turn 和模型的用量。 |
+| `record` | 不启动 TUI，持续记录本地和账户历史。 |
+| `service` | 安装、检查或删除可选的用户级后台记录服务。 |
 | `debug-startup` | 分析正常 TUI 冷启动流程，但不进入交互模式。 |
 
-上面的所有命令都支持 `--format text|json`。数据命令还支持 `--compact`，它会把 JSON 写成单行，而不是进行美化输出；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。
+一次性数据命令支持 `--format text|json` 和 `--compact`，后者会把 JSON 写成单行；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。
 
 ```bash
 # 只输出指定的 snapshot section
@@ -168,7 +172,30 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` 是可选工具，只用于上面的管道示例。
 
-有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 把第二个顶层 tab 称为 **Other**；`health` 仍然是一次性 snapshot 的 section 名称。
+有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends** 和 **Other**；`health` 仍然是一次性 snapshot 的 section 名称。
+
+### 持续记录历史
+
+TUI 打开时会记录历史。本地 token 桶通常可以在重启后从 rollout 文件回算，但服务端额度 gauge 无法事后恢复。如果希望 TUI 关闭后剩余额度曲线仍然连续，可以显式安装用户级记录服务：
+
+```bash
+codex-usage-monit service install
+codex-usage-monit service status
+```
+
+macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低权限的当前用户任务计划。在线记录时，注册项会固化当前监控程序和 Codex 可执行文件的绝对路径，保留安装时的采集选项，并运行 `record --foreground`；launchd 和 systemd 还会获得安装时的 `PATH`。程序自身不会 daemonize。可以在 `service install` 前传入 `--codex-bin <FILE>` 覆盖自动发现的 Codex；离线 recorder 不要求安装 Codex。Windows 任务按用户 SID 隔离，不受默认 72 小时运行上限影响，允许电池供电，并会在失败后重启。删除服务不会删除历史：
+
+```bash
+codex-usage-monit service uninstall
+```
+
+移动或替换任一可执行文件、修改 `--codex-home`，或者改变采集选项后，请重新运行 `service install`。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
+
+没有受支持服务管理器的环境，可以在 tmux、Zellij 或其他 supervisor 中运行：
+
+```bash
+codex-usage-monit record --foreground
+```
 
 ### 常用选项
 
@@ -177,6 +204,7 @@ codex-usage-monit --redact-content tasks --format json
 | 选项 | 含义 |
 | --- | --- |
 | `--codex-home <DIR>` | 读取自定义 Codex 数据目录，而不是 `$CODEX_HOME` 或 `~/.codex`。 |
+| `--codex-bin <FILE>` | 使用指定的 Codex 可执行文件采集 App Server 数据；安装服务时会固化解析后的绝对路径。 |
 | `--days <N>` | 扫描最近 N 天的 rollout；默认：`7`。 |
 | `--max-files <N>` | 最多扫描 N 个 rollout 文件；默认：`500`。 |
 | `--active-grace-minutes <N>` | 推断任务是否活跃时使用的时间阈值；默认：`5`。 |
@@ -191,7 +219,7 @@ codex-usage-monit --redact-content tasks --format json
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Other** tab 显示数据源健康状态、采集统计、诊断信息、额度窗口，以及 App Server 返回的重置机会详情（包括获得和过期时间）。
+**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和半小时柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -200,7 +228,9 @@ codex-usage-monit --redact-content tasks --format json
 | 按键 | 操作 |
 | --- | --- |
 | `Tab` / `→`、`Shift+Tab` / `←` | 在视图之间移动。 |
-| `1`、`2` | 打开 Overview 或 Other。 |
+| `1`、`2`、`3` | 打开 Overview、Trends 或 Other。 |
+| 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 Half-hour 图表。 |
+| Trends 中的 `[`、`]`、`n` | 把 24 小时图表窗口向前/向后移动，或回到 Now。 |
 | `5`、`w` | 选择 5 小时或周重置周期。 |
 | `↑` / `k`、`↓` / `j`、`Home`、`End`、`PgUp`、`PgDn` | 在列表中导航。 |
 | `Enter`、`Backspace` | 打开任务的 turns，或返回 Tasks。 |
@@ -266,6 +296,18 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 
 为了保持 schema 一致，额度归因 confidence 使用相同枚举，但当前估算器在能够计算时只输出 `low`，不能计算时输出 `unknown`。TUI 特意使用 `~` 或 `-` 传达这一点，而不是为每一行增加 confidence 列。
 
+### 走势字段
+
+| 图表 | 含义 |
+| --- | --- |
+| `Quota Remaining` | 持久化的服务端 `100 - usedPercent` 观察值。5 小时和周周期是独立序列；没有 recorder 运行时产生的缺口不会插值。 |
+| `Weekly Local Tokens` | 当前服务端周周期内，符合条件的本地 token 增量累计值。 |
+| `Weekly ~EST Usage` | 使用最新周 gauge，把额度按截至各时间点的本地价格权重分配。它是低置信度分配，不是独立的服务端测量。 |
+| `30m Local Tokens` | 按调用完成观察时间放入 UTC 对齐半小时桶的本地 token 增量。 |
+| `30m ~EST Usage` | 把同一周低置信度分配拆到这些半小时价格权重桶。 |
+
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 历史会保留原始模型、服务层、token 分量和估算器版本，避免价格逻辑变化时静默混用不同定义。由于计算采用最新周 gauge 和完整周期分母，新增本地调用或服务端样本后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `30m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+
 ## 精度和限制
 
 - **Token 是本地观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在已扫描的本地数据范围内是准确值。
@@ -274,6 +316,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
 - **任务结束不等于账单精确。** 已结算任务可以拥有精确的本地可观察 token 总量，但其额度估算仍然是低可信值。
+- **历史区分零值和缺失。** 程序停止会在服务端额度历史中留下缺口。本地半小时桶只有在对应 rollout 仍处于配置的扫描天数和文件上限内时才能回填。
 
 公式、价格回退规则、计数器处理和详细的不完整原因语义见[数据能力和限制](docs/codex-data-capabilities.md)。
 
@@ -326,6 +369,14 @@ Token 用量包含 `inputTokens`、`cachedInputTokens`、`outputTokens`、`reaso
 
 设置 `CODEX_USAGE_MONIT_CACHE_DIR` 可以覆盖缓存目录。
 
+历史和 recorder 状态属于用户数据，而不是可重建的解析缓存。默认位置为：
+
+- macOS：`~/Library/Application Support/codex-usage-monit`
+- Linux：`$XDG_STATE_HOME/codex-usage-monit`；未设置时为 `~/.local/state/codex-usage-monit`
+- Windows：`%LOCALAPPDATA%\codex-usage-monit`
+
+设置 `CODEX_USAGE_MONIT_STATE_DIR` 可以覆盖状态目录。历史按 Codex home 隔离，以 UTC 日 JSON 分片保存 90 天。`--no-rollout-cache` 不会禁用历史，删除后台服务也不会删除历史。
+
 ## 故障排查和诊断
 
 ### `codex-usage-monit: command not found`
@@ -357,6 +408,7 @@ codex-usage-monit --perf-log /tmp/codex-usage-perf.jsonl
 ```
 
 首次运行、解析器版本变化或禁用缓存时，因为需要从头解析 rollout，耗时可能更长。
+运行时日志会记录采集刷新、历史写入/读取耗时和分片数量、绘制聚合，以及周期性的 CPU、内存和 I/O 样本，不包含 session 内容。
 
 ## 文档
 

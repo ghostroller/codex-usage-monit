@@ -8,6 +8,7 @@ use crate::startup::StartupTrace;
 #[derive(Clone, Debug)]
 pub struct CollectConfig {
     pub codex_home: PathBuf,
+    pub codex_bin: Option<PathBuf>,
     pub rollout_cache_dir: Option<PathBuf>,
     pub lookback_days: i64,
     pub max_files: usize,
@@ -23,6 +24,7 @@ impl Default for CollectConfig {
     fn default() -> Self {
         Self {
             codex_home: default_codex_home(),
+            codex_bin: None,
             rollout_cache_dir: None,
             lookback_days: 7,
             max_files: 500,

@@ -73,7 +73,7 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     }
 
     let spawn_span = config.startup_trace.span("app_server.spawn");
-    let child = codex_command()
+    let child = codex_command(config)
         .args(["app-server", "--stdio"])
         .env("CODEX_HOME", &config.codex_home)
         .stdin(Stdio::piped())
@@ -296,7 +296,10 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     result
 }
 
-fn codex_command() -> Command {
+fn codex_command(config: &CollectConfig) -> Command {
+    if let Some(codex_bin) = config.codex_bin.as_deref() {
+        return Command::new(codex_bin);
+    }
     #[cfg(not(windows))]
     {
         Command::new("codex")

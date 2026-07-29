@@ -4,13 +4,13 @@ expression: diagnostics.frame().snapshot_text()
 ---
 size=80x24
 rows:
-00| 1 Overview  |  2 Other
+00| 1 Overview  |  2 Trends  |  3 Other
 01|┌Sources───────────────────────────────────────────────────────────────────────┐
 02|│SOURCE             STATE      AS OF      DETAIL                               │
 03|│rollout_jsonl      partial    04:30:00   4 files, 1 truncated, 1 line skipped │
 04|│app_server         error      04:30:00   mock app-server unavailable          │
 05|└──────────────────────────────────────────────────────────────────────────────┘
-06|┌Collection────────────────────────────────────────────────────────────────────┐
+06|┌Collection · recorder idle────────────────────────────────────────────────────┐
 07|│Files  4/4 scanned (1 truncated, 0 unreadable)    Lines  81 parsed / 1 skipped│
 08|│Tasks  0 running    0 completed    0 stale/unknown                            │
 09|│Snapshot  2026-07-12 04:30:00 UTC    Schema v1    Partial true                │
@@ -32,7 +32,9 @@ styles:
 00:001+001 fg=#3fb9c0 bg=#121417 mods=bold text="1"
 00:002+014 fg=#7e8691 bg=#121417 mods=none text=" Overview  |  "
 00:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="2"
-00:018+005 fg=#f4f6f8 bg=#121417 mods=bold text="Other"
+00:017+012 fg=#7e8691 bg=#121417 mods=none text=" Trends  |  "
+00:029+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
+00:031+005 fg=#f4f6f8 bg=#121417 mods=bold text="Other"
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+007 fg=#f4f6f8 bg=#121417 mods=bold text="Sources"
 01:008+072 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────────────────────────────────────┐"
@@ -47,8 +49,8 @@ styles:
 04:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 05:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
 06:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
-06:001+010 fg=#f4f6f8 bg=#121417 mods=bold text="Collection"
-06:011+069 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────────────────────┐"
+06:001+026 fg=#f4f6f8 bg=#121417 mods=bold text="Collection · recorder idle"
+06:027+053 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────┐"
 07:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 07:001+078 fg=#dadee4 bg=#121417 mods=none text="Files  4/4 scanned (1 truncated, 0 unreadable)    Lines  81 parsed / 1 skipped"
 07:079+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -91,4 +93,5 @@ styles:
 23:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
 controls:
 ViewOverview binding=1 rect=0,0,12,1
-ViewOther binding=2 rect=15,0,9,1
+ViewTrends binding=2 rect=15,0,10,1
+ViewOther binding=3 rect=28,0,9,1

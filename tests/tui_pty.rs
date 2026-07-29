@@ -92,6 +92,9 @@ impl PtySession {
     }
 
     fn resize(&mut self, columns: u16, rows: u16) {
+        while let Ok(bytes) = self.output.try_recv() {
+            self.parser.process(&bytes);
+        }
         let size = PtySize {
             rows,
             cols: columns,
@@ -100,6 +103,41 @@ impl PtySession {
         };
         self.parser.set_size(rows, columns);
         self.master.resize(size).unwrap();
+    }
+
+    fn wait_for_new_output(
+        &mut self,
+        description: &str,
+        predicate: impl Fn(&vt100::Screen) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!(
+                    "timed out waiting for {description}\nterminal:\n{}",
+                    self.parser.screen().contents()
+                );
+            }
+            match self
+                .output
+                .recv_timeout((deadline - now).min(Duration::from_millis(100)))
+            {
+                Ok(bytes) => {
+                    self.parser.process(&bytes);
+                    if predicate(self.parser.screen()) {
+                        return;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "PTY closed while waiting for {description}\nterminal:\n{}",
+                        self.parser.screen().contents()
+                    );
+                }
+            }
+        }
     }
 
     fn wait_for(&mut self, description: &str, predicate: impl Fn(&vt100::Screen) -> bool) {
@@ -184,7 +222,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     });
     assert!(!session.label_is_bold("Other"));
 
-    session.send(b"2");
+    session.send(b"3");
     session.wait_for("keyboard switch to Other", |screen| {
         label_is_bold(screen, "Other")
     });
@@ -219,7 +257,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     });
 
     session.resize(60, 24);
-    session.wait_for("compact controls after resize", |screen| {
+    session.wait_for_new_output("compact controls after resize", |screen| {
         screen.size() == (24, 60)
             && screen
                 .rows(0, 60)

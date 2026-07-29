@@ -13,6 +13,7 @@ use crate::domain::{
     AccountSnapshot, LimitBucket, LimitWindow, Provenance, RateObservation, RolloutDataset,
     Snapshot, SourceStatus, WindowAnalysis,
 };
+use crate::history::{HISTORY_RETENTION_DAYS, HistoryObservation};
 use crate::perf::{RefreshMetrics, RefreshStageMetrics};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
 
@@ -20,6 +21,7 @@ use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, sca
 pub struct CollectionResult {
     pub snapshot: Snapshot,
     pub account: AccountSnapshot,
+    pub history_observation: HistoryObservation,
 }
 
 struct LocalCollection {
@@ -475,6 +477,31 @@ fn collect_snapshot_with_local(
             .iter()
             .any(|source| matches!(source.status.as_str(), "error" | "partial" | "stale"));
 
+    let mut history_partial_reasons = Vec::new();
+    if !scan_local {
+        history_partial_reasons.push("local_scan_disabled".to_string());
+    } else if !rollout_complete || rollout_source_degraded {
+        history_partial_reasons.push("rollout_scan_incomplete".to_string());
+    }
+    for reason in window_analyses
+        .iter()
+        .flat_map(|analysis| analysis.partial_reasons.iter())
+        .filter(|reason| reason.starts_with("rollout_") || reason.as_str() == "local_scan_disabled")
+    {
+        if !history_partial_reasons.contains(reason) {
+            history_partial_reasons.push(reason.clone());
+        }
+    }
+    let local_coverage_starts_at = (scan_local && rollout_complete && !rollout_source_degraded)
+        .then(|| now - Duration::days(config.lookback_days.clamp(1, HISTORY_RETENTION_DAYS)));
+    let history_observation = HistoryObservation::from_sources_with_coverage(
+        now,
+        &dataset.calls,
+        &limits,
+        &history_partial_reasons,
+        local_coverage_starts_at,
+    );
+
     let result = CollectionResult {
         snapshot: Snapshot {
             schema_version: 1,
@@ -496,6 +523,7 @@ fn collect_snapshot_with_local(
             errors,
         },
         account,
+        history_observation,
     };
     derive_span.finish_with(|| {
         format!(

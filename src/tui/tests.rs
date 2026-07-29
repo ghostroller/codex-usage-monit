@@ -4,6 +4,7 @@ use crate::domain::{
     RateLimitResetCredit, RateLimitResetCreditsSnapshot, SourceStatus, ThreadWindowUsage,
     TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
+use crate::history::{LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint};
 use ratatui::backend::TestBackend;
 
 mod integration_scenarios;
@@ -202,9 +203,86 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 errors: Vec::new(),
             },
             account: AccountSnapshot::default(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         Theme::Light,
     )
+}
+
+fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
+    let five_hour_reset = now + ChronoDuration::hours(4);
+    let weekly_reset = now + ChronoDuration::days(3);
+    let day_bounds = trend_day_bounds(now, 0);
+    let bucket_starts = [
+        day_bounds[1] - ChronoDuration::hours(2),
+        day_bounds[1] - ChronoDuration::minutes(90),
+        day_bounds[1] - ChronoDuration::minutes(30),
+    ];
+    HistoryData {
+        quota_points: vec![
+            QuotaPoint {
+                observed_at: now - ChronoDuration::hours(1),
+                limit_id: "codex".to_string(),
+                duration_mins: 300,
+                resets_at: five_hour_reset,
+                used_percent: 20.0,
+                remaining_percent: 80.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: now,
+                limit_id: "codex".to_string(),
+                duration_mins: 300,
+                resets_at: five_hour_reset,
+                used_percent: 40.0,
+                remaining_percent: 60.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: now - ChronoDuration::days(1),
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: weekly_reset,
+                used_percent: 10.0,
+                remaining_percent: 90.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: now,
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: weekly_reset,
+                used_percent: 25.0,
+                remaining_percent: 75.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+        ],
+        half_hour_buckets: bucket_starts
+            .into_iter()
+            .enumerate()
+            .map(|(index, starts_at)| LocalHalfHourBucket {
+                starts_at,
+                ends_at: starts_at + ChronoDuration::minutes(30),
+                sampled_at: now,
+                token_usage: TokenUsage {
+                    total_tokens: u64::try_from(index + 1).unwrap() * 1_000,
+                    ..TokenUsage::default()
+                },
+                estimated_cost_units: u128::try_from(index + 1).unwrap() * 100,
+                estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                call_count: 1,
+                groups: Vec::new(),
+                partial_reasons: if index == 1 {
+                    vec!["fixture_partial".to_string()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect(),
+        weekly_local_points: Vec::new(),
+        warnings: Vec::new(),
+        read_only: false,
+    }
 }
 
 fn make_task_resumable(app: &mut App, index: usize, cwd: &std::path::Path) {
@@ -485,6 +563,7 @@ fn resume_confirmation_revalidates_after_refresh_and_reuses_known_panes() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -788,6 +867,7 @@ fn render_models_content_for_scope(
         CollectionResult {
             snapshot: snapshot.clone(),
             account: AccountSnapshot::default(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         Theme::Dark,
     );
@@ -2526,6 +2606,7 @@ fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
         CollectionResult {
             snapshot,
             account: refreshed.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -2550,6 +2631,7 @@ fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
         CollectionResult {
             snapshot: app.snapshot.clone(),
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -2566,6 +2648,7 @@ fn refresh_retains_live_collapses_and_drops_removed_parent_state() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -2879,6 +2962,7 @@ fn tree_click_scroll_and_refresh_keep_flattened_positions_mapped_by_thread() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -3116,7 +3200,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
             .unwrap();
         assert_eq!(app.window_controls_hitbox.unwrap(), initial);
 
-        if width >= 44 {
+        if width >= 50 {
             assert!(!initial.toggle_turns.is_empty());
             assert!(!initial.toggle_models.is_empty());
             assert!(initial.scopes.iter().all(|button| !button.is_empty()));
@@ -3166,7 +3250,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
     }
 
     let mut app = interaction_test_app(1, 1);
-    let mut terminal = Terminal::new(TestBackend::new(44, 1)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(54, 1)).unwrap();
     terminal
         .draw(|frame| {
             let controls = render_overview_controls(frame, frame.area(), &app);
@@ -4625,6 +4709,7 @@ fn refresh_preserves_viewport_rows_and_leaves_empty_turn_focus() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -4654,6 +4739,7 @@ fn refresh_preserves_viewport_rows_and_leaves_empty_turn_focus() {
         CollectionResult {
             snapshot: no_turns,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -4682,6 +4768,7 @@ fn refresh_keeps_a_top_task_viewport_following_new_rows() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -4726,6 +4813,7 @@ fn refresh_restores_filtered_turn_selection_and_viewport_by_id() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -4778,6 +4866,7 @@ fn refresh_reveals_a_previously_visible_selection_after_reordering() {
         CollectionResult {
             snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -4901,7 +4990,8 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let tabs = app.view_tabs_hitbox.expect("view tabs should render");
     assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 12, 1));
-    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(15, 0, 9, 1));
+    assert_eq!(tabs.tabs[View::Trends.index()], Rect::new(15, 0, 10, 1));
+    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(28, 0, 9, 1));
 
     let divider = tabs.tabs[View::Overview.index()].right();
     assert!(!handle_mouse_event(
@@ -4940,6 +5030,395 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
                 .iter()
                 .all(|tab| tab.x >= area.x && tab.right() <= area.right())
         );
+    }
+}
+
+#[test]
+fn trends_view_uses_responsive_panels_and_btop_controls() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = interaction_test_app(3, 2);
+        app.theme = theme;
+        app.set_view(View::Trends);
+        let selected_task = app.selected_task;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Quota Remaining"));
+        assert!(!content.contains("Weekly Local Tokens"));
+        assert!(content.contains("No history recorded yet"));
+        assert!(app.task_table_hitbox.is_none());
+        assert!(app.turn_table_hitbox.is_none());
+        let controls = app.trend_controls_hitbox.expect("trend controls");
+        assert!(controls.sections.iter().all(|area| !area.is_empty()));
+        assert!(controls.previous_day.is_empty());
+        assert!(controls.next_day.is_empty());
+        assert!(controls.now.is_empty());
+
+        let remaining = controls.sections[TrendSection::Remaining.index()];
+        let shortcut = &terminal.backend().buffer()[(remaining.x + 1, remaining.y)];
+        assert_eq!(shortcut.symbol(), "R");
+        assert!(shortcut.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(shortcut.bg, theme.palette().accent);
+
+        for section in TrendSection::ALL {
+            let button = controls.sections[section.index()];
+            for x in [button.x, button.x + button.width / 2, button.right() - 1] {
+                assert!(handle_mouse_event(
+                    &mut app,
+                    mouse_event(MouseEventKind::Down(MouseButton::Left), x, button.y),
+                ));
+                assert_eq!(app.trend_section, section);
+            }
+        }
+        handle_key_event(&mut app, key_event(KeyCode::Char('W')));
+        assert_eq!(app.trend_section, TrendSection::Weekly);
+        handle_key_event(&mut app, key_event(KeyCode::Char('H')));
+        assert_eq!(app.trend_section, TrendSection::HalfHour);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("30m Local Tokens"));
+        assert!(content.contains("30m ~EST Usage"));
+        assert!(!content.contains("Weekly Local Tokens"));
+
+        let controls = app.trend_controls_hitbox.expect("half-hour controls");
+        assert!(!controls.previous_day.is_empty());
+        assert!(!controls.next_day.is_empty());
+        assert!(!controls.now.is_empty());
+        for x in [
+            controls.previous_day.x,
+            controls.previous_day.x + controls.previous_day.width / 2,
+            controls.previous_day.right() - 1,
+        ] {
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    x,
+                    controls.previous_day.y,
+                ),
+            ));
+        }
+        assert_eq!(app.trend_day_offset, 3);
+        handle_key_event(&mut app, key_event(KeyCode::Char(']')));
+        assert_eq!(app.trend_day_offset, 2);
+        handle_key_event(&mut app, key_event(KeyCode::Char('[')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('N')));
+        assert_eq!(app.trend_day_offset, 0);
+        for _ in 0..16 {
+            handle_key_event(&mut app, key_event(KeyCode::Char('[')));
+        }
+        assert_eq!(
+            app.trend_day_offset,
+            u16::try_from(HISTORY_VIEW_DAYS - 1).unwrap()
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('N')));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('j')));
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.selected_task, selected_task);
+    }
+
+    let mut app = interaction_test_app(1, 1);
+    app.trend_section = TrendSection::Weekly;
+    app.set_view(View::Trends);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    for title in [
+        "Quota Remaining",
+        "Weekly Local Tokens",
+        "Weekly ~EST Usage",
+        "30m Local Tokens",
+        "30m ~EST Usage",
+    ] {
+        assert!(content.contains(title), "missing {title}: {content}");
+    }
+    let controls = app.trend_controls_hitbox.expect("wide trend controls");
+    assert!(controls.sections.iter().all(|area| area.is_empty()));
+    assert!(!controls.previous_day.is_empty());
+    handle_key_event(&mut app, key_event(KeyCode::Char('R')));
+    assert_eq!(app.trend_section, TrendSection::Weekly);
+}
+
+#[test]
+fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    let mut history = trend_history_fixture(now);
+    history.warnings.push("fixture warning".to_string());
+    history.read_only = true;
+    app.replace_history(history);
+    app.set_view(View::Trends);
+
+    let bounds = trend_day_bounds(now, 0);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    for expected in [
+        "Quota Remaining",
+        "Weekly Local Tokens",
+        "Weekly ~EST Usage",
+        "30m Local Tokens",
+        "30m ~EST Usage",
+        "samples",
+        "gaps",
+        "PARTIAL",
+        "READ-ONLY",
+    ] {
+        assert!(content.contains(expected), "missing {expected}: {content}");
+    }
+    assert!(!content.contains("No history recorded yet"));
+    for time in [
+        format_local_time(bounds[0], "%m-%d %H:%M"),
+        format_local_time(bounds[1], "%m-%d %H:%M"),
+    ] {
+        assert!(content.contains(&time), "missing time {time}: {content}");
+    }
+
+    app.trend_section = TrendSection::HalfHour;
+    let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    handle_key_event(&mut app, key_event(KeyCode::Char('[')));
+    assert_eq!(app.trend_day_offset, 1);
+    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    let previous_day = compact
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(previous_day.contains("No history recorded yet"));
+}
+
+#[test]
+fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
+    let mut app = interaction_test_app(1, 1);
+    let reset = app.snapshot.as_of + ChronoDuration::days(3);
+    let start = reset - ChronoDuration::days(7);
+    let first_at = start + ChronoDuration::minutes(30);
+    let second_at = start + ChronoDuration::minutes(120);
+    let zero_bucket = |starts_at| LocalHalfHourBucket {
+        starts_at,
+        ends_at: starts_at + ChronoDuration::minutes(30),
+        sampled_at: starts_at + ChronoDuration::minutes(30),
+        token_usage: TokenUsage::default(),
+        estimated_cost_units: 0,
+        estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        call_count: 0,
+        groups: Vec::new(),
+        partial_reasons: Vec::new(),
+    };
+    let history = HistoryData {
+        quota_points: vec![QuotaPoint {
+            observed_at: second_at,
+            limit_id: "codex".to_string(),
+            duration_mins: 10_080,
+            resets_at: reset,
+            used_percent: 40.0,
+            remaining_percent: 60.0,
+            provenance: Provenance::ServerSnapshot,
+        }],
+        half_hour_buckets: vec![
+            zero_bucket(start + ChronoDuration::minutes(30)),
+            zero_bucket(start + ChronoDuration::minutes(60)),
+        ],
+        weekly_local_points: vec![
+            WeeklyLocalPoint {
+                observed_at: first_at,
+                resets_at: reset,
+                token_usage: TokenUsage {
+                    total_tokens: 10,
+                    ..TokenUsage::default()
+                },
+                estimated_cost_units: 100,
+                estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                call_count: 1,
+                partial_reasons: Vec::new(),
+            },
+            WeeklyLocalPoint {
+                observed_at: second_at,
+                resets_at: reset,
+                token_usage: TokenUsage {
+                    total_tokens: 20,
+                    ..TokenUsage::default()
+                },
+                estimated_cost_units: 200,
+                estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                call_count: 2,
+                partial_reasons: Vec::new(),
+            },
+        ],
+        ..HistoryData::default()
+    };
+    app.replace_history(history.clone());
+    app.set_view(View::Trends);
+    app.trend_section = TrendSection::Weekly;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let connected = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!connected.contains("gaps"), "{connected}");
+
+    let mut missing = history;
+    missing.half_hour_buckets.pop();
+    app.replace_history(missing);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let gapped = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(gapped.contains("1 gaps"), "{gapped}");
+}
+
+#[test]
+fn trend_chart_canvas_uses_the_active_theme_background() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = interaction_test_app(1, 1);
+        let now = app.snapshot.as_of;
+        app.theme = theme;
+        app.replace_history(trend_history_fixture(now));
+        app.set_view(View::Trends);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().all(|cell| cell.bg != Color::Reset),
+            "trend canvas leaked the terminal default background for {theme:?}"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.bg == theme.palette().background)
+                .count()
+                > buffer.content().len() / 2,
+            "trend canvas did not use the {theme:?} background"
+        );
+        for data_color in [theme.palette().accent, theme.palette().warning] {
+            assert!(
+                buffer.content().iter().any(|cell| {
+                    !cell.symbol().trim().is_empty()
+                        && cell.fg == data_color
+                        && cell.bg == theme.palette().background
+                }),
+                "trend marks did not preserve the {theme:?} background"
+            );
+        }
+    }
+}
+
+#[test]
+fn trend_segments_keep_single_points_and_split_missing_intervals() {
+    let start = DateTime::parse_from_rfc3339("2026-07-28T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let points = vec![
+        TrendPoint {
+            at: start,
+            value: 1.0,
+            partial: false,
+        },
+        TrendPoint {
+            at: start + ChronoDuration::minutes(5),
+            value: 2.0,
+            partial: false,
+        },
+        TrendPoint {
+            at: start + ChronoDuration::minutes(25),
+            value: 3.0,
+            partial: true,
+        },
+    ];
+    let (segments, gaps) = prepare_trend_segments(
+        &points,
+        TrendGraphKind::Line {
+            maximum_gap: ChronoDuration::minutes(10),
+        },
+    );
+    assert_eq!(gaps, 1);
+    assert_eq!(segments.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+
+    let (single, gaps) = prepare_trend_segments(
+        &points[..1],
+        TrendGraphKind::Line {
+            maximum_gap: ChronoDuration::minutes(10),
+        },
+    );
+    assert_eq!(gaps, 0);
+    assert_eq!(single.iter().map(Vec::len).collect::<Vec<_>>(), [1]);
+
+    let (bars, gaps) = prepare_trend_segments(
+        &points,
+        TrendGraphKind::Bar {
+            expected_step: ChronoDuration::minutes(5),
+        },
+    );
+    assert_eq!(gaps, 3);
+    assert_eq!(bars[0].len(), 3);
+}
+
+#[test]
+fn trends_controls_clip_only_whole_buttons_in_tiny_terminals() {
+    for (width, height) in [(40, 12), (20, 8), (8, 3)] {
+        let mut app = interaction_test_app(1, 1);
+        app.set_view(View::Trends);
+        app.trend_section = TrendSection::HalfHour;
+        app.trend_day_offset = 2;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let controls = app.trend_controls_hitbox.expect("trend controls");
+        for control in controls.sections.into_iter().chain([
+            controls.previous_day,
+            controls.next_day,
+            controls.now,
+        ]) {
+            if !control.is_empty() {
+                assert_eq!(control.width, 3);
+                assert!(control.right() <= width);
+                assert!(control.bottom() <= height);
+            }
+        }
+        if controls.now.is_empty() {
+            handle_key_event(&mut app, key_event(KeyCode::Char('N')));
+            assert_eq!(app.trend_day_offset, 2);
+        }
     }
 }
 
@@ -5741,6 +6220,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
         CollectionResult {
             snapshot: inserted_snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -5756,6 +6236,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
         CollectionResult {
             snapshot: removed_snapshot,
             account: app.account.clone(),
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -5778,6 +6259,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
         CollectionResult {
             snapshot: replacement_snapshot,
             account: replacement.account,
+            history_observation: crate::history::HistoryObservation::default(),
         },
         false,
     );
@@ -6028,6 +6510,7 @@ fn renders_all_views_at_common_terminal_sizes() {
         let result = CollectionResult {
             snapshot,
             account: AccountSnapshot::default(),
+            history_observation: crate::history::HistoryObservation::default(),
         };
 
         for theme in [Theme::Dark, Theme::Light] {
@@ -6059,7 +6542,7 @@ fn renders_all_views_at_common_terminal_sizes() {
                             > 10
                     );
                 }
-                if view != View::Health {
+                if view == View::Overview {
                     let content = buffer
                         .content()
                         .iter()
@@ -6108,6 +6591,17 @@ fn renders_all_views_at_common_terminal_sizes() {
                                 Some(cell.fg) == style.fg && Some(cell.bg) == style.bg
                             }));
                         }
+                    }
+                } else if view == View::Trends {
+                    let content = buffer
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(content.contains("Quota Remaining"));
+                    if width >= 120 && height >= 30 {
+                        assert!(content.contains("Weekly Local Tokens"));
+                        assert!(content.contains("30m Local Tokens"));
                     }
                 }
             }

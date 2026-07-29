@@ -1,0 +1,2714 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration as StdDuration, Instant};
+
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::atomic_file::replace_file;
+use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_model};
+use crate::domain::{LimitBucket, Provenance, TokenUsage, UsageCall};
+
+pub const HISTORY_FORMAT_VERSION: u32 = 1;
+pub const HISTORY_METRIC_REVISION: u32 = 1;
+pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
+pub const HISTORY_RETENTION_DAYS: i64 = 90;
+
+const APP_DIRECTORY: &str = "codex-usage-monit";
+const HISTORY_DIRECTORY: &str = "history-v1";
+const STATE_DIRECTORY_ENV: &str = "CODEX_USAGE_MONIT_STATE_DIR";
+const LOCK_FILE: &str = "history.lock";
+const HALF_HOUR_SECS: i64 = 30 * 60;
+const QUOTA_SAMPLE_SECS: i64 = 5 * 60;
+const FIVE_HOURS_MINS: i64 = 300;
+const WEEK_MINS: i64 = 10_080;
+const RESET_DRIFT_SECS: i64 = 120;
+const FULL_HISTORY_MERGE_SECS: i64 = 30 * 60;
+const RECENT_BUCKET_OVERLAP_SECS: i64 = 60 * 60;
+const HISTORY_READ_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
+const TEMP_FILE_ATTEMPTS: usize = 128;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoint {
+    pub observed_at: DateTime<Utc>,
+    pub limit_id: String,
+    pub duration_mins: i64,
+    pub resets_at: DateTime<Utc>,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalUsageGroup {
+    pub model: Option<String>,
+    pub service_tier: Option<String>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    pub call_count: u64,
+    pub used_model_fallback: bool,
+    pub used_token_breakdown_fallback: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalHalfHourBucket {
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub sampled_at: DateTime<Utc>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    pub estimator_revision: u32,
+    pub call_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<LocalUsageGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyLocalPoint {
+    pub observed_at: DateTime<Utc>,
+    pub resets_at: DateTime<Utc>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    pub estimator_revision: u32,
+    pub call_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HistoryObservation {
+    pub observed_at: DateTime<Utc>,
+    pub quota_points: Vec<QuotaPoint>,
+    pub half_hour_buckets: Vec<LocalHalfHourBucket>,
+    pub weekly_local_points: Vec<WeeklyLocalPoint>,
+}
+
+impl HistoryObservation {
+    pub fn from_sources(
+        observed_at: DateTime<Utc>,
+        calls: &[UsageCall],
+        limits: &[LimitBucket],
+        partial_reasons: &[String],
+    ) -> Self {
+        Self::from_sources_with_coverage(observed_at, calls, limits, partial_reasons, None)
+    }
+
+    pub fn from_sources_with_coverage(
+        observed_at: DateTime<Utc>,
+        calls: &[UsageCall],
+        limits: &[LimitBucket],
+        partial_reasons: &[String],
+        local_coverage_starts_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        let weekly_local_points = weekly_local_points_from_sources(
+            observed_at,
+            calls,
+            limits,
+            partial_reasons,
+            local_coverage_starts_at,
+        );
+        Self {
+            observed_at,
+            quota_points: quota_points_from_limits(limits),
+            half_hour_buckets: half_hour_buckets_from_calls(
+                observed_at,
+                calls,
+                partial_reasons,
+                local_coverage_starts_at,
+            ),
+            weekly_local_points,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HistoryData {
+    pub quota_points: Vec<QuotaPoint>,
+    pub half_hour_buckets: Vec<LocalHalfHourBucket>,
+    pub weekly_local_points: Vec<WeeklyLocalPoint>,
+    pub warnings: Vec<String>,
+    pub read_only: bool,
+}
+
+impl HistoryData {
+    pub fn remaining_series(&self, duration_mins: i64) -> Vec<QuotaPoint> {
+        self.quota_points
+            .iter()
+            .filter(|point| point.duration_mins == duration_mins)
+            .cloned()
+            .collect()
+    }
+
+    pub fn half_hour_series(&self) -> &[LocalHalfHourBucket] {
+        &self.half_hour_buckets
+    }
+
+    pub fn latest_weekly_reset(&self) -> Option<DateTime<Utc>> {
+        self.quota_points
+            .iter()
+            .filter(|point| point.duration_mins == WEEK_MINS)
+            .map(|point| (point.observed_at, point.resets_at))
+            .chain(
+                self.weekly_local_points
+                    .iter()
+                    .map(|point| (point.observed_at, point.resets_at)),
+            )
+            .max_by_key(|(observed_at, _)| *observed_at)
+            .map(|(_, resets_at)| resets_at)
+    }
+
+    pub fn estimated_half_hour_series(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+    ) -> Vec<HalfHourSeriesPoint> {
+        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        let boundary_crosses_bucket = cycle_starts_at.timestamp().rem_euclid(HALF_HOUR_SECS) != 0;
+        let cycle = self.weekly_cycle_buckets(weekly_resets_at);
+        let estimate = self.estimate_context(weekly_resets_at, &cycle);
+        cycle
+            .into_iter()
+            .map(|bucket| {
+                let mut partial_reasons = bucket
+                    .partial_reasons
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if boundary_crosses_bucket {
+                    partial_reasons
+                        .insert("reset_boundary_excludes_partial_half_hour_buckets".to_string());
+                }
+                if !estimate.revisions_are_consistent {
+                    partial_reasons.insert("estimator_revision_changed".to_string());
+                }
+                HalfHourSeriesPoint {
+                    starts_at: bucket.starts_at,
+                    ends_at: bucket.ends_at,
+                    token_usage: bucket.token_usage,
+                    estimated_cost_units: bucket.estimated_cost_units,
+                    estimated_quota_percent: estimate.percent_for(bucket.estimated_cost_units),
+                    estimator_revision: bucket.estimator_revision,
+                    partial_reasons: partial_reasons.into_iter().collect(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn weekly_cumulative_series(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+    ) -> Vec<WeeklyCumulativePoint> {
+        if let Some(points) = self.recorded_weekly_cumulative_series(weekly_resets_at) {
+            return points;
+        }
+        self.derived_weekly_cumulative_series(weekly_resets_at)
+    }
+
+    fn recorded_weekly_cumulative_series(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+    ) -> Option<Vec<WeeklyCumulativePoint>> {
+        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        let mut recorded = self
+            .weekly_local_points
+            .iter()
+            .filter(|point| {
+                (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+                    && point.observed_at >= cycle_starts_at
+                    && point.observed_at < weekly_resets_at
+            })
+            .collect::<Vec<_>>();
+        recorded.sort_by_key(|point| point.observed_at);
+        if recorded.is_empty() {
+            return None;
+        }
+        let revisions = recorded
+            .iter()
+            .map(|point| point.estimator_revision)
+            .collect::<BTreeSet<_>>();
+        let revisions_are_consistent = revisions.len() <= 1;
+        let estimator_revision = revisions.iter().next().copied().unwrap_or_default();
+        let latest = recorded
+            .iter()
+            .max_by_key(|point| point.observed_at)
+            .copied()
+            .expect("recorded weekly points are non-empty");
+        let used_percent = self.latest_weekly_used_percent(weekly_resets_at);
+        let estimate_percent = |cost_units: u128| {
+            if !revisions_are_consistent || latest.estimated_cost_units == 0 {
+                return None;
+            }
+            used_percent.map(|used| used * cost_units as f64 / latest.estimated_cost_units as f64)
+        };
+        let mut initial_reasons = recorded
+            .first()
+            .into_iter()
+            .flat_map(|point| point.partial_reasons.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if !revisions_are_consistent {
+            initial_reasons.insert("estimator_revision_changed".to_string());
+        }
+        let mut points = vec![WeeklyCumulativePoint {
+            at: cycle_starts_at,
+            token_usage: TokenUsage::default(),
+            estimated_cost_units: 0,
+            estimated_quota_percent: estimate_percent(0),
+            estimator_revision,
+            partial_reasons: initial_reasons.into_iter().collect(),
+        }];
+        points.extend(recorded.into_iter().map(|point| {
+            let mut partial_reasons = point
+                .partial_reasons
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !revisions_are_consistent {
+                partial_reasons.insert("estimator_revision_changed".to_string());
+            }
+            WeeklyCumulativePoint {
+                at: point.observed_at.min(weekly_resets_at),
+                token_usage: point.token_usage,
+                estimated_cost_units: point.estimated_cost_units,
+                estimated_quota_percent: estimate_percent(point.estimated_cost_units),
+                estimator_revision,
+                partial_reasons: partial_reasons.into_iter().collect(),
+            }
+        }));
+        let mut projected = points
+            .into_iter()
+            .map(|point| (point.at, point))
+            .collect::<BTreeMap<_, _>>();
+        let mut buckets = self.weekly_cycle_buckets(weekly_resets_at);
+        buckets.sort_by_key(|bucket| bucket.starts_at);
+        for bucket in buckets {
+            if !confirmed_zero_bucket(bucket) || projected.contains_key(&bucket.ends_at) {
+                continue;
+            }
+            let Some(anchor) = projected
+                .range(..=bucket.ends_at)
+                .next_back()
+                .map(|(_, point)| point.clone())
+            else {
+                continue;
+            };
+            if anchor.at < bucket.starts_at {
+                continue;
+            }
+            projected.insert(
+                bucket.ends_at,
+                WeeklyCumulativePoint {
+                    at: bucket.ends_at,
+                    ..anchor
+                },
+            );
+        }
+        Some(projected.into_values().collect())
+    }
+
+    fn derived_weekly_cumulative_series(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+    ) -> Vec<WeeklyCumulativePoint> {
+        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        let buckets = self.weekly_cycle_buckets(weekly_resets_at);
+        let estimate = self.estimate_context(weekly_resets_at, &buckets);
+        let boundary_crosses_bucket = cycle_starts_at.timestamp().rem_euclid(HALF_HOUR_SECS) != 0;
+        let mut token_usage = TokenUsage::default();
+        let mut estimated_cost_units = 0_u128;
+        let mut partial_reasons = BTreeSet::new();
+        if boundary_crosses_bucket {
+            partial_reasons.insert("reset_boundary_excludes_partial_half_hour_buckets".to_string());
+        }
+        if !estimate.revisions_are_consistent {
+            partial_reasons.insert("estimator_revision_changed".to_string());
+        }
+
+        let mut points = vec![WeeklyCumulativePoint {
+            at: cycle_starts_at,
+            token_usage,
+            estimated_cost_units,
+            estimated_quota_percent: estimate.percent_for(0),
+            estimator_revision: estimate.estimator_revision,
+            partial_reasons: partial_reasons.iter().cloned().collect(),
+        }];
+        for bucket in buckets {
+            token_usage.add_assign(bucket.token_usage);
+            estimated_cost_units = estimated_cost_units.saturating_add(bucket.estimated_cost_units);
+            partial_reasons.extend(bucket.partial_reasons.iter().cloned());
+            points.push(WeeklyCumulativePoint {
+                at: bucket.sampled_at.min(bucket.ends_at).min(weekly_resets_at),
+                token_usage,
+                estimated_cost_units,
+                estimated_quota_percent: estimate.percent_for(estimated_cost_units),
+                estimator_revision: estimate.estimator_revision,
+                partial_reasons: partial_reasons.iter().cloned().collect(),
+            });
+        }
+        points
+    }
+
+    fn latest_weekly_used_percent(&self, weekly_resets_at: DateTime<Utc>) -> Option<f64> {
+        self.quota_points
+            .iter()
+            .filter(|point| {
+                point.duration_mins == WEEK_MINS
+                    && (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+            })
+            .max_by_key(|point| point.observed_at)
+            .map(|point| point.used_percent)
+    }
+
+    fn weekly_cycle_buckets(&self, weekly_resets_at: DateTime<Utc>) -> Vec<&LocalHalfHourBucket> {
+        let starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        self.half_hour_buckets
+            .iter()
+            // A half-hour aggregate cannot be split accurately after the fact. Keep
+            // only buckets wholly inside the quota cycle so a non-aligned reset
+            // never imports usage from the preceding or following cycle.
+            .filter(|bucket| bucket.starts_at >= starts_at && bucket.ends_at <= weekly_resets_at)
+            .collect()
+    }
+
+    fn estimate_context(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        buckets: &[&LocalHalfHourBucket],
+    ) -> EstimateContext {
+        let revisions = buckets
+            .iter()
+            .map(|bucket| bucket.estimator_revision)
+            .collect::<BTreeSet<_>>();
+        let revisions_are_consistent = revisions.len() <= 1;
+        let estimator_revision = revisions.iter().next().copied().unwrap_or_default();
+        let total_cost_units = buckets.iter().fold(0_u128, |total, bucket| {
+            total.saturating_add(bucket.estimated_cost_units)
+        });
+        let weekly_point = self
+            .weekly_local_points
+            .iter()
+            .filter(|point| {
+                (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+            })
+            .max_by_key(|point| point.observed_at);
+        let total_cost_units = weekly_point
+            .map(|point| point.estimated_cost_units)
+            .unwrap_or(total_cost_units);
+        let revisions_are_consistent = revisions_are_consistent
+            && weekly_point.is_none_or(|point| {
+                revisions.is_empty() || revisions.contains(&point.estimator_revision)
+            });
+        let estimator_revision = weekly_point
+            .map(|point| point.estimator_revision)
+            .unwrap_or(estimator_revision);
+        let used_percent = self.latest_weekly_used_percent(weekly_resets_at);
+        EstimateContext {
+            used_percent,
+            total_cost_units,
+            estimator_revision,
+            revisions_are_consistent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HalfHourSeriesPoint {
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    pub estimated_quota_percent: Option<f64>,
+    pub estimator_revision: u32,
+    pub partial_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeeklyCumulativePoint {
+    pub at: DateTime<Utc>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    pub estimated_quota_percent: Option<f64>,
+    pub estimator_revision: u32,
+    pub partial_reasons: Vec<String>,
+}
+
+struct EstimateContext {
+    used_percent: Option<f64>,
+    total_cost_units: u128,
+    estimator_revision: u32,
+    revisions_are_consistent: bool,
+}
+
+fn confirmed_zero_bucket(bucket: &LocalHalfHourBucket) -> bool {
+    bucket.sampled_at == bucket.ends_at
+        && bucket.token_usage.is_zero()
+        && bucket.estimated_cost_units == 0
+        && bucket.call_count == 0
+        && bucket.partial_reasons.is_empty()
+}
+
+impl EstimateContext {
+    fn percent_for(&self, cost_units: u128) -> Option<f64> {
+        if !self.revisions_are_consistent || self.total_cost_units == 0 {
+            return None;
+        }
+        self.used_percent
+            .map(|used_percent| used_percent * cost_units as f64 / self.total_cost_units as f64)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryWriteReport {
+    pub shards_written: usize,
+    pub shards_skipped: usize,
+    pub shards_pruned: usize,
+    pub warnings: Vec<String>,
+    pub read_only: bool,
+}
+
+#[derive(Debug)]
+pub struct HistoryStore {
+    history_root: Option<PathBuf>,
+    namespace: String,
+    namespace_dir: Option<PathBuf>,
+    read_only: bool,
+    namespace_checked: bool,
+    last_full_merge_at: Option<DateTime<Utc>>,
+    cached_since: Option<DateTime<Utc>>,
+    cached_data: Option<HistoryData>,
+    cache_loaded_at: Option<Instant>,
+}
+
+impl HistoryStore {
+    pub fn discover(codex_home: &Path) -> Self {
+        Self::from_optional_root(default_history_root(), codex_home)
+    }
+
+    pub fn new(history_root: PathBuf, codex_home: &Path) -> Self {
+        Self::from_optional_root(Some(history_root), codex_home)
+    }
+
+    fn from_optional_root(history_root: Option<PathBuf>, codex_home: &Path) -> Self {
+        let namespace = history_namespace(codex_home);
+        let namespace_dir = history_root.as_ref().map(|root| root.join(&namespace));
+        Self {
+            history_root,
+            namespace,
+            namespace_dir,
+            read_only: false,
+            namespace_checked: false,
+            last_full_merge_at: None,
+            cached_since: None,
+            cached_data: None,
+            cache_loaded_at: None,
+        }
+    }
+
+    pub fn history_root(&self) -> Option<&Path> {
+        self.history_root.as_deref()
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn namespace_dir(&self) -> Option<&Path> {
+        self.namespace_dir.as_deref()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn record(&mut self, observation: &HistoryObservation) -> io::Result<HistoryWriteReport> {
+        let mut report = HistoryWriteReport::default();
+        let Some(directory) = self.namespace_dir.as_deref() else {
+            report
+                .warnings
+                .push("history state directory is unavailable".to_string());
+            return Ok(report);
+        };
+        if self.read_only {
+            report.read_only = true;
+            return Ok(report);
+        }
+
+        create_private_directory(directory)?;
+        let lock = open_lock_file(directory)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+
+        if !self.namespace_checked {
+            let preflight = inspect_namespace(directory, &self.namespace);
+            report.warnings.extend(preflight.warnings);
+            if preflight.future_version {
+                self.read_only = true;
+                self.cached_data = None;
+                report.read_only = true;
+                return Ok(report);
+            }
+            self.namespace_checked = true;
+        }
+
+        let cutoff = observation.observed_at - Duration::days(HISTORY_RETENTION_DAYS);
+        let full_merge = self.last_full_merge_at.is_none_or(|last| {
+            observation.observed_at < last
+                || observation.observed_at - last >= Duration::seconds(FULL_HISTORY_MERGE_SECS)
+        });
+        let additions = additions_by_day(observation, cutoff, full_merge);
+        for (day, additions) in additions {
+            let path = shard_path(directory, day);
+            let mut shard = match read_shard(&path, &self.namespace, day) {
+                ShardRead::Missing => HistoryShard::new(self.namespace.clone(), day),
+                ShardRead::Current(shard) => shard,
+                ShardRead::Future(version) => {
+                    self.read_only = true;
+                    self.cached_data = None;
+                    report.read_only = true;
+                    report.warnings.push(format!(
+                        "{} uses future history format version {version}; writes are disabled",
+                        path.display()
+                    ));
+                    return Ok(report);
+                }
+                ShardRead::Corrupt(message) => {
+                    report.shards_skipped += 1;
+                    report.warnings.push(message);
+                    continue;
+                }
+            };
+            let mut changed = shard.retain_since(cutoff);
+            for point in additions.quota_points {
+                changed |= upsert_quota_point(&mut shard.quota_points, point);
+            }
+            for bucket in additions.half_hour_buckets {
+                changed |= upsert_half_hour_bucket(&mut shard.half_hour_buckets, bucket);
+            }
+            for point in additions.weekly_local_points {
+                changed |= upsert_weekly_local_point(&mut shard.weekly_local_points, point);
+            }
+            if !changed {
+                report.shards_skipped += 1;
+                continue;
+            }
+            shard.sort();
+            if let Err(error) = write_shard_atomically(&path, &shard) {
+                self.cached_data = None;
+                return Err(error);
+            }
+            report.shards_written += 1;
+        }
+
+        if full_merge {
+            report.shards_pruned =
+                prune_old_shards(directory, cutoff.date_naive(), &mut report.warnings);
+            self.last_full_merge_at = Some(observation.observed_at);
+        }
+        report.read_only = self.read_only;
+        if report.warnings.is_empty() {
+            self.merge_cached_observation(observation, full_merge);
+        } else {
+            self.cached_data = None;
+        }
+        Ok(report)
+    }
+
+    pub fn load_since(&mut self, since: DateTime<Utc>) -> HistoryData {
+        if self.cached_since == Some(since)
+            && self
+                .cache_loaded_at
+                .is_some_and(|loaded| loaded.elapsed() < HISTORY_READ_CACHE_TTL)
+            && let Some(data) = self.cached_data.as_ref()
+        {
+            let mut data = data.clone();
+            data.read_only = self.read_only;
+            return data;
+        }
+        let mut data = HistoryData::default();
+        let Some(directory) = self.namespace_dir.as_deref() else {
+            data.warnings
+                .push("history state directory is unavailable".to_string());
+            return data;
+        };
+        if !directory.is_dir() {
+            return data;
+        }
+        let lock = match open_lock_file(directory) {
+            Ok(lock) => lock,
+            Err(error) => {
+                data.warnings.push(format!(
+                    "could not open history lock in {}: {error}",
+                    directory.display()
+                ));
+                return data;
+            }
+        };
+        if let Err(error) = fs2::FileExt::lock_shared(&lock) {
+            data.warnings.push(format!(
+                "could not lock history in {}: {error}",
+                directory.display()
+            ));
+            return data;
+        }
+
+        let entries = match shard_entries(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                data.warnings.push(format!(
+                    "could not list history in {}: {error}",
+                    directory.display()
+                ));
+                return data;
+            }
+        };
+        for (day, path) in entries {
+            if day < since.date_naive() - Duration::days(1) {
+                continue;
+            }
+            match read_shard(&path, &self.namespace, day) {
+                ShardRead::Current(shard) => {
+                    data.quota_points.extend(
+                        shard
+                            .quota_points
+                            .into_iter()
+                            .filter(|point| point.observed_at >= since),
+                    );
+                    data.half_hour_buckets.extend(
+                        shard
+                            .half_hour_buckets
+                            .into_iter()
+                            .filter(|bucket| bucket.ends_at > since),
+                    );
+                    data.weekly_local_points.extend(
+                        shard
+                            .weekly_local_points
+                            .into_iter()
+                            .filter(|point| point.observed_at >= since),
+                    );
+                }
+                ShardRead::Future(version) => {
+                    self.read_only = true;
+                    data.warnings.push(format!(
+                        "{} uses future history format version {version}; writes are disabled",
+                        path.display()
+                    ));
+                }
+                ShardRead::Corrupt(message) => data.warnings.push(message),
+                ShardRead::Missing => {}
+            }
+        }
+        normalize_loaded_data(&mut data);
+        data.read_only = self.read_only;
+        self.cached_since = Some(since);
+        self.cached_data = Some(data.clone());
+        self.cache_loaded_at = Some(Instant::now());
+        data
+    }
+
+    pub fn reload_since_if_stale(&mut self, since: DateTime<Utc>) -> Option<HistoryData> {
+        let cache_is_fresh = self.cached_since == Some(since)
+            && self
+                .cache_loaded_at
+                .is_some_and(|loaded| loaded.elapsed() < HISTORY_READ_CACHE_TTL)
+            && self.cached_data.is_some();
+        (!cache_is_fresh).then(|| self.load_since(since))
+    }
+
+    fn merge_cached_observation(&mut self, observation: &HistoryObservation, full_merge: bool) {
+        let (Some(since), Some(data)) = (self.cached_since, self.cached_data.as_mut()) else {
+            return;
+        };
+        for point in &observation.quota_points {
+            if point.observed_at >= since {
+                let _ = upsert_quota_point(&mut data.quota_points, point.clone());
+            }
+        }
+        let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+        for bucket in &observation.half_hour_buckets {
+            if bucket.ends_at > since && (full_merge || bucket.ends_at > recent_cutoff) {
+                let _ = upsert_half_hour_bucket(&mut data.half_hour_buckets, bucket.clone());
+            }
+        }
+        for point in &observation.weekly_local_points {
+            if point.observed_at >= since && (full_merge || point.observed_at > recent_cutoff) {
+                let _ = upsert_weekly_local_point(&mut data.weekly_local_points, point.clone());
+            }
+        }
+        data.quota_points.retain(|point| point.observed_at >= since);
+        data.half_hour_buckets
+            .retain(|bucket| bucket.ends_at > since);
+        data.weekly_local_points
+            .retain(|point| point.observed_at >= since);
+        normalize_loaded_data(data);
+        data.read_only = self.read_only;
+    }
+}
+
+#[derive(Default)]
+struct DayAdditions {
+    quota_points: Vec<QuotaPoint>,
+    half_hour_buckets: Vec<LocalHalfHourBucket>,
+    weekly_local_points: Vec<WeeklyLocalPoint>,
+}
+
+fn additions_by_day(
+    observation: &HistoryObservation,
+    cutoff: DateTime<Utc>,
+    full_merge: bool,
+) -> BTreeMap<NaiveDate, DayAdditions> {
+    let mut additions: BTreeMap<NaiveDate, DayAdditions> = BTreeMap::new();
+    for point in &observation.quota_points {
+        if point.observed_at >= cutoff {
+            additions
+                .entry(point.observed_at.date_naive())
+                .or_default()
+                .quota_points
+                .push(point.clone());
+        }
+    }
+    let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+    for bucket in &observation.half_hour_buckets {
+        if bucket.ends_at > cutoff && (full_merge || bucket.ends_at > recent_cutoff) {
+            additions
+                .entry(bucket.starts_at.date_naive())
+                .or_default()
+                .half_hour_buckets
+                .push(bucket.clone());
+        }
+    }
+    for point in &observation.weekly_local_points {
+        if point.observed_at >= cutoff && (full_merge || point.observed_at > recent_cutoff) {
+            additions
+                .entry(point.observed_at.date_naive())
+                .or_default()
+                .weekly_local_points
+                .push(point.clone());
+        }
+    }
+    additions
+}
+
+fn quota_points_from_limits(limits: &[LimitBucket]) -> Vec<QuotaPoint> {
+    let mut selected: BTreeMap<i64, QuotaPoint> = BTreeMap::new();
+    for bucket in limits {
+        if bucket.provenance != Provenance::ServerSnapshot
+            || !bucket.limit_id.trim().eq_ignore_ascii_case("codex")
+        {
+            continue;
+        }
+        for window in [bucket.primary.as_ref(), bucket.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let Some(duration_mins) = window.window_duration_mins else {
+                continue;
+            };
+            if !matches!(duration_mins, FIVE_HOURS_MINS | WEEK_MINS)
+                || !window.used_percent.is_finite()
+                || !window.remaining_percent.is_finite()
+            {
+                continue;
+            }
+            let Some(resets_at) = window.resets_at else {
+                continue;
+            };
+            let starts_at = resets_at - Duration::minutes(duration_mins);
+            if bucket.as_of < starts_at - Duration::seconds(RESET_DRIFT_SECS)
+                || bucket.as_of >= resets_at
+            {
+                continue;
+            }
+            let point = QuotaPoint {
+                observed_at: bucket.as_of,
+                limit_id: bucket.limit_id.clone(),
+                duration_mins,
+                resets_at,
+                used_percent: window.used_percent.clamp(0.0, 100.0),
+                remaining_percent: window.remaining_percent.clamp(0.0, 100.0),
+                provenance: bucket.provenance,
+            };
+            let replace = selected
+                .get(&duration_mins)
+                .is_none_or(|current| point.observed_at > current.observed_at);
+            if replace {
+                selected.insert(duration_mins, point);
+            }
+        }
+    }
+    selected.into_values().collect()
+}
+
+fn weekly_local_points_from_sources(
+    observed_at: DateTime<Utc>,
+    calls: &[UsageCall],
+    limits: &[LimitBucket],
+    partial_reasons: &[String],
+    local_coverage_starts_at: Option<DateTime<Utc>>,
+) -> Vec<WeeklyLocalPoint> {
+    let mut selected = None;
+    for bucket in limits {
+        if !bucket.limit_id.trim().eq_ignore_ascii_case("codex")
+            || !matches!(
+                bucket.provenance,
+                Provenance::ServerSnapshot | Provenance::Stale
+            )
+        {
+            continue;
+        }
+        for window in [bucket.primary.as_ref(), bucket.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if window.window_duration_mins != Some(WEEK_MINS) {
+                continue;
+            }
+            let Some(resets_at) = window.resets_at else {
+                continue;
+            };
+            let starts_at = resets_at - Duration::minutes(WEEK_MINS);
+            if observed_at < starts_at - Duration::seconds(RESET_DRIFT_SECS)
+                || observed_at >= resets_at
+            {
+                continue;
+            }
+            let candidate = (bucket.as_of, resets_at, bucket.provenance);
+            if selected.is_none_or(
+                |(selected_as_of, _, _): (DateTime<Utc>, DateTime<Utc>, Provenance)| {
+                    candidate.0 > selected_as_of
+                },
+            ) {
+                selected = Some(candidate);
+            }
+        }
+    }
+    let Some((_, resets_at, provenance)) = selected else {
+        return Vec::new();
+    };
+    let starts_at = resets_at - Duration::minutes(WEEK_MINS);
+    let mut buckets = BTreeMap::<DateTime<Utc>, WeeklyAccumulator>::new();
+    let mut first_call_bucket = None;
+    for call in calls {
+        if call.timestamp < starts_at
+            || call.timestamp > observed_at
+            || call.timestamp >= resets_at
+            || is_spark_model(call.model.as_deref())
+        {
+            continue;
+        }
+        let bucket_starts_at = floor_half_hour(call.timestamp);
+        first_call_bucket = Some(
+            first_call_bucket.map_or(bucket_starts_at, |first: DateTime<Utc>| {
+                first.min(bucket_starts_at)
+            }),
+        );
+        let bucket = buckets.entry(bucket_starts_at).or_default();
+        let weight = estimate_call_weight(call);
+        bucket.token_usage.add_assign(call.tokens);
+        bucket.estimated_cost_units = bucket.estimated_cost_units.saturating_add(weight.units);
+        bucket.call_count = bucket.call_count.saturating_add(1);
+        if weight.used_model_fallback {
+            bucket
+                .partial_reasons
+                .insert("unpriced_model_rate_fallback".to_string());
+        }
+        if weight.used_token_breakdown_fallback {
+            bucket
+                .partial_reasons
+                .insert("token_breakdown_missing".to_string());
+        }
+    }
+
+    let last_bucket = floor_half_hour(observed_at);
+    let materialize_zeros = local_coverage_starts_at.is_some();
+    let first_bucket = local_coverage_starts_at
+        .map(|coverage| floor_half_hour(coverage.max(starts_at)))
+        .or(first_call_bucket)
+        .unwrap_or(last_bucket);
+    if materialize_zeros {
+        let mut bucket_starts_at = first_bucket;
+        while bucket_starts_at <= last_bucket {
+            buckets.entry(bucket_starts_at).or_default();
+            bucket_starts_at += Duration::seconds(HALF_HOUR_SECS);
+        }
+    } else {
+        buckets.entry(last_bucket).or_default();
+    }
+
+    let mut token_usage = TokenUsage::default();
+    let mut estimated_cost_units = 0_u128;
+    let mut call_count = 0_u64;
+    let mut reasons = partial_reasons.iter().cloned().collect::<BTreeSet<_>>();
+    if provenance != Provenance::ServerSnapshot {
+        reasons.insert("weekly_window_stale".to_string());
+    }
+    buckets
+        .into_iter()
+        .filter(|(bucket_starts_at, _)| *bucket_starts_at >= first_bucket)
+        .map(|(bucket_starts_at, bucket)| {
+            token_usage.add_assign(bucket.token_usage);
+            estimated_cost_units = estimated_cost_units.saturating_add(bucket.estimated_cost_units);
+            call_count = call_count.saturating_add(bucket.call_count);
+            reasons.extend(bucket.partial_reasons);
+            WeeklyLocalPoint {
+                observed_at: (bucket_starts_at + Duration::seconds(HALF_HOUR_SECS))
+                    .min(observed_at),
+                resets_at,
+                token_usage,
+                estimated_cost_units,
+                estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                call_count,
+                partial_reasons: reasons.iter().cloned().collect(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct WeeklyAccumulator {
+    token_usage: TokenUsage,
+    estimated_cost_units: u128,
+    call_count: u64,
+    partial_reasons: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct BucketAccumulator {
+    token_usage: TokenUsage,
+    estimated_cost_units: u128,
+    call_count: u64,
+    groups: BTreeMap<(Option<String>, Option<String>), LocalUsageGroup>,
+    partial_reasons: BTreeSet<String>,
+}
+
+fn half_hour_buckets_from_calls(
+    observed_at: DateTime<Utc>,
+    calls: &[UsageCall],
+    partial_reasons: &[String],
+    local_coverage_starts_at: Option<DateTime<Utc>>,
+) -> Vec<LocalHalfHourBucket> {
+    let mut buckets: BTreeMap<DateTime<Utc>, BucketAccumulator> = BTreeMap::new();
+    for call in calls {
+        if call.timestamp > observed_at || is_spark_model(call.model.as_deref()) {
+            continue;
+        }
+        let starts_at = floor_half_hour(call.timestamp);
+        let bucket = buckets.entry(starts_at).or_default();
+        let weight = estimate_call_weight(call);
+        bucket.token_usage.add_assign(call.tokens);
+        bucket.estimated_cost_units = bucket.estimated_cost_units.saturating_add(weight.units);
+        bucket.call_count = bucket.call_count.saturating_add(1);
+        bucket
+            .partial_reasons
+            .extend(partial_reasons.iter().cloned());
+        if weight.used_model_fallback {
+            bucket
+                .partial_reasons
+                .insert("unpriced_model_rate_fallback".to_string());
+        }
+        if weight.used_token_breakdown_fallback {
+            bucket
+                .partial_reasons
+                .insert("token_breakdown_missing".to_string());
+        }
+
+        let key = (
+            normalized_optional(&call.model),
+            normalized_optional(&call.service_tier),
+        );
+        let group = bucket
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| LocalUsageGroup {
+                model: key.0,
+                service_tier: key.1,
+                ..LocalUsageGroup::default()
+            });
+        group.token_usage.add_assign(call.tokens);
+        group.estimated_cost_units = group.estimated_cost_units.saturating_add(weight.units);
+        group.call_count = group.call_count.saturating_add(1);
+        group.used_model_fallback |= weight.used_model_fallback;
+        group.used_token_breakdown_fallback |= weight.used_token_breakdown_fallback;
+    }
+
+    if let Some(coverage_starts_at) =
+        local_coverage_starts_at.filter(|starts_at| *starts_at <= observed_at)
+    {
+        let first_bucket = floor_half_hour(coverage_starts_at);
+        let last_bucket = floor_half_hour(observed_at);
+        let mut starts_at = first_bucket;
+        while starts_at <= last_bucket {
+            let bucket = buckets.entry(starts_at).or_default();
+            if starts_at == first_bucket && coverage_starts_at > first_bucket {
+                bucket
+                    .partial_reasons
+                    .insert("coverage_starts_within_half_hour_bucket".to_string());
+            }
+            starts_at += Duration::seconds(HALF_HOUR_SECS);
+        }
+    }
+
+    buckets
+        .into_iter()
+        .map(|(starts_at, bucket)| {
+            let ends_at = starts_at + Duration::seconds(HALF_HOUR_SECS);
+            LocalHalfHourBucket {
+                starts_at,
+                ends_at,
+                // Closed buckets are stable across later full-lookback observations. The
+                // open bucket retains the exact observation time so it can be replaced.
+                sampled_at: observed_at.min(ends_at),
+                token_usage: bucket.token_usage,
+                estimated_cost_units: bucket.estimated_cost_units,
+                estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                call_count: bucket.call_count,
+                groups: bucket.groups.into_values().collect(),
+                partial_reasons: bucket.partial_reasons.into_iter().collect(),
+            }
+        })
+        .collect()
+}
+
+fn normalized_optional(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn floor_half_hour(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = timestamp.timestamp().div_euclid(HALF_HOUR_SECS) * HALF_HOUR_SECS;
+    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid half-hour floor")
+}
+
+fn is_exact_half_hour_boundary(timestamp: DateTime<Utc>) -> bool {
+    timestamp.timestamp().rem_euclid(HALF_HOUR_SECS) == 0 && timestamp.timestamp_subsec_nanos() == 0
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryShard {
+    format_version: u32,
+    metric_revision: u32,
+    namespace: String,
+    utc_day: NaiveDate,
+    #[serde(default)]
+    quota_points: Vec<QuotaPoint>,
+    #[serde(default)]
+    half_hour_buckets: Vec<LocalHalfHourBucket>,
+    #[serde(default)]
+    weekly_local_points: Vec<WeeklyLocalPoint>,
+}
+
+impl HistoryShard {
+    fn new(namespace: String, utc_day: NaiveDate) -> Self {
+        Self {
+            format_version: HISTORY_FORMAT_VERSION,
+            metric_revision: HISTORY_METRIC_REVISION,
+            namespace,
+            utc_day,
+            quota_points: Vec::new(),
+            half_hour_buckets: Vec::new(),
+            weekly_local_points: Vec::new(),
+        }
+    }
+
+    fn retain_since(&mut self, cutoff: DateTime<Utc>) -> bool {
+        let quota_len = self.quota_points.len();
+        let bucket_len = self.half_hour_buckets.len();
+        let weekly_len = self.weekly_local_points.len();
+        self.quota_points
+            .retain(|point| point.observed_at >= cutoff);
+        self.half_hour_buckets
+            .retain(|bucket| bucket.ends_at > cutoff);
+        self.weekly_local_points
+            .retain(|point| point.observed_at >= cutoff);
+        quota_len != self.quota_points.len()
+            || bucket_len != self.half_hour_buckets.len()
+            || weekly_len != self.weekly_local_points.len()
+    }
+
+    fn sort(&mut self) {
+        self.quota_points.sort_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+                .then_with(|| left.resets_at.cmp(&right.resets_at))
+        });
+        self.half_hour_buckets
+            .sort_by_key(|bucket| bucket.starts_at);
+        self.weekly_local_points
+            .sort_by_key(|point| point.observed_at);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionProbe {
+    format_version: Option<u32>,
+}
+
+enum ShardRead {
+    Missing,
+    Current(HistoryShard),
+    Future(u32),
+    Corrupt(String),
+}
+
+fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ShardRead::Missing,
+        Err(error) => {
+            return ShardRead::Corrupt(format!(
+                "could not read history shard {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let probe = match serde_json::from_slice::<VersionProbe>(&contents) {
+        Ok(probe) => probe,
+        Err(error) => {
+            return ShardRead::Corrupt(format!(
+                "history shard {} is malformed: {error}",
+                path.display()
+            ));
+        }
+    };
+    let Some(version) = probe.format_version else {
+        return ShardRead::Corrupt(format!(
+            "history shard {} is missing formatVersion",
+            path.display()
+        ));
+    };
+    if version > HISTORY_FORMAT_VERSION {
+        return ShardRead::Future(version);
+    }
+    if version != HISTORY_FORMAT_VERSION {
+        return ShardRead::Corrupt(format!(
+            "history shard {} has unsupported format version {version}",
+            path.display()
+        ));
+    }
+    let shard = match serde_json::from_slice::<HistoryShard>(&contents) {
+        Ok(shard) => shard,
+        Err(error) => {
+            return ShardRead::Corrupt(format!(
+                "history shard {} could not be decoded: {error}",
+                path.display()
+            ));
+        }
+    };
+    if shard.namespace != namespace {
+        return ShardRead::Corrupt(format!(
+            "history shard {} belongs to namespace {}, expected {namespace}",
+            path.display(),
+            shard.namespace
+        ));
+    }
+    if shard.utc_day != day {
+        return ShardRead::Corrupt(format!(
+            "history shard {} declares {}, expected {day}",
+            path.display(),
+            shard.utc_day
+        ));
+    }
+    ShardRead::Current(shard)
+}
+
+fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
+    let slot = incoming
+        .observed_at
+        .timestamp()
+        .div_euclid(QUOTA_SAMPLE_SECS);
+    let existing = points.iter().position(|point| {
+        point.duration_mins == incoming.duration_mins
+            && point.limit_id.eq_ignore_ascii_case(&incoming.limit_id)
+            && point.observed_at.timestamp().div_euclid(QUOTA_SAMPLE_SECS) == slot
+            && (point.resets_at - incoming.resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+    });
+    if let Some(index) = existing {
+        if quota_point_payload_eq(&incoming, &points[index]) {
+            return false;
+        }
+        let replace = incoming.observed_at > points[index].observed_at
+            || (incoming.observed_at == points[index].observed_at
+                && (incoming.used_percent, -incoming.remaining_percent)
+                    > (points[index].used_percent, -points[index].remaining_percent));
+        if replace {
+            points[index] = incoming;
+            true
+        } else {
+            false
+        }
+    } else {
+        points.push(incoming);
+        true
+    }
+}
+
+fn upsert_half_hour_bucket(
+    buckets: &mut Vec<LocalHalfHourBucket>,
+    incoming: LocalHalfHourBucket,
+) -> bool {
+    let existing = buckets
+        .iter()
+        .position(|bucket| bucket.starts_at == incoming.starts_at);
+    if let Some(index) = existing {
+        if half_hour_bucket_payload_eq(&incoming, &buckets[index]) {
+            let closes_open_bucket = buckets[index].sampled_at < buckets[index].ends_at
+                && incoming.sampled_at == incoming.ends_at;
+            if closes_open_bucket {
+                buckets[index] = incoming;
+                return true;
+            }
+            return false;
+        }
+        if should_replace_half_hour_bucket(&incoming, &buckets[index]) {
+            buckets[index] = incoming;
+            true
+        } else {
+            false
+        }
+    } else {
+        buckets.push(incoming);
+        true
+    }
+}
+
+fn upsert_weekly_local_point(
+    points: &mut Vec<WeeklyLocalPoint>,
+    incoming: WeeklyLocalPoint,
+) -> bool {
+    let incoming_is_boundary = is_exact_half_hour_boundary(incoming.observed_at);
+    let slot = incoming
+        .observed_at
+        .timestamp()
+        .div_euclid(QUOTA_SAMPLE_SECS);
+    let same_cycle = |point: &&WeeklyLocalPoint| {
+        (point.resets_at - incoming.resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+    };
+    if let Some(index) = points.iter().position(|point| {
+        same_cycle(&point)
+            && point.observed_at.timestamp().div_euclid(QUOTA_SAMPLE_SECS) == slot
+            && is_exact_half_hour_boundary(point.observed_at) == incoming_is_boundary
+    }) {
+        if weekly_local_point_payload_eq(&incoming, &points[index]) {
+            return false;
+        }
+        if should_replace_weekly_local_point(&incoming, &points[index]) {
+            points[index] = incoming;
+            return true;
+        }
+        return false;
+    }
+
+    let latest = points
+        .iter()
+        .filter(same_cycle)
+        .max_by_key(|point| point.observed_at);
+    if let Some(latest) = latest {
+        if weekly_local_point_payload_eq(&incoming, latest) {
+            if incoming_is_boundary {
+                points.push(incoming);
+                return true;
+            }
+            return false;
+        }
+        if incoming.observed_at > latest.observed_at
+            && weekly_evidence_dominates(latest, &incoming)
+            && collection_issue_count(&latest.partial_reasons)
+                <= collection_issue_count(&incoming.partial_reasons)
+        {
+            return false;
+        }
+    }
+    points.push(incoming);
+    true
+}
+
+fn quota_point_payload_eq(left: &QuotaPoint, right: &QuotaPoint) -> bool {
+    left.limit_id.eq_ignore_ascii_case(&right.limit_id)
+        && left.duration_mins == right.duration_mins
+        && left.resets_at == right.resets_at
+        && left.used_percent == right.used_percent
+        && left.remaining_percent == right.remaining_percent
+        && left.provenance == right.provenance
+}
+
+fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHourBucket) -> bool {
+    left.starts_at == right.starts_at
+        && left.ends_at == right.ends_at
+        && left.token_usage == right.token_usage
+        && left.estimated_cost_units == right.estimated_cost_units
+        && left.estimator_revision == right.estimator_revision
+        && left.call_count == right.call_count
+        && left.groups == right.groups
+        && left.partial_reasons == right.partial_reasons
+}
+
+fn weekly_local_point_payload_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoint) -> bool {
+    left.resets_at == right.resets_at
+        && left.token_usage == right.token_usage
+        && left.estimated_cost_units == right.estimated_cost_units
+        && left.estimator_revision == right.estimator_revision
+        && left.call_count == right.call_count
+        && left.partial_reasons == right.partial_reasons
+}
+
+fn should_replace_half_hour_bucket(
+    incoming: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    let incoming_dominates = bucket_evidence_dominates(incoming, existing);
+    let existing_dominates = bucket_evidence_dominates(existing, incoming);
+    if incoming_dominates != existing_dominates {
+        return incoming_dominates;
+    }
+
+    let incoming_collection_issues = bucket_collection_issue_count(incoming);
+    let existing_collection_issues = bucket_collection_issue_count(existing);
+    if incoming_collection_issues != existing_collection_issues {
+        return incoming_collection_issues < existing_collection_issues;
+    }
+    if incoming.sampled_at != existing.sampled_at {
+        return incoming.sampled_at > existing.sampled_at;
+    }
+
+    bucket_evidence_key(incoming) > bucket_evidence_key(existing)
+}
+
+fn bucket_collection_issue_count(bucket: &LocalHalfHourBucket) -> usize {
+    collection_issue_count(&bucket.partial_reasons)
+}
+
+fn should_replace_weekly_local_point(
+    incoming: &WeeklyLocalPoint,
+    existing: &WeeklyLocalPoint,
+) -> bool {
+    let incoming_dominates = weekly_evidence_dominates(incoming, existing);
+    let existing_dominates = weekly_evidence_dominates(existing, incoming);
+    if incoming_dominates != existing_dominates {
+        return incoming_dominates;
+    }
+    let incoming_collection_issues = collection_issue_count(&incoming.partial_reasons);
+    let existing_collection_issues = collection_issue_count(&existing.partial_reasons);
+    if incoming_collection_issues != existing_collection_issues {
+        return incoming_collection_issues < existing_collection_issues;
+    }
+    if incoming.observed_at != existing.observed_at {
+        return incoming.observed_at > existing.observed_at;
+    }
+    weekly_evidence_key(incoming) > weekly_evidence_key(existing)
+}
+
+fn collection_issue_count(partial_reasons: &[String]) -> usize {
+    partial_reasons
+        .iter()
+        .filter(|reason| reason.starts_with("rollout_") || reason.as_str() == "local_scan_disabled")
+        .count()
+}
+
+fn bucket_evidence_dominates(candidate: &LocalHalfHourBucket, other: &LocalHalfHourBucket) -> bool {
+    candidate.call_count >= other.call_count
+        && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
+        && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
+        && candidate.token_usage.output_tokens >= other.token_usage.output_tokens
+        && candidate.token_usage.reasoning_output_tokens
+            >= other.token_usage.reasoning_output_tokens
+        && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
+        && candidate.estimated_cost_units >= other.estimated_cost_units
+}
+
+fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u64, u64, u64) {
+    (
+        bucket.token_usage.total_tokens,
+        bucket.estimated_cost_units,
+        bucket.call_count,
+        bucket.token_usage.input_tokens,
+        bucket.token_usage.cached_input_tokens,
+        bucket.token_usage.output_tokens,
+        bucket.token_usage.reasoning_output_tokens,
+    )
+}
+
+fn weekly_evidence_dominates(candidate: &WeeklyLocalPoint, other: &WeeklyLocalPoint) -> bool {
+    candidate.call_count >= other.call_count
+        && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
+        && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
+        && candidate.token_usage.output_tokens >= other.token_usage.output_tokens
+        && candidate.token_usage.reasoning_output_tokens
+            >= other.token_usage.reasoning_output_tokens
+        && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
+        && candidate.estimated_cost_units >= other.estimated_cost_units
+}
+
+fn weekly_evidence_key(point: &WeeklyLocalPoint) -> (u64, u128, u64, u64, u64, u64, u64) {
+    (
+        point.token_usage.total_tokens,
+        point.estimated_cost_units,
+        point.call_count,
+        point.token_usage.input_tokens,
+        point.token_usage.cached_input_tokens,
+        point.token_usage.output_tokens,
+        point.token_usage.reasoning_output_tokens,
+    )
+}
+
+fn normalize_loaded_data(data: &mut HistoryData) {
+    let mut quota = Vec::new();
+    for point in std::mem::take(&mut data.quota_points) {
+        let _ = upsert_quota_point(&mut quota, point);
+    }
+    quota.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+    });
+    data.quota_points = quota;
+
+    let mut buckets = Vec::new();
+    for bucket in std::mem::take(&mut data.half_hour_buckets) {
+        let _ = upsert_half_hour_bucket(&mut buckets, bucket);
+    }
+    buckets.sort_by_key(|bucket| bucket.starts_at);
+    data.half_hour_buckets = buckets;
+
+    let mut loaded_weekly = std::mem::take(&mut data.weekly_local_points);
+    loaded_weekly.sort_by_key(|point| point.observed_at);
+    let mut weekly = Vec::new();
+    for point in loaded_weekly {
+        let _ = upsert_weekly_local_point(&mut weekly, point);
+    }
+    weekly.sort_by_key(|point| point.observed_at);
+    data.weekly_local_points = weekly;
+}
+
+struct NamespaceInspection {
+    future_version: bool,
+    warnings: Vec<String>,
+}
+
+fn inspect_namespace(directory: &Path, namespace: &str) -> NamespaceInspection {
+    let mut inspection = NamespaceInspection {
+        future_version: false,
+        warnings: Vec::new(),
+    };
+    let entries = match shard_entries(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            inspection.warnings.push(format!(
+                "could not list history in {}: {error}",
+                directory.display()
+            ));
+            return inspection;
+        }
+    };
+    for (day, path) in entries {
+        match read_shard(&path, namespace, day) {
+            ShardRead::Future(version) => {
+                inspection.future_version = true;
+                inspection.warnings.push(format!(
+                    "{} uses future history format version {version}; writes are disabled",
+                    path.display()
+                ));
+            }
+            ShardRead::Corrupt(message) => inspection.warnings.push(message),
+            ShardRead::Missing | ShardRead::Current(_) => {}
+        }
+    }
+    inspection
+}
+
+fn shard_entries(directory: &Path) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(day) = shard_day_from_path(&path) else {
+            continue;
+        };
+        entries.push((day, path));
+    }
+    entries.sort_by_key(|(day, _)| *day);
+    Ok(entries)
+}
+
+fn shard_day_from_path(path: &Path) -> Option<NaiveDate> {
+    if path.extension().and_then(OsStr::to_str) != Some("json") {
+        return None;
+    }
+    NaiveDate::parse_from_str(path.file_stem()?.to_str()?, "%Y-%m-%d").ok()
+}
+
+fn shard_path(directory: &Path, day: NaiveDate) -> PathBuf {
+    directory.join(format!("{day}.json"))
+}
+
+fn write_shard_atomically(path: &Path, shard: &HistoryShard) -> io::Result<()> {
+    let mut contents = serde_json::to_vec_pretty(shard)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    contents.push(b'\n');
+    write_private_atomically(path, &contents)
+}
+
+fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_private_directory(parent)?;
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("history"));
+    let (temporary, mut file) = create_temporary_file(parent, file_name)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, path)?;
+        sync_directory(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBuf, File)> {
+    for _ in 0..TEMP_FILE_ATTEMPTS {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            sequence
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique history temporary file",
+    ))
+}
+
+fn open_lock_file(directory: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(directory.join(LOCK_FILE))
+}
+
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn sync_directory(path: &Path) {
+    if let Ok(directory) = File::open(path) {
+        let _ = directory.sync_all();
+    }
+}
+
+fn prune_old_shards(directory: &Path, cutoff_day: NaiveDate, warnings: &mut Vec<String>) -> usize {
+    let entries = match shard_entries(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!(
+                "could not inspect old history shards in {}: {error}",
+                directory.display()
+            ));
+            return 0;
+        }
+    };
+    let mut pruned = 0;
+    for (day, path) in entries {
+        if day >= cutoff_day {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => pruned += 1,
+            Err(error) => warnings.push(format!(
+                "could not prune old history shard {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    pruned
+}
+
+pub fn default_history_root() -> Option<PathBuf> {
+    resolve_history_root(
+        nonempty_env(STATE_DIRECTORY_ENV).as_deref(),
+        nonempty_env("XDG_STATE_HOME").as_deref(),
+        nonempty_env("HOME").as_deref(),
+        nonempty_env("LOCALAPPDATA").as_deref(),
+        current_platform(),
+    )
+}
+
+fn nonempty_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    MacOs,
+    Windows,
+    Unix,
+}
+
+fn current_platform() -> Platform {
+    if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else if cfg!(windows) {
+        Platform::Windows
+    } else {
+        Platform::Unix
+    }
+}
+
+fn resolve_history_root(
+    state_directory: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    platform: Platform,
+) -> Option<PathBuf> {
+    if let Some(directory) = state_directory.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(directory.join(HISTORY_DIRECTORY));
+    }
+    if let Some(directory) = xdg_state_home.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(directory.join(APP_DIRECTORY).join(HISTORY_DIRECTORY));
+    }
+    let directory = match platform {
+        Platform::MacOs => home.map(|path| path.join("Library/Application Support")),
+        Platform::Windows => local_app_data.map(Path::to_path_buf),
+        Platform::Unix => home.map(|path| path.join(".local/state")),
+    }?;
+    Some(directory.join(APP_DIRECTORY).join(HISTORY_DIRECTORY))
+}
+
+pub fn history_namespace(codex_home: &Path) -> String {
+    let normalized = normalized_path(codex_home);
+    let mut bytes = normalized.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        bytes = bytes.replace('\\', "/").to_ascii_lowercase();
+    }
+    format!("{:016x}", stable_hash(bytes.as_bytes()))
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|directory| directory.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    fs::canonicalize(&absolute).unwrap_or_else(|_| lexical_normalize(&absolute))
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::domain::{LimitWindow, UsageCall};
+
+    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            .single()
+            .unwrap()
+    }
+
+    fn usage(total: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: total,
+            total_tokens: total,
+            ..TokenUsage::default()
+        }
+    }
+
+    fn call(
+        timestamp: DateTime<Utc>,
+        model: &str,
+        service_tier: Option<&str>,
+        total: u64,
+    ) -> UsageCall {
+        UsageCall {
+            timestamp,
+            thread_id: "thread".to_string(),
+            turn_id: Some("turn".to_string()),
+            model: Some(model.to_string()),
+            service_tier: service_tier.map(str::to_string),
+            tokens: usage(total),
+        }
+    }
+
+    fn bucket(as_of: DateTime<Utc>, provenance: Provenance, limit_id: &str) -> LimitBucket {
+        LimitBucket {
+            limit_id: limit_id.to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: Some(LimitWindow::new(
+                25.0,
+                Some(FIVE_HOURS_MINS),
+                Some(as_of + Duration::hours(2)),
+            )),
+            secondary: Some(LimitWindow::new(
+                40.0,
+                Some(WEEK_MINS),
+                Some(as_of + Duration::days(3)),
+            )),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance,
+            as_of,
+        }
+    }
+
+    #[test]
+    fn state_root_resolution_matches_all_supported_platforms() {
+        let override_dir = Path::new("/override");
+        let xdg = Path::new("/xdg");
+        let home = Path::new("/home/user");
+        let local = Path::new("C:/Users/user/AppData/Local");
+        assert_eq!(
+            resolve_history_root(
+                Some(override_dir),
+                Some(xdg),
+                Some(home),
+                Some(local),
+                Platform::Unix,
+            ),
+            Some(override_dir.join(HISTORY_DIRECTORY))
+        );
+        assert_eq!(
+            resolve_history_root(None, Some(xdg), Some(home), None, Platform::Unix),
+            Some(xdg.join(APP_DIRECTORY).join(HISTORY_DIRECTORY))
+        );
+        assert_eq!(
+            resolve_history_root(None, None, Some(home), None, Platform::MacOs),
+            Some(
+                home.join("Library/Application Support")
+                    .join(APP_DIRECTORY)
+                    .join(HISTORY_DIRECTORY)
+            )
+        );
+        assert_eq!(
+            resolve_history_root(None, None, Some(home), None, Platform::Unix),
+            Some(
+                home.join(".local/state")
+                    .join(APP_DIRECTORY)
+                    .join(HISTORY_DIRECTORY)
+            )
+        );
+        assert_eq!(
+            resolve_history_root(None, None, None, Some(local), Platform::Windows),
+            Some(local.join(APP_DIRECTORY).join(HISTORY_DIRECTORY))
+        );
+        assert_eq!(
+            resolve_history_root(None, None, None, None, Platform::Unix),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_home_namespace_is_stable_and_path_specific() {
+        let root = tempdir().unwrap();
+        let first = root.path().join("first/../first");
+        let equivalent = root.path().join("first");
+        let other = root.path().join("other");
+        assert_eq!(history_namespace(&first), history_namespace(&equivalent));
+        assert_ne!(history_namespace(&first), history_namespace(&other));
+        assert_eq!(history_namespace(&first).len(), 16);
+    }
+
+    #[test]
+    fn observation_uses_only_fresh_codex_limits_and_builds_exact_half_hours() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let calls = vec![
+            call(at(2026, 7, 28, 11, 59, 59), "gpt-5.4", None, 10),
+            call(at(2026, 7, 28, 12, 0, 0), "gpt-5.4", Some("priority"), 20),
+            call(at(2026, 7, 28, 12, 1, 0), "gpt-5.3-codex-spark", None, 999),
+        ];
+        let limits = vec![
+            bucket(now, Provenance::ServerSnapshot, "codex"),
+            bucket(now, Provenance::Stale, "codex"),
+            bucket(now, Provenance::ServerSnapshot, "codex_bengalfox"),
+        ];
+        let observation = HistoryObservation::from_sources(
+            now,
+            &calls,
+            &limits,
+            &["rollout_scan_incomplete".to_string()],
+        );
+        assert_eq!(observation.quota_points.len(), 2);
+        assert_eq!(observation.weekly_local_points.len(), 2);
+        assert_eq!(
+            observation
+                .weekly_local_points
+                .last()
+                .unwrap()
+                .token_usage
+                .total_tokens,
+            30
+        );
+        assert!(
+            observation
+                .weekly_local_points
+                .last()
+                .unwrap()
+                .partial_reasons
+                .contains(&"rollout_scan_incomplete".to_string())
+        );
+        assert!(
+            observation
+                .quota_points
+                .iter()
+                .all(|point| point.provenance == Provenance::ServerSnapshot)
+        );
+        assert_eq!(observation.half_hour_buckets.len(), 2);
+        assert_eq!(
+            observation.half_hour_buckets[0].starts_at,
+            at(2026, 7, 28, 11, 30, 0)
+        );
+        assert_eq!(
+            observation.half_hour_buckets[0].ends_at,
+            at(2026, 7, 28, 12, 0, 0)
+        );
+        assert_eq!(
+            observation.half_hour_buckets[0].token_usage.total_tokens,
+            10
+        );
+        assert_eq!(
+            observation.half_hour_buckets[1].token_usage.total_tokens,
+            20
+        );
+        assert_eq!(observation.half_hour_buckets[1].groups.len(), 1);
+        assert_eq!(
+            observation.half_hour_buckets[1].groups[0]
+                .service_tier
+                .as_deref(),
+            Some("priority")
+        );
+        assert!(
+            observation.half_hour_buckets[1].estimated_cost_units
+                > observation.half_hour_buckets[0].estimated_cost_units
+        );
+        assert_eq!(
+            observation.half_hour_buckets[1].partial_reasons,
+            vec!["rollout_scan_incomplete"]
+        );
+    }
+
+    #[test]
+    fn complete_local_coverage_materializes_zero_buckets_but_keeps_partial_edges_explicit() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let observation = HistoryObservation::from_sources_with_coverage(
+            now,
+            &[call(at(2026, 7, 28, 11, 45, 0), "gpt-5.4", None, 10)],
+            &[],
+            &[],
+            Some(at(2026, 7, 28, 10, 10, 0)),
+        );
+
+        assert_eq!(observation.half_hour_buckets.len(), 5);
+        assert_eq!(
+            observation.half_hour_buckets[0].starts_at,
+            at(2026, 7, 28, 10, 0, 0)
+        );
+        assert_eq!(
+            observation.half_hour_buckets[0].partial_reasons,
+            vec!["coverage_starts_within_half_hour_bucket"]
+        );
+        assert_eq!(
+            observation
+                .half_hour_buckets
+                .iter()
+                .map(|bucket| bucket.token_usage.total_tokens)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 10, 0]
+        );
+        assert_eq!(
+            observation.half_hour_buckets.last().unwrap().sampled_at,
+            now
+        );
+    }
+
+    #[test]
+    fn store_round_trips_upserts_and_prunes_old_shards() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let old_at = at(2026, 1, 1, 12, 0, 0);
+        let old = HistoryObservation {
+            observed_at: old_at,
+            quota_points: vec![quota_point(old_at, old_at + Duration::days(3), 20.0)],
+            half_hour_buckets: vec![local_bucket(old_at, old_at, 5, 50)],
+            weekly_local_points: vec![weekly_point(old_at, old_at + Duration::days(3), 5, 50)],
+        };
+        store.record(&old).unwrap();
+
+        let now = at(2026, 7, 28, 12, 5, 0);
+        let first = HistoryObservation {
+            observed_at: now,
+            quota_points: vec![quota_point(now, now + Duration::days(3), 40.0)],
+            half_hour_buckets: vec![local_bucket(at(2026, 7, 28, 12, 0, 0), now, 10, 100)],
+            weekly_local_points: vec![weekly_point(now, now + Duration::days(3), 10, 100)],
+        };
+        store.record(&first).unwrap();
+        let replacement_at = now + Duration::minutes(2);
+        let replacement = HistoryObservation {
+            observed_at: replacement_at,
+            quota_points: vec![quota_point(replacement_at, now + Duration::days(3), 45.0)],
+            half_hour_buckets: vec![local_bucket(
+                at(2026, 7, 28, 12, 0, 0),
+                replacement_at,
+                20,
+                200,
+            )],
+            weekly_local_points: vec![weekly_point(
+                replacement_at,
+                now + Duration::days(3),
+                20,
+                200,
+            )],
+        };
+        let report = store.record(&replacement).unwrap();
+        assert_eq!(report.shards_written, 1);
+        assert_eq!(report.shards_pruned, 0);
+
+        let data = store.load_since(now - Duration::days(1));
+        assert_eq!(data.quota_points.len(), 1);
+        assert_eq!(data.quota_points[0].used_percent, 45.0);
+        assert_eq!(data.half_hour_buckets.len(), 1);
+        assert_eq!(data.half_hour_buckets[0].token_usage.total_tokens, 20);
+        assert_eq!(data.weekly_local_points.len(), 1);
+        assert_eq!(data.weekly_local_points[0].token_usage.total_tokens, 20);
+        assert!(!shard_path(store.namespace_dir().unwrap(), old_at.date_naive()).exists());
+        assert!(data.warnings.is_empty());
+    }
+
+    #[test]
+    fn repeated_full_lookback_observations_do_not_rewrite_closed_bucket_shards() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let observed_at = at(2026, 7, 28, 12, 7, 0);
+        let calls = vec![
+            call(at(2026, 7, 27, 10, 1, 0), "gpt-5.4", None, 10),
+            call(at(2026, 7, 28, 10, 1, 0), "gpt-5.4", None, 20),
+        ];
+        let first = HistoryObservation::from_sources(observed_at, &calls, &[], &[]);
+        let first_report = store.record(&first).unwrap();
+        assert_eq!(first_report.shards_written, 2);
+        assert!(
+            first
+                .half_hour_buckets
+                .iter()
+                .all(|bucket| bucket.sampled_at == bucket.ends_at)
+        );
+
+        let second =
+            HistoryObservation::from_sources(observed_at + Duration::minutes(1), &calls, &[], &[]);
+        let second_report = store.record(&second).unwrap();
+        assert_eq!(second_report.shards_written, 0);
+        assert_eq!(second_report.shards_skipped, 0);
+
+        let periodic =
+            HistoryObservation::from_sources(observed_at + Duration::minutes(31), &calls, &[], &[]);
+        let periodic_report = store.record(&periodic).unwrap();
+        assert_eq!(periodic_report.shards_written, 0);
+        assert_eq!(periodic_report.shards_skipped, 2);
+    }
+
+    #[test]
+    fn read_cache_merges_local_writes_and_periodically_observes_external_writers() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let first_at = starts_at + Duration::minutes(5);
+        let since = starts_at - Duration::days(1);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        let first = HistoryObservation {
+            observed_at: first_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(starts_at, first_at, 10, 100)],
+            weekly_local_points: Vec::new(),
+        };
+        store.record(&first).unwrap();
+        assert_eq!(
+            store.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+        assert!(store.reload_since_if_stale(since).is_none());
+
+        let second_at = first_at + Duration::minutes(1);
+        let second = HistoryObservation {
+            observed_at: second_at,
+            quota_points: Vec::new(),
+            half_hour_buckets: vec![local_bucket(starts_at, second_at, 20, 200)],
+            weekly_local_points: Vec::new(),
+        };
+        store.record(&second).unwrap();
+        assert_eq!(
+            store.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+
+        let external_at = second_at + Duration::minutes(1);
+        let mut external = HistoryStore::new(history_root, &codex_home);
+        external
+            .record(&HistoryObservation {
+                observed_at: external_at,
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![local_bucket(starts_at, external_at, 30, 300)],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.load_since(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert!(store.reload_since_if_stale(since).is_none());
+
+        store.cache_loaded_at =
+            Some(Instant::now() - HISTORY_READ_CACHE_TTL - StdDuration::from_secs(1));
+        assert_eq!(
+            store
+                .reload_since_if_stale(since)
+                .unwrap()
+                .half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            30
+        );
+    }
+
+    #[test]
+    fn unchanged_open_bucket_and_same_slot_quota_do_not_rewrite_the_shard() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let observed_at = at(2026, 7, 28, 12, 7, 0);
+        let reset = observed_at + Duration::days(3);
+        let first = HistoryObservation {
+            observed_at,
+            quota_points: vec![quota_point(observed_at, reset, 40.0)],
+            half_hour_buckets: vec![local_bucket(
+                at(2026, 7, 28, 12, 0, 0),
+                observed_at,
+                10,
+                100,
+            )],
+            weekly_local_points: Vec::new(),
+        };
+        assert_eq!(store.record(&first).unwrap().shards_written, 1);
+
+        let later = observed_at + Duration::seconds(45);
+        let unchanged = HistoryObservation {
+            observed_at: later,
+            quota_points: vec![quota_point(later, reset, 40.0)],
+            half_hour_buckets: vec![local_bucket(at(2026, 7, 28, 12, 0, 0), later, 10, 100)],
+            weekly_local_points: Vec::new(),
+        };
+        let report = store.record(&unchanged).unwrap();
+        assert_eq!(report.shards_written, 0);
+        assert_eq!(report.shards_skipped, 1);
+    }
+
+    #[test]
+    fn unchanged_half_hour_bucket_writes_only_when_it_closes() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut open = local_bucket(starts_at, starts_at + Duration::minutes(10), 0, 0);
+        open.call_count = 0;
+        let mut buckets = vec![open.clone()];
+
+        let mut later_open = open.clone();
+        later_open.sampled_at = starts_at + Duration::minutes(20);
+        assert!(!upsert_half_hour_bucket(&mut buckets, later_open));
+        assert_eq!(buckets[0].sampled_at, open.sampled_at);
+
+        let mut closed = open;
+        closed.sampled_at = closed.ends_at;
+        assert!(upsert_half_hour_bucket(&mut buckets, closed.clone()));
+        assert_eq!(buckets, vec![closed.clone()]);
+        assert!(!upsert_half_hour_bucket(&mut buckets, closed));
+    }
+
+    #[test]
+    fn lower_quality_writer_cannot_replace_a_complete_half_hour_bucket() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut complete = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
+        complete.call_count = 5;
+        let mut partial = local_bucket(starts_at, starts_at + Duration::minutes(20), 20, 200);
+        partial.call_count = 2;
+        partial.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut buckets = vec![complete.clone()];
+
+        assert!(!upsert_half_hour_bucket(&mut buckets, partial));
+        assert_eq!(buckets, vec![complete]);
+
+        let mut fuller = local_bucket(starts_at, starts_at + Duration::minutes(25), 70, 700);
+        fuller.call_count = 7;
+        assert!(upsert_half_hour_bucket(&mut buckets, fuller.clone()));
+        assert_eq!(buckets, vec![fuller]);
+    }
+
+    #[test]
+    fn later_evidence_is_not_blocked_by_estimator_partial_reasons() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut existing = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
+        existing.call_count = 5;
+        let mut incoming = local_bucket(starts_at, starts_at + Duration::minutes(20), 70, 700);
+        incoming.call_count = 7;
+        incoming.partial_reasons = vec!["unpriced_model_rate_fallback".to_string()];
+        let mut buckets = vec![existing];
+
+        assert!(upsert_half_hour_bucket(&mut buckets, incoming.clone()));
+        assert_eq!(buckets, vec![incoming]);
+    }
+
+    #[test]
+    fn later_weekly_point_cannot_drop_on_a_lower_quality_scan() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let first_at = at(2026, 7, 28, 12, 5, 0);
+        let complete = weekly_point(first_at, reset, 50, 500);
+        let mut truncated = weekly_point(first_at + Duration::minutes(6), reset, 20, 200);
+        truncated.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut points = vec![complete.clone()];
+
+        assert!(!upsert_weekly_local_point(&mut points, truncated));
+        assert_eq!(points, vec![complete.clone()]);
+
+        let mut richer = weekly_point(first_at + Duration::minutes(6), reset, 70, 700);
+        richer.partial_reasons = vec!["unpriced_model_rate_fallback".to_string()];
+        assert!(upsert_weekly_local_point(&mut points, richer.clone()));
+        assert_eq!(points, vec![complete, richer]);
+    }
+
+    #[test]
+    fn weekly_plateaus_keep_boundaries_and_compress_open_samples() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let first_at = at(2026, 7, 28, 12, 40, 0);
+        let mut points = vec![weekly_point(first_at, reset, 50, 500)];
+
+        let first_boundary = weekly_point(at(2026, 7, 28, 13, 0, 0), reset, 50, 500);
+        assert!(upsert_weekly_local_point(
+            &mut points,
+            first_boundary.clone()
+        ));
+        assert!(!upsert_weekly_local_point(
+            &mut points,
+            weekly_point(at(2026, 7, 28, 13, 3, 0), reset, 50, 500)
+        ));
+
+        let second_boundary = weekly_point(at(2026, 7, 28, 13, 30, 0), reset, 50, 500);
+        assert!(upsert_weekly_local_point(
+            &mut points,
+            second_boundary.clone()
+        ));
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| point.observed_at)
+                .collect::<Vec<_>>(),
+            [
+                first_at,
+                first_boundary.observed_at,
+                second_boundary.observed_at
+            ]
+        );
+
+        let mut reverse_order = vec![weekly_point(at(2026, 7, 28, 14, 3, 0), reset, 50, 500)];
+        let boundary = weekly_point(at(2026, 7, 28, 14, 0, 0), reset, 50, 500);
+        assert!(upsert_weekly_local_point(
+            &mut reverse_order,
+            boundary.clone()
+        ));
+        assert!(reverse_order.contains(&boundary));
+    }
+
+    #[test]
+    fn future_shard_disables_writes_without_overwriting_it() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let path = shard_path(&namespace_dir, now.date_naive());
+        let future = format!(
+            "{{\"formatVersion\":{},\"namespace\":\"{}\"}}",
+            HISTORY_FORMAT_VERSION + 1,
+            store.namespace()
+        );
+        fs::write(&path, &future).unwrap();
+
+        let data = store.load_since(now - Duration::days(1));
+        assert!(data.read_only);
+        assert!(
+            data.warnings
+                .iter()
+                .any(|warning| warning.contains("future"))
+        );
+        let report = store
+            .record(&HistoryObservation {
+                observed_at: now,
+                ..HistoryObservation::default()
+            })
+            .unwrap();
+        assert!(report.read_only);
+        assert_eq!(fs::read_to_string(path).unwrap(), future);
+    }
+
+    #[test]
+    fn corrupt_target_is_reported_and_never_replaced() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let path = shard_path(&namespace_dir, now.date_naive());
+        fs::write(&path, b"not json").unwrap();
+        let observation = HistoryObservation {
+            observed_at: now,
+            quota_points: vec![quota_point(now, now + Duration::days(3), 20.0)],
+            half_hour_buckets: Vec::new(),
+            weekly_local_points: Vec::new(),
+        };
+        let report = store.record(&observation).unwrap();
+        assert_eq!(report.shards_skipped, 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("malformed"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"not json");
+
+        let data = store.load_since(now - Duration::days(1));
+        assert!(
+            data.warnings
+                .iter()
+                .any(|warning| warning.contains("malformed"))
+        );
+    }
+
+    #[test]
+    fn series_derive_weekly_tokens_and_price_weighted_estimates() {
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let start = reset - Duration::days(7);
+        let data = HistoryData {
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)],
+            half_hour_buckets: vec![
+                local_bucket(start, reset - Duration::hours(1), 10, 100),
+                local_bucket(
+                    start + Duration::minutes(30),
+                    reset - Duration::minutes(1),
+                    30,
+                    300,
+                ),
+            ],
+            ..HistoryData::default()
+        };
+        let half_hours = data.estimated_half_hour_series(reset);
+        assert_eq!(half_hours.len(), 2);
+        assert_eq!(half_hours[0].estimated_quota_percent, Some(15.0));
+        assert_eq!(half_hours[1].estimated_quota_percent, Some(45.0));
+
+        let cumulative = data.weekly_cumulative_series(reset);
+        assert_eq!(cumulative.len(), 3);
+        assert_eq!(cumulative[0].estimated_quota_percent, Some(0.0));
+        assert_eq!(cumulative[1].token_usage.total_tokens, 10);
+        assert_eq!(cumulative[1].estimated_quota_percent, Some(15.0));
+        assert_eq!(cumulative[2].token_usage.total_tokens, 40);
+        assert_eq!(cumulative[2].estimated_quota_percent, Some(60.0));
+        assert_eq!(data.latest_weekly_reset(), Some(reset));
+    }
+
+    #[test]
+    fn half_hour_estimate_keeps_confirmed_zero_buckets_as_zero_samples() {
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let start = reset - Duration::days(7);
+        let mut zero = local_bucket(
+            start + Duration::minutes(30),
+            start + Duration::minutes(60),
+            0,
+            0,
+        );
+        zero.call_count = 0;
+        let data = HistoryData {
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 40.0)],
+            half_hour_buckets: vec![
+                local_bucket(start, start + Duration::minutes(30), 10, 100),
+                zero,
+            ],
+            ..HistoryData::default()
+        };
+
+        let half_hours = data.estimated_half_hour_series(reset);
+        assert_eq!(half_hours.len(), 2);
+        assert_eq!(half_hours[0].estimated_quota_percent, Some(40.0));
+        assert_eq!(half_hours[1].estimated_quota_percent, Some(0.0));
+    }
+
+    #[test]
+    fn recorded_weekly_series_restores_only_confirmed_zero_plateaus() {
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let start = reset - Duration::days(7);
+        let first_at = start + Duration::minutes(30);
+        let second_at = start + Duration::minutes(120);
+        let mut first_zero = local_bucket(
+            start + Duration::minutes(30),
+            start + Duration::minutes(60),
+            0,
+            0,
+        );
+        first_zero.call_count = 0;
+        let mut second_zero = local_bucket(
+            start + Duration::minutes(60),
+            start + Duration::minutes(90),
+            0,
+            0,
+        );
+        second_zero.call_count = 0;
+        let data = HistoryData {
+            quota_points: vec![quota_point(second_at, reset, 40.0)],
+            half_hour_buckets: vec![
+                local_bucket(start, first_at, 10, 100),
+                first_zero.clone(),
+                second_zero.clone(),
+                local_bucket(start + Duration::minutes(90), second_at, 10, 100),
+            ],
+            weekly_local_points: vec![
+                weekly_point(first_at, reset, 10, 100),
+                weekly_point(second_at, reset, 20, 200),
+            ],
+            ..HistoryData::default()
+        };
+
+        let restored = data.weekly_cumulative_series(reset);
+        assert_eq!(
+            restored.iter().map(|point| point.at).collect::<Vec<_>>(),
+            [
+                start,
+                first_at,
+                start + Duration::minutes(60),
+                start + Duration::minutes(90),
+                second_at,
+            ]
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .map(|point| point.token_usage.total_tokens)
+                .collect::<Vec<_>>(),
+            [0, 10, 10, 10, 20]
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .map(|point| point.estimated_quota_percent)
+                .collect::<Vec<_>>(),
+            [Some(0.0), Some(20.0), Some(20.0), Some(20.0), Some(40.0)]
+        );
+
+        let mut missing = data.clone();
+        missing
+            .half_hour_buckets
+            .retain(|bucket| bucket.starts_at != start + Duration::minutes(60));
+        let still_gapped = missing.weekly_cumulative_series(reset);
+        assert_eq!(
+            still_gapped
+                .iter()
+                .map(|point| point.at)
+                .collect::<Vec<_>>(),
+            [start, first_at, start + Duration::minutes(60), second_at,]
+        );
+        assert_eq!(
+            still_gapped[3].at - still_gapped[2].at,
+            Duration::minutes(60)
+        );
+
+        first_zero.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut partial = data;
+        partial.half_hour_buckets[1] = first_zero;
+        partial.half_hour_buckets[2] = second_zero;
+        let not_confirmed = partial.weekly_cumulative_series(reset);
+        assert!(!not_confirmed.iter().any(|point| {
+            point.at == start + Duration::minutes(60) || point.at == start + Duration::minutes(90)
+        }));
+    }
+
+    #[test]
+    fn latest_weekly_reset_uses_the_newest_quota_or_local_observation() {
+        let old_observed_at = at(2026, 7, 28, 12, 0, 0);
+        let old_reset = at(2026, 7, 31, 12, 0, 0);
+        let new_observed_at = at(2026, 8, 1, 12, 0, 0);
+        let new_reset = at(2026, 8, 7, 12, 0, 0);
+        let data = HistoryData {
+            quota_points: vec![quota_point(old_observed_at, old_reset, 60.0)],
+            weekly_local_points: vec![weekly_point(new_observed_at, new_reset, 10, 100)],
+            ..HistoryData::default()
+        };
+
+        assert_eq!(data.latest_weekly_reset(), Some(new_reset));
+    }
+
+    #[test]
+    fn non_aligned_weekly_reset_excludes_cross_cycle_half_hours_and_marks_partial() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let start = reset - Duration::days(7);
+        let first_full = floor_half_hour(start) + Duration::minutes(30);
+        let last_full = floor_half_hour(reset) - Duration::minutes(30);
+        let last_sample = last_full + Duration::minutes(17);
+        let data = HistoryData {
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)],
+            half_hour_buckets: vec![
+                local_bucket(floor_half_hour(start), first_full, 100, 1_000),
+                local_bucket(first_full, first_full + Duration::minutes(30), 10, 100),
+                local_bucket(last_full, last_sample, 20, 200),
+                local_bucket(floor_half_hour(reset), reset, 200, 2_000),
+            ],
+            ..HistoryData::default()
+        };
+
+        let half_hours = data.estimated_half_hour_series(reset);
+        assert_eq!(half_hours.len(), 2);
+        assert_eq!(
+            half_hours
+                .iter()
+                .map(|point| point.token_usage.total_tokens)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert!(half_hours.iter().all(|point| {
+            point
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "reset_boundary_excludes_partial_half_hour_buckets")
+        }));
+
+        let cumulative = data.weekly_cumulative_series(reset);
+        assert_eq!(cumulative.len(), 3);
+        assert_eq!(cumulative.last().unwrap().token_usage.total_tokens, 30);
+        assert_eq!(cumulative.last().unwrap().at, last_sample);
+        assert!(cumulative.iter().all(|point| {
+            point
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "reset_boundary_excludes_partial_half_hour_buckets")
+        }));
+    }
+
+    #[test]
+    fn recorded_weekly_points_cut_non_aligned_cycles_at_exact_call_times() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let start = reset - Duration::days(7);
+        let observed_at = reset - Duration::minutes(7);
+        let limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: None,
+            secondary: Some(LimitWindow::new(40.0, Some(WEEK_MINS), Some(reset))),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: observed_at,
+        }];
+        let calls = vec![
+            call(start - Duration::minutes(1), "gpt-5.4", None, 100),
+            call(start + Duration::minutes(1), "gpt-5.4", None, 10),
+            call(start + Duration::days(3), "gpt-5.4", None, 20),
+            call(observed_at, "gpt-5.4", None, 30),
+            call(observed_at + Duration::minutes(1), "gpt-5.4", None, 200),
+        ];
+        let observation = HistoryObservation::from_sources(observed_at, &calls, &limits, &[]);
+        let data = HistoryData {
+            quota_points: observation.quota_points,
+            half_hour_buckets: observation.half_hour_buckets,
+            weekly_local_points: observation.weekly_local_points,
+            ..HistoryData::default()
+        };
+
+        let cumulative = data.weekly_cumulative_series(reset);
+        assert_eq!(cumulative.len(), 4);
+        assert_eq!(cumulative[0].at, start);
+        assert_eq!(cumulative.last().unwrap().at, observed_at);
+        assert_eq!(cumulative.last().unwrap().token_usage.total_tokens, 60);
+        assert_eq!(
+            cumulative.last().unwrap().estimated_quota_percent,
+            Some(40.0)
+        );
+        assert!(cumulative.last().unwrap().partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn concurrent_writers_merge_under_the_namespace_lock() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for index in 0..4 {
+            let history_root = history_root.clone();
+            let codex_home = codex_home.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let mut store = HistoryStore::new(history_root, &codex_home);
+                let starts_at = at(2026, 7, 28, 10 + index, 0, 0);
+                let observation = HistoryObservation {
+                    observed_at: at(2026, 7, 28, 14, 0, 0),
+                    quota_points: Vec::new(),
+                    half_hour_buckets: vec![local_bucket(
+                        starts_at,
+                        at(2026, 7, 28, 14, 0, 0),
+                        index as u64 + 1,
+                        index as u128 + 1,
+                    )],
+                    weekly_local_points: Vec::new(),
+                };
+                barrier.wait();
+                store.record(&observation).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let mut store = HistoryStore::new(history_root, &codex_home);
+        let data = store.load_since(at(2026, 7, 28, 0, 0, 0));
+        assert_eq!(data.half_hour_buckets.len(), 4);
+    }
+
+    fn quota_point(
+        observed_at: DateTime<Utc>,
+        resets_at: DateTime<Utc>,
+        used_percent: f64,
+    ) -> QuotaPoint {
+        QuotaPoint {
+            observed_at,
+            limit_id: "codex".to_string(),
+            duration_mins: WEEK_MINS,
+            resets_at,
+            used_percent,
+            remaining_percent: 100.0 - used_percent,
+            provenance: Provenance::ServerSnapshot,
+        }
+    }
+
+    fn local_bucket(
+        starts_at: DateTime<Utc>,
+        sampled_at: DateTime<Utc>,
+        total_tokens: u64,
+        estimated_cost_units: u128,
+    ) -> LocalHalfHourBucket {
+        LocalHalfHourBucket {
+            starts_at,
+            ends_at: starts_at + Duration::minutes(30),
+            sampled_at,
+            token_usage: usage(total_tokens),
+            estimated_cost_units,
+            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            call_count: 1,
+            groups: Vec::new(),
+            partial_reasons: Vec::new(),
+        }
+    }
+
+    fn weekly_point(
+        observed_at: DateTime<Utc>,
+        resets_at: DateTime<Utc>,
+        total_tokens: u64,
+        estimated_cost_units: u128,
+    ) -> WeeklyLocalPoint {
+        WeeklyLocalPoint {
+            observed_at,
+            resets_at,
+            token_usage: usage(total_tokens),
+            estimated_cost_units,
+            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            call_count: 1,
+            partial_reasons: Vec::new(),
+        }
+    }
+}

@@ -34,7 +34,7 @@ fn semantic_frames_cover_full_compact_and_diagnostic_layouts() {
     );
 
     let mut diagnostics = TuiHarness::from_fixture("partial", 80, 24, Theme::Dark);
-    diagnostics.key(KeyCode::Char('2'));
+    diagnostics.key(KeyCode::Char('3'));
     insta::assert_snapshot!(
         "tui_partial_other_dark_80x24",
         diagnostics.frame().snapshot_text()
@@ -48,7 +48,8 @@ fn keyboard_and_mouse_controls_have_equivalent_state_transitions() {
             (KeyCode::Char('v'), ControlId::ToggleTurns),
             (KeyCode::Char('m'), ControlId::ToggleModels),
             (KeyCode::Char('W'), ControlId::ScopeWeek),
-            (KeyCode::Char('2'), ControlId::ViewOther),
+            (KeyCode::Char('2'), ControlId::ViewTrends),
+            (KeyCode::Char('3'), ControlId::ViewOther),
             (KeyCode::Char('R'), ControlId::ToggleTree),
             (KeyCode::Char('D'), ControlId::SourceDesktop),
         ] {
@@ -82,6 +83,7 @@ fn shortcut_graphemes_are_visually_distinct_when_the_binding_is_active() {
         let harness = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
         for control in [
             ControlId::ViewOverview,
+            ControlId::ViewTrends,
             ControlId::ViewOther,
             ControlId::ToggleTurns,
             ControlId::ToggleModels,
@@ -113,6 +115,10 @@ fn whole_labels_are_clickable_at_both_layout_breakpoints() {
             let mut tab = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
             assert!(tab.click(ControlId::ViewOther, edge));
             assert_eq!(tab.state().ui_state.view, UiView::Health);
+
+            let mut trends = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+            assert!(trends.click(ControlId::ViewTrends, edge));
+            assert_eq!(trends.state().ui_state.view, UiView::Trends);
 
             let mut toggle = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
             assert!(toggle.state().ui_state.models_visible);
@@ -163,6 +169,7 @@ fn resize_reflows_without_losing_selection_or_control_bindings() {
         Some("size=60x24")
     );
     harness.assert_shortcut_distinct(ControlId::ViewOther);
+    harness.assert_shortcut_distinct(ControlId::ViewTrends);
     harness.assert_shortcut_distinct(ControlId::TaskSearch);
 }
 
@@ -197,7 +204,7 @@ fn svg_gallery_is_generated_from_the_same_semantic_frames() {
     scenarios.push(("task-search-unicode-80x24", search));
 
     let mut other = TuiHarness::from_fixture("normal", 80, 24, Theme::Dark);
-    other.key(KeyCode::Char('2'));
+    other.key(KeyCode::Char('3'));
     scenarios.push(("other-normal-80x24", other));
 
     scenarios.push((
@@ -206,7 +213,7 @@ fn svg_gallery_is_generated_from_the_same_semantic_frames() {
     ));
 
     let mut partial = TuiHarness::from_fixture("partial", 80, 24, Theme::Light);
-    partial.key(KeyCode::Char('2'));
+    partial.key(KeyCode::Char('3'));
     scenarios.push(("other-partial-80x24", partial));
 
     let mut quit = TuiHarness::from_fixture("normal", 60, 24, Theme::Dark);

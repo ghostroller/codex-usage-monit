@@ -14,6 +14,7 @@ const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
+pub(crate) const ESTIMATOR_REVISION: u32 = 1;
 
 // OpenAI short-context prices as of 2026-07-14:
 // https://developers.openai.com/api/docs/pricing?latest-pricing=priority
@@ -50,10 +51,10 @@ impl TokenRates {
 }
 
 #[derive(Clone, Copy)]
-struct EstimatedCost {
-    units: u128,
-    used_model_fallback: bool,
-    used_token_breakdown_fallback: bool,
+pub(crate) struct EstimatedUsageWeight {
+    pub(crate) units: u128,
+    pub(crate) used_model_fallback: bool,
+    pub(crate) used_token_breakdown_fallback: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -210,7 +211,7 @@ fn analyze_selected_window(
     let mut used_token_breakdown_fallback = false;
 
     for call in &window_calls {
-        let estimated_cost = estimated_cost(call);
+        let estimated_cost = estimate_call_weight(call);
         used_model_fallback |= estimated_cost.used_model_fallback;
         used_token_breakdown_fallback |= estimated_cost.used_token_breakdown_fallback;
         local_usage.add_call(call, estimated_cost.units);
@@ -403,7 +404,7 @@ fn bucket_priority(bucket: &LimitBucket) -> u8 {
     }
 }
 
-fn is_spark_model(model: Option<&str>) -> bool {
+pub(crate) fn is_spark_model(model: Option<&str>) -> bool {
     model.is_some_and(|model| model.trim().eq_ignore_ascii_case(SPARK_MODEL))
 }
 
@@ -441,7 +442,7 @@ fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f
     }
 }
 
-fn estimated_cost(call: &UsageCall) -> EstimatedCost {
+pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
     let rates = short_context_rates(call.model.as_deref(), call.is_fast());
     let used_model_fallback = rates.is_none() && !call.tokens.is_zero();
     let rates = rates.unwrap_or(if call.is_fast() {
@@ -469,7 +470,7 @@ fn estimated_cost(call: &UsageCall) -> EstimatedCost {
         .saturating_add(u128::from(cached_input_tokens).saturating_mul(rates.cached_input))
         .saturating_add(u128::from(output_tokens).saturating_mul(rates.output));
 
-    EstimatedCost {
+    EstimatedUsageWeight {
         units,
         used_model_fallback,
         used_token_breakdown_fallback,
@@ -539,12 +540,12 @@ mod tests {
         ];
 
         for (model, standard, fast) in cases {
-            let standard_cost = estimated_cost(&priced_call(model, false, tokens));
+            let standard_cost = estimate_call_weight(&priced_call(model, false, tokens));
             assert_eq!(standard_cost.units, standard, "{model} Standard");
             assert!(!standard_cost.used_model_fallback);
             assert!(!standard_cost.used_token_breakdown_fallback);
 
-            let fast_cost = estimated_cost(&priced_call(model, true, tokens));
+            let fast_cost = estimate_call_weight(&priced_call(model, true, tokens));
             assert_eq!(fast_cost.units, fast, "{model} Fast");
             assert!(!fast_cost.used_model_fallback);
             assert!(!fast_cost.used_token_breakdown_fallback);
@@ -562,7 +563,7 @@ mod tests {
                 ..TokenUsage::default()
             },
         );
-        let unknown_cost = estimated_cost(&unknown);
+        let unknown_cost = estimate_call_weight(&unknown);
         assert_eq!(unknown_cost.units, 800);
         assert!(unknown_cost.used_model_fallback);
         assert!(!unknown_cost.used_token_breakdown_fallback);
@@ -575,7 +576,7 @@ mod tests {
                 ..TokenUsage::default()
             },
         );
-        let total_only_cost = estimated_cost(&total_only);
+        let total_only_cost = estimate_call_weight(&total_only);
         assert_eq!(total_only_cost.units, 280);
         assert!(!total_only_cost.used_model_fallback);
         assert!(total_only_cost.used_token_breakdown_fallback);
@@ -583,7 +584,7 @@ mod tests {
 
     #[test]
     fn cached_input_is_clamped_to_input_tokens() {
-        let cost = estimated_cost(&priced_call(
+        let cost = estimate_call_weight(&priced_call(
             "gpt-5.6-luna",
             false,
             TokenUsage {

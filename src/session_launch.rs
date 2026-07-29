@@ -753,7 +753,7 @@ fn validate_percentage(name: &'static str, value: u8) -> Result<(), PrepareError
     }
 }
 
-fn resolve_executable(
+pub(crate) fn resolve_executable(
     name: &'static str,
     override_path: Option<&Path>,
     path: &OsStr,
