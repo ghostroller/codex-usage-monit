@@ -5649,6 +5649,122 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
 }
 
 #[test]
+fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps() {
+    let boundary = DateTime::parse_from_rfc3339("2026-07-29T04:10:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let quota_point = |duration_mins, observed_at, resets_at, remaining_percent| QuotaPoint {
+        observed_at,
+        limit_id: "codex".to_string(),
+        duration_mins,
+        resets_at,
+        used_percent: 100.0 - remaining_percent,
+        remaining_percent,
+        provenance: Provenance::ServerSnapshot,
+    };
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        // Deliberately keep the input out of order so the chart contract does
+        // not depend on how a caller assembled HistoryData.
+        quota_points: vec![
+            quota_point(
+                300,
+                boundary + ChronoDuration::minutes(5),
+                boundary + ChronoDuration::minutes(300),
+                99.0,
+            ),
+            quota_point(
+                10_080,
+                boundary - ChronoDuration::minutes(5),
+                boundary,
+                12.0,
+            ),
+            quota_point(300, boundary - ChronoDuration::minutes(5), boundary, 8.0),
+            quota_point(
+                10_080,
+                boundary + ChronoDuration::minutes(5),
+                boundary + ChronoDuration::minutes(10_080),
+                100.0,
+            ),
+        ],
+        ..HistoryData::default()
+    };
+
+    let data = prepare_trend_data_at(&app, boundary + ChronoDuration::minutes(5));
+    assert_eq!(
+        data.five_hour_remaining
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [8.0, 99.0]
+    );
+    assert_eq!(
+        data.weekly_remaining
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [12.0, 100.0]
+    );
+
+    let (segments, gaps) = prepare_trend_segments(
+        &data.five_hour_remaining,
+        TrendGraphKind::Line {
+            maximum_gap: ChronoDuration::minutes(15),
+        },
+    );
+    assert_eq!(gaps, 0);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0]
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>(),
+        [8.0, 99.0]
+    );
+}
+
+#[test]
+fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
+    let boundary = DateTime::parse_from_rfc3339("2026-07-29T04:10:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let history = HistoryData {
+        quota_points: vec![
+            QuotaPoint {
+                observed_at: boundary - ChronoDuration::minutes(10),
+                limit_id: "codex".to_string(),
+                duration_mins: 300,
+                resets_at: boundary,
+                used_percent: 94.0,
+                remaining_percent: 6.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: boundary + ChronoDuration::minutes(20),
+                limit_id: "codex".to_string(),
+                duration_mins: 300,
+                resets_at: boundary + ChronoDuration::minutes(300),
+                used_percent: 3.0,
+                remaining_percent: 97.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+        ],
+        ..HistoryData::default()
+    };
+    let points = remaining_trend(&history, 300);
+
+    let (segments, gaps) = prepare_trend_segments(
+        &points,
+        TrendGraphKind::Line {
+            maximum_gap: ChronoDuration::minutes(15),
+        },
+    );
+    assert_eq!(points.len(), 2);
+    assert_eq!(gaps, 1);
+    assert_eq!(segments.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+}
+
+#[test]
 fn trends_controls_clip_only_whole_buttons_in_tiny_terminals() {
     for (width, height) in [(40, 12), (20, 8), (8, 3)] {
         let mut app = interaction_test_app(1, 1);

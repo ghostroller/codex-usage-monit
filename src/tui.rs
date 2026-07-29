@@ -4795,8 +4795,8 @@ fn append_trend_control(
 }
 
 fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
-    let five_hour_remaining = current_remaining_trend(&app.history, 300);
-    let weekly_remaining = current_remaining_trend(&app.history, 10_080);
+    let five_hour_remaining = remaining_trend(&app.history, 300);
+    let weekly_remaining = remaining_trend(&app.history, 10_080);
     let half_hour_bounds = trend_day_bounds(now, app.trend_day_offset);
     let weekly_reset = app.history.latest_weekly_reset();
 
@@ -4937,15 +4937,18 @@ fn weekly_resets_overlapping(
         .collect()
 }
 
-fn current_remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
-    let points = history.remaining_series(duration_mins);
-    let Some(latest) = points.iter().max_by_key(|point| point.observed_at) else {
-        return Vec::new();
-    };
-    let latest_reset = latest.resets_at;
+fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
+    let mut points = history.remaining_series(duration_mins);
+    // Keep real observations from every loaded cycle. A reset credit can start
+    // a new cycle before the previous resets_at, so the observed timestamps are
+    // the honest transition boundary; the renderer still splits recorder gaps.
+    points.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.resets_at.cmp(&right.resets_at))
+    });
     points
         .into_iter()
-        .filter(|point| (point.resets_at - latest_reset).num_seconds().abs() <= 120)
         .map(|point| TrendPoint {
             at: point.observed_at,
             value: point.remaining_percent,
