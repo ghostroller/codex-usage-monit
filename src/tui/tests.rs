@@ -216,7 +216,7 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
     let bucket_starts = [
         day_bounds[1] - ChronoDuration::hours(2),
         day_bounds[1] - ChronoDuration::minutes(90),
-        day_bounds[1] - ChronoDuration::minutes(30),
+        day_bounds[1] - ChronoDuration::minutes(15),
     ];
     HistoryData {
         quota_points: vec![
@@ -262,8 +262,8 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
             .enumerate()
             .map(|(index, starts_at)| LocalHalfHourBucket {
                 starts_at,
-                ends_at: starts_at + ChronoDuration::minutes(30),
-                sampled_at: now,
+                ends_at: starts_at + ChronoDuration::minutes(15),
+                sampled_at: now.min(starts_at + ChronoDuration::minutes(15)),
                 token_usage: TokenUsage {
                     total_tokens: u64::try_from(index + 1).unwrap() * 1_000,
                     ..TokenUsage::default()
@@ -5135,11 +5135,11 @@ fn trends_view_uses_responsive_panels_and_btop_controls() {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("30m Local Tokens"));
-        assert!(content.contains("30m ~EST Usage"));
+        assert!(content.contains("15m Local Tokens"));
+        assert!(content.contains("15m ~EST Usage"));
         assert!(!content.contains("Weekly Local Tokens"));
 
-        let controls = app.trend_controls_hitbox.expect("half-hour controls");
+        let controls = app.trend_controls_hitbox.expect("15-minute controls");
         assert!(!controls.previous_day.is_empty());
         assert!(!controls.next_day.is_empty());
         assert!(!controls.now.is_empty());
@@ -5194,8 +5194,8 @@ fn trends_view_uses_responsive_panels_and_btop_controls() {
         "Quota Remaining",
         "Weekly Local Tokens",
         "Weekly ~EST Usage",
-        "30m Local Tokens",
-        "30m ~EST Usage",
+        "15m Local Tokens",
+        "15m ~EST Usage",
     ] {
         assert!(content.contains(title), "missing {title}: {content}");
     }
@@ -5232,8 +5232,8 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
         "Quota Remaining",
         "Weekly Local Tokens",
         "Weekly ~EST Usage",
-        "30m Local Tokens",
-        "30m ~EST Usage",
+        "15m Local Tokens",
+        "15m ~EST Usage",
         "samples",
         "gaps",
         "PARTIAL",
@@ -5270,16 +5270,339 @@ fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
 }
 
 #[test]
-fn latest_half_hour_window_uses_now_when_the_snapshot_clock_is_frozen() {
+fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut history = trend_history_fixture(now);
+    let weekly_observed_at = now - ChronoDuration::seconds(7);
+    history
+        .quota_points
+        .iter_mut()
+        .find(|point| point.duration_mins == 10_080 && point.observed_at == now)
+        .unwrap()
+        .observed_at = weekly_observed_at;
+
+    let mut app = interaction_test_app(1, 1);
+    app.replace_history(history);
+    app.set_view(View::Trends);
+    let data = prepare_trend_data_at(&app, now);
+
+    assert_eq!(
+        data.five_hour_remaining_readout,
+        Some(TrendReadout {
+            sampled_at: now,
+            value: TrendReadoutValue::Percent(60.0),
+            partial: false,
+        })
+    );
+    assert_eq!(
+        data.weekly_remaining_readout,
+        Some(TrendReadout {
+            sampled_at: weekly_observed_at,
+            value: TrendReadoutValue::Percent(75.0),
+            partial: false,
+        })
+    );
+    assert_eq!(
+        data.weekly_tokens_readout.map(|readout| readout.value),
+        Some(TrendReadoutValue::Tokens(6_000))
+    );
+    assert_eq!(
+        data.weekly_estimated_readout.map(|readout| readout.value),
+        Some(TrendReadoutValue::Percent(25.0))
+    );
+
+    let offset = FixedOffset::east_opt(0).unwrap();
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let content = with_test_display_offset(offset, || {
+            terminal
+                .draw(|frame| render_at(frame, &mut app, now))
+                .unwrap();
+            buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 120, 40))
+        });
+        for exact_readout in [
+            "5h 60% @ 07-29 09:16:42",
+            "Week 75% @ 07-29 09:16:35",
+            "Tokens 6,000 @ 07-29 09:16:42",
+            "~EST 25% @ 07-29 09:16:42",
+        ] {
+            assert!(
+                content.contains(exact_readout),
+                "missing {exact_readout} for {theme:?}:\n{content}"
+            );
+        }
+    }
+
+    let exact_tokens = 9_007_199_254_740_993;
+    for bucket in &mut app.history.half_hour_buckets {
+        bucket.token_usage.total_tokens = 0;
+    }
+    app.history
+        .half_hour_buckets
+        .last_mut()
+        .unwrap()
+        .token_usage
+        .total_tokens = exact_tokens;
+    assert_eq!(
+        prepare_trend_data_at(&app, now)
+            .weekly_tokens_readout
+            .map(|readout| readout.value),
+        Some(TrendReadoutValue::Tokens(exact_tokens))
+    );
+}
+
+#[test]
+fn half_hour_bar_charts_omit_the_current_value_row() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(1, 1);
+    app.replace_history(trend_history_fixture(now));
+    app.set_view(View::Trends);
+    app.trend_section = TrendSection::HalfHour;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let content = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        terminal
+            .draw(|frame| render_at(frame, &mut app, now))
+            .unwrap();
+        buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 60, 24))
+    });
+    assert!(content.contains("15m Local Tokens"), "{content}");
+    assert!(content.contains("15m ~EST Usage"), "{content}");
+    assert!(content.contains("samples"), "{content}");
+    assert!(!content.contains("As of"), "{content}");
+    assert!(!content.contains("Tokens 3,000 @"), "{content}");
+    assert!(!content.contains("~EST 12.5% @"), "{content}");
+}
+
+#[test]
+fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
     let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let bounds = trend_day_bounds(now, 0);
+    let weekly_reset = now + ChronoDuration::days(3);
+    let buckets = (0..96)
+        .map(|index| {
+            let starts_at = bounds[0] + ChronoDuration::minutes(i64::from(index) * 15);
+            LocalHalfHourBucket {
+                starts_at,
+                ends_at: starts_at + ChronoDuration::minutes(15),
+                sampled_at: starts_at + ChronoDuration::minutes(15),
+                token_usage: TokenUsage {
+                    total_tokens: u64::try_from(index + 1).unwrap() * 100,
+                    ..TokenUsage::default()
+                },
+                estimated_cost_units: u128::try_from(index + 1).unwrap(),
+                estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                call_count: 1,
+                groups: Vec::new(),
+                partial_reasons: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        quota_points: vec![QuotaPoint {
+            observed_at: now,
+            limit_id: "codex".to_string(),
+            duration_mins: 10_080,
+            resets_at: weekly_reset,
+            used_percent: 50.0,
+            remaining_percent: 50.0,
+            provenance: Provenance::ServerSnapshot,
+        }],
+        half_hour_buckets: buckets,
+        ..HistoryData::default()
+    };
+    app.set_view(View::Trends);
+    app.trend_section = TrendSection::HalfHour;
+
+    let data = prepare_trend_data_at(&app, now);
+    assert_eq!(data.half_hour_tokens.len(), 96);
+    assert_eq!(data.half_hour_estimated.len(), 96);
+    assert_eq!(
+        data.half_hour_tokens[0].at,
+        bounds[0] + ChronoDuration::minutes(7) + ChronoDuration::seconds(30)
+    );
+
+    for (width, height) in [(60, 24), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &mut app, now))
+            .unwrap();
+        let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, width, height));
+        assert!(
+            content.contains("15m Local Tokens · 96 samples"),
+            "{content}"
+        );
+        assert!(content.contains("15m ~EST Usage · 96 samples"), "{content}");
+    }
+
+    app.history.half_hour_buckets.remove(48);
+    let gapped = prepare_trend_data_at(&app, now);
+    assert_eq!(gapped.half_hour_tokens.len(), 95);
+    assert_eq!(gapped.half_hour_estimated.len(), 95);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+    let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 120, 40));
+    assert!(
+        content.contains("15m Local Tokens · 95 samples · 1 gaps"),
+        "{content}"
+    );
+    assert!(
+        content.contains("15m ~EST Usage · 95 samples · 1 gaps"),
+        "{content}"
+    );
+}
+
+#[test]
+fn trend_readout_formatting_keeps_exact_integer_tokens_and_compact_decimals() {
+    assert_eq!(format_exact_token_count(0), "0");
+    assert_eq!(
+        format_exact_token_count(9_007_199_254_740_993),
+        "9,007,199,254,740,993"
+    );
+    assert_eq!(
+        format_exact_token_count(u64::MAX),
+        "18,446,744,073,709,551,615"
+    );
+    assert_eq!(
+        format_trend_readout_value(TrendReadoutValue::Percent(12.5)),
+        "12.5%"
+    );
+    assert_eq!(
+        format_trend_readout_value(TrendReadoutValue::Percent(12.345)),
+        "12.35%"
+    );
+    assert_eq!(
+        format_trend_readout_value(TrendReadoutValue::Percent(f64::NAN)),
+        "—"
+    );
+}
+
+#[test]
+fn trend_readouts_reject_expired_quota_and_the_synthetic_weekly_anchor() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let weekly_reset = now + ChronoDuration::days(3);
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        quota_points: vec![
+            QuotaPoint {
+                observed_at: now - ChronoDuration::minutes(1),
+                limit_id: "codex".to_string(),
+                duration_mins: 300,
+                resets_at: now,
+                used_percent: 90.0,
+                remaining_percent: 10.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: now,
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: weekly_reset,
+                used_percent: 25.0,
+                remaining_percent: 75.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+        ],
+        ..HistoryData::default()
+    };
+
+    let data = prepare_trend_data_at(&app, now);
+
+    assert!(!data.five_hour_remaining.is_empty());
+    assert_eq!(data.five_hour_remaining_readout, None);
+    assert_eq!(
+        data.weekly_remaining_readout.map(|readout| readout.value),
+        Some(TrendReadoutValue::Percent(75.0))
+    );
+    assert_eq!(data.weekly_tokens.len(), 1);
+    assert_eq!(data.weekly_tokens_readout, None);
+    assert_eq!(data.weekly_estimated_readout, None);
+}
+
+#[test]
+fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
+    let weekly_reset = DateTime::parse_from_rfc3339("2026-08-05T09:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let cycle_start = weekly_reset - ChronoDuration::days(7);
+    let now = cycle_start + ChronoDuration::minutes(1);
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        quota_points: vec![QuotaPoint {
+            observed_at: now,
+            limit_id: "codex".to_string(),
+            duration_mins: 10_080,
+            resets_at: weekly_reset,
+            used_percent: 25.0,
+            remaining_percent: 75.0,
+            provenance: Provenance::ServerSnapshot,
+        }],
+        weekly_local_points: vec![WeeklyLocalPoint {
+            observed_at: cycle_start,
+            resets_at: weekly_reset,
+            token_usage: TokenUsage {
+                total_tokens: 123,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: 100,
+            estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+            call_count: 1,
+            partial_reasons: Vec::new(),
+        }],
+        ..HistoryData::default()
+    };
+
+    let data = prepare_trend_data_at(&app, now);
+
+    assert_eq!(
+        data.weekly_tokens_readout,
+        Some(TrendReadout {
+            sampled_at: cycle_start,
+            value: TrendReadoutValue::Tokens(123),
+            partial: false,
+        })
+    );
+    assert_eq!(
+        data.weekly_estimated_readout.map(|readout| readout.value),
+        Some(TrendReadoutValue::Percent(25.0))
+    );
+
+    app.history.quota_points.clear();
+    let uncalibrated = prepare_trend_data_at(&app, now);
+    assert!(uncalibrated.weekly_history_present);
+    assert_eq!(
+        uncalibrated
+            .weekly_tokens_readout
+            .map(|readout| readout.value),
+        Some(TrendReadoutValue::Tokens(123))
+    );
+    assert!(uncalibrated.weekly_estimated.is_empty());
+    assert_eq!(uncalibrated.weekly_estimated_readout, None);
+}
+
+#[test]
+fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:07:00Z")
         .unwrap()
         .with_timezone(&Utc);
     let mut app = interaction_test_app(1, 1);
     app.snapshot.as_of = now - ChronoDuration::hours(6);
     let bucket = |starts_at, total_tokens| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(30),
-        sampled_at: starts_at + ChronoDuration::minutes(30),
+        ends_at: starts_at + ChronoDuration::minutes(15),
+        sampled_at: starts_at + ChronoDuration::minutes(15),
         token_usage: TokenUsage {
             total_tokens,
             ..TokenUsage::default()
@@ -5291,13 +5614,29 @@ fn latest_half_hour_window_uses_now_when_the_snapshot_clock_is_frozen() {
         partial_reasons: Vec::new(),
     };
     app.history.half_hour_buckets = vec![
-        bucket(now - ChronoDuration::hours(28), 100),
-        bucket(now - ChronoDuration::minutes(30), 200),
+        bucket(
+            DateTime::parse_from_rfc3339("2026-07-28T08:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            100,
+        ),
+        bucket(
+            DateTime::parse_from_rfc3339("2026-07-29T11:45:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            200,
+        ),
     ];
 
     let data = prepare_trend_data_at(&app, now);
 
     assert_eq!(data.half_hour_bounds, trend_day_bounds(now, 0));
+    assert_eq!(
+        data.half_hour_bounds[1],
+        DateTime::parse_from_rfc3339("2026-07-29T12:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    );
     assert_ne!(
         data.half_hour_bounds,
         trend_day_bounds(app.snapshot.as_of, 0)
@@ -5308,6 +5647,25 @@ fn latest_half_hour_window_uses_now_when_the_snapshot_clock_is_frozen() {
             .map(|point| point.value)
             .collect::<Vec<_>>(),
         [200.0]
+    );
+    assert_eq!(
+        data.half_hour_tokens[0].at,
+        DateTime::parse_from_rfc3339("2026-07-29T11:52:30Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    );
+}
+
+#[test]
+fn history_view_cutoff_uses_15_minute_alignment() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:20:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        history_view_since(now),
+        DateTime::parse_from_rfc3339("2026-07-21T12:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     );
 }
 
@@ -5343,8 +5701,8 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
     let cross_reset_now = boundary + ChronoDuration::hours(12);
     let bucket = |starts_at, cost_units| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(30),
-        sampled_at: starts_at + ChronoDuration::minutes(30),
+        ends_at: starts_at + ChronoDuration::minutes(15),
+        sampled_at: starts_at + ChronoDuration::minutes(15),
         token_usage: TokenUsage {
             total_tokens: u64::try_from(cost_units).unwrap(),
             ..TokenUsage::default()
@@ -5432,6 +5790,93 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
 }
 
 #[test]
+fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
+    let transition = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let now = transition + ChronoDuration::minutes(20);
+    let old_reset = transition + ChronoDuration::days(3);
+    let new_reset = transition + ChronoDuration::days(7);
+    let bucket = |starts_at, sampled_at| LocalHalfHourBucket {
+        starts_at,
+        ends_at: starts_at + ChronoDuration::minutes(15),
+        sampled_at,
+        token_usage: TokenUsage {
+            total_tokens: 1_000,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 100,
+        estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        call_count: 1,
+        groups: Vec::new(),
+        partial_reasons: Vec::new(),
+    };
+    let mut app = interaction_test_app(1, 1);
+    app.history = HistoryData {
+        quota_points: vec![
+            QuotaPoint {
+                observed_at: transition - ChronoDuration::minutes(5),
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: old_reset,
+                used_percent: 80.0,
+                remaining_percent: 20.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+            QuotaPoint {
+                observed_at: now,
+                limit_id: "codex".to_string(),
+                duration_mins: 10_080,
+                resets_at: new_reset,
+                used_percent: 10.0,
+                remaining_percent: 90.0,
+                provenance: Provenance::ServerSnapshot,
+            },
+        ],
+        half_hour_buckets: vec![
+            bucket(transition - ChronoDuration::minutes(15), transition),
+            bucket(transition, transition + ChronoDuration::minutes(15)),
+        ],
+        ..HistoryData::default()
+    };
+
+    let data = prepare_trend_data_at(&app, now);
+
+    assert_eq!(
+        data.half_hour_estimated
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [40.0, 10.0]
+    );
+
+    app.history.quota_points.pop();
+    app.history.weekly_local_points = vec![WeeklyLocalPoint {
+        observed_at: now,
+        resets_at: new_reset,
+        token_usage: TokenUsage {
+            total_tokens: 1_000,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 100,
+        estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        call_count: 1,
+        partial_reasons: Vec::new(),
+    }];
+    app.trend_day_offset = 1;
+    let viewed_at = now + ChronoDuration::days(1);
+    let uncalibrated = prepare_trend_data_at(&app, viewed_at);
+    assert_eq!(
+        uncalibrated
+            .half_hour_estimated
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [40.0]
+    );
+}
+
+#[test]
 fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
     let base_reset = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
         .unwrap()
@@ -5485,14 +5930,20 @@ fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
 #[test]
 fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
     let mut app = interaction_test_app(1, 1);
-    let reset = app.snapshot.as_of + ChronoDuration::days(3);
+    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
+    let aligned_now = DateTime::from_timestamp(
+        app.snapshot.as_of.timestamp().div_euclid(bucket_seconds) * bucket_seconds,
+        0,
+    )
+    .unwrap();
+    let reset = aligned_now + ChronoDuration::days(3);
     let start = reset - ChronoDuration::days(7);
     let first_at = start + ChronoDuration::minutes(30);
     let second_at = start + ChronoDuration::minutes(120);
     let zero_bucket = |starts_at| LocalHalfHourBucket {
         starts_at,
-        ends_at: starts_at + ChronoDuration::minutes(30),
-        sampled_at: starts_at + ChronoDuration::minutes(30),
+        ends_at: starts_at + ChronoDuration::minutes(15),
+        sampled_at: starts_at + ChronoDuration::minutes(15),
         token_usage: TokenUsage::default(),
         estimated_cost_units: 0,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
@@ -5512,6 +5963,7 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
         }],
         half_hour_buckets: vec![
             zero_bucket(start + ChronoDuration::minutes(30)),
+            zero_bucket(start + ChronoDuration::minutes(45)),
             zero_bucket(start + ChronoDuration::minutes(60)),
         ],
         weekly_local_points: vec![
@@ -6982,7 +7434,7 @@ fn renders_all_views_at_common_terminal_sizes() {
                     assert!(content.contains("Quota Remaining"));
                     if width >= 120 && height >= 30 {
                         assert!(content.contains("Weekly Local Tokens"));
-                        assert!(content.contains("30m Local Tokens"));
+                        assert!(content.contains("15m Local Tokens"));
                     }
                 }
             }

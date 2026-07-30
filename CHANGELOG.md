@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Increased local token and `~EST` bar resolution from 30-minute to UTC-aligned 15-minute buckets while keeping weekly cumulative sampling at 30 minutes.
+- Added exact as-of values to Quota and Weekly line charts while leaving point-in-time values off the 15-minute bar charts.
+
+### Compatibility
+
+- Bumped history shards to format and metric revision 2. Legacy quota and weekly cumulative history are retained, while indivisible 30-minute local buckets are discarded and recent 15-minute buckets are rebuilt from rollout files still in the configured scan range.
+- Bumped performance-log schema to version 4 and renamed the history volume field from `halfHourBuckets` to `localBuckets`.
+- Existing recorder-service installations must be reinstalled after upgrading so the resident process restarts with history format 2 support.
+
 ## [0.2.3] - 2026-07-29
 
 ### Added

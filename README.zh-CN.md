@@ -24,7 +24,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **重置机会详情** — 查看权威的可用数量，以及服务端返回明细时每次机会的获得和过期时间。
 - **过期提醒** — 如果最早且信息完整的可用重置机会会在普通 Codex 周自然重置前过期，Overview 的周用量进度条会显示提醒和准确的本地过期时间。
 - **本地用量拆分** — 按当前 5 小时或周重置周期查看 task、turn、模型、token 总量和 token 占比。
-- **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及半小时 token/估算桶。
+- **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及 15 分钟 token/估算桶。
 - **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 导出便于阅读的文本或带 schema 版本的 camelCase JSON，选择指定 section，或按 thread 筛选 turn。
@@ -59,7 +59,7 @@ sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
 
-升级时，重新下载并运行最新版安装器，然后重启正在运行的 TUI。程序不提供自更新功能。
+升级时，重新下载并运行最新版安装器，然后重启正在运行的 TUI。如果安装过后台记录服务，还要在替换可执行文件后再次运行 `codex-usage-monit service install`，让常驻进程切换到新版本。程序不提供自更新功能。
 
 64 位 Windows 用户可以从[最新 Release](https://github.com/ghostroller/codex-usage-monit/releases/latest)下载 `codex-usage-monit-x86_64-pc-windows-msvc.exe` 和 `SHA256SUMS`。在 PowerShell 中校验后可按需改名，然后把 `codex-usage-monit.exe` 所在目录加入 `PATH`：
 
@@ -219,7 +219,7 @@ codex-usage-monit record --foreground
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和半小时柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
+**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -229,7 +229,7 @@ codex-usage-monit record --foreground
 | --- | --- |
 | `Tab` / `→`、`Shift+Tab` / `←` | 在视图之间移动。 |
 | `1`、`2`、`3` | 打开 Overview、Trends 或 Other。 |
-| 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 Half-hour 图表。 |
+| 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 15-minute 图表。 |
 | Trends 中的 `[`、`]`、`n` | 把 24 小时图表窗口向前/向后移动，或回到 Now。 |
 | `5`、`w` | 选择 5 小时或周重置周期。 |
 | `↑` / `k`、`↓` / `j`、`Home`、`End`、`PgUp`、`PgDn` | 在列表中导航。 |
@@ -303,10 +303,10 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `Quota Remaining` | 持久化的服务端 `100 - usedPercent` 观察值。5 小时和周周期是独立序列；没有 recorder 运行时产生的缺口不会插值。 |
 | `Weekly Local Tokens` | 当前服务端周周期内，符合条件的本地 token 增量累计值。 |
 | `Weekly ~EST Usage` | 使用最新周 gauge，把额度按截至各时间点的本地价格权重分配。它是低置信度分配，不是独立的服务端测量。 |
-| `30m Local Tokens` | 按调用完成观察时间放入 UTC 对齐半小时桶的本地 token 增量。 |
-| `30m ~EST Usage` | 把同一周低置信度分配拆到这些半小时价格权重桶。 |
+| `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
+| `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟价格权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 历史会保留原始模型、服务层、token 分量和估算器版本，避免价格逻辑变化时静默混用不同定义。由于计算采用最新周 gauge 和完整周期分母，新增本地调用或服务端样本后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `30m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 历史会保留原始模型、服务层、token 分量和估算器版本，避免价格逻辑变化时静默混用不同定义。由于计算采用最新周 gauge 和完整周期分母，新增本地调用或服务端样本后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 ## 精度和限制
 
@@ -316,7 +316,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
 - **任务结束不等于账单精确。** 已结算任务可以拥有精确的本地可观察 token 总量，但其额度估算仍然是低可信值。
-- **历史区分零值和缺失。** 程序停止会在服务端额度历史中留下缺口。本地半小时桶只有在对应 rollout 仍处于配置的扫描天数和文件上限内时才能回填。
+- **历史区分零值和缺失。** 程序停止会在服务端额度历史中留下缺口。本地 15 分钟桶只有在对应 rollout 仍处于配置的扫描天数和文件上限内时才能回填。升级时会丢弃旧的 30 分钟本地聚合桶，而不是近似拆分；额度历史和周累计历史会保留，近期本地桶会从仍在扫描范围内的 rollout 文件重建。
 
 公式、价格回退规则、计数器处理和详细的不完整原因语义见[数据能力和限制](docs/codex-data-capabilities.md)。
 

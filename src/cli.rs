@@ -621,7 +621,7 @@ fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
                 history_metrics.quota_points =
                     u64::try_from(result.history_observation.quota_points.len())
                         .unwrap_or(u64::MAX);
-                history_metrics.half_hour_buckets =
+                history_metrics.local_buckets =
                     u64::try_from(result.history_observation.half_hour_buckets.len())
                         .unwrap_or(u64::MAX);
                 history_metrics.weekly_local_points =

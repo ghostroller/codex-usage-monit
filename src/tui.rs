@@ -50,7 +50,7 @@ use crate::domain::{
     TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage,
     terminal_safe_text,
 };
-use crate::history::{HistoryData, HistoryObservation, HistoryStore};
+use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
 use crate::open_config::{OpenConfig, OpenConfigStore};
 use crate::perf::{HistoryMetrics, PerfLog};
 use crate::rollout::RolloutCache;
@@ -251,7 +251,7 @@ impl TrendSection {
         match self {
             Self::Remaining => "Remaining",
             Self::Weekly => "Weekly",
-            Self::HalfHour => "Half-hour",
+            Self::HalfHour => "15-minute",
         }
     }
 
@@ -279,10 +279,24 @@ struct TrendPoint {
     partial: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TrendReadoutValue {
+    Percent(f64),
+    Tokens(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrendReadout {
+    sampled_at: DateTime<Utc>,
+    value: TrendReadoutValue,
+    partial: bool,
+}
+
 #[derive(Clone, Copy)]
 struct TrendSeries<'a> {
     name: &'static str,
     points: &'a [TrendPoint],
+    readout: Option<TrendReadout>,
     color: Color,
 }
 
@@ -861,6 +875,10 @@ struct PreparedTrendData {
     weekly_estimated: Vec<TrendPoint>,
     half_hour_tokens: Vec<TrendPoint>,
     half_hour_estimated: Vec<TrendPoint>,
+    five_hour_remaining_readout: Option<TrendReadout>,
+    weekly_remaining_readout: Option<TrendReadout>,
+    weekly_tokens_readout: Option<TrendReadout>,
+    weekly_estimated_readout: Option<TrendReadout>,
     half_hour_bounds: [DateTime<Utc>; 2],
     weekly_history_present: bool,
     half_hour_history_present: bool,
@@ -876,6 +894,7 @@ struct TrendPanelSpec<'a> {
     fixed_x_bounds: Option<[DateTime<Utc>; 2]>,
     history_warning_count: usize,
     history_read_only: bool,
+    readout_label: Option<&'static str>,
     theme: Theme,
 }
 
@@ -3482,7 +3501,7 @@ fn prepare_initial_tui(
     );
     history_span.finish_with(|| {
         format!(
-            "quota_points={} half_hour_buckets={} warnings={} read_only={}",
+            "quota_points={} local_buckets={} warnings={} read_only={}",
             history.quota_points.len(),
             history.half_hour_buckets.len(),
             history.warnings.len(),
@@ -3555,7 +3574,7 @@ fn stage_and_load_history(
         metrics.warnings = 1;
     }
     metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
-    metrics.half_hour_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    metrics.local_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
     match write_result {
@@ -3618,7 +3637,7 @@ fn flush_or_reload_history_if_due(
         metrics.warnings = 1;
     }
     metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
-    metrics.half_hour_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    metrics.local_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
     match write_result {
@@ -3670,7 +3689,8 @@ fn flush_staged_history_on_exit(history_store: &Arc<Mutex<HistoryStore>>, perf_l
 }
 
 fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
-    let aligned_seconds = now.timestamp().div_euclid(30 * 60) * 30 * 60;
+    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
+    let aligned_seconds = now.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
     DateTime::from_timestamp(aligned_seconds, 0).unwrap_or(now)
         - ChronoDuration::days(HISTORY_VIEW_DAYS)
 }
@@ -4745,7 +4765,7 @@ fn section_label_suffix(section: TrendSection) -> &'static str {
     match section {
         TrendSection::Remaining => "]Remaining",
         TrendSection::Weekly => "]Weekly",
-        TrendSection::HalfHour => "]Half-hour",
+        TrendSection::HalfHour => "]15-minute",
     }
 }
 
@@ -4797,13 +4817,17 @@ fn append_trend_control(
 fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let five_hour_remaining = remaining_trend(&app.history, 300);
     let weekly_remaining = remaining_trend(&app.history, 10_080);
+    let five_hour_remaining_readout = remaining_trend_readout(&app.history, 300, now);
+    let weekly_remaining_readout = remaining_trend_readout(&app.history, 10_080, now);
     let half_hour_bounds = trend_day_bounds(now, app.trend_day_offset);
     let weekly_reset = app.history.latest_weekly_reset();
 
     let weekly_cumulative = weekly_reset
         .map(|reset| app.history.weekly_cumulative_series(reset))
         .unwrap_or_default();
-    let weekly_history_present = weekly_cumulative.len() > 1;
+    let weekly_history_present = weekly_cumulative
+        .iter()
+        .any(|point| point.sampled_at.is_some());
     let weekly_tokens = weekly_cumulative
         .iter()
         .map(|point| TrendPoint {
@@ -4822,6 +4846,29 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
             })
         })
         .collect();
+    let weekly_readout_point = weekly_reset
+        .filter(|reset| {
+            let starts_at = *reset - ChronoDuration::minutes(10_080);
+            starts_at <= now && now < *reset
+        })
+        .and_then(|_| {
+            weekly_cumulative
+                .iter()
+                .rfind(|point| point.sampled_at.is_some_and(|sampled_at| sampled_at <= now))
+                .and_then(|point| point.sampled_at.map(|sampled_at| (point, sampled_at)))
+        });
+    let weekly_tokens_readout = weekly_readout_point.map(|(point, sampled_at)| TrendReadout {
+        sampled_at,
+        value: TrendReadoutValue::Tokens(point.token_usage.total_tokens),
+        partial: !point.partial_reasons.is_empty(),
+    });
+    let weekly_estimated_readout = weekly_readout_point.and_then(|(point, sampled_at)| {
+        point.estimated_quota_percent.map(|value| TrendReadout {
+            sampled_at,
+            value: TrendReadoutValue::Percent(value),
+            partial: !point.partial_reasons.is_empty(),
+        })
+    });
 
     let half_hour_buckets = app
         .history
@@ -4835,7 +4882,7 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let half_hour_tokens = half_hour_buckets
         .iter()
         .map(|bucket| TrendPoint {
-            at: bucket.starts_at + ChronoDuration::minutes(15),
+            at: bucket.starts_at + (bucket.ends_at - bucket.starts_at) / 2,
             value: bucket.token_usage.total_tokens as f64,
             partial: !bucket.partial_reasons.is_empty(),
         })
@@ -4849,6 +4896,10 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
         weekly_estimated,
         half_hour_tokens,
         half_hour_estimated,
+        five_hour_remaining_readout,
+        weekly_remaining_readout,
+        weekly_tokens_readout,
+        weekly_estimated_readout,
         half_hour_bounds,
         weekly_history_present,
         half_hour_history_present,
@@ -4857,32 +4908,85 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     }
 }
 
+fn remaining_trend_readout(
+    history: &HistoryData,
+    duration_mins: i64,
+    now: DateTime<Utc>,
+) -> Option<TrendReadout> {
+    history
+        .quota_points
+        .iter()
+        .filter(|point| {
+            point.duration_mins == duration_mins
+                && point.observed_at <= now
+                && now < point.resets_at
+        })
+        .max_by_key(|point| (point.observed_at, point.resets_at))
+        .map(|point| TrendReadout {
+            sampled_at: point.observed_at,
+            value: TrendReadoutValue::Percent(point.remaining_percent),
+            partial: false,
+        })
+}
+
 fn half_hour_estimated_trend(history: &HistoryData, bounds: [DateTime<Utc>; 2]) -> Vec<TrendPoint> {
+    const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
+    let resets = weekly_resets_overlapping(history, bounds);
+    let estimates_by_reset = resets
+        .iter()
+        .copied()
+        .map(|reset| {
+            let points = history
+                .estimated_half_hour_series(reset)
+                .into_iter()
+                .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
+                .map(|point| (point.starts_at, point))
+                .collect::<BTreeMap<_, _>>();
+            (reset, points)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut points = BTreeMap::new();
-    for reset in weekly_resets_overlapping(history, bounds) {
-        for point in history
-            .estimated_half_hour_series(reset)
-            .into_iter()
-            .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
-        {
-            let Some(value) = point.estimated_quota_percent else {
-                continue;
-            };
-            let at = point.starts_at + (point.ends_at - point.starts_at) / 2;
-            let candidate = TrendPoint {
+    for bucket in history
+        .half_hour_series()
+        .iter()
+        .filter(|bucket| bucket.starts_at >= bounds[0] && bucket.starts_at < bounds[1])
+    {
+        let crosses_reset = resets.iter().any(|reset| {
+            let cycle_starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
+            bucket.starts_at < cycle_starts_at && cycle_starts_at < bucket.ends_at
+        });
+        if crosses_reset {
+            continue;
+        }
+        let Some(reset) = resets
+            .iter()
+            .copied()
+            .filter(|reset| {
+                let cycle_starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
+                bucket.starts_at >= cycle_starts_at && bucket.ends_at <= *reset
+            })
+            .max()
+        else {
+            continue;
+        };
+        let Some(point) = estimates_by_reset
+            .get(&reset)
+            .and_then(|points| points.get(&bucket.starts_at))
+        else {
+            continue;
+        };
+        let Some(value) = point.estimated_quota_percent else {
+            continue;
+        };
+        let at = point.starts_at + (point.ends_at - point.starts_at) / 2;
+        points.insert(
+            at,
+            TrendPoint {
                 at,
                 value,
                 partial: !point.partial_reasons.is_empty(),
-            };
-            points
-                .entry(at)
-                .and_modify(|existing: &mut TrendPoint| {
-                    if existing.partial && !candidate.partial {
-                        *existing = candidate;
-                    }
-                })
-                .or_insert(candidate);
-        }
+            },
+        );
     }
     points.into_values().collect()
 }
@@ -4959,11 +5063,12 @@ fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint>
 
 fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2] {
     let shifted = as_of - ChronoDuration::days(i64::from(day_offset));
+    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let end_seconds = shifted
         .timestamp()
-        .saturating_add(30 * 60 - 1)
-        .div_euclid(30 * 60)
-        .saturating_mul(30 * 60);
+        .saturating_add(bucket_seconds - 1)
+        .div_euclid(bucket_seconds)
+        .saturating_mul(bucket_seconds);
     let end = DateTime::from_timestamp(end_seconds, 0).unwrap_or(shifted);
     [end - ChronoDuration::hours(24), end]
 }
@@ -5066,11 +5171,13 @@ fn render_remaining_trend_panel(
             TrendSeries {
                 name: "5h",
                 points: &data.five_hour_remaining,
+                readout: data.five_hour_remaining_readout,
                 color: palette.accent,
             },
             TrendSeries {
                 name: "Week",
                 points: &data.weekly_remaining,
+                readout: data.weekly_remaining_readout,
                 color: palette.warning,
             },
         ],
@@ -5084,6 +5191,7 @@ fn render_remaining_trend_panel(
             fixed_x_bounds: None,
             history_warning_count: data.history_warning_count,
             history_read_only: data.history_read_only,
+            readout_label: Some("As of"),
             theme,
         },
     );
@@ -5101,6 +5209,7 @@ fn render_weekly_token_trend_panel(
         &[TrendSeries {
             name: "Tokens",
             points: &data.weekly_tokens,
+            readout: data.weekly_tokens_readout,
             color: theme.palette().accent,
         }],
         TrendPanelSpec {
@@ -5113,6 +5222,7 @@ fn render_weekly_token_trend_panel(
             fixed_x_bounds: None,
             history_warning_count: data.history_warning_count,
             history_read_only: data.history_read_only,
+            readout_label: Some("As of"),
             theme,
         },
     );
@@ -5146,6 +5256,7 @@ fn render_weekly_estimated_trend_panel(
         &[TrendSeries {
             name: "~EST",
             points: &data.weekly_estimated,
+            readout: data.weekly_estimated_readout,
             color: theme.palette().warning,
         }],
         TrendPanelSpec {
@@ -5158,6 +5269,7 @@ fn render_weekly_estimated_trend_panel(
             fixed_x_bounds: None,
             history_warning_count: data.history_warning_count,
             history_read_only: data.history_read_only,
+            readout_label: Some("As of"),
             theme,
         },
     );
@@ -5175,18 +5287,20 @@ fn render_half_hour_token_trend_panel(
         &[TrendSeries {
             name: "Tokens",
             points: &data.half_hour_tokens,
+            readout: None,
             color: theme.palette().accent,
         }],
         TrendPanelSpec {
-            title: "30m Local Tokens",
+            title: "15m Local Tokens",
             graph_kind: TrendGraphKind::Bar {
-                expected_step: ChronoDuration::minutes(30),
+                expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
             value_kind: TrendValueKind::Tokens,
             fixed_y_bounds: None,
             fixed_x_bounds: Some(data.half_hour_bounds),
             history_warning_count: data.history_warning_count,
             history_read_only: data.history_read_only,
+            readout_label: None,
             theme,
         },
     );
@@ -5200,7 +5314,7 @@ fn render_half_hour_estimated_trend_panel(
 ) {
     if data.half_hour_estimated.is_empty() && data.half_hour_history_present {
         let title = trend_panel_status_title(
-            "30m ~EST Usage",
+            "15m ~EST Usage",
             data.history_warning_count,
             data.history_read_only,
         );
@@ -5220,18 +5334,20 @@ fn render_half_hour_estimated_trend_panel(
         &[TrendSeries {
             name: "~EST",
             points: &data.half_hour_estimated,
+            readout: None,
             color: theme.palette().warning,
         }],
         TrendPanelSpec {
-            title: "30m ~EST Usage",
+            title: "15m ~EST Usage",
             graph_kind: TrendGraphKind::Bar {
-                expected_step: ChronoDuration::minutes(30),
+                expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
             value_kind: TrendValueKind::Percent,
             fixed_y_bounds: None,
             fixed_x_bounds: Some(data.half_hour_bounds),
             history_warning_count: data.history_warning_count,
             history_read_only: data.history_read_only,
+            readout_label: None,
             theme,
         },
     );
@@ -5320,7 +5436,10 @@ fn render_time_series_panel(
             };
             let marker = match spec.graph_kind {
                 TrendGraphKind::Line { .. } => Marker::Braille,
-                TrendGraphKind::Bar { .. } => Marker::Bar,
+                // Braille provides two horizontal plot positions per terminal
+                // cell, keeping a full day of 96 quarter-hour bars distinct in
+                // the common half-width Trends layout.
+                TrendGraphKind::Bar { .. } => Marker::Braille,
             };
             let mut dataset = Dataset::default()
                 .data(segment)
@@ -5334,12 +5453,6 @@ fn render_time_series_panel(
         }
     }
 
-    let palette = spec.theme.palette();
-    let x_labels = trend_time_axis_labels(minimum_time, maximum_time, area.width);
-    let y_labels = vec![
-        format_trend_axis_value(y_bounds[0], spec.value_kind),
-        format_trend_axis_value(y_bounds[1], spec.value_kind),
-    ];
     let mut panel_title = format!(
         "{} · {}",
         trend_panel_status_title(
@@ -5360,9 +5473,42 @@ fn render_time_series_panel(
         panel_title.push_str(" · PARTIAL");
     }
 
+    let panel_block = panel(&panel_title, spec.theme);
+    let inner = panel_block.inner(area);
+    frame.render_widget(panel_block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let chart_area = spec.readout_label.map_or(inner, |readout_label| {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(trend_readout_line(
+                series,
+                readout_label,
+                rows[0].width,
+                spec.theme,
+            ))
+            .style(spec.theme.base_style())
+            .alignment(Alignment::Right),
+            rows[0],
+        );
+        rows[1]
+    });
+    if chart_area.is_empty() {
+        return;
+    }
+
+    let palette = spec.theme.palette();
+    let x_labels = trend_time_axis_labels(minimum_time, maximum_time, chart_area.width);
+    let y_labels = vec![
+        format_trend_axis_value(y_bounds[0], spec.value_kind),
+        format_trend_axis_value(y_bounds[1], spec.value_kind),
+    ];
     let chart = Chart::new(datasets)
         .style(spec.theme.base_style())
-        .block(panel(&panel_title, spec.theme))
         .x_axis(
             Axis::default()
                 .bounds(x_bounds)
@@ -5378,7 +5524,163 @@ fn render_time_series_panel(
         .legend_position(
             (nonempty_series > 1).then_some(ratatui::widgets::LegendPosition::TopRight),
         );
-    frame.render_widget(chart, area);
+    frame.render_widget(chart, chart_area);
+}
+
+fn trend_readout_line(
+    series: &[TrendSeries<'_>],
+    label: &str,
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
+    let maximum_width = usize::from(width);
+    if maximum_width == 0 {
+        return Line::default();
+    }
+    if series.iter().all(|series| series.readout.is_none()) {
+        for message in [
+            "Current sample unavailable".to_string(),
+            format!("{label}: unavailable"),
+            "Unavailable".to_string(),
+        ] {
+            if UnicodeWidthStr::width(message.as_str()) <= maximum_width {
+                return Line::styled(message, Style::default().fg(theme.palette().muted));
+            }
+        }
+        return Line::styled("…", Style::default().fg(theme.palette().muted));
+    }
+
+    let candidates = [
+        (Some(label), "%m-%d %H:%M:%S", false, true),
+        (Some(label), "%H:%M:%S", false, true),
+        (None, "%H:%M:%S", false, false),
+        (None, "%H:%M:%S", true, false),
+        (None, "%H:%M", true, false),
+    ];
+    for (prefix, time_format, compact_names, spaced) in candidates {
+        let (line, line_width) =
+            build_trend_readout_line(series, prefix, time_format, compact_names, spaced, theme);
+        if line_width <= maximum_width {
+            return line;
+        }
+    }
+
+    Line::styled("…", Style::default().fg(theme.palette().muted))
+}
+
+fn build_trend_readout_line(
+    series: &[TrendSeries<'_>],
+    label: Option<&str>,
+    time_format: &str,
+    compact_names: bool,
+    spaced: bool,
+    theme: Theme,
+) -> (Line<'static>, usize) {
+    let palette = theme.palette();
+    let mut spans = Vec::new();
+    let mut width = 0_usize;
+    if let Some(label) = label {
+        push_trend_readout_span(
+            &mut spans,
+            &mut width,
+            format!("{label} · "),
+            Style::default().fg(palette.muted),
+        );
+    }
+
+    for (index, trend_series) in series.iter().enumerate() {
+        if index > 0 {
+            push_trend_readout_span(
+                &mut spans,
+                &mut width,
+                if spaced { " · " } else { " " }.to_string(),
+                Style::default().fg(palette.muted),
+            );
+        }
+        let name = if compact_names {
+            match trend_series.name {
+                "Week" => "W",
+                "Tokens" => "Tok",
+                name => name,
+            }
+        } else {
+            trend_series.name
+        };
+        let Some(readout) = trend_series.readout else {
+            push_trend_readout_span(
+                &mut spans,
+                &mut width,
+                format!("{name} —"),
+                Style::default().fg(palette.muted),
+            );
+            continue;
+        };
+        let separator = if spaced { " @ " } else { "@" };
+        push_trend_readout_span(
+            &mut spans,
+            &mut width,
+            format!("{name} {}", format_trend_readout_value(readout.value)),
+            Style::default()
+                .fg(trend_series.color)
+                .add_modifier(Modifier::BOLD),
+        );
+        push_trend_readout_span(
+            &mut spans,
+            &mut width,
+            format!(
+                "{separator}{}",
+                format_local_time(readout.sampled_at, time_format)
+            ),
+            Style::default().fg(if readout.partial {
+                palette.warning
+            } else {
+                palette.muted
+            }),
+        );
+    }
+
+    (Line::from(spans), width)
+}
+
+fn push_trend_readout_span(
+    spans: &mut Vec<Span<'static>>,
+    width: &mut usize,
+    text: String,
+    style: Style,
+) {
+    *width = width.saturating_add(UnicodeWidthStr::width(text.as_str()));
+    spans.push(Span::styled(text, style));
+}
+
+fn format_trend_readout_value(value: TrendReadoutValue) -> String {
+    match value {
+        TrendReadoutValue::Percent(value) => {
+            if !value.is_finite() {
+                return "—".to_string();
+            }
+            let mut value = format!("{value:.2}");
+            while value.ends_with('0') {
+                value.pop();
+            }
+            if value.ends_with('.') {
+                value.pop();
+            }
+            format!("{value}%")
+        }
+        TrendReadoutValue::Tokens(value) => format_exact_token_count(value),
+    }
+}
+
+fn format_exact_token_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len().saturating_sub(1) / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
 }
 
 fn prepare_trend_segments(

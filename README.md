@@ -24,7 +24,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **Reset-credit details** — See the authoritative available count plus grant and expiry times when the server returns per-credit details.
 - **Expiry reminder** — The weekly Overview gauge warns when the earliest fully known available reset credit expires before the ordinary Codex weekly reset, with the exact local expiry time.
 - **Local usage breakdown** — Explore tasks, turns, models, token totals, and token share for the current 5-hour or weekly reset cycle.
-- **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 30-minute token/estimate buckets in local state.
+- **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 15-minute token/estimate buckets in local state.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export human-readable text or schema-versioned camelCase JSON, select individual sections, and filter turns by thread.
@@ -59,7 +59,7 @@ sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
 
-To upgrade, download the latest installer again and rerun it, then restart any running TUI. The application does not provide a self-update function.
+To upgrade, download the latest installer again and rerun it, then restart any running TUI. If the background recorder is installed, also run `codex-usage-monit service install` again after replacing the executable; this restarts the resident process on the new version. The application does not provide a self-update function.
 
 On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, rename it if desired, and place it in a directory on `PATH`:
 
@@ -219,7 +219,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 30-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
+The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -229,7 +229,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | --- | --- |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
 | `1`, `2`, `3` | Open Overview, Trends, or Other. |
-| `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or Half-hour charts. |
+| `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or 15-minute charts. |
 | `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
 | `5`, `w` | Select the 5-hour or weekly reset cycle. |
 | `↑` / `k`, `↓` / `j`, `Home`, `End`, `PgUp`, `PgDn` | Navigate lists. |
@@ -303,10 +303,10 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `Quota Remaining` | Persisted server observations of `100 - usedPercent`. Five-hour and weekly reset cycles are separate series; gaps while no recorder was running are not interpolated. |
 | `Weekly Local Tokens` | A cumulative sum of eligible local token deltas inside the current server-defined weekly cycle. |
 | `Weekly ~EST Usage` | The latest weekly server gauge distributed across local price-weighted activity up to each point. It is a low-confidence allocation, not an independent server measurement. |
-| `30m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned half-hour buckets. |
-| `30m ~EST Usage` | The same weekly low-confidence allocation split across those half-hour price-weight buckets. |
+| `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
+| `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute price-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST history retains raw model, service-tier, and token components plus an estimator revision so pricing logic can be recomputed without silently mixing definitions. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls or a new server sample arrives. A `30m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST history retains raw model, service-tier, and token components plus an estimator revision so pricing logic can be recomputed without silently mixing definitions. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls or a new server sample arrives. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 ## Accuracy and limitations
 
@@ -316,7 +316,7 @@ History is stored in UTC and displayed in local time. Weekly cumulative samples 
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.
 - **Finished does not mean billable-exact.** Settled tasks can have exact locally observed token totals, while their quota estimate remains low confidence.
-- **History distinguishes zero from missing.** A program outage creates a gap in server quota history. Local half-hour buckets can be backfilled only while their rollout files remain inside the configured scan range and file cap.
+- **History distinguishes zero from missing.** A program outage creates a gap in server quota history. Local 15-minute buckets can be backfilled only while their rollout files remain inside the configured scan range and file cap. On upgrade, legacy 30-minute local buckets are discarded instead of being split approximately; quota and weekly cumulative history are retained, and recent local buckets are rebuilt from rollout files still in range.
 
 See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas, pricing fallbacks, counter handling, and detailed partial-reason semantics.
 

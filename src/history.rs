@@ -14,16 +14,19 @@ use crate::atomic_file::replace_file;
 use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_model};
 use crate::domain::{LimitBucket, Provenance, TokenUsage, UsageCall};
 
-pub const HISTORY_FORMAT_VERSION: u32 = 1;
-pub const HISTORY_METRIC_REVISION: u32 = 1;
+pub const HISTORY_FORMAT_VERSION: u32 = 2;
+pub const HISTORY_METRIC_REVISION: u32 = 2;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
+pub const LOCAL_BUCKET_MINUTES: i64 = 15;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const HISTORY_DIRECTORY: &str = "history-v1";
 const STATE_DIRECTORY_ENV: &str = "CODEX_USAGE_MONIT_STATE_DIR";
 const LOCK_FILE: &str = "history.lock";
-const HALF_HOUR_SECS: i64 = 30 * 60;
+const LEGACY_HISTORY_FORMAT_VERSION: u32 = 1;
+const LOCAL_BUCKET_SECS: i64 = LOCAL_BUCKET_MINUTES * 60;
+const WEEKLY_SAMPLE_SECS: i64 = 30 * 60;
 const QUOTA_SAMPLE_SECS: i64 = 5 * 60;
 const FIVE_HOURS_MINS: i64 = 300;
 const WEEK_MINS: i64 = 10_080;
@@ -60,6 +63,10 @@ pub struct LocalUsageGroup {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// A fixed-width local usage bucket.
+///
+/// The type and serialized collection keep their original "half hour" names
+/// so format-1 shards can preserve non-bucket history during migration.
 pub struct LocalHalfHourBucket {
     pub starts_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
@@ -122,7 +129,7 @@ impl HistoryObservation {
         Self {
             observed_at,
             quota_points: quota_points_from_limits(limits),
-            half_hour_buckets: half_hour_buckets_from_calls(
+            half_hour_buckets: local_buckets_from_calls(
                 observed_at,
                 calls,
                 partial_reasons,
@@ -174,7 +181,8 @@ impl HistoryData {
         weekly_resets_at: DateTime<Utc>,
     ) -> Vec<HalfHourSeriesPoint> {
         let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
-        let boundary_crosses_bucket = cycle_starts_at.timestamp().rem_euclid(HALF_HOUR_SECS) != 0;
+        let boundary_crosses_bucket =
+            cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
         let cycle = self.weekly_cycle_buckets(weekly_resets_at);
         let estimate = self.estimate_context(weekly_resets_at, &cycle);
         cycle
@@ -187,7 +195,7 @@ impl HistoryData {
                     .collect::<BTreeSet<_>>();
                 if boundary_crosses_bucket {
                     partial_reasons
-                        .insert("reset_boundary_excludes_partial_half_hour_buckets".to_string());
+                        .insert("reset_boundary_excludes_partial_local_buckets".to_string());
                 }
                 if !estimate.revisions_are_consistent {
                     partial_reasons.insert("estimator_revision_changed".to_string());
@@ -261,6 +269,7 @@ impl HistoryData {
         }
         let mut points = vec![WeeklyCumulativePoint {
             at: cycle_starts_at,
+            sampled_at: None,
             token_usage: TokenUsage::default(),
             estimated_cost_units: 0,
             estimated_quota_percent: estimate_percent(0),
@@ -278,6 +287,7 @@ impl HistoryData {
             }
             WeeklyCumulativePoint {
                 at: point.observed_at.min(weekly_resets_at),
+                sampled_at: Some(point.observed_at),
                 token_usage: point.token_usage,
                 estimated_cost_units: point.estimated_cost_units,
                 estimated_quota_percent: estimate_percent(point.estimated_cost_units),
@@ -309,6 +319,7 @@ impl HistoryData {
                 bucket.ends_at,
                 WeeklyCumulativePoint {
                     at: bucket.ends_at,
+                    sampled_at: Some(bucket.sampled_at),
                     ..anchor
                 },
             );
@@ -323,12 +334,13 @@ impl HistoryData {
         let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
         let buckets = self.weekly_cycle_buckets(weekly_resets_at);
         let estimate = self.estimate_context(weekly_resets_at, &buckets);
-        let boundary_crosses_bucket = cycle_starts_at.timestamp().rem_euclid(HALF_HOUR_SECS) != 0;
+        let boundary_crosses_bucket =
+            cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
         let mut token_usage = TokenUsage::default();
         let mut estimated_cost_units = 0_u128;
         let mut partial_reasons = BTreeSet::new();
         if boundary_crosses_bucket {
-            partial_reasons.insert("reset_boundary_excludes_partial_half_hour_buckets".to_string());
+            partial_reasons.insert("reset_boundary_excludes_partial_local_buckets".to_string());
         }
         if !estimate.revisions_are_consistent {
             partial_reasons.insert("estimator_revision_changed".to_string());
@@ -336,6 +348,7 @@ impl HistoryData {
 
         let mut points = vec![WeeklyCumulativePoint {
             at: cycle_starts_at,
+            sampled_at: None,
             token_usage,
             estimated_cost_units,
             estimated_quota_percent: estimate.percent_for(0),
@@ -348,6 +361,7 @@ impl HistoryData {
             partial_reasons.extend(bucket.partial_reasons.iter().cloned());
             points.push(WeeklyCumulativePoint {
                 at: bucket.sampled_at.min(bucket.ends_at).min(weekly_resets_at),
+                sampled_at: Some(bucket.sampled_at),
                 token_usage,
                 estimated_cost_units,
                 estimated_quota_percent: estimate.percent_for(estimated_cost_units),
@@ -373,10 +387,14 @@ impl HistoryData {
         let starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
         self.half_hour_buckets
             .iter()
-            // A half-hour aggregate cannot be split accurately after the fact. Keep
+            // A local aggregate cannot be split accurately after the fact. Keep
             // only buckets wholly inside the quota cycle so a non-aligned reset
             // never imports usage from the preceding or following cycle.
-            .filter(|bucket| bucket.starts_at >= starts_at && bucket.ends_at <= weekly_resets_at)
+            .filter(|bucket| {
+                is_current_local_bucket(bucket)
+                    && bucket.starts_at >= starts_at
+                    && bucket.ends_at <= weekly_resets_at
+            })
             .collect()
     }
 
@@ -435,6 +453,7 @@ pub struct HalfHourSeriesPoint {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeeklyCumulativePoint {
     pub at: DateTime<Utc>,
+    pub sampled_at: Option<DateTime<Utc>>,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
     pub estimated_quota_percent: Option<f64>,
@@ -585,15 +604,25 @@ impl HistoryStore {
         let additions = additions_by_day(observation, cutoff, include_all_observation_points);
         for (day, additions) in additions {
             let path = shard_path(directory, day);
-            let mut shard = match read_shard(&path, &self.namespace, day) {
-                ShardRead::Missing => HistoryShard::new(self.namespace.clone(), day),
-                ShardRead::Current(shard) => shard,
-                ShardRead::Future(version) => {
+            let (mut shard, migrated) = match read_shard(&path, &self.namespace, day) {
+                ShardRead::Missing => (HistoryShard::new(self.namespace.clone(), day), false),
+                ShardRead::Current { shard, migrated } => (shard, migrated),
+                ShardRead::FutureFormat(version) => {
                     self.read_only = true;
                     self.cached_data = None;
                     report.read_only = true;
                     report.warnings.push(format!(
                         "{} uses future history format version {version}; writes are disabled",
+                        path.display()
+                    ));
+                    return Ok(report);
+                }
+                ShardRead::FutureMetric(revision) => {
+                    self.read_only = true;
+                    self.cached_data = None;
+                    report.read_only = true;
+                    report.warnings.push(format!(
+                        "{} uses future history metric revision {revision}; writes are disabled",
                         path.display()
                     ));
                     return Ok(report);
@@ -604,7 +633,7 @@ impl HistoryStore {
                     continue;
                 }
             };
-            let mut changed = shard.retain_since(cutoff);
+            let mut changed = migrated | shard.retain_since(cutoff);
             for point in additions.quota_points {
                 changed |= upsert_quota_point(&mut shard.quota_points, point);
             }
@@ -644,7 +673,7 @@ impl HistoryStore {
     ///
     /// Staging never acquires the on-disk history lock. Multiple observations
     /// are compacted with the same replacement rules used by shard writes so
-    /// reset transitions, closed half-hours, and stronger external evidence
+    /// reset transitions, closed local buckets, and stronger external evidence
     /// retain their normal semantics.
     pub(crate) fn stage(&mut self, observation: &HistoryObservation) {
         let pending_clock_rollback = self
@@ -791,7 +820,7 @@ impl HistoryStore {
                 continue;
             }
             match read_shard(&path, &self.namespace, day) {
-                ShardRead::Current(shard) => {
+                ShardRead::Current { shard, .. } => {
                     data.quota_points.extend(
                         shard
                             .quota_points
@@ -811,10 +840,17 @@ impl HistoryStore {
                             .filter(|point| point.observed_at >= since),
                     );
                 }
-                ShardRead::Future(version) => {
+                ShardRead::FutureFormat(version) => {
                     self.read_only = true;
                     data.warnings.push(format!(
                         "{} uses future history format version {version}; writes are disabled",
+                        path.display()
+                    ));
+                }
+                ShardRead::FutureMetric(revision) => {
+                    self.read_only = true;
+                    data.warnings.push(format!(
+                        "{} uses future history metric revision {revision}; writes are disabled",
                         path.display()
                     ));
                 }
@@ -1105,7 +1141,7 @@ fn weekly_local_points_from_sources(
         {
             continue;
         }
-        let bucket_starts_at = floor_half_hour(call.timestamp);
+        let bucket_starts_at = floor_weekly_sample(call.timestamp);
         first_call_bucket = Some(
             first_call_bucket.map_or(bucket_starts_at, |first: DateTime<Utc>| {
                 first.min(bucket_starts_at)
@@ -1128,17 +1164,17 @@ fn weekly_local_points_from_sources(
         }
     }
 
-    let last_bucket = floor_half_hour(observed_at);
+    let last_bucket = floor_weekly_sample(observed_at);
     let materialize_zeros = local_coverage_starts_at.is_some();
     let first_bucket = local_coverage_starts_at
-        .map(|coverage| floor_half_hour(coverage.max(starts_at)))
+        .map(|coverage| floor_weekly_sample(coverage.max(starts_at)))
         .or(first_call_bucket)
         .unwrap_or(last_bucket);
     if materialize_zeros {
         let mut bucket_starts_at = first_bucket;
         while bucket_starts_at <= last_bucket {
             buckets.entry(bucket_starts_at).or_default();
-            bucket_starts_at += Duration::seconds(HALF_HOUR_SECS);
+            bucket_starts_at += Duration::seconds(WEEKLY_SAMPLE_SECS);
         }
     } else {
         buckets.entry(last_bucket).or_default();
@@ -1160,7 +1196,7 @@ fn weekly_local_points_from_sources(
             call_count = call_count.saturating_add(bucket.call_count);
             reasons.extend(bucket.partial_reasons);
             WeeklyLocalPoint {
-                observed_at: (bucket_starts_at + Duration::seconds(HALF_HOUR_SECS))
+                observed_at: (bucket_starts_at + Duration::seconds(WEEKLY_SAMPLE_SECS))
                     .min(observed_at),
                 resets_at,
                 token_usage,
@@ -1190,7 +1226,7 @@ struct BucketAccumulator {
     partial_reasons: BTreeSet<String>,
 }
 
-fn half_hour_buckets_from_calls(
+fn local_buckets_from_calls(
     observed_at: DateTime<Utc>,
     calls: &[UsageCall],
     partial_reasons: &[String],
@@ -1201,7 +1237,7 @@ fn half_hour_buckets_from_calls(
         if call.timestamp > observed_at || is_spark_model(call.model.as_deref()) {
             continue;
         }
-        let starts_at = floor_half_hour(call.timestamp);
+        let starts_at = floor_local_bucket(call.timestamp);
         let bucket = buckets.entry(starts_at).or_default();
         let weight = estimate_call_weight(call);
         bucket.token_usage.add_assign(call.tokens);
@@ -1243,24 +1279,24 @@ fn half_hour_buckets_from_calls(
     if let Some(coverage_starts_at) =
         local_coverage_starts_at.filter(|starts_at| *starts_at <= observed_at)
     {
-        let first_bucket = floor_half_hour(coverage_starts_at);
-        let last_bucket = floor_half_hour(observed_at);
+        let first_bucket = floor_local_bucket(coverage_starts_at);
+        let last_bucket = floor_local_bucket(observed_at);
         let mut starts_at = first_bucket;
         while starts_at <= last_bucket {
             let bucket = buckets.entry(starts_at).or_default();
             if starts_at == first_bucket && coverage_starts_at > first_bucket {
                 bucket
                     .partial_reasons
-                    .insert("coverage_starts_within_half_hour_bucket".to_string());
+                    .insert("coverage_starts_within_local_bucket".to_string());
             }
-            starts_at += Duration::seconds(HALF_HOUR_SECS);
+            starts_at += Duration::seconds(LOCAL_BUCKET_SECS);
         }
     }
 
     buckets
         .into_iter()
         .map(|(starts_at, bucket)| {
-            let ends_at = starts_at + Duration::seconds(HALF_HOUR_SECS);
+            let ends_at = starts_at + Duration::seconds(LOCAL_BUCKET_SECS);
             LocalHalfHourBucket {
                 starts_at,
                 ends_at,
@@ -1286,13 +1322,19 @@ fn normalized_optional(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn floor_half_hour(timestamp: DateTime<Utc>) -> DateTime<Utc> {
-    let seconds = timestamp.timestamp().div_euclid(HALF_HOUR_SECS) * HALF_HOUR_SECS;
-    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid half-hour floor")
+fn floor_local_bucket(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = timestamp.timestamp().div_euclid(LOCAL_BUCKET_SECS) * LOCAL_BUCKET_SECS;
+    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid local-bucket floor")
 }
 
-fn is_exact_half_hour_boundary(timestamp: DateTime<Utc>) -> bool {
-    timestamp.timestamp().rem_euclid(HALF_HOUR_SECS) == 0 && timestamp.timestamp_subsec_nanos() == 0
+fn floor_weekly_sample(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = timestamp.timestamp().div_euclid(WEEKLY_SAMPLE_SECS) * WEEKLY_SAMPLE_SECS;
+    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid weekly-sample floor")
+}
+
+fn is_exact_weekly_sample_boundary(timestamp: DateTime<Utc>) -> bool {
+    timestamp.timestamp().rem_euclid(WEEKLY_SAMPLE_SECS) == 0
+        && timestamp.timestamp_subsec_nanos() == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1360,8 +1402,9 @@ struct VersionProbe {
 
 enum ShardRead {
     Missing,
-    Current(HistoryShard),
-    Future(u32),
+    Current { shard: HistoryShard, migrated: bool },
+    FutureFormat(u32),
+    FutureMetric(u32),
     Corrupt(String),
 }
 
@@ -1392,15 +1435,18 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
         ));
     };
     if version > HISTORY_FORMAT_VERSION {
-        return ShardRead::Future(version);
+        return ShardRead::FutureFormat(version);
     }
-    if version != HISTORY_FORMAT_VERSION {
+    if !matches!(
+        version,
+        LEGACY_HISTORY_FORMAT_VERSION | HISTORY_FORMAT_VERSION
+    ) {
         return ShardRead::Corrupt(format!(
             "history shard {} has unsupported format version {version}",
             path.display()
         ));
     }
-    let shard = match serde_json::from_slice::<HistoryShard>(&contents) {
+    let mut shard = match serde_json::from_slice::<HistoryShard>(&contents) {
         Ok(shard) => shard,
         Err(error) => {
             return ShardRead::Corrupt(format!(
@@ -1423,7 +1469,32 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
             shard.utc_day
         ));
     }
-    ShardRead::Current(shard)
+    if shard.metric_revision > HISTORY_METRIC_REVISION {
+        return ShardRead::FutureMetric(shard.metric_revision);
+    }
+
+    let mut migrated = false;
+    if version == LEGACY_HISTORY_FORMAT_VERSION || shard.metric_revision < HISTORY_METRIC_REVISION {
+        // Revision 1 local buckets were 30-minute aggregates. They cannot be
+        // split honestly, so preserve quota and weekly cumulative history while
+        // letting retained rollout events rebuild local buckets at 15 minutes.
+        shard.half_hour_buckets.clear();
+        shard.format_version = HISTORY_FORMAT_VERSION;
+        shard.metric_revision = HISTORY_METRIC_REVISION;
+        migrated = true;
+    }
+    let bucket_count = shard.half_hour_buckets.len();
+    shard.half_hour_buckets.retain(is_current_local_bucket);
+    migrated |= bucket_count != shard.half_hour_buckets.len();
+
+    ShardRead::Current { shard, migrated }
+}
+
+fn is_current_local_bucket(bucket: &LocalHalfHourBucket) -> bool {
+    bucket.ends_at - bucket.starts_at == Duration::seconds(LOCAL_BUCKET_SECS)
+        && floor_local_bucket(bucket.starts_at) == bucket.starts_at
+        && bucket.sampled_at >= bucket.starts_at
+        && bucket.sampled_at <= bucket.ends_at
 }
 
 fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
@@ -1461,6 +1532,9 @@ fn upsert_half_hour_bucket(
     buckets: &mut Vec<LocalHalfHourBucket>,
     incoming: LocalHalfHourBucket,
 ) -> bool {
+    if !is_current_local_bucket(&incoming) {
+        return false;
+    }
     let existing = buckets
         .iter()
         .position(|bucket| bucket.starts_at == incoming.starts_at);
@@ -1490,7 +1564,7 @@ fn upsert_weekly_local_point(
     points: &mut Vec<WeeklyLocalPoint>,
     incoming: WeeklyLocalPoint,
 ) -> bool {
-    let incoming_is_boundary = is_exact_half_hour_boundary(incoming.observed_at);
+    let incoming_is_boundary = is_exact_weekly_sample_boundary(incoming.observed_at);
     let slot = incoming
         .observed_at
         .timestamp()
@@ -1501,7 +1575,7 @@ fn upsert_weekly_local_point(
     if let Some(index) = points.iter().position(|point| {
         same_cycle(&point)
             && point.observed_at.timestamp().div_euclid(QUOTA_SAMPLE_SECS) == slot
-            && is_exact_half_hour_boundary(point.observed_at) == incoming_is_boundary
+            && is_exact_weekly_sample_boundary(point.observed_at) == incoming_is_boundary
     }) {
         if weekly_local_point_payload_eq(&incoming, &points[index]) {
             return false;
@@ -1723,15 +1797,22 @@ fn inspect_namespace(directory: &Path, namespace: &str) -> NamespaceInspection {
     };
     for (day, path) in entries {
         match read_shard(&path, namespace, day) {
-            ShardRead::Future(version) => {
+            ShardRead::FutureFormat(version) => {
                 inspection.future_version = true;
                 inspection.warnings.push(format!(
                     "{} uses future history format version {version}; writes are disabled",
                     path.display()
                 ));
             }
+            ShardRead::FutureMetric(revision) => {
+                inspection.future_version = true;
+                inspection.warnings.push(format!(
+                    "{} uses future history metric revision {revision}; writes are disabled",
+                    path.display()
+                ));
+            }
             ShardRead::Corrupt(message) => inspection.warnings.push(message),
-            ShardRead::Missing | ShardRead::Current(_) => {}
+            ShardRead::Missing | ShardRead::Current { .. } => {}
         }
     }
     inspection
@@ -2161,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_uses_only_fresh_codex_limits_and_builds_exact_half_hours() {
+    fn observation_uses_only_fresh_codex_limits_and_builds_exact_local_buckets() {
         let now = at(2026, 7, 28, 12, 7, 0);
         let calls = vec![
             call(at(2026, 7, 28, 11, 59, 59), "gpt-5.4", None, 10),
@@ -2207,7 +2288,7 @@ mod tests {
         assert_eq!(observation.half_hour_buckets.len(), 2);
         assert_eq!(
             observation.half_hour_buckets[0].starts_at,
-            at(2026, 7, 28, 11, 30, 0)
+            at(2026, 7, 28, 11, 45, 0)
         );
         assert_eq!(
             observation.half_hour_buckets[0].ends_at,
@@ -2249,14 +2330,14 @@ mod tests {
             Some(at(2026, 7, 28, 10, 10, 0)),
         );
 
-        assert_eq!(observation.half_hour_buckets.len(), 5);
+        assert_eq!(observation.half_hour_buckets.len(), 9);
         assert_eq!(
             observation.half_hour_buckets[0].starts_at,
             at(2026, 7, 28, 10, 0, 0)
         );
         assert_eq!(
             observation.half_hour_buckets[0].partial_reasons,
-            vec!["coverage_starts_within_half_hour_bucket"]
+            vec!["coverage_starts_within_local_bucket"]
         );
         assert_eq!(
             observation
@@ -2264,7 +2345,7 @@ mod tests {
                 .iter()
                 .map(|bucket| bucket.token_usage.total_tokens)
                 .collect::<Vec<_>>(),
-            vec![0, 0, 0, 10, 0]
+            vec![0, 0, 0, 0, 0, 0, 0, 10, 0]
         );
         assert_eq!(
             observation.half_hour_buckets.last().unwrap().sampled_at,
@@ -2552,8 +2633,8 @@ mod tests {
         let history_root = directory.path().join("state");
         let codex_home = directory.path().join("codex");
         let observed_at = at(2026, 7, 28, 12, 0, 0);
-        let edge_time = observed_at - Duration::minutes(59) - Duration::seconds(50);
-        let bucket_start = edge_time - Duration::minutes(30);
+        let bucket_start = observed_at - Duration::minutes(60);
+        let edge_time = bucket_start + Duration::minutes(15);
         let reset = observed_at + Duration::days(7);
         let mut store = HistoryStore::new(history_root.clone(), &codex_home);
         store.last_full_merge_at = Some(observed_at - Duration::minutes(5));
@@ -2565,7 +2646,7 @@ mod tests {
             weekly_local_points: vec![weekly_point(edge_time, reset, 10, 100)],
         });
         store.stage(&HistoryObservation {
-            observed_at: observed_at + Duration::seconds(30),
+            observed_at: observed_at + Duration::minutes(15) + Duration::seconds(30),
             ..HistoryObservation::default()
         });
         assert!(store.flush_staged().unwrap().is_some());
@@ -2779,11 +2860,11 @@ mod tests {
             weekly_local_points: Vec::new(),
         });
         store.stage(&HistoryObservation {
-            observed_at: starts_at + Duration::minutes(30),
+            observed_at: starts_at + Duration::minutes(15),
             quota_points: Vec::new(),
             half_hour_buckets: vec![local_bucket(
                 starts_at,
-                starts_at + Duration::minutes(30),
+                starts_at + Duration::minutes(15),
                 10,
                 100,
             )],
@@ -2791,12 +2872,12 @@ mod tests {
         });
         assert_eq!(
             store.staged_observation.as_ref().unwrap().half_hour_buckets[0].sampled_at,
-            starts_at + Duration::minutes(30)
+            starts_at + Duration::minutes(15)
         );
         store.flush_staged().unwrap();
         assert_eq!(
             store.last_full_merge_at,
-            Some(starts_at + Duration::minutes(30))
+            Some(starts_at + Duration::minutes(15))
         );
 
         store.stage(&HistoryObservation {
@@ -2855,7 +2936,7 @@ mod tests {
         let mut buckets = vec![open.clone()];
 
         let mut later_open = open.clone();
-        later_open.sampled_at = starts_at + Duration::minutes(20);
+        later_open.sampled_at = starts_at + Duration::minutes(12);
         assert!(!upsert_half_hour_bucket(&mut buckets, later_open));
         assert_eq!(buckets[0].sampled_at, open.sampled_at);
 
@@ -2871,7 +2952,7 @@ mod tests {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let mut complete = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
         complete.call_count = 5;
-        let mut partial = local_bucket(starts_at, starts_at + Duration::minutes(20), 20, 200);
+        let mut partial = local_bucket(starts_at, starts_at + Duration::minutes(12), 20, 200);
         partial.call_count = 2;
         partial.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
         let mut buckets = vec![complete.clone()];
@@ -2879,7 +2960,7 @@ mod tests {
         assert!(!upsert_half_hour_bucket(&mut buckets, partial));
         assert_eq!(buckets, vec![complete]);
 
-        let mut fuller = local_bucket(starts_at, starts_at + Duration::minutes(25), 70, 700);
+        let mut fuller = local_bucket(starts_at, starts_at + Duration::minutes(14), 70, 700);
         fuller.call_count = 7;
         assert!(upsert_half_hour_bucket(&mut buckets, fuller.clone()));
         assert_eq!(buckets, vec![fuller]);
@@ -2890,7 +2971,7 @@ mod tests {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let mut existing = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
         existing.call_count = 5;
-        let mut incoming = local_bucket(starts_at, starts_at + Duration::minutes(20), 70, 700);
+        let mut incoming = local_bucket(starts_at, starts_at + Duration::minutes(14), 70, 700);
         incoming.call_count = 7;
         incoming.partial_reasons = vec!["unpriced_model_rate_fallback".to_string()];
         let mut buckets = vec![existing];
@@ -2993,6 +3074,140 @@ mod tests {
     }
 
     #[test]
+    fn future_metric_revision_disables_writes_without_overwriting_it() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let path = shard_path(&namespace_dir, now.date_naive());
+        let future = HistoryShard {
+            format_version: HISTORY_FORMAT_VERSION,
+            metric_revision: HISTORY_METRIC_REVISION + 1,
+            namespace: store.namespace().to_string(),
+            utc_day: now.date_naive(),
+            quota_points: Vec::new(),
+            half_hour_buckets: Vec::new(),
+            weekly_local_points: Vec::new(),
+        };
+        write_shard_atomically(&path, &future).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let data = store.load_since(now - Duration::days(1));
+        assert!(data.read_only);
+        assert!(
+            data.warnings
+                .iter()
+                .any(|warning| warning.contains("future history metric revision"))
+        );
+        let report = store
+            .record(&HistoryObservation {
+                observed_at: now,
+                ..HistoryObservation::default()
+            })
+            .unwrap();
+        assert!(report.read_only);
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_shard_keeps_quota_and_weekly_history_without_mixing_bucket_grains() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let path = shard_path(&namespace_dir, starts_at.date_naive());
+        let mut legacy_bucket = local_bucket(starts_at, starts_at + Duration::minutes(20), 30, 300);
+        legacy_bucket.ends_at = starts_at + Duration::minutes(30);
+        write_shard_atomically(
+            &path,
+            &HistoryShard {
+                format_version: LEGACY_HISTORY_FORMAT_VERSION,
+                metric_revision: 1,
+                namespace: store.namespace().to_string(),
+                utc_day: starts_at.date_naive(),
+                quota_points: vec![quota_point(starts_at, reset, 40.0)],
+                half_hour_buckets: vec![legacy_bucket],
+                weekly_local_points: vec![weekly_point(starts_at, reset, 30, 300)],
+            },
+        )
+        .unwrap();
+
+        let migrated_view = store.load_since(starts_at - Duration::minutes(1));
+        assert_eq!(migrated_view.quota_points.len(), 1);
+        assert_eq!(migrated_view.weekly_local_points.len(), 1);
+        assert!(migrated_view.half_hour_buckets.is_empty());
+
+        let current_bucket = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
+        let report = store
+            .record(&HistoryObservation {
+                observed_at: starts_at + Duration::minutes(20),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![current_bucket.clone()],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(report.shards_written, 1);
+
+        let persisted = match read_shard(&path, store.namespace(), starts_at.date_naive()) {
+            ShardRead::Current { shard, migrated } => {
+                assert!(!migrated);
+                shard
+            }
+            _ => panic!("migrated shard should be readable"),
+        };
+        assert_eq!(persisted.format_version, HISTORY_FORMAT_VERSION);
+        assert_eq!(persisted.metric_revision, HISTORY_METRIC_REVISION);
+        assert_eq!(persisted.quota_points.len(), 1);
+        assert_eq!(persisted.weekly_local_points.len(), 1);
+        assert_eq!(persisted.half_hour_buckets, vec![current_bucket.clone()]);
+
+        let repeated = store
+            .record(&HistoryObservation {
+                observed_at: starts_at + Duration::minutes(20),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![current_bucket],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(repeated.shards_written, 0);
+        assert_eq!(repeated.shards_skipped, 1);
+    }
+
+    #[test]
+    fn normalization_rejects_legacy_width_without_double_counting_current_buckets() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let first = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
+        let second = local_bucket(
+            starts_at + Duration::minutes(15),
+            starts_at + Duration::minutes(30),
+            20,
+            200,
+        );
+        let mut legacy = local_bucket(starts_at, starts_at + Duration::minutes(15), 30, 300);
+        legacy.ends_at = starts_at + Duration::minutes(30);
+        let mut data = HistoryData {
+            half_hour_buckets: vec![legacy, first, second],
+            ..HistoryData::default()
+        };
+
+        normalize_loaded_data(&mut data);
+
+        assert_eq!(data.half_hour_buckets.len(), 2);
+        assert_eq!(
+            data.half_hour_buckets
+                .iter()
+                .map(|bucket| bucket.token_usage.total_tokens)
+                .sum::<u64>(),
+            30
+        );
+    }
+
+    #[test]
     fn corrupt_target_is_reported_and_never_replaced() {
         let directory = tempdir().unwrap();
         let codex_home = directory.path().join("codex");
@@ -3088,18 +3303,18 @@ mod tests {
     fn recorded_weekly_series_restores_only_confirmed_zero_plateaus() {
         let reset = at(2026, 7, 31, 12, 0, 0);
         let start = reset - Duration::days(7);
-        let first_at = start + Duration::minutes(30);
-        let second_at = start + Duration::minutes(120);
+        let first_at = start + Duration::minutes(15);
+        let second_at = start + Duration::minutes(60);
         let mut first_zero = local_bucket(
+            start + Duration::minutes(15),
             start + Duration::minutes(30),
-            start + Duration::minutes(60),
             0,
             0,
         );
         first_zero.call_count = 0;
         let mut second_zero = local_bucket(
-            start + Duration::minutes(60),
-            start + Duration::minutes(90),
+            start + Duration::minutes(30),
+            start + Duration::minutes(45),
             0,
             0,
         );
@@ -3110,7 +3325,7 @@ mod tests {
                 local_bucket(start, first_at, 10, 100),
                 first_zero.clone(),
                 second_zero.clone(),
-                local_bucket(start + Duration::minutes(90), second_at, 10, 100),
+                local_bucket(start + Duration::minutes(45), second_at, 10, 100),
             ],
             weekly_local_points: vec![
                 weekly_point(first_at, reset, 10, 100),
@@ -3125,8 +3340,8 @@ mod tests {
             [
                 start,
                 first_at,
-                start + Duration::minutes(60),
-                start + Duration::minutes(90),
+                start + Duration::minutes(30),
+                start + Duration::minutes(45),
                 second_at,
             ]
         );
@@ -3148,18 +3363,18 @@ mod tests {
         let mut missing = data.clone();
         missing
             .half_hour_buckets
-            .retain(|bucket| bucket.starts_at != start + Duration::minutes(60));
+            .retain(|bucket| bucket.starts_at != start + Duration::minutes(30));
         let still_gapped = missing.weekly_cumulative_series(reset);
         assert_eq!(
             still_gapped
                 .iter()
                 .map(|point| point.at)
                 .collect::<Vec<_>>(),
-            [start, first_at, start + Duration::minutes(60), second_at,]
+            [start, first_at, start + Duration::minutes(30), second_at,]
         );
         assert_eq!(
             still_gapped[3].at - still_gapped[2].at,
-            Duration::minutes(60)
+            Duration::minutes(30)
         );
 
         first_zero.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
@@ -3168,7 +3383,7 @@ mod tests {
         partial.half_hour_buckets[2] = second_zero;
         let not_confirmed = partial.weekly_cumulative_series(reset);
         assert!(!not_confirmed.iter().any(|point| {
-            point.at == start + Duration::minutes(60) || point.at == start + Duration::minutes(90)
+            point.at == start + Duration::minutes(30) || point.at == start + Duration::minutes(45)
         }));
     }
 
@@ -3188,19 +3403,19 @@ mod tests {
     }
 
     #[test]
-    fn non_aligned_weekly_reset_excludes_cross_cycle_half_hours_and_marks_partial() {
+    fn non_aligned_weekly_reset_excludes_cross_cycle_local_buckets_and_marks_partial() {
         let reset = at(2026, 7, 31, 12, 17, 0);
         let start = reset - Duration::days(7);
-        let first_full = floor_half_hour(start) + Duration::minutes(30);
-        let last_full = floor_half_hour(reset) - Duration::minutes(30);
-        let last_sample = last_full + Duration::minutes(17);
+        let first_full = floor_local_bucket(start) + Duration::minutes(15);
+        let last_full = floor_local_bucket(reset) - Duration::minutes(15);
+        let last_sample = last_full + Duration::minutes(15);
         let data = HistoryData {
             quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)],
             half_hour_buckets: vec![
-                local_bucket(floor_half_hour(start), first_full, 100, 1_000),
-                local_bucket(first_full, first_full + Duration::minutes(30), 10, 100),
+                local_bucket(floor_local_bucket(start), first_full, 100, 1_000),
+                local_bucket(first_full, first_full + Duration::minutes(15), 10, 100),
                 local_bucket(last_full, last_sample, 20, 200),
-                local_bucket(floor_half_hour(reset), reset, 200, 2_000),
+                local_bucket(floor_local_bucket(reset), reset, 200, 2_000),
             ],
             ..HistoryData::default()
         };
@@ -3218,7 +3433,7 @@ mod tests {
             point
                 .partial_reasons
                 .iter()
-                .any(|reason| reason == "reset_boundary_excludes_partial_half_hour_buckets")
+                .any(|reason| reason == "reset_boundary_excludes_partial_local_buckets")
         }));
 
         let cumulative = data.weekly_cumulative_series(reset);
@@ -3229,7 +3444,7 @@ mod tests {
             point
                 .partial_reasons
                 .iter()
-                .any(|reason| reason == "reset_boundary_excludes_partial_half_hour_buckets")
+                .any(|reason| reason == "reset_boundary_excludes_partial_local_buckets")
         }));
     }
 
@@ -3337,8 +3552,11 @@ mod tests {
     ) -> LocalHalfHourBucket {
         LocalHalfHourBucket {
             starts_at,
-            ends_at: starts_at + Duration::minutes(30),
-            sampled_at,
+            ends_at: starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES),
+            sampled_at: sampled_at.clamp(
+                starts_at,
+                starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES),
+            ),
             token_usage: usage(total_tokens),
             estimated_cost_units,
             estimator_revision: HISTORY_ESTIMATOR_REVISION,

@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const PERF_LOG_SCHEMA_VERSION: u32 = 3;
+const PERF_LOG_SCHEMA_VERSION: u32 = 4;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Per-stage timings for one refresh. Sibling stages may overlap when account
@@ -76,7 +76,7 @@ pub struct HistoryMetrics {
     pub shards_skipped: u64,
     pub shards_pruned: u64,
     pub quota_points: u64,
-    pub half_hour_buckets: u64,
+    pub local_buckets: u64,
     pub weekly_local_points: u64,
     pub warnings: u64,
     pub read_only: bool,
@@ -752,6 +752,7 @@ mod tests {
         history.stage_us = 250;
         history.shards_written = 1;
         history.weekly_local_points = 12;
+        history.local_buckets = 24;
         log.record_history(history);
         log.record_history_runtime(Duration::from_micros(500));
         log.record_event_wakeup();
@@ -783,6 +784,8 @@ mod tests {
         assert_eq!(values[2]["metrics"]["loadPerformed"], true);
         assert_eq!(values[2]["metrics"]["shardsWritten"], 1);
         assert_eq!(values[2]["metrics"]["weeklyLocalPoints"], 12);
+        assert_eq!(values[2]["metrics"]["localBuckets"], 24);
+        assert!(values[2]["metrics"].get("halfHourBuckets").is_none());
         assert_eq!(values[3]["event"], "sample");
         assert_eq!(values[3]["draw"]["count"], 2);
         assert_eq!(values[3]["draw"]["totalDurationUs"], 1_000);
