@@ -276,7 +276,16 @@ impl TrendSection {
 struct TrendPoint {
     at: DateTime<Utc>,
     value: f64,
+    readout_value: TrendReadoutValue,
+    sampled_at: Option<DateTime<Utc>>,
+    interval: Option<TrendInterval>,
     partial: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrendInterval {
+    starts_at: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -289,6 +298,7 @@ enum TrendReadoutValue {
 struct TrendReadout {
     sampled_at: DateTime<Utc>,
     value: TrendReadoutValue,
+    interval: Option<TrendInterval>,
     partial: bool,
 }
 
@@ -306,10 +316,156 @@ enum TrendValueKind {
     Tokens,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TrendGraphKind {
     Line { maximum_gap: chrono::Duration },
     Bar { expected_step: chrono::Duration },
+}
+
+impl TrendGraphKind {
+    fn selection_tolerance(self) -> chrono::Duration {
+        match self {
+            Self::Line { maximum_gap } => maximum_gap,
+            Self::Bar { expected_step } => expected_step,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrendPanelId {
+    Remaining,
+    WeeklyTokens,
+    WeeklyEstimated,
+    LocalTokens,
+    LocalEstimated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrendInspection {
+    panel: TrendPanelId,
+    at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrendDrag {
+    panel: TrendPanelId,
+}
+
+#[derive(Clone, Debug)]
+struct TrendChartHitbox {
+    panel: TrendPanelId,
+    plot: Rect,
+    legend: Option<Rect>,
+    x_bounds: [f64; 2],
+    graph_kind: TrendGraphKind,
+    inspectable_times: Vec<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrendChartGeometry {
+    plot: Rect,
+    legend: Option<Rect>,
+}
+
+impl TrendPoint {
+    fn readout(self) -> Option<TrendReadout> {
+        self.sampled_at.map(|sampled_at| TrendReadout {
+            sampled_at,
+            value: self.readout_value,
+            interval: self.interval,
+            partial: self.partial,
+        })
+    }
+}
+
+impl TrendChartHitbox {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        rect_contains(self.plot, column, row)
+            && !self
+                .legend
+                .is_some_and(|legend| rect_contains(legend, column, row))
+    }
+
+    fn has_inspectable_points(&self) -> bool {
+        !self.inspectable_times.is_empty()
+    }
+
+    fn earliest_inspection(&self) -> Option<TrendInspection> {
+        self.inspectable_times
+            .first()
+            .copied()
+            .map(|at| TrendInspection {
+                panel: self.panel,
+                at,
+            })
+    }
+
+    fn latest_inspection(&self) -> Option<TrendInspection> {
+        self.inspectable_times
+            .last()
+            .copied()
+            .map(|at| TrendInspection {
+                panel: self.panel,
+                at,
+            })
+    }
+
+    fn nearest_inspection(&self, at: DateTime<Utc>) -> Option<TrendInspection> {
+        let tolerance_ms = self
+            .graph_kind
+            .selection_tolerance()
+            .num_milliseconds()
+            .unsigned_abs();
+        self.inspectable_times
+            .iter()
+            .copied()
+            .map(|candidate| {
+                let distance = (candidate - at).num_milliseconds().unsigned_abs();
+                (distance, candidate)
+            })
+            .filter(|(distance, _)| *distance <= tolerance_ms)
+            .min_by_key(|(distance, candidate)| (*distance, *candidate))
+            .map(|(_, at)| TrendInspection {
+                panel: self.panel,
+                at,
+            })
+    }
+
+    fn step_inspection(&self, current: DateTime<Utc>, forward: bool) -> Option<TrendInspection> {
+        let at = if forward {
+            self.inspectable_times
+                .iter()
+                .copied()
+                .find(|candidate| *candidate > current)
+                .or_else(|| self.inspectable_times.last().copied())
+        } else {
+            self.inspectable_times
+                .iter()
+                .rev()
+                .copied()
+                .find(|candidate| *candidate < current)
+                .or_else(|| self.inspectable_times.first().copied())
+        }?;
+        Some(TrendInspection {
+            panel: self.panel,
+            at,
+        })
+    }
+
+    fn inspection_at_column(&self, column: u16) -> Option<TrendInspection> {
+        if self.plot.is_empty() {
+            return None;
+        }
+        let column = column.clamp(self.plot.x, self.plot.right().saturating_sub(1));
+        let fraction = if self.plot.width <= 1 {
+            0.5
+        } else {
+            f64::from(column.saturating_sub(self.plot.x)) / f64::from(self.plot.width - 1)
+        };
+        let target = self.x_bounds[0] + fraction * (self.x_bounds[1] - self.x_bounds[0]);
+        let target = DateTime::from_timestamp(target.round() as i64, 0)?;
+        self.nearest_inspection(target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -808,6 +964,7 @@ struct WindowControlsHitbox {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TrendControlsHitbox {
     sections: [Rect; 3],
+    inspect: Rect,
     previous_day: Rect,
     next_day: Rect,
     now: Rect,
@@ -887,6 +1044,7 @@ struct PreparedTrendData {
 }
 
 struct TrendPanelSpec<'a> {
+    panel: TrendPanelId,
     title: &'a str,
     graph_kind: TrendGraphKind,
     value_kind: TrendValueKind,
@@ -1135,6 +1293,10 @@ struct App {
     turn_controls_hitbox: Option<TurnControlsHitbox>,
     window_controls_hitbox: Option<WindowControlsHitbox>,
     trend_controls_hitbox: Option<TrendControlsHitbox>,
+    trend_chart_hitboxes: Vec<TrendChartHitbox>,
+    trend_inspect_mode: bool,
+    trend_inspection: Option<TrendInspection>,
+    trend_drag: Option<TrendDrag>,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
@@ -1201,6 +1363,10 @@ impl App {
             turn_controls_hitbox: None,
             window_controls_hitbox: None,
             trend_controls_hitbox: None,
+            trend_chart_hitboxes: Vec::new(),
+            trend_inspect_mode: false,
+            trend_inspection: None,
+            trend_drag: None,
             view_tabs_hitbox: None,
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
@@ -2706,6 +2872,9 @@ impl App {
         if self.view != view && self.turns_temporarily_visible {
             self.close_temporary_turns();
         }
+        if self.view != view {
+            self.clear_trend_inspection();
+        }
         if view != View::Overview {
             self.close_temporary_turns();
             self.transition_to_tasks();
@@ -2718,6 +2887,9 @@ impl App {
     }
 
     fn set_trend_section(&mut self, section: TrendSection) {
+        if self.trend_section != section {
+            self.clear_trend_inspection();
+        }
         self.trend_section = section;
     }
 
@@ -2741,17 +2913,174 @@ impl App {
             .is_some_and(|hitbox| !hitbox.now.is_empty())
     }
 
+    fn trend_inspect_control_visible(&self) -> bool {
+        self.trend_controls_hitbox
+            .is_some_and(|hitbox| !hitbox.inspect.is_empty())
+    }
+
     fn show_previous_trend_day(&mut self) {
         let maximum = u16::try_from(HISTORY_VIEW_DAYS.saturating_sub(1)).unwrap_or(u16::MAX);
-        self.trend_day_offset = self.trend_day_offset.saturating_add(1).min(maximum);
+        let next = self.trend_day_offset.saturating_add(1).min(maximum);
+        if self.trend_day_offset != next {
+            self.clear_trend_inspection();
+        }
+        self.trend_day_offset = next;
     }
 
     fn show_next_trend_day(&mut self) {
-        self.trend_day_offset = self.trend_day_offset.saturating_sub(1);
+        let next = self.trend_day_offset.saturating_sub(1);
+        if self.trend_day_offset != next {
+            self.clear_trend_inspection();
+        }
+        self.trend_day_offset = next;
     }
 
     fn show_current_trend_day(&mut self) {
+        if self.trend_day_offset != 0 {
+            self.clear_trend_inspection();
+        }
         self.trend_day_offset = 0;
+    }
+
+    fn clear_trend_inspection(&mut self) {
+        self.trend_inspect_mode = false;
+        self.trend_inspection = None;
+        self.trend_drag = None;
+    }
+
+    fn toggle_trend_inspection(&mut self) {
+        if self.trend_inspect_mode {
+            self.clear_trend_inspection();
+            return;
+        }
+        self.trend_inspect_mode = true;
+        self.trend_inspection = self
+            .trend_chart_hitboxes
+            .iter()
+            .find_map(TrendChartHitbox::latest_inspection);
+    }
+
+    fn begin_trend_drag_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Trends {
+            return false;
+        }
+        let Some((panel, inspection)) = self
+            .trend_chart_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.contains(column, row))
+            .and_then(|hitbox| {
+                hitbox
+                    .inspection_at_column(column)
+                    .map(|inspection| (hitbox.panel, inspection))
+            })
+        else {
+            return false;
+        };
+        self.scroll_drag = None;
+        self.trend_drag = Some(TrendDrag { panel });
+        self.trend_inspect_mode = true;
+        self.trend_inspection = Some(inspection);
+        true
+    }
+
+    fn drag_trend_to(&mut self, column: u16) -> bool {
+        let Some(drag) = self.trend_drag else {
+            return false;
+        };
+        let Some(inspection) = self
+            .trend_chart_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.panel == drag.panel)
+            .and_then(|hitbox| hitbox.inspection_at_column(column))
+        else {
+            return false;
+        };
+        if self.trend_inspection == Some(inspection) {
+            return false;
+        }
+        self.trend_inspection = Some(inspection);
+        true
+    }
+
+    fn step_trend_inspection(&mut self, forward: bool) {
+        if !self.trend_inspect_mode {
+            return;
+        }
+        let Some(current) = self.trend_inspection.or_else(|| {
+            self.trend_chart_hitboxes
+                .iter()
+                .find_map(TrendChartHitbox::latest_inspection)
+        }) else {
+            return;
+        };
+        let Some(hitbox) = self
+            .trend_chart_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.panel == current.panel)
+        else {
+            self.trend_inspection = self
+                .trend_chart_hitboxes
+                .iter()
+                .find_map(TrendChartHitbox::latest_inspection);
+            return;
+        };
+        self.trend_inspection = hitbox.step_inspection(current.at, forward);
+    }
+
+    fn edge_trend_inspection(&mut self, end: bool) {
+        if !self.trend_inspect_mode {
+            return;
+        }
+        let Some(panel) = self
+            .trend_inspection
+            .map(|inspection| inspection.panel)
+            .or_else(|| self.trend_chart_hitboxes.first().map(|hitbox| hitbox.panel))
+        else {
+            return;
+        };
+        self.trend_inspection = self
+            .trend_chart_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.panel == panel)
+            .and_then(|hitbox| {
+                if end {
+                    hitbox.latest_inspection()
+                } else {
+                    hitbox.earliest_inspection()
+                }
+            });
+    }
+
+    fn move_trend_inspection_panel(&mut self, forward: bool) {
+        if !self.trend_inspect_mode {
+            return;
+        }
+        let available = self
+            .trend_chart_hitboxes
+            .iter()
+            .filter(|hitbox| hitbox.has_inspectable_points())
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            self.trend_inspection = None;
+            return;
+        }
+        let current = self
+            .trend_inspection
+            .and_then(|inspection| {
+                available
+                    .iter()
+                    .position(|hitbox| hitbox.panel == inspection.panel)
+            })
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1).min(available.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        let target_at = self.trend_inspection.map(|inspection| inspection.at);
+        self.trend_inspection = target_at
+            .and_then(|at| available[next].nearest_inspection(at))
+            .or_else(|| available[next].latest_inspection());
     }
 
     fn activate_window_control_at(&mut self, column: u16, row: u16) -> bool {
@@ -2796,6 +3125,10 @@ impl App {
             self.set_trend_section(section);
             return true;
         }
+        if rect_contains(hitbox.inspect, column, row) {
+            self.toggle_trend_inspection();
+            return true;
+        }
         if rect_contains(hitbox.previous_day, column, row) {
             self.show_previous_trend_day();
             return true;
@@ -2815,6 +3148,7 @@ impl App {
         self.quit_confirmation_visible = true;
         self.quit_requested = false;
         self.scroll_drag = None;
+        self.trend_drag = None;
     }
 
     fn close_quit_confirmation(&mut self) {
@@ -3038,9 +3372,11 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             app.scroll_drag = None;
+            app.trend_drag = None;
             if app.activate_view_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
                 || app.activate_trend_control_at(event.column, event.row)
+                || app.begin_trend_drag_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
                 || app.activate_turn_control_at(event.column, event.row)
                 || app.activate_task_tree_marker_at(event.column, event.row)
@@ -3067,8 +3403,18 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 }
             }
         }
-        MouseEventKind::Drag(MouseButton::Left) => app.drag_scrollbar_to(event.row),
-        MouseEventKind::Up(MouseButton::Left) => app.scroll_drag.take().is_some(),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.scroll_drag.is_some() {
+                app.drag_scrollbar_to(event.row)
+            } else {
+                app.drag_trend_to(event.column)
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let ended_scroll_drag = app.scroll_drag.take().is_some();
+            let ended_trend_drag = app.trend_drag.take().is_some();
+            ended_scroll_drag || ended_trend_drag
+        }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = matches!(event.kind, MouseEventKind::ScrollDown);
             if app
@@ -3224,6 +3570,32 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    if app.view == View::Trends && app.trend_inspect_mode {
+        match key.code {
+            KeyCode::Char('i' | 'I') | KeyCode::Esc => app.clear_trend_inspection(),
+            KeyCode::Left => app.step_trend_inspection(false),
+            KeyCode::Right => app.step_trend_inspection(true),
+            KeyCode::Up => app.move_trend_inspection_panel(false),
+            KeyCode::Down => app.move_trend_inspection_panel(true),
+            KeyCode::Home => app.edge_trend_inspection(false),
+            KeyCode::End => app.edge_trend_inspection(true),
+            _ => {}
+        }
+        if matches!(
+            key.code,
+            KeyCode::Char('i' | 'I')
+                | KeyCode::Esc
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        ) {
+            return false;
+        }
+    }
+
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => app.open_quit_confirmation(),
@@ -3255,6 +3627,11 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 && app.trend_section_control_visible(TrendSection::HalfHour) =>
         {
             app.set_trend_section(TrendSection::HalfHour);
+        }
+        KeyCode::Char('i' | 'I')
+            if app.view == View::Trends && app.trend_inspect_control_visible() =>
+        {
+            app.toggle_trend_inspection();
         }
         KeyCode::Char('[')
             if app.view == View::Trends && app.trend_previous_day_control_visible() =>
@@ -4023,6 +4400,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
     app.trend_controls_hitbox = None;
+    app.trend_chart_hitboxes.clear();
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
@@ -4093,6 +4471,13 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
         View::Trends => render_trends_at(frame, root[1], app, now),
         View::Health => render_health(frame, root[1], app),
     };
+    if app.trend_drag.is_some_and(|drag| {
+        !app.trend_chart_hitboxes
+            .iter()
+            .any(|hitbox| hitbox.panel == drag.panel)
+    }) {
+        app.trend_drag = None;
+    }
     if app
         .scroll_drag
         .is_some_and(|drag| app.scrollbar_hitbox(drag.target).is_none())
@@ -4675,10 +5060,11 @@ fn render_trend_controls(
         .into_iter()
         .map(|section| 3 + UnicodeWidthStr::width(section.label()))
         .sum::<usize>()
+        + UnicodeWidthStr::width("[I]Inspect")
         + UnicodeWidthStr::width("[[]Prev")
         + UnicodeWidthStr::width("[]]Next")
         + UnicodeWidthStr::width("[N]Now")
-        + 5;
+        + 6;
     let terse = compact && full_width > usize::from(area.width);
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -4704,6 +5090,18 @@ fn render_trend_controls(
             );
         }
     }
+    hitbox.inspect = append_trend_control(
+        &mut spans,
+        area,
+        &mut x,
+        TrendControlSpec {
+            shortcut: "I",
+            suffix: if terse { "]" } else { "]Inspect" },
+            selected: app.trend_inspect_mode,
+            shortcuts_active: app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
     if !compact || app.trend_section == TrendSection::HalfHour {
         hitbox.previous_day = append_trend_control(
             &mut spans,
@@ -4833,6 +5231,9 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
         .map(|point| TrendPoint {
             at: point.at,
             value: point.token_usage.total_tokens as f64,
+            readout_value: TrendReadoutValue::Tokens(point.token_usage.total_tokens),
+            sampled_at: point.sampled_at,
+            interval: None,
             partial: !point.partial_reasons.is_empty(),
         })
         .collect();
@@ -4842,6 +5243,9 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
             point.estimated_quota_percent.map(|value| TrendPoint {
                 at: point.at,
                 value,
+                readout_value: TrendReadoutValue::Percent(value),
+                sampled_at: point.sampled_at,
+                interval: None,
                 partial: !point.partial_reasons.is_empty(),
             })
         })
@@ -4860,12 +5264,14 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let weekly_tokens_readout = weekly_readout_point.map(|(point, sampled_at)| TrendReadout {
         sampled_at,
         value: TrendReadoutValue::Tokens(point.token_usage.total_tokens),
+        interval: None,
         partial: !point.partial_reasons.is_empty(),
     });
     let weekly_estimated_readout = weekly_readout_point.and_then(|(point, sampled_at)| {
         point.estimated_quota_percent.map(|value| TrendReadout {
             sampled_at,
             value: TrendReadoutValue::Percent(value),
+            interval: None,
             partial: !point.partial_reasons.is_empty(),
         })
     });
@@ -4884,6 +5290,12 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
         .map(|bucket| TrendPoint {
             at: bucket.starts_at + (bucket.ends_at - bucket.starts_at) / 2,
             value: bucket.token_usage.total_tokens as f64,
+            readout_value: TrendReadoutValue::Tokens(bucket.token_usage.total_tokens),
+            sampled_at: Some(bucket.sampled_at),
+            interval: Some(TrendInterval {
+                starts_at: bucket.starts_at,
+                ends_at: bucket.ends_at,
+            }),
             partial: !bucket.partial_reasons.is_empty(),
         })
         .collect();
@@ -4925,6 +5337,7 @@ fn remaining_trend_readout(
         .map(|point| TrendReadout {
             sampled_at: point.observed_at,
             value: TrendReadoutValue::Percent(point.remaining_percent),
+            interval: None,
             partial: false,
         })
 }
@@ -4984,6 +5397,12 @@ fn half_hour_estimated_trend(history: &HistoryData, bounds: [DateTime<Utc>; 2]) 
             TrendPoint {
                 at,
                 value,
+                readout_value: TrendReadoutValue::Percent(value),
+                sampled_at: Some(bucket.sampled_at),
+                interval: Some(TrendInterval {
+                    starts_at: point.starts_at,
+                    ends_at: point.ends_at,
+                }),
                 partial: !point.partial_reasons.is_empty(),
             },
         );
@@ -5056,6 +5475,9 @@ fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint>
         .map(|point| TrendPoint {
             at: point.observed_at,
             value: point.remaining_percent,
+            readout_value: TrendReadoutValue::Percent(point.remaining_percent),
+            sampled_at: Some(point.observed_at),
+            interval: None,
             partial: false,
         })
         .collect()
@@ -5085,51 +5507,172 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
         return;
     }
     let data = prepare_trend_data_at(app, now);
+    let visible_panels: &[TrendPanelId] = if compact {
+        match app.trend_section {
+            TrendSection::Remaining => &[TrendPanelId::Remaining],
+            TrendSection::Weekly => &[TrendPanelId::WeeklyTokens, TrendPanelId::WeeklyEstimated],
+            TrendSection::HalfHour => &[TrendPanelId::LocalTokens, TrendPanelId::LocalEstimated],
+        }
+    } else {
+        &[
+            TrendPanelId::Remaining,
+            TrendPanelId::WeeklyTokens,
+            TrendPanelId::WeeklyEstimated,
+            TrendPanelId::LocalTokens,
+            TrendPanelId::LocalEstimated,
+        ]
+    };
+    let inspect_mode = app.trend_inspect_mode;
+    let mut inspection = app
+        .trend_inspection
+        .filter(|inspection| visible_panels.contains(&inspection.panel));
+    let mut chart_hitboxes = Vec::new();
 
     if compact {
         match app.trend_section {
-            TrendSection::Remaining => render_remaining_trend_panel(frame, body, &data, app.theme),
+            TrendSection::Remaining => {
+                if let Some(hitbox) = render_remaining_trend_panel(
+                    frame,
+                    body,
+                    &data,
+                    app.theme,
+                    inspect_mode,
+                    &mut inspection,
+                ) {
+                    chart_hitboxes.push(hitbox);
+                }
+            }
             TrendSection::Weekly => {
                 let panels = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(body);
-                render_weekly_token_trend_panel(frame, panels[0], &data, app.theme);
-                render_weekly_estimated_trend_panel(frame, panels[1], &data, app.theme);
+                if let Some(hitbox) = render_weekly_token_trend_panel(
+                    frame,
+                    panels[0],
+                    &data,
+                    app.theme,
+                    inspect_mode,
+                    &mut inspection,
+                ) {
+                    chart_hitboxes.push(hitbox);
+                }
+                if let Some(hitbox) = render_weekly_estimated_trend_panel(
+                    frame,
+                    panels[1],
+                    &data,
+                    app.theme,
+                    inspect_mode,
+                    &mut inspection,
+                ) {
+                    chart_hitboxes.push(hitbox);
+                }
             }
             TrendSection::HalfHour => {
                 let panels = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(body);
-                render_half_hour_token_trend_panel(frame, panels[0], &data, app.theme);
-                render_half_hour_estimated_trend_panel(frame, panels[1], &data, app.theme);
+                if let Some(hitbox) = render_half_hour_token_trend_panel(
+                    frame,
+                    panels[0],
+                    &data,
+                    app.theme,
+                    inspect_mode,
+                    &mut inspection,
+                ) {
+                    chart_hitboxes.push(hitbox);
+                }
+                if let Some(hitbox) = render_half_hour_estimated_trend_panel(
+                    frame,
+                    panels[1],
+                    &data,
+                    app.theme,
+                    inspect_mode,
+                    &mut inspection,
+                ) {
+                    chart_hitboxes.push(hitbox);
+                }
             }
         }
-        return;
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(body);
+        if let Some(hitbox) = render_remaining_trend_panel(
+            frame,
+            rows[0],
+            &data,
+            app.theme,
+            inspect_mode,
+            &mut inspection,
+        ) {
+            chart_hitboxes.push(hitbox);
+        }
+        let weekly = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+        if let Some(hitbox) = render_weekly_token_trend_panel(
+            frame,
+            weekly[0],
+            &data,
+            app.theme,
+            inspect_mode,
+            &mut inspection,
+        ) {
+            chart_hitboxes.push(hitbox);
+        }
+        if let Some(hitbox) = render_weekly_estimated_trend_panel(
+            frame,
+            weekly[1],
+            &data,
+            app.theme,
+            inspect_mode,
+            &mut inspection,
+        ) {
+            chart_hitboxes.push(hitbox);
+        }
+        let half_hour = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[2]);
+        if let Some(hitbox) = render_half_hour_token_trend_panel(
+            frame,
+            half_hour[0],
+            &data,
+            app.theme,
+            inspect_mode,
+            &mut inspection,
+        ) {
+            chart_hitboxes.push(hitbox);
+        }
+        if let Some(hitbox) = render_half_hour_estimated_trend_panel(
+            frame,
+            half_hour[1],
+            &data,
+            app.theme,
+            inspect_mode,
+            &mut inspection,
+        ) {
+            chart_hitboxes.push(hitbox);
+        }
     }
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(body);
-    render_remaining_trend_panel(frame, rows[0], &data, app.theme);
-    let weekly = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_weekly_token_trend_panel(frame, weekly[0], &data, app.theme);
-    render_weekly_estimated_trend_panel(frame, weekly[1], &data, app.theme);
-    let half_hour = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[2]);
-    render_half_hour_token_trend_panel(frame, half_hour[0], &data, app.theme);
-    render_half_hour_estimated_trend_panel(frame, half_hour[1], &data, app.theme);
+    if inspect_mode
+        && inspection.is_none()
+        && let Some(default) = chart_hitboxes
+            .iter()
+            .find_map(TrendChartHitbox::latest_inspection)
+    {
+        inspection = Some(default);
+    }
+    app.trend_inspection = inspect_mode.then_some(inspection).flatten();
+    app.trend_chart_hitboxes = chart_hitboxes;
 }
 
 fn render_empty_trend_panel(frame: &mut Frame<'_>, area: Rect, title: &str, theme: Theme) {
@@ -5162,7 +5705,9 @@ fn render_remaining_trend_panel(
     area: Rect,
     data: &PreparedTrendData,
     theme: Theme,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     let palette = theme.palette();
     render_time_series_panel(
         frame,
@@ -5182,6 +5727,7 @@ fn render_remaining_trend_panel(
             },
         ],
         TrendPanelSpec {
+            panel: TrendPanelId::Remaining,
             title: "Quota Remaining",
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(15),
@@ -5194,7 +5740,9 @@ fn render_remaining_trend_panel(
             readout_label: Some("As of"),
             theme,
         },
-    );
+        inspect_mode,
+        inspection,
+    )
 }
 
 fn render_weekly_token_trend_panel(
@@ -5202,7 +5750,9 @@ fn render_weekly_token_trend_panel(
     area: Rect,
     data: &PreparedTrendData,
     theme: Theme,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     render_time_series_panel(
         frame,
         area,
@@ -5213,6 +5763,7 @@ fn render_weekly_token_trend_panel(
             color: theme.palette().accent,
         }],
         TrendPanelSpec {
+            panel: TrendPanelId::WeeklyTokens,
             title: "Weekly Local Tokens",
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(45),
@@ -5225,7 +5776,9 @@ fn render_weekly_token_trend_panel(
             readout_label: Some("As of"),
             theme,
         },
-    );
+        inspect_mode,
+        inspection,
+    )
 }
 
 fn render_weekly_estimated_trend_panel(
@@ -5233,8 +5786,13 @@ fn render_weekly_estimated_trend_panel(
     area: Rect,
     data: &PreparedTrendData,
     theme: Theme,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     if data.weekly_estimated.is_empty() && data.weekly_history_present {
+        if inspection.is_some_and(|inspection| inspection.panel == TrendPanelId::WeeklyEstimated) {
+            *inspection = None;
+        }
         let title = trend_panel_status_title(
             "Weekly ~EST Usage",
             data.history_warning_count,
@@ -5248,7 +5806,7 @@ fn render_weekly_estimated_trend_panel(
             theme,
             true,
         );
-        return;
+        return None;
     }
     render_time_series_panel(
         frame,
@@ -5260,6 +5818,7 @@ fn render_weekly_estimated_trend_panel(
             color: theme.palette().warning,
         }],
         TrendPanelSpec {
+            panel: TrendPanelId::WeeklyEstimated,
             title: "Weekly ~EST Usage",
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(45),
@@ -5272,7 +5831,9 @@ fn render_weekly_estimated_trend_panel(
             readout_label: Some("As of"),
             theme,
         },
-    );
+        inspect_mode,
+        inspection,
+    )
 }
 
 fn render_half_hour_token_trend_panel(
@@ -5280,7 +5841,9 @@ fn render_half_hour_token_trend_panel(
     area: Rect,
     data: &PreparedTrendData,
     theme: Theme,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     render_time_series_panel(
         frame,
         area,
@@ -5291,6 +5854,7 @@ fn render_half_hour_token_trend_panel(
             color: theme.palette().accent,
         }],
         TrendPanelSpec {
+            panel: TrendPanelId::LocalTokens,
             title: "15m Local Tokens",
             graph_kind: TrendGraphKind::Bar {
                 expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
@@ -5303,7 +5867,9 @@ fn render_half_hour_token_trend_panel(
             readout_label: None,
             theme,
         },
-    );
+        inspect_mode,
+        inspection,
+    )
 }
 
 fn render_half_hour_estimated_trend_panel(
@@ -5311,8 +5877,13 @@ fn render_half_hour_estimated_trend_panel(
     area: Rect,
     data: &PreparedTrendData,
     theme: Theme,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     if data.half_hour_estimated.is_empty() && data.half_hour_history_present {
+        if inspection.is_some_and(|inspection| inspection.panel == TrendPanelId::LocalEstimated) {
+            *inspection = None;
+        }
         let title = trend_panel_status_title(
             "15m ~EST Usage",
             data.history_warning_count,
@@ -5326,7 +5897,7 @@ fn render_half_hour_estimated_trend_panel(
             theme,
             true,
         );
-        return;
+        return None;
     }
     render_time_series_panel(
         frame,
@@ -5338,6 +5909,7 @@ fn render_half_hour_estimated_trend_panel(
             color: theme.palette().warning,
         }],
         TrendPanelSpec {
+            panel: TrendPanelId::LocalEstimated,
             title: "15m ~EST Usage",
             graph_kind: TrendGraphKind::Bar {
                 expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
@@ -5350,7 +5922,9 @@ fn render_half_hour_estimated_trend_panel(
             readout_label: None,
             theme,
         },
-    );
+        inspect_mode,
+        inspection,
+    )
 }
 
 fn trend_panel_status_title(base: &str, warning_count: usize, read_only: bool) -> String {
@@ -5369,7 +5943,9 @@ fn render_time_series_panel(
     area: Rect,
     series: &[TrendSeries<'_>],
     spec: TrendPanelSpec<'_>,
-) {
+    inspect_mode: bool,
+    inspection: &mut Option<TrendInspection>,
+) -> Option<TrendChartHitbox> {
     let nonempty_series = series
         .iter()
         .filter(|series| !series.points.is_empty())
@@ -5385,7 +5961,10 @@ fn render_time_series_panel(
             spec.history_read_only,
         );
         render_empty_trend_panel(frame, area, &title, spec.theme);
-        return;
+        if inspection.is_some_and(|inspection| inspection.panel == spec.panel) {
+            *inspection = None;
+        }
+        return None;
     }
 
     let mut minimum_time = spec.fixed_x_bounds.map(|bounds| bounds[0]);
@@ -5419,6 +5998,46 @@ fn render_time_series_panel(
         [0.0, maximum]
     });
 
+    let active_at = if inspect_mode {
+        match *inspection {
+            Some(current) if current.panel == spec.panel => {
+                nearest_inspectable_time(series, current.at, spec.graph_kind)
+                    .or_else(|| latest_inspectable_time(series))
+            }
+            None => latest_inspectable_time(series),
+            Some(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(at) = active_at {
+        *inspection = Some(TrendInspection {
+            panel: spec.panel,
+            at,
+        });
+    }
+    let selected_points = series
+        .iter()
+        .map(|trend_series| {
+            active_at
+                .and_then(|at| nearest_inspectable_point(trend_series.points, at, spec.graph_kind))
+        })
+        .collect::<Vec<_>>();
+    let displayed_series = series
+        .iter()
+        .zip(&selected_points)
+        .map(|(trend_series, selected)| TrendSeries {
+            name: trend_series.name,
+            points: trend_series.points,
+            readout: if active_at.is_some() {
+                selected.and_then(|point| point.readout())
+            } else {
+                trend_series.readout
+            },
+            color: trend_series.color,
+        })
+        .collect::<Vec<_>>();
+
     let mut prepared = Vec::with_capacity(series.len());
     let mut gap_count = 0_usize;
     for series in series {
@@ -5426,7 +6045,51 @@ fn render_time_series_panel(
         prepared.push(segments);
         gap_count = gap_count.saturating_add(gaps);
     }
+    let vertical_guide = active_at.map(|at| {
+        vec![
+            (at.timestamp() as f64, y_bounds[0]),
+            (at.timestamp() as f64, y_bounds[1]),
+        ]
+    });
+    let horizontal_guide = (nonempty_series == 1)
+        .then(|| selected_points.iter().flatten().next().copied())
+        .flatten()
+        .map(|point| {
+            let value = point.value.clamp(y_bounds[0], y_bounds[1]);
+            vec![(x_bounds[0], value), (x_bounds[1], value)]
+        });
+    let selected_markers = selected_points
+        .iter()
+        .map(|point| {
+            point
+                .map(|point| vec![(point.at.timestamp() as f64, point.value.max(0.0))])
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
     let mut datasets = Vec::new();
+    let palette = spec.theme.palette();
+    if let Some(guide) = vertical_guide.as_deref() {
+        datasets.push(
+            Dataset::default()
+                .data(guide)
+                .graph_type(GraphType::Line)
+                .marker(Marker::Braille)
+                .style(
+                    Style::default()
+                        .fg(palette.border)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+    }
+    if let Some(guide) = horizontal_guide.as_deref() {
+        datasets.push(
+            Dataset::default()
+                .data(guide)
+                .graph_type(GraphType::Line)
+                .marker(Marker::Braille)
+                .style(Style::default().fg(palette.border)),
+        );
+    }
     for (series, segments) in series.iter().zip(&prepared) {
         for (segment_index, segment) in segments.iter().enumerate() {
             let graph_type = match spec.graph_kind {
@@ -5451,6 +6114,22 @@ fn render_time_series_panel(
             }
             datasets.push(dataset);
         }
+    }
+    for ((series, selected), marker) in series.iter().zip(&selected_points).zip(&selected_markers) {
+        if selected.is_none() {
+            continue;
+        }
+        datasets.push(
+            Dataset::default()
+                .data(marker)
+                .graph_type(GraphType::Scatter)
+                .marker(Marker::Block)
+                .style(
+                    Style::default()
+                        .fg(series.color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
     }
 
     let mut panel_title = format!(
@@ -5477,7 +6156,7 @@ fn render_time_series_panel(
     let inner = panel_block.inner(area);
     frame.render_widget(panel_block, area);
     if inner.is_empty() {
-        return;
+        return None;
     }
     let chart_area = spec.readout_label.map_or(inner, |readout_label| {
         let rows = Layout::default()
@@ -5486,8 +6165,12 @@ fn render_time_series_panel(
             .split(inner);
         frame.render_widget(
             Paragraph::new(trend_readout_line(
-                series,
-                readout_label,
+                &displayed_series,
+                if active_at.is_some() {
+                    "Inspect"
+                } else {
+                    readout_label
+                },
                 rows[0].width,
                 spec.theme,
             ))
@@ -5498,15 +6181,24 @@ fn render_time_series_panel(
         rows[1]
     });
     if chart_area.is_empty() {
-        return;
+        return None;
     }
 
-    let palette = spec.theme.palette();
     let x_labels = trend_time_axis_labels(minimum_time, maximum_time, chart_area.width);
     let y_labels = vec![
         format_trend_axis_value(y_bounds[0], spec.value_kind),
         format_trend_axis_value(y_bounds[1], spec.value_kind),
     ];
+    let legend_names = if nonempty_series > 1 {
+        series
+            .iter()
+            .filter(|series| !series.points.is_empty())
+            .map(|series| series.name)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let geometry = trend_chart_geometry(chart_area, &x_labels, &y_labels, legend_names.as_slice());
     let chart = Chart::new(datasets)
         .style(spec.theme.base_style())
         .x_axis(
@@ -5525,6 +6217,178 @@ fn render_time_series_panel(
             (nonempty_series > 1).then_some(ratatui::widgets::LegendPosition::TopRight),
         );
     frame.render_widget(chart, chart_area);
+    let geometry = geometry?;
+    if active_at.is_some() && spec.readout_label.is_none() {
+        let overlay_right = geometry
+            .legend
+            .filter(|legend| legend.y == geometry.plot.y)
+            .map_or(geometry.plot.right(), |legend| legend.x);
+        let overlay_area = Rect::new(
+            geometry.plot.x,
+            geometry.plot.y,
+            overlay_right.saturating_sub(geometry.plot.x),
+            u16::from(geometry.plot.height > 0),
+        );
+        if !overlay_area.is_empty() {
+            frame.render_widget(Clear, overlay_area);
+            frame.render_widget(
+                Paragraph::new(trend_readout_line(
+                    &displayed_series,
+                    "Inspect",
+                    overlay_area.width,
+                    spec.theme,
+                ))
+                .style(spec.theme.base_style()),
+                overlay_area,
+            );
+        }
+    }
+
+    let mut inspectable_times = series
+        .iter()
+        .flat_map(|series| series.points.iter())
+        .filter(|point| point.sampled_at.is_some() && point.value.is_finite())
+        .map(|point| point.at)
+        .collect::<Vec<_>>();
+    inspectable_times.sort_unstable();
+    inspectable_times.dedup();
+    Some(TrendChartHitbox {
+        panel: spec.panel,
+        plot: geometry.plot,
+        legend: geometry.legend,
+        x_bounds,
+        graph_kind: spec.graph_kind,
+        inspectable_times,
+    })
+}
+
+fn latest_inspectable_time(series: &[TrendSeries<'_>]) -> Option<DateTime<Utc>> {
+    series
+        .iter()
+        .flat_map(|series| series.points.iter())
+        .filter(|point| point.sampled_at.is_some() && point.value.is_finite())
+        .map(|point| point.at)
+        .max()
+}
+
+fn nearest_inspectable_time(
+    series: &[TrendSeries<'_>],
+    at: DateTime<Utc>,
+    graph_kind: TrendGraphKind,
+) -> Option<DateTime<Utc>> {
+    let tolerance_ms = graph_kind
+        .selection_tolerance()
+        .num_milliseconds()
+        .unsigned_abs();
+    series
+        .iter()
+        .flat_map(|series| series.points.iter())
+        .filter(|point| point.sampled_at.is_some() && point.value.is_finite())
+        .map(|point| ((point.at - at).num_milliseconds().unsigned_abs(), point.at))
+        .filter(|(distance, _)| *distance <= tolerance_ms)
+        .min_by_key(|(distance, point_at)| (*distance, *point_at))
+        .map(|(_, point_at)| point_at)
+}
+
+fn nearest_inspectable_point(
+    points: &[TrendPoint],
+    at: DateTime<Utc>,
+    graph_kind: TrendGraphKind,
+) -> Option<&TrendPoint> {
+    let tolerance_ms = graph_kind
+        .selection_tolerance()
+        .num_milliseconds()
+        .unsigned_abs();
+    points
+        .iter()
+        .filter(|point| point.sampled_at.is_some() && point.value.is_finite())
+        .map(|point| ((point.at - at).num_milliseconds().unsigned_abs(), point))
+        .filter(|(distance, _)| *distance <= tolerance_ms)
+        .min_by_key(|(distance, point)| (*distance, point.at))
+        .map(|(_, point)| point)
+}
+
+fn trend_chart_geometry(
+    area: Rect,
+    x_labels: &[String],
+    y_labels: &[String],
+    legend_names: &[&str],
+) -> Option<TrendChartGeometry> {
+    if area.is_empty() {
+        return None;
+    }
+
+    let mut x = area.left();
+    let mut y = area.bottom() - 1;
+    if !x_labels.is_empty() && y > area.top() {
+        y -= 1;
+    }
+
+    let has_y_axis = !y_labels.is_empty();
+    let mut left_label_width = y_labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(label.as_str()))
+        .max()
+        .unwrap_or_default();
+    if let Some(first_x_label) = x_labels.first() {
+        left_label_width = left_label_width.max(
+            UnicodeWidthStr::width(first_x_label.as_str()).saturating_sub(usize::from(has_y_axis)),
+        );
+    }
+    let left_label_width = u16::try_from(left_label_width)
+        .unwrap_or(u16::MAX)
+        .min(area.width / 3);
+    x = x.saturating_add(left_label_width);
+    if !x_labels.is_empty() && y > area.top() {
+        y -= 1;
+    }
+    if has_y_axis && x + 1 < area.right() {
+        x += 1;
+    }
+
+    let plot = Rect::new(
+        x,
+        area.top(),
+        area.right().saturating_sub(x),
+        y.saturating_sub(area.top()).saturating_add(1),
+    );
+    if plot.is_empty() {
+        return None;
+    }
+
+    let legend = if legend_names.is_empty() {
+        None
+    } else {
+        let inner_width = legend_names
+            .iter()
+            .map(|name| UnicodeWidthStr::width(*name))
+            .max()
+            .unwrap_or_default();
+        let legend_width = u16::try_from(inner_width.saturating_add(2)).unwrap_or(u16::MAX);
+        let legend_height = u16::try_from(legend_names.len().saturating_add(2)).unwrap_or(u16::MAX);
+        let maximum_width = Layout::horizontal([Constraint::Ratio(1, 4)])
+            .flex(Flex::Start)
+            .split(plot)[0]
+            .width;
+        let maximum_height = Layout::vertical([Constraint::Ratio(1, 4)])
+            .flex(Flex::Start)
+            .split(plot)[0]
+            .height;
+        (inner_width > 0
+            && legend_width <= maximum_width
+            && legend_height <= maximum_height
+            && legend_width <= plot.width
+            && legend_height <= plot.height)
+            .then(|| {
+                Rect::new(
+                    plot.right() - legend_width,
+                    plot.top(),
+                    legend_width,
+                    legend_height,
+                )
+            })
+    };
+    Some(TrendChartGeometry { plot, legend })
 }
 
 fn trend_readout_line(
@@ -5629,7 +6493,7 @@ fn build_trend_readout_line(
             &mut width,
             format!(
                 "{separator}{}",
-                format_local_time(readout.sampled_at, time_format)
+                format_trend_readout_time(readout, time_format)
             ),
             Style::default().fg(if readout.partial {
                 palette.warning
@@ -5640,6 +6504,28 @@ fn build_trend_readout_line(
     }
 
     (Line::from(spans), width)
+}
+
+fn format_trend_readout_time(readout: TrendReadout, time_format: &str) -> String {
+    let Some(interval) = readout.interval else {
+        return format_local_time(readout.sampled_at, time_format);
+    };
+    let include_date = time_format.contains("%m-%d");
+    let starts_at = format_local_time(
+        interval.starts_at,
+        if include_date { "%m-%d %H:%M" } else { "%H:%M" },
+    );
+    let crosses_local_date = format_local_time(interval.starts_at, "%Y-%m-%d")
+        != format_local_time(interval.ends_at, "%Y-%m-%d");
+    let ends_at = format_local_time(
+        interval.ends_at,
+        if include_date && crosses_local_date {
+            "%m-%d %H:%M"
+        } else {
+            "%H:%M"
+        },
+    );
+    format!("{starts_at}–{ends_at}")
 }
 
 fn push_trend_readout_span(

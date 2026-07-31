@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added an interactive Trends inspector with keyboard navigation and mouse click/drag selection. Readouts preserve exact sampled values and timestamps, and 15-minute bars show their precise bucket interval.
+
 ### Changed
 
 - Increased local token and `~EST` bar resolution from 30-minute to UTC-aligned 15-minute buckets while keeping weekly cumulative sampling at 30 minutes.

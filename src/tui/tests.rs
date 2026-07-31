@@ -5207,6 +5207,348 @@ fn trends_view_uses_responsive_panels_and_btop_controls() {
 }
 
 #[test]
+fn trend_inspect_control_is_whole_label_clickable_and_esc_exits_inspection() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = interaction_test_app(1, 1);
+        app.theme = theme;
+        app.replace_history(trend_history_fixture(now));
+        app.set_view(View::Trends);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &mut app, now))
+            .unwrap();
+
+        let inspect = app.trend_controls_hitbox.expect("trend controls").inspect;
+        assert_eq!(
+            buffer_rect_text(terminal.backend().buffer(), inspect),
+            "[I]Inspect"
+        );
+        let shortcut = &terminal.backend().buffer()[(inspect.x + 1, inspect.y)];
+        assert_eq!(shortcut.symbol(), "I");
+        assert_eq!(shortcut.fg, theme.palette().accent);
+        assert!(shortcut.modifier.contains(Modifier::BOLD));
+
+        for x in [
+            inspect.x,
+            inspect.x + inspect.width / 2,
+            inspect.right() - 1,
+        ] {
+            let before = app.trend_inspect_mode;
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Down(MouseButton::Left), x, inspect.y),
+            ));
+            assert_ne!(app.trend_inspect_mode, before);
+        }
+        assert!(app.trend_inspect_mode);
+        assert!(app.trend_inspection.is_some());
+        terminal
+            .draw(|frame| render_at(frame, &mut app, now))
+            .unwrap();
+        let selected_inspect = app
+            .trend_controls_hitbox
+            .expect("selected trend controls")
+            .inspect;
+        assert_eq!(selected_inspect, inspect);
+        let selected_shortcut =
+            &terminal.backend().buffer()[(selected_inspect.x + 1, selected_inspect.y)];
+        assert_eq!(selected_shortcut.bg, theme.palette().accent);
+        assert_eq!(selected_shortcut.fg, theme.palette().background);
+        assert!(selected_shortcut.modifier.contains(Modifier::UNDERLINED));
+
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Esc)));
+        assert!(!app.trend_inspect_mode);
+        assert!(app.trend_inspection.is_none());
+        assert!(!app.quit_confirmation_visible);
+
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('I'))));
+        assert!(app.trend_inspect_mode);
+        assert!(app.trend_inspection.is_some());
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('i'))));
+        assert!(!app.trend_inspect_mode);
+        assert!(app.trend_inspection.is_none());
+
+        let mut compact = interaction_test_app(1, 1);
+        compact.theme = theme;
+        compact.replace_history(trend_history_fixture(now));
+        compact.set_view(View::Trends);
+        let mut compact_terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        compact_terminal
+            .draw(|frame| render_at(frame, &mut compact, now))
+            .unwrap();
+        let compact_inspect = compact
+            .trend_controls_hitbox
+            .expect("compact trend controls")
+            .inspect;
+        assert_eq!(compact_inspect.width, 3);
+        assert_eq!(
+            buffer_rect_text(compact_terminal.backend().buffer(), compact_inspect),
+            "[I]"
+        );
+        for x in compact_inspect.x..compact_inspect.right() {
+            let before = compact.trend_inspect_mode;
+            assert!(handle_mouse_event(
+                &mut compact,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    x,
+                    compact_inspect.y,
+                ),
+            ));
+            assert_ne!(compact.trend_inspect_mode, before);
+        }
+        assert!(compact.trend_inspect_mode);
+    }
+}
+
+#[test]
+fn trend_inspect_keyboard_steps_samples_and_visible_panels() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(1, 1);
+    app.replace_history(trend_history_fixture(now));
+    app.set_view(View::Trends);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+
+    handle_key_event(&mut app, key_event(KeyCode::Char('i')));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now,
+        })
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Left));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now - ChronoDuration::hours(1),
+        })
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Home));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now - ChronoDuration::days(1),
+        })
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Right));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now - ChronoDuration::hours(1),
+        })
+    );
+    handle_key_event(&mut app, key_event(KeyCode::End));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now,
+        })
+    );
+
+    handle_key_event(&mut app, key_event(KeyCode::Up));
+    assert_eq!(
+        app.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::Remaining)
+    );
+    for panel in [
+        TrendPanelId::WeeklyTokens,
+        TrendPanelId::WeeklyEstimated,
+        TrendPanelId::LocalTokens,
+        TrendPanelId::LocalEstimated,
+    ] {
+        handle_key_event(&mut app, key_event(KeyCode::Down));
+        assert_eq!(
+            app.trend_inspection.map(|inspection| inspection.panel),
+            Some(panel)
+        );
+    }
+    handle_key_event(&mut app, key_event(KeyCode::Down));
+    assert_eq!(
+        app.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::LocalEstimated)
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Up));
+    assert_eq!(
+        app.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::LocalTokens)
+    );
+
+    let mut compact = interaction_test_app(1, 1);
+    compact.replace_history(trend_history_fixture(now));
+    compact.set_view(View::Trends);
+    compact.trend_section = TrendSection::Weekly;
+    let mut compact_terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    compact_terminal
+        .draw(|frame| render_at(frame, &mut compact, now))
+        .unwrap();
+    handle_key_event(&mut compact, key_event(KeyCode::Char('i')));
+    assert_eq!(
+        compact.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::WeeklyTokens)
+    );
+    handle_key_event(&mut compact, key_event(KeyCode::Up));
+    assert_eq!(
+        compact.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::WeeklyTokens)
+    );
+    handle_key_event(&mut compact, key_event(KeyCode::Down));
+    assert_eq!(
+        compact.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::WeeklyEstimated)
+    );
+    handle_key_event(&mut compact, key_event(KeyCode::Down));
+    assert_eq!(
+        compact.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::WeeklyEstimated)
+    );
+    handle_key_event(&mut compact, key_event(KeyCode::Up));
+    assert_eq!(
+        compact.trend_inspection.map(|inspection| inspection.panel),
+        Some(TrendPanelId::WeeklyTokens)
+    );
+}
+
+#[test]
+fn trend_inspect_mouse_click_drag_and_release_retain_the_selected_sample() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(1, 1);
+    app.replace_history(trend_history_fixture(now));
+    app.set_view(View::Trends);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+
+    let chart = app
+        .trend_chart_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.panel == TrendPanelId::Remaining)
+        .cloned()
+        .expect("remaining chart hitbox");
+    let row = chart.plot.bottom() - 1;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(MouseEventKind::Down(MouseButton::Left), chart.plot.x, row,),
+    ));
+    assert!(app.trend_inspect_mode);
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now - ChronoDuration::days(1),
+        })
+    );
+    assert_eq!(
+        app.trend_drag,
+        Some(TrendDrag {
+            panel: TrendPanelId::Remaining
+        })
+    );
+
+    let before_move = app.trend_inspection;
+    let moved = mouse_event(
+        MouseEventKind::Moved,
+        chart.plot.x + chart.plot.width / 2,
+        row,
+    );
+    let handled = handle_mouse_event(&mut app, moved);
+    assert!(!handled);
+    assert!(!mouse_event_requests_redraw(MouseEventKind::Moved, handled));
+    assert_eq!(app.trend_inspection, before_move);
+
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            chart.plot.right() - 1,
+            row,
+        ),
+    ));
+    assert_eq!(
+        app.trend_inspection,
+        Some(TrendInspection {
+            panel: TrendPanelId::Remaining,
+            at: now,
+        })
+    );
+    let retained = app.trend_inspection;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            chart.plot.right() - 1,
+            row,
+        ),
+    ));
+    assert!(app.trend_drag.is_none());
+    assert_eq!(app.trend_inspection, retained);
+}
+
+#[test]
+fn inspected_quarter_hour_bar_shows_exact_tokens_and_bucket_interval() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T09:16:42Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let exact_tokens = 9_007_199_254_740_993;
+    let mut history = trend_history_fixture(now);
+    history
+        .half_hour_buckets
+        .last_mut()
+        .unwrap()
+        .token_usage
+        .total_tokens = exact_tokens;
+
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = interaction_test_app(1, 1);
+        app.theme = theme;
+        app.replace_history(history.clone());
+        app.set_view(View::Trends);
+        app.trend_section = TrendSection::HalfHour;
+        let mut terminal = Terminal::new(TestBackend::new(119, 40)).unwrap();
+        let content = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+            terminal
+                .draw(|frame| render_at(frame, &mut app, now))
+                .unwrap();
+            handle_key_event(&mut app, key_event(KeyCode::Char('i')));
+            terminal
+                .draw(|frame| render_at(frame, &mut app, now))
+                .unwrap();
+            buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 119, 40))
+        });
+
+        assert_eq!(
+            app.trend_inspection.map(|inspection| inspection.panel),
+            Some(TrendPanelId::LocalTokens)
+        );
+        assert!(
+            content.contains("9,007,199,254,740,993"),
+            "exact token readout was lost for {theme:?}:\n{content}"
+        );
+        assert!(
+            content.contains("07-29 09:15–09:30"),
+            "15-minute interval was missing for {theme:?}:\n{content}"
+        );
+        assert!(content.contains("Inspect"), "{content}");
+    }
+}
+
+#[test]
 fn trends_render_recorded_samples_gaps_partial_state_and_day_windows() {
     let mut app = interaction_test_app(1, 1);
     let now = app.snapshot.as_of;
@@ -5293,6 +5635,7 @@ fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
         Some(TrendReadout {
             sampled_at: now,
             value: TrendReadoutValue::Percent(60.0),
+            interval: None,
             partial: false,
         })
     );
@@ -5301,6 +5644,7 @@ fn line_trend_readouts_show_exact_values_at_their_real_sample_times() {
         Some(TrendReadout {
             sampled_at: weekly_observed_at,
             value: TrendReadoutValue::Percent(75.0),
+            interval: None,
             partial: false,
         })
     );
@@ -5571,6 +5915,7 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
         Some(TrendReadout {
             sampled_at: cycle_start,
             value: TrendReadoutValue::Tokens(123),
+            interval: None,
             partial: false,
         })
     );
@@ -6070,16 +6415,25 @@ fn trend_segments_keep_single_points_and_split_missing_intervals() {
         TrendPoint {
             at: start,
             value: 1.0,
+            readout_value: TrendReadoutValue::Percent(1.0),
+            sampled_at: Some(start),
+            interval: None,
             partial: false,
         },
         TrendPoint {
             at: start + ChronoDuration::minutes(5),
             value: 2.0,
+            readout_value: TrendReadoutValue::Percent(2.0),
+            sampled_at: Some(start + ChronoDuration::minutes(5)),
+            interval: None,
             partial: false,
         },
         TrendPoint {
             at: start + ChronoDuration::minutes(25),
             value: 3.0,
+            readout_value: TrendReadoutValue::Percent(3.0),
+            sampled_at: Some(start + ChronoDuration::minutes(25)),
+            interval: None,
             partial: true,
         },
     ];
@@ -6238,6 +6592,7 @@ fn trends_controls_clip_only_whole_buttons_in_tiny_terminals() {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let controls = app.trend_controls_hitbox.expect("trend controls");
         for control in controls.sections.into_iter().chain([
+            controls.inspect,
             controls.previous_day,
             controls.next_day,
             controls.now,

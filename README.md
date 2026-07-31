@@ -231,6 +231,9 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `1`, `2`, `3` | Open Overview, Trends, or Other. |
 | `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or 15-minute charts. |
 | `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
+| `i` on Trends | Toggle Inspect mode. |
+| `←` / `→`, `Home`, `End` in Inspect mode | Select the previous/next, first, or last recorded point. |
+| `↑` / `↓` in Inspect mode | Move between the visible charts. |
 | `5`, `w` | Select the 5-hour or weekly reset cycle. |
 | `↑` / `k`, `↓` / `j`, `Home`, `End`, `PgUp`, `PgDn` | Navigate lists. |
 | `Enter`, `Backspace` | Open a task's turns or return to Tasks. |
@@ -242,7 +245,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `t` | Toggle dark/light theme. |
 | `q` | Quit. `Esc` opens quit confirmation from the main view. |
 
-Printable keys are consumed by a focused text field before global shortcuts. Mouse input is also available for controls, Tasks/Turns rows, tabs, and scrollbars.
+Printable keys are consumed by a focused text field before global shortcuts. Mouse input is also available for controls, Tasks/Turns rows, tabs, and scrollbars. On Trends, click a chart to inspect its nearest recorded point, or hold the left mouse button and drag to scrub across points.
 
 ## Understanding the fields
 
@@ -307,6 +310,8 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute price-weight buckets. |
 
 History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST history retains raw model, service-tier, and token components plus an estimator revision so pricing logic can be recomputed without silently mixing definitions. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls or a new server sample arrives. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+
+Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 
 ## Accuracy and limitations
 
