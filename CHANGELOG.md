@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.5] - 2026-08-10
+
 ### Changed
 
 - Replaced the API-dollar short-context weighting proxy with OpenAI's token-based Codex credit rate card for the `gpt-5.6` Sol alias, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.5 Cyber, GPT-5.4, GPT-5.4 mini, GPT-5.3-Codex, GPT-5.2, and the historical `gpt-5.2-codex` slug.
@@ -113,7 +115,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.1...v0.2.2
