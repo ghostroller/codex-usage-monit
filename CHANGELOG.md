@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Replaced the API-dollar short-context weighting proxy with OpenAI's token-based Codex credit rate card for the `gpt-5.6` Sol alias, GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.5 Cyber, GPT-5.4, GPT-5.4 mini, GPT-5.3-Codex, GPT-5.2, and the historical `gpt-5.2-codex` slug.
+- Applied the published Fast credit multipliers to both `serviceTier=fast` and `serviceTier=priority`, retained GPT-5.6 Luna as the explicit fallback for unknown non-Spark models, and continued excluding GPT-5.3-Codex-Spark while its rate remains a research preview.
+- Renamed user-facing estimate explanations from price-weighted to Codex credit-rate-weighted; `~EST` remains a low-confidence allocation of the account gauge rather than server per-task accounting.
+
+### Compatibility
+
+- Bumped the estimator revision to 2. Overlapping local buckets and weekly points are rebuilt from rollout calls still in the configured scan range, and revision-aware upsert replaces older points when unweighted evidence is no worse. Older points that cannot be rebuilt remain isolated; mixed-revision windows keep `~EST` unavailable and partial instead of silently combining mappings.
+- Changed the attribution method identifier from `current_codex_gauge_short_context_price_weighted_proxy` to `current_codex_gauge_credit_rate_weighted_proxy`.
+- A small subset of Enterprise workspaces still uses OpenAI's legacy per-message rate card. The monitor cannot detect that migration state from local rollout data, so revision-2 estimates do not represent the applicable legacy card for those workspaces.
+
 ## [0.2.4] - 2026-07-31
 
 ### Added

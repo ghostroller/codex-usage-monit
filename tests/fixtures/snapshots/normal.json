@@ -276,7 +276,7 @@
     "attributionCoveragePercent": 100.0,
     "externalActivityPossible": false,
     "confidence": "low",
-    "method": "price_weighted_local_share",
+    "method": "current_codex_gauge_credit_rate_weighted_proxy",
     "settled": false
   },
   "windowAnalyses": [
@@ -304,7 +304,7 @@
         "attributionCoveragePercent": 100.0,
         "externalActivityPossible": false,
         "confidence": "low",
-        "method": "price_weighted_local_share",
+        "method": "current_codex_gauge_credit_rate_weighted_proxy",
         "settled": false
       },
       "partial": false,
@@ -382,7 +382,7 @@
         "attributionCoveragePercent": 100.0,
         "externalActivityPossible": false,
         "confidence": "low",
-        "method": "price_weighted_local_share",
+        "method": "current_codex_gauge_credit_rate_weighted_proxy",
         "settled": false
       },
       "partial": false,

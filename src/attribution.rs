@@ -14,12 +14,13 @@ const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
-pub(crate) const ESTIMATOR_REVISION: u32 = 1;
+pub(crate) const ESTIMATOR_REVISION: u32 = 2;
 
-// OpenAI short-context prices as of 2026-07-14:
-// https://developers.openai.com/api/docs/pricing?latest-pricing=priority
-// Integer rates use $0.025 per million tokens. The currency and per-million
-// scales cancel when the values are converted into relative shares.
+// OpenAI Codex token-based credit rates as of 2026-08-10:
+// https://help.openai.com/en/articles/20001106-codex-rate-card
+// Integer rates use 1/8 credit per million tokens. The credit and per-million
+// scales cancel when the values are converted into relative shares. Fast rates
+// apply the published family multipliers: GPT-5.6/GPT-5.5 2.5x, GPT-5.4 2x.
 #[derive(Clone, Copy)]
 struct TokenRates {
     input: u128,
@@ -27,18 +28,22 @@ struct TokenRates {
     output: u128,
 }
 
-const SOL_STANDARD: TokenRates = TokenRates::new(200, 20, 1_200);
-const SOL_FAST: TokenRates = TokenRates::new(400, 40, 2_400);
-const TERRA_STANDARD: TokenRates = TokenRates::new(100, 10, 600);
-const TERRA_FAST: TokenRates = TokenRates::new(200, 20, 1_200);
+const SOL_STANDARD: TokenRates = TokenRates::new(1_000, 100, 6_000);
+const SOL_FAST: TokenRates = TokenRates::new(2_500, 250, 15_000);
+const TERRA_STANDARD: TokenRates = TokenRates::new(400, 40, 2_400);
+const TERRA_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
 const LUNA_STANDARD: TokenRates = TokenRates::new(40, 4, 240);
-const LUNA_FAST: TokenRates = TokenRates::new(80, 8, 480);
-const GPT_5_5_STANDARD: TokenRates = TokenRates::new(200, 20, 1_200);
-const GPT_5_5_FAST: TokenRates = TokenRates::new(500, 50, 3_000);
-const GPT_5_4_STANDARD: TokenRates = TokenRates::new(100, 10, 600);
-const GPT_5_4_FAST: TokenRates = TokenRates::new(200, 20, 1_200);
-const GPT_5_4_MINI_STANDARD: TokenRates = TokenRates::new(30, 3, 180);
-const GPT_5_4_MINI_FAST: TokenRates = TokenRates::new(60, 6, 360);
+const LUNA_FAST: TokenRates = TokenRates::new(100, 10, 600);
+const GPT_5_5_STANDARD: TokenRates = TokenRates::new(1_000, 100, 6_000);
+const GPT_5_5_FAST: TokenRates = TokenRates::new(2_500, 250, 15_000);
+const GPT_5_5_CYBER_STANDARD: TokenRates = TokenRates::new(2_500, 250, 15_000);
+const GPT_5_5_CYBER_FAST: TokenRates = TokenRates::new(6_250, 625, 37_500);
+const GPT_5_4_STANDARD: TokenRates = TokenRates::new(500, 50, 3_000);
+const GPT_5_4_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
+const GPT_5_4_MINI_STANDARD: TokenRates = TokenRates::new(150, 15, 904);
+const GPT_5_4_MINI_FAST: TokenRates = TokenRates::new(300, 30, 1_808);
+const GPT_5_3_CODEX_STANDARD: TokenRates = TokenRates::new(350, 35, 2_800);
+const GPT_5_2_STANDARD: TokenRates = TokenRates::new(350, 35, 2_800);
 
 impl TokenRates {
     const fn new(input: u128, cached_input: u128, output: u128) -> Self {
@@ -82,8 +87,8 @@ struct SelectedWindow<'a> {
 /// Calculates raw local-token shares and low-confidence quota estimates for
 /// the current normal Codex five-hour and weekly rate-limit windows.
 ///
-/// Spark calls are excluded. EST uses the published short-context Standard or
-/// Fast token prices, while raw token totals and TOKEN% shares remain unchanged.
+/// Spark calls are excluded. EST uses the published Standard or Fast token
+/// credit rates, while raw token totals and TOKEN% shares remain unchanged.
 pub fn analyze_windows(
     tasks: &[TaskRecord],
     _turns: &[TurnRecord],
@@ -300,7 +305,7 @@ fn analyze_selected_window(
         method: if total_tokens == 0 {
             "codex_gauge_without_local_tokens".to_string()
         } else {
-            "current_codex_gauge_short_context_price_weighted_proxy".to_string()
+            "current_codex_gauge_credit_rate_weighted_proxy".to_string()
         },
         settled,
     };
@@ -443,7 +448,7 @@ fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f
 }
 
 pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
-    let rates = short_context_rates(call.model.as_deref(), call.is_fast());
+    let rates = codex_credit_rates(call.model.as_deref(), call.is_fast());
     let used_model_fallback = rates.is_none() && !call.tokens.is_zero();
     let rates = rates.unwrap_or(if call.is_fast() {
         LUNA_FAST
@@ -477,9 +482,11 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
     }
 }
 
-fn short_context_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
+fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
     let model = model?.trim();
-    let (standard, priority) = if model.eq_ignore_ascii_case("gpt-5.6-sol") {
+    let (standard, fast_rate) = if model.eq_ignore_ascii_case("gpt-5.6-sol")
+        || model.eq_ignore_ascii_case("gpt-5.6")
+    {
         (SOL_STANDARD, SOL_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.6-terra") {
         (TERRA_STANDARD, TERRA_FAST)
@@ -487,14 +494,20 @@ fn short_context_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
         (LUNA_STANDARD, LUNA_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.5") {
         (GPT_5_5_STANDARD, GPT_5_5_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.5-cyber") {
+        (GPT_5_5_CYBER_STANDARD, GPT_5_5_CYBER_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.4") {
         (GPT_5_4_STANDARD, GPT_5_4_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.4-mini") {
         (GPT_5_4_MINI_STANDARD, GPT_5_4_MINI_FAST)
+    } else if model.eq_ignore_ascii_case("gpt-5.3-codex") {
+        (GPT_5_3_CODEX_STANDARD, GPT_5_3_CODEX_STANDARD)
+    } else if model.eq_ignore_ascii_case("gpt-5.2") || model.eq_ignore_ascii_case("gpt-5.2-codex") {
+        (GPT_5_2_STANDARD, GPT_5_2_STANDARD)
     } else {
         return None;
     };
-    Some(if fast { priority } else { standard })
+    Some(if fast { fast_rate } else { standard })
 }
 
 fn model_name(call: &UsageCall) -> String {
@@ -510,7 +523,7 @@ fn model_name(call: &UsageCall) -> String {
 mod tests {
     use super::*;
 
-    fn priced_call(model: &str, fast: bool, tokens: TokenUsage) -> UsageCall {
+    fn rated_call(model: &str, fast: bool, tokens: TokenUsage) -> UsageCall {
         UsageCall {
             timestamp: Utc::now(),
             thread_id: "thread".to_string(),
@@ -522,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn published_short_context_price_matrix_uses_each_model_and_tier() {
+    fn published_codex_credit_rate_matrix_uses_each_model_and_tier() {
         let tokens = TokenUsage {
             input_tokens: 13,
             cached_input_tokens: 3,
@@ -531,21 +544,26 @@ mod tests {
             total_tokens: 999,
         };
         let cases = [
-            ("gpt-5.6-sol", 4_460, 8_920),
-            ("gpt-5.6-terra", 2_230, 4_460),
-            ("gpt-5.6-luna", 892, 1_784),
-            ("gpt-5.5", 4_460, 11_150),
-            ("gpt-5.4", 2_230, 4_460),
-            ("gpt-5.4-mini", 669, 1_338),
+            ("gpt-5.6-sol", 22_300, 55_750),
+            ("gpt-5.6", 22_300, 55_750),
+            ("gpt-5.6-terra", 8_920, 22_300),
+            ("gpt-5.6-luna", 892, 2_230),
+            ("gpt-5.5", 22_300, 55_750),
+            ("gpt-5.5-cyber", 55_750, 139_375),
+            ("gpt-5.4", 11_150, 22_300),
+            ("gpt-5.4-mini", 3_353, 6_706),
+            ("gpt-5.3-codex", 9_205, 9_205),
+            ("gpt-5.2", 9_205, 9_205),
+            ("gpt-5.2-codex", 9_205, 9_205),
         ];
 
         for (model, standard, fast) in cases {
-            let standard_cost = estimate_call_weight(&priced_call(model, false, tokens));
+            let standard_cost = estimate_call_weight(&rated_call(model, false, tokens));
             assert_eq!(standard_cost.units, standard, "{model} Standard");
             assert!(!standard_cost.used_model_fallback);
             assert!(!standard_cost.used_token_breakdown_fallback);
 
-            let fast_cost = estimate_call_weight(&priced_call(model, true, tokens));
+            let fast_cost = estimate_call_weight(&rated_call(model, true, tokens));
             assert_eq!(fast_cost.units, fast, "{model} Fast");
             assert!(!fast_cost.used_model_fallback);
             assert!(!fast_cost.used_token_breakdown_fallback);
@@ -554,7 +572,7 @@ mod tests {
 
     #[test]
     fn pricing_fallbacks_are_explicit_and_keep_a_nonzero_denominator() {
-        let unknown = priced_call(
+        let unknown = rated_call(
             "unknown-model",
             true,
             TokenUsage {
@@ -564,11 +582,11 @@ mod tests {
             },
         );
         let unknown_cost = estimate_call_weight(&unknown);
-        assert_eq!(unknown_cost.units, 800);
+        assert_eq!(unknown_cost.units, 1_000);
         assert!(unknown_cost.used_model_fallback);
         assert!(!unknown_cost.used_token_breakdown_fallback);
 
-        let total_only = priced_call(
+        let total_only = rated_call(
             "gpt-5.6-luna",
             false,
             TokenUsage {
@@ -584,7 +602,7 @@ mod tests {
 
     #[test]
     fn cached_input_is_clamped_to_input_tokens() {
-        let cost = estimate_call_weight(&priced_call(
+        let cost = estimate_call_weight(&rated_call(
             "gpt-5.6-luna",
             false,
             TokenUsage {

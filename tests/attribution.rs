@@ -208,7 +208,7 @@ fn estimates_each_entity_from_codex_gauge_and_local_token_share() {
     assert!(summary.settled);
     assert_eq!(
         summary.method,
-        "current_codex_gauge_short_context_price_weighted_proxy"
+        "current_codex_gauge_credit_rate_weighted_proxy"
     );
 
     assert_eq!(tasks[0].window_token_usage, tokens(300));
@@ -237,7 +237,7 @@ fn estimates_each_entity_from_codex_gauge_and_local_token_share() {
 }
 
 #[test]
-fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share() {
+fn model_and_fast_credit_rates_weight_est_without_changing_raw_tokens_or_local_share() {
     let now = at(12, 0);
     let reset = at(14, 0);
     let limits = vec![codex_limit(now, 40.0, 300, reset)];
@@ -256,7 +256,7 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
             "b",
             "b-5.5-fast",
             Some("gpt-5.5"),
-            Some("priority"),
+            Some("fast"),
             100,
         ),
         call_with_tier(
@@ -286,13 +286,13 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
     assert_eq!(summary.local_token_usage, tokens(400));
     assert_eq!(tasks[0].window_token_usage, tokens(200));
     assert_close(tasks[0].local_token_share_percent, 50.0);
-    assert_close(tasks[0].estimated_quota_percent, 12.0);
+    assert_close(tasks[0].estimated_quota_percent, 10.833333333333334);
     assert_eq!(tasks[1].window_token_usage, tokens(100));
     assert_close(tasks[1].local_token_share_percent, 25.0);
-    assert_close(tasks[1].estimated_quota_percent, 25.0);
+    assert_close(tasks[1].estimated_quota_percent, 26.041666666666668);
     assert_eq!(tasks[2].window_token_usage, tokens(100));
     assert_close(tasks[2].local_token_share_percent, 25.0);
-    assert_close(tasks[2].estimated_quota_percent, 3.0);
+    assert_close(tasks[2].estimated_quota_percent, 3.125);
 
     for turn in &turns {
         assert_eq!(turn.window_token_usage, tokens(100));
@@ -304,7 +304,7 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
             .find(|turn| turn.turn_id == "a-luna-standard")
             .unwrap()
             .estimated_quota_percent,
-        2.0,
+        0.4166666666666667,
     );
     assert_close(
         turns
@@ -312,7 +312,7 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
             .find(|turn| turn.turn_id == "a-5.5-standard")
             .unwrap()
             .estimated_quota_percent,
-        10.0,
+        10.416666666666668,
     );
     assert_close(
         turns
@@ -320,7 +320,7 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
             .find(|turn| turn.turn_id == "b-5.5-fast")
             .unwrap()
             .estimated_quota_percent,
-        25.0,
+        26.041666666666668,
     );
     assert_close(
         turns
@@ -328,7 +328,7 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
             .find(|turn| turn.turn_id == "c-mini-fast")
             .unwrap()
             .estimated_quota_percent,
-        3.0,
+        3.125,
     );
 
     let luna = models
@@ -337,21 +337,21 @@ fn model_and_fast_prices_weight_est_without_changing_raw_tokens_or_local_share()
         .unwrap();
     assert_eq!(luna.token_usage, tokens(100));
     assert_close(luna.local_token_share_percent, 25.0);
-    assert_close(luna.estimated_quota_percent, 2.0);
+    assert_close(luna.estimated_quota_percent, 0.4166666666666667);
     let gpt_5_5 = models
         .iter()
         .find(|model| model.model == "gpt-5.5")
         .unwrap();
     assert_eq!(gpt_5_5.token_usage, tokens(200));
     assert_close(gpt_5_5.local_token_share_percent, 50.0);
-    assert_close(gpt_5_5.estimated_quota_percent, 35.0);
+    assert_close(gpt_5_5.estimated_quota_percent, 36.458333333333336);
     let mini = models
         .iter()
         .find(|model| model.model == "gpt-5.4-mini")
         .unwrap();
     assert_eq!(mini.token_usage, tokens(100));
     assert_close(mini.local_token_share_percent, 25.0);
-    assert_close(mini.estimated_quota_percent, 3.0);
+    assert_close(mini.estimated_quota_percent, 3.125);
 
     assert_close(
         tasks.iter().map(|task| task.estimated_quota_percent).sum(),

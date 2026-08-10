@@ -23,9 +23,9 @@ rows:
 16|┌ Models · 5h · top 0/1────────────────────────────────────┐
 17|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to │
 18|│07-12 06:30                                               │
-19|│Tokens 10.0K · EST ~37.50pp · codex gauge × price-weighted│
+19|│Tokens 10.0K · EST ~37.50pp · codex gauge × credit-rate   │
 20|│share                                                     │
-21|│Price-weighted quota proxy · not server accounting        │
+21|│Credit-rate-weighted quota proxy · not server accounting  │
 22|│MODEL               TOKENS       TOKEN SHARE  EST. QUOTA  │
 23|└──────────────────────────────────────────────────────────┘
 styles:
@@ -142,13 +142,13 @@ styles:
 18:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="07-12 06:30                                               "
 18:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 19:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-19:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Tokens 10.0K · EST ~37.50pp · codex gauge × price-weighted"
+19:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Tokens 10.0K · EST ~37.50pp · codex gauge × credit-rate   "
 19:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 20:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 20:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="share                                                     "
 20:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 21:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-21:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Price-weighted quota proxy · not server accounting        "
+21:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Credit-rate-weighted quota proxy · not server accounting  "
 21:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 22:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 22:001+058 fg=#006c75 bg=#f7f9fc mods=bold text="MODEL               TOKENS       TOKEN SHARE  EST. QUOTA  "

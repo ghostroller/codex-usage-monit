@@ -1600,7 +1600,7 @@ fn upsert_weekly_local_point(
             return false;
         }
         if incoming.observed_at > latest.observed_at
-            && weekly_evidence_dominates(latest, &incoming)
+            && weekly_point_can_suppress_later(latest, &incoming)
             && collection_issue_count(&latest.partial_reasons)
                 <= collection_issue_count(&incoming.partial_reasons)
         {
@@ -1644,6 +1644,13 @@ fn should_replace_half_hour_bucket(
     incoming: &LocalHalfHourBucket,
     existing: &LocalHalfHourBucket,
 ) -> bool {
+    if incoming.estimator_revision != existing.estimator_revision {
+        return incoming.estimator_revision > existing.estimator_revision
+            && bucket_unweighted_evidence_dominates(incoming, existing)
+            && bucket_collection_issue_count(incoming) <= bucket_collection_issue_count(existing)
+            && incoming.sampled_at >= existing.sampled_at;
+    }
+
     let incoming_dominates = bucket_evidence_dominates(incoming, existing);
     let existing_dominates = bucket_evidence_dominates(existing, incoming);
     if incoming_dominates != existing_dominates {
@@ -1670,6 +1677,14 @@ fn should_replace_weekly_local_point(
     incoming: &WeeklyLocalPoint,
     existing: &WeeklyLocalPoint,
 ) -> bool {
+    if incoming.estimator_revision != existing.estimator_revision {
+        return incoming.estimator_revision > existing.estimator_revision
+            && weekly_unweighted_evidence_dominates(incoming, existing)
+            && collection_issue_count(&incoming.partial_reasons)
+                <= collection_issue_count(&existing.partial_reasons)
+            && incoming.observed_at >= existing.observed_at;
+    }
+
     let incoming_dominates = weekly_evidence_dominates(incoming, existing);
     let existing_dominates = weekly_evidence_dominates(existing, incoming);
     if incoming_dominates != existing_dominates {
@@ -1694,6 +1709,14 @@ fn collection_issue_count(partial_reasons: &[String]) -> usize {
 }
 
 fn bucket_evidence_dominates(candidate: &LocalHalfHourBucket, other: &LocalHalfHourBucket) -> bool {
+    bucket_unweighted_evidence_dominates(candidate, other)
+        && candidate.estimated_cost_units >= other.estimated_cost_units
+}
+
+fn bucket_unweighted_evidence_dominates(
+    candidate: &LocalHalfHourBucket,
+    other: &LocalHalfHourBucket,
+) -> bool {
     candidate.call_count >= other.call_count
         && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
         && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
@@ -1701,7 +1724,6 @@ fn bucket_evidence_dominates(candidate: &LocalHalfHourBucket, other: &LocalHalfH
         && candidate.token_usage.reasoning_output_tokens
             >= other.token_usage.reasoning_output_tokens
         && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
-        && candidate.estimated_cost_units >= other.estimated_cost_units
 }
 
 fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u64, u64, u64) {
@@ -1717,6 +1739,26 @@ fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u6
 }
 
 fn weekly_evidence_dominates(candidate: &WeeklyLocalPoint, other: &WeeklyLocalPoint) -> bool {
+    weekly_unweighted_evidence_dominates(candidate, other)
+        && candidate.estimated_cost_units >= other.estimated_cost_units
+}
+
+fn weekly_point_can_suppress_later(candidate: &WeeklyLocalPoint, later: &WeeklyLocalPoint) -> bool {
+    if candidate.estimator_revision == later.estimator_revision {
+        return weekly_evidence_dominates(candidate, later);
+    }
+    if candidate.estimator_revision > later.estimator_revision {
+        return weekly_unweighted_evidence_dominates(candidate, later);
+    }
+
+    weekly_unweighted_evidence_dominates(candidate, later)
+        && !weekly_unweighted_evidence_dominates(later, candidate)
+}
+
+fn weekly_unweighted_evidence_dominates(
+    candidate: &WeeklyLocalPoint,
+    other: &WeeklyLocalPoint,
+) -> bool {
     candidate.call_count >= other.call_count
         && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
         && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
@@ -1724,7 +1766,6 @@ fn weekly_evidence_dominates(candidate: &WeeklyLocalPoint, other: &WeeklyLocalPo
         && candidate.token_usage.reasoning_output_tokens
             >= other.token_usage.reasoning_output_tokens
         && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
-        && candidate.estimated_cost_units >= other.estimated_cost_units
 }
 
 fn weekly_evidence_key(point: &WeeklyLocalPoint) -> (u64, u128, u64, u64, u64, u64, u64) {
@@ -2981,6 +3022,35 @@ mod tests {
     }
 
     #[test]
+    fn newer_estimator_revision_replaces_equivalent_bucket_evidence_at_a_lower_weight() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut older = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
+        older.estimator_revision = 1;
+        older.call_count = 5;
+        let mut newer = local_bucket(starts_at, starts_at + Duration::minutes(12), 50, 100);
+        newer.estimator_revision = 2;
+        newer.call_count = 5;
+        let mut buckets = vec![older];
+
+        assert!(upsert_half_hour_bucket(&mut buckets, newer.clone()));
+        assert_eq!(buckets, vec![newer.clone()]);
+
+        let mut richer_but_older =
+            local_bucket(starts_at, starts_at + Duration::minutes(14), 70, 700);
+        richer_but_older.estimator_revision = 1;
+        richer_but_older.call_count = 7;
+        assert!(!upsert_half_hour_bucket(&mut buckets, richer_but_older));
+        assert_eq!(buckets, vec![newer.clone()]);
+
+        let mut poorer_but_newer =
+            local_bucket(starts_at, starts_at + Duration::minutes(14), 40, 80);
+        poorer_but_newer.estimator_revision = 3;
+        poorer_but_newer.call_count = 4;
+        assert!(!upsert_half_hour_bucket(&mut buckets, poorer_but_newer));
+        assert_eq!(buckets, vec![newer]);
+    }
+
+    #[test]
     fn later_weekly_point_cannot_drop_on_a_lower_quality_scan() {
         let reset = at(2026, 7, 31, 12, 17, 0);
         let first_at = at(2026, 7, 28, 12, 5, 0);
@@ -2996,6 +3066,55 @@ mod tests {
         richer.partial_reasons = vec!["unpriced_model_rate_fallback".to_string()];
         assert!(upsert_weekly_local_point(&mut points, richer.clone()));
         assert_eq!(points, vec![complete, richer]);
+    }
+
+    #[test]
+    fn newer_estimator_revision_replaces_equivalent_weekly_evidence_at_a_lower_weight() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let first_at = at(2026, 7, 28, 12, 6, 0);
+        let mut older = weekly_point(first_at, reset, 50, 500);
+        older.estimator_revision = 1;
+        older.call_count = 5;
+        let mut newer = weekly_point(first_at + Duration::minutes(1), reset, 50, 100);
+        newer.estimator_revision = 2;
+        newer.call_count = 5;
+        let mut points = vec![older];
+
+        assert!(upsert_weekly_local_point(&mut points, newer.clone()));
+        assert_eq!(points, vec![newer.clone()]);
+
+        let mut richer_but_older = weekly_point(first_at + Duration::minutes(2), reset, 70, 700);
+        richer_but_older.estimator_revision = 1;
+        richer_but_older.call_count = 7;
+        assert!(!upsert_weekly_local_point(&mut points, richer_but_older));
+        assert_eq!(points, vec![newer.clone()]);
+
+        let mut poorer_but_newer = weekly_point(first_at + Duration::minutes(3), reset, 40, 80);
+        poorer_but_newer.estimator_revision = 3;
+        poorer_but_newer.call_count = 4;
+        assert!(!upsert_weekly_local_point(&mut points, poorer_but_newer));
+        assert_eq!(points, vec![newer]);
+    }
+
+    #[test]
+    fn cross_slot_weekly_plateaus_keep_the_newer_estimator_revision() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let mut older = weekly_point(at(2026, 7, 28, 12, 1, 0), reset, 50, 500);
+        older.estimator_revision = 1;
+        older.call_count = 5;
+        let mut newer = weekly_point(at(2026, 7, 28, 12, 7, 0), reset, 50, 100);
+        newer.estimator_revision = 2;
+        newer.call_count = 5;
+        let mut points = vec![older.clone()];
+
+        assert!(upsert_weekly_local_point(&mut points, newer.clone()));
+        assert_eq!(points, vec![older, newer.clone()]);
+
+        let mut older_downgrade = weekly_point(at(2026, 7, 28, 12, 12, 0), reset, 50, 500);
+        older_downgrade.estimator_revision = 1;
+        older_downgrade.call_count = 5;
+        assert!(!upsert_weekly_local_point(&mut points, older_downgrade));
+        assert_eq!(points.last(), Some(&newer));
     }
 
     #[test]
@@ -3242,7 +3361,7 @@ mod tests {
     }
 
     #[test]
-    fn series_derive_weekly_tokens_and_price_weighted_estimates() {
+    fn series_derive_weekly_tokens_and_credit_rate_weighted_estimates() {
         let reset = at(2026, 7, 31, 12, 0, 0);
         let start = reset - Duration::days(7);
         let data = HistoryData {

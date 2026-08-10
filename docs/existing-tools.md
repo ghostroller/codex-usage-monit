@@ -1,6 +1,6 @@
 # 现有开源工具调研
 
-更新日期：2026-07-14
+更新日期：2026-08-10
 
 ## 结论
 
@@ -37,7 +37,7 @@
 2. CodexBar 的只读 App Server 额度读取；
 3. codex-ops/ccusage 的 rollout token 重建。
 
-本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。`TOKEN%` 是原始非 Spark token share，`EST.Q` 才使用 `codex usedPercent × 模型/服务层短上下文价格加权用量占比`，不会把 token 占比冒充官方额度账单。
+本项目增加的核心能力是把三条链路放进同一个 snapshot model，并把 exact/partial local token、账户级 `codex` gauge、Low-confidence estimated quota share、confidence 和 external risk 分开表达。`TOKEN%` 是原始非 Spark token share，`EST.Q` 才使用 `codex usedPercent × 模型/服务层 Codex token credit 费率加权用量占比`。模型费率依据 OpenAI 的 [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)，Fast 倍率依据 [Speed](https://developers.openai.com/codex/speed)；这仍不会把 token 占比或本地 credit 代理冒充官方逐 task/turn 账单。
 
 ## Idle 后是否精确
 

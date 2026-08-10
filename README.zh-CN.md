@@ -278,9 +278,13 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | 该实体在所选普通 `codex` 周期的本地可观察、符合条件的非 Spark token 中所占比例。它是 token 占比，不是账户额度百分比。 |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | 归因到该实体的低置信度额度消耗估算，单位为百分点。`~` 表示近似值；`-` 表示无法计算。 |
 | `EFFORT` | Codex 记录的 reasoning-effort 值。 |
-| `FAST` | rollout 使用了 `serviceTier=priority`；归因会使用对应的 Fast 价格权重。 |
+| `FAST` | rollout 使用了可识别的 Fast 服务层（`serviceTier=fast` 或兼容的 `priority`）；归因会应用官方 Fast credit 倍率。 |
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
 | `SOURCE` | 记录的任务来源。TUI 筛选器包括 All（不限制来源）、Desktop（包含 `vscode`）、Subagent 和 CLI。 |
+
+估算器依据 OpenAI 的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card) 映射 `gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.5-cyber`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex`、`gpt-5.2` 和历史 `gpt-5.2-codex` slug。对于识别为 Fast 的调用，按官方 [Speed](https://developers.openai.com/codex/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
+
+GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
 任务树默认全部收起；可见的父任务行会包含被隐藏后代的 token/占比。
 
@@ -305,11 +309,11 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | --- | --- |
 | `Quota Remaining` | 持久化的服务端 `100 - usedPercent` 观察值。5 小时和周周期是独立序列；没有 recorder 运行时产生的缺口不会插值。 |
 | `Weekly Local Tokens` | 当前服务端周周期内，符合条件的本地 token 增量累计值。 |
-| `Weekly ~EST Usage` | 使用最新周 gauge，把额度按截至各时间点的本地价格权重分配。它是低置信度分配，不是独立的服务端测量。 |
+| `Weekly ~EST Usage` | 使用最新周 gauge，把额度按截至各时间点的本地 Codex credit 费率权重分配。它是低置信度分配，不是独立的服务端测量。 |
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
-| `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟价格权重桶。 |
+| `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 历史会保留原始模型、服务层、token 分量和估算器版本，避免价格逻辑变化时静默混用不同定义。由于计算采用最新周 gauge 和完整周期分母，新增本地调用或服务端样本后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。token-based credit 映射对应 revision 2。升级后，程序只会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点；当 revision 2 数据点的未加权 token/call 证据不差于旧点时，由 revision-aware upsert 替换旧点。无法重建的更早数据继续隔离，窗口内出现混合 revision 时，`~EST` 显示 unavailable 并标为 partial。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本或估算器更新后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 
@@ -317,13 +321,14 @@ Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不
 
 - **Token 是本地观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在已扫描的本地数据范围内是准确值。
 - **账户用量指标是服务端数据。** 当前额度窗口百分比和重置时间来自 Codex App Server；离线或降级时则来自已过期（`stale`）的本地后备数据。
-- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层价格权重上，因此来自其他机器或客户端的活动可能使结果失真。
+- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层 Codex credit 费率权重上，因此来自其他机器或客户端的活动可能使结果失真。
+- **需考虑 workspace 的费率卡迁移状态。** token-based 卡适用于绝大多数方案，但 OpenAI 说明仍有少量 Enterprise workspace 使用旧的按消息计费卡。监控器无法从本地 rollout 判断 workspace 是否已迁移，因此这些用户不应把 `~EST` 视为其适用计费卡的代表值。
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
 - **任务结束不等于账单精确。** 已结算任务可以拥有精确的本地可观察 token 总量，但其额度估算仍然是低可信值。
 - **历史区分零值和缺失。** 程序停止会在服务端额度历史中留下缺口。本地 15 分钟桶只有在对应 rollout 仍处于配置的扫描天数和文件上限内时才能回填。升级时会丢弃旧的 30 分钟本地聚合桶，而不是近似拆分；额度历史和周累计历史会保留，近期本地桶会从仍在扫描范围内的 rollout 文件重建。
 
-公式、价格回退规则、计数器处理和详细的不完整原因语义见[数据能力和限制](docs/codex-data-capabilities.md)。
+公式、费率卡后备规则、计数器处理和详细的不完整原因语义见[数据能力和限制](docs/codex-data-capabilities.md)。
 
 ## JSON 输出
 

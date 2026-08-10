@@ -962,7 +962,7 @@ fn add_window_analysis(
             attribution_coverage_percent: 0.0,
             external_activity_possible: true,
             confidence: Confidence::Low,
-            method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
+            method: "current_codex_gauge_credit_rate_weighted_proxy".to_string(),
             settled: true,
         },
         partial: false,
@@ -1735,7 +1735,7 @@ fn every_available_estimate_is_marked_as_approximate() {
 }
 
 #[test]
-fn attribution_summary_explains_the_price_weighted_codex_share_formula() {
+fn attribution_summary_explains_the_credit_rate_weighted_codex_share_formula() {
     let now = chrono::Utc::now();
     let attribution = AttributionSummary {
         window: Some(WindowDescriptor {
@@ -1757,15 +1757,15 @@ fn attribution_summary_explains_the_price_weighted_codex_share_formula() {
     let compact =
         attribution_summary_lines(Some(&attribution), WindowScope::Week, false, &[], true);
     assert!(compact[1].contains("EST ~34.00pp"));
-    assert!(compact[1].contains("codex gauge × price-weighted share"));
-    assert!(compact[2].contains("Price-weighted quota proxy"));
+    assert!(compact[1].contains("codex gauge × credit-rate share"));
+    assert!(compact[2].contains("Credit-rate-weighted quota proxy"));
     assert!(compact[2].contains("not server accounting"));
     assert!(!compact[2].contains("confidence"));
 
     let wide = attribution_summary_lines(Some(&attribution), WindowScope::Week, false, &[], false);
     assert!(wide[1].contains("~34.00pp estimated"));
-    assert!(wide[1].contains("codex gauge × price-weighted share"));
-    assert!(wide[2].contains("Price-weighted quota proxy"));
+    assert!(wide[1].contains("codex gauge × credit-rate share"));
+    assert!(wide[2].contains("Credit-rate-weighted quota proxy"));
     assert!(wide[2].contains("not server per-task accounting"));
     assert!(!wide[2].contains("confidence"));
     assert!(!wide.join(" ").contains("evidence"));
@@ -1890,8 +1890,8 @@ fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
     let content = render_models_content(&app.snapshot, 80, 8);
 
     assert!(content.contains("EST ~23.00pp"));
-    assert!(content.contains("codex gauge × price-weighted share"));
-    assert!(content.contains("Price-weighted quota proxy"));
+    assert!(content.contains("codex gauge × credit-rate share"));
+    assert!(content.contains("Credit-rate-weighted quota proxy"));
     assert!(content.contains("not server accounting"));
     assert!(!content.contains("confidence"));
     assert!(content.contains("external"));

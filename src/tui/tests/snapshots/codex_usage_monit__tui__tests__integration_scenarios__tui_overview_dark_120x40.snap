@@ -36,8 +36,8 @@ rows:
 29|└  R RUN   W WAIT   D DONE   X STOP   F FAIL   ? STALE  ─────┘└ gpt-5.3-codex · high ──────────────────────────────────┘
 30|┌ Models · 5h──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 31|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 │
-32|│10.0K token total · ~37.50pp estimated · codex gauge × price-weighted share                                           │
-33|│Price-weighted quota proxy, not server per-task accounting                                                            │
+32|│10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              │
+33|│Credit-rate-weighted quota proxy, not server per-task accounting                                                      │
 34|│MODEL                                                                           TOKENS       TOKEN SHARE  EST. QUOTA  │
 35|│gpt-5.3-codex                                                                   10.0K        100.0%       ~37.5%      │
 36|│                                                                                                                      │
@@ -239,10 +239,10 @@ styles:
 31:001+118 fg=#7e8691 bg=#121417 mods=none text="Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 "
 31:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 32:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-32:001+118 fg=#7e8691 bg=#121417 mods=none text="10.0K token total · ~37.50pp estimated · codex gauge × price-weighted share                                           "
+32:001+118 fg=#7e8691 bg=#121417 mods=none text="10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              "
 32:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 33:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-33:001+118 fg=#7e8691 bg=#121417 mods=none text="Price-weighted quota proxy, not server per-task accounting                                                            "
+33:001+118 fg=#7e8691 bg=#121417 mods=none text="Credit-rate-weighted quota proxy, not server per-task accounting                                                      "
 33:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 34:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 34:001+118 fg=#3fb9c0 bg=#121417 mods=bold text="MODEL                                                                           TOKENS       TOKEN SHARE  EST. QUOTA  "

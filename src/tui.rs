@@ -8464,13 +8464,13 @@ fn attribution_summary_lines(
     let allocation = if estimate_available {
         if compact {
             format!(
-                "Tokens {} · EST ~{:.2}pp · codex gauge × price-weighted share",
+                "Tokens {} · EST ~{:.2}pp · codex gauge × credit-rate share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
         } else {
             format!(
-                "{} token total · ~{:.2}pp estimated · codex gauge × price-weighted share",
+                "{} token total · ~{:.2}pp estimated · codex gauge × credit-rate share",
                 format_tokens(attribution.local_token_usage),
                 attribution.proxy_projected_percent,
             )
@@ -8501,9 +8501,9 @@ fn attribution_summary_lines(
         )
     };
     let mut quality = if compact {
-        "Price-weighted quota proxy · not server accounting".to_string()
+        "Credit-rate-weighted quota proxy · not server accounting".to_string()
     } else {
-        "Price-weighted quota proxy, not server per-task accounting".to_string()
+        "Credit-rate-weighted quota proxy, not server per-task accounting".to_string()
     };
     if attribution.external_activity_possible {
         quality.push_str(if compact {

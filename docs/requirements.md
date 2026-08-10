@@ -1,6 +1,6 @@
 # 产品需求文档
 
-更新日期：2026-07-14
+更新日期：2026-08-10
 
 ## 1. 产品目标
 
@@ -35,12 +35,12 @@ TUI Overview 显示近期 tasks：
 - task token 总量；
 - 当前选中 5h/Week reset cycle 的 `TOKEN5H%` / `TOKENWK%` 与 estimated quota；
 - project、来源、turn 数和会话标题；会话标题优先取 `$CODEX_HOME/session_index.jsonl` 中 thread 最新的非空 `thread_name`，缺失或不可读时回退 rollout 首条消息摘要，`--redact-content` 始终显示 `[redacted]`；
-- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown 与所选 reset cycle `TOKEN%` 必须汇总当前过滤树内所有隐藏后代，`EST.Q` 必须累加同一短上下文价格加权分母下的实体值；Spark 后代不得进入 `TOKEN%` 或 `EST.Q`。展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
+- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown 与所选 reset cycle `TOKEN%` 必须汇总当前过滤树内所有隐藏后代，`EST.Q` 必须累加同一 Codex credit-rate 加权分母下的实体值；Spark 后代不得进入 `TOKEN%` 或 `EST.Q`。展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
 - Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；当前会话标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
 - 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，两个提示整体都是鼠标按钮，且出现或消失不得移动相邻控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
 - Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影。筛选编辑确认后，非输入状态下的 `Delete` 与可点击 `[Del]` 清空当前焦点面板的查询；从 Turns 切换回 Tasks 时自动清空 Turns 查询及编辑恢复状态、重置 Turns 筛选投影，同时保留 Tasks 查询；
 - `V` 切换 Turns 默认显隐。默认显示时 Turns 常显；默认隐藏时 Tasks 使用完整内容区域，`Enter` / `↵` 临时展开并聚焦 Turns，`Backspace` / `←` 返回 Tasks 后关闭临时面板；
-- rollout 中 `thread_settings_applied.thread_settings.service_tier=priority` 在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 在模型名称后增加醒目标识，普通 turn 保持原显示；
+- rollout 中 `thread_settings_applied.thread_settings.service_tier` 为 `fast` 或兼容的 `priority` 时，在下一次 turn 激活时快照为 Fast；TUI 只为 Fast turn 在模型名称后增加醒目标识，普通 turn 保持原显示；
 - 选中 task 的近期 turns、模型、推理强度、最多 72 字符的用户消息摘要、状态和 token；旧日志缺失强度时显示 unknown，不在 task 层臆造单值；选中 turn 后以响应式详情显示时长、总量与所选 5h/Week reset cycle 的 token breakdown，并在空间允许时补充起止时间、占比、带 `~`/`-` 的 EST 和 turn ID，不回读或展示完整消息正文。
 
 独立启动的监控进程不能读取其他 Codex runtime 的精确等待状态。未闭合 turn 只根据事件与文件新鲜度标为 `inferred running`，超过宽限期标为 `stale`；不得把 `notLoaded` 当成 completed。
@@ -87,14 +87,17 @@ task/thread -> turn -> model token events
 
 - 只选择当前普通 `codex` 窗口，并按该窗口的 `resetsAt - windowDurationMins` 边界筛选本地调用；
 - `local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100`；
-- EST 使用 OpenAI API Pricing 的短上下文价格；Standard/Fast 的 `(input, cached input, output)` 美元/百万 token 分别为：`gpt-5.6-sol` `(5,.5,30)/(10,1,60)`、`gpt-5.6-terra` `(2.5,.25,15)/(5,.5,30)`、`gpt-5.6-luna` `(1,.1,6)/(2,.2,12)`、`gpt-5.5` `(5,.5,30)/(12.5,1.25,75)`、`gpt-5.4` `(2.5,.25,15)/(5,.5,30)`、`gpt-5.4-mini` `(.75,.075,4.5)/(1.5,.15,9)`；
-- 仅 `serviceTier=priority` 使用 Fast 价格，其他服务层使用 Standard；`cached = min(cached_input, input)`，`uncached = input - cached`，`call_price_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；
-- rollout 未暴露 GPT-5.6 cache-write token，不能套用价目表的独立 cache-write 价格；只有 total 而缺少 input/output breakdown 时按 uncached input 降级，并增加 `token_breakdown_missing` partial reason；
-- 缺失或未定价的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast 价格降级，并增加 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
-- `estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units`；task、turn、model 的 EST 使用同一价格分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
+- EST 使用 OpenAI Help Center 的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）与 `gpt-5.6-sol` `(125,12.5,750)`、`gpt-5.6-terra` `(50,5,300)`、`gpt-5.6-luna` `(5,.5,30)`、`gpt-5.5` `(125,12.5,750)`、`gpt-5.5-cyber` `(312.5,31.25,1875)`、`gpt-5.4` `(62.5,6.25,375)`、`gpt-5.4-mini` `(18.75,1.875,113)`、`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 均为 `(43.75,4.375,350)`；
+- `serviceTier=fast` 与 `serviceTier=priority` 都识别为 Fast；根据官方 [Speed](https://developers.openai.com/codex/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard；
+- `cached = min(cached_input, input)`，`uncached = input - cached`，`call_credit_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；Codex 不收取 cache-write credits，因此公式不得增加 cache-write 项；
+- 缺失或未映射的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast credit 费率降级，并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
+- `estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units`；task、turn、model 的 EST 使用同一 credit-rate 分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
+- `gpt-5.3-codex-spark` 的公开费率仍是 research preview，继续按精确模型名排除；不得为 Spark 虚构 credit 值；
+- token-based 映射使用 estimator revision 2；不得假定任意持久化聚合都能直接重新定价。仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 2 新点的未加权 token/call 证据不差于旧点时由 revision-aware upsert 替换；无法重建的旧点保留原 revision，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
+- Help Center 所述少量仍使用 legacy rate card 的 Enterprise workspace 无法从本地 rollout 自动识别；对这些 workspace，EST 不得声称代表其适用计费卡；
 - 每个 scope 的摘要统一说明估算方法、`external activity possible` 与 partial 状态；partial 时列出 `partialReasons`。partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；
-- 不得把短上下文价格代理称为服务端账单；
+- 不得把 credit-rate 代理称为服务端逐 task/turn 账单；
 - 服务端不提供当前 300 分钟窗口时，不得用周窗口冒充 5 小时归因；Models 面板必须显示明确的 unavailable 原因，不能只留下空表或把不可用表达成零模型使用量。
 - 任何 scope 不可用时不得回退到另一 duration 冒充；旧顶层 window 字段固定兼容首选 5h 结果，周结果只进入多窗口分析结构。
 
@@ -204,7 +207,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - 5h/Week 使用服务端 reset cycle 边界；`--days` 覆盖不足时对应 `windowAnalyses` 为 partial；
 - Overview 最顶栏中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`V` / `[V]Turns` 和 `M` / `[M]Models` 可稳定隐藏并恢复对应面板；
 - Tree 节点收起时父行准确汇总当前过滤树中隐藏后代的 token、`TOKEN%` 与 estimated quota，展开时不重复计数；
-- Fast turn 的 `FAST` 只出现在模型名称后，普通 turn 的模型单元格保持不变；
+- `serviceTier=fast` / `priority` 的 Fast turn，其 `FAST` 只出现在模型名称后；普通 turn 的模型单元格保持不变；
 - 相同 duration 出现多个额度桶时仍完整显示 gauge，但只有 `codex` 生成归因；Spark 精确模型名大小写不敏感排除，`codex_bengalfox` 保持 gauge-only，缺失模型名进入普通 `codex` 分母；
 - `windows` 与 `snapshot --section windows` 输出多窗口分析，旧 5h 字段保持兼容；
 - idle 后额度估算仍不声称 exact。

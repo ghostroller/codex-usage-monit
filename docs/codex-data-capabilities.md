@@ -1,6 +1,6 @@
 # Codex 数据能力与边界
 
-更新日期：2026-07-14
+更新日期：2026-08-10
 
 验证版本：`codex-cli 0.144.1`
 
@@ -14,7 +14,7 @@
 
 当前工具启动独立 App Server，只调用账户额度与账户用量读取方法。这个新 runtime 无法提供其他已经运行的 CLI/IDE/Desktop task 的精确 active flags，所以 v0.1 的 task 状态来自 rollout turn 边界与文件新鲜度，并明确标为 `inferred` 或 `stale`。官方 thread status API 是未来统一 runtime 模式的数据能力，不是当前实现已经声称拥有的能力。
 
-在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的短上下文价格加权用量占比做 Low-confidence 投影。主要显示口径 `TOKEN%` 是未加权的本地可观察 token 占比；一次性命令与 TUI 使用相同定义。
+在线额度以 App Server 为准；rollout 中的额度快照用于离线 fallback。实体 EST 不再尝试从相邻整数快照重建严格 delta，而是始终使用当前普通 `codex` gauge 与同一 reset cycle 的 Codex token credit 费率加权用量占比做 Low-confidence 投影。主要显示口径 `TOKEN%` 是未加权的本地可观察 token 占比；一次性命令与 TUI 使用相同定义。
 
 扫描不完整、lookback 不足或 task 状态 stale 会保留在 `partial` / `partialReasons` 和 provenance 中，但不会关闭仍可计算的 EST。只有没有当前 `codex` 窗口或窗口内没有本地非 Spark token 分母时，归因才不可用。
 
@@ -106,7 +106,7 @@ Rollout JSONL 中可利用以下事件重建历史：
 - `task_complete`：完成时间和耗时；
 - `turn_aborted`：中断原因和时间。
 
-近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。`thread_settings_applied.thread_settings.service_tier=priority` 可以为下一次激活的 turn 提供 Fast 标识，TUI 把 `FAST` 放在模型名称后，普通 turn 不显示。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
+近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。`thread_settings_applied.thread_settings.service_tier` 为 `fast` 或兼容的 `priority` 时，可以为下一次激活的 turn 提供 Fast 标识。TUI 把 `FAST` 放在模型名称后，普通 turn 不显示。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
 
 subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。Tree 模式收起父节点时，父行会在渲染层汇总当前过滤树内隐藏后代的 token、所选 reset cycle `TOKEN%` 与 estimated quota；它不改变底层 task/turn 归属，也不会影响一次性输出。
 
@@ -127,7 +127,7 @@ request_rate_limit_cost
 服务端只提供账户级 `usedPercent`，而本地提供 token。二者不能直接等同，原因包括：
 
 - 百分比是整数，存在取整；
-- Codex 配额的模型/服务层权重不保证等同于公开 API 价格；
+- 即使公开 Codex credit 费率可以计算本地调用的相对权重，账户 gauge 仍没有逐 task/turn 扣费明细；
 - cached input、output、reasoning 或特殊工具的额度影响不一定线性；
 - 多个本地线程可能并发；
 - 其他设备、IDE、桌面端或云任务可能共享额度；
@@ -148,32 +148,40 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 ### 可以估算但不能精确归因
 
-当前实现采用单一、可解释的价格代理公式。它固化 [OpenAI API Pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=priority) 的短上下文 Standard/Priority 价格，单位均为美元/百万 token：
+当前实现采用单一、可解释的 credit 费率代理公式。它固化 OpenAI Help Center 公布的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)，Standard 列的单位均为 credits / 1M tokens；Fast 倍率来自官方 [Speed](https://developers.openai.com/codex/speed) 说明：GPT-5.6 与 GPT-5.5 family 为 `2.5x`，GPT-5.4 family 为 `2x`。
 
-| model | Standard input | Standard cached | Standard cache write | Standard output | Fast input | Fast cached | Fast cache write | Fast output |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gpt-5.6-sol` | 5.00 | 0.50 | 6.25 | 30.00 | 10.00 | 1.00 | 12.50 | 60.00 |
-| `gpt-5.6-terra` | 2.50 | 0.25 | 3.125 | 15.00 | 5.00 | 0.50 | 6.25 | 30.00 |
-| `gpt-5.6-luna` | 1.00 | 0.10 | 1.25 | 6.00 | 2.00 | 0.20 | 2.50 | 12.00 |
-| `gpt-5.5` | 5.00 | 0.50 | - | 30.00 | 12.50 | 1.25 | - | 75.00 |
-| `gpt-5.4` | 2.50 | 0.25 | - | 15.00 | 5.00 | 0.50 | - | 30.00 |
-| `gpt-5.4-mini` | 0.75 | 0.075 | - | 4.50 | 1.50 | 0.15 | - | 9.00 |
+| model id | Standard input | Standard cached input | Standard output | Fast multiplier |
+| --- | ---: | ---: | ---: | ---: |
+| `gpt-5.6` (Sol alias), `gpt-5.6-sol` | 125 | 12.50 | 750 | 2.5x |
+| `gpt-5.6-terra` | 50 | 5 | 300 | 2.5x |
+| `gpt-5.6-luna` | 5 | 0.5 | 30 | 2.5x |
+| `gpt-5.5` | 125 | 12.50 | 750 | 2.5x |
+| `gpt-5.5-cyber` | 312.5 | 31.25 | 1,875 | 2.5x |
+| `gpt-5.4` | 62.50 | 6.250 | 375 | 2x |
+| `gpt-5.4-mini` | 18.75 | 1.875 | 113 | 2x |
+| `gpt-5.3-codex` | 43.75 | 4.375 | 350 | — |
+| `gpt-5.2`, `gpt-5.2-codex` | 43.75 | 4.375 | 350 | — |
+| `gpt-5.3-codex-spark` | research preview | research preview | research preview | excluded |
 
-实现以 `$0.025/百万 token` 为一个整数价格单位，避免浮点累计误差。`priority` 使用 Fast 列，缺失、`default` 或其他 service tier 使用 Standard 列。模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型：
+公告中的 GPT-Image-2.0 同时给出 image 与 text 两套计费行；当前 rollout `UsageCall` 不暴露足以区分这两种计费模态的字段，因此实现不会仅凭模型名套用其中任意一行。若该模型名出现在普通 token 调用中，它会走未知模型的 Luna 后备并标记 partial，而不会伪装成精确的 GPT-Image 费率。
+
+模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。`serviceTier=fast` 与 `serviceTier=priority` 都使用该模型适用的 Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识也保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100
 cached = min(call_cached_input_tokens, call_input_tokens)
 uncached = call_input_tokens - cached
-call_price_units = uncached * input_rate + cached * cached_rate + call_output_tokens * output_rate
-estimated_quota_percent = codex_used_percent * entity_price_units / all_price_units
+call_credit_units = uncached * input_rate + cached * cached_rate + call_output_tokens * output_rate
+estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units
 ```
 
-`reasoning_output_tokens` 是 output 的子集，不能再次相加。rollout 当前不暴露 `cache_write_tokens`，因此上表的 GPT-5.6 cache-write 价格无法进入历史 EST；`input - cached` 只能按普通 input 价格处理。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
+`reasoning_output_tokens` 是 output 的子集，不能再次相加。官方 rate card 明确 Codex 不收取 cache-write credits，因此公式没有 cache-write 项；cached input 只按 cached input 费率计算。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
-缺失或不在价目表中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast 价格降级，以免静默丢出分母；该窗口增加 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个价格分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、价格降级或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
+缺失或不在费率卡映射中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast credit 费率降级，以免静默丢出分母；该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
-该公式隐含“Codex 配额相对成本近似 API 短上下文价格，且本机看到了账户活动”的强假设。真实 Codex 配额权重、cache write、其他设备或云 task、服务端取整与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方配额账单。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
+token-based credit 映射定义为 estimator revision 2。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call 证据不差于旧点时优先使用 revision 2，避免旧 `estimated_cost_units` 的大小阻止替换。无法从当前扫描范围重建的更早数据继续保留原 revision；包含混合 revision 的窗口不会合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。
+
+该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
 
 ## 多窗口输出与交互
 
@@ -202,7 +210,7 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 
 - task/turn/model token 可以精确结算；
 - 扫描完整的当前 5 小时或周 reset cycle `TOKEN%` 可以精确结算；
-- 按当前 `codex` gauge 与短上下文价格加权用量占比得到的 estimated quota share 仍保持 Low；
+- 按当前 `codex` gauge 与 Codex credit 费率加权用量占比得到的 estimated quota share 仍保持 Low；
 - 服务端 task/turn quota 仍然不能精确计算。
 
 取整、模型隐藏权重、快照间隙和外部活动不会因为本地任务停止而消失，所以 idle 不是把 estimated 变成 exact 的条件。
@@ -220,6 +228,8 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 
 ## 官方依据
 
+- [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)
+- [Codex Speed / Fast mode](https://developers.openai.com/codex/speed)
 - [Codex App Server](https://developers.openai.com/codex/app-server)
 - [OpenAI Codex app-server source](https://github.com/openai/codex/tree/main/codex-rs/app-server)
 - [App Server protocol README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)

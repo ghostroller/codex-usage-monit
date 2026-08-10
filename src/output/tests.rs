@@ -27,7 +27,7 @@ fn every_available_estimate_is_marked_as_approximate() {
 }
 
 #[test]
-fn attribution_text_describes_price_weighted_codex_gauge_estimate() {
+fn attribution_text_describes_credit_rate_weighted_codex_gauge_estimate() {
     let now = Utc::now();
     let attribution = AttributionSummary {
         window: Some(WindowDescriptor {
@@ -47,7 +47,7 @@ fn attribution_text_describes_price_weighted_codex_gauge_estimate() {
         unattributed_percent: 30.0,
         attribution_coverage_percent: 11.8,
         confidence: Confidence::Low,
-        method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
+        method: "current_codex_gauge_credit_rate_weighted_proxy".to_string(),
         ..AttributionSummary::default()
     };
 
@@ -55,14 +55,14 @@ fn attribution_text_describes_price_weighted_codex_gauge_estimate() {
     assert!(allocation.contains("token total 760.00M"));
     assert!(allocation.contains("estimated ~34.00pp"));
     assert!(allocation.contains("codex gauge 34.00% used"));
-    assert!(allocation.contains("gauge x short-context price share"));
+    assert!(allocation.contains("gauge x credit-rate share"));
     assert!(!allocation.contains("observed"));
     assert!(!allocation.contains("evidence"));
     assert!(!allocation.contains("gap"));
     assert!(!allocation.contains("unattributed"));
 
     let quality = attribution_quality_line(&attribution);
-    assert!(quality.contains("price-weighted quota proxy"));
+    assert!(quality.contains("credit-rate-weighted quota proxy"));
     assert!(quality.contains("not server per-task accounting"));
     assert!(!quality.contains("confidence"));
     assert!(quality.contains("normal Codex bucket only (Spark excluded)"));
@@ -114,7 +114,7 @@ fn zero_percent_codex_gauge_is_still_a_known_estimate() {
         },
         proxy_projected_percent: 0.0,
         confidence: Confidence::Low,
-        method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
+        method: "current_codex_gauge_credit_rate_weighted_proxy".to_string(),
         ..AttributionSummary::default()
     };
 
@@ -268,7 +268,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             proxy_projected_percent: 10.0,
             external_activity_possible: true,
             confidence: Confidence::Medium,
-            method: "current_codex_gauge_short_context_price_weighted_proxy".to_string(),
+            method: "current_codex_gauge_credit_rate_weighted_proxy".to_string(),
             ..AttributionSummary::default()
         },
         window_analyses: vec![WindowAnalysis {
@@ -488,7 +488,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     assert!(text.contains("TOKEN5H%"));
     assert!(text.contains("TOKEN%"));
     assert!(!text.contains("LOCAL5H"));
-    assert_eq!(text.matches("price-weighted quota proxy").count(), 1);
+    assert_eq!(text.matches("credit-rate-weighted quota proxy").count(), 1);
     assert!(text.contains("external activity possible true"));
     assert!(!text.contains("confidence Medium"));
 
@@ -502,7 +502,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         },
     )
     .unwrap();
-    assert!(turns_text.contains("price-weighted quota proxy"));
+    assert!(turns_text.contains("credit-rate-weighted quota proxy"));
     assert!(turns_text.contains("external activity possible true"));
 
     let models_text = render_output(
@@ -516,7 +516,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     )
     .unwrap();
     assert!(models_text.contains("~1.25% estimated quota"));
-    assert!(models_text.contains("price-weighted quota proxy"));
+    assert!(models_text.contains("credit-rate-weighted quota proxy"));
     assert!(models_text.contains("not server per-task accounting"));
     assert!(models_text.contains("external activity possible true"));
     assert!(!models_text.contains("Medium"));

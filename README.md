@@ -278,9 +278,13 @@ Reset and turn timestamps in the TUI are shown in local time; Collection/Snapsho
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | The entity's share of locally observed, eligible non-Spark tokens in the selected ordinary `codex` cycle. This is a token share, not an account quota percentage. |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | A low-confidence estimate of account quota percentage points attributed to the entity. `~` means approximate; `-` means unavailable. |
 | `EFFORT` | The reasoning-effort value recorded by Codex. |
-| `FAST` | The rollout used `serviceTier=priority`; attribution uses the corresponding Fast price weights. |
+| `FAST` | The rollout used a recognized Fast tier (`serviceTier=fast` or the compatible `priority` value); attribution applies the published Fast credit multiplier. |
 | `MESSAGE` | A short local preview of the turn message, up to 72 characters. |
 | `SOURCE` | The recorded task source. TUI filters include All (no source filter), Desktop (including `vscode`), Subagent, and CLI. |
+
+The estimator follows OpenAI's [token-based Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card) for `gpt-5.6` (the Sol alias), `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-cyber`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2`, and the historical `gpt-5.2-codex` slug. For recognized Fast calls it applies the published [Speed](https://developers.openai.com/codex/speed) multiplier: `2.5x` for GPT-5.6/GPT-5.5 and `2x` for GPT-5.4. Exact `gpt-5.3-codex-spark` calls remain outside this attribution because its credit rate is still a research preview; an unlisted or missing non-Spark model uses the corresponding GPT-5.6 Luna fallback and marks the scope partial.
+
+GPT-Image-2.0 is not assigned one of its published rows: the official card separates image and text billing, while rollout usage does not expose enough modality information to choose reliably. If such a model name appears in an ordinary token call, it uses the partial-marked unknown-model fallback instead of pretending the image rate is exact.
 
 Task trees start fully collapsed. A visible parent row includes the tokens/share of its hidden descendants.
 
@@ -305,11 +309,11 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | --- | --- |
 | `Quota Remaining` | Persisted server observations of `100 - usedPercent`. Five-hour and weekly reset cycles are separate series; gaps while no recorder was running are not interpolated. |
 | `Weekly Local Tokens` | A cumulative sum of eligible local token deltas inside the current server-defined weekly cycle. |
-| `Weekly ~EST Usage` | The latest weekly server gauge distributed across local price-weighted activity up to each point. It is a low-confidence allocation, not an independent server measurement. |
+| `Weekly ~EST Usage` | The latest weekly server gauge distributed across local Codex credit-rate-weighted activity up to each point. It is a low-confidence allocation, not an independent server measurement. |
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
-| `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute price-weight buckets. |
+| `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST history retains raw model, service-tier, and token components plus an estimator revision so pricing logic can be recomputed without silently mixing definitions. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls or a new server sample arrives. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The token-based credit mapping is estimator revision 2. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range; revision-aware replacement accepts the revision-2 point when its unweighted token/call evidence is no worse. Older points that cannot be rebuilt remain isolated, and a window containing mixed revisions shows `~EST` as unavailable and partial. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, or an estimator update arrives. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 
@@ -317,13 +321,14 @@ Inspect mode shows each selected point's exact stored timestamp and value rather
 
 - **Tokens are local observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within the scanned local data when the relevant logs are complete and counters have not reset ambiguously.
 - **Account gauges are server data.** Current quota-window percentages and reset times come from the Codex App Server, or from a stale local fallback in offline/degraded mode.
-- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier price weights, so activity from other machines or clients can distort it.
+- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier Codex credit-rate weights, so activity from other machines or clients can distort it.
+- **Workspace rate-card migration matters.** The token-based card applies to most plans, but OpenAI says a small subset of Enterprise workspaces remains on the legacy per-message card. The monitor cannot infer that workspace migration state from local rollouts, so those users should treat `~EST` as not representative of their applicable billing card.
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.
 - **Finished does not mean billable-exact.** Settled tasks can have exact locally observed token totals, while their quota estimate remains low confidence.
 - **History distinguishes zero from missing.** A program outage creates a gap in server quota history. Local 15-minute buckets can be backfilled only while their rollout files remain inside the configured scan range and file cap. On upgrade, legacy 30-minute local buckets are discarded instead of being split approximately; quota and weekly cumulative history are retained, and recent local buckets are rebuilt from rollout files still in range.
 
-See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas, pricing fallbacks, counter handling, and detailed partial-reason semantics.
+See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas, rate-card fallbacks, counter handling, and detailed partial-reason semantics.
 
 ## JSON output
 

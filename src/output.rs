@@ -718,14 +718,14 @@ fn attribution_allocation_line(attribution: &crate::domain::AttributionSummary) 
     }
 
     format!(
-        "  token total {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x short-context price share)",
+        "  token total {local_tokens} | codex gauge {:.2}% used | estimated ~{:.2}pp (gauge x credit-rate share)",
         window.used_percent, attribution.proxy_projected_percent
     )
 }
 
 fn attribution_quality_line(attribution: &crate::domain::AttributionSummary) -> String {
     format!(
-        "  price-weighted quota proxy, not server per-task accounting | normal Codex bucket only (Spark excluded) | external activity possible {} | settled {} | method {}",
+        "  credit-rate-weighted quota proxy, not server per-task accounting | normal Codex bucket only (Spark excluded) | external activity possible {} | settled {} | method {}",
         attribution.external_activity_possible,
         attribution.settled,
         terminal_safe_text(&attribution.method)

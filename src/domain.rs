@@ -338,7 +338,7 @@ pub struct AttributionSummary {
     pub observed_delta_percent: f64,
     pub estimated_assigned_percent: f64,
     /// Current normal-Codex gauge percentage projected across entities using
-    /// the local short-context price-weighted denominator. This is a
+    /// the local Codex credit-rate-weighted denominator. This is a
     /// low-confidence estimate, not server-side entity accounting.
     #[serde(default)]
     pub proxy_projected_percent: f64,
@@ -469,7 +469,10 @@ impl UsageCall {
 }
 
 fn is_fast_service_tier(service_tier: Option<&str>) -> bool {
-    service_tier.is_some_and(|tier| tier.trim().eq_ignore_ascii_case("priority"))
+    service_tier.is_some_and(|tier| {
+        let tier = tier.trim();
+        tier.eq_ignore_ascii_case("fast") || tier.eq_ignore_ascii_case("priority")
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]

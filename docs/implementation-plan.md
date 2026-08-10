@@ -1,6 +1,6 @@
 # 实现路径
 
-更新日期：2026-07-14
+更新日期：2026-08-10
 
 ## 1. 技术选型
 
@@ -137,12 +137,15 @@ Estimated 部分：
 
 1. 读取所选当前 `codex` 窗口的 `usedPercent`；
 2. `TOKEN%` 对 task/turn/model 分别计算原始 `entity_non_spark_tokens / all_local_non_spark_tokens`；
-3. EST 按模型与 `priority`/Standard 的短上下文 input、cached input、output 价格生成整数成本单位，计算 `estimatedQuotaPercent = usedPercent * entityPriceUnits / allPriceUnits`；
-4. 所有可用实体结果在 Snapshot/JSON 中标为 Low；TUI/text 只用 `~`/`-`，不显示独立 quota confidence；
-5. scope summary 统一显示方法、`externalActivityPossible` 与具体 partial reasons；partial、lookback 不完整与 stale 不清空仍可计算的 estimate；
-6. 当前 `codex` 窗口或本地非 Spark 分母不存在时保持 unavailable。
+3. EST 按 OpenAI Help Center 的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card) 映射 input、cached input、output credits / 1M tokens；精确支持 `gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.5-cyber`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug，精确 Spark 模型因 research-preview 费率而排除，未知非 Spark 模型按 GPT-5.6 Luna 后备并标 partial；
+4. `fast` / `priority` service tier 都作为 Fast；按官方 [Speed](https://developers.openai.com/codex/speed) 对 GPT-5.6/GPT-5.5 family 应用 `2.5x`，对 GPT-5.4 family 应用 `2x`，不支持 Fast 的已知模型保持 Standard；Codex 不收取 cache-write credits；
+5. 将 rate card 按统一比例转为整数 credit units，计算 `estimatedQuotaPercent = usedPercent * entityCreditUnits / allCreditUnits`；reasoning 仍是 output 子集，不重复累计；
+6. 所有可用实体结果在 Snapshot/JSON 中标为 Low；TUI/text 只用 `~`/`-`，不显示独立 quota confidence；
+7. scope summary 统一显示方法、`externalActivityPossible` 与具体 partial reasons；partial、lookback 不完整与 stale 不清空仍可计算的 estimate；
+8. 当前 `codex` 窗口或本地非 Spark 分母不存在时保持 unavailable；
+9. token-based 映射使用 estimator revision 2；只从仍在配置扫描范围内的 rollout 调用重建重叠本地桶/周数据点，并在新点的未加权 token/call 证据不差于旧点时通过 revision-aware upsert 替换；无法重建的旧点保留原 revision，混合 revision 的 EST 保持 unavailable/partial。
 
-这不是官方配额账单。
+这不是官方逐 task/turn 配额账单。少量尚未迁移到 token-based 卡的 legacy Enterprise workspace 无法从本地 rollout 自动识别，其 EST 不能视为适用费率卡的代表值。
 
 ## 7. 刷新模型
 
@@ -159,7 +162,7 @@ Estimated 部分：
 - App Server mock：多桶、legacy、nullable、错误、reset credits 的正数/零/缺值、`credits` 的 null/空/截断、`grantedAt` / `expiresAt`、未知状态、单条与汇总非法值的独立降级、可选 usage stall、timeout、child reap；
 - rollout：duplicate/reset、嵌套 turn、消息归属、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry，以及账户刷新失败时 reset-credit 明细 stale 保留、成功 fresh null/空明细不回填旧数据；
-- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、Spark 精确模型名大小写不敏感排除、缺失模型纳入、task/turn/model 公式求和、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
+- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、含 `gpt-5.6` Sol 别名的完整 token-based credit 费率矩阵、`fast`/`priority` 与 Standard、Spark 精确模型名大小写不敏感排除、缺失模型的 Luna 后备、task/turn/model 公式求和、estimator revision 2、扫描范围内 rollout 重建与 revision-aware upsert、混合 revision 隔离、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
 - output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、Limits 范围内的 `rateLimitResetCredits` camelCase/section scoping、旧 summary 无 `credits` 兼容、null/空数组区分、`expiresAt: null` 文本显示 never、可用 EST 的 `~`、不可用的 `-`、无独立 quota-confidence 文本、scope 级 method/external/partial reasons、旧 confidence/5h attribution schema 兼容、section partial/failure、broken pipe、help/usage；
 - TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、两个顶层视图 tab 点击、Other 的多 bucket Resets、primary/secondary、完整本地 reset time 与缺失值、reset credits 的正数/零/unavailable/stale、null/空/截断明细、granted/reset time、never、未知状态与控制字符清洗、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` 的键盘与鼠标 hitbox、scope 切换同步 Tasks/Turns/Models/归因摘要、Turns/Models 显隐与布局回收、Tasks 底部图例在 Turns 收起时仍可见、Models 无 CONF 列、turn 详情无 quota-confidence 文本、scope summary 在 compact/wide 下保留 method/external/partial reasons、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、搜索态按键隔离、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 

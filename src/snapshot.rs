@@ -1114,7 +1114,7 @@ mod tests {
         assert_close(analysis.attribution.proxy_projected_percent, 40.0);
         assert_eq!(
             analysis.attribution.method,
-            "current_codex_gauge_short_context_price_weighted_proxy"
+            "current_codex_gauge_credit_rate_weighted_proxy"
         );
         assert_eq!(analysis.attribution.confidence, Confidence::Low);
         assert_close(analysis.threads[0].usage.estimated_quota_percent, 10.0);
