@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.6] - 2026-08-10
+
 ### Changed
 
 - Deferred the Codex App Server account refresh until after the TUI's first frame, while keeping the initial local rollout snapshot and history load synchronous.
@@ -125,7 +127,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.2...v0.2.3
