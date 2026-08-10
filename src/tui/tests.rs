@@ -52,20 +52,20 @@ fn run_loop_poll_timeout_sleeps_until_work_and_checks_workers_promptly() {
     app.last_local_refresh = now.checked_sub(Duration::from_millis(500)).unwrap();
 
     assert_eq!(
-        next_run_loop_poll_timeout(&app, now),
+        next_run_loop_poll_timeout(&app, now, false),
         Duration::from_millis(1_500)
     );
 
     app.worker_running = true;
     assert_eq!(
-        next_run_loop_poll_timeout(&app, now),
+        next_run_loop_poll_timeout(&app, now, false),
         BACKGROUND_CHANNEL_POLL
     );
 
     app.worker_running = false;
     app.launching_threads.insert("opening".to_string());
     assert_eq!(
-        next_run_loop_poll_timeout(&app, now),
+        next_run_loop_poll_timeout(&app, now, false),
         BACKGROUND_CHANNEL_POLL
     );
 
@@ -76,9 +76,178 @@ fn run_loop_poll_timeout_sleeps_until_work_and_checks_workers_promptly() {
         created_at: now.checked_sub(Duration::from_millis(7_900)).unwrap(),
     });
     assert_eq!(
-        next_run_loop_poll_timeout(&app, now),
+        next_run_loop_poll_timeout(&app, now, false),
         Duration::from_millis(100)
     );
+}
+
+#[test]
+fn account_refresh_is_due_immediately_after_app_creation() {
+    let app = mouse_test_app(1);
+    let now = Instant::now();
+
+    assert!(app.account_refresh_due(now));
+    assert_eq!(next_run_loop_poll_timeout(&app, now, true), Duration::ZERO);
+}
+
+#[test]
+fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
+    let mut app = mouse_test_app(1);
+    let now = Instant::now();
+    app.snapshot.sources = vec![SourceStatus {
+        source: "app_server".to_string(),
+        status: "stale".to_string(),
+        as_of: Utc::now(),
+        message: Some("no cached account snapshot".to_string()),
+    }];
+
+    assert_eq!(app.reset_credit_fetch_status(now), Some("loading"));
+    app.account_refresh_retry_count = 1;
+    assert_eq!(app.reset_credit_fetch_status(now), Some("retrying"));
+
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 2,
+        credits: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: Utc::now(),
+    });
+    assert_eq!(app.reset_credit_fetch_status(now), Some("retrying"));
+
+    app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
+        available_count: 0,
+        credits: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: Utc::now(),
+    });
+    assert_eq!(app.reset_credit_fetch_status(now), None);
+}
+
+#[test]
+fn incomplete_account_refreshes_back_off_before_returning_to_normal_period() {
+    let mut app = mouse_test_app(1);
+    let first_attempt = Instant::now();
+    let missing_reset_snapshot = account_refresh_result("partial", None, true);
+    app.schedule_next_account_refresh(&missing_reset_snapshot, first_attempt);
+    assert_eq!(
+        app.next_account_refresh
+            .saturating_duration_since(first_attempt),
+        Duration::from_secs(5)
+    );
+
+    let second_attempt = first_attempt + Duration::from_secs(5);
+    let count_only_reset_snapshot = account_refresh_result(
+        "ok",
+        Some(RateLimitResetCreditsSnapshot {
+            available_count: 2,
+            credits: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: Utc::now(),
+        }),
+        false,
+    );
+    app.schedule_next_account_refresh(&count_only_reset_snapshot, second_attempt);
+    assert_eq!(
+        app.next_account_refresh
+            .saturating_duration_since(second_attempt),
+        Duration::from_secs(10)
+    );
+
+    let third_attempt = second_attempt + Duration::from_secs(10);
+    app.schedule_next_account_refresh(&count_only_reset_snapshot, third_attempt);
+    assert_eq!(
+        app.next_account_refresh
+            .saturating_duration_since(third_attempt),
+        ACCOUNT_REFRESH
+    );
+    assert_eq!(app.account_refresh_retry_count, 2);
+}
+
+#[test]
+fn complete_account_refresh_uses_normal_period_and_resets_backoff() {
+    let mut app = mouse_test_app(1);
+    let failed_at = Instant::now();
+    app.schedule_next_account_refresh(&account_refresh_result("error", None, true), failed_at);
+    assert_eq!(app.account_refresh_retry_count, 1);
+
+    let succeeded_at = failed_at + Duration::from_secs(5);
+    let complete = account_refresh_result(
+        // account/usage warnings make the aggregate source partial, but the
+        // independently parsed rate limits and reset details are complete.
+        "partial",
+        Some(RateLimitResetCreditsSnapshot {
+            available_count: 0,
+            credits: Some(Vec::new()),
+            provenance: Provenance::ServerSnapshot,
+            as_of: Utc::now(),
+        }),
+        false,
+    );
+    app.schedule_next_account_refresh(&complete, succeeded_at);
+
+    assert_eq!(app.account_refresh_retry_count, 0);
+    assert_eq!(
+        app.next_account_refresh
+            .saturating_duration_since(succeeded_at),
+        ACCOUNT_REFRESH
+    );
+}
+
+#[test]
+fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
+    let now = Utc::now();
+    let bucket = LocalHalfHourBucket {
+        starts_at: now - ChronoDuration::minutes(15),
+        ends_at: now,
+        sampled_at: now,
+        token_usage: TokenUsage {
+            total_tokens: 42,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 7,
+        estimator_revision: 1,
+        call_count: 1,
+        groups: Vec::new(),
+        partial_reasons: Vec::new(),
+    };
+    let observation = HistoryObservation {
+        observed_at: now,
+        quota_points: vec![QuotaPoint {
+            observed_at: now,
+            limit_id: "codex".to_string(),
+            duration_mins: 10_080,
+            resets_at: now + ChronoDuration::days(1),
+            used_percent: 25.0,
+            remaining_percent: 75.0,
+            provenance: Provenance::Stale,
+        }],
+        half_hour_buckets: vec![bucket.clone()],
+        weekly_local_points: vec![WeeklyLocalPoint {
+            observed_at: now,
+            resets_at: now + ChronoDuration::days(1),
+            token_usage: TokenUsage {
+                total_tokens: 42,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: 7,
+            estimator_revision: 1,
+            call_count: 1,
+            partial_reasons: vec!["weekly_window_stale".to_string()],
+        }],
+    };
+
+    let mut failed_refresh = account_refresh_result("error", None, true);
+    failed_refresh.history_observation = observation.clone();
+    let deferred = collection_history_observation(&failed_refresh, false);
+
+    assert_eq!(deferred.observed_at, now);
+    assert!(deferred.quota_points.is_empty());
+    assert_eq!(deferred.half_hour_buckets, vec![bucket]);
+    assert!(deferred.weekly_local_points.is_empty());
+    assert!(matches!(&deferred, Cow::Owned(_)));
+
+    let offline = collection_history_observation(&failed_refresh, true);
+    assert_eq!(offline.as_ref(), &observation);
+    assert!(matches!(&offline, Cow::Borrowed(_)));
 }
 
 #[test]
@@ -118,6 +287,49 @@ fn mouse_moves_never_request_a_redraw_and_notices_expire_once() {
 
 fn mouse_test_app(task_count: usize) -> App {
     interaction_test_app(task_count, 0)
+}
+
+fn account_refresh_result(
+    app_server_status: &str,
+    reset_credits: Option<RateLimitResetCreditsSnapshot>,
+    reset_credits_partial: bool,
+) -> CollectionResult {
+    let app = mouse_test_app(0);
+    let now = Utc::now();
+    let limits = (app_server_status != "error")
+        .then(|| LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: Some("test".to_string()),
+            primary: None,
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut snapshot = app.snapshot.clone();
+    snapshot.sources = vec![SourceStatus {
+        source: "app_server".to_string(),
+        status: app_server_status.to_string(),
+        as_of: now,
+        message: None,
+    }];
+    snapshot.limits.clone_from(&limits);
+    snapshot.rate_limit_reset_credits = reset_credits.clone();
+    snapshot.rate_limit_reset_credits_partial = reset_credits_partial;
+    CollectionResult {
+        snapshot,
+        account: AccountSnapshot {
+            limits,
+            rate_limit_reset_credits: reset_credits,
+            rate_limit_reset_credits_partial: reset_credits_partial,
+            ..AccountSnapshot::default()
+        },
+        history_observation: crate::history::HistoryObservation::default(),
+    }
 }
 
 fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
@@ -6917,7 +7129,7 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
 fn other_view_reports_when_reset_data_is_unavailable() {
     let mut app = interaction_test_app(0, 0);
     app.view = View::Health;
-    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let content = terminal
         .backend()
@@ -6938,6 +7150,7 @@ fn other_view_reports_when_reset_data_is_unavailable() {
         provenance: Provenance::ServerSnapshot,
         as_of: app.snapshot.as_of,
     });
+    app.account_refresh_retry_count = 1;
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let content = terminal
         .backend()
@@ -6947,6 +7160,7 @@ fn other_view_reports_when_reset_data_is_unavailable() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(content.contains("2 available"));
+    assert!(content.contains("RETRYING"));
     assert!(content.contains("DETAILS UNAVAILABLE"));
     assert!(!content.contains("SHOWING"));
 }

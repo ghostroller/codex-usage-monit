@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Deferred the Codex App Server account refresh until after the TUI's first frame, while keeping the initial local rollout snapshot and history load synchronous.
+- Added bounded 5-second and 10-second retries for missing, partial, stale, or failed reset-credit refreshes before returning to the normal 45-second account interval.
+
+### Fixed
+
+- Preserved recently fetched reset-credit details across transient omitted or `null` responses for at most five minutes, without extending their original observation time or retaining expired details.
+- Avoided persisting stale online quota-window samples while the deferred account refresh is incomplete; offline history collection continues to retain its local fallback observations.
+
 ## [0.2.5] - 2026-08-10
 
 ### Changed

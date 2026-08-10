@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
@@ -70,6 +71,8 @@ use crate::ui_state::{
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
+const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(5), Duration::from_secs(10)];
 const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
@@ -1100,12 +1103,56 @@ impl RefreshWorker {
             let _ = handle.join();
         }
     }
+
+    fn detach(&mut self) {
+        self.handle.take();
+    }
 }
 
 impl Drop for RefreshWorker {
     fn drop(&mut self) {
         self.join();
     }
+}
+
+fn account_limits_are_fresh(result: &CollectionResult) -> bool {
+    result
+        .account
+        .limits
+        .iter()
+        .any(|limit| limit.provenance == Provenance::ServerSnapshot)
+}
+
+fn account_refresh_is_complete(result: &CollectionResult) -> bool {
+    let reset_credits_complete = result
+        .account
+        .rate_limit_reset_credits
+        .as_ref()
+        .is_some_and(|reset_credits| {
+            reset_credits.provenance == Provenance::ServerSnapshot
+                && (reset_credits.available_count == 0
+                    || reset_credits.credits.as_ref().is_some_and(|credits| {
+                        u64::try_from(credits.len()).unwrap_or(u64::MAX)
+                            >= reset_credits.available_count
+                    }))
+        });
+
+    account_limits_are_fresh(result)
+        && !result.account.rate_limit_reset_credits_partial
+        && reset_credits_complete
+}
+
+fn collection_history_observation(
+    result: &CollectionResult,
+    offline: bool,
+) -> Cow<'_, HistoryObservation> {
+    if offline || account_limits_are_fresh(result) {
+        return Cow::Borrowed(&result.history_observation);
+    }
+    let mut observation = result.history_observation.clone();
+    observation.quota_points.clear();
+    observation.weekly_local_points.clear();
+    Cow::Owned(observation)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1307,7 +1354,8 @@ struct App {
     turn_reveal_pending: bool,
     worker_running: bool,
     last_local_refresh: Instant,
-    last_account_refresh: Instant,
+    next_account_refresh: Instant,
+    account_refresh_retry_count: usize,
 }
 
 impl App {
@@ -1377,8 +1425,60 @@ impl App {
             turn_reveal_pending: false,
             worker_running: false,
             last_local_refresh: Instant::now(),
-            last_account_refresh: Instant::now(),
+            next_account_refresh: Instant::now(),
+            account_refresh_retry_count: 0,
         }
+    }
+
+    fn account_refresh_due(&self, now: Instant) -> bool {
+        now >= self.next_account_refresh
+    }
+
+    fn reset_credit_fetch_status(&self, now: Instant) -> Option<&'static str> {
+        let details_incomplete =
+            self.snapshot
+                .rate_limit_reset_credits
+                .as_ref()
+                .is_none_or(|reset_credits| {
+                    self.snapshot.rate_limit_reset_credits_partial
+                        || reset_credits.provenance != Provenance::ServerSnapshot
+                        || (reset_credits.available_count > 0
+                            && reset_credits.credits.as_ref().is_none_or(|credits| {
+                                u64::try_from(credits.len()).unwrap_or(u64::MAX)
+                                    < reset_credits.available_count
+                            }))
+                });
+        if !details_incomplete {
+            return None;
+        }
+        if self.account_refresh_retry_count > 0 {
+            return Some("retrying");
+        }
+        let awaiting_initial_refresh = self.snapshot.sources.iter().any(|source| {
+            source.source == "app_server"
+                && source.status == "stale"
+                && source.message.as_deref() == Some("no cached account snapshot")
+        });
+        (awaiting_initial_refresh && (self.worker_running || self.account_refresh_due(now)))
+            .then_some("loading")
+    }
+
+    fn schedule_next_account_refresh(&mut self, result: &CollectionResult, now: Instant) {
+        let delay = if account_refresh_is_complete(result) {
+            self.account_refresh_retry_count = 0;
+            ACCOUNT_REFRESH
+        } else {
+            let delay = ACCOUNT_REFRESH_RETRY_DELAYS
+                .get(self.account_refresh_retry_count)
+                .copied()
+                .unwrap_or(ACCOUNT_REFRESH);
+            self.account_refresh_retry_count = self
+                .account_refresh_retry_count
+                .saturating_add(1)
+                .min(ACCOUNT_REFRESH_RETRY_DELAYS.len());
+            delay
+        };
+        self.next_account_refresh = now.checked_add(delay).unwrap_or(now);
     }
 
     fn apply_ui_state(&mut self, state: &UiState, theme_override: Option<Theme>) {
@@ -2416,6 +2516,9 @@ impl App {
     }
 
     fn replace(&mut self, result: CollectionResult, refreshed_account: bool) {
+        if refreshed_account {
+            self.schedule_next_account_refresh(&result, Instant::now());
+        }
         let filtered = self.filtered_task_indices();
         let task_viewport_was_at_top = self.task_table_offset == 0;
         let selected_position = filtered
@@ -2541,9 +2644,6 @@ impl App {
         }
         self.worker_running = false;
         self.last_local_refresh = Instant::now();
-        if refreshed_account {
-            self.last_account_refresh = Instant::now();
-        }
     }
 
     fn finish_unchanged_refresh(&mut self) {
@@ -3856,7 +3956,7 @@ fn prepare_initial_tui(
         let mut cache = rollout_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        collect_snapshot_cached(config, None, true, &mut cache)
+        collect_snapshot_cached(config, None, false, &mut cache)
     };
     snapshot_span.finish_with(|| {
         format!(
@@ -3869,9 +3969,10 @@ fn prepare_initial_tui(
     });
     let history_span = config.startup_trace.span("tui.history_load");
     let mut history_store = HistoryStore::discover(&config.codex_home);
+    let initial_history_observation = collection_history_observation(&initial, config.offline);
     let (history, recorder_health) = stage_and_load_history(
         &mut history_store,
-        &initial.history_observation,
+        initial_history_observation.as_ref(),
         initial.snapshot.as_of,
         &config.perf_log,
         true,
@@ -4193,7 +4294,20 @@ fn run_loop(
             redraw_reasons.clear();
         }
 
-        if event::poll(next_run_loop_poll_timeout(app, Instant::now()))? {
+        start_refresh_if_due(
+            app,
+            config,
+            channels,
+            &rollout_cache,
+            &history_store,
+            &mut refresh_worker,
+        );
+
+        if event::poll(next_run_loop_poll_timeout(
+            app,
+            Instant::now(),
+            !config.offline,
+        ))? {
             config.perf_log.record_event_wakeup();
             let previous_ui_state = app.ui_state();
             let mut should_quit = false;
@@ -4222,7 +4336,7 @@ fn run_loop(
                 let _ = ui_state_store.save(&current_ui_state);
             }
             if should_quit {
-                refresh_worker.join();
+                refresh_worker.detach();
                 return Ok(());
             }
         }
@@ -4238,69 +4352,81 @@ fn run_loop(
             let result = write_osc52_clipboard(terminal.backend_mut(), &request.text);
             app.apply_clipboard_result(request, result);
         }
-
-        if !app.worker_running && app.last_local_refresh.elapsed() >= LOCAL_REFRESH {
-            let refresh_account =
-                !config.offline && app.last_account_refresh.elapsed() >= ACCOUNT_REFRESH;
-            let worker_config = config.clone();
-            let cached_account = app.account.clone();
-            let worker_sender = channels.refresh_sender.clone();
-            let worker_cache = Arc::clone(&rollout_cache);
-            let worker_history = Arc::clone(&history_store);
-            app.worker_running = true;
-            refresh_worker.start(thread::spawn(move || {
-                let result = {
-                    let mut cache = worker_cache
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if refresh_account {
-                        Some(collect_snapshot_cached(
-                            &worker_config,
-                            Some(cached_account),
-                            true,
-                            &mut cache,
-                        ))
-                    } else {
-                        collect_snapshot_cached_if_changed(
-                            &worker_config,
-                            Some(cached_account),
-                            &mut cache,
-                        )
-                    }
-                };
-                let history_and_recorder = {
-                    let mut history_store = worker_history
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    match result.as_ref() {
-                        Some(result) => Some(stage_and_load_history(
-                            &mut history_store,
-                            &result.history_observation,
-                            result.snapshot.as_of,
-                            &worker_config.perf_log,
-                            false,
-                        )),
-                        None => flush_or_reload_history_if_due(
-                            &mut history_store,
-                            Utc::now(),
-                            &worker_config.perf_log,
-                        ),
-                    }
-                };
-                let (history, recorder_health) = history_and_recorder
-                    .map_or((None, None), |(history, recorder_health)| {
-                        (Some(history), Some(recorder_health))
-                    });
-                let _ = worker_sender.send(RefreshCompletion {
-                    result,
-                    history,
-                    recorder_health,
-                    refreshed_account: refresh_account,
-                });
-            }));
-        }
         config.perf_log.maybe_sample();
     }
+}
+
+fn start_refresh_if_due(
+    app: &mut App,
+    config: &CollectConfig,
+    channels: &RunLoopChannels<'_>,
+    rollout_cache: &Arc<Mutex<RolloutCache>>,
+    history_store: &Arc<Mutex<HistoryStore>>,
+    refresh_worker: &mut RefreshWorker,
+) {
+    let now = Instant::now();
+    let local_refresh_due = now.saturating_duration_since(app.last_local_refresh) >= LOCAL_REFRESH;
+    let account_refresh_due = !config.offline && app.account_refresh_due(now);
+    if app.worker_running || (!local_refresh_due && !account_refresh_due) {
+        return;
+    }
+
+    let worker_config = config.clone();
+    let cached_account = app.account.clone();
+    let worker_sender = channels.refresh_sender.clone();
+    let worker_cache = Arc::clone(rollout_cache);
+    let worker_history = Arc::clone(history_store);
+    app.worker_running = true;
+    refresh_worker.start(thread::spawn(move || {
+        let result = {
+            let mut cache = worker_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if account_refresh_due {
+                Some(collect_snapshot_cached(
+                    &worker_config,
+                    Some(cached_account),
+                    true,
+                    &mut cache,
+                ))
+            } else {
+                collect_snapshot_cached_if_changed(&worker_config, Some(cached_account), &mut cache)
+            }
+        };
+        let history_and_recorder = {
+            let mut history_store = worker_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match result.as_ref() {
+                Some(result) => {
+                    let history_observation =
+                        collection_history_observation(result, worker_config.offline);
+                    Some(stage_and_load_history(
+                        &mut history_store,
+                        history_observation.as_ref(),
+                        result.snapshot.as_of,
+                        &worker_config.perf_log,
+                        false,
+                    ))
+                }
+                None => flush_or_reload_history_if_due(
+                    &mut history_store,
+                    Utc::now(),
+                    &worker_config.perf_log,
+                ),
+            }
+        };
+        let (history, recorder_health) = history_and_recorder
+            .map_or((None, None), |(history, recorder_health)| {
+                (Some(history), Some(recorder_health))
+            });
+        let _ = worker_sender.send(RefreshCompletion {
+            result,
+            history,
+            recorder_health,
+            refreshed_account: account_refresh_due,
+        });
+    }));
 }
 
 fn mouse_event_requests_redraw(kind: MouseEventKind, handled: bool) -> bool {
@@ -4308,7 +4434,7 @@ fn mouse_event_requests_redraw(kind: MouseEventKind, handled: bool) -> bool {
         && (handled || matches!(kind, MouseEventKind::Down(MouseButton::Left)))
 }
 
-fn next_run_loop_poll_timeout(app: &App, now: Instant) -> Duration {
+fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: bool) -> Duration {
     let local_refresh_wait =
         LOCAL_REFRESH.saturating_sub(now.saturating_duration_since(app.last_local_refresh));
     let mut timeout = if app.worker_running {
@@ -4316,6 +4442,9 @@ fn next_run_loop_poll_timeout(app: &App, now: Instant) -> Duration {
     } else {
         local_refresh_wait
     };
+    if account_refresh_enabled && !app.worker_running {
+        timeout = timeout.min(app.next_account_refresh.saturating_duration_since(now));
+    }
     if !app.launching_threads.is_empty() {
         timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
     }
@@ -6872,7 +7001,13 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows[1],
     );
 
-    render_resets(frame, rows[2], &app.snapshot, app.theme);
+    render_resets(
+        frame,
+        rows[2],
+        &app.snapshot,
+        app.reset_credit_fetch_status(Instant::now()),
+        app.theme,
+    );
 
     let issues = app
         .snapshot
@@ -6970,7 +7105,13 @@ fn local_granted_time_label(value: chrono::DateTime<chrono::Utc>, compact: bool)
     )
 }
 
-fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
+fn render_resets(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &Snapshot,
+    credit_fetch_status: Option<&str>,
+    theme: Theme,
+) {
     let palette = theme.palette();
     let windows = snapshot
         .limits
@@ -7026,6 +7167,9 @@ fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
                 reset_credits.available_count,
                 provenance_label(reset_credits.provenance)
             );
+            if let Some(status) = credit_fetch_status {
+                title.push_str(&format!(" · {}", status.to_ascii_uppercase()));
+            }
             match &reset_credits.credits {
                 None => title.push_str(" · DETAILS UNAVAILABLE"),
                 Some(details) => {
@@ -7046,7 +7190,10 @@ fn render_resets(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
             }
             title
         }
-        None => "Resets · credits unavailable".to_string(),
+        None => credit_fetch_status.map_or_else(
+            || "Resets · credits unavailable".to_string(),
+            |status| format!("Resets · credits {status}"),
+        ),
     };
     if visible_window_count < windows.len() {
         title.push_str(&format!(
