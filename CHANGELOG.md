@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.7] - 2026-08-18
+
 ### Fixed
 
 - Restored turn message previews for Codex rollout files that emit user prompts as `response_item` records, while excluding injected AGENTS, environment, internal-context, and plugin envelopes.
@@ -132,7 +134,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.3...v0.2.4
