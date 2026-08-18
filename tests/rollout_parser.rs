@@ -321,6 +321,147 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
 }
 
 #[test]
+fn counts_an_exact_first_sample_after_a_cumulative_counter_epoch_reset() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-exact-counter-epoch.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "epoch-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "epoch-turn-1"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(80, 30, 20, 5, 100),
+                        "last_token_usage": usage(80, 30, 20, 5, 100)
+                    }
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "epoch-turn-1"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "epoch-turn-2"}
+            }),
+            // A resumed process starts a new counter epoch. Since total and
+            // last are identical, this first sample is exact rather than
+            // ambiguous and must be counted.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(16, 4, 4, 1, 20),
+                        "lastTokenUsage": usage(16, 4, 4, 1, 20)
+                    }
+                }
+            }),
+            // Repeated notifications from the new epoch remain deduplicated.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(16, 4, 4, 1, 20),
+                        "last_token_usage": usage(16, 4, 4, 1, 20)
+                    }
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(28, 10, 7, 2, 35),
+                        "last_token_usage": usage(12, 6, 3, 1, 15)
+                    }
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "epoch-turn-2"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "epoch-turn-3"}
+            }),
+            // The first sample of a new epoch can still be larger than the
+            // previous epoch. total == last remains the decisive signal.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(160, 60, 40, 10, 200),
+                        "last_token_usage": usage(160, 60, 40, 10, 200)
+                    }
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "epoch-turn-3"}
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.stats.ambiguous_token_resets, 0);
+    assert_eq!(dataset.calls.len(), 4);
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 335);
+    let turn_1 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "epoch-turn-1")
+        .unwrap();
+    let turn_2 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "epoch-turn-2")
+        .unwrap();
+    let turn_3 = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "epoch-turn-3")
+        .unwrap();
+    assert_eq!(turn_1.token_usage.total_tokens, 100);
+    assert_eq!(turn_2.token_usage.total_tokens, 35);
+    assert_eq!(turn_3.token_usage.total_tokens, 200);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("counter reset"))
+    );
+}
+
+#[test]
 fn ignores_non_finite_string_quota_percentages() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -770,6 +911,198 @@ fn associates_only_active_or_explicit_messages_without_guessing_a_future_turn() 
     assert_eq!(turn_2.message_preview, None);
     assert_eq!(turn_3.message_preview.as_ref().unwrap().chars().count(), 72);
     assert!(turn_3.message_preview.as_ref().unwrap().ends_with("..."));
+}
+
+#[test]
+fn parses_response_item_user_messages_without_treating_internal_context_as_prompts() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-response-item-messages.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "response-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "response-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "# AGENTS.md instructions for /work/project\n<INSTRUCTIONS>ignore</INSTRUCTIONS>"},
+                        {"type": "input_text", "text": "<environment_context>generated</environment_context>"},
+                        {"type": "input_text", "text": "<recommended_plugins>generated</recommended_plugins>"}
+                    ],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "response-turn"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "turn_context",
+                "payload": {"turn_id": "response-turn", "model": "gpt-response"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "# Files mentioned by the user:\n\n## chart.png: /tmp/chart.png\n\n## My request:\nInspect the attached image"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,ignored"},
+                        {"type": "input_text", "text": "and report the mismatch"}
+                    ],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "response-turn"}
+                }
+            }),
+            // Steering within the same turn does not replace its first prompt.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "also check the labels"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "response-turn"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "response-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "mixed-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "raw fallback prompt"}],
+                    "internalChatMessageMetadataPassthrough": {"turnId": "mixed-turn"}
+                }
+            }),
+            // Older Codex versions emit both forms. The canonical event_msg
+            // preview wins without creating a second turn message.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "turn_id": "mixed-turn",
+                    "message": "# Files mentioned by the user:\n\n## chart.png: /tmp/chart.png\n\n## My request for Codex:\ncanonical mixed prompt"
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "mixed-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "nested-outer"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "nested canonical prompt"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "nested-outer"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "nested-inner"}
+            }),
+            // A legacy duplicate without a turn id follows the explicit
+            // response item while another turn is at the top of the stack.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "nested canonical prompt"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "nested-inner"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "nested-outer"}
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(
+        dataset.tasks[0].title,
+        "Inspect the attached image and report the mismatch"
+    );
+    let response_turn = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "response-turn")
+        .unwrap();
+    let mixed_turn = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "mixed-turn")
+        .unwrap();
+    let nested_outer = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "nested-outer")
+        .unwrap();
+    let nested_inner = dataset
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "nested-inner")
+        .unwrap();
+    assert_eq!(
+        response_turn.message_preview.as_deref(),
+        Some("Inspect the attached image and report the mismatch")
+    );
+    assert_eq!(
+        mixed_turn.message_preview.as_deref(),
+        Some("canonical mixed prompt")
+    );
+    assert_eq!(
+        nested_outer.message_preview.as_deref(),
+        Some("nested canonical prompt")
+    );
+    assert_eq!(nested_inner.message_preview, None);
+
+    let mut redacted = config(temp.path());
+    redacted.redact_content = true;
+    let redacted = scan_rollouts(&redacted, now).unwrap();
+    assert_eq!(redacted.tasks[0].title, "[redacted]");
+    assert!(
+        redacted
+            .turns
+            .iter()
+            .all(|turn| turn.message_preview.is_none())
+    );
 }
 
 #[test]

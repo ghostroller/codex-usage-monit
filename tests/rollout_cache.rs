@@ -319,6 +319,15 @@ fn corrupt_and_future_persistent_entries_fall_back_and_are_repaired() {
     assert_eq!(incompatible.last_refresh().disk_misses, 1);
     assert_eq!(incompatible.last_refresh().disk_corrupt_files, 0);
     assert_eq!(incompatible.last_refresh().reparsed_files, 1);
+
+    let mut stale_parser: Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+    stale_parser["parserRevision"] = json!(u32::MAX);
+    fs::write(&entry, serde_json::to_vec(&stale_parser).unwrap()).unwrap();
+    let mut reparsed = RolloutCache::new();
+    reparsed.scan(&scan_config, now).unwrap();
+    assert_eq!(reparsed.last_refresh().disk_misses, 1);
+    assert_eq!(reparsed.last_refresh().disk_corrupt_files, 0);
+    assert_eq!(reparsed.last_refresh().reparsed_files, 1);
 }
 
 #[test]
@@ -338,7 +347,19 @@ fn redacted_persistent_cache_is_isolated_and_contains_no_message_preview() {
             json!({
                 "timestamp": timestamp(now),
                 "type": "event_msg",
-                "payload": {"type": "user_message", "message": private_message}
+                "payload": {"type": "task_started", "turn_id": "redaction-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": private_message}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "redaction-turn"
+                    }
+                }
             }),
         ],
     );

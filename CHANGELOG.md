@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Restored turn message previews for Codex rollout files that emit user prompts as `response_item` records, while excluding injected AGENTS, environment, internal-context, and plugin envelopes.
+- Counted exact first samples after resumed rollout token-counter epochs when `total_token_usage` and `last_token_usage` prove the reset boundary, instead of reporting and dropping them as ambiguous.
+
 ## [0.2.6] - 2026-08-10
 
 ### Changed

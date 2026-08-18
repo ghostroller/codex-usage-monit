@@ -22,7 +22,7 @@ use crate::session_index::load_thread_titles;
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 2;
+const ROLLOUT_PARSER_REVISION: u32 = 3;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -116,6 +116,7 @@ enum ParsedEvent {
     UserMessage {
         preview: String,
         turn_id: Option<String>,
+        source: UserMessageSource,
     },
     ThreadSettingsApplied {
         service_tier: String,
@@ -146,8 +147,16 @@ enum ParsedEvent {
         timestamp: DateTime<Utc>,
         line_number: usize,
         total_usage: Option<TokenUsage>,
+        #[serde(default)]
+        last_usage: Option<TokenUsage>,
         rate_limits: Option<CachedRateLimits>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+enum UserMessageSource {
+    ResponseItem,
+    EventMessage,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -155,6 +164,12 @@ struct CachedRateLimits {
     limit_id: String,
     primary: Option<LimitWindow>,
     secondary: Option<LimitWindow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TokenCounterSample {
+    total: Option<TokenUsage>,
+    last: Option<TokenUsage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +552,8 @@ struct ThreadBuilder {
     seen_active_file: bool,
     seen_archived_file: bool,
     title: Option<String>,
+    title_source: Option<UserMessageSource>,
+    title_turn_id: Option<String>,
     cwd: Option<PathBuf>,
     source: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -556,6 +573,7 @@ struct TurnBuilder {
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     message_preview: Option<String>,
+    message_source: Option<UserMessageSource>,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
     duration_ms: Option<u64>,
@@ -2415,12 +2433,14 @@ fn parse_rollout_reader<R: BufRead>(
                             && let Some(title) = payload
                                 .get("message")
                                 .and_then(Value::as_str)
+                                .and_then(user_authored_input_text)
                                 .and_then(title_preview)
                         {
                             parsed.events.push(ParsedEvent::UserMessage {
                                 preview: title,
                                 turn_id: string_field_in(payload, &["turn_id", "turnId"])
                                     .map(str::to_owned),
+                                source: UserMessageSource::EventMessage,
                             });
                         }
                     } else if string_field_in(payload, &["type"]) == Some("thread_settings_applied")
@@ -2440,6 +2460,18 @@ fn parse_rollout_reader<R: BufRead>(
                     } else {
                         cache_event_message(&mut parsed.events, payload, timestamp, line_number);
                     }
+                }
+            }
+            Some("response_item") => {
+                if !config.redact_content
+                    && let Some(payload) = object_at(&record, &["payload"])
+                    && let Some((preview, turn_id)) = response_item_user_message(payload)
+                {
+                    parsed.events.push(ParsedEvent::UserMessage {
+                        preview,
+                        turn_id,
+                        source: UserMessageSource::ResponseItem,
+                    });
                 }
             }
             _ => {}
@@ -2514,22 +2546,83 @@ fn cache_event_message(
         }
         Some("token_count") => {
             let total_usage = total_token_usage(payload);
+            let last_usage = last_token_usage(payload);
             let rate_limits = payload
                 .get("rate_limits")
                 .or_else(|| payload.get("rateLimits"))
                 .and_then(Value::as_object)
                 .and_then(parse_cached_rate_limits);
-            if total_usage.is_some() || rate_limits.is_some() {
+            if total_usage.is_some() || last_usage.is_some() || rate_limits.is_some() {
                 events.push(ParsedEvent::TokenCount {
                     timestamp,
                     line_number,
                     total_usage,
+                    last_usage,
                     rate_limits,
                 });
             }
         }
         _ => {}
     }
+}
+
+fn response_item_user_message(payload: &Map<String, Value>) -> Option<(String, Option<String>)> {
+    if string_field_in(payload, &["type"]) != Some("message")
+        || string_field_in(payload, &["role"]) != Some("user")
+    {
+        return None;
+    }
+
+    let message = payload
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|item| string_field_in(item, &["type"]) == Some("input_text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter_map(user_authored_input_text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = title_preview(&message)?;
+    let turn_id = string_field_in(payload, &["turn_id", "turnId"])
+        .or_else(|| {
+            payload
+                .get("internal_chat_message_metadata_passthrough")
+                .or_else(|| payload.get("internalChatMessageMetadataPassthrough"))
+                .and_then(Value::as_object)
+                .and_then(|metadata| string_field_in(metadata, &["turn_id", "turnId"]))
+        })
+        .map(str::to_owned);
+    Some((preview, turn_id))
+}
+
+fn user_authored_input_text(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || is_synthetic_user_context(value) {
+        return None;
+    }
+
+    const REQUEST_MARKERS: [&str; 4] = [
+        "## My request:",
+        "# My request:",
+        "## My request for Codex:",
+        "# My request for Codex:",
+    ];
+    let request = REQUEST_MARKERS
+        .into_iter()
+        .filter_map(|marker| value.rfind(marker).map(|index| (index, marker)))
+        .max_by_key(|(index, _)| *index)
+        .map(|(index, marker)| value[index + marker.len()..].trim())
+        .filter(|request| !request.is_empty());
+    request.or(Some(value))
+}
+
+fn is_synthetic_user_context(value: &str) -> bool {
+    value.starts_with("# AGENTS.md instructions for ")
+        || value.starts_with("<environment_context>")
+        || value.starts_with("<codex_internal_context")
+        || value.starts_with("<turn_aborted>")
+        || value.starts_with("<recommended_plugins>")
 }
 
 fn is_forked_session(payload: &Map<String, Value>) -> bool {
@@ -2666,8 +2759,12 @@ fn replay_rollout_file(
             ParsedEvent::ForeignCounterBaseline(total_usage) => {
                 thread.previous_cumulative = Some(*total_usage);
             }
-            ParsedEvent::UserMessage { preview, turn_id } => {
-                apply_user_message(thread, preview, turn_id.as_deref());
+            ParsedEvent::UserMessage {
+                preview,
+                turn_id,
+                source,
+            } => {
+                apply_user_message(thread, preview, turn_id.as_deref(), *source);
             }
             ParsedEvent::ThreadSettingsApplied { service_tier } => {
                 thread.service_tier = Some(service_tier.clone());
@@ -2713,10 +2810,14 @@ fn replay_rollout_file(
                 timestamp,
                 line_number,
                 total_usage,
+                last_usage,
                 rate_limits,
             } => apply_token_count(
                 thread,
-                *total_usage,
+                TokenCounterSample {
+                    total: *total_usage,
+                    last: *last_usage,
+                },
                 rate_limits.as_ref(),
                 *timestamp,
                 path,
@@ -2762,23 +2863,49 @@ fn apply_session_meta(
     set_max_timestamp(&mut thread.updated_at, timestamp);
 }
 
-fn apply_user_message(thread: &mut ThreadBuilder, message: &str, explicit_turn_id: Option<&str>) {
-    if thread.title.is_none() {
+fn apply_user_message(
+    thread: &mut ThreadBuilder,
+    message: &str,
+    explicit_turn_id: Option<&str>,
+    source: UserMessageSource,
+) {
+    let preview = shorten_preview(message, TURN_MESSAGE_PREVIEW_CHARS);
+    let turn_id = explicit_turn_id
+        .map(str::to_owned)
+        .or_else(|| {
+            (source == UserMessageSource::EventMessage)
+                .then(|| response_item_turn_with_preview(thread, &preview))
+                .flatten()
+        })
+        .or_else(|| thread.active_turn_ids.last().cloned());
+    let replace_title = thread.title.is_none()
+        || (thread.title_turn_id == turn_id
+            && thread.title_source.is_some_and(|current| source > current));
+    if replace_title {
         thread.title = Some(message.to_owned());
+        thread.title_source = Some(source);
+        thread.title_turn_id = turn_id.clone();
     }
 
-    let preview = shorten_preview(message, TURN_MESSAGE_PREVIEW_CHARS);
-    if let Some(turn_id) = explicit_turn_id {
-        let turn = ensure_turn(thread, turn_id);
-        if turn.message_preview.is_none() {
-            turn.message_preview = Some(preview);
-        }
-    } else if let Some(turn_id) = thread.active_turn_ids.last().cloned() {
+    if let Some(turn_id) = turn_id {
         let turn = ensure_turn(thread, &turn_id);
-        if turn.message_preview.is_none() {
+        if turn.message_preview.is_none()
+            || turn.message_source.is_some_and(|current| source > current)
+        {
             turn.message_preview = Some(preview);
+            turn.message_source = Some(source);
         }
     }
+}
+
+fn response_item_turn_with_preview(thread: &ThreadBuilder, preview: &str) -> Option<String> {
+    thread.active_turn_ids.iter().rev().find_map(|turn_id| {
+        thread.turns.get(turn_id).and_then(|turn| {
+            (turn.message_source == Some(UserMessageSource::ResponseItem)
+                && turn.message_preview.as_deref() == Some(preview))
+            .then(|| turn_id.clone())
+        })
+    })
 }
 
 fn apply_turn_context(
@@ -2854,7 +2981,7 @@ fn finish_turn(
 
 fn apply_token_count(
     thread: &mut ThreadBuilder,
-    total_usage: Option<TokenUsage>,
+    usage: TokenCounterSample,
     rate_limits: Option<&CachedRateLimits>,
     timestamp: DateTime<Utc>,
     path: &Path,
@@ -2877,13 +3004,14 @@ fn apply_token_count(
         });
     }
 
-    let Some(total_usage) = total_usage else {
+    let Some(total_usage) = usage.total else {
         return;
     };
 
     let delta = match thread.previous_cumulative {
         None => total_usage,
         Some(previous) if previous == total_usage => return,
+        Some(_) if usage.last == Some(total_usage) => total_usage,
         Some(previous) => match total_usage.delta_from(previous) {
             Some(delta) => delta,
             None => {
@@ -2937,6 +3065,19 @@ fn total_token_usage(payload: &Map<String, Value>) -> Option<TokenUsage> {
         })
         .or_else(|| payload.get("total_token_usage"))
         .or_else(|| payload.get("totalTokenUsage"))
+        .and_then(parse_token_usage)
+}
+
+fn last_token_usage(payload: &Map<String, Value>) -> Option<TokenUsage> {
+    payload
+        .get("info")
+        .and_then(Value::as_object)
+        .and_then(|info| {
+            info.get("last_token_usage")
+                .or_else(|| info.get("lastTokenUsage"))
+        })
+        .or_else(|| payload.get("last_token_usage"))
+        .or_else(|| payload.get("lastTokenUsage"))
         .and_then(parse_token_usage)
 }
 
