@@ -132,8 +132,8 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Co
 
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "mock usage RPC deliberately makes the result partial: {}",
+        Some(0),
+        "an unavailable optional usage RPC must not make the snapshot partial: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let snapshot = parse_json(&output);
@@ -148,9 +148,11 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Co
             .as_array()
             .unwrap()
             .iter()
-            .any(|warning| warning
-                .as_str()
-                .is_some_and(|warning| warning.contains("usage disabled in fixture")))
+            .all(|warning| {
+                warning
+                    .as_str()
+                    .is_none_or(|warning| !warning.contains("usage disabled in fixture"))
+            })
     );
 
     let refresh = fs::read_to_string(perf_log)

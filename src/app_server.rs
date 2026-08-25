@@ -27,6 +27,7 @@ const ACCOUNT_USAGE_ID: u64 = 3;
 const STDERR_LIMIT: usize = 32 * 1024;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 2 * 1024;
 const RPC_ERROR_MESSAGE_LIMIT: usize = 512;
+#[cfg(windows)]
 const DESKTOP_CLI_RESOURCE_DIAGNOSTIC: &str = "Codex Desktop packaged resource";
 #[cfg(windows)]
 const DESKTOP_PACKAGE_PREFIX: &str = "OpenAI.Codex_";
@@ -355,10 +356,10 @@ fn select_windows_codex_program(
     }
 }
 
-fn app_server_spawn_error(program: &OsStr, error: io::Error) -> anyhow::Error {
+fn app_server_spawn_error(_program: &OsStr, error: io::Error) -> anyhow::Error {
     #[cfg(windows)]
     {
-        let path = Path::new(program);
+        let path = Path::new(_program);
         if error.kind() == io::ErrorKind::PermissionDenied
             && error.raw_os_error() == Some(5)
             && is_desktop_codex_resource(path)
