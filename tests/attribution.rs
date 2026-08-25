@@ -213,26 +213,26 @@ fn estimates_each_entity_from_codex_gauge_and_local_token_share() {
 
     assert_eq!(tasks[0].window_token_usage, tokens(300));
     assert_close(tasks[0].local_token_share_percent, 75.0);
-    assert_close(tasks[0].estimated_quota_percent, 30.0);
+    assert_close(tasks[0].estimated_quota_percent, 28.235294117647058);
     assert_eq!(tasks[0].quota_confidence, Confidence::Low);
     assert_eq!(tasks[1].window_token_usage, tokens(100));
     assert_close(tasks[1].local_token_share_percent, 25.0);
-    assert_close(tasks[1].estimated_quota_percent, 10.0);
+    assert_close(tasks[1].estimated_quota_percent, 11.764705882352942);
     assert_eq!(tasks[2].window_token_usage, TokenUsage::default());
     assert_close(tasks[2].estimated_quota_percent, 0.0);
     assert_eq!(tasks[2].quota_confidence, Confidence::Unknown);
 
-    assert_close(turns[0].estimated_quota_percent, 30.0);
-    assert_close(turns[1].estimated_quota_percent, 10.0);
+    assert_close(turns[0].estimated_quota_percent, 28.235294117647058);
+    assert_close(turns[1].estimated_quota_percent, 11.764705882352942);
     assert_close(turns[2].estimated_quota_percent, 0.0);
 
     assert_eq!(models.len(), 2);
     assert_eq!(models[0].model, "gpt-5.5");
-    assert_close(models[0].estimated_quota_percent, 10.0);
+    assert_close(models[0].estimated_quota_percent, 11.764705882352942);
     assert_eq!(models[1].model, "gpt-5.6-sol");
     assert_eq!(models[1].token_usage, tokens(300));
     assert_close(models[1].local_token_share_percent, 75.0);
-    assert_close(models[1].estimated_quota_percent, 30.0);
+    assert_close(models[1].estimated_quota_percent, 28.235294117647058);
     assert_eq!(models[1].quota_confidence, Confidence::Low);
 }
 
@@ -389,8 +389,14 @@ fn observations_do_not_change_the_simple_estimate() {
     let with = analyze_windows(&[], &[], &calls, &observations, &limits, now);
 
     assert_eq!(with, without);
-    assert_close(with[0].threads[0].usage.estimated_quota_percent, 8.5);
-    assert_close(with[0].threads[1].usage.estimated_quota_percent, 25.5);
+    assert_close(
+        with[0].threads[0].usage.estimated_quota_percent,
+        7.157894736842105,
+    );
+    assert_close(
+        with[0].threads[1].usage.estimated_quota_percent,
+        26.842105263157894,
+    );
 }
 
 #[test]
@@ -718,9 +724,12 @@ fn five_hour_and_weekly_cycles_use_independent_codex_denominators() {
         .find(|row| row.thread_id == "week-only")
         .unwrap();
     assert_close(weekly_recent.usage.local_token_share_percent, 25.0);
-    assert_close(weekly_recent.usage.estimated_quota_percent, 12.5);
+    assert_close(
+        weekly_recent.usage.estimated_quota_percent,
+        14.705882352941176,
+    );
     assert_close(weekly_old.usage.local_token_share_percent, 75.0);
-    assert_close(weekly_old.usage.estimated_quota_percent, 37.5);
+    assert_close(weekly_old.usage.estimated_quota_percent, 35.294117647058826);
 }
 
 #[test]

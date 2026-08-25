@@ -1,6 +1,6 @@
 # 产品需求文档
 
-更新日期：2026-08-10
+更新日期：2026-08-25
 
 ## 1. 产品目标
 
@@ -87,13 +87,14 @@ task/thread -> turn -> model token events
 
 - 只选择当前普通 `codex` 窗口，并按该窗口的 `resetsAt - windowDurationMins` 边界筛选本地调用；
 - `local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100`；
-- EST 使用 OpenAI Help Center 的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）与 `gpt-5.6-sol` `(125,12.5,750)`、`gpt-5.6-terra` `(50,5,300)`、`gpt-5.6-luna` `(5,.5,30)`、`gpt-5.5` `(125,12.5,750)`、`gpt-5.5-cyber` `(312.5,31.25,1875)`、`gpt-5.4` `(62.5,6.25,375)`、`gpt-5.4-mini` `(18.75,1.875,113)`、`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 均为 `(43.75,4.375,350)`；
-- `serviceTier=fast` 与 `serviceTier=priority` 都识别为 Fast；根据官方 [Speed](https://developers.openai.com/codex/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard；
-- `cached = min(cached_input, input)`，`uncached = input - cached`，`call_credit_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；Codex 不收取 cache-write credits，因此公式不得增加 cache-write 项；
+- EST 使用 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 与 Daybreak Blue 的 `daybreak-blue-latest` `(100,10,500)`，`gpt-5.6-terra` `(50,5,300)`，`gpt-5.6-luna` `(5,.5,30)`，`gpt-5.5` `(125,12.5,750)`，Daybreak Red 的 `daybreak-red-latest`、`gpt-5.6-cyber` 与历史兼容 slug `gpt-5.5-cyber` `(312.5,31.25,1875)`，`gpt-5.4` `(62.5,6.25,375)`，`gpt-5.4-mini` `(18.75,1.875,113)`；该映射包含 2026-08-21 的 Sol 调价，官方说明其促销费率至少持续到 2026-11-21；
+- 当前官方费率卡不再列出 GPT-5.3-Codex/GPT-5.2；为读取历史 rollout，`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仍保留早期 `(43.75,4.375,350)` Standard 兼容权重，不得把它们描述为当前官方费率卡行；
+- `serviceTier=fast` 与本地登录态 rollout 的兼容 `serviceTier=priority` 值都按 ChatGPT Fast 识别；根据官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard。这里的 `priority` 兼容行为不得解释为 API Priority 计费，后者在官方文档中是独立费率；
+- `cached = min(cached_input, input)`，`uncached = input - cached`，`call_credit_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；当前 Codex credit 卡没有 cache-write 行，因此公式不得增加 cache-write 项；
 - 缺失或未映射的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast credit 费率降级，并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
 - `estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units`；task、turn、model 的 EST 使用同一 credit-rate 分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
 - `gpt-5.3-codex-spark` 的公开费率仍是 research preview，继续按精确模型名排除；不得为 Spark 虚构 credit 值；
-- token-based 映射使用 estimator revision 2；不得假定任意持久化聚合都能直接重新定价。仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 2 新点的未加权 token/call 证据不差于旧点时由 revision-aware upsert 替换；无法重建的旧点保留原 revision，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
+- token-based 映射使用 estimator revision 3；不得假定任意持久化聚合都能直接重新定价。仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 3 新点的未加权 token/call 证据不差于旧点时由 revision-aware upsert 替换；无法重建的 revision 1/2 历史点必须保留原 revision 并继续隔离，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
 - Help Center 所述少量仍使用 legacy rate card 的 Enterprise workspace 无法从本地 rollout 自动识别；对这些 workspace，EST 不得声称代表其适用计费卡；
 - 每个 scope 的摘要统一说明估算方法、`external activity possible` 与 partial 状态；partial 时列出 `partialReasons`。partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；

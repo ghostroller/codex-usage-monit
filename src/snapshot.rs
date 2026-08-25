@@ -1461,8 +1461,14 @@ mod tests {
             "current_codex_gauge_credit_rate_weighted_proxy"
         );
         assert_eq!(analysis.attribution.confidence, Confidence::Low);
-        assert_close(analysis.threads[0].usage.estimated_quota_percent, 10.0);
-        assert_close(analysis.threads[1].usage.estimated_quota_percent, 30.0);
+        assert_close(
+            analysis.threads[0].usage.estimated_quota_percent,
+            8.421052631578947,
+        );
+        assert_close(
+            analysis.threads[1].usage.estimated_quota_percent,
+            31.57894736842105,
+        );
 
         let mut stale_limits = limits;
         stale_limits[0].provenance = Provenance::Stale;
@@ -1481,8 +1487,14 @@ mod tests {
                 .partial_reasons
                 .contains(&"rollout_lookback_incomplete".to_string())
         );
-        assert_close(analysis.threads[0].usage.estimated_quota_percent, 10.0);
-        assert_close(analysis.threads[1].usage.estimated_quota_percent, 30.0);
+        assert_close(
+            analysis.threads[0].usage.estimated_quota_percent,
+            8.421052631578947,
+        );
+        assert_close(
+            analysis.threads[1].usage.estimated_quota_percent,
+            31.57894736842105,
+        );
         assert_eq!(analysis.attribution.confidence, Confidence::Low);
     }
 

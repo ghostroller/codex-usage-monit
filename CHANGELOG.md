@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Aligned Codex credit weighting with OpenAI's [August 21, 2026 token-based rate card](https://learn.chatgpt.com/docs/pricing): GPT-5.6 Sol and Daybreak Blue now use 100/10/500 input/cached-input/output credits per 1M tokens, while the unchanged Terra, Luna, GPT-5.5, GPT-5.4, GPT-5.4 mini, and Daybreak Red rows retain their published rates. Sol's promotional pricing is currently documented as available at least through November 21, 2026.
+- Added the current `daybreak-blue-latest` and `daybreak-red-latest` aliases plus the `gpt-5.6-cyber` model ID. The legacy `gpt-5.5-cyber` slug remains mapped to the Daybreak Red row, and GPT-5.3-Codex/GPT-5.2 mappings remain only for historical rollout compatibility rather than being described as current official rate-card rows.
+
+### Compatibility
+
+- Bumped the estimator revision to 3 for the updated Sol weight and Daybreak mappings. Rebuildable points inside the configured rollout scan range may replace older revisions when their unweighted evidence is no worse; unrebuildable revision-1/2 points remain stored, and mixed-revision windows keep `~EST` unavailable and partial instead of combining incompatible weights.
+
 ## [0.2.7] - 2026-08-18
 
 ### Fixed

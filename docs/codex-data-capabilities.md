@@ -1,6 +1,6 @@
 # Codex 数据能力与边界
 
-更新日期：2026-08-10
+更新日期：2026-08-25
 
 验证版本：`codex-cli 0.144.1`
 
@@ -148,24 +148,26 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 ### 可以估算但不能精确归因
 
-当前实现采用单一、可解释的 credit 费率代理公式。它固化 OpenAI Help Center 公布的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)，Standard 列的单位均为 credits / 1M tokens；Fast 倍率来自官方 [Speed](https://developers.openai.com/codex/speed) 说明：GPT-5.6 与 GPT-5.5 family 为 `2.5x`，GPT-5.4 family 为 `2x`。
+当前实现采用单一、可解释的 credit 费率代理公式。它固化 OpenAI 当前公布的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)，Standard 列的单位均为 credits / 1M tokens；Fast 倍率来自官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明：GPT-5.6 与 GPT-5.5 family 为 `2.5x`，GPT-5.4 family 为 `2x`。Sol 行已包含 2026-08-21 的调价；OpenAI 说明该促销费率至少持续到 2026-11-21，届时仍需重新核对官方卡。
 
 | model id | Standard input | Standard cached input | Standard output | Fast multiplier |
 | --- | ---: | ---: | ---: | ---: |
-| `gpt-5.6` (Sol alias), `gpt-5.6-sol` | 125 | 12.50 | 750 | 2.5x |
+| `gpt-5.6` (Sol alias), `gpt-5.6-sol`, `daybreak-blue-latest` | 100 | 10 | 500 | 2.5x |
 | `gpt-5.6-terra` | 50 | 5 | 300 | 2.5x |
 | `gpt-5.6-luna` | 5 | 0.5 | 30 | 2.5x |
 | `gpt-5.5` | 125 | 12.50 | 750 | 2.5x |
-| `gpt-5.5-cyber` | 312.5 | 31.25 | 1,875 | 2.5x |
+| `daybreak-red-latest`, `gpt-5.6-cyber`, legacy `gpt-5.5-cyber` | 312.5 | 31.25 | 1,875 | 2.5x |
 | `gpt-5.4` | 62.50 | 6.250 | 375 | 2x |
 | `gpt-5.4-mini` | 18.75 | 1.875 | 113 | 2x |
-| `gpt-5.3-codex` | 43.75 | 4.375 | 350 | — |
-| `gpt-5.2`, `gpt-5.2-codex` | 43.75 | 4.375 | 350 | — |
+| `gpt-5.3-codex` (historical compatibility) | 43.75 | 4.375 | 350 | — |
+| `gpt-5.2`, `gpt-5.2-codex` (historical compatibility) | 43.75 | 4.375 | 350 | — |
 | `gpt-5.3-codex-spark` | research preview | research preview | research preview | excluded |
+
+官方模型目录将 `daybreak-blue-latest` 列为 GPT-5.6 Sol 的 Daybreak Blue alias，将 `daybreak-red-latest` 列为 `gpt-5.6-cyber` 的 Daybreak Red alias；旧 `gpt-5.5-cyber` 仅为历史 rollout 兼容。GPT-5.3-Codex/GPT-5.2 已不在当前 Codex credit 卡中，表中的数值只用于兼容旧 rollout，不声称是当前官方费率。
 
 公告中的 GPT-Image-2.0 同时给出 image 与 text 两套计费行；当前 rollout `UsageCall` 不暴露足以区分这两种计费模态的字段，因此实现不会仅凭模型名套用其中任意一行。若该模型名出现在普通 token 调用中，它会走未知模型的 Luna 后备并标记 partial，而不会伪装成精确的 GPT-Image 费率。
 
-模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。`serviceTier=fast` 与 `serviceTier=priority` 都使用该模型适用的 Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识也保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
+模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识也保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100
@@ -175,11 +177,11 @@ call_credit_units = uncached * input_rate + cached * cached_rate + call_output_t
 estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units
 ```
 
-`reasoning_output_tokens` 是 output 的子集，不能再次相加。官方 rate card 明确 Codex 不收取 cache-write credits，因此公式没有 cache-write 项；cached input 只按 cached input 费率计算。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
+`reasoning_output_tokens` 是 output 的子集，不能再次相加。当前 Codex credit 卡没有 cache-write 行，因此公式没有 cache-write 项；cached input 只按 cached input 费率计算。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
 缺失或不在费率卡映射中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast credit 费率降级，以免静默丢出分母；该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
-token-based credit 映射定义为 estimator revision 2。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call 证据不差于旧点时优先使用 revision 2，避免旧 `estimated_cost_units` 的大小阻止替换。无法从当前扫描范围重建的更早数据继续保留原 revision；包含混合 revision 的窗口不会合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。
+token-based credit 映射定义为 estimator revision 3。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call 证据不差于旧点时优先使用 revision 3，避免旧 `estimated_cost_units` 的大小阻止替换。无法从当前扫描范围重建的 revision 1/2 历史数据继续保留原 revision 并隔离；包含混合 revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。
 
 该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
 
@@ -228,8 +230,10 @@ TUI 将主题、顶层视图、window scope、Turns/Models 显隐、Flat/Tree �
 
 ## 官方依据
 
-- [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card)
-- [Codex Speed / Fast mode](https://developers.openai.com/codex/speed)
+- [Codex pricing and token-based credit rate card](https://learn.chatgpt.com/docs/pricing)
+- [Codex Speed / Fast mode](https://learn.chatgpt.com/docs/agent-configuration/speed)
+- [Daybreak Blue aliases](https://developers.openai.com/api/docs/models/daybreak-blue-latest)
+- [Daybreak Red aliases](https://developers.openai.com/api/docs/models/daybreak-red-latest)
 - [Codex App Server](https://developers.openai.com/codex/app-server)
 - [OpenAI Codex app-server source](https://github.com/openai/codex/tree/main/codex-rs/app-server)
 - [App Server protocol README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)

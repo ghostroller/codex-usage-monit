@@ -14,10 +14,10 @@ const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
-pub(crate) const ESTIMATOR_REVISION: u32 = 2;
+pub(crate) const ESTIMATOR_REVISION: u32 = 3;
 
-// OpenAI Codex token-based credit rates as of 2026-08-10:
-// https://help.openai.com/en/articles/20001106-codex-rate-card
+// OpenAI Codex token-based credit rates as of 2026-08-25:
+// https://learn.chatgpt.com/docs/pricing
 // Integer rates use 1/8 credit per million tokens. The credit and per-million
 // scales cancel when the values are converted into relative shares. Fast rates
 // apply the published family multipliers: GPT-5.6/GPT-5.5 2.5x, GPT-5.4 2x.
@@ -28,16 +28,16 @@ struct TokenRates {
     output: u128,
 }
 
-const SOL_STANDARD: TokenRates = TokenRates::new(1_000, 100, 6_000);
-const SOL_FAST: TokenRates = TokenRates::new(2_500, 250, 15_000);
+const SOL_STANDARD: TokenRates = TokenRates::new(800, 80, 4_000);
+const SOL_FAST: TokenRates = TokenRates::new(2_000, 200, 10_000);
 const TERRA_STANDARD: TokenRates = TokenRates::new(400, 40, 2_400);
 const TERRA_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
 const LUNA_STANDARD: TokenRates = TokenRates::new(40, 4, 240);
 const LUNA_FAST: TokenRates = TokenRates::new(100, 10, 600);
 const GPT_5_5_STANDARD: TokenRates = TokenRates::new(1_000, 100, 6_000);
 const GPT_5_5_FAST: TokenRates = TokenRates::new(2_500, 250, 15_000);
-const GPT_5_5_CYBER_STANDARD: TokenRates = TokenRates::new(2_500, 250, 15_000);
-const GPT_5_5_CYBER_FAST: TokenRates = TokenRates::new(6_250, 625, 37_500);
+const DAYBREAK_RED_STANDARD: TokenRates = TokenRates::new(2_500, 250, 15_000);
+const DAYBREAK_RED_FAST: TokenRates = TokenRates::new(6_250, 625, 37_500);
 const GPT_5_4_STANDARD: TokenRates = TokenRates::new(500, 50, 3_000);
 const GPT_5_4_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
 const GPT_5_4_MINI_STANDARD: TokenRates = TokenRates::new(150, 15, 904);
@@ -486,6 +486,7 @@ fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
     let model = model?.trim();
     let (standard, fast_rate) = if model.eq_ignore_ascii_case("gpt-5.6-sol")
         || model.eq_ignore_ascii_case("gpt-5.6")
+        || model.eq_ignore_ascii_case("daybreak-blue-latest")
     {
         (SOL_STANDARD, SOL_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.6-terra") {
@@ -494,8 +495,11 @@ fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
         (LUNA_STANDARD, LUNA_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.5") {
         (GPT_5_5_STANDARD, GPT_5_5_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.5-cyber") {
-        (GPT_5_5_CYBER_STANDARD, GPT_5_5_CYBER_FAST)
+    } else if model.eq_ignore_ascii_case("daybreak-red-latest")
+        || model.eq_ignore_ascii_case("gpt-5.6-cyber")
+        || model.eq_ignore_ascii_case("gpt-5.5-cyber")
+    {
+        (DAYBREAK_RED_STANDARD, DAYBREAK_RED_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.4") {
         (GPT_5_4_STANDARD, GPT_5_4_FAST)
     } else if model.eq_ignore_ascii_case("gpt-5.4-mini") {
@@ -544,11 +548,14 @@ mod tests {
             total_tokens: 999,
         };
         let cases = [
-            ("gpt-5.6-sol", 22_300, 55_750),
-            ("gpt-5.6", 22_300, 55_750),
+            ("gpt-5.6-sol", 16_240, 40_600),
+            ("gpt-5.6", 16_240, 40_600),
+            ("daybreak-blue-latest", 16_240, 40_600),
             ("gpt-5.6-terra", 8_920, 22_300),
             ("gpt-5.6-luna", 892, 2_230),
             ("gpt-5.5", 22_300, 55_750),
+            ("daybreak-red-latest", 55_750, 139_375),
+            ("gpt-5.6-cyber", 55_750, 139_375),
             ("gpt-5.5-cyber", 55_750, 139_375),
             ("gpt-5.4", 11_150, 22_300),
             ("gpt-5.4-mini", 3_353, 6_706),
@@ -567,6 +574,32 @@ mod tests {
             assert_eq!(fast_cost.units, fast, "{model} Fast");
             assert!(!fast_cost.used_model_fallback);
             assert!(!fast_cost.used_token_breakdown_fallback);
+        }
+    }
+
+    #[test]
+    fn current_daybreak_aliases_are_case_insensitive_and_do_not_fallback() {
+        let tokens = TokenUsage {
+            input_tokens: 13,
+            cached_input_tokens: 3,
+            output_tokens: 2,
+            total_tokens: 15,
+            ..TokenUsage::default()
+        };
+        let cases = [
+            ("  DAYBREAK-BLUE-LATEST  ", "gpt-5.6-sol"),
+            ("  DAYBREAK-RED-LATEST  ", "gpt-5.6-cyber"),
+            ("  GPT-5.5-CYBER  ", "gpt-5.6-cyber"),
+        ];
+
+        for (alias, canonical) in cases {
+            for fast in [false, true] {
+                let alias_cost = estimate_call_weight(&rated_call(alias, fast, tokens));
+                let canonical_cost = estimate_call_weight(&rated_call(canonical, fast, tokens));
+                assert_eq!(alias_cost.units, canonical_cost.units, "{alias}");
+                assert!(!alias_cost.used_model_fallback, "{alias}");
+                assert!(!alias_cost.used_token_breakdown_fallback, "{alias}");
+            }
         }
     }
 

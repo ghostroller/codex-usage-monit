@@ -282,7 +282,9 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
 | `SOURCE` | 记录的任务来源。TUI 筛选器包括 All（不限制来源）、Desktop（包含 `vscode`）、Subagent 和 CLI。 |
 
-估算器依据 OpenAI 的 [Codex token-based rate card](https://help.openai.com/en/articles/20001106-codex-rate-card) 映射 `gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.5-cyber`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex`、`gpt-5.2` 和历史 `gpt-5.2-codex` slug。对于识别为 Fast 的调用，按官方 [Speed](https://developers.openai.com/codex/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
+估算器依据 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)。按 2026-08-21 的调整，`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 和 Daybreak Blue 的 `daybreak-blue-latest` 别名使用每百万 token `(100, 10, 500)` 的 input/cached-input/output credits；OpenAI 说明该 Sol 促销费率至少持续到 2026-11-21。Daybreak Red 当前的 `daybreak-red-latest` 别名与 `gpt-5.6-cyber` ID 使用 `(312.5, 31.25, 1875)`，旧 `gpt-5.5-cyber` slug 仅为历史 rollout 兼容而继续映射到同一行。当前费率卡还提供 GPT-5.6 Terra/Luna、GPT-5.5、GPT-5.4 和 GPT-5.4 mini；GPT-5.3-Codex、GPT-5.2 与历史 `gpt-5.2-codex` slug 继续使用早期兼容权重，但不再表述为当前官方费率卡行。
+
+对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
 
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
@@ -313,7 +315,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。token-based credit 映射对应 revision 2。升级后，程序只会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点；当 revision 2 数据点的未加权 token/call 证据不差于旧点时，由 revision-aware upsert 替换旧点。无法重建的更早数据继续隔离，窗口内出现混合 revision 时，`~EST` 显示 unavailable 并标为 partial。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本或估算器更新后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前 token-based credit 映射对应 revision 3。升级后，程序只会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点；当 revision 3 数据点的未加权 token/call 证据不差于旧点时，由 revision-aware upsert 替换旧点。无法重建的 revision 1/2 历史数据会继续保存并隔离；窗口内出现混合 revision 时不能合并 EST，`~EST` 显示 unavailable 并标为 partial。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本或估算器更新后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 
