@@ -111,7 +111,7 @@ fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
         provenance: Provenance::ServerSnapshot,
         as_of: Utc::now(),
     });
-    assert_eq!(app.reset_credit_fetch_status(now), Some("retrying"));
+    assert_eq!(app.reset_credit_fetch_status(now), None);
 
     app.snapshot.rate_limit_reset_credits = Some(RateLimitResetCreditsSnapshot {
         available_count: 0,
@@ -119,6 +119,14 @@ fn reset_credit_fetch_status_distinguishes_initial_load_and_retry() {
         provenance: Provenance::ServerSnapshot,
         as_of: Utc::now(),
     });
+    assert_eq!(app.reset_credit_fetch_status(now), None);
+
+    app.snapshot.sources[0].status = "partial".to_string();
+    app.snapshot.sources[0].message = None;
+    app.snapshot.rate_limit_reset_credits = None;
+    app.snapshot.rate_limit_reset_credits_partial = true;
+    assert_eq!(app.reset_credit_fetch_status(now), Some("retrying"));
+    app.snapshot.rate_limit_reset_credits_partial = false;
     assert_eq!(app.reset_credit_fetch_status(now), None);
 }
 
@@ -149,17 +157,9 @@ fn incomplete_account_refreshes_back_off_before_returning_to_normal_period() {
     assert_eq!(
         app.next_account_refresh
             .saturating_duration_since(second_attempt),
-        Duration::from_secs(10)
-    );
-
-    let third_attempt = second_attempt + Duration::from_secs(10);
-    app.schedule_next_account_refresh(&count_only_reset_snapshot, third_attempt);
-    assert_eq!(
-        app.next_account_refresh
-            .saturating_duration_since(third_attempt),
         ACCOUNT_REFRESH
     );
-    assert_eq!(app.account_refresh_retry_count, 2);
+    assert_eq!(app.account_refresh_retry_count, 0);
 }
 
 #[test]
@@ -190,6 +190,21 @@ fn complete_account_refresh_uses_normal_period_and_resets_backoff() {
             .saturating_duration_since(succeeded_at),
         ACCOUNT_REFRESH
     );
+
+    let without_reset_credit_support = account_refresh_result("partial", None, false);
+    assert!(account_refresh_is_complete(&without_reset_credit_support));
+
+    let truncated_reset_credit_details = account_refresh_result(
+        "partial",
+        Some(RateLimitResetCreditsSnapshot {
+            available_count: 2,
+            credits: Some(Vec::new()),
+            provenance: Provenance::ServerSnapshot,
+            as_of: Utc::now(),
+        }),
+        false,
+    );
+    assert!(account_refresh_is_complete(&truncated_reset_credit_details));
 }
 
 #[test]
@@ -1765,6 +1780,146 @@ fn overview_keeps_reset_expiry_reminder_inside_the_quota_panel() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     assert!(app.task_table_hitbox.is_some());
     assert_eq!(overview_quota_height(&app.snapshot, 40, 3), 7);
+
+    app.snapshot
+        .warnings
+        .push("app-server refresh failed: access denied".to_string());
+    app.snapshot.sources = vec![SourceStatus {
+        source: "app_server".to_string(),
+        status: "partial".to_string(),
+        as_of: now,
+        message: None,
+    }];
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(app.task_table_hitbox.is_some());
+    assert!(content.contains("codex app-server failed · install CLI"));
+    assert!(content.contains("Models ·"));
+}
+
+#[test]
+fn overview_places_app_server_failure_between_sessions_and_models_at_all_sizes() {
+    for (theme, width, height, expected) in [
+        (
+            Theme::Dark,
+            80,
+            40,
+            "Unable to call codex app-server · try installing Codex CLI",
+        ),
+        (
+            Theme::Light,
+            40,
+            24,
+            "codex app-server failed · install CLI",
+        ),
+        (Theme::Dark, 24, 24, "app-server failed · CLI"),
+    ] {
+        let mut app = interaction_test_app(1, 1);
+        app.theme = theme;
+        app.snapshot.sources = vec![SourceStatus {
+            source: "app_server".to_string(),
+            status: "error".to_string(),
+            as_of: app.snapshot.as_of,
+            message: Some("failed to spawn codex app-server".to_string()),
+        }];
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let buffer = terminal.backend().buffer();
+        let area = Rect::new(0, 0, width, height);
+        let warning_row = (0..height)
+            .find(|row| buffer_rect_row_text(buffer, area, *row).contains(expected))
+            .expect("warning row must be visible");
+        let models_row = (0..height)
+            .find(|row| buffer_rect_row_text(buffer, area, *row).contains("Models ·"))
+            .expect("models panel must be visible");
+
+        assert!(
+            content.contains(expected),
+            "missing CLI hint at {width}x{height}/{theme:?}: {content}"
+        );
+        assert_eq!(
+            warning_row + 1,
+            models_row,
+            "notice must sit immediately above Models at {width}x{height}/{theme:?}"
+        );
+    }
+}
+
+#[test]
+fn overview_keeps_app_server_failure_stable_across_local_only_refresh_state() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    app.snapshot
+        .warnings
+        .push("app-server refresh failed: access denied".to_string());
+    app.snapshot.sources = vec![SourceStatus {
+        source: "app_server".to_string(),
+        status: "stale".to_string(),
+        as_of: now,
+        message: Some("no cached account snapshot".to_string()),
+    }];
+    app.snapshot.limits = vec![LimitBucket {
+        limit_id: "codex".to_string(),
+        limit_name: Some("Codex".to_string()),
+        plan_type: Some("test".to_string()),
+        primary: Some(LimitWindow::new(
+            25.0,
+            Some(300),
+            Some(now + ChronoDuration::hours(2)),
+        )),
+        secondary: None,
+        credits: None,
+        rate_limit_reached_type: None,
+        provenance: Provenance::Stale,
+        as_of: now,
+    }];
+
+    assert!(app_server_call_failed(&app.snapshot));
+    app.snapshot.sources[0].status = "partial".to_string();
+    app.snapshot.sources[0].message = None;
+    assert!(
+        app_server_call_failed(&app.snapshot),
+        "the persisted refresh warning must survive a local-only source-state rewrite"
+    );
+    assert_eq!(overview_quota_height(&app.snapshot, 80, 3), 3);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(content.contains("Unable to call codex app-server · try installing Codex CLI"));
+}
+
+#[test]
+fn overview_does_not_report_the_initial_account_loading_state_as_an_error() {
+    let mut app = interaction_test_app(0, 0);
+    app.snapshot.sources = vec![SourceStatus {
+        source: "app_server".to_string(),
+        status: "stale".to_string(),
+        as_of: app.snapshot.as_of,
+        message: Some("no cached account snapshot".to_string()),
+    }];
+
+    assert!(!app_server_call_failed(&app.snapshot));
 }
 
 fn buffer_rect_text(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
@@ -7160,7 +7315,7 @@ fn other_view_reports_when_reset_data_is_unavailable() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(content.contains("2 available"));
-    assert!(content.contains("RETRYING"));
+    assert!(!content.contains("RETRYING"));
     assert!(content.contains("DETAILS UNAVAILABLE"));
     assert!(!content.contains("SHOWING"));
 }

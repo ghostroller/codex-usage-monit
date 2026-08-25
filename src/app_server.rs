@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::ffi::OsStr;
+use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -24,6 +25,11 @@ const INITIALIZE_ID: u64 = 1;
 const RATE_LIMITS_ID: u64 = 2;
 const ACCOUNT_USAGE_ID: u64 = 3;
 const STDERR_LIMIT: usize = 32 * 1024;
+const STDERR_DIAGNOSTIC_LIMIT: usize = 2 * 1024;
+const RPC_ERROR_MESSAGE_LIMIT: usize = 512;
+const DESKTOP_CLI_RESOURCE_DIAGNOSTIC: &str = "Codex Desktop packaged resource";
+#[cfg(windows)]
+const DESKTOP_PACKAGE_PREFIX: &str = "OpenAI.Codex_";
 
 enum ReaderEvent {
     Message(Value),
@@ -75,14 +81,16 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     if let Some(path) = config.app_server_path.as_deref() {
         command.env("PATH", path);
     }
+    let program = command.get_program().to_owned();
     let child = command
-        .args(["app-server", "--stdio"])
+        .arg("app-server")
         .env("CODEX_HOME", &config.codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to spawn `codex app-server --stdio`")?;
+        .map_err(|error| app_server_spawn_error(&program, error))
+        .context("failed to spawn `codex app-server`")?;
     spawn_span.finish("command=codex_app_server");
 
     let io_span = config.startup_trace.span("app_server.io_setup");
@@ -272,6 +280,7 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                         "account/usage/read returned invalid data: {error:#}"
                     )),
                 },
+                Err(message) if optional_usage_rpc_unavailable(&message) => {}
                 Err(message) => snapshot
                     .warnings
                     .push(format!("account/usage/read failed: {message}")),
@@ -314,11 +323,92 @@ fn codex_command(config: &CollectConfig) -> Command {
             .or_else(|| env::var_os("PATH"))
             .unwrap_or_default();
         let monitor_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Command::new(
-            crate::session_launch::resolve_executable("codex", None, &path, &monitor_cwd)
-                .unwrap_or_else(|_| PathBuf::from("codex")),
-        )
+        let discovered =
+            crate::session_launch::resolve_executable("codex", None, &path, &monitor_cwd).ok();
+        Command::new(select_windows_codex_program(
+            discovered,
+            installed_windows_codex_cli(),
+        ))
     }
+}
+
+#[cfg(windows)]
+fn installed_windows_codex_cli() -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os("LOCALAPPDATA")?)
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin")
+        .join("codex.exe");
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn select_windows_codex_program(
+    discovered: Option<PathBuf>,
+    installed: Option<PathBuf>,
+) -> PathBuf {
+    match (discovered, installed) {
+        (Some(discovered), Some(installed)) if is_desktop_codex_resource(&discovered) => installed,
+        (Some(discovered), _) => discovered,
+        (None, Some(installed)) => installed,
+        (None, None) => PathBuf::from("codex"),
+    }
+}
+
+fn app_server_spawn_error(program: &OsStr, error: io::Error) -> anyhow::Error {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if error.kind() == io::ErrorKind::PermissionDenied
+            && error.raw_os_error() == Some(5)
+            && is_desktop_codex_resource(path)
+        {
+            return anyhow!(
+                "found the {DESKTOP_CLI_RESOURCE_DIAGNOSTIC} at {}; Windows cannot launch it as a standalone Codex CLI. Install and sign in to the Codex CLI, use --codex-bin to select a runnable `codex.cmd` or `codex.exe`, or use --offline to monitor local rollout data: {error}",
+                path.display()
+            );
+        }
+    }
+
+    error.into()
+}
+
+#[cfg(windows)]
+fn is_desktop_codex_resource(path: &Path) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    if !path_component_equals(file_name, "codex") && !path_component_equals(file_name, "codex.exe")
+    {
+        return false;
+    }
+
+    let Some(resources) = path.parent() else {
+        return false;
+    };
+    let Some(app) = resources.parent() else {
+        return false;
+    };
+    let Some(package) = app.parent() else {
+        return false;
+    };
+    let Some(windows_apps) = package.parent() else {
+        return false;
+    };
+
+    path_component_equals(resources.file_name().unwrap_or_default(), "resources")
+        && path_component_equals(app.file_name().unwrap_or_default(), "app")
+        && package
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .and_then(|name| name.get(..DESKTOP_PACKAGE_PREFIX.len()).map(str::to_owned))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DESKTOP_PACKAGE_PREFIX))
+        && path_component_equals(windows_apps.file_name().unwrap_or_default(), "WindowsApps")
+}
+
+#[cfg(windows)]
+fn path_component_equals(value: &OsStr, expected: &str) -> bool {
+    value.to_string_lossy().eq_ignore_ascii_case(expected)
 }
 
 /// Parses the `result` object returned by `account/rateLimits/read`.
@@ -661,16 +751,26 @@ fn response_payload(message: &Value) -> std::result::Result<Value, String> {
 
 fn format_rpc_error(error: &Value) -> String {
     let Some(object) = error.as_object() else {
-        return error.to_string();
+        return compact_diagnostic_text(&error.to_string(), RPC_ERROR_MESSAGE_LIMIT);
     };
-    let message = object
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown JSON-RPC error");
+    let message = compact_diagnostic_text(
+        object
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown JSON-RPC error"),
+        RPC_ERROR_MESSAGE_LIMIT,
+    );
     match object.get("code") {
         Some(code) => format!("{message} (code {code})"),
-        None => message.to_string(),
+        None => message,
     }
+}
+
+fn optional_usage_rpc_unavailable(message: &str) -> bool {
+    message.contains("(code -32601)")
+        || (message.contains("(code -32600)")
+            && message.contains("account/usage/read")
+            && message.to_ascii_lowercase().contains("unknown variant"))
 }
 
 fn write_message(stdin: &mut impl Write, message: &Value) -> Result<()> {
@@ -780,11 +880,70 @@ fn capture_stderr(mut stderr: impl Read, output: Arc<Mutex<String>>) {
                 let available = STDERR_LIMIT.saturating_sub(captured.len());
                 captured.extend_from_slice(&buffer[..count.min(available)]);
                 if let Ok(mut destination) = output.lock() {
-                    *destination = String::from_utf8_lossy(&captured).trim().to_string();
+                    *destination = compact_diagnostic_text(
+                        &String::from_utf8_lossy(&captured),
+                        STDERR_DIAGNOSTIC_LIMIT,
+                    );
                 }
             }
         }
     }
+}
+
+fn compact_diagnostic_text(value: &str, max_chars: usize) -> String {
+    let stripped = strip_ansi_sequences(value);
+    let normalized = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut compact = normalized
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            if !character.is_control() || matches!(character, '\n' | '\t') {
+                output.push(character);
+            }
+            continue;
+        }
+
+        match chars.next() {
+            Some('[') => {
+                for character in chars.by_ref() {
+                    if ('@'..='~').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut previous_escape = false;
+                for character in chars.by_ref() {
+                    if character == '\u{7}' || (previous_escape && character == '\\') {
+                        break;
+                    }
+                    previous_escape = character == '\u{1b}';
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
 }
 
 fn stderr_suffix(stderr: &Arc<Mutex<String>>) -> String {
@@ -906,4 +1065,128 @@ fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
     };
     DateTime::from_timestamp(seconds, nanos)
         .ok_or_else(|| anyhow!("{key} is outside the supported timestamp range"))
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use serde_json::json;
+
+    use super::{
+        RPC_ERROR_MESSAGE_LIMIT, compact_diagnostic_text, format_rpc_error,
+        optional_usage_rpc_unavailable,
+    };
+
+    #[test]
+    fn unsupported_optional_usage_errors_are_recognized_without_matching_other_failures() {
+        assert!(optional_usage_rpc_unavailable(
+            "usage disabled (code -32601)"
+        ));
+        assert!(optional_usage_rpc_unavailable(
+            "Invalid request: unknown variant `account/usage/read`, expected one of `initialize` (code -32600)"
+        ));
+        assert!(!optional_usage_rpc_unavailable(
+            "Invalid request: malformed payload (code -32600)"
+        ));
+    }
+
+    #[test]
+    fn external_diagnostics_strip_ansi_and_bound_rpc_messages() {
+        assert_eq!(
+            compact_diagnostic_text(
+                "\u{1b}[2m2026-08-25\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m bad config\n",
+                128,
+            ),
+            "2026-08-25 ERROR bad config"
+        );
+
+        let error = format_rpc_error(&json!({
+            "code": -32600,
+            "message": "x".repeat(RPC_ERROR_MESSAGE_LIMIT + 100)
+        }));
+        assert!(error.ends_with("... (code -32600)"));
+        assert!(error.chars().count() <= RPC_ERROR_MESSAGE_LIMIT + 16);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::{app_server_spawn_error, select_windows_codex_program};
+
+    fn desktop_resource_path() -> PathBuf {
+        PathBuf::from(
+            r"C:\Program Files\WINDOWSAPPS\openai.codex_26.818.0.0_x64__test\APP\RESOURCES\CODEX.EXE",
+        )
+    }
+
+    #[test]
+    fn desktop_resource_access_denied_gets_an_actionable_hint() {
+        let path = desktop_resource_path();
+        let rendered = format!(
+            "{:#}",
+            app_server_spawn_error(path.as_os_str(), io::Error::from_raw_os_error(5))
+        );
+
+        assert!(rendered.contains("Codex Desktop packaged resource"));
+        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("--codex-bin"));
+        assert!(rendered.contains("--offline"));
+    }
+
+    #[test]
+    fn desktop_resource_other_permission_error_keeps_its_original_diagnostic() {
+        let path = desktop_resource_path();
+        let rendered = format!(
+            "{:#}",
+            app_server_spawn_error(
+                path.as_os_str(),
+                io::Error::new(io::ErrorKind::PermissionDenied, "blocked by policy"),
+            )
+        );
+
+        assert!(rendered.contains("blocked by policy"));
+        assert!(!rendered.contains("Codex Desktop packaged resource"));
+    }
+
+    #[test]
+    fn ordinary_access_denied_is_not_reclassified_as_a_desktop_resource() {
+        let path = PathBuf::from(r"C:\tools\codex.exe");
+        let rendered = format!(
+            "{:#}",
+            app_server_spawn_error(path.as_os_str(), io::Error::from_raw_os_error(5))
+        );
+
+        assert!(!rendered.contains("Codex Desktop packaged resource"));
+    }
+
+    #[test]
+    fn installed_windows_cli_replaces_only_the_desktop_packaged_resource() {
+        let desktop = desktop_resource_path();
+        let installed =
+            PathBuf::from(r"C:\Users\developer\AppData\Local\OpenAI\Codex\bin\codex.exe");
+        let path_cli = PathBuf::from(r"C:\tools\codex.cmd");
+
+        assert_eq!(
+            select_windows_codex_program(Some(desktop.clone()), Some(installed.clone())),
+            installed
+        );
+        assert_eq!(
+            select_windows_codex_program(Some(path_cli.clone()), Some(installed.clone())),
+            path_cli
+        );
+        assert_eq!(
+            select_windows_codex_program(None, Some(installed.clone())),
+            installed
+        );
+        assert_eq!(
+            select_windows_codex_program(Some(desktop.clone()), None),
+            desktop
+        );
+        assert_eq!(
+            select_windows_codex_program(None, None),
+            PathBuf::from("codex")
+        );
+    }
 }

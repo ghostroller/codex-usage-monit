@@ -45,7 +45,7 @@ src/
 
 ### App Server
 
-每次账户刷新启动 `codex app-server --stdio`，执行：
+每次账户刷新启动 `codex app-server`（默认 stdio transport），执行：
 
 1. `initialize`；
 2. `initialized`；

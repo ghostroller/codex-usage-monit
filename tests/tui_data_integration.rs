@@ -92,7 +92,7 @@ fn real_binary_combines_fixture_rollouts_with_a_mock_codex_app_server() {
         &codex,
         r#"#!/bin/sh
 test "$1" = "app-server" || exit 41
-test "$2" = "--stdio" || exit 42
+test -z "$2" || exit 42
 IFS= read -r initialize || exit 43
 printf '%s\n' '{"id":1,"result":{"userAgent":"fixture-app-server"}}'
 IFS= read -r initialized || exit 44

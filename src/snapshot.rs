@@ -674,26 +674,19 @@ fn preserve_cached_account_data(
     cached: &AccountSnapshot,
     now: DateTime<Utc>,
 ) {
-    let limits_refresh_succeeded = !fresh.limits.is_empty();
     let limits_refresh_failed = fresh.limits.is_empty() && !fresh.errors.is_empty();
+    let reset_credits_refresh_failed =
+        fresh.rate_limit_reset_credits.is_none() && fresh.rate_limit_reset_credits_partial;
     if fresh.limits.is_empty() && !cached.limits.is_empty() {
         fresh.limits = cached.limits.clone();
         mark_limits_stale(&mut fresh.limits);
     }
-    if limits_refresh_failed && fresh.rate_limit_reset_credits.is_none() {
+    if (limits_refresh_failed || reset_credits_refresh_failed)
+        && fresh.rate_limit_reset_credits.is_none()
+    {
         preserve_omitted_reset_credits(fresh, cached, now);
         fresh.rate_limit_reset_credits_partial = true;
     }
-    if limits_refresh_succeeded && fresh.rate_limit_reset_credits.is_none() {
-        let as_of = fresh
-            .limits
-            .iter()
-            .map(|limit| limit.as_of)
-            .max()
-            .unwrap_or(now);
-        preserve_omitted_reset_credits(fresh, cached, as_of);
-    }
-    preserve_cached_reset_credit_details(fresh, cached);
     if fresh.usage.is_none() {
         fresh.usage.clone_from(&cached.usage);
     }
@@ -708,34 +701,6 @@ fn preserve_omitted_reset_credits(
         return;
     };
     let Some(unexpired) = unexpired_cached_reset_credit_details(cached_reset_credits, as_of) else {
-        return;
-    };
-
-    let mut preserved = cached_reset_credits.clone();
-    preserved.credits = Some(unexpired);
-    preserved.provenance = Provenance::Stale;
-    fresh.rate_limit_reset_credits = Some(preserved);
-    fresh.rate_limit_reset_credits_partial = true;
-}
-
-fn preserve_cached_reset_credit_details(fresh: &mut AccountSnapshot, cached: &AccountSnapshot) {
-    let Some(fresh_reset_credits) = &fresh.rate_limit_reset_credits else {
-        return;
-    };
-    if fresh_reset_credits.available_count == 0 || fresh_reset_credits.credits.is_some() {
-        return;
-    }
-    let fresh_available_count = fresh_reset_credits.available_count;
-    let fresh_as_of = fresh_reset_credits.as_of;
-
-    let Some(cached_reset_credits) = &cached.rate_limit_reset_credits else {
-        return;
-    };
-    if cached_reset_credits.available_count != fresh_available_count {
-        return;
-    }
-    let Some(unexpired) = unexpired_cached_reset_credit_details(cached_reset_credits, fresh_as_of)
-    else {
         return;
     };
 
@@ -1064,32 +1029,12 @@ mod tests {
             ..AccountSnapshot::default()
         };
         preserve_cached_account_data(&mut successful_without_reset_credits, &cached, now);
-        assert_eq!(
+        assert!(
             successful_without_reset_credits
                 .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .credits
-                .as_deref(),
-            Some([cached_credit.clone()].as_slice())
+                .is_none()
         );
-        assert_eq!(
-            successful_without_reset_credits
-                .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .provenance,
-            Provenance::Stale
-        );
-        assert_eq!(
-            successful_without_reset_credits
-                .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .as_of,
-            now
-        );
-        assert!(successful_without_reset_credits.rate_limit_reset_credits_partial);
+        assert!(!successful_without_reset_credits.rate_limit_reset_credits_partial);
 
         let mut successful_with_unknown_details = AccountSnapshot {
             limits: cached.limits.clone(),
@@ -1102,32 +1047,14 @@ mod tests {
             ..AccountSnapshot::default()
         };
         preserve_cached_account_data(&mut successful_with_unknown_details, &cached, now);
-        assert_eq!(
-            successful_with_unknown_details
-                .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .credits
-                .as_deref(),
-            Some([cached_credit.clone()].as_slice())
-        );
-        assert_eq!(
-            successful_with_unknown_details
-                .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .as_of,
-            now
-        );
-        assert_eq!(
-            successful_with_unknown_details
-                .rate_limit_reset_credits
-                .as_ref()
-                .unwrap()
-                .provenance,
-            Provenance::Stale
-        );
-        assert!(successful_with_unknown_details.rate_limit_reset_credits_partial);
+        let count_only = successful_with_unknown_details
+            .rate_limit_reset_credits
+            .as_ref()
+            .unwrap();
+        assert!(count_only.credits.is_none());
+        assert_eq!(count_only.as_of, now + Duration::minutes(1));
+        assert_eq!(count_only.provenance, Provenance::ServerSnapshot);
+        assert!(!successful_with_unknown_details.rate_limit_reset_credits_partial);
 
         let mut successful_with_empty_details = AccountSnapshot {
             limits: cached.limits.clone(),
@@ -1164,21 +1091,15 @@ mod tests {
     }
 
     #[test]
-    fn cached_reset_credit_details_only_preserve_matching_unexpired_entries() {
+    fn fresh_count_only_reset_credits_do_not_reuse_cached_details() {
         let now = Utc::now();
-        let expired = reset_credit(now - Duration::days(5), Some(now - Duration::seconds(1)));
-        let expiring_now = reset_credit(now - Duration::days(4), Some(now));
-        let unexpired = reset_credit(now - Duration::days(3), Some(now + Duration::days(2)));
-        let no_expiry = reset_credit(now - Duration::days(2), None);
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
-                available_count: 4,
-                credits: Some(vec![
-                    expired,
-                    expiring_now,
-                    unexpired.clone(),
-                    no_expiry.clone(),
-                ]),
+                available_count: 1,
+                credits: Some(vec![reset_credit(
+                    now - Duration::days(3),
+                    Some(now + Duration::days(2)),
+                )]),
                 provenance: Provenance::ServerSnapshot,
                 as_of: now - Duration::minutes(1),
             }),
@@ -1186,7 +1107,7 @@ mod tests {
         };
         let mut fresh = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
-                available_count: 4,
+                available_count: 1,
                 credits: None,
                 provenance: Provenance::ServerSnapshot,
                 as_of: now,
@@ -1197,21 +1118,22 @@ mod tests {
         preserve_cached_account_data(&mut fresh, &cached, now);
 
         let reset_credits = fresh.rate_limit_reset_credits.unwrap();
-        assert_eq!(reset_credits.credits, Some(vec![unexpired]));
-        assert!(!reset_credits.credits.as_ref().unwrap().contains(&no_expiry));
-        assert_eq!(reset_credits.as_of, now - Duration::minutes(1));
-        assert_eq!(reset_credits.provenance, Provenance::Stale);
-        assert!(fresh.rate_limit_reset_credits_partial);
+        assert!(reset_credits.credits.is_none());
+        assert_eq!(reset_credits.as_of, now);
+        assert_eq!(reset_credits.provenance, Provenance::ServerSnapshot);
+        assert!(!fresh.rate_limit_reset_credits_partial);
     }
 
     #[test]
-    fn cached_reset_credit_details_do_not_roll_their_as_of_forward() {
+    fn repeated_count_only_refreshes_keep_each_fresh_server_timestamp() {
         let now = Utc::now();
-        let cached_credit = reset_credit(now - Duration::days(1), Some(now + Duration::days(1)));
         let cached = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
                 available_count: 1,
-                credits: Some(vec![cached_credit.clone()]),
+                credits: Some(vec![reset_credit(
+                    now - Duration::days(1),
+                    Some(now + Duration::days(1)),
+                )]),
                 provenance: Provenance::ServerSnapshot,
                 as_of: now,
             }),
@@ -1235,7 +1157,15 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .as_of,
-            now
+            now + Duration::minutes(1)
+        );
+        assert!(
+            first_refresh
+                .rate_limit_reset_credits
+                .as_ref()
+                .unwrap()
+                .credits
+                .is_none()
         );
         let mut second_refresh = AccountSnapshot {
             rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
@@ -1250,10 +1180,10 @@ mod tests {
         preserve_cached_account_data(&mut second_refresh, &first_refresh, now);
 
         let reset_credits = second_refresh.rate_limit_reset_credits.unwrap();
-        assert_eq!(reset_credits.as_of, now);
-        assert_eq!(reset_credits.credits, Some(vec![cached_credit]));
-        assert_eq!(reset_credits.provenance, Provenance::Stale);
-        assert!(second_refresh.rate_limit_reset_credits_partial);
+        assert_eq!(reset_credits.as_of, now + Duration::minutes(2));
+        assert!(reset_credits.credits.is_none());
+        assert_eq!(reset_credits.provenance, Provenance::ServerSnapshot);
+        assert!(!second_refresh.rate_limit_reset_credits_partial);
     }
 
     #[test]

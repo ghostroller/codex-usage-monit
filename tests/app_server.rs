@@ -536,11 +536,11 @@ fn offline_mode_returns_without_starting_codex() {
 fn fetches_limits_through_a_codex_cmd_shim() {
     let script = r#"@echo off
 if not "%~1"=="app-server" exit /b 41
-if not "%~2"=="--stdio" exit /b 42
+if not "%~2"=="" exit /b 42
 set /p initialize=
 echo {"id":1,"result":{"userAgent":"mock"}}
 set /p account_requests=
-echo {"id":3,"error":{"code":-32601,"message":"usage disabled"}}
+echo {"id":3,"error":{"code":-32600,"message":"Invalid request: unknown variant `account/usage/read`, expected one of `initialize`, `account/rateLimits/read`, `thread/start`"}}
 echo {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300}},"rateLimitsByLimitId":null}}
 rem Keep the shim alive while the client writes the remaining RPC messages.
 rem A redirected set /p can read ahead and consume multiple LF-delimited messages.
@@ -563,12 +563,7 @@ more >nul
             42.0
         );
         assert!(snapshot.usage.is_none());
-        assert!(
-            snapshot
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("usage disabled (code -32601)"))
-        );
+        assert!(snapshot.warnings.is_empty());
     });
 }
 
@@ -577,7 +572,7 @@ more >nul
 fn fetches_limits_and_preserves_a_nonfatal_usage_rpc_error() {
     let script = r#"#!/bin/sh
 test "$1" = "app-server" || exit 41
-test "$2" = "--stdio" || exit 42
+test -z "$2" || exit 42
 IFS= read -r initialize || exit 43
 case "$initialize" in *'"method":"initialize"'*) ;; *) exit 44 ;; esac
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
@@ -625,10 +620,10 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
         assert!(snapshot.usage.is_none());
         assert!(snapshot.errors.is_empty());
         assert!(
-            snapshot
+            !snapshot
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("usage disabled (code -32601)"))
+                .any(|warning| warning.contains("account/usage/read failed"))
         );
         assert!(
             snapshot

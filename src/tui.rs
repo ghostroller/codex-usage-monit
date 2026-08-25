@@ -1128,14 +1128,7 @@ fn account_refresh_is_complete(result: &CollectionResult) -> bool {
         .account
         .rate_limit_reset_credits
         .as_ref()
-        .is_some_and(|reset_credits| {
-            reset_credits.provenance == Provenance::ServerSnapshot
-                && (reset_credits.available_count == 0
-                    || reset_credits.credits.as_ref().is_some_and(|credits| {
-                        u64::try_from(credits.len()).unwrap_or(u64::MAX)
-                            >= reset_credits.available_count
-                    }))
-        });
+        .is_none_or(|reset_credits| reset_credits.provenance == Provenance::ServerSnapshot);
 
     account_limits_are_fresh(result)
         && !result.account.rate_limit_reset_credits_partial
@@ -1435,32 +1428,32 @@ impl App {
     }
 
     fn reset_credit_fetch_status(&self, now: Instant) -> Option<&'static str> {
-        let details_incomplete =
-            self.snapshot
-                .rate_limit_reset_credits
-                .as_ref()
-                .is_none_or(|reset_credits| {
-                    self.snapshot.rate_limit_reset_credits_partial
-                        || reset_credits.provenance != Provenance::ServerSnapshot
-                        || (reset_credits.available_count > 0
-                            && reset_credits.credits.as_ref().is_none_or(|credits| {
-                                u64::try_from(credits.len()).unwrap_or(u64::MAX)
-                                    < reset_credits.available_count
-                            }))
-                });
+        let reset_credits = self.snapshot.rate_limit_reset_credits.as_ref();
+        let details_incomplete = reset_credits.is_none_or(|reset_credits| {
+            self.snapshot.rate_limit_reset_credits_partial
+                || reset_credits.provenance != Provenance::ServerSnapshot
+        });
         if !details_incomplete {
             return None;
         }
-        if self.account_refresh_retry_count > 0 {
-            return Some("retrying");
-        }
+
         let awaiting_initial_refresh = self.snapshot.sources.iter().any(|source| {
             source.source == "app_server"
                 && source.status == "stale"
                 && source.message.as_deref() == Some("no cached account snapshot")
         });
-        (awaiting_initial_refresh && (self.worker_running || self.account_refresh_due(now)))
-            .then_some("loading")
+        if awaiting_initial_refresh {
+            if self.account_refresh_retry_count > 0 {
+                return Some("retrying");
+            }
+            return (self.worker_running || self.account_refresh_due(now)).then_some("loading");
+        }
+
+        let retryable = self.snapshot.rate_limit_reset_credits_partial
+            || reset_credits.is_some_and(|reset_credits| {
+                reset_credits.provenance != Provenance::ServerSnapshot
+            });
+        (retryable && self.account_refresh_retry_count > 0).then_some("retrying")
     }
 
     fn schedule_next_account_refresh(&mut self, result: &CollectionResult, now: Instant) {
@@ -5128,12 +5121,22 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let compact = area.height < 30;
     let base_quota_height = if compact { 3 } else { 5 };
     let quota_height = overview_quota_height(&app.snapshot, area.width, base_quota_height);
+    let app_server_failed = app_server_call_failed(&app.snapshot);
+    let notice_height = u16::from(app_server_failed);
     let mut constraints = vec![Constraint::Length(quota_height)];
     constraints.push(Constraint::Min(9));
+    if app_server_failed {
+        constraints.push(Constraint::Length(notice_height));
+    }
     if app.models_visible {
         let desired_height = if compact { 8 } else { 10 };
-        let model_height = if compact && quota_height > base_quota_height {
-            desired_height.min(area.height.saturating_sub(quota_height).saturating_sub(9))
+        let model_height = if compact && (quota_height > base_quota_height || app_server_failed) {
+            desired_height.min(
+                area.height
+                    .saturating_sub(quota_height)
+                    .saturating_sub(notice_height)
+                    .saturating_sub(9),
+            )
         } else {
             desired_height
         };
@@ -5167,6 +5170,10 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         render_turns(frame, body[1], app, true);
     } else {
         render_tasks(frame, task_area, app, true);
+    }
+    if app_server_failed {
+        render_app_server_failure_notice(frame, rows[row_index], app.theme);
+        row_index += 1;
     }
     if app.models_visible {
         render_models(frame, rows[row_index], app);
@@ -6895,15 +6902,52 @@ fn reset_expiry_gauge_inner_width(
 }
 
 fn overview_quota_height(snapshot: &Snapshot, area_width: u16, base_height: u16) -> u16 {
-    let Some(reminder) = reset_expiry_reminder(snapshot) else {
-        return base_height;
-    };
-    let Some(inner_width) = reset_expiry_gauge_inner_width(snapshot, area_width, reminder) else {
-        return base_height;
-    };
-    let alert_height = u16::try_from(reset_expiry_gauge_alert_lines(reminder, inner_width).len())
-        .unwrap_or(u16::MAX);
-    base_height.max(alert_height.saturating_mul(2).saturating_add(3))
+    reset_expiry_reminder(snapshot)
+        .and_then(|reminder| {
+            reset_expiry_gauge_inner_width(snapshot, area_width, reminder).map(|inner_width| {
+                let alert_height =
+                    u16::try_from(reset_expiry_gauge_alert_lines(reminder, inner_width).len())
+                        .unwrap_or(u16::MAX);
+                base_height.max(alert_height.saturating_mul(2).saturating_add(3))
+            })
+        })
+        .unwrap_or(base_height)
+}
+
+fn app_server_call_failed(snapshot: &Snapshot) -> bool {
+    snapshot
+        .warnings
+        .iter()
+        .any(|value| value.starts_with("app-server refresh failed:"))
+        || snapshot.sources.iter().any(|source| {
+            source.source == "app_server"
+                && (source.status == "error"
+                    || (source.status == "stale"
+                        && source.message.as_deref() != Some("no cached account snapshot")))
+        })
+}
+
+fn app_server_failure_message(width: u16) -> &'static str {
+    if width >= 59 {
+        "Unable to call codex app-server · try installing Codex CLI"
+    } else if width >= 37 {
+        "codex app-server failed · install CLI"
+    } else {
+        "app-server failed · CLI"
+    }
+}
+
+fn render_app_server_failure_notice(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    frame.render_widget(
+        Paragraph::new(app_server_failure_message(area.width))
+            .style(
+                Style::default()
+                    .fg(theme.palette().warning)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {

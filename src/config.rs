@@ -34,11 +34,15 @@ impl Default for CollectConfig {
             active_grace: Duration::from_secs(5 * 60),
             redact_content: false,
             offline: false,
-            app_server_timeout: Duration::from_secs(12),
+            app_server_timeout: default_app_server_timeout(cfg!(windows)),
             perf_log: PerfLog::default(),
             startup_trace: StartupTrace::default(),
         }
     }
+}
+
+fn default_app_server_timeout(windows: bool) -> Duration {
+    Duration::from_secs(if windows { 30 } else { 12 })
 }
 
 pub fn default_codex_home() -> PathBuf {
@@ -97,5 +101,11 @@ mod tests {
             ),
             override_path
         );
+    }
+
+    #[test]
+    fn windows_app_server_timeout_allows_for_cli_cold_start() {
+        assert_eq!(default_app_server_timeout(true), Duration::from_secs(30));
+        assert_eq!(default_app_server_timeout(false), Duration::from_secs(12));
     }
 }
