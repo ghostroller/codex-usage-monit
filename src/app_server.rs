@@ -78,7 +78,7 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     }
 
     let spawn_span = config.startup_trace.span("app_server.spawn");
-    let mut command = codex_command(config);
+    let mut command = codex_command(config).context("failed to resolve a runnable Codex CLI")?;
     if let Some(path) = config.app_server_path.as_deref() {
         command.env("PATH", path);
     }
@@ -308,13 +308,13 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     result
 }
 
-fn codex_command(config: &CollectConfig) -> Command {
+fn codex_command(config: &CollectConfig) -> Result<Command> {
     if let Some(codex_bin) = config.codex_bin.as_deref() {
-        return Command::new(codex_bin);
+        return Ok(Command::new(codex_bin));
     }
     #[cfg(not(windows))]
     {
-        Command::new("codex")
+        Ok(Command::new("codex"))
     }
     #[cfg(windows)]
     {
@@ -324,17 +324,12 @@ fn codex_command(config: &CollectConfig) -> Command {
             .or_else(|| env::var_os("PATH"))
             .unwrap_or_default();
         let monitor_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let discovered =
-            crate::session_launch::resolve_executable("codex", None, &path, &monitor_cwd).ok();
-        Command::new(select_windows_codex_program(
-            discovered,
-            installed_windows_codex_cli(),
-        ))
+        resolve_automatic_windows_codex_cli(&path, &monitor_cwd).map(Command::new)
     }
 }
 
 #[cfg(windows)]
-fn installed_windows_codex_cli() -> Option<PathBuf> {
+pub(crate) fn installed_windows_codex_cli() -> Option<PathBuf> {
     let path = PathBuf::from(env::var_os("LOCALAPPDATA")?)
         .join("OpenAI")
         .join("Codex")
@@ -344,16 +339,47 @@ fn installed_windows_codex_cli() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn select_windows_codex_program(
-    discovered: Option<PathBuf>,
+pub(crate) fn resolve_automatic_windows_codex_cli(
+    path: &OsStr,
+    monitor_cwd: &Path,
+) -> Result<PathBuf> {
+    resolve_automatic_windows_codex_cli_with_installed(
+        path,
+        monitor_cwd,
+        installed_windows_codex_cli(),
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_automatic_windows_codex_cli_with_installed(
+    path: &OsStr,
+    monitor_cwd: &Path,
     installed: Option<PathBuf>,
-) -> PathBuf {
-    match (discovered, installed) {
-        (Some(discovered), Some(installed)) if is_desktop_codex_resource(&discovered) => installed,
-        (Some(discovered), _) => discovered,
-        (None, Some(installed)) => installed,
-        (None, None) => PathBuf::from("codex"),
+) -> Result<PathBuf> {
+    match crate::session_launch::resolve_executable("codex", None, path, monitor_cwd) {
+        Ok(discovered) if !is_desktop_codex_resource(&discovered) => Ok(discovered),
+        Ok(packaged) => {
+            if let Some(installed) = installed {
+                return Ok(installed);
+            }
+            crate::session_launch::resolve_executable_matching(
+                "codex",
+                path,
+                monitor_cwd,
+                |candidate| !is_desktop_codex_resource(candidate),
+            )
+            .map_err(|_| anyhow!(desktop_cli_resource_message(&packaged)))
+        }
+        Err(error) => installed.ok_or_else(|| anyhow::Error::new(error)),
     }
+}
+
+#[cfg(windows)]
+fn desktop_cli_resource_message(path: &Path) -> String {
+    format!(
+        "found the {DESKTOP_CLI_RESOURCE_DIAGNOSTIC} at {}; Windows cannot launch it as a standalone Codex CLI. Install and sign in to the Codex CLI, use --codex-bin to select a runnable `codex.cmd` or `codex.exe`, or use --offline to monitor local rollout data",
+        path.display()
+    )
 }
 
 fn app_server_spawn_error(_program: &OsStr, error: io::Error) -> anyhow::Error {
@@ -364,10 +390,7 @@ fn app_server_spawn_error(_program: &OsStr, error: io::Error) -> anyhow::Error {
             && error.raw_os_error() == Some(5)
             && is_desktop_codex_resource(path)
         {
-            return anyhow!(
-                "found the {DESKTOP_CLI_RESOURCE_DIAGNOSTIC} at {}; Windows cannot launch it as a standalone Codex CLI. Install and sign in to the Codex CLI, use --codex-bin to select a runnable `codex.cmd` or `codex.exe`, or use --offline to monitor local rollout data: {error}",
-                path.display()
-            );
+            return anyhow!("{}: {error}", desktop_cli_resource_message(path));
         }
     }
 
@@ -1070,12 +1093,28 @@ fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
 
 #[cfg(test)]
 mod diagnostic_tests {
+    use std::path::PathBuf;
+
     use serde_json::json;
 
     use super::{
-        RPC_ERROR_MESSAGE_LIMIT, compact_diagnostic_text, format_rpc_error,
+        RPC_ERROR_MESSAGE_LIMIT, codex_command, compact_diagnostic_text, format_rpc_error,
         optional_usage_rpc_unavailable,
     };
+    use crate::config::CollectConfig;
+
+    #[test]
+    fn explicit_codex_bin_is_passed_directly_to_the_runtime_command() {
+        let codex_bin = PathBuf::from("relative tools/custom-codex.cmd");
+        let config = CollectConfig {
+            codex_bin: Some(codex_bin.clone()),
+            ..CollectConfig::default()
+        };
+
+        let command = codex_command(&config).unwrap();
+
+        assert_eq!(command.get_program(), codex_bin.as_os_str());
+    }
 
     #[test]
     fn unsupported_optional_usage_errors_are_recognized_without_matching_other_failures() {
@@ -1111,10 +1150,12 @@ mod diagnostic_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::env;
+    use std::fs;
     use std::io;
     use std::path::PathBuf;
 
-    use super::{app_server_spawn_error, select_windows_codex_program};
+    use super::{app_server_spawn_error, resolve_automatic_windows_codex_cli_with_installed};
 
     fn desktop_resource_path() -> PathBuf {
         PathBuf::from(
@@ -1162,32 +1203,84 @@ mod tests {
         assert!(!rendered.contains("Codex Desktop packaged resource"));
     }
 
-    #[test]
-    fn installed_windows_cli_replaces_only_the_desktop_packaged_resource() {
-        let desktop = desktop_resource_path();
-        let installed =
-            PathBuf::from(r"C:\Users\developer\AppData\Local\OpenAI\Codex\bin\codex.exe");
-        let path_cli = PathBuf::from(r"C:\tools\codex.cmd");
+    fn automatic_discovery_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        std::ffi::OsString,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let resources = temp
+            .path()
+            .join("WindowsApps")
+            .join("OpenAI.Codex_26.818.0.0_x64__test")
+            .join("app")
+            .join("resources");
+        let npm_bin = temp.path().join("npm-bin");
+        let installed_bin = temp.path().join("installed-bin");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&npm_bin).unwrap();
+        fs::create_dir_all(&installed_bin).unwrap();
+        let desktop = resources.join("codex.exe");
+        let npm = npm_bin.join("codex.cmd");
+        let installed = installed_bin.join("codex.exe");
+        fs::write(&desktop, b"").unwrap();
+        fs::write(&npm, "@echo off\r\nexit /b 0\r\n").unwrap();
+        fs::write(&installed, b"").unwrap();
+        let path = env::join_paths([resources, npm_bin]).unwrap();
+        (temp, desktop, npm, installed, path)
+    }
 
-        assert_eq!(
-            select_windows_codex_program(Some(desktop.clone()), Some(installed.clone())),
-            installed
-        );
-        assert_eq!(
-            select_windows_codex_program(Some(path_cli.clone()), Some(installed.clone())),
-            path_cli
-        );
-        assert_eq!(
-            select_windows_codex_program(None, Some(installed.clone())),
-            installed
-        );
-        assert_eq!(
-            select_windows_codex_program(Some(desktop.clone()), None),
-            desktop
-        );
-        assert_eq!(
-            select_windows_codex_program(None, None),
-            PathBuf::from("codex")
-        );
+    #[test]
+    fn automatic_discovery_skips_desktop_resource_for_later_cmd() {
+        let (temp, _desktop, npm, _installed, path) = automatic_discovery_fixture();
+
+        let resolved =
+            resolve_automatic_windows_codex_cli_with_installed(&path, temp.path(), None).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(npm).unwrap());
+    }
+
+    #[test]
+    fn automatic_discovery_prefers_installed_cli_after_desktop_resource() {
+        let (temp, _desktop, _npm, installed, path) = automatic_discovery_fixture();
+
+        let resolved = resolve_automatic_windows_codex_cli_with_installed(
+            &path,
+            temp.path(),
+            Some(installed.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, installed);
+    }
+
+    #[test]
+    fn automatic_discovery_keeps_a_runnable_path_cli_ahead_of_installed_fallback() {
+        let (temp, _desktop, npm, installed, _path) = automatic_discovery_fixture();
+        let npm_bin = npm.parent().unwrap();
+        let path = env::join_paths([npm_bin]).unwrap();
+
+        let resolved =
+            resolve_automatic_windows_codex_cli_with_installed(&path, temp.path(), Some(installed))
+                .unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(npm).unwrap());
+    }
+
+    #[test]
+    fn automatic_discovery_rejects_desktop_resource_without_an_alternative() {
+        let (temp, desktop, _npm, _installed, _path) = automatic_discovery_fixture();
+        let resources = desktop.parent().unwrap();
+        let path = env::join_paths([resources]).unwrap();
+
+        let error = resolve_automatic_windows_codex_cli_with_installed(&path, temp.path(), None)
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("Codex Desktop packaged resource"));
+        assert!(rendered.contains(&desktop.display().to_string()));
+        assert!(rendered.contains("--codex-bin"));
     }
 }

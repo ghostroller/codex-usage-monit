@@ -531,13 +531,45 @@ fn run_service(config: &CollectConfig, args: ServiceArgs, perf_log: Option<&Path
 fn resolve_service_codex(config: &CollectConfig) -> Result<PathBuf> {
     let current_dir = std::env::current_dir().map_err(anyhow::Error::from)?;
     let path = std::env::var_os("PATH").unwrap_or_default();
-    crate::session_launch::resolve_executable(
-        "codex",
-        config.codex_bin.as_deref(),
-        &path,
-        &current_dir,
-    )
-    .map_err(anyhow::Error::new)
+    #[cfg(windows)]
+    {
+        resolve_windows_service_codex(
+            config,
+            &path,
+            &current_dir,
+            crate::app_server::installed_windows_codex_cli(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        crate::session_launch::resolve_executable(
+            "codex",
+            config.codex_bin.as_deref(),
+            &path,
+            &current_dir,
+        )
+        .map_err(anyhow::Error::new)
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_service_codex(
+    config: &CollectConfig,
+    path: &std::ffi::OsStr,
+    current_dir: &Path,
+    installed: Option<PathBuf>,
+) -> Result<PathBuf> {
+    match config.codex_bin.as_deref() {
+        Some(codex_bin) => {
+            crate::session_launch::resolve_executable("codex", Some(codex_bin), path, current_dir)
+                .map_err(anyhow::Error::new)
+        }
+        None => crate::app_server::resolve_automatic_windows_codex_cli_with_installed(
+            path,
+            current_dir,
+            installed,
+        ),
+    }
 }
 
 fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
@@ -837,6 +869,41 @@ mod tests {
             let service = Cli::try_parse_from(["codex-usage-monit", "service", action]).unwrap();
             assert!(matches!(service.command, Some(Command::Service(_))));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_uses_shared_auto_discovery_but_honors_explicit_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let resources = temp
+            .path()
+            .join("WindowsApps")
+            .join("OpenAI.Codex_26.818.0.0_x64__test")
+            .join("app")
+            .join("resources");
+        let npm_bin = temp.path().join("npm-bin");
+        let installed_bin = temp.path().join("installed-bin");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(&npm_bin).unwrap();
+        std::fs::create_dir_all(&installed_bin).unwrap();
+        let desktop = resources.join("codex.exe");
+        let npm = npm_bin.join("codex.cmd");
+        let installed = installed_bin.join("codex.exe");
+        std::fs::write(&desktop, b"").unwrap();
+        std::fs::write(&npm, b"@echo off\r\nexit /b 0\r\n").unwrap();
+        std::fs::write(&installed, b"").unwrap();
+        let path = std::env::join_paths([resources, npm_bin]).unwrap();
+        let mut config = CollectConfig::default();
+
+        let automatic =
+            resolve_windows_service_codex(&config, &path, temp.path(), Some(installed.clone()))
+                .unwrap();
+        assert_eq!(automatic, installed);
+
+        config.codex_bin = Some(desktop.clone());
+        let explicit =
+            resolve_windows_service_codex(&config, &path, temp.path(), Some(installed)).unwrap();
+        assert_eq!(explicit, std::fs::canonicalize(desktop).unwrap());
     }
 
     #[test]

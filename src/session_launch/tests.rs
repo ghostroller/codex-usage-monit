@@ -84,6 +84,29 @@ fn explicit_executable_override_bypasses_pathext_discovery() {
     assert_eq!(resolved, fs::canonicalize(explicit).unwrap());
 }
 
+#[test]
+fn path_resolution_can_skip_an_unusable_earlier_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let rejected_bin = temp.path().join("rejected");
+    let accepted_bin = temp.path().join("accepted");
+    fs::create_dir_all(&rejected_bin).unwrap();
+    fs::create_dir_all(&accepted_bin).unwrap();
+    let rejected = executable_path(&rejected_bin, "codex");
+    let accepted = executable_path(&accepted_bin, "codex");
+    executable(&rejected);
+    executable(&accepted);
+    let rejected = fs::canonicalize(rejected).unwrap();
+    let accepted = fs::canonicalize(accepted).unwrap();
+    let path = env::join_paths([&rejected_bin, &accepted_bin]).unwrap();
+
+    let resolved = resolve_executable_matching("codex", &path, temp.path(), |candidate| {
+        candidate != rejected
+    })
+    .unwrap();
+
+    assert_eq!(resolved, accepted);
+}
+
 fn create_pane_script() -> &'static str {
     #[cfg(windows)]
     {

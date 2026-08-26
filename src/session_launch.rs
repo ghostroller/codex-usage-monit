@@ -768,11 +768,21 @@ pub(crate) fn resolve_executable(
             .map_err(|_| PrepareError::ExecutableUnavailable { name, path });
     }
 
+    resolve_executable_matching(name, path, monitor_cwd, |_| true)
+}
+
+pub(crate) fn resolve_executable_matching(
+    name: &'static str,
+    path: &OsStr,
+    monitor_cwd: &Path,
+    mut accepts: impl FnMut(&Path) -> bool,
+) -> Result<PathBuf, PrepareError> {
     for directory in env::split_paths(path) {
         let directory = absolute_from(&directory, monitor_cwd);
         for candidate in executable_candidates(&directory, name) {
             if is_executable_file(&candidate)
                 && let Ok(candidate) = fs::canonicalize(candidate)
+                && accepts(&candidate)
             {
                 return Ok(candidate);
             }
