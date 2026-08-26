@@ -1475,6 +1475,101 @@ fn reset_expiry_reminder_requires_a_current_codex_week_window() {
 }
 
 #[test]
+fn overview_orders_codex_quota_windows_before_other_buckets() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    app.snapshot.limits = vec![
+        LimitBucket {
+            limit_id: "base_model_inference".to_string(),
+            limit_name: Some("GPT reserve".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(
+                0.0,
+                Some(10_080),
+                Some(now + chrono::Duration::days(7)),
+            )),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+        LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: Some("Codex".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(
+                12.0,
+                Some(300),
+                Some(now + chrono::Duration::hours(5)),
+            )),
+            secondary: Some(LimitWindow::new(
+                34.0,
+                Some(10_080),
+                Some(now + chrono::Duration::days(6)),
+            )),
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+        LimitBucket {
+            limit_id: "codex_bengalfox".to_string(),
+            limit_name: Some("Codex Spark".to_string()),
+            plan_type: Some("test".to_string()),
+            primary: Some(LimitWindow::new(
+                0.0,
+                Some(300),
+                Some(now + chrono::Duration::hours(4)),
+            )),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        },
+    ];
+
+    let ordered = ordered_quota_windows(&app.snapshot);
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|(bucket, window)| (bucket.limit_id.clone(), window.label()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("codex".to_string(), "5h".to_string()),
+            ("codex".to_string(), "week".to_string()),
+            ("base_model_inference".to_string(), "week".to_string()),
+            ("codex_bengalfox".to_string(), "5h".to_string()),
+        ]
+    );
+
+    let width = 200;
+    let height = 5;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .unwrap();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 4); 4])
+        .split(Rect::new(0, 0, width, height));
+    let buffer = terminal.backend().buffer();
+    for (column, expected_title) in columns.iter().zip([
+        "5h · codex · SERVER",
+        "week · codex · SERVER",
+        "week · base_model_inference · SERVER",
+        "5h · codex_bengalfox · SERVER",
+    ]) {
+        let text = buffer_rect_text(buffer, *column);
+        assert!(
+            text.contains(expected_title),
+            "missing {expected_title:?} in reordered quota column: {text}"
+        );
+    }
+}
+
+#[test]
 fn weekly_gauge_renders_exact_reset_expiry_reminder() {
     for theme in [Theme::Dark, Theme::Light] {
         for width in [40, 60, 80, 120] {

@@ -6871,12 +6871,10 @@ fn is_reset_expiry_gauge(
         && window.resets_at == Some(reminder.weekly_reset_at)
 }
 
-fn reset_expiry_gauge_inner_width(
+fn ordered_quota_windows(
     snapshot: &Snapshot,
-    area_width: u16,
-    reminder: ResetExpiryReminder,
-) -> Option<u16> {
-    let windows = snapshot
+) -> Vec<(&crate::domain::LimitBucket, &crate::domain::LimitWindow)> {
+    let mut windows = snapshot
         .limits
         .iter()
         .flat_map(|bucket| {
@@ -6886,6 +6884,16 @@ fn reset_expiry_gauge_inner_width(
                 .map(move |window| (bucket, window))
         })
         .collect::<Vec<_>>();
+    windows.sort_by_key(|(bucket, _)| !bucket.limit_id.trim().eq_ignore_ascii_case("codex"));
+    windows
+}
+
+fn reset_expiry_gauge_inner_width(
+    snapshot: &Snapshot,
+    area_width: u16,
+    reminder: ResetExpiryReminder,
+) -> Option<u16> {
+    let windows = ordered_quota_windows(snapshot);
     let target = windows
         .iter()
         .position(|(bucket, window)| is_reset_expiry_gauge(bucket, window, reminder))?;
@@ -7341,16 +7349,7 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
     let palette = theme.palette();
     let reset_reminder = reset_expiry_reminder(snapshot);
     let mut reset_reminder_rendered = false;
-    let windows = snapshot
-        .limits
-        .iter()
-        .flat_map(|bucket| {
-            [bucket.primary.as_ref(), bucket.secondary.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(move |window| (bucket, window))
-        })
-        .collect::<Vec<_>>();
+    let windows = ordered_quota_windows(snapshot);
 
     if windows.is_empty() {
         frame.render_widget(
