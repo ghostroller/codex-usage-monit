@@ -4,10 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.8] - 2026-08-26
+
 ### Changed
 
 - Aligned Codex credit weighting with OpenAI's [August 21, 2026 token-based rate card](https://learn.chatgpt.com/docs/pricing): GPT-5.6 Sol and Daybreak Blue now use 100/10/500 input/cached-input/output credits per 1M tokens, while the unchanged Terra, Luna, GPT-5.5, GPT-5.4, GPT-5.4 mini, and Daybreak Red rows retain their published rates. Sol's promotional pricing is currently documented as available at least through November 21, 2026.
 - Added the current `daybreak-blue-latest` and `daybreak-red-latest` aliases plus the `gpt-5.6-cyber` model ID. The legacy `gpt-5.5-cyber` slug remains mapped to the Daybreak Red row, and GPT-5.3-Codex/GPT-5.2 mappings remain only for historical rollout compatibility rather than being described as current official rate-card rows.
+
+### Fixed
+
+- Restored Windows account-quota collection by preferring the installed standalone Codex CLI over the non-launchable Desktop packaged resource, using the current default stdio App Server transport, and allowing additional CLI cold-start time.
+- Treated an unavailable optional `account/usage/read` RPC as protocol-compatible, bounded external diagnostics, and kept a stable actionable App Server/CLI warning between the session panels and Models instead of letting transient refresh state consume the session area.
 
 ### Compatibility
 
@@ -143,7 +150,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.4...v0.2.5
