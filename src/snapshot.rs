@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
+use crate::api_cost::pricing_metadata;
 use crate::app_server::fetch_account_snapshot;
 use crate::attribution::{analyze_windows, project_five_hour_analysis};
 use crate::config::CollectConfig;
@@ -448,6 +449,10 @@ fn collect_snapshot_with_local(
     }
     let (models, attribution) =
         project_five_hour_analysis(&mut tasks, &mut turns, &window_analyses);
+    let api_equivalent_cost = window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 300)
+        .map(|analysis| analysis.api_equivalent_cost.clone());
     analysis_span.finish_with(|| {
         format!(
             "windows={} models={} tasks={} turns={}",
@@ -507,7 +512,9 @@ fn collect_snapshot_with_local(
 
     let result = CollectionResult {
         snapshot: Snapshot {
-            schema_version: 1,
+            schema_version: 2,
+            api_pricing: pricing_metadata(),
+            api_equivalent_cost,
             as_of: now,
             partial,
             codex_home: config.codex_home.clone(),
@@ -1536,8 +1543,30 @@ mod tests {
             "codex"
         );
         assert_eq!(analysis.attribution.local_token_usage.total_tokens, 300);
-        assert_eq!(analysis.threads.len(), 1);
-        assert_eq!(analysis.threads[0].thread_id, "regular");
+        assert_eq!(analysis.threads.len(), 2);
+        let regular = analysis
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == "regular")
+            .unwrap();
+        assert_eq!(regular.usage.token_usage.total_tokens, 300);
+        let spark = analysis
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == "spark")
+            .unwrap();
+        assert_eq!(spark.usage.token_usage.total_tokens, 0);
+        assert_eq!(spark.usage.estimated_quota_percent, 0.0);
+        assert_eq!(spark.usage.quota_confidence, Confidence::Unknown);
+        assert_eq!(spark.usage.api_equivalent_cost.observed_samples, 1);
+        assert_eq!(spark.usage.api_equivalent_cost.priced_samples, 0);
+        assert!(
+            analysis
+                .api_equivalent_cost
+                .model_breakdown
+                .iter()
+                .any(|model| model.model == "gpt-5.3-codex-spark")
+        );
         assert_eq!(analysis.models.len(), 1);
         assert_eq!(analysis.models[0].model, "gpt-5.6-sol");
         assert_close(analysis.models[0].estimated_quota_percent, 34.0);

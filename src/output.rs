@@ -5,8 +5,10 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
 
+use crate::api_cost::{format_api_cost_amount, format_api_equivalent_cost};
 use crate::domain::{
-    Confidence, LimitWindow, Provenance, Snapshot, TokenUsage, terminal_safe_text,
+    ApiCostAmount, Confidence, LimitWindow, Provenance, Snapshot, TokenUsage, WindowAnalysis,
+    terminal_safe_text,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +191,19 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
             }
         }
     }
+    if !request.sections.iter().any(|section| {
+        matches!(
+            section,
+            Section::Tasks
+                | Section::Turns
+                | Section::Models
+                | Section::Attribution
+                | Section::Windows
+        )
+    }) {
+        object.remove("apiPricing");
+        object.remove("apiEquivalentCost");
+    }
 
     if let Some(thread_id) = &request.thread_filter
         && let Some(Value::Array(turns)) = object.get_mut("turns")
@@ -198,6 +213,9 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
                 .and_then(Value::as_str)
                 .is_some_and(|value| value == thread_id)
         });
+        // The preferred top-level API total covers every local thread in the
+        // 5-hour window. Do not attach that global value to filtered rows.
+        object.remove("apiEquivalentCost");
     }
 
     if request.compact {
@@ -316,16 +334,27 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 &snapshot.attribution,
                 preferred_partial_reasons(snapshot),
             );
+            if let Some(analysis) = analysis_for_duration(snapshot, 300) {
+                render_api_equivalent_summary(&mut output, analysis);
+            }
         }
         let _ = writeln!(
             output,
-            "  {:<15} {:>12} {:>8} {:>8} {:<12}  TITLE",
-            "STATUS/EVIDENCE", "TOKENS", "TOKEN5H%", "EST.Q5H", "SOURCE"
+            "  {:<15} {:>12} {:>8} {:>8} {:>14} {:<12}  TITLE",
+            "STATUS/EVIDENCE", "TOKENS", "TOKEN5H%", "EST.Q5H", "API.EQ5H", "SOURCE"
         );
+        let five_hour = analysis_for_duration(snapshot, 300);
         for task in &snapshot.tasks {
+            let api_cost = five_hour.and_then(|analysis| {
+                analysis
+                    .threads
+                    .iter()
+                    .find(|usage| usage.thread_id == task.thread_id)
+                    .map(|usage| usage.usage.api_equivalent_cost)
+            });
             let _ = writeln!(
                 output,
-                "  {:<15} {:>12} {:>7.2}% {:>8} {:<12}  {}",
+                "  {:<15} {:>12} {:>7.2}% {:>8} {:>14} {:<12}  {}",
                 format!(
                     "{} {}",
                     task.status.label(),
@@ -334,6 +363,7 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 compact_tokens(task.token_usage),
                 task.local_token_share_percent,
                 estimated_percent(task.estimated_quota_percent, task.quota_confidence),
+                format_optional_api_cost(api_cost),
                 terminal_safe_text(task.source.as_deref().unwrap_or("unknown")),
                 terminal_safe_text(&task.title)
             );
@@ -348,27 +378,43 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 &snapshot.attribution,
                 preferred_partial_reasons(snapshot),
             );
+            if request.thread_filter.is_none()
+                && let Some(analysis) = analysis_for_duration(snapshot, 300)
+            {
+                render_api_equivalent_summary(&mut output, analysis);
+            }
         }
         let _ = writeln!(
             output,
-            "  {:<11} {:<16} {:<7} {:>12} {:>8} {:>8}  THREAD   MESSAGE",
-            "STATUS", "MODEL", "EFFORT", "TOKENS", "TOKEN%", "EST.Q%"
+            "  {:<11} {:<16} {:<7} {:>12} {:>8} {:>8} {:>14}  THREAD   MESSAGE",
+            "STATUS", "MODEL", "EFFORT", "TOKENS", "TOKEN%", "EST.Q%", "API.EQ5H"
         );
+        let five_hour = analysis_for_duration(snapshot, 300);
         for turn in snapshot.turns.iter().filter(|turn| {
             request
                 .thread_filter
                 .as_deref()
                 .is_none_or(|thread| thread == turn.thread_id)
         }) {
+            let api_cost = five_hour.and_then(|analysis| {
+                analysis
+                    .turns
+                    .iter()
+                    .find(|usage| {
+                        usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id
+                    })
+                    .map(|usage| usage.usage.api_equivalent_cost)
+            });
             let _ = writeln!(
                 output,
-                "  {:<11} {:<16} {:<7} {:>12} {:>7.2}% {:>8}  {}  {}",
+                "  {:<11} {:<16} {:<7} {:>12} {:>7.2}% {:>8} {:>14}  {}  {}",
                 turn.status.label(),
                 terminal_safe_text(turn.model.as_deref().unwrap_or("unknown")),
                 terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown")),
                 compact_tokens(turn.token_usage),
                 turn.local_token_share_percent,
                 estimated_percent(turn.estimated_quota_percent, turn.quota_confidence),
+                format_optional_api_cost(api_cost),
                 terminal_safe_text(short_id(&turn.thread_id)),
                 terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"))
             );
@@ -384,14 +430,18 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
                 preferred_partial_reasons(snapshot),
             );
         }
+        if let Some(analysis) = analysis_for_duration(snapshot, 300) {
+            render_api_equivalent_summary(&mut output, analysis);
+        }
         for model in &snapshot.models {
             let _ = writeln!(
                 output,
-                "  {:<24} {:>12}  {:>7.2}% token share  {:>8} estimated quota",
+                "  {:<24} {:>12}  {:>7.2}% token share  {:>8} estimated quota  {:>14} API equivalent",
                 terminal_safe_text(&model.model),
                 compact_tokens(model.token_usage),
                 model.local_token_share_percent,
-                estimated_percent(model.estimated_quota_percent, model.quota_confidence)
+                estimated_percent(model.estimated_quota_percent, model.quota_confidence),
+                format_api_cost_amount(model.api_equivalent_cost)
             );
         }
     }
@@ -414,6 +464,9 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
             attribution,
             preferred_partial_reasons(snapshot),
         );
+        if let Some(analysis) = analysis_for_duration(snapshot, 300) {
+            render_api_equivalent_summary(&mut output, analysis);
+        }
     }
 
     if request.sections.contains(&Section::Windows) {
@@ -511,6 +564,7 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             );
         }
         let _ = writeln!(output, "{}", attribution_quality_line(attribution));
+        render_api_equivalent_summary(output, analysis);
 
         if attribution.local_token_usage.is_zero()
             && analysis.threads.is_empty()
@@ -525,7 +579,9 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             .threads
             .iter()
             .filter(|thread| {
-                !thread.usage.token_usage.is_zero() || thread.usage.estimated_quota_percent > 0.0
+                !thread.usage.token_usage.is_zero()
+                    || thread.usage.estimated_quota_percent > 0.0
+                    || thread.usage.api_equivalent_cost.observed_samples > 0
             })
             .collect::<Vec<_>>();
         threads.sort_by(|left, right| {
@@ -540,8 +596,8 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(output, "  Tasks");
             let _ = writeln!(
                 output,
-                "    {:>8} {:>8} {:>12} {:<8}  TITLE",
-                "TOKEN%", "EST.Q%", "TOKENS", "THREAD"
+                "    {:>8} {:>8} {:>12} {:>14} {:<8}  TITLE",
+                "TOKEN%", "EST.Q%", "TOKENS", "API EQ.", "THREAD"
             );
             for thread in threads {
                 let title = snapshot
@@ -552,13 +608,14 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
                     .unwrap_or("-");
                 let _ = writeln!(
                     output,
-                    "    {:>8} {:>8} {:>12} {:<8}  {}",
+                    "    {:>8} {:>8} {:>12} {:>14} {:<8}  {}",
                     format!("{:.2}%", thread.usage.local_token_share_percent),
                     estimated_percent(
                         thread.usage.estimated_quota_percent,
                         thread.usage.quota_confidence
                     ),
                     compact_tokens(thread.usage.token_usage),
+                    format_api_cost_amount(thread.usage.api_equivalent_cost),
                     terminal_safe_text(short_id(&thread.thread_id)),
                     terminal_safe_text(title)
                 );
@@ -569,7 +626,9 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             .turns
             .iter()
             .filter(|turn| {
-                !turn.usage.token_usage.is_zero() || turn.usage.estimated_quota_percent > 0.0
+                !turn.usage.token_usage.is_zero()
+                    || turn.usage.estimated_quota_percent > 0.0
+                    || turn.usage.api_equivalent_cost.observed_samples > 0
             })
             .collect::<Vec<_>>();
         turns.sort_by(|left, right| {
@@ -585,8 +644,8 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(output, "  Turns");
             let _ = writeln!(
                 output,
-                "    {:>8} {:>8} {:>12} {:<16} {:<7} {:<17}  MESSAGE",
-                "TOKEN%", "EST.Q%", "TOKENS", "MODEL", "EFFORT", "THREAD/TURN"
+                "    {:>8} {:>8} {:>12} {:>14} {:<16} {:<7} {:<17}  MESSAGE",
+                "TOKEN%", "EST.Q%", "TOKENS", "API EQ.", "MODEL", "EFFORT", "THREAD/TURN"
             );
             for window_turn in turns {
                 let turn = snapshot.turns.iter().find(|turn| {
@@ -608,13 +667,14 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
                 );
                 let _ = writeln!(
                     output,
-                    "    {:>8} {:>8} {:>12} {:<16} {:<7} {:<17}  {}",
+                    "    {:>8} {:>8} {:>12} {:>14} {:<16} {:<7} {:<17}  {}",
                     format!("{:.2}%", window_turn.usage.local_token_share_percent),
                     estimated_percent(
                         window_turn.usage.estimated_quota_percent,
                         window_turn.usage.quota_confidence
                     ),
                     compact_tokens(window_turn.usage.token_usage),
+                    format_api_cost_amount(window_turn.usage.api_equivalent_cost),
                     terminal_safe_text(model),
                     terminal_safe_text(effort),
                     terminal_safe_text(&turn_ref),
@@ -639,20 +699,51 @@ fn render_window_analyses(output: &mut String, snapshot: &Snapshot) {
             let _ = writeln!(output, "  Models");
             let _ = writeln!(
                 output,
-                "    {:>8} {:>8} {:>12}  MODEL",
-                "TOKEN%", "EST.Q%", "TOKENS"
+                "    {:>8} {:>8} {:>12} {:>14}  MODEL",
+                "TOKEN%", "EST.Q%", "TOKENS", "API EQ."
             );
             for model in models {
                 let _ = writeln!(
                     output,
-                    "    {:>8} {:>8} {:>12}  {}",
+                    "    {:>8} {:>8} {:>12} {:>14}  {}",
                     format!("{:.2}%", model.local_token_share_percent),
                     estimated_percent(model.estimated_quota_percent, model.quota_confidence),
                     compact_tokens(model.token_usage),
+                    format_api_cost_amount(model.api_equivalent_cost),
                     terminal_safe_text(&model.model)
                 );
             }
         }
+    }
+}
+
+fn analysis_for_duration(snapshot: &Snapshot, duration_mins: i64) -> Option<&WindowAnalysis> {
+    snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == duration_mins)
+}
+
+fn format_optional_api_cost(cost: Option<ApiCostAmount>) -> String {
+    cost.map(format_api_cost_amount)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn render_api_equivalent_summary(output: &mut String, analysis: &WindowAnalysis) {
+    let cost = &analysis.api_equivalent_cost;
+    let _ = writeln!(
+        output,
+        "  API equivalent {}  model calls only  {:.1}% priced  rates {}",
+        format_api_equivalent_cost(cost),
+        cost.amount.priced_token_percent(),
+        terminal_safe_text(&analysis.api_pricing.rates_as_of)
+    );
+    if !cost.partial_reasons.is_empty() {
+        let _ = writeln!(
+            output,
+            "  API equivalent partial: {}",
+            terminal_safe_text(&cost.partial_reasons.join(", "))
+        );
     }
 }
 

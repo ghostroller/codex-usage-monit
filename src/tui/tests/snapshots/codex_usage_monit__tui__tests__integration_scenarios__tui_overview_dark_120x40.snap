@@ -4,7 +4,7 @@ expression: overview.frame().snapshot_text()
 ---
 size=120x40
 rows:
-00| 1 Overview  |  2 Trends  |  3 Other  | [V]Turns [M]Models [5h] [Week] [L]Long×
+00| 1 Overview  |  2 Trends  |  3 Other  | [V]Turns [M]Models [5h] [Week] [L]EST Long×
 01|┌5h · codex · SERVER───────────────────────────────────────┐┌week · codex · SERVER─────────────────────────────────────┐
 02|│██████████████████████                                    ││████████████████████████                                  │
 03|│█████████38% used | 62% left | reset 07-12 06:30          ││█████████42% used | 58% left | reset 07-16 04:30          │
@@ -29,7 +29,7 @@ rows:
 22|│                                                            │┌Turn detail · 1/2 · COMPLETED · 20m00s──────────────────┐
 23|│                                                            ││5h total=0 in=0 cache=0 out=0 reason=0                  │
 24|│                                                            ││all total=9000 in=7000 cache=2500 out=2000 reason=700   │
-25|│                                                            ││token.share=0.0% · est.quota=-                          │
+25|│                                                            ││share=0.0% · est=-                                      │
 26|│                                                            ││start=07-12 04:00:00 · end=07-12 04:20:00 · duration=20m│
 27|│                                                            ││turn=turn-main-2                                        │
 28|│                                                            ││message=Add deterministic TUI scenarios and snapshots   │
@@ -65,7 +65,7 @@ styles:
 00:065+001 fg=#3fb9c0 bg=#121417 mods=bold text="W"
 00:066+006 fg=#7e8691 bg=#121417 mods=none text="eek] ["
 00:072+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
-00:073+047 fg=#7e8691 bg=#121417 mods=none text="]Long×                                         "
+00:073+047 fg=#7e8691 bg=#121417 mods=none text="]EST Long×                                     "
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+019 fg=#f4f6f8 bg=#121417 mods=bold text="5h · codex · SERVER"
 01:020+041 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────┐┌"
@@ -205,7 +205,7 @@ styles:
 25:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 25:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 25:062+001 fg=#4b525c bg=#121417 mods=none text="│"
-25:063+056 fg=#dadee4 bg=#121417 mods=none text="token.share=0.0% · est.quota=-                          "
+25:063+056 fg=#dadee4 bg=#121417 mods=none text="share=0.0% · est=-                                      "
 25:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 26:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 26:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"

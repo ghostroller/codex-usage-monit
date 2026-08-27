@@ -1,8 +1,9 @@
 use super::*;
 use crate::domain::{
-    AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage,
-    RateLimitResetCredit, RateLimitResetCreditsSnapshot, SourceStatus, ThreadWindowUsage,
-    TurnWindowUsage, UsageCall, WindowAnalysis, WindowDescriptor, WindowUsage,
+    ApiCostAmount, ApiEquivalentCost, AttributionSummary, CollectionStats, LimitBucket,
+    LimitWindow, ModelUsage, PicoUsd, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
+    SourceStatus, ThreadWindowUsage, TurnWindowUsage, UsageCall, WindowAnalysis, WindowDescriptor,
+    WindowUsage,
 };
 use crate::history::{LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint};
 use ratatui::backend::TestBackend;
@@ -375,6 +376,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
             local_token_share_percent: 0.0,
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: Default::default(),
         })
         .collect();
     let mut turns = Vec::new();
@@ -411,6 +413,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 local_token_share_percent: turn_index as f64,
                 estimated_quota_percent: turn_index as f64 / 10.0,
                 quota_confidence: Confidence::Medium,
+                api_equivalent_cost: Default::default(),
             });
         }
     }
@@ -418,6 +421,8 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
         CollectionResult {
             snapshot: Snapshot {
                 schema_version: 1,
+                api_pricing: Default::default(),
+                api_equivalent_cost: Default::default(),
                 as_of: now,
                 partial: false,
                 codex_home: "/tmp/.codex".into(),
@@ -1147,6 +1152,18 @@ fn model_usage(model: &str, total_tokens: u64) -> ModelUsage {
         local_token_share_percent: 0.0,
         estimated_quota_percent: 0.0,
         quota_confidence: Confidence::Unknown,
+        api_equivalent_cost: Default::default(),
+    }
+}
+
+fn exact_api_cost(pico_usd: u128) -> ApiCostAmount {
+    ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(pico_usd),
+        maximum_pico_usd: PicoUsd::new(pico_usd),
+        observed_samples: 1,
+        priced_samples: 1,
+        observed_tokens: 100,
+        priced_tokens: 100,
     }
 }
 
@@ -1167,6 +1184,7 @@ fn add_window_analysis(
         local_token_share_percent: local_share_percent,
         estimated_quota_percent,
         quota_confidence: Confidence::Low,
+        api_equivalent_cost: Default::default(),
     };
     let thread_id = app.snapshot.tasks[0].thread_id.clone();
     let turn_id = app
@@ -1217,7 +1235,10 @@ fn add_window_analysis(
             local_token_share_percent: local_share_percent,
             estimated_quota_percent: usage.estimated_quota_percent,
             quota_confidence: usage.quota_confidence,
+            api_equivalent_cost: Default::default(),
         }],
+        api_equivalent_cost: Default::default(),
+        api_pricing: Default::default(),
         api_long_context: None,
     });
 }
@@ -1276,6 +1297,7 @@ fn add_spark_window_analysis(app: &mut App, scope: WindowScope, total_tokens: u6
         local_token_share_percent: 100.0,
         estimated_quota_percent: 1.25,
         quota_confidence: Confidence::Low,
+        api_equivalent_cost: Default::default(),
     };
     let window = analysis.attribution.window.as_mut().unwrap();
     window.limit_id = "codex_bengalfox".to_string();
@@ -1296,6 +1318,7 @@ fn add_spark_window_analysis(app: &mut App, scope: WindowScope, total_tokens: u6
         local_token_share_percent: 100.0,
         estimated_quota_percent: usage.estimated_quota_percent,
         quota_confidence: usage.quota_confidence,
+        api_equivalent_cost: Default::default(),
     }];
     app.snapshot.window_analyses.push(analysis);
 }
@@ -2392,6 +2415,42 @@ fn compact_models_table_uses_four_columns_without_confidence() {
 }
 
 #[test]
+fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
+    let analysis = &mut app.snapshot.window_analyses[0];
+    analysis.api_pricing = crate::api_cost::pricing_metadata();
+    analysis.api_equivalent_cost = ApiEquivalentCost {
+        amount: ApiCostAmount {
+            minimum_pico_usd: PicoUsd::new(1_234_500_000_000),
+            maximum_pico_usd: PicoUsd::new(1_234_500_000_000),
+            observed_samples: 2,
+            priced_samples: 1,
+            observed_tokens: 400,
+            priced_tokens: 300,
+        },
+        partial_reasons: vec!["api_price_model_unknown".to_string()],
+        model_breakdown: Vec::new(),
+    };
+    analysis.models[0].api_equivalent_cost = exact_api_cost(250_000_000_000);
+
+    let wide = render_models_content(&app.snapshot, 120, 12);
+    assert!(wide.contains("API equivalent $1.2345"));
+    assert!(wide.contains("model calls only"));
+    assert!(wide.contains("coverage 75.0%"));
+    assert!(wide.contains("rates 2026-08-27"));
+    assert!(wide.contains("API EQ."));
+    assert!(wide.contains("$0.2500"));
+
+    let compact = render_models_content(&app.snapshot, 80, 12);
+    assert!(compact.contains("API equivalent $1.2345"));
+    assert!(compact.contains("model calls only"));
+    assert!(compact.contains("coverage 75.0%"));
+    assert!(compact.contains("rates 2026-08-27"));
+    assert!(!compact.contains("API EQ."));
+}
+
+#[test]
 fn tui_ignores_bengalfox_analysis_for_rows_models_and_summary() {
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::Week, 150, 100.0);
@@ -2803,6 +2862,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 20.0,
             estimated_quota_percent: 2.0,
             quota_confidence: Confidence::High,
+            api_equivalent_cost: Default::default(),
         },
         WindowUsage {
             token_usage: TokenUsage {
@@ -2812,6 +2872,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 30.0,
             estimated_quota_percent: 3.0,
             quota_confidence: Confidence::Low,
+            api_equivalent_cost: Default::default(),
         },
         WindowUsage {
             token_usage: TokenUsage {
@@ -2821,6 +2882,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 10.0,
             estimated_quota_percent: 1.0,
             quota_confidence: Confidence::Medium,
+            api_equivalent_cost: Default::default(),
         },
     ];
     app.snapshot.window_analyses.push(WindowAnalysis {
@@ -2849,6 +2911,8 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             .collect(),
         turns: Vec::new(),
         models: Vec::new(),
+        api_equivalent_cost: Default::default(),
+        api_pricing: Default::default(),
         api_long_context: None,
     });
 
@@ -3849,13 +3913,31 @@ fn top_window_controls_keep_stable_compact_geometry() {
 #[test]
 fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules() {
     let mut app = interaction_test_app(1, 1);
+    app.snapshot.turns[0].turn_id = "01a00b37-eb69-7f23-9c43-03cba436f012".to_string();
+    app.snapshot.turns[0].message_preview = Some("visible message preview".to_string());
     add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    app.snapshot.api_pricing = crate::api_cost::pricing_metadata();
     let base = app.snapshot.window_analyses.first_mut().unwrap();
+    base.api_pricing = crate::api_cost::pricing_metadata();
+    base.api_equivalent_cost = ApiEquivalentCost {
+        amount: exact_api_cost(1_234_500_000_000),
+        partial_reasons: Vec::new(),
+        model_breakdown: Vec::new(),
+    };
+    base.models[0].api_equivalent_cost = exact_api_cost(250_000_000_000);
+    let mut partial_turn_cost = exact_api_cost(125_000_000_000);
+    partial_turn_cost.maximum_pico_usd = PicoUsd::new(250_000_000_000);
+    partial_turn_cost.observed_samples = 2;
+    partial_turn_cost.observed_tokens = 200;
+    base.turns[0].usage.api_equivalent_cost = partial_turn_cost;
     let mut api = base.clone();
     api.api_long_context = None;
     api.threads[0].usage.estimated_quota_percent = 17.0;
     api.turns[0].usage.estimated_quota_percent = 17.0;
     api.models[0].estimated_quota_percent = 17.0;
+    api.api_equivalent_cost.amount = exact_api_cost(9_000_000_000_000);
+    api.models[0].api_equivalent_cost = exact_api_cost(9_000_000_000_000);
+    api.turns[0].usage.api_equivalent_cost = exact_api_cost(9_000_000_000_000);
     base.api_long_context = Some(Box::new(api));
 
     assert!(!app.api_long_context_multiplier);
@@ -3882,6 +3964,20 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
 
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let initial_content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(initial_content.contains("[L]EST Long×"));
+    assert!(initial_content.contains("API equivalent $1.2345"));
+    assert!(initial_content.contains("$0.2500"));
+    assert!(initial_content.contains("share="));
+    assert!(initial_content.contains(" · est="));
+    assert!(initial_content.contains("api[5h]=$0.1250–$0.2500+ · cov=50.0%"));
+    assert!(initial_content.contains("turn=01a00b37… · message=visible message preview"));
     let toggle = app.window_controls_hitbox.unwrap().toggle_api_long_context;
     let shortcut = &terminal.backend().buffer()[(toggle.x + 1, toggle.y)];
     assert_eq!(shortcut.symbol(), "L");
@@ -3897,7 +3993,13 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(content.contains("Models · 5h · API Long ON"));
+    assert!(content.contains("Models · 5h · EST Long ON"));
+    assert!(content.contains("API equivalent $1.2345"));
+    assert!(content.contains("$0.2500"));
+    assert!(content.contains("share="));
+    assert!(content.contains(" · est="));
+    assert!(content.contains("api[5h]=$0.1250–$0.2500+ · cov=50.0%"));
+    assert!(!content.contains("$9.0000"));
     let toggle = app.window_controls_hitbox.unwrap().toggle_api_long_context;
     assert!(
         terminal.backend().buffer()[(toggle.x + 1, toggle.y)]
@@ -4714,7 +4816,7 @@ fn filtered_turn_rows_keep_selection_detail_mouse_and_scroll_in_sync() {
         .collect::<String>();
     assert!(content.contains("turn=turn-0-6"));
     assert!(content.contains("message=message 0/6"));
-    assert!(content.contains("est.quota="));
+    assert!(content.contains("est="));
     assert!(!content.contains("confidence="));
 
     app.turn_search = "no matching turn".to_string();
@@ -8328,6 +8430,8 @@ fn renders_all_views_at_common_terminal_sizes() {
         let now = chrono::Utc::now();
         let snapshot = Snapshot {
             schema_version: 1,
+            api_pricing: Default::default(),
+            api_equivalent_cost: Default::default(),
             as_of: now,
             partial: false,
             codex_home: "/tmp/.codex".into(),
@@ -8378,6 +8482,7 @@ fn renders_all_views_at_common_terminal_sizes() {
                 local_token_share_percent: 100.0,
                 estimated_quota_percent: 1.0,
                 quota_confidence: Confidence::Low,
+                api_equivalent_cost: Default::default(),
             }],
             turns: vec![TurnRecord {
                 thread_id: "task-thread".to_string(),
@@ -8401,6 +8506,7 @@ fn renders_all_views_at_common_terminal_sizes() {
                 local_token_share_percent: 100.0,
                 estimated_quota_percent: 1.0,
                 quota_confidence: Confidence::Low,
+                api_equivalent_cost: Default::default(),
             }],
             models: Vec::new(),
             attribution: AttributionSummary {

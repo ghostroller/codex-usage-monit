@@ -3280,6 +3280,7 @@ fn finish_dataset(
                 local_token_share_percent: 0.0,
                 estimated_quota_percent: 0.0,
                 quota_confidence: Confidence::Unknown,
+                api_equivalent_cost: Default::default(),
             });
         }
 
@@ -3310,6 +3311,7 @@ fn finish_dataset(
             local_token_share_percent: 0.0,
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: Default::default(),
         });
     }
 

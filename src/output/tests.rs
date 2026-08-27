@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{
-    AttributionSummary, CollectionStats, LimitBucket, ModelUsage, Provenance, RateLimitResetCredit,
+    ApiCostAmount, ApiEquivalentCost, ApiModelCost, ApiPricingMetadata, AttributionSummary,
+    CollectionStats, LimitBucket, ModelUsage, PicoUsd, Provenance, RateLimitResetCredit,
     RateLimitResetCreditsSnapshot, SourceStatus, TaskRecord, TaskStatus, ThreadWindowUsage,
     TurnRecord, TurnStatus, TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
@@ -180,9 +181,12 @@ fn partial_status_is_scoped_to_requested_sections() {
         local_token_share_percent: 100.0,
         estimated_quota_percent: 1.25,
         quota_confidence: Confidence::Medium,
+        api_equivalent_cost: Default::default(),
     };
     let snapshot = Snapshot {
         schema_version: 1,
+        api_pricing: Default::default(),
+        api_equivalent_cost: Default::default(),
         as_of: now,
         partial: true,
         codex_home: "/tmp/.codex".into(),
@@ -248,6 +252,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             local_token_share_percent: 0.0,
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: Default::default(),
         }],
         turns: vec![TurnRecord {
             thread_id: "task-thread".to_string(),
@@ -265,6 +270,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             local_token_share_percent: 0.0,
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: Default::default(),
         }],
         models: vec![ModelUsage {
             model: "gpt-test".to_string(),
@@ -272,6 +278,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             local_token_share_percent: 100.0,
             estimated_quota_percent: 1.25,
             quota_confidence: Confidence::Medium,
+            api_equivalent_cost: Default::default(),
         }],
         attribution: AttributionSummary {
             window: Some(WindowDescriptor {
@@ -319,7 +326,10 @@ fn partial_status_is_scoped_to_requested_sections() {
                 local_token_share_percent: 100.0,
                 estimated_quota_percent: 1.25,
                 quota_confidence: Confidence::Medium,
+                api_equivalent_cost: Default::default(),
             }],
+            api_equivalent_cost: Default::default(),
+            api_pricing: Default::default(),
             api_long_context: None,
         }],
         stats: CollectionStats::default(),
@@ -540,6 +550,193 @@ fn partial_status_is_scoped_to_requested_sections() {
     assert!(!models_text.contains("Medium"));
     assert!(!models_text.contains("confidence"));
 
+    let mut cost_snapshot = snapshot.clone();
+    cost_snapshot.partial = false;
+    cost_snapshot.errors.clear();
+    for source in &mut cost_snapshot.sources {
+        source.status = "ok".to_string();
+        source.message = None;
+    }
+    cost_snapshot.api_pricing = ApiPricingMetadata {
+        catalog_revision: 1,
+        rates_as_of: "2026-08-27".to_string(),
+        source_url: "https://developers.openai.com/api/docs/pricing".to_string(),
+        basis: "current_api_rates_model_tokens_only".to_string(),
+    };
+    let priced_amount = ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(438_000_000_000),
+        maximum_pico_usd: PicoUsd::new(438_000_000_000),
+        observed_samples: 1,
+        priced_samples: 1,
+        observed_tokens: 135_000,
+        priced_tokens: 135_000,
+    };
+    cost_snapshot.api_equivalent_cost = Some(ApiEquivalentCost {
+        amount: ApiCostAmount {
+            observed_samples: 2,
+            priced_samples: 1,
+            observed_tokens: 270_000,
+            priced_tokens: 135_000,
+            ..priced_amount
+        },
+        partial_reasons: vec!["api_price_model_unknown".to_string()],
+        model_breakdown: vec![ApiModelCost {
+            model: "gpt-test".to_string(),
+            amount: priced_amount,
+        }],
+    });
+    cost_snapshot.tasks[0].api_equivalent_cost = Some(priced_amount);
+    cost_snapshot.turns[0].api_equivalent_cost = Some(priced_amount);
+    cost_snapshot.models[0].api_equivalent_cost = priced_amount;
+    let cost_analysis = &mut cost_snapshot.window_analyses[0];
+    cost_analysis.duration_mins = 300;
+    cost_analysis.api_pricing = cost_snapshot.api_pricing.clone();
+    cost_analysis.api_equivalent_cost = ApiEquivalentCost {
+        amount: ApiCostAmount {
+            observed_samples: 2,
+            priced_samples: 1,
+            observed_tokens: 270_000,
+            priced_tokens: 135_000,
+            ..priced_amount
+        },
+        partial_reasons: vec!["api_price_model_unknown".to_string()],
+        model_breakdown: vec![ApiModelCost {
+            model: "gpt-test".to_string(),
+            amount: priced_amount,
+        }],
+    };
+    cost_analysis.models[0].api_equivalent_cost = priced_amount;
+    cost_analysis.threads[0].usage.api_equivalent_cost = priced_amount;
+    cost_analysis.turns[0].usage.api_equivalent_cost = priced_amount;
+    assert!(!request_is_partial(
+        &cost_snapshot,
+        &OutputRequest {
+            sections: BTreeSet::from([Section::Models]),
+            ..tasks.clone()
+        }
+    ));
+    let cost_text = render_output(
+        &cost_snapshot,
+        &OutputRequest {
+            format: OutputFormat::Text,
+            compact: false,
+            sections: BTreeSet::from([Section::Models]),
+            thread_filter: None,
+        },
+    )
+    .unwrap();
+    assert!(cost_text.contains("API equivalent $0.4380"));
+    assert!(cost_text.contains("model calls only"));
+    assert!(cost_text.contains("50.0% priced"));
+    assert!(cost_text.contains("api_price_model_unknown"));
+
+    let cost_json: Value = serde_json::from_str(
+        &render_output(
+            &cost_snapshot,
+            &OutputRequest {
+                format: OutputFormat::Json,
+                compact: true,
+                sections: BTreeSet::from([Section::Models]),
+                thread_filter: None,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cost_json["apiPricing"]["catalogRevision"], 1);
+    assert_eq!(cost_json["apiEquivalentCost"]["observedSamples"], 2);
+    assert!(
+        cost_json["apiEquivalentCost"]
+            .get("observedCalls")
+            .is_none()
+    );
+    assert_eq!(
+        cost_json["apiEquivalentCost"]["minimumPicoUsd"],
+        "438000000000"
+    );
+    assert_eq!(
+        cost_json["models"][0]["apiEquivalentCost"]["minimumPicoUsd"],
+        "438000000000"
+    );
+    assert_eq!(
+        cost_json["apiEquivalentCost"]["modelBreakdown"][0]["model"],
+        "gpt-test"
+    );
+    for section in [Section::Tasks, Section::Turns, Section::Attribution] {
+        let section_json: Value = serde_json::from_str(
+            &render_output(
+                &cost_snapshot,
+                &OutputRequest {
+                    format: OutputFormat::Json,
+                    compact: true,
+                    sections: BTreeSet::from([section]),
+                    thread_filter: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(section_json["apiEquivalentCost"]["pricedTokens"], 135_000);
+        assert!(section_json.get("apiPricing").is_some());
+    }
+    let tasks_json: Value = serde_json::from_str(
+        &render_output(
+            &cost_snapshot,
+            &OutputRequest {
+                format: OutputFormat::Json,
+                compact: true,
+                sections: BTreeSet::from([Section::Tasks]),
+                thread_filter: None,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        tasks_json["tasks"][0]["apiEquivalentCost"]["minimumPicoUsd"],
+        "438000000000"
+    );
+    let filtered_cost_request = OutputRequest {
+        format: OutputFormat::Json,
+        compact: true,
+        sections: BTreeSet::from([Section::Turns]),
+        thread_filter: Some("task-thread".to_string()),
+    };
+    let filtered_cost_json: Value =
+        serde_json::from_str(&render_output(&cost_snapshot, &filtered_cost_request).unwrap())
+            .unwrap();
+    assert!(filtered_cost_json.get("apiEquivalentCost").is_none());
+    assert_eq!(
+        filtered_cost_json["turns"][0]["apiEquivalentCost"]["minimumPicoUsd"],
+        "438000000000"
+    );
+    let filtered_cost_text = render_output(
+        &cost_snapshot,
+        &OutputRequest {
+            format: OutputFormat::Text,
+            ..filtered_cost_request
+        },
+    )
+    .unwrap();
+    assert!(!filtered_cost_text.contains("API equivalent $0.4380"));
+    assert!(filtered_cost_text.contains("API.EQ5H"));
+    assert!(filtered_cost_text.contains("$0.4380"));
+    let limits_only_json: Value = serde_json::from_str(
+        &render_output(
+            &cost_snapshot,
+            &OutputRequest {
+                format: OutputFormat::Json,
+                compact: true,
+                sections: BTreeSet::from([Section::Limits]),
+                thread_filter: None,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(limits_only_json.get("apiPricing").is_none());
+    assert!(limits_only_json.get("apiEquivalentCost").is_none());
+
     let mut five_hour_partial = snapshot.clone();
     five_hour_partial.partial = false;
     five_hour_partial.errors.clear();
@@ -727,6 +924,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         local_token_share_percent: 0.0,
         estimated_quota_percent: 0.0,
         quota_confidence: Confidence::Unknown,
+        api_equivalent_cost: Default::default(),
     });
     let filtered_turns = OutputRequest {
         sections: BTreeSet::from([Section::Turns]),

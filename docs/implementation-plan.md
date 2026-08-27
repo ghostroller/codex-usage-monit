@@ -8,7 +8,7 @@
 
 - `ratatui` + `crossterm`：TUI 与终端事件；
 - `clap`：CLI；
-- `serde` + `serde_json`：rollout、App Server 与 JSON v1；
+- `serde` + `serde_json`：rollout、App Server 与 JSON v2；
 - `chrono`：窗口与时间；
 - `walkdir`：受限目录发现；
 - `anyhow`：错误边界。
@@ -24,7 +24,7 @@ flowchart LR
   C --> D
   D --> E["Ratatui TUI"]
   D --> F["Text output"]
-  D --> G["JSON schema v1"]
+  D --> G["JSON schema v2"]
 ```
 
 模块：
@@ -101,9 +101,9 @@ turn/model metadata
 
 Task 来源先识别 subagent，再使用 `originator` 区分 desktop/cli，最后回退到 rollout `source`。Turn 的 reasoning effort 从 `turn_context` 保留到 JSON、text 和 TUI；窄 TUI 面板将 effort 前置合并到 model 单元格，Fast 标识始终追加在模型名称后。
 
-Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Tasks 底部始终渲染统一图例，空间足够时在右侧保留选中 task 的状态证据，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v1 使用 `messagePreview`。
+Recent tasks 和 Turns 不使用独立状态列，而以轻量行背景色及单字符标记表达状态；Tasks 底部始终渲染统一图例，空间足够时在右侧保留选中 task 的状态证据，并增加消息摘要列。Tasks/Turns 的点击选择与滚轮 viewport 独立，滚轮按 btop 的面板路由习惯每格移动 3 行；turn 选择按 `turn_id` 跨刷新保持，详情面板使用已有 TurnRecord 展示时间、时长、token breakdown 和归因指标。一次性 text 输出显示消息摘要，JSON schema v2 使用 `messagePreview`。
 
-Overview 维护独立 `WindowScope`，在最顶栏中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换；同一栏增加默认关闭的 `[L]Long×`，由 `L` 或整块按钮点击切换可选 API 长上下文口径。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope、同一估算口径读取，标题和列名不得硬编码成 5h。Trends 的 Weekly/15m `~EST` 图跟随倍率开关，原始 token 图不跟随。切换 scope 或口径保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容并保持基础口径。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
+Overview 维护独立 `WindowScope`，在最顶栏中用 `[5h]` / `[Week]`、键盘 `5` / `W` 或整块按钮点击切换；同一栏增加默认关闭的 `[L]EST Long×`，由 `L` 或整块按钮点击切换可选 API 长上下文口径。Tasks、Turns、Models、Models 内的 attribution 摘要和 turn detail 必须从同一 scope、同一估算口径读取，标题和列名不得硬编码成 5h。Trends 的 Weekly/15m `~EST` 图跟随倍率开关，原始 token 图不跟随。切换 scope 或口径保留搜索、来源筛选、键盘焦点，以及新 scope 中仍存在的 `thread_id` / `turn_id` 选择。独立 Attribution TUI 面板删除，但一次性 text/JSON 的 attribution 数据结构保持兼容并保持基础口径。快捷键字符按仓库 btop 风格规则单独渲染，文本输入焦点继续先消费可打印字符。
 
 TUI 单独维护 task 标题/项目名查询、`TaskSourceFilter` 和 `Focus` 状态，不写回 `Snapshot`。名称条件对 task 标题或 `cwd` basename 做大小写不敏感的子串匹配；过滤后的位置映射到 `snapshot.tasks` 的绝对索引，点击、滚动和键盘导航都经过同一映射，确保 Turns 始终绑定正确 thread。历史 `vscode` 来源作为 desktop-class 匹配 Desktop，其他未知来源只出现在 All；无匹配项时 selected thread 为空。顶部筛选控件复用 Tasks 面板边框，不占用 80x24 的数据行；长查询按 Unicode 显示宽度围绕光标水平裁剪。顶层视图 tab 每帧按 Ratatui 实际 padding/divider 计算鼠标 hitbox。
 
@@ -113,7 +113,7 @@ Turns 使用自己的查询、光标、取消恢复状态和筛选后索引投�
 
 Recent tasks 默认 Flat；`R` / `[R]Tree` 切换 Tree。过滤仍先得到绝对 task index 集合，Tree 只在该集合内为 `source=subagent` 的节点解析 parent 链，再生成带 Unicode connector 前缀的扁平显示投影；缺失/被过滤 parent 成为 orphan root，自引用边和会形成循环的 parent 边在构图时直接拒绝。每个子树使用其中最小的原始 recency position 作为排序 key，使最新 child 把父分支带到前面；该排序在折叠前完成，隐藏后代仍能推动分支。App 以 thread id 保存折叠集合，并在刷新时剔除已消失的 id；投影 DFS 在父节点折叠时记录并跳过完整后代集合，selection、viewport、mouse hitbox、scrollbar 与刷新锚点继续消费同一可见投影。大写 `E` / `[E]Collapse` 以空折叠集合构造当前过滤条件下的完整展开投影，再把所有 `has_children` 节点加入折叠集合，因此不会漏掉嵌套在已折叠祖先下的父节点；若这些节点已经全部折叠，则固定宽度标签切为 `[E]Expand` 并只从集合中移除当前过滤树的父节点。渲染折叠父行时，用父节点及隐藏后代对 `TokenUsage` 分量求和，并按当前 `codex` scope 的非 Spark 本地 token 分母重算 `TOKEN%` 与 estimated quota。展开行与 `Snapshot` 原始实体保持不变。拥有子节点的行保留固定宽度 `[-]` / `[+]` 区域，Tasks 焦点下由 `-` / `+` 操作，鼠标点击整块区域时先选择父节点再切换折叠状态。派生 depth 只属于投影，用于让真实 child 省略重复 project；被过滤 parent 的 orphan root 保持完整标签。
 
-Turns 与 Models 首次启动默认可见，`V` / `[V]Turns` 和 `M` / `[M]Models` 在最顶栏共同切换对应面板显隐；隐藏时主布局接管释放的空间，顶栏恢复入口与 scope、`[L]Long×` 控件保持可用。Models 使用单一外框，内容先渲染当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST，以及方法、external activity 与具体 partial reasons，再渲染无嵌套边框且不含 confidence 列的模型表；开启倍率时标题明确标记 `API Long ON`，即使模型为空，unavailable/归因信息仍然存在。Other 保留 Sources、Collection 和 Diagnostics，并新增 `ITEM / STATE / GRANTED / RESET TIME` 表：先显示重置机会明细，再按 bucket 展开所有 primary/secondary 窗口；`RESET TIME` 使用本地完整日期、秒和 UTC offset，宽布局的 `GRANTED` 同样完整，窄布局只缩短 `GRANTED`。窗口缺值显示 unavailable，机会永不过期显示 never。标题单独显示 `availableCount`、provenance，以及 `DETAILS UNAVAILABLE`、正常截断的 `SHOWING n/N` 与异常 `PARTIAL` 状态。其他额度桶仍不进入 Models attribution。
+Turns 与 Models 首次启动默认可见，`V` / `[V]Turns` 和 `M` / `[M]Models` 在最顶栏共同切换对应面板显隐；隐藏时主布局接管释放的空间，顶栏恢复入口与 scope、`[L]EST Long×` 控件保持可用。Models 使用单一外框，内容先渲染当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST，以及方法、external activity 与具体 partial reasons，再渲染无嵌套边框且不含 confidence 列的模型表；开启倍率时标题明确标记 `EST Long ON`，即使模型为空，unavailable/归因信息仍然存在。Other 保留 Sources、Collection 和 Diagnostics，并新增 `ITEM / STATE / GRANTED / RESET TIME` 表：先显示重置机会明细，再按 bucket 展开所有 primary/secondary 窗口；`RESET TIME` 使用本地完整日期、秒和 UTC offset，宽布局的 `GRANTED` 同样完整，窄布局只缩短 `GRANTED`。窗口缺值显示 unavailable，机会永不过期显示 never。标题单独显示 `availableCount`、provenance，以及 `DETAILS UNAVAILABLE`、正常截断的 `SHOWING n/N` 与异常 `PARTIAL` 状态。其他额度桶仍不进入 Models attribution。
 
 非搜索状态的 `Esc` 打开覆盖式退出确认弹窗，弹窗吞掉底层键鼠事件，`Enter` 确认、`Esc` 取消；`Ctrl-C` 和既有 `q` 仍直接退出。搜索输入状态继续优先消费 `Esc`，只恢复编辑前查询。
 
@@ -129,7 +129,7 @@ TUI 颜色集中到 dark/light palette；首次运行默认 dark，CLI 的 `--th
 
 Exact 部分：按窗口时间筛选本地 token events，聚合到 model、turn、task。
 
-Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage；同一 duration 最多一个普通 `codex` 分析。`windows` 子命令和 `snapshot --section windows` 输出该结构。可用重置机会以可选的 `rateLimitResetCredits` 只随 Limits section 输出，保留 `availableCount`、`credits`、provenance 和 as-of；`credits: null` 与 `[]` 分别表示明细未知和已获取空列表，明细少于 count 表示服务端截断。整个账户刷新失败时旧 count 和明细一起保留并标为 stale；成功响应的 summary、`null` 或 `[]` 都是 fresh 事实，不回填旧 summary/明细。旧 summary JSON 缺少 `credits` 时按 `null` 反序列化兼容。为保持 JSON v1 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution` 和旧 summary 字段继续保留；首选字段固定投影 5h `codex` 分析，没有可用 5h 时保持 unavailable/empty，绝不投影 Week。TUI/text 的展示简化不改变 `statusConfidence`、各层 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
+Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `partial` / `partialReasons`，以及按 task/turn/model 聚合的 usage；同一 duration 最多一个普通 `codex` 分析。`windows` 子命令和 `snapshot --section windows` 输出该结构。可用重置机会以可选的 `rateLimitResetCredits` 只随 Limits section 输出，保留 `availableCount`、`credits`、provenance 和 as-of；`credits: null` 与 `[]` 分别表示明细未知和已获取空列表，明细少于 count 表示服务端截断。整个账户刷新失败时旧 count 和明细一起保留并标为 stale；成功响应的 summary、`null` 或 `[]` 都是 fresh 事实，不回填旧 summary/明细。旧 summary JSON 缺少 `credits` 时按 `null` 反序列化兼容。为保持既有 JSON 消费者兼容，原有 task/turn 的 `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence`，以及顶层 `models`、`attribution` 和旧 summary 字段继续保留；首选字段固定投影 5h `codex` 分析，没有可用 5h 时保持 unavailable/empty，绝不投影 Week。schema v2 另增 `apiPricing` 与窗口/实体 `apiEquivalentCost`。TUI/text 的展示简化不改变 `statusConfidence`、各层 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
 
 本地可观察 token 占比只有在 rollout 扫描覆盖窗口起点且数据完整时才标为 exact。采集器除现有 truncated/unreadable/skipped/counter-reset 检查外，还比较 `--days` cutoff 与各 scope 的 `startsAt`；lookback 不足时只将对应分析标为 partial，limits gauge 仍可保持服务端完整。完整扫描下 `TOKENWK%` 可精确结算，quota share 仍走 estimated 口径。
 
@@ -139,7 +139,7 @@ Estimated 部分：
 2. `TOKEN%` 对 task/turn/model 分别计算原始 `entity_non_spark_tokens / all_local_non_spark_tokens`；
 3. EST 按 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing) 映射 input、cached input、output credits / 1M tokens；精确支持 `gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、Daybreak Blue 的 `daybreak-blue-latest`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、Daybreak Red 的 `daybreak-red-latest` 与 `gpt-5.6-cyber`、历史兼容 `gpt-5.5-cyber`、`gpt-5.4` 和 `gpt-5.4-mini`；Sol 使用 2026-08-21 起的 `(100,10,500)` 调整后费率，促销期按官方说明至少持续到 2026-11-21。当前官方卡不再列出的 `gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仅保留早期兼容权重；精确 Spark 模型因 research-preview 费率而排除，未知非 Spark 模型按 GPT-5.6 Luna 后备并标 partial；
 4. `fast` 与本地登录态 rollout 中兼容的 `priority` service tier 都作为 ChatGPT Fast；按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 对 GPT-5.6/GPT-5.5 family 应用 `2.5x`，对 GPT-5.4 family 应用 `2x`，不支持 Fast 的已知模型保持 Standard；该兼容行为不等同于官方另行计费的 API Priority；
-5. 每次调用先计算不含 API 长上下文倍率的基础 credit units；再对官方 API 明确支持的 GPT-5.6 Sol/Terra/Luna/Cyber、GPT-5.5 与 GPT-5.4 profile，只在 `last_token_usage` 与安全累计 delta 完全相等且单次 input 严格超过 272K 时，另算 input/cached `2x` 与 output `1.5x` 产生的 optional extra。recorder 同时保存基础值与 extra，TUI `[L]Long×` 关闭时选基础值、开启时选两者之和；多个短请求的累计值不得误触发。只有可选口径开启时，单次边界未知且累计 input 超过阈值才增加 `long_context_usage_unknown`；Codex credit 卡未公布相同逐请求公式，界面与文档不得把它称为官方 credit 账单；
+5. 每次调用先计算不含 API 长上下文倍率的基础 credit units；再对官方 API 明确支持的 GPT-5.6 Sol/Terra/Luna/Cyber、GPT-5.5 与 GPT-5.4 profile，只在 `last_token_usage` 与安全累计 delta 完全相等且单次 input 严格超过 272K 时，另算 input/cached `2x` 与 output `1.5x` 产生的 optional extra。recorder 同时保存基础值与 extra，TUI `[L]EST Long×` 关闭时选基础值、开启时选两者之和；多个短请求的累计值不得误触发。只有可选口径开启时，单次边界未知且累计 input 超过阈值才增加 `long_context_usage_unknown`；Codex credit 卡未公布相同逐请求公式，界面与文档不得把它称为官方 credit 账单；
 6. 解析并累计 `cache_write_input_tokens`，但它是 input 子集，不重复计入 token 或 credit。当前 Codex credit 卡没有 cache-write 行，因此公式不增加 API cache-write charge；reasoning 仍是 output 子集；
 7. 将 rate card 按统一比例转为整数 credit units，计算 `estimatedQuotaPercent = usedPercent * entityCreditUnits / allCreditUnits`；
 8. 所有可用实体结果在 Snapshot/JSON 中标为 Low；TUI/text 只用 `~`/`-`，不显示独立 quota confidence；
@@ -166,7 +166,7 @@ Estimated 部分：
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry，以及账户刷新失败时 reset-credit 明细 stale 保留、成功 fresh null/空明细不回填旧数据；
 - attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、含 `gpt-5.6` Sol 别名和当前 Daybreak aliases/IDs 的完整 token-based credit 费率矩阵、`fast`/`priority` 与 Standard、严格 `>272K` 的逐请求可选长上下文倍率、基础/optional-extra 双投影、关闭时不传播长上下文未知 partial、cache-write 子集、Spark 精确模型名大小写不敏感排除、缺失模型的 Luna 后备、task/turn/model 公式求和、estimator revision 5、history metric revision 3、扫描范围内 rollout 重建与 revision-aware upsert、released revision 3 保留、development revision 4 丢弃及混合 revision 隔离、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
 - output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、Limits 范围内的 `rateLimitResetCredits` camelCase/section scoping、旧 summary 无 `credits` 兼容、null/空数组区分、`expiresAt: null` 文本显示 never、可用 EST 的 `~`、不可用的 `-`、无独立 quota-confidence 文本、scope 级 method/external/partial reasons、旧 confidence/5h attribution schema 兼容、section partial/failure、broken pipe、help/usage；
-- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、三个顶层视图 tab 点击、Other 的多 bucket Resets、primary/secondary、完整本地 reset time 与缺失值、reset credits 的正数/零/unavailable/stale、null/空/截断明细、granted/reset time、never、未知状态与控制字符清洗、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` / `[L]Long×` 的键盘与整块鼠标 hitbox、默认 off 与状态 round-trip、搜索输入优先消费 `l`、非 Overview 不误触发、scope/倍率切换同步 Tasks/Turns/Models/归因摘要和 Trends EST 图、原始 token 图不受倍率影响、Turns/Models 显隐与布局回收、Tasks 底部图例在 Turns 收起时仍可见、Models 无 CONF 列、turn 详情无 quota-confidence 文本、scope summary 在 compact/wide 下保留 method/external/partial reasons、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
+- TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、三个顶层视图 tab 点击、Other 的多 bucket Resets、primary/secondary、完整本地 reset time 与缺失值、reset credits 的正数/零/unavailable/stale、null/空/截断明细、granted/reset time、never、未知状态与控制字符清洗、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` / `[L]EST Long×` 的键盘与整块鼠标 hitbox、默认 off 与状态 round-trip、搜索输入优先消费 `l`、非 Overview 不误触发、scope/倍率切换同步 Tasks/Turns/Models/归因摘要和 Trends EST 图、原始 token 图不受倍率影响、Turns/Models 显隐与布局回收、Tasks 底部图例在 Turns 收起时仍可见、Models 无 CONF 列、turn 详情无 quota-confidence 文本、scope summary 在 compact/wide 下保留 method/external/partial reasons、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 
 ## 9. 已完成阶段
 

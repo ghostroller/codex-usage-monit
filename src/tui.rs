@@ -45,6 +45,7 @@ use text::{
     truncate_display_text, truncate_middle_display_text,
 };
 
+use crate::api_cost::{format_api_cost_amount, format_api_equivalent_cost};
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, AttributionSummary, Confidence, ModelUsage, Provenance, Snapshot, TaskRecord,
@@ -678,6 +679,7 @@ fn task_usage_for_scope_with_api_long_context(
             local_token_share_percent: task.local_token_share_percent,
             estimated_quota_percent: task.estimated_quota_percent,
             quota_confidence: task.quota_confidence,
+            api_equivalent_cost: task.api_equivalent_cost.unwrap_or_default(),
         }
     } else {
         WindowUsage::default()
@@ -706,6 +708,7 @@ fn turn_usage_for_scope_with_api_long_context(
             local_token_share_percent: turn.local_token_share_percent,
             estimated_quota_percent: turn.estimated_quota_percent,
             quota_confidence: turn.quota_confidence,
+            api_equivalent_cost: turn.api_equivalent_cost.unwrap_or_default(),
         }
     } else {
         WindowUsage::default()
@@ -727,6 +730,7 @@ fn task_record_usage(
             local_token_share_percent: task.local_token_share_percent,
             estimated_quota_percent: task.estimated_quota_percent,
             quota_confidence: task.quota_confidence,
+            api_equivalent_cost: Default::default(),
         }
     }
 }
@@ -771,6 +775,9 @@ fn aggregate_task_row_usage_with_api_long_context(
             aggregate.token_usage.add_assign(thread.usage.token_usage);
             aggregate.local_token_share_percent += thread.usage.local_token_share_percent;
             aggregate.estimated_quota_percent += thread.usage.estimated_quota_percent;
+            aggregate
+                .api_equivalent_cost
+                .add_assign(thread.usage.api_equivalent_cost);
             if quota_estimate_participates(&thread.usage) {
                 quota_confidence = Some(match quota_confidence {
                     None => thread.usage.quota_confidence,
@@ -799,6 +806,9 @@ fn aggregate_task_row_usage_with_api_long_context(
         aggregate.token_usage.add_assign(usage.token_usage);
         aggregate.local_token_share_percent += usage.local_token_share_percent;
         aggregate.estimated_quota_percent += usage.estimated_quota_percent;
+        aggregate
+            .api_equivalent_cost
+            .add_assign(usage.api_equivalent_cost);
         if quota_estimate_participates(&usage) {
             quota_confidence = Some(match quota_confidence {
                 None => usage.quota_confidence,
@@ -4692,7 +4702,9 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         .map(|view| tabs.tabs[view.index()].right())
         .unwrap_or(area.x);
     let remaining = usize::from(area.right().saturating_sub(start_x));
-    let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week] [L]Long×");
+    let full_long_context_label = "[L]EST Long×";
+    let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week] ")
+        + UnicodeWidthStr::width(full_long_context_label);
     let compact = remaining < full_width;
     let separator = if compact { " " } else { TAB_DIVIDER };
     let gap = if compact { "" } else { " " };
@@ -4819,7 +4831,11 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         x = x.saturating_add(width);
     }
 
-    let api_long_context_label = if compact { "[L]" } else { "[L]Long×" };
+    let api_long_context_label = if compact {
+        "[L]"
+    } else {
+        full_long_context_label
+    };
     let api_long_context_width =
         u16::try_from(UnicodeWidthStr::width(api_long_context_label)).unwrap_or(u16::MAX);
     let mut toggle_api_long_context = Rect::default();
@@ -4850,7 +4866,10 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         };
         spans.push(Span::styled("[", style));
         spans.push(Span::styled("L", shortcut_style));
-        spans.push(Span::styled(if compact { "]" } else { "]Long×" }, style));
+        spans.push(Span::styled(
+            if compact { "]" } else { "]EST Long×" },
+            style,
+        ));
     }
 
     frame.render_widget(
@@ -6061,7 +6080,7 @@ fn render_weekly_estimated_trend_panel(
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
     let base_title = if data.api_long_context_multiplier {
-        "Weekly ~EST Usage · API Long ON"
+        "Weekly ~EST Usage · EST Long ON"
     } else {
         "Weekly ~EST Usage"
     };
@@ -6157,7 +6176,7 @@ fn render_half_hour_estimated_trend_panel(
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
     let base_title = if data.api_long_context_multiplier {
-        "15m ~EST Usage · API Long ON"
+        "15m ~EST Usage · EST Long ON"
     } else {
         "15m ~EST Usage"
     };
@@ -8587,12 +8606,20 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         let selected_turn = turns.get(app.selected_turn).copied();
         let selected_usage = selected_turn
             .map(|turn| {
-                turn_usage_for_scope_with_api_long_context(
+                let mut usage = turn_usage_for_scope_with_api_long_context(
                     &app.snapshot,
                     detail_scope,
                     turn,
                     app.api_long_context_multiplier,
+                );
+                usage.api_equivalent_cost = turn_usage_for_scope_with_api_long_context(
+                    &app.snapshot,
+                    detail_scope,
+                    turn,
+                    false,
                 )
+                .api_equivalent_cost;
+                usage
             })
             .unwrap_or_default();
         render_turn_detail(
@@ -8697,24 +8724,52 @@ fn render_turn_detail(
         },
         quota_confidence,
     );
-    let lines = vec![
-        Line::from(first_tokens),
-        Line::from(second_tokens),
-        Line::from(format!(
-            "token.share={:.1}% · est.quota={}",
-            if window_only {
-                selected_window_usage.local_token_share_percent
-            } else {
-                turn.local_token_share_percent
-            },
-            estimated_quota
-        )),
-        Line::from(format!(
-            "start={started} · end={completed} · duration={duration}"
-        )),
-        Line::from(format!("turn={}", terminal_safe_text(&turn.turn_id))),
-        Line::from(format!("message={message}")),
-    ];
+    let local_share_percent = if window_only {
+        selected_window_usage.local_token_share_percent
+    } else {
+        turn.local_token_share_percent
+    };
+    let quota_allocation = format!("share={local_share_percent:.1}% · est={estimated_quota}");
+    let allocation_lines = if selected_window_usage.api_equivalent_cost.observed_samples > 0 {
+        let api_cost = selected_window_usage.api_equivalent_cost;
+        let coverage = if api_cost.priced_samples < api_cost.observed_samples
+            || api_cost.priced_tokens < api_cost.observed_tokens
+        {
+            format!(" · cov={:.1}%", api_cost.priced_token_percent())
+        } else {
+            String::new()
+        };
+        let api_allocation = format!(
+            "api[{}]={}{}",
+            window_scope.label(),
+            format_api_cost_amount(api_cost),
+            coverage,
+        );
+        let combined = format!("{quota_allocation} · {api_allocation}");
+        if UnicodeWidthStr::width(combined.as_str()) <= content_width {
+            vec![Line::from(combined)]
+        } else {
+            vec![Line::from(quota_allocation), Line::from(api_allocation)]
+        }
+    } else {
+        vec![Line::from(quota_allocation)]
+    };
+    let split_allocation = allocation_lines.len() > 1;
+    let mut lines = vec![Line::from(first_tokens), Line::from(second_tokens)];
+    lines.extend(allocation_lines);
+    lines.push(Line::from(format!(
+        "start={started} · end={completed} · duration={duration}"
+    )));
+    let turn_id = terminal_safe_text(&turn.turn_id);
+    if split_allocation {
+        let compact_turn_id = truncate_display_text(&turn_id, 9);
+        lines.push(Line::from(format!(
+            "turn={compact_turn_id} · message={message}"
+        )));
+    } else {
+        lines.push(Line::from(format!("turn={turn_id}")));
+        lines.push(Line::from(format!("message={message}")));
+    }
     let block = panel(&title, theme).title_bottom(Line::from(bottom_title));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -8878,6 +8933,20 @@ fn attribution_summary_lines(
     vec![format!("Attribution  {window}"), allocation, quality]
 }
 
+fn api_equivalent_summary_line(analysis: &WindowAnalysis) -> Option<String> {
+    let rates_as_of = analysis.api_pricing.rates_as_of.trim();
+    if analysis.api_pricing.catalog_revision == 0 || rates_as_of.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "API equivalent {} · model calls only · coverage {:.1}% · rates {}",
+        format_api_equivalent_cost(&analysis.api_equivalent_cost),
+        analysis.api_equivalent_cost.amount.priced_token_percent(),
+        terminal_safe_text(rates_as_of),
+    ))
+}
+
 #[cfg(test)]
 fn models_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Vec<ModelUsage> {
     models_for_scope_with_api_long_context(snapshot, scope, false)
@@ -8912,6 +8981,9 @@ fn wrapped_text_height(lines: &[String], width: usize) -> usize {
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
+    // API-equivalent cost always follows the published API pricing rules. The
+    // optional long-context switch changes only the Codex quota estimate.
+    let api_cost_analysis = window_analysis(&app.snapshot, window_scope);
     let analysis = window_analysis_with_api_long_context(
         &app.snapshot,
         window_scope,
@@ -8936,19 +9008,25 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     });
 
     let panel_inner = Block::default().borders(Borders::ALL).inner(area);
+    let compact = panel_inner.width < 100;
+    let api_summary_line = api_cost_analysis.and_then(api_equivalent_summary_line);
+    let show_api_cost_column = !compact && api_summary_line.is_some();
     let selected_partial = analysis
         .map(|analysis| analysis.partial)
         .unwrap_or(window_scope == WindowScope::FiveHours && app.snapshot.partial);
     let partial_reasons = analysis
         .map(|analysis| analysis.partial_reasons.as_slice())
         .unwrap_or_default();
-    let attribution_lines = attribution_summary_lines(
+    let mut attribution_lines = attribution_summary_lines(
         attribution,
         window_scope,
         selected_partial,
         partial_reasons,
-        panel_inner.width < 100,
+        compact,
     );
+    if let Some(api_summary_line) = api_summary_line {
+        attribution_lines.insert(attribution_lines.len().min(2), api_summary_line);
+    }
     let attribution_height = u16::try_from(wrapped_text_height(
         &attribution_lines,
         usize::from(panel_inner.width),
@@ -8967,7 +9045,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .map(|window| window.label.clone());
     let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
     if app.api_long_context_multiplier {
-        title_suffix.push_str(" · API Long ON");
+        title_suffix.push_str(" · EST Long ON");
     }
     if attribution.is_none() {
         title_suffix.push_str(" unavailable");
@@ -9014,30 +9092,51 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let rows = models.iter().take(visible_capacity).map(|model| {
-        Row::new([
-            Cell::from(terminal_safe_text(&model.model)),
-            Cell::from(format_tokens(model.token_usage)),
-            Cell::from(format!("{:.1}%", model.local_token_share_percent)),
-            Cell::from(format_estimated_quota(
-                model.estimated_quota_percent,
-                model.quota_confidence,
-            )),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(18),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ],
-    )
-    .header(table_header(
-        ["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA"],
-        theme,
-    ));
+    let rows = models
+        .iter()
+        .take(visible_capacity)
+        .map(|model| {
+            let mut cells = vec![
+                Cell::from(terminal_safe_text(&model.model)),
+                Cell::from(format_tokens(model.token_usage)),
+                Cell::from(format!("{:.1}%", model.local_token_share_percent)),
+                Cell::from(format_estimated_quota(
+                    model.estimated_quota_percent,
+                    model.quota_confidence,
+                )),
+            ];
+            if show_api_cost_column {
+                let api_cost = api_cost_analysis
+                    .and_then(|analysis| {
+                        analysis
+                            .models
+                            .iter()
+                            .find(|base| base.model == model.model)
+                    })
+                    .map(|base| base.api_equivalent_cost)
+                    .unwrap_or(model.api_equivalent_cost);
+                cells.push(Cell::from(format_api_cost_amount(api_cost)));
+            }
+            Row::new(cells)
+        })
+        .collect::<Vec<_>>();
+    let mut constraints = vec![
+        Constraint::Min(18),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+    ];
+    let mut headers = vec!["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA"];
+    if show_api_cost_column {
+        constraints.push(Constraint::Length(16));
+        headers.push("API EQ.");
+    }
+    let header = Row::new(headers).style(
+        Style::default()
+            .fg(theme.palette().accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(rows, constraints).header(header);
     frame.render_widget(table, model_area);
 }
 

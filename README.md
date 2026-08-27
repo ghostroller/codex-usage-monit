@@ -8,7 +8,7 @@
 
 **Codex usage monitoring, entirely in your terminal.**
 
-`codex-usage-monit` tracks Codex quota windows, reset times, reset credits, tasks, turns, models, locally observed token usage, and usage history. Run it as an interactive TUI, or use its non-interactive CLI to produce plain text or JSON for scripts, cron jobs, and CI.
+`codex-usage-monit` tracks Codex quota windows, reset times, reset credits, tasks, turns, models, locally observed token usage, API-equivalent model-call cost, and usage history. Run it as an interactive TUI, or use its non-interactive CLI to produce plain text or JSON for scripts, cron jobs, and CI.
 
 It is local-first and terminal-native: no desktop application, browser, database, or listening port is required. The TUI works as a standalone process; an optional per-user background recorder can keep quota history continuous while the TUI is closed. Prebuilt binaries run on Windows, macOS, and Linux, including headless development servers over SSH.
 
@@ -24,6 +24,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **Reset-credit details** — See the authoritative available count plus grant and expiry times when the server returns per-credit details.
 - **Expiry reminder** — The weekly Overview gauge warns when the earliest fully known available reset credit expires before the ordinary Codex weekly reset, with the exact local expiry time.
 - **Local usage breakdown** — Explore tasks, turns, models, token totals, and token share for the current 5-hour or weekly reset cycle.
+- **API-equivalent model cost** — Value locally observed model tokens at current API rates with exact fixed-point math, long-context ranges, and explicit priced coverage; non-model tool charges are excluded.
 - **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 15-minute token/estimate buckets in local state.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
@@ -219,7 +220,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, and Models. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
+The **Overview** tab combines account limits with Tasks, Turns, Models, and the local token-only API-equivalent cost of model calls. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -241,7 +242,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `r`, `E`, `-`, `+` | Toggle flat/tree mode, collapse/expand all, or collapse/expand one parent. |
 | `a`, `d`, `s`, `c`, `[` / `]` | Filter All, Desktop, Subagent, or CLI sources, or cycle source filters. |
 | `v`, `m` | Show/hide Turns or Models. |
-| `l` on Overview | Toggle the optional API long-context multiplier for TUI `~EST` values. |
+| `l` on Overview | Toggle the optional long-context multiplier for TUI quota `~EST` values (`EST Long×`). |
 | `o` | Open the selected stopped root task in a new Zellij pane, or offer a resume command for other terminals. |
 | `t` | Toggle dark/light theme. |
 | `q` | Quit. `Esc` opens quit confirmation from the main view. |
@@ -278,6 +279,7 @@ Reset and turn timestamps in the TUI are shown in local time; Collection/Snapsho
 | `TOKENS` | Locally observed total tokens. In scoped TUI views, this is eligible non-Spark usage inside the selected ordinary `codex` reset cycle; in one-shot `tasks`/`turns` and their JSON `tokenUsage`, it covers the configured scan range. |
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | The entity's share of locally observed, eligible non-Spark tokens in the selected ordinary `codex` cycle. This is a token share, not an account quota percentage. |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | A low-confidence estimate of account quota percentage points attributed to the entity. `~` means approximate; `-` means unavailable. |
+| `API EQ.` / `API.EQ5H` | Local model tokens valued at the bundled OpenAI API rates. One-shot task/turn rows use the current 5-hour reset cycle. A range means request boundaries could be short or long context; trailing `+` means the priced subtotal excludes unpriced usage samples; `-` means no public price can be applied. |
 | `EFFORT` | The reasoning-effort value recorded by Codex. |
 | `FAST` | The rollout used a recognized Fast tier (`serviceTier=fast` or the compatible `priority` value); attribution applies the published Fast credit multiplier. |
 | `MESSAGE` | A short local preview of the turn message, up to 72 characters. |
@@ -287,7 +289,9 @@ The estimator follows OpenAI's current [token-based Codex rate card](https://lea
 
 For recognized ChatGPT Fast calls the estimator applies the published [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) multiplier: `2.5x` for GPT-5.6/GPT-5.5 and `2x` for GPT-5.4. The compatible `serviceTier=priority` value found in local signed-in rollouts is treated as Fast for this attribution; this is not API Priority billing, which the official Speed page describes separately. Exact `gpt-5.3-codex-spark` calls remain outside this attribution because its credit rate is still a research preview; an unlisted or missing non-Spark model uses the corresponding GPT-5.6 Luna fallback and marks the scope partial.
 
-The TUI's `[L]Long×` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models: a verified request above 272K input tokens uses `2x` input/cached-input and `1.5x` output weights. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
+The TUI's `[L]EST Long×` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models for the Codex quota `~EST` projection. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
+
+`API EQ.` is a separate calculation based on the current [OpenAI API pricing table](https://developers.openai.com/api/docs/pricing). It prices each locally observed model request using regular input, cached input, cache-write, and output rates; reasoning tokens are already part of output and are not added twice. The calculation applies a published API long-context price when an exact request exceeds 272K input tokens; models with one flat price keep it across their supported context. If a larger cumulative delta has unknown request boundaries, the UI shows a short/long cost range. Unknown models, unknown or missing service tiers, unavailable Fast/long rows, missing token breakdowns, and cache writes without a published rate reduce the displayed priced coverage instead of using a fallback. Per-call tool and other non-model charges are not included; model input/output tokens surrounding tool execution are still valued at model rates. This is an equivalent value at current API rates, not an API invoice or a Codex subscription charge.
 
 GPT-Image-2.0 is not assigned one of its published rows: the official card separates image and text billing, while rollout usage does not expose enough modality information to choose reliably. If such a model name appears in an ordinary token call, it uses the partial-marked unknown-model fallback instead of pretending the image rate is exact.
 
@@ -318,7 +322,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]Long×` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Long×` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 
@@ -327,6 +331,7 @@ Inspect mode shows each selected point's exact stored timestamp and value rather
 - **Tokens are local observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within the scanned local data when the relevant logs are complete and counters have not reset ambiguously.
 - **Account gauges are server data.** Current quota-window percentages and reset times come from the Codex App Server, or from a stale local fallback in offline/degraded mode.
 - **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier Codex credit-rate weights. The optional API long-context multiplier is disabled by default; either projection can still be distorted by activity from other machines or clients.
+- **API equivalent is token-only and local.** It values locally observed model calls at the bundled current API prices. It excludes per-call tool fees, container, storage, search-call, tax, regional, and negotiated-contract charges, and does not yet include usage from other machines.
 - **Workspace rate-card migration matters.** The token-based card applies to most plans, but OpenAI says a small subset of Enterprise workspaces remains on the legacy per-message card. The monitor cannot infer that workspace migration state from local rollouts, so those users should treat `~EST` as not representative of their applicable billing card.
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.
@@ -337,11 +342,13 @@ See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas
 
 ## JSON output
 
-JSON output uses camelCase and currently reports `"schemaVersion": 1`.
+JSON output uses camelCase and currently reports `"schemaVersion": 2`.
 
 | Field | Meaning |
 | --- | --- |
 | `asOf` | Snapshot timestamp. |
+| `apiPricing` | Version, rates-as-of date, official source URL, and the `current_api_rates_model_tokens_only` basis of the bundled API price catalog. |
+| `apiEquivalentCost` | Preferred current 5-hour token-only total, coverage, and partial reasons; omitted when no current 5-hour analysis exists. |
 | `partial` | The result is usable but one or more sources/cycles are incomplete or degraded. |
 | `sources` | Source freshness, provenance, and collection details. |
 | `limits` | All quota windows. |
@@ -354,6 +361,8 @@ JSON output uses camelCase and currently reports `"schemaVersion": 1`.
 | `warnings`, `errors` | Warning and error diagnostics from collection. A source error does not necessarily make the whole snapshot unusable. |
 
 Token usage contains `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`, `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. Do not sum them: cached input and cache write input are subsets of input, reasoning output is part of output, and `totalTokens` is already the total.
+
+`apiEquivalentCost` reports `minimumPicoUsd` and `maximumPicoUsd` as exact decimal strings, plus observed/priced rollout usage-sample and token counts. One non-exact sample can represent multiple requests, so `observedSamples` and `pricedSamples` are not request counts. `modelBreakdown` includes every observed model, including unpriced models excluded from the quota estimator. The top-level value and task/turn/model projections use the preferred current 5-hour window; `windowAnalyses[]` also exposes weekly values. A thread-filtered Turns response omits the all-thread top-level total while retaining per-turn costs. The amounts cover only priced model calls; inspect `partialReasons` and coverage before treating the subtotal as complete. Equal minimum and maximum values represent a single price, while differing values represent an unresolved short/long-context request-boundary range.
 
 For reset credits, `availableCount` is authoritative. `credits: null` means only the count is known; `credits: []` means details were fetched and the returned list was empty. A non-empty list can still be shorter than `availableCount` if the service truncated details.
 

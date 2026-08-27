@@ -24,10 +24,11 @@ TUI 默认使用 dark 主题，可通过 `--theme light`（`bright` 为别名）
 
 - **任务 / Thread**：一条 Codex 会话，包含多个 turns。
 - **对话 / Turn**：一次用户请求及随后发生的 agent 工作。
-- **模型调用**：turn 内产生一次 token usage 更新的模型响应。
+- **模型调用**：实际发给模型的一次请求。rollout 中的 token usage sample 并不总与调用一一对应；精确 sample 可对应单次请求，非精确累计增量可能覆盖多个模型请求。
 - **额度窗口**：由服务端返回的 `windowDurationMins` 和 `resetsAt` 标识，周期为 `resetsAt - windowDurationMins` 到 `resetsAt`，不能用 `now - duration` 推导。
 - **周 reset cycle**：`windowDurationMins == 10080` 的当前服务端周期，不是滚动过去 7 天，也不保证与日历自然周重合。
 - **本地 token**：当前 `CODEX_HOME` 下可以从 rollout JSONL 观察到的 token。
+- **API 等价费用**：把本地可观察的模型 token 按当前公开 API 价格换算成美元；它不是 API 账单，也不是 Codex 订阅实际扣费。
 - **配额占比**：OpenAI 服务端 `usedPercent`，不是 token 的同义词。
 
 ## 数据源矩阵
@@ -97,6 +98,18 @@ Token breakdown 包括：
 - `totalTokens`
 
 `cachedInputTokens` 与 `cacheWriteInputTokens` 都是 input 的子集，`reasoningOutputTokens` 是 output 的相关细分；展示时不能把所有字段再次相加。
+
+### API 等价模型费用
+
+当前 5 小时和周 reset cycle 会独立计算 `API EQ.`。价格目录来自当前公开的 [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)，并携带目录 revision、费率日期和来源 URL；该结果与 Codex 额度 `~EST` 是两套互不影响的指标。计算只覆盖模型 token，不包含按次收取的工具调用费、容器、存储、搜索调用、税费、区域加价或协商合同价格；工具执行前后已经进入模型 input/output 的 token 仍按模型费率计算。
+
+每次调用按 `普通 input = input - cached input - cache-write input`、cached input、cache-write input 和 output 分项计价。`reasoningOutputTokens` 已包含在 output 中，不重复收费。金额以 pico-USD 整数累计并在 JSON 中序列化为十进制字符串，避免浮点和 JavaScript 大整数精度损失。
+
+准确的单次请求 input 严格大于 272K 时使用公开的 long-context 价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。若累计增量大于阈值但无法确认请求边界，并且该模型同时有完整的 short/long 费率，则输出两种解释形成的金额区间。未知模型、未知或缺失的服务层、官方没有公布的 Fast/long 行、缺少或互相矛盾的 token breakdown，以及出现 cache write 但该模型没有公开写入费率时，对应 token 保持未计价，并降低 `pricedTokens / observedTokens` 覆盖率，不会套用 Luna 或其他后备价格。`observedSamples` / `pricedSamples` 统计 rollout usage delta；非精确 sample 可能包含多个请求，不能解释为请求数。`modelBreakdown` 保留包括 Spark 在内的所有观察模型，使总覆盖率可以按模型对账。部分计价小计末尾显示 `+`；极小正金额显示 `<$0.000001`，已知金额为零与完全无法计价分别显示为 `$0.0000` 和 `-`。
+
+Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有 `>272K` 的倍率说明，但通用价格表的 Cyber long-context 单元格仍为 `-`，且模型页同时列出 272K maximum input。实现以通用价格目录为准，将这种长调用保持未计价并降低 coverage，不猜测一个无法由公开价目表完整支持的金额。
+
+当前版本只从仍可读取的 rollout 调用计算当前窗口，不把金额写入历史桶。价格会变化，而现有历史聚合没有保存足够的逐请求 short/long 与服务层证据；以后若增加费用趋势，应先扩展价格无关的历史证据结构，再按指定价格目录重放，不能直接重估旧聚合。
 
 Rollout JSONL 中可利用以下事件重建历史：
 
@@ -170,7 +183,7 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 公告中的 GPT-Image-2.0 同时给出 image 与 text 两套计费行；当前 rollout `UsageCall` 不暴露足以区分这两种计费模态的字段，因此实现不会仅凭模型名套用其中任意一行。若该模型名出现在普通 token 调用中，它会走未知模型的 Luna 后备并标记 partial，而不会伪装成精确的 GPT-Image 费率。
 
-模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识也保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
+模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。在额度 EST 中，`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。API 等价费用采用更严格的证据口径：缺失或未知 service tier 不假定 Standard，而是降低已计价覆盖率。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识，额度 EST 仍保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100
@@ -191,21 +204,21 @@ selected_credit_units = if TUI_Long_multiplier_enabled
 estimated_quota_percent = codex_used_percent * entity_selected_units / all_selected_units
 ```
 
-长上下文判断只使用与安全累计 delta 完全相等的 `last_token_usage`，不会把 turn、thread 或同一采样间隔内多个请求的累计 input 误当成一个请求。recorder 对每次观察同时保存基础 units 与可选 API 长上下文 extra，不根据当前 TUI 偏好改变采集结果。`[L]Long×` 默认关闭；关闭时使用基础口径，且无法核实请求边界的大聚合不会仅因该假设降低完整性。开启时，聚合 input 不超过 272K 可以证明所有组成请求都属于短上下文；聚合 input 超过 272K 则保留基础费率并增加 `long_context_usage_unknown` partial reason，不猜测附加倍率。`reasoning_output_tokens` 是 output 的子集，不能再次相加。`cache_write_input_tokens` 也已解析、累计并参与单次请求一致性校验，但它本身是 input 子集，不能再次加到 token 总数。当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不额外增加 API 文档中的 cache-write charge；开启可选倍率且发生可核实的长上下文时，它作为 input 的一部分自然包含在 input `2x` 中。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
+长上下文判断只使用与安全累计 delta 完全相等的 `last_token_usage`，不会把 turn、thread 或同一采样间隔内多个请求的累计 input 误当成一个请求。recorder 对每次观察同时保存基础 units 与可选 API 长上下文 extra，不根据当前 TUI 偏好改变采集结果。`[L]EST Long×` 默认关闭；关闭时使用基础口径，且无法核实请求边界的大聚合不会仅因该假设降低完整性。开启时，聚合 input 不超过 272K 可以证明所有组成请求都属于短上下文；聚合 input 超过 272K 则保留基础费率并增加 `long_context_usage_unknown` partial reason，不猜测附加倍率。`reasoning_output_tokens` 是 output 的子集，不能再次相加。`cache_write_input_tokens` 也已解析、累计并参与单次请求一致性校验，但它本身是 input 子集，不能再次加到 token 总数。当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不额外增加 API 文档中的 cache-write charge；开启可选倍率且发生可核实的长上下文时，它作为 input 的一部分自然包含在 input `2x` 中。只有 `total_tokens` 而缺少 input/output breakdown 的旧记录按 uncached input 降级，并增加 `token_breakdown_missing` partial reason。
 
 缺失或不在费率卡映射中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按 `gpt-5.6-luna` 的对应 Standard/Fast 短上下文 credit profile 降级，以免静默丢出分母；不会仅因为 fallback 选择了 Luna 就推断未知模型适用长上下文加价。该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason，不能把 fallback 解释为已识别实际基础模型。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
-双口径 token-based credit 映射定义为 estimator revision 5，历史文件使用 metric revision 3。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用 revision 5，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]Long×` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。
+双口径 token-based credit 映射定义为 estimator revision 5，历史文件使用 metric revision 3。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用 revision 5，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]EST Long×` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。
 
-该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v1 为兼容旧消费者保留既有 attribution 汇总字段，但它们不再驱动当前实体 EST。
+该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v2 为兼容旧消费者保留既有 attribution 汇总字段，同时新增 `apiPricing` 和各窗口/实体的 `apiEquivalentCost`；后两者不会驱动当前实体 EST。
 
 ## 多窗口输出与交互
 
-TUI 提供 Overview、Trends 与 Other 三个顶层视图。Other 保留数据健康信息，并新增 Resets 分组：同一张 `ITEM / STATE / GRANTED / RESET TIME` 表先显示重置机会，再按 bucket 展开所有 primary/secondary 窗口。`RESET TIME` 使用本地 `YYYY-MM-DD HH:MM:SS ±HH:MM`，宽布局的 `GRANTED` 使用相同格式，窄布局缩短为 `MM-DD HH:MM`。窗口缺少 `resetsAt` 时显示 unavailable，机会的 `expiresAt` 为 `null` 时显示 never；标题显示权威的可用数、provenance，并区分 `DETAILS UNAVAILABLE`、正常截断的 `SHOWING n/N` 与解析异常的 `PARTIAL`。明确的零显示 `0 available`，整个刷新失败保留的旧汇总和明细都标为 stale。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]`、`[Week]` 与 `[L]Long×`，分别由 `V`、`M`、`5`、`W`、`L` 或鼠标左键操作；Turns 首次启动默认显示，长上下文倍率首次启动默认关闭。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次 scope 或倍率切换中使用同一套估算口径；Trends 的 Weekly/15m `~EST` 图也同步切换，而原始 token 图不受影响。不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 先显示当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST 和 scope 级方法/external/partial-reasons 摘要，再显示不含独立 confidence 列的模型表；Turns 或 Models 隐藏后顶栏恢复入口和 scope/倍率控件仍然可达，归因信息不再占用独立 TUI 面板。
+TUI 提供 Overview、Trends 与 Other 三个顶层视图。Other 保留数据健康信息，并新增 Resets 分组：同一张 `ITEM / STATE / GRANTED / RESET TIME` 表先显示重置机会，再按 bucket 展开所有 primary/secondary 窗口。`RESET TIME` 使用本地 `YYYY-MM-DD HH:MM:SS ±HH:MM`，宽布局的 `GRANTED` 使用相同格式，窄布局缩短为 `MM-DD HH:MM`。窗口缺少 `resetsAt` 时显示 unavailable，机会的 `expiresAt` 为 `null` 时显示 never；标题显示权威的可用数、provenance，并区分 `DETAILS UNAVAILABLE`、正常截断的 `SHOWING n/N` 与解析异常的 `PARTIAL`。明确的零显示 `0 available`，整个刷新失败保留的旧汇总和明细都标为 stale。Overview 最顶栏提供 `[V]Turns`、`[M]Models`、`[5h]`、`[Week]` 与 `[L]EST Long×`，分别由 `V`、`M`、`5`、`W`、`L` 或鼠标左键操作；Turns 首次启动默认显示，长上下文倍率首次启动默认关闭。Tasks、选中 task 的 Turns、Models 及 Models 内的 attribution 摘要必须在一次 scope 或倍率切换中使用同一套估算口径；Trends 的 Weekly/15m `~EST` 图也同步切换，而原始 token 图和 API 等价费用不受影响。不可用的 scope 显示 unavailable，不能借用另一时长或 `codex_bengalfox` 的数据。Models 先显示当前 `codex` scope 的 gauge、本地非 Spark token、带 `~`/`-` 的 EST、API 等价费用与已计价覆盖率，再显示模型表；宽布局为每个模型显示 `API EQ.`，紧凑布局省略该列。Turns 或 Models 隐藏后顶栏恢复入口和 scope/倍率控件仍然可达，归因信息不再占用独立 TUI 面板。
 
 TUI 将主题、顶层视图、window scope、API 长上下文倍率开关、Turns/Models 显隐、Flat/Tree 和来源筛选保存为版本化的用户级 JSON。读取失败或内容损坏时回退到默认值；开关字段缺失时默认关闭。搜索、选择、滚动位置和具体 thread 折叠集合不持久化。写入采用同目录临时文件替换，未来版本文件不会被旧程序覆盖；`--theme` 显式值优先于保存值。CLI 一次性输出保持基础口径，不参与此状态生命周期。
 
-一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON v1 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。此次展示简化不改变 `statusConfidence`、task/turn/model/窗口 usage 的 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
+一次性输出通过 `windows` 子命令或 `snapshot --section windows` 暴露全部 `windowAnalyses`。独立 TUI Attribution 面板的删除不影响 CLI/JSON attribution 能力；旧 JSON 的 task/turn `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 与顶层 `models`、`attribution` 固定保留首选 5h 语义，新增 Week 分析不能静默改变这些字段，避免旧消费者把周数据误认为 5h。schema v2 新增顶层 `apiPricing`、可选的首选 5h `apiEquivalentCost`、task/turn/model 投影，以及各窗口总额和实体定点金额；pico-USD 使用字符串编码。没有当前 5h 分析时省略顶层和 task/turn 金额，周数据仍可从 `windowAnalyses` 读取。此次展示简化不改变 `statusConfidence`、task/turn/model/窗口 usage 的 `quotaConfidence` 或 attribution `confidence` 的 JSON 字段名与枚举值。
 
 ## 状态可信度
 

@@ -8,7 +8,7 @@
 
 **完全运行在终端里的 Codex 用量监控工具。**
 
-`codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型、本地可观察 token 用量和历史走势。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
+`codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型、本地可观察 token 用量、模型调用的 API 等价费用和历史走势。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
 
 它以本地数据和终端为核心：不需要桌面程序、浏览器、数据库或监听端口。TUI 可以独立运行；也可以选择注册用户级后台记录服务，在 TUI 关闭后继续保存额度走势。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
 
@@ -24,6 +24,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **重置机会详情** — 查看权威的可用数量，以及服务端返回明细时每次机会的获得和过期时间。
 - **过期提醒** — 如果最早且信息完整的可用重置机会会在普通 Codex 周自然重置前过期，Overview 的周用量进度条会显示提醒和准确的本地过期时间。
 - **本地用量拆分** — 按当前 5 小时或周重置周期查看 task、turn、模型、token 总量和 token 占比。
+- **API 等价模型费用** — 使用精确定点计算按当前 API 费率换算本地模型 token，并显示长上下文区间与已计价覆盖率；不包含非模型工具费用。
 - **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及 15 分钟 token/估算桶。
 - **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
@@ -219,7 +220,7 @@ codex-usage-monit record --foreground
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度与 Tasks、Turns、Models 放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
+**Overview** tab 把账户额度、Tasks、Turns、Models，以及本地模型调用的纯 token API 等价费用放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -241,7 +242,7 @@ codex-usage-monit record --foreground
 | `r`、`E`、`-`、`+` | 切换平铺/树形模式，全部收起/展开，或收起/展开一个父任务。 |
 | `a`、`d`、`s`、`c`、`[` / `]` | 筛选 All、Desktop、Subagent、CLI 来源，或循环切换来源。 |
 | `v`、`m` | 显示/隐藏 Turns 或 Models。 |
-| Overview 中的 `l` | 切换 TUI `~EST` 可选的 API 长上下文倍率。 |
+| Overview 中的 `l` | 切换 TUI 额度 `~EST` 的可选长上下文倍率（`EST Long×`）。 |
 | `o` | 在新 Zellij pane 中打开选中的已停止 root task，或为其他终端提供 resume 命令。 |
 | `t` | 切换深色/浅色主题。 |
 | `q` | 退出。在主视图按 `Esc` 会打开退出确认。 |
@@ -278,6 +279,7 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `TOKENS` | 本地观察到的 token 总量。在带周期范围的 TUI 视图中，它表示所选普通 `codex` 重置周期内符合条件的非 Spark 用量；在一次性 `tasks`/`turns` 及其 JSON `tokenUsage` 中，它覆盖配置的扫描范围。 |
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | 该实体在所选普通 `codex` 周期的本地可观察、符合条件的非 Spark token 中所占比例。它是 token 占比，不是账户额度百分比。 |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | 归因到该实体的低置信度额度消耗估算，单位为百分点。`~` 表示近似值；`-` 表示无法计算。 |
+| `API EQ.` / `API.EQ5H` | 按内置 OpenAI API 费率换算本地模型 token；一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示已计价小计不含部分未计价 usage sample；`-` 表示没有可应用的公开价格。 |
 | `EFFORT` | Codex 记录的 reasoning-effort 值。 |
 | `FAST` | rollout 使用了可识别的 Fast 服务层（`serviceTier=fast` 或兼容的 `priority`）；归因会应用官方 Fast credit 倍率。 |
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
@@ -287,7 +289,9 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 
 对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
 
-TUI 的 `[L]Long×` 开关**默认关闭**。开启后，程序才会对支持的模型额外套用 OpenAI API 公布的长上下文规则：可核实的单次请求 input 超过 272K token 时，input/cached-input 权重为 `2x`、output 权重为 `1.5x`。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
+TUI 的 `[L]EST Long×` 开关**默认关闭**。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
+
+`API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。程序按每个本地可观察模型请求分别计算普通 input、cached input、cache write 和 output；reasoning token 已包含在 output 中，不会重复相加。单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。模型未知、服务层未知或缺失、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备模型价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
 
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
@@ -318,7 +322,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]Long×` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Long×` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 
@@ -327,6 +331,7 @@ Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不
 - **Token 是本地观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在已扫描的本地数据范围内是准确值。
 - **账户用量指标是服务端数据。** 当前额度窗口百分比和重置时间来自 Codex App Server；离线或降级时则来自已过期（`stale`）的本地后备数据。
 - **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层 Codex credit 费率权重上。可选 API 长上下文倍率默认关闭；无论选择哪种口径，来自其他机器或客户端的活动都可能使结果失真。
+- **API 等价费用只覆盖本地模型 token。** 它按内置的当前 API 价格换算本地可观察模型调用，不包含按次工具费、容器、存储、搜索调用、税费、区域加价或协商合同价格，目前也不包含其他机器的用量。
 - **需考虑 workspace 的费率卡迁移状态。** token-based 卡适用于绝大多数方案，但 OpenAI 说明仍有少量 Enterprise workspace 使用旧的按消息计费卡。监控器无法从本地 rollout 判断 workspace 是否已迁移，因此这些用户不应把 `~EST` 视为其适用计费卡的代表值。
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
@@ -337,11 +342,13 @@ Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不
 
 ## JSON 输出
 
-JSON 输出使用 camelCase，目前报告 `"schemaVersion": 1`。
+JSON 输出使用 camelCase，目前报告 `"schemaVersion": 2`。
 
 | 字段 | 含义 |
 | --- | --- |
 | `asOf` | 快照时间。 |
+| `apiPricing` | 内置 API 价格目录的版本、费率日期、官方来源 URL，以及 `current_api_rates_model_tokens_only` 计算口径。 |
+| `apiEquivalentCost` | 首选当前 5 小时周期的纯 token 总额、覆盖率和 partial reasons；没有当前 5 小时分析时省略。 |
 | `partial` | 结果可用，但一个或多个数据源/周期不完整或处于降级状态。 |
 | `sources` | 数据源是否为最新、来源证据和采集详情。 |
 | `limits` | 所有额度窗口。 |
@@ -354,6 +361,8 @@ JSON 输出使用 camelCase，目前报告 `"schemaVersion": 1`。
 | `warnings`、`errors` | 采集过程中的警告和错误诊断。单个数据源出错不一定会使整个快照不可用。 |
 
 Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`、`outputTokens`、`reasoningOutputTokens` 和 `totalTokens`。不要把这些字段相加：cached input 与 cache write input 都是 input 的子集，reasoning output 是 output 的一部分，而 `totalTokens` 已经是总量。
+
+`apiEquivalentCost` 使用精确十进制字符串输出 `minimumPicoUsd` 和 `maximumPicoUsd`，并附带已观察/已计价的 rollout usage sample 数和 token 数。一个非精确 sample 可能包含多个请求，因此 `observedSamples` 与 `pricedSamples` 不能当作请求数。`modelBreakdown` 包含所有已观察模型，包括额度估算排除且无法计价的模型。顶层值和 task/turn/model 投影固定使用首选当前 5 小时窗口；`windowAnalyses[]` 还提供周周期结果。按 thread 过滤的 Turns 响应会省略覆盖所有 thread 的顶层总额，但保留逐 turn 金额。金额只覆盖已计价模型调用；使用前应同时检查 `partialReasons` 和覆盖率。最小值与最大值相同表示单一价格，不同时表示短/长上下文请求边界尚未确定的区间。
 
 对于重置机会，`availableCount` 是权威值。`credits: null` 表示只知道数量；`credits: []` 表示已经读取明细，并且返回的列表为空。如果服务端截断详情，非空列表仍可能短于 `availableCount`。
 

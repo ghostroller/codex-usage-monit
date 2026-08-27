@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added token-only API-equivalent model-call costs for the current 5-hour and weekly Codex reset cycles. The calculation uses a versioned OpenAI API price catalog, preserves Standard/Fast and short/long-context request boundaries, prices regular input, cached input, cache writes, and output separately, and reports unpriced coverage instead of applying a fallback to unknown models or tiers.
+- Added exact fixed-point pico-USD values to snapshot JSON and API-equivalent totals/ranges to the Models summary, per-model rows, task/turn window output, and selected-turn detail. Totals include per-model coverage and distinguish rollout usage samples from request counts. Tool-call, container, storage, search-call, tax, regional, and contract-specific charges are intentionally excluded.
+
+### Changed
+
+- Clarified the Overview long-context control as `[L]EST Long×`: it changes only the optional Codex quota estimate projection. API-equivalent cost always follows the API pricing catalog and is unaffected by this display preference.
+
+### Compatibility
+
+- Bumped snapshot JSON to schema version 2 and added `apiPricing`, per-window `apiEquivalentCost`, and per-entity fixed-point cost fields. Pico-USD values serialize as decimal strings so large totals remain exact in JavaScript clients.
+
 ## [0.2.9] - 2026-08-27
 
 ### Changed

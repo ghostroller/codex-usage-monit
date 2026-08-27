@@ -44,6 +44,7 @@ fn task(thread_id: &str, status: TaskStatus) -> TaskRecord {
         local_token_share_percent: 99.0,
         estimated_quota_percent: 99.0,
         quota_confidence: Confidence::High,
+        api_equivalent_cost: Default::default(),
     }
 }
 
@@ -64,6 +65,7 @@ fn turn(thread_id: &str, turn_id: &str) -> TurnRecord {
         local_token_share_percent: 99.0,
         estimated_quota_percent: 99.0,
         quota_confidence: Confidence::High,
+        api_equivalent_cost: Default::default(),
     }
 }
 
@@ -496,13 +498,19 @@ fn excludes_only_the_exact_spark_model_case_insensitively() {
 
     let analysis = &analyses[0];
     assert_eq!(analysis.attribution.local_token_usage, tokens(300));
-    assert_eq!(analysis.threads.len(), 2);
-    assert!(
-        analysis
+    assert_eq!(analysis.threads.len(), 4);
+    for thread_id in ["spark-a", "spark-b"] {
+        let row = analysis
             .threads
             .iter()
-            .all(|row| !row.thread_id.starts_with("spark-") || row.thread_id == "spark-preview")
-    );
+            .find(|row| row.thread_id == thread_id)
+            .unwrap();
+        assert_eq!(row.usage.token_usage, TokenUsage::default());
+        assert_eq!(row.usage.estimated_quota_percent, 0.0);
+        assert_eq!(row.usage.quota_confidence, Confidence::Unknown);
+        assert_eq!(row.usage.api_equivalent_cost.observed_samples, 1);
+        assert_eq!(row.usage.api_equivalent_cost.priced_samples, 0);
+    }
     assert_eq!(analysis.models.len(), 2);
     assert!(
         analysis
@@ -660,7 +668,7 @@ fn api_long_context_projection_is_opt_in_and_keeps_the_base_projection_unchanged
             "long",
             "long-turn",
             Some("gpt-5.6-luna"),
-            None,
+            Some("default"),
             TokenUsage {
                 input_tokens: 300_000,
                 total_tokens: 300_000,
@@ -672,7 +680,7 @@ fn api_long_context_projection_is_opt_in_and_keeps_the_base_projection_unchanged
             "short",
             "short-turn-1",
             Some("gpt-5.6-luna"),
-            None,
+            Some("default"),
             TokenUsage {
                 input_tokens: 150_000,
                 total_tokens: 150_000,
@@ -684,7 +692,7 @@ fn api_long_context_projection_is_opt_in_and_keeps_the_base_projection_unchanged
             "short",
             "short-turn-2",
             Some("gpt-5.6-luna"),
-            None,
+            Some("default"),
             TokenUsage {
                 input_tokens: 150_000,
                 total_tokens: 150_000,
@@ -728,6 +736,100 @@ fn api_long_context_projection_is_opt_in_and_keeps_the_base_projection_unchanged
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_close(api["long"], 40.0);
     assert_close(api["short"], 20.0);
+
+    assert_eq!(
+        analysis
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == "long")
+            .unwrap()
+            .usage
+            .api_equivalent_cost
+            .minimum_pico_usd
+            .value(),
+        120_000_000_000
+    );
+    assert_eq!(
+        analysis.api_equivalent_cost.amount.minimum_pico_usd.value(),
+        180_000_000_000
+    );
+    assert_eq!(
+        analysis.api_equivalent_cost,
+        analysis
+            .api_long_context
+            .as_deref()
+            .unwrap()
+            .api_equivalent_cost
+    );
+}
+
+#[test]
+fn api_cost_keeps_unpriced_spark_in_coverage_without_degrading_quota_status() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![
+        call_with_tier(
+            at(11, 0),
+            "priced",
+            "priced-turn",
+            Some("gpt-5.6-luna"),
+            Some("default"),
+            100,
+        ),
+        call_with_tier(
+            at(11, 1),
+            "spark",
+            "spark-turn",
+            Some("gpt-5.3-codex-spark"),
+            Some("default"),
+            100,
+        ),
+    ];
+
+    let analysis = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[],
+        &[codex_limit(now, 40.0, 300, reset)],
+        now,
+    )
+    .remove(0);
+
+    assert!(!analysis.partial);
+    assert_eq!(analysis.api_equivalent_cost.amount.observed_samples, 2);
+    assert_eq!(analysis.api_equivalent_cost.amount.priced_samples, 1);
+    let spark_model = analysis
+        .api_equivalent_cost
+        .model_breakdown
+        .iter()
+        .find(|model| model.model == "gpt-5.3-codex-spark")
+        .unwrap();
+    assert_eq!(spark_model.amount.observed_samples, 1);
+    assert_eq!(spark_model.amount.priced_samples, 0);
+    assert_eq!(
+        analysis.api_equivalent_cost.amount.priced_token_percent(),
+        50.0
+    );
+    assert_eq!(
+        analysis.api_equivalent_cost.partial_reasons,
+        vec!["api_price_model_unknown".to_string()]
+    );
+    assert!(analysis.api_equivalent_cost.is_partial());
+    let spark_thread = analysis
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == "spark")
+        .unwrap();
+    assert!(spark_thread.usage.token_usage.is_zero());
+    assert_eq!(spark_thread.usage.api_equivalent_cost.observed_samples, 1);
+    assert_eq!(spark_thread.usage.api_equivalent_cost.priced_samples, 0);
+    let spark_turn = analysis
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "spark-turn")
+        .unwrap();
+    assert_eq!(spark_turn.usage.api_equivalent_cost.observed_samples, 1);
 }
 
 #[test]

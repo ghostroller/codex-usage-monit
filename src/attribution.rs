@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::api_cost::{ApiCostAggregation, pricing_metadata};
 use crate::domain::{
     AttributionSummary, Confidence, LimitBucket, LimitWindow, ModelUsage, Provenance,
     RateObservation, TaskRecord, ThreadWindowUsage, TokenUsage, TurnRecord, TurnWindowUsage,
@@ -120,6 +121,7 @@ struct WindowAggregation {
     used_model_fallback: bool,
     used_token_breakdown_fallback: bool,
     used_long_context_detection_fallback: bool,
+    api_cost: ApiCostAggregation,
 }
 
 #[derive(Clone, Copy)]
@@ -205,6 +207,7 @@ pub(crate) fn project_five_hour_analysis(
             task.local_token_share_percent = usage.local_token_share_percent;
             task.estimated_quota_percent = usage.estimated_quota_percent;
             task.quota_confidence = usage.quota_confidence;
+            task.api_equivalent_cost = Some(usage.api_equivalent_cost);
         }
     }
     for turn in turns {
@@ -216,6 +219,7 @@ pub(crate) fn project_five_hour_analysis(
             turn.local_token_share_percent = usage.local_token_share_percent;
             turn.estimated_quota_percent = usage.estimated_quota_percent;
             turn.quota_confidence = usage.quota_confidence;
+            turn.api_equivalent_cost = Some(usage.api_equivalent_cost);
         }
     }
 
@@ -250,8 +254,21 @@ fn analyze_selected_window(
         call.timestamp >= selected.starts_at
             && call.timestamp <= now
             && call.timestamp <= selected.ends_at
-            && !is_spark_model(call.model.as_deref())
     }) {
+        aggregation.api_cost.add_call(call);
+        if is_spark_model(call.model.as_deref()) {
+            aggregation
+                .task_usage
+                .entry(call.thread_id.clone())
+                .or_default();
+            if let Some(turn_id) = &call.turn_id {
+                aggregation
+                    .turn_usage
+                    .entry((call.thread_id.clone(), turn_id.clone()))
+                    .or_default();
+            }
+            continue;
+        }
         let estimated_cost = estimate_call_weight(call);
         aggregation.used_model_fallback |= estimated_cost.used_model_fallback;
         aggregation.used_token_breakdown_fallback |= estimated_cost.used_token_breakdown_fallback;
@@ -304,8 +321,13 @@ fn build_window_analysis(
     } else {
         Confidence::Low
     };
-    let usage_for = |usage: UsageAccumulator| {
+    let usage_for = |usage: UsageAccumulator, api_equivalent_cost| {
         let local_token_share_percent = token_share(usage.tokens, total_tokens);
+        let quota_confidence = if usage.tokens.is_zero() {
+            Confidence::Unknown
+        } else {
+            confidence
+        };
         WindowUsage {
             token_usage: usage.tokens,
             local_token_share_percent,
@@ -315,7 +337,8 @@ fn build_window_analysis(
                     total_estimated_cost_units,
                 )
                 / 100.0,
-            quota_confidence: confidence,
+            quota_confidence,
+            api_equivalent_cost,
         }
     };
 
@@ -324,7 +347,7 @@ fn build_window_analysis(
         .iter()
         .map(|(thread_id, usage)| ThreadWindowUsage {
             thread_id: thread_id.clone(),
-            usage: usage_for(*usage),
+            usage: usage_for(*usage, aggregation.api_cost.thread(thread_id)),
         })
         .collect();
     let turns = aggregation
@@ -333,7 +356,7 @@ fn build_window_analysis(
         .map(|((thread_id, turn_id), usage)| TurnWindowUsage {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
-            usage: usage_for(*usage),
+            usage: usage_for(*usage, aggregation.api_cost.turn(thread_id, turn_id)),
         })
         .collect();
     let models = aggregation
@@ -350,6 +373,7 @@ fn build_window_analysis(
             quota_confidence: confidence,
             model: model.clone(),
             token_usage: usage.tokens,
+            api_equivalent_cost: aggregation.api_cost.model(model),
         })
         .collect();
 
@@ -402,6 +426,8 @@ fn build_window_analysis(
         threads,
         turns,
         models,
+        api_equivalent_cost: aggregation.api_cost.total(),
+        api_pricing: pricing_metadata(),
         api_long_context: None,
     }
 }
@@ -412,12 +438,14 @@ fn reset_records(tasks: &mut [TaskRecord], turns: &mut [TurnRecord]) {
         task.local_token_share_percent = 0.0;
         task.estimated_quota_percent = 0.0;
         task.quota_confidence = Confidence::Unknown;
+        task.api_equivalent_cost = None;
     }
     for turn in turns {
         turn.window_token_usage = TokenUsage::default();
         turn.local_token_share_percent = 0.0;
         turn.estimated_quota_percent = 0.0;
         turn.quota_confidence = Confidence::Unknown;
+        turn.api_equivalent_cost = None;
     }
 }
 

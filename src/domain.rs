@@ -2,7 +2,26 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+mod u128_string {
+    use super::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +180,122 @@ impl TokenUsage {
     }
 }
 
+/// Exact fixed-point money amount in trillionths of one US dollar.
+///
+/// JSON represents this value as a decimal string so JavaScript consumers do
+/// not lose precision on large cumulative totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PicoUsd(#[serde(with = "u128_string")] pub u128);
+
+impl PicoUsd {
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u128 {
+        self.0
+    }
+}
+
+/// Token-only API-equivalent model-call cost at the bundled catalog's rates.
+///
+/// `minimum` and `maximum` differ only when a cumulative rollout delta could
+/// represent either several short requests or at least one long-context
+/// request. Unpriced samples are excluded from both subtotals and reported via
+/// coverage and partial reasons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCostAmount {
+    pub minimum_pico_usd: PicoUsd,
+    pub maximum_pico_usd: PicoUsd,
+    /// Rollout token-usage deltas. One non-exact sample can cover multiple
+    /// model requests, so this must not be interpreted as a request count.
+    pub observed_samples: u64,
+    pub priced_samples: u64,
+    pub observed_tokens: u64,
+    pub priced_tokens: u64,
+}
+
+impl ApiCostAmount {
+    pub fn add_assign(&mut self, other: Self) {
+        self.minimum_pico_usd.0 = self
+            .minimum_pico_usd
+            .0
+            .saturating_add(other.minimum_pico_usd.0);
+        self.maximum_pico_usd.0 = self
+            .maximum_pico_usd
+            .0
+            .saturating_add(other.maximum_pico_usd.0);
+        self.observed_samples = self.observed_samples.saturating_add(other.observed_samples);
+        self.priced_samples = self.priced_samples.saturating_add(other.priced_samples);
+        self.observed_tokens = self.observed_tokens.saturating_add(other.observed_tokens);
+        self.priced_tokens = self.priced_tokens.saturating_add(other.priced_tokens);
+    }
+
+    pub fn range_is_exact(self) -> bool {
+        self.minimum_pico_usd == self.maximum_pico_usd
+    }
+
+    pub fn has_priced_usage(self) -> bool {
+        self.priced_samples > 0
+    }
+
+    pub fn priced_token_percent(self) -> f64 {
+        if self.observed_tokens == 0 {
+            if self.observed_samples == 0 {
+                100.0
+            } else {
+                self.priced_samples as f64 / self.observed_samples as f64 * 100.0
+            }
+        } else {
+            self.priced_tokens as f64 / self.observed_tokens as f64 * 100.0
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiModelCost {
+    pub model: String,
+    #[serde(flatten)]
+    pub amount: ApiCostAmount,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEquivalentCost {
+    #[serde(flatten)]
+    pub amount: ApiCostAmount,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_reasons: Vec<String>,
+    /// Price coverage by observed model, including API-only/unpriced models
+    /// such as Spark that are excluded from the Codex quota estimator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_breakdown: Vec<ApiModelCost>,
+}
+
+impl ApiEquivalentCost {
+    pub fn is_partial(&self) -> bool {
+        self.amount.priced_samples < self.amount.observed_samples
+            || self.amount.priced_tokens < self.amount.observed_tokens
+            || !self.partial_reasons.is_empty()
+    }
+
+    pub fn is_fully_exact(&self) -> bool {
+        !self.is_partial() && self.amount.range_is_exact()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPricingMetadata {
+    pub catalog_revision: u32,
+    pub rates_as_of: String,
+    pub source_url: String,
+    pub basis: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitWindow {
@@ -288,6 +423,9 @@ pub struct TaskRecord {
     pub local_token_share_percent: f64,
     pub estimated_quota_percent: f64,
     pub quota_confidence: Confidence,
+    /// API-equivalent model-token cost in the preferred current 5-hour window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_cost: Option<ApiCostAmount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -311,6 +449,9 @@ pub struct TurnRecord {
     pub local_token_share_percent: f64,
     pub estimated_quota_percent: f64,
     pub quota_confidence: Confidence,
+    /// API-equivalent model-token cost in the preferred current 5-hour window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_cost: Option<ApiCostAmount>,
 }
 
 impl TurnRecord {
@@ -327,6 +468,8 @@ pub struct ModelUsage {
     pub local_token_share_percent: f64,
     pub estimated_quota_percent: f64,
     pub quota_confidence: Confidence,
+    #[serde(default)]
+    pub api_equivalent_cost: ApiCostAmount,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -384,6 +527,8 @@ pub struct WindowUsage {
     pub local_token_share_percent: f64,
     pub estimated_quota_percent: f64,
     pub quota_confidence: Confidence,
+    #[serde(default)]
+    pub api_equivalent_cost: ApiCostAmount,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -413,6 +558,10 @@ pub struct WindowAnalysis {
     pub threads: Vec<ThreadWindowUsage>,
     pub turns: Vec<TurnWindowUsage>,
     pub models: Vec<ModelUsage>,
+    #[serde(default)]
+    pub api_equivalent_cost: ApiEquivalentCost,
+    #[serde(default)]
+    pub api_pricing: ApiPricingMetadata,
     /// Alternative projection that applies the API-published long-context
     /// multiplier. It is a local display option, not part of snapshot JSON.
     #[serde(skip)]
@@ -444,6 +593,11 @@ pub struct CollectionStats {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub schema_version: u32,
+    #[serde(default)]
+    pub api_pricing: ApiPricingMetadata,
+    /// API-equivalent model-token total in the preferred current 5-hour window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_cost: Option<ApiEquivalentCost>,
     pub as_of: DateTime<Utc>,
     pub partial: bool,
     pub codex_home: PathBuf,
