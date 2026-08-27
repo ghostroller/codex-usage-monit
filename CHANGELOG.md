@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.3.0] - 2026-08-28
+
 ### Added
 
 - Added token-only API-equivalent model-call costs for the current 5-hour and weekly Codex reset cycles. The calculation uses a versioned OpenAI API price catalog, preserves Standard/Fast and short/long-context request boundaries, prices regular input, cached input, cache writes, and output separately, and reports unpriced coverage instead of applying a fallback to unknown models or tiers.
@@ -194,7 +196,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...v0.2.7
