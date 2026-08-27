@@ -14,10 +14,13 @@ const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
-pub(crate) const ESTIMATOR_REVISION: u32 = 3;
+const LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
+pub(crate) const ESTIMATOR_REVISION: u32 = 5;
 
-// OpenAI Codex token-based credit rates as of 2026-08-25:
+// OpenAI Codex token-based credit rates as of 2026-08-27:
 // https://learn.chatgpt.com/docs/pricing
+// Published per-request long-context multipliers:
+// https://developers.openai.com/api/docs/pricing
 // Integer rates use 1/8 credit per million tokens. The credit and per-million
 // scales cancel when the values are converted into relative shares. Fast rates
 // apply the published family multipliers: GPT-5.6/GPT-5.5 2.5x, GPT-5.4 2x.
@@ -53,30 +56,73 @@ impl TokenRates {
             output,
         }
     }
+
+    fn long_context(self) -> Self {
+        Self {
+            input: self.input.saturating_mul(2),
+            cached_input: self.cached_input.saturating_mul(2),
+            output: self.output.saturating_mul(3) / 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct EstimatedUsageWeight {
+    /// Base Codex credit-card proxy without API long-context multipliers.
     pub(crate) units: u128,
+    /// Additional units produced only by the optional API long-context rule.
+    pub(crate) api_long_context_extra_units: u128,
     pub(crate) used_model_fallback: bool,
     pub(crate) used_token_breakdown_fallback: bool,
+    pub(crate) used_long_context_pricing: bool,
+    pub(crate) used_long_context_detection_fallback: bool,
+}
+
+impl EstimatedUsageWeight {
+    #[cfg(test)]
+    pub(crate) fn units_with_api_long_context(self) -> u128 {
+        self.units.saturating_add(self.api_long_context_extra_units)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
 struct UsageAccumulator {
     tokens: TokenUsage,
     estimated_cost_units: u128,
+    api_long_context_extra_cost_units: u128,
 }
 
 impl UsageAccumulator {
-    fn add_call(&mut self, call: &UsageCall, estimated_cost_units: u128) {
+    fn add_call(&mut self, call: &UsageCall, estimated: EstimatedUsageWeight) {
         self.tokens.add_assign(call.tokens);
-        self.estimated_cost_units = self
-            .estimated_cost_units
-            .saturating_add(estimated_cost_units);
+        self.estimated_cost_units = self.estimated_cost_units.saturating_add(estimated.units);
+        self.api_long_context_extra_cost_units = self
+            .api_long_context_extra_cost_units
+            .saturating_add(estimated.api_long_context_extra_units);
+    }
+
+    fn projected_cost_units(self, api_long_context: bool) -> u128 {
+        if api_long_context {
+            self.estimated_cost_units
+                .saturating_add(self.api_long_context_extra_cost_units)
+        } else {
+            self.estimated_cost_units
+        }
     }
 }
 
+#[derive(Default)]
+struct WindowAggregation {
+    local_usage: UsageAccumulator,
+    task_usage: BTreeMap<String, UsageAccumulator>,
+    turn_usage: BTreeMap<(String, String), UsageAccumulator>,
+    model_usage: BTreeMap<String, UsageAccumulator>,
+    used_model_fallback: bool,
+    used_token_breakdown_fallback: bool,
+    used_long_context_detection_fallback: bool,
+}
+
+#[derive(Clone, Copy)]
 struct SelectedWindow<'a> {
     bucket: &'a LimitBucket,
     window: &'a LimitWindow,
@@ -198,47 +244,59 @@ fn analyze_selected_window(
         selected.bucket.provenance,
         Provenance::Stale | Provenance::Unknown
     );
-    let window_calls = calls
-        .iter()
-        .filter(|call| {
-            call.timestamp >= selected.starts_at
-                && call.timestamp <= now
-                && call.timestamp <= selected.ends_at
-                && !is_spark_model(call.model.as_deref())
-        })
-        .collect::<Vec<_>>();
+    let mut aggregation = WindowAggregation::default();
 
-    let mut local_usage = UsageAccumulator::default();
-    let mut task_usage: BTreeMap<String, UsageAccumulator> = BTreeMap::new();
-    let mut turn_usage: BTreeMap<(String, String), UsageAccumulator> = BTreeMap::new();
-    let mut model_usage: BTreeMap<String, UsageAccumulator> = BTreeMap::new();
-    let mut used_model_fallback = false;
-    let mut used_token_breakdown_fallback = false;
-
-    for call in &window_calls {
+    for call in calls.iter().filter(|call| {
+        call.timestamp >= selected.starts_at
+            && call.timestamp <= now
+            && call.timestamp <= selected.ends_at
+            && !is_spark_model(call.model.as_deref())
+    }) {
         let estimated_cost = estimate_call_weight(call);
-        used_model_fallback |= estimated_cost.used_model_fallback;
-        used_token_breakdown_fallback |= estimated_cost.used_token_breakdown_fallback;
-        local_usage.add_call(call, estimated_cost.units);
-        task_usage
+        aggregation.used_model_fallback |= estimated_cost.used_model_fallback;
+        aggregation.used_token_breakdown_fallback |= estimated_cost.used_token_breakdown_fallback;
+        aggregation.used_long_context_detection_fallback |=
+            estimated_cost.used_long_context_detection_fallback;
+        aggregation.local_usage.add_call(call, estimated_cost);
+        aggregation
+            .task_usage
             .entry(call.thread_id.clone())
             .or_default()
-            .add_call(call, estimated_cost.units);
+            .add_call(call, estimated_cost);
         if let Some(turn_id) = &call.turn_id {
-            turn_usage
+            aggregation
+                .turn_usage
                 .entry((call.thread_id.clone(), turn_id.clone()))
                 .or_default()
-                .add_call(call, estimated_cost.units);
+                .add_call(call, estimated_cost);
         }
-        model_usage
+        aggregation
+            .model_usage
             .entry(model_name(call))
             .or_default()
-            .add_call(call, estimated_cost.units);
+            .add_call(call, estimated_cost);
     }
 
-    let local_token_usage = local_usage.tokens;
+    let api_long_context =
+        build_window_analysis(selected, settled, true, &aggregation, quota_window_stale);
+    let mut base =
+        build_window_analysis(selected, settled, false, &aggregation, quota_window_stale);
+    base.api_long_context = Some(Box::new(api_long_context));
+    base
+}
+
+fn build_window_analysis(
+    selected: SelectedWindow<'_>,
+    settled: bool,
+    api_long_context: bool,
+    aggregation: &WindowAggregation,
+    quota_window_stale: bool,
+) -> WindowAnalysis {
+    let local_token_usage = aggregation.local_usage.tokens;
     let total_tokens = local_token_usage.total_tokens;
-    let total_estimated_cost_units = local_usage.estimated_cost_units;
+    let total_estimated_cost_units = aggregation
+        .local_usage
+        .projected_cost_units(api_long_context);
 
     let used_percent = selected.window.used_percent.clamp(0.0, 100.0);
     let confidence = if total_tokens == 0 {
@@ -252,36 +310,45 @@ fn analyze_selected_window(
             token_usage: usage.tokens,
             local_token_share_percent,
             estimated_quota_percent: used_percent
-                * cost_share(usage.estimated_cost_units, total_estimated_cost_units)
+                * cost_share(
+                    usage.projected_cost_units(api_long_context),
+                    total_estimated_cost_units,
+                )
                 / 100.0,
             quota_confidence: confidence,
         }
     };
 
-    let threads = task_usage
-        .into_iter()
+    let threads = aggregation
+        .task_usage
+        .iter()
         .map(|(thread_id, usage)| ThreadWindowUsage {
-            thread_id,
-            usage: usage_for(usage),
+            thread_id: thread_id.clone(),
+            usage: usage_for(*usage),
         })
         .collect();
-    let turns = turn_usage
-        .into_iter()
+    let turns = aggregation
+        .turn_usage
+        .iter()
         .map(|((thread_id, turn_id), usage)| TurnWindowUsage {
-            thread_id,
-            turn_id,
-            usage: usage_for(usage),
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            usage: usage_for(*usage),
         })
         .collect();
-    let models = model_usage
-        .into_iter()
+    let models = aggregation
+        .model_usage
+        .iter()
         .map(|(model, usage)| ModelUsage {
             local_token_share_percent: token_share(usage.tokens, total_tokens),
             estimated_quota_percent: used_percent
-                * cost_share(usage.estimated_cost_units, total_estimated_cost_units)
+                * cost_share(
+                    usage.projected_cost_units(api_long_context),
+                    total_estimated_cost_units,
+                )
                 / 100.0,
             quota_confidence: confidence,
-            model,
+            model: model.clone(),
             token_usage: usage.tokens,
         })
         .collect();
@@ -314,11 +381,14 @@ fn analyze_selected_window(
     if quota_window_stale {
         partial_reasons.push("quota_window_stale".to_string());
     }
-    if used_model_fallback {
+    if aggregation.used_model_fallback {
         partial_reasons.push("unpriced_model_rate_fallback".to_string());
     }
-    if used_token_breakdown_fallback {
+    if aggregation.used_token_breakdown_fallback {
         partial_reasons.push("token_breakdown_missing".to_string());
+    }
+    if api_long_context && aggregation.used_long_context_detection_fallback {
+        partial_reasons.push("long_context_usage_unknown".to_string());
     }
 
     WindowAnalysis {
@@ -332,6 +402,7 @@ fn analyze_selected_window(
         threads,
         turns,
         models,
+        api_long_context: None,
     }
 }
 
@@ -448,9 +519,9 @@ fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f
 }
 
 pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
-    let rates = codex_credit_rates(call.model.as_deref(), call.is_fast());
-    let used_model_fallback = rates.is_none() && !call.tokens.is_zero();
-    let rates = rates.unwrap_or(if call.is_fast() {
+    let published_rates = codex_credit_rates(call.model.as_deref(), call.is_fast());
+    let used_model_fallback = published_rates.is_none() && !call.tokens.is_zero();
+    let base_rates = published_rates.unwrap_or(if call.is_fast() {
         LUNA_FAST
     } else {
         LUNA_STANDARD
@@ -470,16 +541,68 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
         )
     };
 
+    // The surcharge is decided per model request, never from a turn/thread
+    // aggregate. A missing request sample is still provably short when its
+    // aggregate input upper bound does not exceed the threshold.
+    let supports_long_context_pricing =
+        published_rates.is_some() && model_supports_long_context_pricing(call.model.as_deref());
+    let exact_request_input_tokens =
+        (call.request_usage_exact && !used_token_breakdown_fallback).then_some(tokens.input_tokens);
+    let aggregate_input_upper_bound = if used_token_breakdown_fallback {
+        tokens.total_tokens
+    } else {
+        tokens.input_tokens
+    };
+    let (used_long_context_pricing, used_long_context_detection_fallback) =
+        if !supports_long_context_pricing || tokens.is_zero() {
+            (false, false)
+        } else if let Some(request_input_tokens) = exact_request_input_tokens {
+            (request_input_tokens > LONG_CONTEXT_INPUT_THRESHOLD, false)
+        } else if aggregate_input_upper_bound <= LONG_CONTEXT_INPUT_THRESHOLD {
+            (false, false)
+        } else {
+            (false, true)
+        };
+    let long_context_rates = if used_long_context_pricing {
+        base_rates.long_context()
+    } else {
+        base_rates
+    };
+
     let units = u128::from(input_tokens)
-        .saturating_mul(rates.input)
-        .saturating_add(u128::from(cached_input_tokens).saturating_mul(rates.cached_input))
-        .saturating_add(u128::from(output_tokens).saturating_mul(rates.output));
+        .saturating_mul(base_rates.input)
+        .saturating_add(u128::from(cached_input_tokens).saturating_mul(base_rates.cached_input))
+        .saturating_add(u128::from(output_tokens).saturating_mul(base_rates.output));
+    let api_long_context_units = u128::from(input_tokens)
+        .saturating_mul(long_context_rates.input)
+        .saturating_add(
+            u128::from(cached_input_tokens).saturating_mul(long_context_rates.cached_input),
+        )
+        .saturating_add(u128::from(output_tokens).saturating_mul(long_context_rates.output));
 
     EstimatedUsageWeight {
         units,
+        api_long_context_extra_units: api_long_context_units.saturating_sub(units),
         used_model_fallback,
         used_token_breakdown_fallback,
+        used_long_context_pricing,
+        used_long_context_detection_fallback,
     }
+}
+
+fn model_supports_long_context_pricing(model: Option<&str>) -> bool {
+    let Some(model) = model.map(str::trim) else {
+        return false;
+    };
+    model.eq_ignore_ascii_case("gpt-5.6")
+        || model.eq_ignore_ascii_case("gpt-5.6-sol")
+        || model.eq_ignore_ascii_case("daybreak-blue-latest")
+        || model.eq_ignore_ascii_case("gpt-5.6-terra")
+        || model.eq_ignore_ascii_case("gpt-5.6-luna")
+        || model.eq_ignore_ascii_case("gpt-5.5")
+        || model.eq_ignore_ascii_case("daybreak-red-latest")
+        || model.eq_ignore_ascii_case("gpt-5.6-cyber")
+        || model.eq_ignore_ascii_case("gpt-5.4")
 }
 
 fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
@@ -535,6 +658,7 @@ mod tests {
             model: Some(model.to_string()),
             service_tier: fast.then(|| "priority".to_string()),
             tokens,
+            request_usage_exact: true,
         }
     }
 
@@ -543,6 +667,7 @@ mod tests {
         let tokens = TokenUsage {
             input_tokens: 13,
             cached_input_tokens: 3,
+            cache_write_input_tokens: 0,
             output_tokens: 2,
             reasoning_output_tokens: 1,
             total_tokens: 999,
@@ -647,5 +772,162 @@ mod tests {
         ));
 
         assert_eq!(cost.units, 20);
+    }
+
+    #[test]
+    fn long_context_pricing_uses_the_strict_per_request_threshold() {
+        let short = estimate_call_weight(&rated_call(
+            "gpt-5.6-luna",
+            false,
+            TokenUsage {
+                input_tokens: 272_000,
+                output_tokens: 10,
+                total_tokens: 272_010,
+                ..TokenUsage::default()
+            },
+        ));
+        let long = estimate_call_weight(&rated_call(
+            "gpt-5.6-luna",
+            false,
+            TokenUsage {
+                input_tokens: 272_001,
+                output_tokens: 10,
+                total_tokens: 272_011,
+                ..TokenUsage::default()
+            },
+        ));
+
+        assert_eq!(short.units, 10_882_400);
+        assert!(!short.used_long_context_pricing);
+        assert_eq!(long.units, 10_882_440);
+        assert_eq!(long.units_with_api_long_context(), 21_763_680);
+        assert!(long.used_long_context_pricing);
+        assert!(!long.used_long_context_detection_fallback);
+    }
+
+    #[test]
+    fn long_context_multiplier_covers_cached_input_and_composes_with_fast() {
+        let tokens = TokenUsage {
+            input_tokens: 272_001,
+            cached_input_tokens: 200_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 10,
+            total_tokens: 272_011,
+            ..TokenUsage::default()
+        };
+
+        let standard = estimate_call_weight(&rated_call("gpt-5.6-luna", false, tokens));
+        let fast = estimate_call_weight(&rated_call("gpt-5.6-luna", true, tokens));
+
+        assert_eq!(standard.units, 3_682_440);
+        assert_eq!(standard.units_with_api_long_context(), 7_363_680);
+        assert_eq!(fast.units, 9_206_100);
+        assert_eq!(fast.units_with_api_long_context(), 18_409_200);
+        assert!(standard.used_long_context_pricing);
+        assert!(fast.used_long_context_pricing);
+    }
+
+    #[test]
+    fn request_boundaries_prevent_aggregate_input_from_triggering_the_surcharge() {
+        let mut first = rated_call(
+            "gpt-5.6-luna",
+            false,
+            TokenUsage {
+                input_tokens: 200_000,
+                total_tokens: 200_000,
+                ..TokenUsage::default()
+            },
+        );
+        let second = first.clone();
+
+        let first_weight = estimate_call_weight(&first);
+        let second_weight = estimate_call_weight(&second);
+        assert_eq!(
+            first_weight.units.saturating_add(second_weight.units),
+            16_000_000
+        );
+        assert!(!first_weight.used_long_context_pricing);
+        assert!(!second_weight.used_long_context_pricing);
+
+        first.request_usage_exact = false;
+        let safely_short_aggregate = estimate_call_weight(&first);
+        assert_eq!(safely_short_aggregate.units, 8_000_000);
+        assert!(!safely_short_aggregate.used_long_context_pricing);
+        assert!(!safely_short_aggregate.used_long_context_detection_fallback);
+
+        first.tokens.input_tokens = 400_000;
+        first.tokens.total_tokens = 400_000;
+        let unverified_aggregate = estimate_call_weight(&first);
+        assert_eq!(unverified_aggregate.units, 16_000_000);
+        assert!(!unverified_aggregate.used_long_context_pricing);
+        assert!(unverified_aggregate.used_long_context_detection_fallback);
+    }
+
+    #[test]
+    fn long_context_rules_are_limited_to_published_model_profiles() {
+        let tokens = TokenUsage {
+            input_tokens: 272_001,
+            output_tokens: 1,
+            total_tokens: 272_002,
+            ..TokenUsage::default()
+        };
+
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "daybreak-blue-latest",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "daybreak-red-latest",
+            "gpt-5.6-cyber",
+            "gpt-5.4",
+        ] {
+            let weight = estimate_call_weight(&rated_call(model, false, tokens));
+            assert!(weight.used_long_context_pricing, "{model}");
+        }
+
+        for model in ["gpt-5.5-cyber", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"] {
+            let weight = estimate_call_weight(&rated_call(model, false, tokens));
+            assert!(!weight.used_long_context_pricing, "{model}");
+            assert!(!weight.used_long_context_detection_fallback, "{model}");
+        }
+    }
+
+    #[test]
+    fn unknown_models_do_not_infer_long_context_pricing_from_the_luna_fallback() {
+        let weight = estimate_call_weight(&rated_call(
+            "future-model",
+            false,
+            TokenUsage {
+                input_tokens: 300_000,
+                total_tokens: 300_000,
+                ..TokenUsage::default()
+            },
+        ));
+
+        assert_eq!(weight.units, 12_000_000);
+        assert!(weight.used_model_fallback);
+        assert!(!weight.used_long_context_pricing);
+        assert!(!weight.used_long_context_detection_fallback);
+    }
+
+    #[test]
+    fn cache_write_is_an_input_subset_not_an_additional_credit_component() {
+        let base = TokenUsage {
+            input_tokens: 10_000,
+            cached_input_tokens: 2_000,
+            output_tokens: 100,
+            total_tokens: 10_100,
+            ..TokenUsage::default()
+        };
+        let with_cache_write = TokenUsage {
+            cache_write_input_tokens: 7_000,
+            ..base
+        };
+
+        let without = estimate_call_weight(&rated_call("gpt-5.6-sol", false, base));
+        let with = estimate_call_weight(&rated_call("gpt-5.6-sol", false, with_cache_write));
+        assert_eq!(with.units, without.units);
     }
 }

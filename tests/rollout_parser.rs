@@ -25,6 +25,42 @@ fn usage(input: u64, cached: u64, output: u64, reasoning: u64, total: u64) -> Va
     })
 }
 
+fn usage_with_cache_write(
+    input: u64,
+    cached: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning: u64,
+    total: u64,
+) -> Value {
+    json!({
+        "input_tokens": input,
+        "cached_input_tokens": cached,
+        "cache_write_input_tokens": cache_write,
+        "output_tokens": output,
+        "reasoning_output_tokens": reasoning,
+        "total_tokens": total
+    })
+}
+
+fn camel_usage_with_cache_write(
+    input: u64,
+    cached: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning: u64,
+    total: u64,
+) -> Value {
+    json!({
+        "inputTokens": input,
+        "cachedInputTokens": cached,
+        "cacheWriteInputTokens": cache_write,
+        "outputTokens": output,
+        "reasoningOutputTokens": reasoning,
+        "totalTokens": total
+    })
+}
+
 fn write_jsonl(path: &std::path::Path, records: &[Value], malformed_tail: bool) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = File::create(path).unwrap();
@@ -263,6 +299,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
         TokenUsage {
             input_tokens: 20,
             cached_input_tokens: 6,
+            cache_write_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 1,
             total_tokens: 25,
@@ -459,6 +496,114 @@ fn counts_an_exact_first_sample_after_a_cumulative_counter_epoch_reset() {
             .iter()
             .all(|warning| !warning.contains("counter reset"))
     );
+}
+
+#[test]
+fn preserves_exact_per_request_usage_and_cache_write_fields() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-long-context-requests.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "long-context-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "long-context-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage_with_cache_write(272_000, 100, 30, 1, 0, 272_001),
+                        "last_token_usage": usage_with_cache_write(272_000, 100, 30, 1, 0, 272_001)
+                    }
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "totalTokenUsage": camel_usage_with_cache_write(544_001, 250, 70, 2, 0, 544_003),
+                        "lastTokenUsage": camel_usage_with_cache_write(272_001, 150, 40, 1, 0, 272_002)
+                    }
+                }
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.calls.len(), 2);
+    assert!(dataset.calls[0].request_usage_exact);
+    assert_eq!(dataset.calls[0].tokens.input_tokens, 272_000);
+    assert_eq!(dataset.calls[0].tokens.cache_write_input_tokens, 30);
+    assert!(dataset.calls[1].request_usage_exact);
+    assert_eq!(dataset.calls[1].tokens.input_tokens, 272_001);
+    assert_eq!(dataset.calls[1].tokens.cache_write_input_tokens, 40);
+    assert_eq!(dataset.tasks[0].token_usage.cache_write_input_tokens, 70);
+}
+
+#[test]
+fn does_not_treat_a_mismatched_last_sample_as_one_request() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-unverified-request-boundary.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "unverified-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "unverified-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(100, 0, 0, 0, 100)}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": usage(300_100, 0, 0, 0, 300_100),
+                        "last_token_usage": usage(299_999, 0, 0, 0, 299_999)
+                    }
+                }
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.calls.len(), 2);
+    assert_eq!(dataset.calls[1].tokens.input_tokens, 300_000);
+    assert!(!dataset.calls[1].request_usage_exact);
 }
 
 #[test]

@@ -560,6 +560,19 @@ fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAna
     })
 }
 
+fn window_analysis_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    api_long_context: bool,
+) -> Option<&WindowAnalysis> {
+    let analysis = window_analysis(snapshot, scope)?;
+    if api_long_context {
+        analysis.api_long_context.as_deref().or(Some(analysis))
+    } else {
+        Some(analysis)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResetExpiryReminder {
     expires_at: chrono::DateTime<chrono::Utc>,
@@ -620,8 +633,17 @@ fn has_legacy_codex_window(snapshot: &Snapshot) -> bool {
         .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
 }
 
+#[cfg(test)]
 fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&AttributionSummary> {
-    window_analysis(snapshot, scope)
+    attribution_for_scope_with_api_long_context(snapshot, scope, false)
+}
+
+fn attribution_for_scope_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    api_long_context: bool,
+) -> Option<&AttributionSummary> {
+    window_analysis_with_api_long_context(snapshot, scope, api_long_context)
         .map(|analysis| &analysis.attribution)
         .or_else(|| {
             (scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot))
@@ -629,8 +651,19 @@ fn attribution_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Option<&Att
         })
 }
 
+#[cfg(test)]
 fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskRecord) -> WindowUsage {
-    if let Some(analysis) = window_analysis(snapshot, scope) {
+    task_usage_for_scope_with_api_long_context(snapshot, scope, task, false)
+}
+
+fn task_usage_for_scope_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    task: &TaskRecord,
+    api_long_context: bool,
+) -> WindowUsage {
+    if let Some(analysis) = window_analysis_with_api_long_context(snapshot, scope, api_long_context)
+    {
         return analysis
             .threads
             .iter()
@@ -651,8 +684,14 @@ fn task_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, task: &TaskReco
     }
 }
 
-fn turn_usage_for_scope(snapshot: &Snapshot, scope: WindowScope, turn: &TurnRecord) -> WindowUsage {
-    if let Some(analysis) = window_analysis(snapshot, scope) {
+fn turn_usage_for_scope_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    turn: &TurnRecord,
+    api_long_context: bool,
+) -> WindowUsage {
+    if let Some(analysis) = window_analysis_with_api_long_context(snapshot, scope, api_long_context)
+    {
         return analysis
             .turns
             .iter()
@@ -678,9 +717,10 @@ fn task_record_usage(
     scope: WindowScope,
     task: &TaskRecord,
     window_only: bool,
+    api_long_context: bool,
 ) -> WindowUsage {
     if window_only {
-        task_usage_for_scope(snapshot, scope, task)
+        task_usage_for_scope_with_api_long_context(snapshot, scope, task, api_long_context)
     } else {
         WindowUsage {
             token_usage: task.token_usage,
@@ -691,18 +731,30 @@ fn task_record_usage(
     }
 }
 
+#[cfg(test)]
 fn aggregate_task_row_usage(
     snapshot: &Snapshot,
     scope: WindowScope,
     row: &TaskListRow,
     window_only: bool,
 ) -> WindowUsage {
+    aggregate_task_row_usage_with_api_long_context(snapshot, scope, row, window_only, false)
+}
+
+fn aggregate_task_row_usage_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    row: &TaskListRow,
+    window_only: bool,
+    api_long_context: bool,
+) -> WindowUsage {
     let Some(task) = snapshot.tasks.get(row.index) else {
         return WindowUsage::default();
     };
     if window_only
         && !row.hidden_descendants.is_empty()
-        && let Some(analysis) = window_analysis(snapshot, scope)
+        && let Some(analysis) =
+            window_analysis_with_api_long_context(snapshot, scope, api_long_context)
     {
         let thread_ids = std::iter::once(row.index)
             .chain(row.hidden_descendants.iter().copied())
@@ -732,7 +784,7 @@ fn aggregate_task_row_usage(
         return aggregate;
     }
 
-    let mut aggregate = task_record_usage(snapshot, scope, task, window_only);
+    let mut aggregate = task_record_usage(snapshot, scope, task, window_only, api_long_context);
     if row.hidden_descendants.is_empty() {
         return aggregate;
     }
@@ -743,7 +795,7 @@ fn aggregate_task_row_usage(
         let Some(descendant) = snapshot.tasks.get(index) else {
             continue;
         };
-        let usage = task_record_usage(snapshot, scope, descendant, window_only);
+        let usage = task_record_usage(snapshot, scope, descendant, window_only, api_long_context);
         aggregate.token_usage.add_assign(usage.token_usage);
         aggregate.local_token_share_percent += usage.local_token_share_percent;
         aggregate.estimated_quota_percent += usage.estimated_quota_percent;
@@ -962,6 +1014,7 @@ struct WindowControlsHitbox {
     toggle_turns: Rect,
     toggle_models: Rect,
     scopes: [Rect; 2],
+    toggle_api_long_context: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1044,6 +1097,7 @@ struct PreparedTrendData {
     half_hour_history_present: bool,
     history_warning_count: usize,
     history_read_only: bool,
+    api_long_context_multiplier: bool,
 }
 
 struct TrendPanelSpec<'a> {
@@ -1311,6 +1365,7 @@ struct App {
     turns_default_visible: bool,
     turns_temporarily_visible: bool,
     models_visible: bool,
+    api_long_context_multiplier: bool,
     open_config: OpenConfig,
     open_config_error: Option<String>,
     zellij_environment: bool,
@@ -1382,6 +1437,7 @@ impl App {
             turns_default_visible: true,
             turns_temporarily_visible: false,
             models_visible: true,
+            api_long_context_multiplier: false,
             open_config: OpenConfig::default(),
             open_config_error: None,
             zellij_environment: std::env::var_os("ZELLIJ").is_some(),
@@ -1481,6 +1537,7 @@ impl App {
         self.turns_default_visible = state.turns_visible;
         self.turns_temporarily_visible = false;
         self.models_visible = state.models_visible;
+        self.api_long_context_multiplier = state.api_long_context_multiplier;
         self.task_list_mode = state.task_list_mode.into();
         self.expanded_task_threads.clear();
         self.task_source_filter = state.task_source_filter.into();
@@ -1853,6 +1910,7 @@ impl App {
             window_scope: self.window_scope.into(),
             turns_visible: self.turns_default_visible,
             models_visible: self.models_visible,
+            api_long_context_multiplier: self.api_long_context_multiplier,
             task_list_mode: self.task_list_mode.into(),
             task_source_filter: self.task_source_filter.into(),
             ..UiState::default()
@@ -2134,6 +2192,11 @@ impl App {
         self.models_visible = !self.models_visible;
         self.task_reveal_pending = true;
         self.turn_reveal_pending = true;
+    }
+
+    fn toggle_api_long_context_multiplier(&mut self) {
+        self.api_long_context_multiplier = !self.api_long_context_multiplier;
+        self.clear_trend_inspection();
     }
 
     fn reset_turn_selection(&mut self) {
@@ -3193,6 +3256,11 @@ impl App {
             self.toggle_models_visibility();
             return true;
         }
+        if rect_contains(hitbox.toggle_api_long_context, column, row) {
+            self.accept_active_search();
+            self.toggle_api_long_context_multiplier();
+            return true;
+        }
         let Some(scope) = WindowScope::ALL
             .into_iter()
             .find(|scope| rect_contains(hitbox.scopes[scope.index()], column, row))
@@ -3750,6 +3818,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('m' | 'M') if app.view == View::Overview => {
             app.toggle_models_visibility();
+        }
+        KeyCode::Char('l' | 'L') if app.view == View::Overview => {
+            app.toggle_api_long_context_multiplier();
         }
         KeyCode::Char('o' | 'O') if app.view == View::Overview && app.focus == Focus::Tasks => {
             app.activate_open();
@@ -4621,7 +4692,7 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         .map(|view| tabs.tabs[view.index()].right())
         .unwrap_or(area.x);
     let remaining = usize::from(area.right().saturating_sub(start_x));
-    let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week]");
+    let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week] [L]Long×");
     let compact = remaining < full_width;
     let separator = if compact { " " } else { TAB_DIVIDER };
     let gap = if compact { "" } else { " " };
@@ -4748,6 +4819,40 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         x = x.saturating_add(width);
     }
 
+    let api_long_context_label = if compact { "[L]" } else { "[L]Long×" };
+    let api_long_context_width =
+        u16::try_from(UnicodeWidthStr::width(api_long_context_label)).unwrap_or(u16::MAX);
+    let mut toggle_api_long_context = Rect::default();
+    if scopes.iter().all(|scope| !scope.is_empty())
+        && x.saturating_add(gap_width)
+            .saturating_add(api_long_context_width)
+            <= area.right()
+    {
+        spans.push(Span::raw(gap));
+        x = x.saturating_add(gap_width);
+        toggle_api_long_context = clipped_horizontal_hitbox(area, x, api_long_context_width);
+        let style = if app.api_long_context_multiplier {
+            Style::default()
+                .fg(palette.background)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let shortcut_style = if !shortcuts_active {
+            style
+        } else if app.api_long_context_multiplier {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled("[", style));
+        spans.push(Span::styled("L", shortcut_style));
+        spans.push(Span::styled(if compact { "]" } else { "]Long×" }, style));
+    }
+
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect::new(
@@ -4761,6 +4866,7 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         toggle_turns,
         toggle_models,
         scopes,
+        toggle_api_long_context,
     }
 }
 
@@ -5359,6 +5465,14 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
     let weekly_cumulative = weekly_reset
         .map(|reset| app.history.weekly_cumulative_series(reset))
         .unwrap_or_default();
+    let weekly_estimated_cumulative = weekly_reset
+        .map(|reset| {
+            app.history.weekly_cumulative_series_with_api_long_context(
+                reset,
+                app.api_long_context_multiplier,
+            )
+        })
+        .unwrap_or_default();
     let weekly_history_present = weekly_cumulative
         .iter()
         .any(|point| point.sampled_at.is_some());
@@ -5373,7 +5487,7 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
             partial: !point.partial_reasons.is_empty(),
         })
         .collect();
-    let weekly_estimated = weekly_cumulative
+    let weekly_estimated = weekly_estimated_cumulative
         .iter()
         .filter_map(|point| {
             point.estimated_quota_percent.map(|value| TrendPoint {
@@ -5403,14 +5517,26 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
         interval: None,
         partial: !point.partial_reasons.is_empty(),
     });
-    let weekly_estimated_readout = weekly_readout_point.and_then(|(point, sampled_at)| {
-        point.estimated_quota_percent.map(|value| TrendReadout {
-            sampled_at,
-            value: TrendReadoutValue::Percent(value),
-            interval: None,
-            partial: !point.partial_reasons.is_empty(),
+    let weekly_estimated_readout_point = weekly_reset
+        .filter(|reset| {
+            let starts_at = *reset - ChronoDuration::minutes(10_080);
+            starts_at <= now && now < *reset
         })
-    });
+        .and_then(|_| {
+            weekly_estimated_cumulative
+                .iter()
+                .rfind(|point| point.sampled_at.is_some_and(|sampled_at| sampled_at <= now))
+                .and_then(|point| point.sampled_at.map(|sampled_at| (point, sampled_at)))
+        });
+    let weekly_estimated_readout =
+        weekly_estimated_readout_point.and_then(|(point, sampled_at)| {
+            point.estimated_quota_percent.map(|value| TrendReadout {
+                sampled_at,
+                value: TrendReadoutValue::Percent(value),
+                interval: None,
+                partial: !point.partial_reasons.is_empty(),
+            })
+        });
 
     let half_hour_buckets = app
         .history
@@ -5435,7 +5561,11 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
             partial: !bucket.partial_reasons.is_empty(),
         })
         .collect();
-    let half_hour_estimated = half_hour_estimated_trend(&app.history, half_hour_bounds);
+    let half_hour_estimated = half_hour_estimated_trend(
+        &app.history,
+        half_hour_bounds,
+        app.api_long_context_multiplier,
+    );
 
     PreparedTrendData {
         five_hour_remaining,
@@ -5453,6 +5583,7 @@ fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
         half_hour_history_present,
         history_warning_count: app.history.warnings.len(),
         history_read_only: app.history.read_only,
+        api_long_context_multiplier: app.api_long_context_multiplier,
     }
 }
 
@@ -5478,7 +5609,11 @@ fn remaining_trend_readout(
         })
 }
 
-fn half_hour_estimated_trend(history: &HistoryData, bounds: [DateTime<Utc>; 2]) -> Vec<TrendPoint> {
+fn half_hour_estimated_trend(
+    history: &HistoryData,
+    bounds: [DateTime<Utc>; 2],
+    api_long_context: bool,
+) -> Vec<TrendPoint> {
     const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
     let resets = weekly_resets_overlapping(history, bounds);
     let estimates_by_reset = resets
@@ -5486,7 +5621,7 @@ fn half_hour_estimated_trend(history: &HistoryData, bounds: [DateTime<Utc>; 2]) 
         .copied()
         .map(|reset| {
             let points = history
-                .estimated_half_hour_series(reset)
+                .estimated_half_hour_series_with_api_long_context(reset, api_long_context)
                 .into_iter()
                 .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
                 .map(|point| (point.starts_at, point))
@@ -5925,12 +6060,17 @@ fn render_weekly_estimated_trend_panel(
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
+    let base_title = if data.api_long_context_multiplier {
+        "Weekly ~EST Usage · API Long ON"
+    } else {
+        "Weekly ~EST Usage"
+    };
     if data.weekly_estimated.is_empty() && data.weekly_history_present {
         if inspection.is_some_and(|inspection| inspection.panel == TrendPanelId::WeeklyEstimated) {
             *inspection = None;
         }
         let title = trend_panel_status_title(
-            "Weekly ~EST Usage",
+            base_title,
             data.history_warning_count,
             data.history_read_only,
         );
@@ -5955,7 +6095,7 @@ fn render_weekly_estimated_trend_panel(
         }],
         TrendPanelSpec {
             panel: TrendPanelId::WeeklyEstimated,
-            title: "Weekly ~EST Usage",
+            title: base_title,
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(45),
             },
@@ -6016,12 +6156,17 @@ fn render_half_hour_estimated_trend_panel(
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
+    let base_title = if data.api_long_context_multiplier {
+        "15m ~EST Usage · API Long ON"
+    } else {
+        "15m ~EST Usage"
+    };
     if data.half_hour_estimated.is_empty() && data.half_hour_history_present {
         if inspection.is_some_and(|inspection| inspection.panel == TrendPanelId::LocalEstimated) {
             *inspection = None;
         }
         let title = trend_panel_status_title(
-            "15m ~EST Usage",
+            base_title,
             data.history_warning_count,
             data.history_read_only,
         );
@@ -6046,7 +6191,7 @@ fn render_half_hour_estimated_trend_panel(
         }],
         TrendPanelSpec {
             panel: TrendPanelId::LocalEstimated,
-            title: "15m ~EST Usage",
+            title: base_title,
             graph_kind: TrendGraphKind::Bar {
                 expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
@@ -7582,7 +7727,13 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .take(visible_capacity)
         .filter_map(|row| app.snapshot.tasks.get(row.index).map(|task| (task, row)))
         .map(|(task, row)| {
-            let usage = aggregate_task_row_usage(&app.snapshot, app.window_scope, row, window_only);
+            let usage = aggregate_task_row_usage_with_api_long_context(
+                &app.snapshot,
+                app.window_scope,
+                row,
+                window_only,
+                app.api_long_context_multiplier,
+            );
             let tokens = usage.token_usage;
             let local_share = usage.local_token_share_percent;
             let estimated_quota = usage.estimated_quota_percent;
@@ -8274,7 +8425,12 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     };
     let theme = app.theme;
     let rows = turns.iter().skip(offset).map(|turn| {
-        let usage = turn_usage_for_scope(&app.snapshot, app.window_scope, turn);
+        let usage = turn_usage_for_scope_with_api_long_context(
+            &app.snapshot,
+            app.window_scope,
+            turn,
+            app.api_long_context_multiplier,
+        );
         let tokens = if window_only {
             usage.token_usage
         } else {
@@ -8430,7 +8586,14 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         };
         let selected_turn = turns.get(app.selected_turn).copied();
         let selected_usage = selected_turn
-            .map(|turn| turn_usage_for_scope(&app.snapshot, detail_scope, turn))
+            .map(|turn| {
+                turn_usage_for_scope_with_api_long_context(
+                    &app.snapshot,
+                    detail_scope,
+                    turn,
+                    app.api_long_context_multiplier,
+                )
+            })
             .unwrap_or_default();
         render_turn_detail(
             frame,
@@ -8715,8 +8878,17 @@ fn attribution_summary_lines(
     vec![format!("Attribution  {window}"), allocation, quality]
 }
 
+#[cfg(test)]
 fn models_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Vec<ModelUsage> {
-    window_analysis(snapshot, scope)
+    models_for_scope_with_api_long_context(snapshot, scope, false)
+}
+
+fn models_for_scope_with_api_long_context(
+    snapshot: &Snapshot,
+    scope: WindowScope,
+    api_long_context: bool,
+) -> Vec<ModelUsage> {
+    window_analysis_with_api_long_context(snapshot, scope, api_long_context)
         .map(|analysis| analysis.models.clone())
         .unwrap_or_else(|| {
             if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
@@ -8740,9 +8912,21 @@ fn wrapped_text_height(lines: &[String], width: usize) -> usize {
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
-    let analysis = window_analysis(&app.snapshot, window_scope);
-    let attribution = attribution_for_scope(&app.snapshot, window_scope);
-    let mut models = models_for_scope(&app.snapshot, window_scope);
+    let analysis = window_analysis_with_api_long_context(
+        &app.snapshot,
+        window_scope,
+        app.api_long_context_multiplier,
+    );
+    let attribution = attribution_for_scope_with_api_long_context(
+        &app.snapshot,
+        window_scope,
+        app.api_long_context_multiplier,
+    );
+    let mut models = models_for_scope_with_api_long_context(
+        &app.snapshot,
+        window_scope,
+        app.api_long_context_multiplier,
+    );
     models.sort_by(|left, right| {
         right
             .token_usage
@@ -8782,6 +8966,9 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .and_then(|attribution| attribution.window.as_ref())
         .map(|window| window.label.clone());
     let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
+    if app.api_long_context_multiplier {
+        title_suffix.push_str(" · API Long ON");
+    }
     if attribution.is_none() {
         title_suffix.push_str(" unavailable");
     }

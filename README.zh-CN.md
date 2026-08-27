@@ -241,6 +241,7 @@ codex-usage-monit record --foreground
 | `r`、`E`、`-`、`+` | 切换平铺/树形模式，全部收起/展开，或收起/展开一个父任务。 |
 | `a`、`d`、`s`、`c`、`[` / `]` | 筛选 All、Desktop、Subagent、CLI 来源，或循环切换来源。 |
 | `v`、`m` | 显示/隐藏 Turns 或 Models。 |
+| Overview 中的 `l` | 切换 TUI `~EST` 可选的 API 长上下文倍率。 |
 | `o` | 在新 Zellij pane 中打开选中的已停止 root task，或为其他终端提供 resume 命令。 |
 | `t` | 切换深色/浅色主题。 |
 | `q` | 退出。在主视图按 `Esc` 会打开退出确认。 |
@@ -286,6 +287,8 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 
 对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
 
+TUI 的 `[L]Long×` 开关**默认关闭**。开启后，程序才会对支持的模型额外套用 OpenAI API 公布的长上下文规则：可核实的单次请求 input 超过 272K token 时，input/cached-input 权重为 `2x`、output 权重为 `1.5x`。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
+
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
 任务树默认全部收起；可见的父任务行会包含被隐藏后代的 token/占比。
@@ -315,7 +318,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前 token-based credit 映射对应 revision 3。升级后，程序只会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点；当 revision 3 数据点的未加权 token/call 证据不差于旧点时，由 revision-aware upsert 替换旧点。无法重建的 revision 1/2 历史数据会继续保存并隔离；窗口内出现混合 revision 时不能合并 EST，`~EST` 显示 unavailable 并标为 partial。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本或估算器更新后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]Long×` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 
@@ -323,7 +326,7 @@ Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不
 
 - **Token 是本地观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在已扫描的本地数据范围内是准确值。
 - **账户用量指标是服务端数据。** 当前额度窗口百分比和重置时间来自 Codex App Server；离线或降级时则来自已过期（`stale`）的本地后备数据。
-- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层 Codex credit 费率权重上，因此来自其他机器或客户端的活动可能使结果失真。
+- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层 Codex credit 费率权重上。可选 API 长上下文倍率默认关闭；无论选择哪种口径，来自其他机器或客户端的活动都可能使结果失真。
 - **需考虑 workspace 的费率卡迁移状态。** token-based 卡适用于绝大多数方案，但 OpenAI 说明仍有少量 Enterprise workspace 使用旧的按消息计费卡。监控器无法从本地 rollout 判断 workspace 是否已迁移，因此这些用户不应把 `~EST` 视为其适用计费卡的代表值。
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
@@ -350,7 +353,7 @@ JSON 输出使用 camelCase，目前报告 `"schemaVersion": 1`。
 | `stats` | 扫描和解析器统计。 |
 | `warnings`、`errors` | 采集过程中的警告和错误诊断。单个数据源出错不一定会使整个快照不可用。 |
 
-Token 用量包含 `inputTokens`、`cachedInputTokens`、`outputTokens`、`reasoningOutputTokens` 和 `totalTokens`。不要把五项相加：cached input 是 input 的子集，reasoning output 是 output 的一部分，而 `totalTokens` 已经是总量。
+Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`、`outputTokens`、`reasoningOutputTokens` 和 `totalTokens`。不要把这些字段相加：cached input 与 cache write input 都是 input 的子集，reasoning output 是 output 的一部分，而 `totalTokens` 已经是总量。
 
 对于重置机会，`availableCount` 是权威值。`credits: null` 表示只知道数量；`credits: []` 表示已经读取明细，并且返回的列表为空。如果服务端截断详情，非空列表仍可能短于 `availableCount`。
 

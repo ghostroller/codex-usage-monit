@@ -90,11 +90,12 @@ task/thread -> turn -> model token events
 - EST 使用 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 与 Daybreak Blue 的 `daybreak-blue-latest` `(100,10,500)`，`gpt-5.6-terra` `(50,5,300)`，`gpt-5.6-luna` `(5,.5,30)`，`gpt-5.5` `(125,12.5,750)`，Daybreak Red 的 `daybreak-red-latest`、`gpt-5.6-cyber` 与历史兼容 slug `gpt-5.5-cyber` `(312.5,31.25,1875)`，`gpt-5.4` `(62.5,6.25,375)`，`gpt-5.4-mini` `(18.75,1.875,113)`；该映射包含 2026-08-21 的 Sol 调价，官方说明其促销费率至少持续到 2026-11-21；
 - 当前官方费率卡不再列出 GPT-5.3-Codex/GPT-5.2；为读取历史 rollout，`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仍保留早期 `(43.75,4.375,350)` Standard 兼容权重，不得把它们描述为当前官方费率卡行；
 - `serviceTier=fast` 与本地登录态 rollout 的兼容 `serviceTier=priority` 值都按 ChatGPT Fast 识别；根据官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard。这里的 `priority` 兼容行为不得解释为 API Priority 计费，后者在官方文档中是独立费率；
-- `cached = min(cached_input, input)`，`uncached = input - cached`，`call_credit_units = uncached * input_rate + cached * cached_rate + output * output_rate`；reasoning 是 output 子集，不得重复相加；当前 Codex credit 卡没有 cache-write 行，因此公式不得增加 cache-write 项；
+- `cached = min(cached_input, input)`，`uncached = input - cached`；基础 EST 始终使用 Codex token-based credit rate，不自动套用 API 长上下文倍率。TUI 提供默认关闭的 `[L]Long×` 可选口径：对 GPT-5.6 Sol/Terra/Luna/Cyber（含当前 aliases）、GPT-5.5 和 GPT-5.4，只有与安全累计 delta 完全相等的单次 `last_token_usage.input_tokens > 272000` 时，才把 API 公布的 input/cached input `2x` 与 output `1.5x` 代理倍率应用到整次请求。判断必须逐调用进行，不能使用 turn/thread/bucket 累计值；可选口径开启且单次边界未知、聚合 input 超过阈值时保留基础费率并标 `long_context_usage_unknown`，关闭时不得仅因该假设标 partial；聚合不超过阈值可安全按短上下文处理。GPT-5.4 mini、旧 `gpt-5.5-cyber` 与 GPT-5.3/GPT-5.2 兼容映射，以及未知模型 Luna fallback 不得凭推断套用长上下文倍率；Codex credit 卡未公布相同公式，输出不得称为官方逐请求 credit 账单；
+- reasoning 是 output 子集，cache-write 是 input 子集，两者都不得重复相加。rollout 必须保留 snake/camel case 的 cache-write 字段并用于累计 delta 与单次请求一致性校验；当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不得额外增加 API cache-write charge；
 - 缺失或未映射的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast credit 费率降级，并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
 - `estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units`；task、turn、model 的 EST 使用同一 credit-rate 分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
 - `gpt-5.3-codex-spark` 的公开费率仍是 research preview，继续按精确模型名排除；不得为 Spark 虚构 credit 值；
-- token-based 映射使用 estimator revision 3；不得假定任意持久化聚合都能直接重新定价。仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 3 新点的未加权 token/call 证据不差于旧点时由 revision-aware upsert 替换；无法重建的 revision 1/2 历史点必须保留原 revision 并继续隔离，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
+- token-based 双口径映射使用 estimator revision 5，历史 metric revision 3；每个新观察必须同时持久化基础 credit units 与可选 API 长上下文 extra，recorder 不得因 TUI 开关改变写入内容。不得假定任意持久化聚合都能直接重新定价，仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 5 新点的未加权 token/call/cache-write 证据不差于旧点时由 revision-aware upsert 替换。已发布的 revision 3 基础历史必须保留，但在重建前开启可选口径时标 `api_long_context_history_unavailable`；无法拆分基础与附加值的开发版 revision 4 历史必须丢弃。其他无法重建的旧 revision 继续隔离，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
 - Help Center 所述少量仍使用 legacy rate card 的 Enterprise workspace 无法从本地 rollout 自动识别；对这些 workspace，EST 不得声称代表其适用计费卡；
 - 每个 scope 的摘要统一说明估算方法、`external activity possible` 与 partial 状态；partial 时列出 `partialReasons`。partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；
@@ -124,7 +125,7 @@ codex-usage-monit --theme light
 
 TUI 首次启动使用 dark 主题，之后恢复用户级状态文件中的主题；`--theme light` 显式覆盖保存值，`bright` 是 `light` 的别名，运行中按 `t` 可切换。主题只影响 TUI 渲染，不得改变采集结果或一次性 text/JSON 输出。
 
-TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、Turns/Models 显隐、Flat/Tree 与 task 来源筛选。搜索、选择、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；状态损坏时回退默认值，一次性输出不得读写此文件。
+TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、默认关闭的 API 长上下文倍率、Turns/Models 显隐、Flat/Tree 与 task 来源筛选。搜索、选择、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；开关字段缺失或状态损坏时回退为关闭，一次性输出不得读写此文件并保持基础 EST 口径。
 
 一次性输出：
 
@@ -147,7 +148,7 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 ### Overview
 
 - quota gauges；
-- Overview 最顶栏中的 `[V]Turns`、`[M]Models`、`[5h]` / `[Week]` 按钮；`V`、`M`、`5` / `W` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；
+- Overview 最顶栏中的 `[V]Turns`、`[M]Models`、`[5h]` / `[Week]`、`[L]Long×` 按钮；`V`、`M`、`5` / `W`、`L` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；紧凑布局可缩为 `[L]`，但不得删除快捷键或 hitbox；
 - 所选当前 reset cycle 的 duration、实际起止时间和额度；
 - 使用所选 scope 的 task 表；
 - 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
@@ -156,7 +157,7 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 - `V` 与最顶栏中可点击的 `[V]Turns` 切换 Turns 默认显隐；首次启动默认显示，隐藏后仍可临时进入 Turns，顶栏恢复控件始终可达；
 - 非搜索状态的 `Esc` 打开退出确认弹窗，弹窗内 `Enter` 确认、`Esc` 取消；`Ctrl-C` 与 `q` 保持直接退出，搜索输入中的 `Esc` 只取消编辑。
 
-Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要，并作为稳定菜单偏好跨 TUI 进程保存；旧 JSON v1 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
+Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要；`[L]Long×` 同步切换这些实体 EST 与 Trends 的 Weekly/15m `~EST` 图，但不改变原始 token 图。两者都作为稳定菜单偏好跨 TUI 进程保存；搜索输入焦点必须先消费 `l`，非 Overview 视图不得误触发该键。旧 JSON v1 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 基础分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
 
 ### Other
 
@@ -206,7 +207,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
 - 5h/Week 使用服务端 reset cycle 边界；`--days` 覆盖不足时对应 `windowAnalyses` 为 partial；
-- Overview 最顶栏中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`V` / `[V]Turns` 和 `M` / `[M]Models` 可稳定隐藏并恢复对应面板；
+- Overview 最顶栏中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`V` / `[V]Turns` 和 `M` / `[M]Models` 可稳定隐藏并恢复对应面板；`L` / `[L]Long×` 默认关闭，键盘和整块鼠标 hitbox 都能同步切换 Overview 与 Trends 的 EST 口径，搜索焦点和其他视图不会误触发；
 - Tree 节点收起时父行准确汇总当前过滤树中隐藏后代的 token、`TOKEN%` 与 estimated quota，展开时不重复计数；
 - `serviceTier=fast` / `priority` 的 Fast turn，其 `FAST` 只出现在模型名称后；普通 turn 的模型单元格保持不变；
 - 相同 duration 出现多个额度桶时仍完整显示 gauge，但只有 `codex` 生成归因；Spark 精确模型名大小写不敏感排除，`codex_bengalfox` 保持 gauge-only，缺失模型名进入普通 `codex` 分母；

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Added an opt-in `[L]Long×` TUI switch for API-style long-context weighting. It is off by default because the Codex subscription credit card does not publish the API's exact per-request formula. When enabled, verified requests with more than 272K input tokens use the API-published 2x input/cached-input and 1.5x output multipliers for supported model profiles; unverifiable large cumulative deltas retain the base rate and report `long_context_usage_unknown` instead of being guessed.
+- Recorder history now stores the base Codex credit proxy and the optional API long-context extra together. Overview attribution and Trends `~EST` charts switch between those paired projections immediately, without recollecting data or changing the recorder service configuration. The saved TUI preference defaults to off on first use.
+- Preserved `cache_write_input_tokens` from rollout counters as an input subset for exact deltas and request-boundary checks. The Codex credit proxy does not add a separate cache-write charge because the published Codex credit card has no cache-write row.
+
+### Compatibility
+
+- Bumped the rollout parser cache revision to 4, the estimator revision to 5, the history metric revision to 3, and the TUI state version to 3. Released estimator-revision-3 base history is retained but cannot provide the optional multiplier until rebuilt; development-only revision-4 single-projection history is discarded because its base and API extra cannot be separated safely. Other incompatible revisions remain isolated, and mixed-revision `~EST` stays unavailable/partial.
+- Existing recorder-service processes should be restarted after upgrading so resident writers use parser revision 4 and the dual-projection history schema. Switching `[L]Long×` afterward does not require reinstalling or restarting the service.
+
 ## [0.2.8] - 2026-08-26
 
 ### Changed

@@ -2,7 +2,7 @@ use super::*;
 use crate::domain::{
     AttributionSummary, CollectionStats, LimitBucket, LimitWindow, ModelUsage,
     RateLimitResetCredit, RateLimitResetCreditsSnapshot, SourceStatus, ThreadWindowUsage,
-    TurnWindowUsage, WindowAnalysis, WindowDescriptor, WindowUsage,
+    TurnWindowUsage, UsageCall, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
 use crate::history::{LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint};
 use ratatui::backend::TestBackend;
@@ -219,6 +219,8 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
             ..TokenUsage::default()
         },
         estimated_cost_units: 7,
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: 1,
         call_count: 1,
         groups: Vec::new(),
@@ -244,6 +246,8 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
                 ..TokenUsage::default()
             },
             estimated_cost_units: 7,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
             estimator_revision: 1,
             call_count: 1,
             partial_reasons: vec!["weekly_window_stale".to_string()],
@@ -391,6 +395,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 token_usage: TokenUsage {
                     input_tokens: token_base / 2,
                     cached_input_tokens: token_base / 5,
+                    cache_write_input_tokens: 0,
                     output_tokens: token_base / 3,
                     reasoning_output_tokens: token_base / 10,
                     total_tokens: token_base,
@@ -398,6 +403,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 window_token_usage: TokenUsage {
                     input_tokens: token_base / 4,
                     cached_input_tokens: token_base / 10,
+                    cache_write_input_tokens: 0,
                     output_tokens: token_base / 6,
                     reasoning_output_tokens: token_base / 20,
                     total_tokens: token_base / 2,
@@ -496,6 +502,8 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
                     ..TokenUsage::default()
                 },
                 estimated_cost_units: u128::try_from(index + 1).unwrap() * 100,
+                api_long_context_extra_cost_units: Some(0),
+                long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
                 call_count: 1,
                 groups: Vec::new(),
@@ -1210,6 +1218,7 @@ fn add_window_analysis(
             estimated_quota_percent: usage.estimated_quota_percent,
             quota_confidence: usage.quota_confidence,
         }],
+        api_long_context: None,
     });
 }
 
@@ -2112,6 +2121,7 @@ fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority(
         window_scope: UiWindowScope::Week,
         turns_visible: false,
         models_visible: false,
+        api_long_context_multiplier: true,
         task_list_mode: UiTaskListMode::Tree,
         task_source_filter: UiTaskSourceFilter::Subagent,
         ..UiState::default()
@@ -2746,6 +2756,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         TokenUsage {
             input_tokens: 11,
             cached_input_tokens: 2,
+            cache_write_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 2,
             total_tokens: 20,
@@ -2753,6 +2764,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         TokenUsage {
             input_tokens: 13,
             cached_input_tokens: 3,
+            cache_write_input_tokens: 0,
             output_tokens: 10,
             reasoning_output_tokens: 4,
             total_tokens: 30,
@@ -2760,6 +2772,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         TokenUsage {
             input_tokens: 4,
             cached_input_tokens: 1,
+            cache_write_input_tokens: 0,
             output_tokens: 4,
             reasoning_output_tokens: 1,
             total_tokens: 10,
@@ -2836,6 +2849,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             .collect(),
         turns: Vec::new(),
         models: Vec::new(),
+        api_long_context: None,
     });
 
     expand_task_tree(&mut app);
@@ -3687,9 +3701,13 @@ fn top_window_controls_keep_stable_compact_geometry() {
             .unwrap();
         let initial = app.window_controls_hitbox.unwrap();
         let tabs = view_tabs_hitbox(Rect::new(0, 0, width, 1));
-        for button in [initial.toggle_turns, initial.toggle_models]
-            .into_iter()
-            .chain(initial.scopes)
+        for button in [
+            initial.toggle_turns,
+            initial.toggle_models,
+            initial.toggle_api_long_context,
+        ]
+        .into_iter()
+        .chain(initial.scopes)
         {
             if !button.is_empty() {
                 assert!(button.x >= tabs.tabs[View::Health.index()].right());
@@ -3718,6 +3736,17 @@ fn top_window_controls_keep_stable_compact_geometry() {
             assert_eq!(buffer[(initial.scopes[0].x + 1, 0)].symbol(), "5");
             assert_eq!(buffer[(initial.scopes[1].x + 1, 0)].symbol(), "W");
         }
+        if width >= 54 {
+            assert!(!initial.toggle_api_long_context.is_empty());
+            assert_eq!(
+                terminal.backend().buffer()[(
+                    initial.toggle_api_long_context.x + 1,
+                    initial.toggle_api_long_context.y,
+                )]
+                    .symbol(),
+                "L"
+            );
+        }
     }
 
     for width in 20..40 {
@@ -3737,7 +3766,8 @@ fn top_window_controls_keep_stable_compact_geometry() {
             4..=6 => " [V]",
             7..=9 => " [V][M]",
             10..=12 => " [V][M][5]",
-            _ => " [V][M][5][W]",
+            13..=15 => " [V][M][5][W]",
+            _ => " [V][M][5][W][L]",
         };
         assert_eq!(rendered.trim_end(), expected, "width={width}");
         let controls = controls.unwrap();
@@ -3746,6 +3776,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
             (controls.toggle_models, "M"),
             (controls.scopes[WindowScope::FiveHours.index()], "5"),
             (controls.scopes[WindowScope::Week.index()], "W"),
+            (controls.toggle_api_long_context, "L"),
         ] {
             if !button.is_empty() {
                 assert_eq!(button.width, 3);
@@ -3804,6 +3835,105 @@ fn top_window_controls_keep_stable_compact_geometry() {
         ),
     ));
     assert!(!app.models_visible);
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            controls.toggle_api_long_context.right() - 1,
+            controls.toggle_api_long_context.y,
+        ),
+    ));
+    assert!(app.api_long_context_multiplier);
+}
+
+#[test]
+fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    let base = app.snapshot.window_analyses.first_mut().unwrap();
+    let mut api = base.clone();
+    api.api_long_context = None;
+    api.threads[0].usage.estimated_quota_percent = 17.0;
+    api.turns[0].usage.estimated_quota_percent = 17.0;
+    api.models[0].estimated_quota_percent = 17.0;
+    base.api_long_context = Some(Box::new(api));
+
+    assert!(!app.api_long_context_multiplier);
+    assert_eq!(
+        task_usage_for_scope_with_api_long_context(
+            &app.snapshot,
+            WindowScope::FiveHours,
+            &app.snapshot.tasks[0],
+            false,
+        )
+        .estimated_quota_percent,
+        23.0
+    );
+    assert_eq!(
+        task_usage_for_scope_with_api_long_context(
+            &app.snapshot,
+            WindowScope::FiveHours,
+            &app.snapshot.tasks[0],
+            true,
+        )
+        .estimated_quota_percent,
+        17.0
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let toggle = app.window_controls_hitbox.unwrap().toggle_api_long_context;
+    let shortcut = &terminal.backend().buffer()[(toggle.x + 1, toggle.y)];
+    assert_eq!(shortcut.symbol(), "L");
+    assert_eq!(shortcut.fg, app.theme.palette().accent);
+
+    handle_key_event(&mut app, key_event(KeyCode::Char('L')));
+    assert!(app.api_long_context_multiplier);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Models · 5h · API Long ON"));
+    let toggle = app.window_controls_hitbox.unwrap().toggle_api_long_context;
+    assert!(
+        terminal.backend().buffer()[(toggle.x + 1, toggle.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.right() - 1,
+            toggle.y,
+        ),
+    ));
+    assert!(!app.api_long_context_multiplier);
+
+    handle_key_event(&mut app, key_event(KeyCode::Char('/')));
+    handle_key_event(&mut app, key_event(KeyCode::Char('l')));
+    assert_eq!(app.task_search, "l");
+    assert!(!app.api_long_context_multiplier);
+    handle_key_event(&mut app, key_event(KeyCode::Esc));
+
+    app.set_view(View::Trends);
+    handle_key_event(&mut app, key_event(KeyCode::Char('L')));
+    assert!(!app.api_long_context_multiplier);
+
+    let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    app.set_view(View::Overview);
+    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(
+        !app.window_controls_hitbox
+            .unwrap()
+            .toggle_api_long_context
+            .is_empty()
+    );
 }
 
 #[test]
@@ -6204,6 +6334,8 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
                     ..TokenUsage::default()
                 },
                 estimated_cost_units: u128::try_from(index + 1).unwrap(),
+                api_long_context_extra_cost_units: Some(0),
+                long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
                 call_count: 1,
                 groups: Vec::new(),
@@ -6265,6 +6397,117 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
     assert!(
         content.contains("15m ~EST Usage · 95 samples · 1 gaps"),
         "{content}"
+    );
+}
+
+#[test]
+fn api_long_context_toggle_reweights_weekly_and_fifteen_minute_estimates_without_changing_tokens() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T11:10:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let weekly_reset = now + ChronoDuration::days(3);
+    let call = |timestamp, thread_id: &str, input_tokens| UsageCall {
+        timestamp,
+        thread_id: thread_id.to_string(),
+        turn_id: Some(format!("{thread_id}-turn")),
+        model: Some("gpt-5.6-luna".to_string()),
+        service_tier: None,
+        tokens: TokenUsage {
+            input_tokens,
+            total_tokens: input_tokens,
+            ..TokenUsage::default()
+        },
+        request_usage_exact: true,
+    };
+    let calls = vec![
+        call(now - ChronoDuration::minutes(70), "short", 200_000),
+        call(now - ChronoDuration::minutes(40), "long", 300_000),
+    ];
+    let limits = vec![LimitBucket {
+        limit_id: "codex".to_string(),
+        limit_name: Some("Codex".to_string()),
+        plan_type: Some("test".to_string()),
+        primary: Some(LimitWindow::new(40.0, Some(10_080), Some(weekly_reset))),
+        secondary: None,
+        credits: None,
+        rate_limit_reached_type: None,
+        provenance: Provenance::ServerSnapshot,
+        as_of: now,
+    }];
+    let observation = HistoryObservation::from_sources(now, &calls, &limits, &[]);
+    let mut app = interaction_test_app(1, 1);
+    app.replace_history(HistoryData {
+        quota_points: observation.quota_points,
+        half_hour_buckets: observation.half_hour_buckets,
+        weekly_local_points: observation.weekly_local_points,
+        ..HistoryData::default()
+    });
+    app.set_view(View::Trends);
+
+    let off = prepare_trend_data_at(&app, now);
+    app.toggle_api_long_context_multiplier();
+    let on = prepare_trend_data_at(&app, now);
+    app.toggle_api_long_context_multiplier();
+    let off_again = prepare_trend_data_at(&app, now);
+
+    let values = |points: &[TrendPoint]| points.iter().map(|point| point.value).collect::<Vec<_>>();
+    let token_values = |points: &[TrendPoint]| {
+        points
+            .iter()
+            .map(|point| point.readout_value)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(&off.weekly_estimated), [0.0, 16.0, 40.0, 40.0]);
+    assert_eq!(values(&on.weekly_estimated), [0.0, 10.0, 40.0, 40.0]);
+    assert_eq!(
+        values(&off.half_hour_estimated),
+        [16.0, 24.0],
+        "base weighting should split the 40% gauge in a 2:3 ratio"
+    );
+    assert_eq!(
+        values(&on.half_hour_estimated),
+        [10.0, 30.0],
+        "API weighting should double only the verified long request"
+    );
+    assert_eq!(
+        values(&off.weekly_estimated),
+        values(&off_again.weekly_estimated)
+    );
+    assert_eq!(
+        values(&off.half_hour_estimated),
+        values(&off_again.half_hour_estimated)
+    );
+    assert_eq!(
+        token_values(&off.weekly_tokens),
+        [
+            TrendReadoutValue::Tokens(0),
+            TrendReadoutValue::Tokens(200_000),
+            TrendReadoutValue::Tokens(500_000),
+            TrendReadoutValue::Tokens(500_000),
+        ]
+    );
+    assert_eq!(
+        token_values(&off.weekly_tokens),
+        token_values(&on.weekly_tokens)
+    );
+    assert_eq!(
+        token_values(&off.weekly_tokens),
+        token_values(&off_again.weekly_tokens)
+    );
+    assert_eq!(
+        token_values(&off.half_hour_tokens),
+        [
+            TrendReadoutValue::Tokens(200_000),
+            TrendReadoutValue::Tokens(300_000),
+        ]
+    );
+    assert_eq!(
+        token_values(&off.half_hour_tokens),
+        token_values(&on.half_hour_tokens)
+    );
+    assert_eq!(
+        token_values(&off.half_hour_tokens),
+        token_values(&off_again.half_hour_tokens)
     );
 }
 
@@ -6363,6 +6606,8 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
                 ..TokenUsage::default()
             },
             estimated_cost_units: 100,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
             estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
             call_count: 1,
             partial_reasons: Vec::new(),
@@ -6415,6 +6660,8 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
             ..TokenUsage::default()
         },
         estimated_cost_units: u128::from(total_tokens),
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 1,
         groups: Vec::new(),
@@ -6515,6 +6762,8 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
             ..TokenUsage::default()
         },
         estimated_cost_units: cost_units,
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 1,
         groups: Vec::new(),
@@ -6613,6 +6862,8 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
             ..TokenUsage::default()
         },
         estimated_cost_units: 100,
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 1,
         groups: Vec::new(),
@@ -6666,6 +6917,8 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
             ..TokenUsage::default()
         },
         estimated_cost_units: 100,
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 1,
         partial_reasons: Vec::new(),
@@ -6753,6 +7006,8 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
         sampled_at: starts_at + ChronoDuration::minutes(15),
         token_usage: TokenUsage::default(),
         estimated_cost_units: 0,
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 0,
         groups: Vec::new(),
@@ -6782,6 +7037,8 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
                     ..TokenUsage::default()
                 },
                 estimated_cost_units: 100,
+                api_long_context_extra_cost_units: Some(0),
+                long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
                 call_count: 1,
                 partial_reasons: Vec::new(),
@@ -6794,6 +7051,8 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
                     ..TokenUsage::default()
                 },
                 estimated_cost_units: 200,
+                api_long_context_extra_cost_units: Some(0),
+                long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
                 call_count: 2,
                 partial_reasons: Vec::new(),

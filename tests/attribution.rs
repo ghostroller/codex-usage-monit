@@ -110,6 +110,7 @@ fn call_with_usage(
         model: model.map(str::to_string),
         service_tier: service_tier.map(str::to_string),
         tokens,
+        request_usage_exact: true,
     }
 }
 
@@ -601,6 +602,132 @@ fn missing_token_breakdown_uses_total_as_input_and_marks_the_window_partial() {
             .partial_reasons
             .contains(&"token_breakdown_missing".to_string())
     );
+}
+
+#[test]
+fn unverified_large_request_boundaries_keep_estimates_but_mark_long_context_unknown() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let mut unverified = call_with_usage(
+        at(11, 0),
+        "a",
+        "a-turn",
+        Some("gpt-5.6-luna"),
+        None,
+        TokenUsage {
+            input_tokens: 300_000,
+            total_tokens: 300_000,
+            ..TokenUsage::default()
+        },
+    );
+    unverified.request_usage_exact = false;
+
+    let analysis = analyze_windows(
+        &[],
+        &[],
+        &[unverified],
+        &[],
+        &[codex_limit(now, 40.0, 300, reset)],
+        now,
+    )
+    .remove(0);
+
+    assert_close(analysis.threads[0].usage.estimated_quota_percent, 40.0);
+    assert!(!analysis.partial);
+    assert!(
+        !analysis
+            .partial_reasons
+            .contains(&"long_context_usage_unknown".to_string())
+    );
+
+    let api_analysis = analysis.api_long_context.as_deref().unwrap();
+    assert_close(api_analysis.threads[0].usage.estimated_quota_percent, 40.0);
+    assert!(api_analysis.partial);
+    assert!(
+        api_analysis
+            .partial_reasons
+            .contains(&"long_context_usage_unknown".to_string())
+    );
+}
+
+#[test]
+fn api_long_context_projection_is_opt_in_and_keeps_the_base_projection_unchanged() {
+    let now = at(12, 0);
+    let reset = at(14, 0);
+    let calls = vec![
+        call_with_usage(
+            at(11, 0),
+            "long",
+            "long-turn",
+            Some("gpt-5.6-luna"),
+            None,
+            TokenUsage {
+                input_tokens: 300_000,
+                total_tokens: 300_000,
+                ..TokenUsage::default()
+            },
+        ),
+        call_with_usage(
+            at(11, 1),
+            "short",
+            "short-turn-1",
+            Some("gpt-5.6-luna"),
+            None,
+            TokenUsage {
+                input_tokens: 150_000,
+                total_tokens: 150_000,
+                ..TokenUsage::default()
+            },
+        ),
+        call_with_usage(
+            at(11, 2),
+            "short",
+            "short-turn-2",
+            Some("gpt-5.6-luna"),
+            None,
+            TokenUsage {
+                input_tokens: 150_000,
+                total_tokens: 150_000,
+                ..TokenUsage::default()
+            },
+        ),
+    ];
+
+    let analysis = analyze_windows(
+        &[],
+        &[],
+        &calls,
+        &[],
+        &[codex_limit(now, 60.0, 300, reset)],
+        now,
+    )
+    .remove(0);
+    let base = analysis
+        .threads
+        .iter()
+        .map(|thread| {
+            (
+                thread.thread_id.as_str(),
+                thread.usage.estimated_quota_percent,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_close(base["long"], 30.0);
+    assert_close(base["short"], 30.0);
+
+    let api = analysis.api_long_context.as_deref().unwrap();
+    let api = api
+        .threads
+        .iter()
+        .map(|thread| {
+            (
+                thread.thread_id.as_str(),
+                thread.usage.estimated_quota_percent,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_close(api["long"], 40.0);
+    assert_close(api["short"], 20.0);
 }
 
 #[test]

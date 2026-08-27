@@ -22,7 +22,7 @@ use crate::session_index::load_thread_titles;
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 3;
+const ROLLOUT_PARSER_REVISION: u32 = 4;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -3030,6 +3030,11 @@ fn apply_token_count(
     if delta.is_zero() {
         return;
     }
+    let request_usage_exact = usage.last.is_some_and(|last| {
+        let breakdown_missing =
+            last.total_tokens > 0 && last.input_tokens == 0 && last.output_tokens == 0;
+        last == delta && !breakdown_missing
+    });
 
     thread.token_usage.add_assign(delta);
     let turn_id = thread
@@ -3052,6 +3057,7 @@ fn apply_token_count(
         model,
         service_tier,
         tokens: delta,
+        request_usage_exact,
     });
 }
 
@@ -3184,6 +3190,8 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
         "inputTokens",
         "cached_input_tokens",
         "cachedInputTokens",
+        "cache_write_input_tokens",
+        "cacheWriteInputTokens",
         "output_tokens",
         "outputTokens",
         "reasoning_output_tokens",
@@ -3198,6 +3206,11 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     let input_tokens = u64_field_in(value, &["input_tokens", "inputTokens"]).unwrap_or(0);
     let cached_input_tokens =
         u64_field_in(value, &["cached_input_tokens", "cachedInputTokens"]).unwrap_or(0);
+    let cache_write_input_tokens = u64_field_in(
+        value,
+        &["cache_write_input_tokens", "cacheWriteInputTokens"],
+    )
+    .unwrap_or(0);
     let output_tokens = u64_field_in(value, &["output_tokens", "outputTokens"]).unwrap_or(0);
     let reasoning_output_tokens =
         u64_field_in(value, &["reasoning_output_tokens", "reasoningOutputTokens"]).unwrap_or(0);
@@ -3207,6 +3220,7 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         input_tokens,
         cached_input_tokens,
+        cache_write_input_tokens,
         output_tokens,
         reasoning_output_tokens,
         total_tokens,

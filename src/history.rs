@@ -15,7 +15,7 @@ use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_mode
 use crate::domain::{LimitBucket, Provenance, TokenUsage, UsageCall};
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
-pub const HISTORY_METRIC_REVISION: u32 = 2;
+pub const HISTORY_METRIC_REVISION: u32 = 3;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
 pub const LOCAL_BUCKET_MINUTES: i64 = 15;
@@ -56,9 +56,17 @@ pub struct LocalUsageGroup {
     pub service_tier: Option<String>,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
+    /// Extra units for the optional API long-context projection. `None` means
+    /// the historical observation predates dual-weight recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_long_context_extra_cost_units: Option<u128>,
     pub call_count: u64,
     pub used_model_fallback: bool,
     pub used_token_breakdown_fallback: bool,
+    #[serde(default)]
+    pub used_long_context_pricing: bool,
+    #[serde(default)]
+    pub used_long_context_detection_fallback: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +81,10 @@ pub struct LocalHalfHourBucket {
     pub sampled_at: DateTime<Utc>,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_long_context_extra_cost_units: Option<u128>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub long_context_usage_unknown: bool,
     pub estimator_revision: u32,
     pub call_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -88,6 +100,10 @@ pub struct WeeklyLocalPoint {
     pub resets_at: DateTime<Utc>,
     pub token_usage: TokenUsage,
     pub estimated_cost_units: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_long_context_extra_cost_units: Option<u128>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub long_context_usage_unknown: bool,
     pub estimator_revision: u32,
     pub call_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -180,11 +196,19 @@ impl HistoryData {
         &self,
         weekly_resets_at: DateTime<Utc>,
     ) -> Vec<HalfHourSeriesPoint> {
+        self.estimated_half_hour_series_with_api_long_context(weekly_resets_at, false)
+    }
+
+    pub fn estimated_half_hour_series_with_api_long_context(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        api_long_context: bool,
+    ) -> Vec<HalfHourSeriesPoint> {
         let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
         let boundary_crosses_bucket =
             cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
         let cycle = self.weekly_cycle_buckets(weekly_resets_at);
-        let estimate = self.estimate_context(weekly_resets_at, &cycle);
+        let estimate = self.estimate_context(weekly_resets_at, &cycle, api_long_context);
         cycle
             .into_iter()
             .map(|bucket| {
@@ -200,12 +224,27 @@ impl HistoryData {
                 if !estimate.revisions_are_consistent {
                     partial_reasons.insert("estimator_revision_changed".to_string());
                 }
+                if api_long_context && !estimate.costs_are_available {
+                    partial_reasons.insert("api_long_context_history_unavailable".to_string());
+                }
+                if api_long_context && bucket.long_context_usage_unknown {
+                    partial_reasons.insert("long_context_usage_unknown".to_string());
+                }
+                let estimated_cost_units = selected_cost_units(
+                    bucket.estimated_cost_units,
+                    bucket.api_long_context_extra_cost_units,
+                    api_long_context,
+                );
+                if estimated_cost_units.is_none() {
+                    partial_reasons.insert("api_long_context_history_unavailable".to_string());
+                }
                 HalfHourSeriesPoint {
                     starts_at: bucket.starts_at,
                     ends_at: bucket.ends_at,
                     token_usage: bucket.token_usage,
-                    estimated_cost_units: bucket.estimated_cost_units,
-                    estimated_quota_percent: estimate.percent_for(bucket.estimated_cost_units),
+                    estimated_cost_units: estimated_cost_units.unwrap_or_default(),
+                    estimated_quota_percent: estimated_cost_units
+                        .and_then(|units| estimate.percent_for(units)),
                     estimator_revision: bucket.estimator_revision,
                     partial_reasons: partial_reasons.into_iter().collect(),
                 }
@@ -217,15 +256,26 @@ impl HistoryData {
         &self,
         weekly_resets_at: DateTime<Utc>,
     ) -> Vec<WeeklyCumulativePoint> {
-        if let Some(points) = self.recorded_weekly_cumulative_series(weekly_resets_at) {
+        self.weekly_cumulative_series_with_api_long_context(weekly_resets_at, false)
+    }
+
+    pub fn weekly_cumulative_series_with_api_long_context(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        api_long_context: bool,
+    ) -> Vec<WeeklyCumulativePoint> {
+        if let Some(points) =
+            self.recorded_weekly_cumulative_series(weekly_resets_at, api_long_context)
+        {
             return points;
         }
-        self.derived_weekly_cumulative_series(weekly_resets_at)
+        self.derived_weekly_cumulative_series(weekly_resets_at, api_long_context)
     }
 
     fn recorded_weekly_cumulative_series(
         &self,
         weekly_resets_at: DateTime<Utc>,
+        api_long_context: bool,
     ) -> Option<Vec<WeeklyCumulativePoint>> {
         let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
         let mut recorded = self
@@ -253,11 +303,20 @@ impl HistoryData {
             .copied()
             .expect("recorded weekly points are non-empty");
         let used_percent = self.latest_weekly_used_percent(weekly_resets_at);
-        let estimate_percent = |cost_units: u128| {
-            if !revisions_are_consistent || latest.estimated_cost_units == 0 {
+        let latest_cost_units = selected_cost_units(
+            latest.estimated_cost_units,
+            latest.api_long_context_extra_cost_units,
+            api_long_context,
+        );
+        let estimate_percent = |cost_units: Option<u128>| {
+            let (Some(cost_units), Some(latest_cost_units)) = (cost_units, latest_cost_units)
+            else {
+                return None;
+            };
+            if !revisions_are_consistent || latest_cost_units == 0 {
                 return None;
             }
-            used_percent.map(|used| used * cost_units as f64 / latest.estimated_cost_units as f64)
+            used_percent.map(|used| used * cost_units as f64 / latest_cost_units as f64)
         };
         let mut initial_reasons = recorded
             .first()
@@ -267,12 +326,19 @@ impl HistoryData {
         if !revisions_are_consistent {
             initial_reasons.insert("estimator_revision_changed".to_string());
         }
+        if api_long_context
+            && recorded
+                .iter()
+                .any(|point| point.api_long_context_extra_cost_units.is_none())
+        {
+            initial_reasons.insert("api_long_context_history_unavailable".to_string());
+        }
         let mut points = vec![WeeklyCumulativePoint {
             at: cycle_starts_at,
             sampled_at: None,
             token_usage: TokenUsage::default(),
             estimated_cost_units: 0,
-            estimated_quota_percent: estimate_percent(0),
+            estimated_quota_percent: estimate_percent(Some(0)),
             estimator_revision,
             partial_reasons: initial_reasons.into_iter().collect(),
         }];
@@ -285,12 +351,23 @@ impl HistoryData {
             if !revisions_are_consistent {
                 partial_reasons.insert("estimator_revision_changed".to_string());
             }
+            if api_long_context && point.long_context_usage_unknown {
+                partial_reasons.insert("long_context_usage_unknown".to_string());
+            }
+            let estimated_cost_units = selected_cost_units(
+                point.estimated_cost_units,
+                point.api_long_context_extra_cost_units,
+                api_long_context,
+            );
+            if estimated_cost_units.is_none() {
+                partial_reasons.insert("api_long_context_history_unavailable".to_string());
+            }
             WeeklyCumulativePoint {
                 at: point.observed_at.min(weekly_resets_at),
                 sampled_at: Some(point.observed_at),
                 token_usage: point.token_usage,
-                estimated_cost_units: point.estimated_cost_units,
-                estimated_quota_percent: estimate_percent(point.estimated_cost_units),
+                estimated_cost_units: estimated_cost_units.unwrap_or_default(),
+                estimated_quota_percent: estimate_percent(estimated_cost_units),
                 estimator_revision,
                 partial_reasons: partial_reasons.into_iter().collect(),
             }
@@ -330,10 +407,11 @@ impl HistoryData {
     fn derived_weekly_cumulative_series(
         &self,
         weekly_resets_at: DateTime<Utc>,
+        api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
         let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
         let buckets = self.weekly_cycle_buckets(weekly_resets_at);
-        let estimate = self.estimate_context(weekly_resets_at, &buckets);
+        let estimate = self.estimate_context(weekly_resets_at, &buckets, api_long_context);
         let boundary_crosses_bucket =
             cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
         let mut token_usage = TokenUsage::default();
@@ -344,6 +422,9 @@ impl HistoryData {
         }
         if !estimate.revisions_are_consistent {
             partial_reasons.insert("estimator_revision_changed".to_string());
+        }
+        if api_long_context && !estimate.costs_are_available {
+            partial_reasons.insert("api_long_context_history_unavailable".to_string());
         }
 
         let mut points = vec![WeeklyCumulativePoint {
@@ -357,14 +438,27 @@ impl HistoryData {
         }];
         for bucket in buckets {
             token_usage.add_assign(bucket.token_usage);
-            estimated_cost_units = estimated_cost_units.saturating_add(bucket.estimated_cost_units);
+            let bucket_cost_units = selected_cost_units(
+                bucket.estimated_cost_units,
+                bucket.api_long_context_extra_cost_units,
+                api_long_context,
+            );
+            if let Some(bucket_cost_units) = bucket_cost_units {
+                estimated_cost_units = estimated_cost_units.saturating_add(bucket_cost_units);
+            } else {
+                partial_reasons.insert("api_long_context_history_unavailable".to_string());
+            }
+            if api_long_context && bucket.long_context_usage_unknown {
+                partial_reasons.insert("long_context_usage_unknown".to_string());
+            }
             partial_reasons.extend(bucket.partial_reasons.iter().cloned());
             points.push(WeeklyCumulativePoint {
                 at: bucket.sampled_at.min(bucket.ends_at).min(weekly_resets_at),
                 sampled_at: Some(bucket.sampled_at),
                 token_usage,
                 estimated_cost_units,
-                estimated_quota_percent: estimate.percent_for(estimated_cost_units),
+                estimated_quota_percent: bucket_cost_units
+                    .and_then(|_| estimate.percent_for(estimated_cost_units)),
                 estimator_revision: estimate.estimator_revision,
                 partial_reasons: partial_reasons.iter().cloned().collect(),
             });
@@ -402,6 +496,7 @@ impl HistoryData {
         &self,
         weekly_resets_at: DateTime<Utc>,
         buckets: &[&LocalHalfHourBucket],
+        api_long_context: bool,
     ) -> EstimateContext {
         let revisions = buckets
             .iter()
@@ -409,9 +504,21 @@ impl HistoryData {
             .collect::<BTreeSet<_>>();
         let revisions_are_consistent = revisions.len() <= 1;
         let estimator_revision = revisions.iter().next().copied().unwrap_or_default();
-        let total_cost_units = buckets.iter().fold(0_u128, |total, bucket| {
-            total.saturating_add(bucket.estimated_cost_units)
-        });
+        let bucket_costs = buckets
+            .iter()
+            .map(|bucket| {
+                selected_cost_units(
+                    bucket.estimated_cost_units,
+                    bucket.api_long_context_extra_cost_units,
+                    api_long_context,
+                )
+            })
+            .collect::<Vec<_>>();
+        let bucket_costs_available = bucket_costs.iter().all(Option::is_some);
+        let total_cost_units = bucket_costs
+            .into_iter()
+            .flatten()
+            .fold(0_u128, u128::saturating_add);
         let weekly_point = self
             .weekly_local_points
             .iter()
@@ -419,9 +526,15 @@ impl HistoryData {
                 (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
             })
             .max_by_key(|point| point.observed_at);
-        let total_cost_units = weekly_point
-            .map(|point| point.estimated_cost_units)
-            .unwrap_or(total_cost_units);
+        let weekly_cost_units = weekly_point.and_then(|point| {
+            selected_cost_units(
+                point.estimated_cost_units,
+                point.api_long_context_extra_cost_units,
+                api_long_context,
+            )
+        });
+        let costs_are_available = weekly_cost_units.is_some() || bucket_costs_available;
+        let total_cost_units = weekly_cost_units.unwrap_or(total_cost_units);
         let revisions_are_consistent = revisions_are_consistent
             && weekly_point.is_none_or(|point| {
                 revisions.is_empty() || revisions.contains(&point.estimator_revision)
@@ -435,6 +548,7 @@ impl HistoryData {
             total_cost_units,
             estimator_revision,
             revisions_are_consistent,
+            costs_are_available,
         }
     }
 }
@@ -466,6 +580,19 @@ struct EstimateContext {
     total_cost_units: u128,
     estimator_revision: u32,
     revisions_are_consistent: bool,
+    costs_are_available: bool,
+}
+
+fn selected_cost_units(
+    base_units: u128,
+    api_long_context_extra_units: Option<u128>,
+    api_long_context: bool,
+) -> Option<u128> {
+    if api_long_context {
+        api_long_context_extra_units.map(|extra| base_units.saturating_add(extra))
+    } else {
+        Some(base_units)
+    }
 }
 
 fn confirmed_zero_bucket(bucket: &LocalHalfHourBucket) -> bool {
@@ -478,7 +605,8 @@ fn confirmed_zero_bucket(bucket: &LocalHalfHourBucket) -> bool {
 
 impl EstimateContext {
     fn percent_for(&self, cost_units: u128) -> Option<f64> {
-        if !self.revisions_are_consistent || self.total_cost_units == 0 {
+        if !self.revisions_are_consistent || !self.costs_are_available || self.total_cost_units == 0
+        {
             return None;
         }
         self.used_percent
@@ -1151,6 +1279,10 @@ fn weekly_local_points_from_sources(
         let weight = estimate_call_weight(call);
         bucket.token_usage.add_assign(call.tokens);
         bucket.estimated_cost_units = bucket.estimated_cost_units.saturating_add(weight.units);
+        bucket.api_long_context_extra_cost_units = bucket
+            .api_long_context_extra_cost_units
+            .saturating_add(weight.api_long_context_extra_units);
+        bucket.long_context_usage_unknown |= weight.used_long_context_detection_fallback;
         bucket.call_count = bucket.call_count.saturating_add(1);
         if weight.used_model_fallback {
             bucket
@@ -1182,6 +1314,8 @@ fn weekly_local_points_from_sources(
 
     let mut token_usage = TokenUsage::default();
     let mut estimated_cost_units = 0_u128;
+    let mut api_long_context_extra_cost_units = 0_u128;
+    let mut long_context_usage_unknown = false;
     let mut call_count = 0_u64;
     let mut reasons = partial_reasons.iter().cloned().collect::<BTreeSet<_>>();
     if provenance != Provenance::ServerSnapshot {
@@ -1193,6 +1327,9 @@ fn weekly_local_points_from_sources(
         .map(|(bucket_starts_at, bucket)| {
             token_usage.add_assign(bucket.token_usage);
             estimated_cost_units = estimated_cost_units.saturating_add(bucket.estimated_cost_units);
+            api_long_context_extra_cost_units = api_long_context_extra_cost_units
+                .saturating_add(bucket.api_long_context_extra_cost_units);
+            long_context_usage_unknown |= bucket.long_context_usage_unknown;
             call_count = call_count.saturating_add(bucket.call_count);
             reasons.extend(bucket.partial_reasons);
             WeeklyLocalPoint {
@@ -1201,6 +1338,8 @@ fn weekly_local_points_from_sources(
                 resets_at,
                 token_usage,
                 estimated_cost_units,
+                api_long_context_extra_cost_units: Some(api_long_context_extra_cost_units),
+                long_context_usage_unknown,
                 estimator_revision: HISTORY_ESTIMATOR_REVISION,
                 call_count,
                 partial_reasons: reasons.iter().cloned().collect(),
@@ -1213,6 +1352,8 @@ fn weekly_local_points_from_sources(
 struct WeeklyAccumulator {
     token_usage: TokenUsage,
     estimated_cost_units: u128,
+    api_long_context_extra_cost_units: u128,
+    long_context_usage_unknown: bool,
     call_count: u64,
     partial_reasons: BTreeSet<String>,
 }
@@ -1221,6 +1362,8 @@ struct WeeklyAccumulator {
 struct BucketAccumulator {
     token_usage: TokenUsage,
     estimated_cost_units: u128,
+    api_long_context_extra_cost_units: u128,
+    long_context_usage_unknown: bool,
     call_count: u64,
     groups: BTreeMap<(Option<String>, Option<String>), LocalUsageGroup>,
     partial_reasons: BTreeSet<String>,
@@ -1242,6 +1385,10 @@ fn local_buckets_from_calls(
         let weight = estimate_call_weight(call);
         bucket.token_usage.add_assign(call.tokens);
         bucket.estimated_cost_units = bucket.estimated_cost_units.saturating_add(weight.units);
+        bucket.api_long_context_extra_cost_units = bucket
+            .api_long_context_extra_cost_units
+            .saturating_add(weight.api_long_context_extra_units);
+        bucket.long_context_usage_unknown |= weight.used_long_context_detection_fallback;
         bucket.call_count = bucket.call_count.saturating_add(1);
         bucket
             .partial_reasons
@@ -1271,9 +1418,17 @@ fn local_buckets_from_calls(
             });
         group.token_usage.add_assign(call.tokens);
         group.estimated_cost_units = group.estimated_cost_units.saturating_add(weight.units);
+        group.api_long_context_extra_cost_units = Some(
+            group
+                .api_long_context_extra_cost_units
+                .unwrap_or_default()
+                .saturating_add(weight.api_long_context_extra_units),
+        );
         group.call_count = group.call_count.saturating_add(1);
         group.used_model_fallback |= weight.used_model_fallback;
         group.used_token_breakdown_fallback |= weight.used_token_breakdown_fallback;
+        group.used_long_context_pricing |= weight.used_long_context_pricing;
+        group.used_long_context_detection_fallback |= weight.used_long_context_detection_fallback;
     }
 
     if let Some(coverage_starts_at) =
@@ -1305,6 +1460,8 @@ fn local_buckets_from_calls(
                 sampled_at: observed_at.min(ends_at),
                 token_usage: bucket.token_usage,
                 estimated_cost_units: bucket.estimated_cost_units,
+                api_long_context_extra_cost_units: Some(bucket.api_long_context_extra_cost_units),
+                long_context_usage_unknown: bucket.long_context_usage_unknown,
                 estimator_revision: HISTORY_ESTIMATOR_REVISION,
                 call_count: bucket.call_count,
                 groups: bucket.groups.into_values().collect(),
@@ -1474,11 +1631,25 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
     }
 
     let mut migrated = false;
-    if version == LEGACY_HISTORY_FORMAT_VERSION || shard.metric_revision < HISTORY_METRIC_REVISION {
+    if version == LEGACY_HISTORY_FORMAT_VERSION || shard.metric_revision < 2 {
         // Revision 1 local buckets were 30-minute aggregates. They cannot be
         // split honestly, so preserve quota and weekly cumulative history while
         // letting retained rollout events rebuild local buckets at 15 minutes.
         shard.half_hour_buckets.clear();
+        migrated = true;
+    }
+    if shard.metric_revision < HISTORY_METRIC_REVISION {
+        // Estimator revision 4 was briefly used by development builds for a
+        // single, always-on API long-context value. Its base and optional
+        // components cannot be separated after the fact. Keep released
+        // revision-3 base history, but let retained rollouts rebuild rev-4
+        // development observations as revision 5 dual weights.
+        shard
+            .half_hour_buckets
+            .retain(|bucket| bucket.estimator_revision != 4);
+        shard
+            .weekly_local_points
+            .retain(|point| point.estimator_revision != 4);
         shard.format_version = HISTORY_FORMAT_VERSION;
         shard.metric_revision = HISTORY_METRIC_REVISION;
         migrated = true;
@@ -1625,6 +1796,8 @@ fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHour
         && left.ends_at == right.ends_at
         && left.token_usage == right.token_usage
         && left.estimated_cost_units == right.estimated_cost_units
+        && left.api_long_context_extra_cost_units == right.api_long_context_extra_cost_units
+        && left.long_context_usage_unknown == right.long_context_usage_unknown
         && left.estimator_revision == right.estimator_revision
         && left.call_count == right.call_count
         && left.groups == right.groups
@@ -1635,6 +1808,8 @@ fn weekly_local_point_payload_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoi
     left.resets_at == right.resets_at
         && left.token_usage == right.token_usage
         && left.estimated_cost_units == right.estimated_cost_units
+        && left.api_long_context_extra_cost_units == right.api_long_context_extra_cost_units
+        && left.long_context_usage_unknown == right.long_context_usage_unknown
         && left.estimator_revision == right.estimator_revision
         && left.call_count == right.call_count
         && left.partial_reasons == right.partial_reasons
@@ -1720,19 +1895,22 @@ fn bucket_unweighted_evidence_dominates(
     candidate.call_count >= other.call_count
         && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
         && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
+        && candidate.token_usage.cache_write_input_tokens
+            >= other.token_usage.cache_write_input_tokens
         && candidate.token_usage.output_tokens >= other.token_usage.output_tokens
         && candidate.token_usage.reasoning_output_tokens
             >= other.token_usage.reasoning_output_tokens
         && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
 }
 
-fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u64, u64, u64) {
+fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u64, u64, u64, u64) {
     (
         bucket.token_usage.total_tokens,
         bucket.estimated_cost_units,
         bucket.call_count,
         bucket.token_usage.input_tokens,
         bucket.token_usage.cached_input_tokens,
+        bucket.token_usage.cache_write_input_tokens,
         bucket.token_usage.output_tokens,
         bucket.token_usage.reasoning_output_tokens,
     )
@@ -1762,19 +1940,22 @@ fn weekly_unweighted_evidence_dominates(
     candidate.call_count >= other.call_count
         && candidate.token_usage.input_tokens >= other.token_usage.input_tokens
         && candidate.token_usage.cached_input_tokens >= other.token_usage.cached_input_tokens
+        && candidate.token_usage.cache_write_input_tokens
+            >= other.token_usage.cache_write_input_tokens
         && candidate.token_usage.output_tokens >= other.token_usage.output_tokens
         && candidate.token_usage.reasoning_output_tokens
             >= other.token_usage.reasoning_output_tokens
         && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
 }
 
-fn weekly_evidence_key(point: &WeeklyLocalPoint) -> (u64, u128, u64, u64, u64, u64, u64) {
+fn weekly_evidence_key(point: &WeeklyLocalPoint) -> (u64, u128, u64, u64, u64, u64, u64, u64) {
     (
         point.token_usage.total_tokens,
         point.estimated_cost_units,
         point.call_count,
         point.token_usage.input_tokens,
         point.token_usage.cached_input_tokens,
+        point.token_usage.cache_write_input_tokens,
         point.token_usage.output_tokens,
         point.token_usage.reasoning_output_tokens,
     )
@@ -2174,6 +2355,7 @@ mod tests {
             model: Some(model.to_string()),
             service_tier: service_tier.map(str::to_string),
             tokens: usage(total),
+            request_usage_exact: true,
         }
     }
 
@@ -2357,6 +2539,97 @@ mod tests {
         assert_eq!(
             observation.half_hour_buckets[1].partial_reasons,
             vec!["rollout_scan_incomplete"]
+        );
+    }
+
+    #[test]
+    fn long_context_detection_quality_propagates_to_local_and_weekly_history() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let mut unverified = call(now - Duration::minutes(1), "gpt-5.6-luna", None, 300_001);
+        unverified.request_usage_exact = false;
+
+        let observation = HistoryObservation::from_sources(
+            now,
+            &[unverified],
+            &[bucket(now, Provenance::ServerSnapshot, "codex")],
+            &[],
+        );
+
+        let local = observation.half_hour_buckets.last().unwrap();
+        assert_eq!(local.estimator_revision, 5);
+        assert!(local.partial_reasons.is_empty());
+        assert!(local.long_context_usage_unknown);
+        assert_eq!(local.groups.len(), 1);
+        assert!(!local.groups[0].used_long_context_pricing);
+        assert!(local.groups[0].used_long_context_detection_fallback);
+
+        let weekly = observation.weekly_local_points.last().unwrap();
+        assert_eq!(weekly.estimator_revision, 5);
+        assert!(weekly.partial_reasons.is_empty());
+        assert!(weekly.long_context_usage_unknown);
+
+        let reset = weekly.resets_at;
+        let history = HistoryData {
+            quota_points: observation.quota_points.clone(),
+            half_hour_buckets: observation.half_hour_buckets.clone(),
+            weekly_local_points: observation.weekly_local_points.clone(),
+            ..HistoryData::default()
+        };
+        let base = history.estimated_half_hour_series(reset);
+        assert!(base.iter().all(|point| {
+            !point
+                .partial_reasons
+                .contains(&"long_context_usage_unknown".to_string())
+        }));
+        let api = history.estimated_half_hour_series_with_api_long_context(reset, true);
+        assert!(api.iter().any(|point| {
+            point
+                .partial_reasons
+                .contains(&"long_context_usage_unknown".to_string())
+        }));
+    }
+
+    #[test]
+    fn one_observation_records_base_and_api_long_context_weights_together() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let observation = HistoryObservation::from_sources(
+            now,
+            &[call(
+                now - Duration::minutes(1),
+                "gpt-5.6-luna",
+                None,
+                300_001,
+            )],
+            &[bucket(now, Provenance::ServerSnapshot, "codex")],
+            &[],
+        );
+
+        let local = observation.half_hour_buckets.last().unwrap();
+        let extra = local.api_long_context_extra_cost_units.unwrap();
+        assert!(extra > 0);
+        assert_eq!(
+            local.groups[0].api_long_context_extra_cost_units,
+            Some(extra)
+        );
+        let weekly = observation.weekly_local_points.last().unwrap();
+        assert_eq!(weekly.api_long_context_extra_cost_units, Some(extra));
+        let reset = weekly.resets_at;
+
+        let history = HistoryData {
+            quota_points: observation.quota_points,
+            half_hour_buckets: observation.half_hour_buckets,
+            weekly_local_points: observation.weekly_local_points,
+            ..HistoryData::default()
+        };
+        let base = history.estimated_half_hour_series(reset);
+        let api = history.estimated_half_hour_series_with_api_long_context(reset, true);
+        assert_eq!(base.len(), api.len());
+        assert_eq!(
+            api.last().unwrap().estimated_cost_units,
+            base.last()
+                .unwrap()
+                .estimated_cost_units
+                .saturating_add(extra)
         );
     }
 
@@ -3298,6 +3571,55 @@ mod tests {
     }
 
     #[test]
+    fn metric_two_migration_preserves_released_base_history_and_drops_ambiguous_revision_four() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let path = shard_path(&namespace_dir, starts_at.date_naive());
+
+        let mut released = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
+        released.estimator_revision = 3;
+        released.api_long_context_extra_cost_units = None;
+        let mut ambiguous = local_bucket(
+            starts_at + Duration::minutes(15),
+            starts_at + Duration::minutes(30),
+            20,
+            400,
+        );
+        ambiguous.estimator_revision = 4;
+        ambiguous.api_long_context_extra_cost_units = None;
+        let mut released_weekly = weekly_point(starts_at, reset, 10, 100);
+        released_weekly.estimator_revision = 3;
+        released_weekly.api_long_context_extra_cost_units = None;
+        let mut ambiguous_weekly = weekly_point(starts_at + Duration::minutes(30), reset, 30, 500);
+        ambiguous_weekly.estimator_revision = 4;
+        ambiguous_weekly.api_long_context_extra_cost_units = None;
+
+        write_shard_atomically(
+            &path,
+            &HistoryShard {
+                format_version: HISTORY_FORMAT_VERSION,
+                metric_revision: 2,
+                namespace: store.namespace().to_string(),
+                utc_day: starts_at.date_naive(),
+                quota_points: vec![quota_point(starts_at, reset, 40.0)],
+                half_hour_buckets: vec![released.clone(), ambiguous],
+                weekly_local_points: vec![released_weekly.clone(), ambiguous_weekly],
+            },
+        )
+        .unwrap();
+
+        let migrated = store.load_since(starts_at - Duration::minutes(1));
+        assert_eq!(migrated.quota_points.len(), 1);
+        assert_eq!(migrated.half_hour_buckets, vec![released]);
+        assert_eq!(migrated.weekly_local_points, vec![released_weekly]);
+    }
+
+    #[test]
     fn normalization_rejects_legacy_width_without_double_counting_current_buckets() {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let first = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
@@ -3678,6 +4000,8 @@ mod tests {
             ),
             token_usage: usage(total_tokens),
             estimated_cost_units,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
             estimator_revision: HISTORY_ESTIMATOR_REVISION,
             call_count: 1,
             groups: Vec::new(),
@@ -3696,6 +4020,8 @@ mod tests {
             resets_at,
             token_usage: usage(total_tokens),
             estimated_cost_units,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
             estimator_revision: HISTORY_ESTIMATOR_REVISION,
             call_count: 1,
             partial_reasons: Vec::new(),

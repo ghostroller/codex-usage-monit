@@ -667,6 +667,9 @@ fn mark_analysis_partial(analysis: &mut WindowAnalysis, reason: &str) {
     if !analysis.partial_reasons.iter().any(|value| value == reason) {
         analysis.partial_reasons.push(reason.to_string());
     }
+    if let Some(api_long_context) = analysis.api_long_context.as_deref_mut() {
+        mark_analysis_partial(api_long_context, reason);
+    }
 }
 
 fn preserve_cached_account_data(
@@ -943,6 +946,7 @@ mod tests {
                 total_tokens,
                 ..TokenUsage::default()
             },
+            request_usage_exact: true,
         }
     }
 

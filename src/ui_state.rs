@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
 
-pub const UI_STATE_VERSION: u32 = 2;
+pub const UI_STATE_VERSION: u32 = 3;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -68,6 +68,9 @@ pub struct UiState {
     pub window_scope: UiWindowScope,
     pub turns_visible: bool,
     pub models_visible: bool,
+    /// Applies API long-context multipliers to local quota estimates. This is
+    /// opt-in because subscription credit billing does not publish that rule.
+    pub api_long_context_multiplier: bool,
     pub task_list_mode: UiTaskListMode,
     pub task_source_filter: UiTaskSourceFilter,
 }
@@ -81,6 +84,7 @@ impl Default for UiState {
             window_scope: UiWindowScope::FiveHours,
             turns_visible: true,
             models_visible: true,
+            api_long_context_multiplier: false,
             task_list_mode: UiTaskListMode::Flat,
             task_source_filter: UiTaskSourceFilter::All,
         }
@@ -309,6 +313,7 @@ mod tests {
                 window_scope: UiWindowScope::FiveHours,
                 turns_visible: true,
                 models_visible: true,
+                api_long_context_multiplier: false,
                 task_list_mode: UiTaskListMode::Flat,
                 task_source_filter: UiTaskSourceFilter::All,
             }
@@ -330,6 +335,7 @@ mod tests {
             window_scope: UiWindowScope::Week,
             turns_visible: false,
             models_visible: false,
+            api_long_context_multiplier: true,
             task_list_mode: UiTaskListMode::Tree,
             task_source_filter: UiTaskSourceFilter::Subagent,
         };
@@ -340,6 +346,7 @@ mod tests {
         assert!(json.contains("\"view\": \"trends\""));
         assert!(json.contains("\"windowScope\": \"week\""));
         assert!(json.contains("\"taskListMode\": \"tree\""));
+        assert!(json.contains("\"apiLongContextMultiplier\": true"));
         assert!(!json.contains("window_scope"));
         assert_eq!(
             fs::read_dir(directory.path().join("nested"))
@@ -378,6 +385,7 @@ mod tests {
                 window_scope: UiWindowScope::Week,
                 turns_visible: false,
                 models_visible: false,
+                api_long_context_multiplier: false,
                 task_list_mode: UiTaskListMode::Tree,
                 task_source_filter: UiTaskSourceFilter::Cli,
             }

@@ -241,6 +241,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `r`, `E`, `-`, `+` | Toggle flat/tree mode, collapse/expand all, or collapse/expand one parent. |
 | `a`, `d`, `s`, `c`, `[` / `]` | Filter All, Desktop, Subagent, or CLI sources, or cycle source filters. |
 | `v`, `m` | Show/hide Turns or Models. |
+| `l` on Overview | Toggle the optional API long-context multiplier for TUI `~EST` values. |
 | `o` | Open the selected stopped root task in a new Zellij pane, or offer a resume command for other terminals. |
 | `t` | Toggle dark/light theme. |
 | `q` | Quit. `Esc` opens quit confirmation from the main view. |
@@ -286,6 +287,8 @@ The estimator follows OpenAI's current [token-based Codex rate card](https://lea
 
 For recognized ChatGPT Fast calls the estimator applies the published [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) multiplier: `2.5x` for GPT-5.6/GPT-5.5 and `2x` for GPT-5.4. The compatible `serviceTier=priority` value found in local signed-in rollouts is treated as Fast for this attribution; this is not API Priority billing, which the official Speed page describes separately. Exact `gpt-5.3-codex-spark` calls remain outside this attribution because its credit rate is still a research preview; an unlisted or missing non-Spark model uses the corresponding GPT-5.6 Luna fallback and marks the scope partial.
 
+The TUI's `[L]Long×` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models: a verified request above 272K input tokens uses `2x` input/cached-input and `1.5x` output weights. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
+
 GPT-Image-2.0 is not assigned one of its published rows: the official card separates image and text billing, while rollout usage does not expose enough modality information to choose reliably. If such a model name appears in an ordinary token call, it uses the partial-marked unknown-model fallback instead of pretending the image rate is exact.
 
 Task trees start fully collapsed. A visible parent row includes the tokens/share of its hidden descendants.
@@ -315,7 +318,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current token-based credit mapping is estimator revision 3. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range; revision-aware replacement accepts the revision-3 point when its unweighted token/call evidence is no worse. Older revision-1/2 points that cannot be rebuilt remain stored and isolated, and a window containing mixed revisions cannot combine their EST values: it shows `~EST` as unavailable and partial. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, or an estimator update arrives. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]Long×` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 
@@ -323,7 +326,7 @@ Inspect mode shows each selected point's exact stored timestamp and value rather
 
 - **Tokens are local observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within the scanned local data when the relevant logs are complete and counters have not reset ambiguously.
 - **Account gauges are server data.** Current quota-window percentages and reset times come from the Codex App Server, or from a stale local fallback in offline/degraded mode.
-- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier Codex credit-rate weights, so activity from other machines or clients can distort it.
+- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier Codex credit-rate weights. The optional API long-context multiplier is disabled by default; either projection can still be distorted by activity from other machines or clients.
 - **Workspace rate-card migration matters.** The token-based card applies to most plans, but OpenAI says a small subset of Enterprise workspaces remains on the legacy per-message card. The monitor cannot infer that workspace migration state from local rollouts, so those users should treat `~EST` as not representative of their applicable billing card.
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.
@@ -350,7 +353,7 @@ JSON output uses camelCase and currently reports `"schemaVersion": 1`.
 | `stats` | Scan and parser statistics. |
 | `warnings`, `errors` | Warning and error diagnostics from collection. A source error does not necessarily make the whole snapshot unusable. |
 
-Token usage contains `inputTokens`, `cachedInputTokens`, `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. Do not sum all five: cached input is a subset of input, reasoning output is part of output, and `totalTokens` is already the total.
+Token usage contains `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`, `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. Do not sum them: cached input and cache write input are subsets of input, reasoning output is part of output, and `totalTokens` is already the total.
 
 For reset credits, `availableCount` is authoritative. `credits: null` means only the count is known; `credits: []` means details were fetched and the returned list was empty. A non-empty list can still be shorter than `availableCount` if the service truncated details.
 

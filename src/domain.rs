@@ -105,6 +105,8 @@ impl TurnStatus {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
@@ -116,6 +118,9 @@ impl TokenUsage {
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(other.cached_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(other.cache_write_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_output_tokens = self
             .reasoning_output_tokens
@@ -127,6 +132,7 @@ impl TokenUsage {
         self.total_tokens == 0
             && self.input_tokens == 0
             && self.cached_input_tokens == 0
+            && self.cache_write_input_tokens == 0
             && self.output_tokens == 0
             && self.reasoning_output_tokens == 0
     }
@@ -134,6 +140,7 @@ impl TokenUsage {
     pub fn delta_from(self, previous: Self) -> Option<Self> {
         if self.input_tokens < previous.input_tokens
             || self.cached_input_tokens < previous.cached_input_tokens
+            || self.cache_write_input_tokens < previous.cache_write_input_tokens
             || self.output_tokens < previous.output_tokens
             || self.reasoning_output_tokens < previous.reasoning_output_tokens
             || self.total_tokens < previous.total_tokens
@@ -144,6 +151,8 @@ impl TokenUsage {
         Some(Self {
             input_tokens: self.input_tokens - previous.input_tokens,
             cached_input_tokens: self.cached_input_tokens - previous.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens
+                - previous.cache_write_input_tokens,
             output_tokens: self.output_tokens - previous.output_tokens,
             reasoning_output_tokens: self.reasoning_output_tokens
                 - previous.reasoning_output_tokens,
@@ -404,6 +413,10 @@ pub struct WindowAnalysis {
     pub threads: Vec<ThreadWindowUsage>,
     pub turns: Vec<TurnWindowUsage>,
     pub models: Vec<ModelUsage>,
+    /// Alternative projection that applies the API-published long-context
+    /// multiplier. It is a local display option, not part of snapshot JSON.
+    #[serde(skip)]
+    pub api_long_context: Option<Box<WindowAnalysis>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +473,11 @@ pub struct UsageCall {
     pub model: Option<String>,
     pub service_tier: Option<String>,
     pub tokens: TokenUsage,
+    /// Whether this call's token delta is the exact usage of one model request.
+    ///
+    /// Rollout counters are cumulative, so this is available only when the
+    /// reported `last_token_usage` exactly matches the safe cumulative delta.
+    pub request_usage_exact: bool,
 }
 
 impl UsageCall {

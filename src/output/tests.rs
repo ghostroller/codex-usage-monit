@@ -144,12 +144,29 @@ fn proxy_projection_json_is_camel_case_and_backward_compatible() {
 #[test]
 fn token_usage_json_uses_camel_case() {
     let value = serde_json::to_value(TokenUsage {
+        cache_write_input_tokens: 7,
         total_tokens: 42,
         ..TokenUsage::default()
     })
     .unwrap();
     assert_eq!(value["totalTokens"], 42);
+    assert_eq!(value["cacheWriteInputTokens"], 7);
     assert!(value.get("total_tokens").is_none());
+    assert!(value.get("cache_write_input_tokens").is_none());
+}
+
+#[test]
+fn legacy_token_usage_json_defaults_missing_cache_write_to_zero() {
+    let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+        "inputTokens": 40,
+        "cachedInputTokens": 10,
+        "outputTokens": 2,
+        "reasoningOutputTokens": 1,
+        "totalTokens": 42
+    }))
+    .unwrap();
+
+    assert_eq!(usage.cache_write_input_tokens, 0);
 }
 
 #[test]
@@ -303,6 +320,7 @@ fn partial_status_is_scoped_to_requested_sections() {
                 estimated_quota_percent: 1.25,
                 quota_confidence: Confidence::Medium,
             }],
+            api_long_context: None,
         }],
         stats: CollectionStats::default(),
         warnings: Vec::new(),
