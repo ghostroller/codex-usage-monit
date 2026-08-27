@@ -1274,13 +1274,17 @@ mod tests {
         let (temp, desktop, _npm, _installed, _path) = automatic_discovery_fixture();
         let resources = desktop.parent().unwrap();
         let path = env::join_paths([resources]).unwrap();
+        // Discovery canonicalizes candidates before building the diagnostic;
+        // use the same Windows path representation (including any `\\?\`
+        // prefix) in the assertion.
+        let expected_desktop = fs::canonicalize(&desktop).unwrap();
 
         let error = resolve_automatic_windows_codex_cli_with_installed(&path, temp.path(), None)
             .unwrap_err();
         let rendered = format!("{error:#}");
 
         assert!(rendered.contains("Codex Desktop packaged resource"));
-        assert!(rendered.contains(&desktop.display().to_string()));
+        assert!(rendered.contains(&expected_desktop.display().to_string()));
         assert!(rendered.contains("--codex-bin"));
     }
 }
