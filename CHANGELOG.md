@@ -4,11 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.2.9] - 2026-08-27
+
 ### Changed
 
 - Added an opt-in `[L]Long×` TUI switch for API-style long-context weighting. It is off by default because the Codex subscription credit card does not publish the API's exact per-request formula. When enabled, verified requests with more than 272K input tokens use the API-published 2x input/cached-input and 1.5x output multipliers for supported model profiles; unverifiable large cumulative deltas retain the base rate and report `long_context_usage_unknown` instead of being guessed.
 - Recorder history now stores the base Codex credit proxy and the optional API long-context extra together. Overview attribution and Trends `~EST` charts switch between those paired projections immediately, without recollecting data or changing the recorder service configuration. The saved TUI preference defaults to off on first use.
 - Preserved `cache_write_input_tokens` from rollout counters as an input subset for exact deltas and request-boundary checks. The Codex credit proxy does not add a separate cache-write charge because the published Codex credit card has no cache-write row.
+
+### Fixed
+
+- On Windows, automatic Codex CLI discovery now skips the non-launchable Desktop packaged resource, prefers a runnable CLI from `PATH` or the installed standalone fallback, and reports an actionable error when neither is available.
+- Prioritized the ordinary `codex` 5h and weekly quota gauges ahead of auxiliary rate-limit buckets while keeping reset-credit reminder placement aligned with the reordered gauges.
+
+### Internal
+
+- Normalized Windows executable-path assertions so release verification does not depend on verbatim temporary-path formatting.
 
 ### Compatibility
 
@@ -161,7 +172,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.5...v0.2.6
