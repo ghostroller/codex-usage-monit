@@ -4,20 +4,20 @@ expression: compact.frame().snapshot_text()
 ---
 size=60x24
 rows:
-00| 1 Overview  |  2 Trends  |  3 Other  [V][M][5][W][L]
+00| 1 Ovw  |  2 Tr  |  3 Other  |  4 Set  [V][M][5][W][L]
 01|┌5h · codex · SERVER─────────┐┌week · codex · SERVER───────┐
 02|│███████████                 ││████████████                │
 03|│███38%/62% | 07-12 06:30    ││███42%/58% | 07-16 04:30    │
 04|│███████████                 ││! 2026-07-14 04:30:00 +00:00│
 05|└────────────────────────────┘└────────────────────────────┘
 06|┌ 5h tasks ↵[O][R][E][A][D][S][C] Filter: ─────────────────┐
-07|│ TOKENS     TOKEN5H% EST.Q5H  TASK                        │
-08|│▌D 15.0K    100.0%   ~37.5%   [+] codex-usage-monit | desk│
+07|│ TOKENS     EST.Q5H  API EQ. TASK                         │
+08|│▌D 15.0K    ~37.5%   $0.0000 [+] codex-usage-monit | deskt│
 09|└  R RUN   W WAIT   D DONE   X STOP   F FAIL   ? STALE  ───┘
 10|┌Turns · 5h cycle   Filter: ───────────────────────────────┐
-11|│ EFFORT/MODEL      MESSAGE       TOKENS    TOKEN%  EST.Q  │
-12|│▏high/gpt-5.3-code Add determini D 0       0.0%    -      │
-13|│ medium/gpt-… FAST Inspect the e D 0       0.0%    -      │
+11|│ EFFORT/MODEL      MESSAGE       TOKENS    EST.Q   API EQ.│
+12|│▏high/gpt-5.3-code Add determini D 0       -       $0.0000│
+13|│ medium/gpt-… FAST Inspect the e D 0       -       $0.0000│
 14|│                                                          │
 15|└──────────────────────────────────────────────────────────┘
 16|┌ Models · 5h · top 0/1────────────────────────────────────┐
@@ -26,28 +26,30 @@ rows:
 19|│Tokens 10.0K · EST ~37.50pp · codex gauge × credit-rate   │
 20|│share                                                     │
 21|│Credit-rate-weighted quota proxy · not server accounting  │
-22|│MODEL               TOKENS       TOKEN SHARE  EST. QUOTA  │
+22|│MODEL                    TOKENS       EST. QUOTA   API EQ.│
 23|└──────────────────────────────────────────────────────────┘
 styles:
 00:001+001 fg=#006c75 bg=#f7f9fc mods=bold text="1"
-00:003+008 fg=#17202a bg=#f7f9fc mods=bold text="Overview"
-00:011+005 fg=#5f6b7a bg=#f7f9fc mods=none text="  |  "
-00:016+001 fg=#006c75 bg=#f7f9fc mods=bold text="2"
-00:017+012 fg=#5f6b7a bg=#f7f9fc mods=none text=" Trends  |  "
-00:029+001 fg=#006c75 bg=#f7f9fc mods=bold text="3"
-00:030+008 fg=#5f6b7a bg=#f7f9fc mods=none text=" Other  "
-00:038+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
-00:039+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="V"
-00:040+002 fg=#f7f9fc bg=#006c75 mods=bold text="]["
-00:042+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="M"
-00:043+002 fg=#f7f9fc bg=#006c75 mods=bold text="]["
-00:045+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="5"
-00:046+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
-00:047+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
-00:048+001 fg=#006c75 bg=#f7f9fc mods=bold text="W"
-00:049+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
-00:051+001 fg=#006c75 bg=#f7f9fc mods=bold text="L"
-00:052+008 fg=#5f6b7a bg=#f7f9fc mods=none text="]       "
+00:003+003 fg=#17202a bg=#f7f9fc mods=bold text="Ovw"
+00:006+005 fg=#5f6b7a bg=#f7f9fc mods=none text="  |  "
+00:011+001 fg=#006c75 bg=#f7f9fc mods=bold text="2"
+00:012+008 fg=#5f6b7a bg=#f7f9fc mods=none text=" Tr  |  "
+00:020+001 fg=#006c75 bg=#f7f9fc mods=bold text="3"
+00:021+011 fg=#5f6b7a bg=#f7f9fc mods=none text=" Other  |  "
+00:032+001 fg=#006c75 bg=#f7f9fc mods=bold text="4"
+00:033+006 fg=#5f6b7a bg=#f7f9fc mods=none text=" Set  "
+00:039+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
+00:040+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="V"
+00:041+002 fg=#f7f9fc bg=#006c75 mods=bold text="]["
+00:043+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="M"
+00:044+002 fg=#f7f9fc bg=#006c75 mods=bold text="]["
+00:046+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="5"
+00:047+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
+00:048+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
+00:049+001 fg=#006c75 bg=#f7f9fc mods=bold text="W"
+00:050+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
+00:052+001 fg=#006c75 bg=#f7f9fc mods=bold text="L"
+00:053+007 fg=#5f6b7a bg=#f7f9fc mods=none text="]      "
 01:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
 01:001+019 fg=#17202a bg=#f7f9fc mods=bold text="5h · codex · SERVER"
 01:020+011 fg=#7d8998 bg=#f7f9fc mods=none text="─────────┐┌"
@@ -100,12 +102,12 @@ styles:
 06:035+006 fg=#5f6b7a bg=#f7f9fc mods=none text="ilter:"
 06:041+019 fg=#006c75 bg=#f7f9fc mods=none text=" ─────────────────┐"
 07:000+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
-07:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" TOKENS     TOKEN5H% EST.Q5H  TASK                        "
+07:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" TOKENS     EST.Q5H  API EQ. TASK                         "
 07:059+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
 08:000+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
-08:001+031 fg=#006c75 bg=#e6f3f8 mods=bold text="▌D 15.0K    100.0%   ~37.5%   ["
-08:032+001 fg=#006c75 bg=#e6f3f8 mods=bold+underline text="+"
-08:033+026 fg=#006c75 bg=#e6f3f8 mods=bold text="] codex-usage-monit | desk"
+08:001+030 fg=#006c75 bg=#e6f3f8 mods=bold text="▌D 15.0K    ~37.5%   $0.0000 ["
+08:031+001 fg=#006c75 bg=#e6f3f8 mods=bold+underline text="+"
+08:032+027 fg=#006c75 bg=#e6f3f8 mods=bold text="] codex-usage-monit | deskt"
 08:059+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
 09:000+002 fg=#006c75 bg=#f7f9fc mods=none text="└ "
 09:002+007 fg=#185c37 bg=#e7f6ec mods=bold text=" R RUN "
@@ -120,15 +122,15 @@ styles:
 10:020+007 fg=#5f6b7a bg=#f7f9fc mods=none text="Filter:"
 10:027+033 fg=#7d8998 bg=#f7f9fc mods=none text=" ───────────────────────────────┐"
 11:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-11:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" EFFORT/MODEL      MESSAGE       TOKENS    TOKEN%  EST.Q  "
+11:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" EFFORT/MODEL      MESSAGE       TOKENS    EST.Q   API EQ."
 11:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 12:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-12:001+058 fg=#5f6b7a bg=#e6f3f8 mods=none text="▏high/gpt-5.3-code Add determini D 0       0.0%    -      "
+12:001+058 fg=#5f6b7a bg=#e6f3f8 mods=none text="▏high/gpt-5.3-code Add determini D 0       -       $0.0000"
 12:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 13:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 13:001+013 fg=#075985 bg=#e6f3f8 mods=none text=" medium/gpt-…"
 13:014+005 fg=#8a5900 bg=#e6f3f8 mods=bold text=" FAST"
-13:019+040 fg=#075985 bg=#e6f3f8 mods=none text=" Inspect the e D 0       0.0%    -      "
+13:019+040 fg=#075985 bg=#e6f3f8 mods=none text=" Inspect the e D 0       -       $0.0000"
 13:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 14:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 14:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
@@ -153,17 +155,18 @@ styles:
 21:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Credit-rate-weighted quota proxy · not server accounting  "
 21:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 22:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-22:001+058 fg=#006c75 bg=#f7f9fc mods=bold text="MODEL               TOKENS       TOKEN SHARE  EST. QUOTA  "
+22:001+058 fg=#006c75 bg=#f7f9fc mods=bold text="MODEL                    TOKENS       EST. QUOTA   API EQ."
 22:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 23:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 controls:
-ViewOverview binding=1 rect=0,0,12,1
-ViewTrends binding=2 rect=15,0,10,1
-ViewOther binding=3 rect=28,0,9,1
-ToggleTurns binding=V rect=38,0,3,1
-ToggleModels binding=M rect=41,0,3,1
-ScopeFiveHours binding=5 rect=44,0,3,1
-ScopeWeek binding=W rect=47,0,3,1
+ViewOverview binding=1 rect=0,0,7,1
+ViewTrends binding=2 rect=10,0,6,1
+ViewOther binding=3 rect=19,0,9,1
+ViewSettings binding=4 rect=31,0,7,1
+ToggleTurns binding=V rect=39,0,3,1
+ToggleModels binding=M rect=42,0,3,1
+ScopeFiveHours binding=5 rect=45,0,3,1
+ScopeWeek binding=W rect=48,0,3,1
 SourceAll binding=A rect=21,6,3,1
 SourceDesktop binding=D rect=24,6,3,1
 SourceSubagent binding=S rect=27,6,3,1

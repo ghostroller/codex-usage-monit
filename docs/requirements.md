@@ -35,7 +35,7 @@ TUI Overview 显示近期 tasks：
 - task token 总量；
 - 当前选中 5h/Week reset cycle 的 `TOKEN5H%` / `TOKENWK%` 与 estimated quota；
 - project、来源、turn 数和会话标题；会话标题优先取 `$CODEX_HOME/session_index.jsonl` 中 thread 最新的非空 `thread_name`，缺失或不可读时回退 rollout 首条消息摘要，`--redact-content` 始终显示 `[redacted]`；
-- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown 与所选 reset cycle `TOKEN%` 必须汇总当前过滤树内所有隐藏后代，`EST.Q` 必须累加同一 Codex credit-rate 加权分母下的实体值；Spark 后代不得进入 `TOKEN%` 或 `EST.Q`。展开后恢复逐行值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
+- 默认使用 Flat 列表；`R` 与可点击 `[R]Tree` 在 Flat/Tree 间切换。Tree 仅把拥有可靠直接父 thread id 的 subagent 挂到当前过滤结果中可见的父节点下，支持多层关系；父节点缺失或被过滤时 child 作为根节点，损坏的自引用/循环关系不得卡死渲染。拥有子节点的行显示稳定宽度的 `[-]` / `[+]` 按钮；Tasks 聚焦时 `-` 收起、`+` 展开所选父节点，整块按钮可点击且不得误选相邻行。Tree 模式提供大写 `E` 与可点击 `[E]Collapse`，一次收起当前文本和来源条件形成的完整过滤树中所有父节点，包含已隐藏在折叠祖先下的嵌套父节点；当这些父节点已全部收起时，固定宽度按钮改为 `[E]Expand`，相同操作展开当前过滤树的全部父节点。筛选范围外的折叠状态不得被批量切换。折叠状态按 thread id 跨刷新保留，选择不得停留在被折叠隐藏的后代。节点折叠时，父行的 token breakdown、所选 reset cycle `TOKEN%`、`EST.Q` 与 `API EQ.` 必须汇总当前过滤树内所有隐藏后代；`EST.Q` 使用同一 Codex credit-rate 加权分母，`API EQ.` 使用同一 API 价格目录，Spark 后代不得进入 `TOKEN%` 或 `EST.Q`。展开后恢复逐会话值，不能改写 `Snapshot` 或在父子同时可见时重复计数。挂在可见父节点下的 child 省略与父节点重复的项目名，orphan root 仍显示项目名。树根与同层分支按包含隐藏后代在内的子树最新活动项排序，让新活动 child 带动整组到顶部；
 - Recent tasks 顶栏提供 task 标题/项目名搜索和 All、Desktop、Subagent、CLI 互斥来源筛选；当前会话标题或 `cwd` basename 使用大小写不敏感的子串匹配，两类条件按 AND 组合，历史 `vscode` 标签归入 Desktop，其他未知来源只属于 All。`F` 与来源按钮的 `A` / `D` / `S` / `C` 必须对应真实快捷键，并按 btop 风格只强调快捷键字符；筛选只属于 TUI 状态，不得修改 `Snapshot` 或一次性输出；
 - 默认焦点在 Tasks；`Enter` 将焦点移入所选 task 的 Turns，`Backspace` 返回 Tasks，上下方向键与 `j` / `k` 只移动当前焦点面板的选择。当前焦点使用醒目标记，非焦点面板保留弱上下文标记；Tasks/Turns 标题在对应跳转动作可用时分别以轻量 `↵` / `←` 提示，两个提示整体都是鼠标按钮，且出现或消失不得移动相邻控件；无匹配 task 或无 turn 时不得进入 Turns 或显示旧详情；
 - Turns 维护独立于 Tasks 的大小写不敏感 Filter，可匹配 turn ID、model、reasoning effort、消息摘要、状态与 `fast`；筛选后的键盘选择、鼠标选择、详情、滚动条和跨刷新 ID 恢复必须使用同一投影。筛选编辑确认后，非输入状态下的 `Delete` 与可点击 `[Del]` 清空当前焦点面板的查询；从 Turns 切换回 Tasks 时自动清空 Turns 查询及编辑恢复状态、重置 Turns 筛选投影，同时保留 Tasks 查询；
@@ -90,7 +90,7 @@ task/thread -> turn -> model token events
 - EST 使用 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 与 Daybreak Blue 的 `daybreak-blue-latest` `(100,10,500)`，`gpt-5.6-terra` `(50,5,300)`，`gpt-5.6-luna` `(5,.5,30)`，`gpt-5.5` `(125,12.5,750)`，Daybreak Red 的 `daybreak-red-latest`、`gpt-5.6-cyber` 与历史兼容 slug `gpt-5.5-cyber` `(312.5,31.25,1875)`，`gpt-5.4` `(62.5,6.25,375)`，`gpt-5.4-mini` `(18.75,1.875,113)`；该映射包含 2026-08-21 的 Sol 调价，官方说明其促销费率至少持续到 2026-11-21；
 - 当前官方费率卡不再列出 GPT-5.3-Codex/GPT-5.2；为读取历史 rollout，`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仍保留早期 `(43.75,4.375,350)` Standard 兼容权重，不得把它们描述为当前官方费率卡行；
 - `serviceTier=fast` 与本地登录态 rollout 的兼容 `serviceTier=priority` 值都按 ChatGPT Fast 识别；根据官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard。这里的 `priority` 兼容行为不得解释为 API Priority 计费，后者在官方文档中是独立费率；
-- `cached = min(cached_input, input)`，`uncached = input - cached`；基础 EST 始终使用 Codex token-based credit rate，不自动套用 API 长上下文倍率。TUI 提供默认关闭的 `[L]EST Long×` 可选口径：对 GPT-5.6 Sol/Terra/Luna/Cyber（含当前 aliases）、GPT-5.5 和 GPT-5.4，只有与安全累计 delta 完全相等的单次 `last_token_usage.input_tokens > 272000` 时，才把 API 公布的 input/cached input `2x` 与 output `1.5x` 代理倍率应用到整次请求。判断必须逐调用进行，不能使用 turn/thread/bucket 累计值；可选口径开启且单次边界未知、聚合 input 超过阈值时保留基础费率并标 `long_context_usage_unknown`，关闭时不得仅因该假设标 partial；聚合不超过阈值可安全按短上下文处理。GPT-5.4 mini、旧 `gpt-5.5-cyber` 与 GPT-5.3/GPT-5.2 兼容映射，以及未知模型 Luna fallback 不得凭推断套用长上下文倍率；Codex credit 卡未公布相同公式，输出不得称为官方逐请求 credit 账单；
+- `cached = min(cached_input, input)`，`uncached = input - cached`；基础 EST 始终使用 Codex token-based credit rate，不自动套用 API 长上下文倍率。TUI 提供默认关闭的 `[L]EST Longx` 可选口径：对 GPT-5.6 Sol/Terra/Luna/Cyber（含当前 aliases）、GPT-5.5 和 GPT-5.4，只有与安全累计 delta 完全相等的单次 `last_token_usage.input_tokens > 272000` 时，才把 API 公布的 input/cached input `2x` 与 output `1.5x` 代理倍率应用到整次请求。判断必须逐调用进行，不能使用 turn/thread/bucket 累计值；可选口径开启且单次边界未知、聚合 input 超过阈值时保留基础费率并标 `long_context_usage_unknown`，关闭时不得仅因该假设标 partial；聚合不超过阈值可安全按短上下文处理。GPT-5.4 mini、旧 `gpt-5.5-cyber` 与 GPT-5.3/GPT-5.2 兼容映射，以及未知模型 Luna fallback 不得凭推断套用长上下文倍率；Codex credit 卡未公布相同公式，输出不得称为官方逐请求 credit 账单；
 - reasoning 是 output 子集，cache-write 是 input 子集，两者都不得重复相加。rollout 必须保留 snake/camel case 的 cache-write 字段并用于累计 delta 与单次请求一致性校验；当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不得额外增加 API cache-write charge；
 - 缺失或未映射的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast credit 费率降级，并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
 - `estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units`；task、turn、model 的 EST 使用同一 credit-rate 分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
@@ -125,7 +125,7 @@ codex-usage-monit --theme light
 
 TUI 首次启动使用 dark 主题，之后恢复用户级状态文件中的主题；`--theme light` 显式覆盖保存值，`bright` 是 `light` 的别名，运行中按 `t` 可切换。主题只影响 TUI 渲染，不得改变采集结果或一次性 text/JSON 输出。
 
-TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、默认关闭的 API 长上下文倍率、Turns/Models 显隐、Flat/Tree 与 task 来源筛选。搜索、选择、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；开关字段缺失或状态损坏时回退为关闭，一次性输出不得读写此文件并保持基础 EST 口径。
+TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、默认关闭的 API 长上下文倍率、Turns/Models 显隐、Tasks/Turns/Models 共用的 table columns、Flat/Tree 与 task 来源筛选。搜索、选择、Settings 当前行、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；字段缺失时使用各自安全默认值（Longx 关闭，Turns/Models 与四个指标列开启），状态损坏时回退完整默认状态。一次性输出不得读写此文件并保持基础 EST 口径。
 
 一次性输出：
 
@@ -148,7 +148,7 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 ### Overview
 
 - quota gauges；
-- Overview 最顶栏中的 `[V]Turns`、`[M]Models`、`[5h]` / `[Week]`、`[L]EST Long×` 按钮；`V`、`M`、`5` / `W`、`L` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；紧凑布局可缩为 `[L]`，但不得删除快捷键或 hitbox；
+- Overview 最顶栏中的 `[V]Turns`、`[M]Models`、`[5h]` / `[Week]`、`[L]EST Longx` 按钮；`V`、`M`、`5` / `W`、`L` 是真实快捷键，整块按钮支持鼠标左键点击，并遵循 btop 风格快捷键字符强调规则；紧凑布局可缩为 `[L]`，但不得删除快捷键或 hitbox；
 - 所选当前 reset cycle 的 duration、实际起止时间和额度；
 - 使用所选 scope 的 task 表；
 - 选中 task 的 turns，包含消息摘要、可点击选中态和 turn 详情；
@@ -157,7 +157,13 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 - `V` 与最顶栏中可点击的 `[V]Turns` 切换 Turns 默认显隐；首次启动默认显示，隐藏后仍可临时进入 Turns，顶栏恢复控件始终可达；
 - 非搜索状态的 `Esc` 打开退出确认弹窗，弹窗内 `Enter` 确认、`Esc` 取消；`Ctrl-C` 与 `q` 保持直接退出，搜索输入中的 `Esc` 只取消编辑。
 
-Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要；`[L]EST Long×` 同步切换这些实体 EST 与 Trends 的 Weekly/15m `~EST` 图，但不改变原始 token 图或 API 等价费用。两者都作为稳定菜单偏好跨 TUI 进程保存；搜索输入焦点必须先消费 `l`，非 Overview 视图不得误触发该键。既有 JSON 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 基础分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
+Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要；`[L]EST Longx` 同步切换这些实体 EST 与 Trends 的 Weekly/15m `~EST` 图，但不改变原始 token 图或 API 等价费用。Tasks 与 Turns 的每一行分别显示所选 5h/Week scope 的独立 `API EQ.`，不是 lifetime 金额；窗口缺失时显示 `-`。scope、Longx、面板和列项开关都作为稳定菜单偏好跨 TUI 进程保存；搜索输入焦点必须先消费可打印字符，非 Overview 视图不得误触发 Overview 快捷键。既有 JSON 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 基础分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
+
+### Settings
+
+- `4` 打开 Settings；Display 管理主题、Turns/Models 显隐和 `EST Longx`；Table columns 全局管理 Tasks、Turns、Models 的 Tokens、Token share、Estimated quota 与 API equivalent 列；
+- 每行显示并强调真实快捷键，支持上下选择、`Enter` 切换和整行鼠标点击；文本输入焦点仍优先消费可打印键；
+- task/model 身份列与 turn 的 model/effort/message 列不可关闭。面板过窄时可以临时省略低优先级的已启用指标列，但不得改写保存的列配置；隐藏 Tokens 后，task/turn 状态标识必须迁移到身份列而不能消失。
 
 ### Other
 
@@ -172,7 +178,7 @@ Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因�
 
 宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的 Tree、名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。Flat/Tree 的显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；切换模式保留所选 thread/turn 并 reveal 新位置，刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
-Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Other 两个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点。除显式视图 tab、顶栏筛选控件、Models scope/显隐按钮和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Trends、Other、Settings 四个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点，Settings 每个设置行整体可点击。除显式视图 tab、当前视图的真实控件、数据行和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择；Settings 中上下键选择行、`Enter` 切换。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -207,7 +213,8 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - 235 文件真实基准 warm refresh 小于 200ms；
 - partial 与退出码按 section 生效；
 - 5h/Week 使用服务端 reset cycle 边界；`--days` 覆盖不足时对应 `windowAnalyses` 为 partial；
-- Overview 最顶栏中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`V` / `[V]Turns` 和 `M` / `[M]Models` 可稳定隐藏并恢复对应面板；`L` / `[L]EST Long×` 默认关闭，键盘和整块鼠标 hitbox 都能同步切换 Overview 与 Trends 的 EST 口径，搜索焦点和其他视图不会误触发；
+- Overview 最顶栏中的 `5` / `W` 和鼠标按钮会同步切换 Tasks、Turns、Models 与归因摘要，`V` / `[V]Turns` 和 `M` / `[M]Models` 可稳定隐藏并恢复对应面板；`L` / `[L]EST Longx` 默认关闭，键盘和整块鼠标 hitbox 都能同步切换 Overview 与 Trends 的 EST 口径，搜索焦点和其他视图不会误触发；
+- Tasks/Turns 的独立 `API EQ.` 会随 5h/Week scope 切换、不随 Longx 改变，并区分窗口缺失 `-` 与已观察零值；`4 Settings`、全部设置行快捷键、整行鼠标命中、非默认列配置持久化、隐藏 Tokens 后状态标识以及 60x24 紧凑布局均有覆盖；
 - Tree 节点收起时父行准确汇总当前过滤树中隐藏后代的 token、`TOKEN%` 与 estimated quota，展开时不重复计数；
 - `serviceTier=fast` / `priority` 的 Fast turn，其 `FAST` 只出现在模型名称后；普通 turn 的模型单元格保持不变；
 - 相同 duration 出现多个额度桶时仍完整显示 gauge，但只有 `codex` 生成归因；Spark 精确模型名大小写不敏感排除，`codex_bengalfox` 保持 gauge-only，缺失模型名进入普通 `codex` 分母；

@@ -45,12 +45,12 @@ use text::{
     truncate_display_text, truncate_middle_display_text,
 };
 
-use crate::api_cost::{format_api_cost_amount, format_api_equivalent_cost};
+use crate::api_cost::format_api_cost_amount;
 use crate::config::CollectConfig;
 use crate::domain::{
-    AccountSnapshot, AttributionSummary, Confidence, ModelUsage, Provenance, Snapshot, TaskRecord,
-    TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis, WindowUsage,
-    terminal_safe_text,
+    AccountSnapshot, ApiCostAmount, AttributionSummary, Confidence, ModelUsage, Provenance,
+    Snapshot, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis,
+    WindowUsage, terminal_safe_text,
 };
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
 use crate::open_config::{OpenConfig, OpenConfigStore};
@@ -67,7 +67,8 @@ use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
 };
 use crate::ui_state::{
-    UiState, UiStateStore, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
+    UiState, UiStateStore, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
+    UiWindowScope,
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
@@ -95,6 +96,17 @@ const TASK_QUOTA_WIDTH: u16 = 8;
 const TASK_COLUMN_SPACING: u16 = 1;
 const TASK_HIGHLIGHT_WIDTH: u16 = 1;
 const TASK_TREE_MARKER_WIDTH: u16 = 3;
+const TURN_MODEL_WIDTH: u16 = 16;
+const TURN_COMPACT_MODEL_WIDTH: u16 = 17;
+const TURN_EFFORT_WIDTH: u16 = 7;
+const TURN_MESSAGE_WIDTH: u16 = 14;
+const TURN_COMPACT_MESSAGE_WIDTH: u16 = 8;
+const TURN_TOKENS_WIDTH: u16 = 9;
+const TURN_TOKEN_SHARE_WIDTH: u16 = 7;
+const TURN_QUOTA_WIDTH: u16 = 7;
+const MODEL_TOKENS_WIDTH: u16 = 12;
+const MODEL_TOKEN_SHARE_WIDTH: u16 = 12;
+const MODEL_QUOTA_WIDTH: u16 = 12;
 const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
 
 #[cfg(test)]
@@ -218,6 +230,7 @@ enum View {
     Overview,
     Trends,
     Health,
+    Settings,
 }
 
 impl From<UiView> for View {
@@ -226,6 +239,7 @@ impl From<UiView> for View {
             UiView::Overview => Self::Overview,
             UiView::Trends => Self::Trends,
             UiView::Health => Self::Health,
+            UiView::Settings => Self::Settings,
         }
     }
 }
@@ -236,7 +250,79 @@ impl From<View> for UiView {
             View::Overview => Self::Overview,
             View::Trends => Self::Trends,
             View::Health => Self::Health,
+            View::Settings => Self::Settings,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingItem {
+    Theme,
+    Turns,
+    Models,
+    ApiLongContext,
+    Tokens,
+    TokenShare,
+    EstimatedQuota,
+    ApiEquivalent,
+}
+
+impl SettingItem {
+    const ALL: [Self; 8] = [
+        Self::Theme,
+        Self::Turns,
+        Self::Models,
+        Self::ApiLongContext,
+        Self::Tokens,
+        Self::TokenShare,
+        Self::EstimatedQuota,
+        Self::ApiEquivalent,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Theme => 0,
+            Self::Turns => 1,
+            Self::Models => 2,
+            Self::ApiLongContext => 3,
+            Self::Tokens => 4,
+            Self::TokenShare => 5,
+            Self::EstimatedQuota => 6,
+            Self::ApiEquivalent => 7,
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::Theme => 'T',
+            Self::Turns => 'V',
+            Self::Models => 'M',
+            Self::ApiLongContext => 'L',
+            Self::Tokens => 'K',
+            Self::TokenShare => 'P',
+            Self::EstimatedQuota => 'E',
+            Self::ApiEquivalent => 'A',
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Theme => "Theme",
+            Self::Turns => "Turns panel",
+            Self::Models => "Models panel",
+            Self::ApiLongContext => "EST Longx",
+            Self::Tokens => "Tokens",
+            Self::TokenShare => "Token share",
+            Self::EstimatedQuota => "Estimated quota",
+            Self::ApiEquivalent => "API equivalent",
+        }
+    }
+
+    fn from_shortcut(value: char) -> Option<Self> {
+        let shortcut = value.to_ascii_uppercase();
+        Self::ALL
+            .into_iter()
+            .find(|item| item.shortcut() == shortcut)
     }
 }
 
@@ -559,6 +645,82 @@ fn window_analysis(snapshot: &Snapshot, scope: WindowScope) -> Option<&WindowAna
                 .as_ref()
                 .is_some_and(|window| window.limit_id.trim().eq_ignore_ascii_case("codex"))
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiCostWindowState {
+    Unavailable,
+    NoLocalData,
+    Incomplete,
+    Complete,
+}
+
+fn api_cost_window_state(analysis: Option<&WindowAnalysis>) -> ApiCostWindowState {
+    let Some(analysis) = analysis else {
+        return ApiCostWindowState::Unavailable;
+    };
+    if analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == "local_scan_disabled")
+    {
+        return ApiCostWindowState::NoLocalData;
+    }
+    let rollout_incomplete = analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason.starts_with("rollout_"));
+    if !rollout_incomplete {
+        return ApiCostWindowState::Complete;
+    }
+    let amount = analysis.api_equivalent_cost.amount;
+    if amount.observed_samples == 0 && amount.observed_tokens == 0 {
+        ApiCostWindowState::NoLocalData
+    } else {
+        ApiCostWindowState::Incomplete
+    }
+}
+
+fn format_scoped_api_cost_amount(state: ApiCostWindowState, cost: ApiCostAmount) -> String {
+    match state {
+        ApiCostWindowState::Unavailable | ApiCostWindowState::NoLocalData => "-".to_string(),
+        ApiCostWindowState::Complete => format_api_cost_amount(cost),
+        ApiCostWindowState::Incomplete => {
+            let mut formatted = format_api_cost_amount(cost);
+            if formatted != "-" && !formatted.ends_with('+') {
+                formatted.push('+');
+            }
+            formatted
+        }
+    }
+}
+
+fn api_cost_column_width(analysis: Option<&WindowAnalysis>, visible_values: &[String]) -> u16 {
+    // The window total keeps the width stable for ordinary amounts. Visible
+    // values also participate because special decimal formatting can make a
+    // numerically smaller entity wider than the total.
+    let total_width = analysis
+        .map(|analysis| {
+            UnicodeWidthStr::width(
+                format_scoped_api_cost_amount(
+                    api_cost_window_state(Some(analysis)),
+                    analysis.api_equivalent_cost.amount,
+                )
+                .as_str(),
+            )
+        })
+        .unwrap_or(0);
+    let value_width = visible_values
+        .iter()
+        .map(|value| UnicodeWidthStr::width(value.as_str()))
+        .max()
+        .unwrap_or(0);
+    u16::try_from(
+        total_width
+            .max(value_width)
+            .max(UnicodeWidthStr::width("API EQ.")),
+    )
+    .unwrap_or(u16::MAX)
 }
 
 fn window_analysis_with_api_long_context(
@@ -1016,7 +1178,12 @@ struct TurnControlsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ViewTabsHitbox {
-    tabs: [Rect; 3],
+    tabs: [Rect; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SettingsControlsHitbox {
+    rows: [Rect; 8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1302,13 +1469,23 @@ impl TableHitbox {
 }
 
 impl View {
-    const ALL: [Self; 3] = [Self::Overview, Self::Trends, Self::Health];
+    const ALL: [Self; 4] = [Self::Overview, Self::Trends, Self::Health, Self::Settings];
 
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
             Self::Trends => "Trends",
             Self::Health => "Other",
+            Self::Settings => "Settings",
+        }
+    }
+
+    fn compact_label(self) -> &'static str {
+        match self {
+            Self::Overview => "Ovw",
+            Self::Trends => "Tr",
+            Self::Health => "Other",
+            Self::Settings => "Set",
         }
     }
 
@@ -1317,6 +1494,7 @@ impl View {
             Self::Overview => '1',
             Self::Trends => '2',
             Self::Health => '3',
+            Self::Settings => '4',
         }
     }
 
@@ -1325,6 +1503,7 @@ impl View {
             Self::Overview => 0,
             Self::Trends => 1,
             Self::Health => 2,
+            Self::Settings => 3,
         }
     }
 
@@ -1332,15 +1511,17 @@ impl View {
         match self {
             Self::Overview => Self::Trends,
             Self::Trends => Self::Health,
-            Self::Health => Self::Overview,
+            Self::Health => Self::Settings,
+            Self::Settings => Self::Overview,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Overview => Self::Health,
+            Self::Overview => Self::Settings,
             Self::Trends => Self::Overview,
             Self::Health => Self::Trends,
+            Self::Settings => Self::Health,
         }
     }
 }
@@ -1376,6 +1557,8 @@ struct App {
     turns_temporarily_visible: bool,
     models_visible: bool,
     api_long_context_multiplier: bool,
+    table_columns: UiTableColumns,
+    selected_setting: usize,
     open_config: OpenConfig,
     open_config_error: Option<String>,
     zellij_environment: bool,
@@ -1397,6 +1580,7 @@ struct App {
     task_tree_marker_hitboxes: Vec<TaskTreeMarkerHitbox>,
     turn_controls_hitbox: Option<TurnControlsHitbox>,
     window_controls_hitbox: Option<WindowControlsHitbox>,
+    settings_controls_hitbox: Option<SettingsControlsHitbox>,
     trend_controls_hitbox: Option<TrendControlsHitbox>,
     trend_chart_hitboxes: Vec<TrendChartHitbox>,
     trend_inspect_mode: bool,
@@ -1448,6 +1632,8 @@ impl App {
             turns_temporarily_visible: false,
             models_visible: true,
             api_long_context_multiplier: false,
+            table_columns: UiTableColumns::default(),
+            selected_setting: 0,
             open_config: OpenConfig::default(),
             open_config_error: None,
             zellij_environment: std::env::var_os("ZELLIJ").is_some(),
@@ -1469,6 +1655,7 @@ impl App {
             task_tree_marker_hitboxes: Vec::new(),
             turn_controls_hitbox: None,
             window_controls_hitbox: None,
+            settings_controls_hitbox: None,
             trend_controls_hitbox: None,
             trend_chart_hitboxes: Vec::new(),
             trend_inspect_mode: false,
@@ -1548,6 +1735,7 @@ impl App {
         self.turns_temporarily_visible = false;
         self.models_visible = state.models_visible;
         self.api_long_context_multiplier = state.api_long_context_multiplier;
+        self.table_columns = state.table_columns;
         self.task_list_mode = state.task_list_mode.into();
         self.expanded_task_threads.clear();
         self.task_source_filter = state.task_source_filter.into();
@@ -1921,6 +2109,7 @@ impl App {
             turns_visible: self.turns_default_visible,
             models_visible: self.models_visible,
             api_long_context_multiplier: self.api_long_context_multiplier,
+            table_columns: self.table_columns,
             task_list_mode: self.task_list_mode.into(),
             task_source_filter: self.task_source_filter.into(),
             ..UiState::default()
@@ -2207,6 +2396,60 @@ impl App {
     fn toggle_api_long_context_multiplier(&mut self) {
         self.api_long_context_multiplier = !self.api_long_context_multiplier;
         self.clear_trend_inspection();
+    }
+
+    fn selected_setting_item(&self) -> SettingItem {
+        SettingItem::ALL[self.selected_setting.min(SettingItem::ALL.len() - 1)]
+    }
+
+    fn select_setting(&mut self, item: SettingItem) {
+        self.selected_setting = item.index();
+    }
+
+    fn move_setting_selection(&mut self, forward: bool) {
+        self.selected_setting = if forward {
+            (self.selected_setting + 1).min(SettingItem::ALL.len() - 1)
+        } else {
+            self.selected_setting.saturating_sub(1)
+        };
+    }
+
+    fn toggle_setting(&mut self, item: SettingItem) {
+        self.select_setting(item);
+        match item {
+            SettingItem::Theme => self.toggle_theme(),
+            SettingItem::Turns => self.toggle_turns_default_visibility(),
+            SettingItem::Models => self.toggle_models_visibility(),
+            SettingItem::ApiLongContext => self.toggle_api_long_context_multiplier(),
+            SettingItem::Tokens => self.table_columns.tokens = !self.table_columns.tokens,
+            SettingItem::TokenShare => {
+                self.table_columns.token_share = !self.table_columns.token_share;
+            }
+            SettingItem::EstimatedQuota => {
+                self.table_columns.estimated_quota = !self.table_columns.estimated_quota;
+            }
+            SettingItem::ApiEquivalent => {
+                self.table_columns.api_equivalent = !self.table_columns.api_equivalent;
+            }
+        }
+        self.task_reveal_pending = true;
+        self.turn_reveal_pending = true;
+    }
+
+    fn setting_value(&self, item: SettingItem) -> &'static str {
+        match item {
+            SettingItem::Theme => match self.theme {
+                Theme::Dark => "Dark",
+                Theme::Light => "Light",
+            },
+            SettingItem::Turns => on_off(self.turns_default_visible),
+            SettingItem::Models => on_off(self.models_visible),
+            SettingItem::ApiLongContext => on_off(self.api_long_context_multiplier),
+            SettingItem::Tokens => on_off(self.table_columns.tokens),
+            SettingItem::TokenShare => on_off(self.table_columns.token_share),
+            SettingItem::EstimatedQuota => on_off(self.table_columns.estimated_quota),
+            SettingItem::ApiEquivalent => on_off(self.table_columns.api_equivalent),
+        }
     }
 
     fn reset_turn_selection(&mut self) {
@@ -2627,6 +2870,7 @@ impl App {
         self.task_tree_marker_hitboxes.clear();
         self.turn_controls_hitbox = None;
         self.window_controls_hitbox = None;
+        self.settings_controls_hitbox = None;
         self.view_tabs_hitbox = None;
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
@@ -3031,6 +3275,23 @@ impl App {
         };
         self.accept_active_search();
         self.set_view(view);
+        true
+    }
+
+    fn activate_setting_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Settings {
+            return false;
+        }
+        let Some(hitbox) = self.settings_controls_hitbox else {
+            return false;
+        };
+        let Some(item) = SettingItem::ALL
+            .into_iter()
+            .find(|item| rect_contains(hitbox.rows[item.index()], column, row))
+        else {
+            return false;
+        };
+        self.toggle_setting(item);
         true
     }
 
@@ -3545,6 +3806,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
             app.scroll_drag = None;
             app.trend_drag = None;
             if app.activate_view_at(event.column, event.row)
+                || app.activate_setting_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
                 || app.activate_trend_control_at(event.column, event.row)
                 || app.begin_trend_drag_at(event.column, event.row)
@@ -3619,12 +3881,18 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
-    let mut tabs = [Rect::default(); 3];
+    let compact = view_tabs_compact(area.width);
+    let mut tabs = [Rect::default(); 4];
     let mut x = area.x;
     for (position, view) in View::ALL.into_iter().enumerate() {
+        let label = if compact {
+            view.compact_label()
+        } else {
+            view.label()
+        };
         let width = UnicodeWidthStr::width(TAB_PADDING)
             + 2
-            + UnicodeWidthStr::width(view.label())
+            + UnicodeWidthStr::width(label)
             + UnicodeWidthStr::width(TAB_PADDING);
         let width = u16::try_from(width).unwrap_or(u16::MAX);
         tabs[view.index()] = clipped_horizontal_hitbox(area, x, width);
@@ -3636,6 +3904,21 @@ fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
         }
     }
     ViewTabsHitbox { tabs }
+}
+
+fn view_tabs_compact(width: u16) -> bool {
+    let full_width = View::ALL
+        .into_iter()
+        .map(|view| {
+            UnicodeWidthStr::width(TAB_PADDING)
+                + 2
+                + UnicodeWidthStr::width(view.label())
+                + UnicodeWidthStr::width(TAB_PADDING)
+        })
+        .sum::<usize>()
+        + UnicodeWidthStr::width(TAB_DIVIDER) * View::ALL.len().saturating_sub(1);
+    let compact_overview_controls = UnicodeWidthStr::width(" [V][M][5][W][L]");
+    full_width.saturating_add(compact_overview_controls) > usize::from(width)
 }
 
 fn clipped_horizontal_hitbox(area: Rect, x: u16, width: u16) -> Rect {
@@ -3775,6 +4058,21 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('1') => app.set_view(View::Overview),
         KeyCode::Char('2') => app.set_view(View::Trends),
         KeyCode::Char('3') => app.set_view(View::Health),
+        KeyCode::Char('4') => app.set_view(View::Settings),
+        KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Settings => {
+            app.toggle_setting(app.selected_setting_item());
+        }
+        KeyCode::Char(character) if app.view == View::Settings => {
+            if let Some(item) = SettingItem::from_shortcut(character) {
+                app.toggle_setting(item);
+            }
+        }
+        KeyCode::Down if app.view == View::Settings => app.move_setting_selection(true),
+        KeyCode::Up if app.view == View::Settings => app.move_setting_selection(false),
+        KeyCode::Home if app.view == View::Settings => app.selected_setting = 0,
+        KeyCode::End if app.view == View::Settings => {
+            app.selected_setting = SettingItem::ALL.len() - 1;
+        }
         KeyCode::Char('5') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::FiveHours);
         }
@@ -4602,6 +4900,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.task_tree_marker_hitboxes.clear();
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
+    app.settings_controls_hitbox = None;
     app.trend_controls_hitbox = None;
     app.trend_chart_hitboxes.clear();
     app.view_tabs_hitbox = None;
@@ -4611,16 +4910,37 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.resume_confirmation_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
+    let initial_tab_area = Rect::new(area.x, area.y, area.width, u16::from(area.height > 0));
+    let initial_tabs = view_tabs_hitbox(initial_tab_area);
+    let controls_on_second_row = app.view == View::Overview
+        && View::ALL
+            .last()
+            .map(|view| {
+                usize::from(
+                    area.right()
+                        .saturating_sub(initial_tabs.tabs[view.index()].right()),
+                ) < overview_controls_min_width()
+            })
+            .unwrap_or(false)
+        && area.height > 2;
+    let header_height = 1 + u16::from(controls_on_second_row);
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
         .split(area);
+    let tab_area = Rect::new(root[0].x, root[0].y, root[0].width, 1);
+    let compact_tabs = view_tabs_compact(tab_area.width);
 
     let titles = View::ALL
         .into_iter()
         .map(|view| {
             let selected = view == app.view;
             let shortcut_active = app.shortcuts_active();
+            let label = if compact_tabs {
+                view.compact_label()
+            } else {
+                view.label()
+            };
             Line::from(vec![
                 Span::styled(
                     view.shortcut().to_string(),
@@ -4638,7 +4958,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    view.label(),
+                    label,
                     Style::default()
                         .fg(if selected {
                             palette.title
@@ -4663,16 +4983,22 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
             TAB_DIVIDER,
             Style::default().fg(palette.muted),
         ));
-    app.view_tabs_hitbox = Some(view_tabs_hitbox(root[0]));
-    frame.render_widget(tabs, root[0]);
+    app.view_tabs_hitbox = Some(view_tabs_hitbox(tab_area));
+    frame.render_widget(tabs, tab_area);
     if app.view == View::Overview {
-        app.window_controls_hitbox = Some(render_overview_controls(frame, root[0], app));
+        app.window_controls_hitbox = Some(if controls_on_second_row {
+            let controls_area = Rect::new(root[0].x, root[0].y + 1, root[0].width, 1);
+            render_overview_controls_from(frame, controls_area, app, controls_area.x)
+        } else {
+            render_overview_controls(frame, tab_area, app)
+        });
     }
 
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
         View::Trends => render_trends_at(frame, root[1], app, now),
         View::Health => render_health(frame, root[1], app),
+        View::Settings => render_settings(frame, root[1], app),
     };
     if app.trend_drag.is_some_and(|drag| {
         !app.trend_chart_hitboxes
@@ -4695,18 +5021,38 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
 }
 
 fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> WindowControlsHitbox {
-    let palette = app.theme.palette();
     let tabs = view_tabs_hitbox(area);
     let start_x = View::ALL
         .last()
         .map(|view| tabs.tabs[view.index()].right())
         .unwrap_or(area.x);
+    render_overview_controls_from(frame, area, app, start_x)
+}
+
+fn overview_controls_min_width() -> usize {
+    UnicodeWidthStr::width(" [V][M][5][W][L]")
+}
+
+fn render_overview_controls_from(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    start_x: u16,
+) -> WindowControlsHitbox {
+    let palette = app.theme.palette();
     let remaining = usize::from(area.right().saturating_sub(start_x));
-    let full_long_context_label = "[L]EST Long×";
+    let full_long_context_label = "[L]EST Longx";
     let full_width = UnicodeWidthStr::width(" | [V]Turns [M]Models [5h] [Week] ")
         + UnicodeWidthStr::width(full_long_context_label);
     let compact = remaining < full_width;
-    let separator = if compact { " " } else { TAB_DIVIDER };
+    let standalone = start_x <= area.x;
+    let separator = if standalone {
+        ""
+    } else if compact {
+        " "
+    } else {
+        TAB_DIVIDER
+    };
     let gap = if compact { "" } else { " " };
     let separator_width = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(u16::MAX);
     let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
@@ -4867,7 +5213,7 @@ fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> Win
         spans.push(Span::styled("[", style));
         spans.push(Span::styled("L", shortcut_style));
         spans.push(Span::styled(
-            if compact { "]" } else { "]EST Long×" },
+            if compact { "]" } else { "]EST Longx" },
             style,
         ));
     }
@@ -5303,6 +5649,161 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if app.models_visible {
         render_models(frame, rows[row_index], app);
     }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "On" } else { "Off" }
+}
+
+fn settings_hint(app: &App) -> Line<'static> {
+    let normal = Style::default().fg(app.theme.palette().muted);
+    let shortcut = if app.shortcuts_active() {
+        Style::default()
+            .fg(app.theme.palette().accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        normal
+    };
+    Line::from(vec![
+        Span::styled(" [", normal),
+        Span::styled("↑↓", shortcut),
+        Span::styled("]Select [", normal),
+        Span::styled("↵", shortcut),
+        Span::styled("]Toggle ", normal),
+    ])
+}
+
+fn settings_row(app: &App, item: SettingItem) -> Row<'static> {
+    let selected = app.selected_setting == item.index();
+    let shortcuts_active = app.shortcuts_active();
+    let palette = app.theme.palette();
+    let row_style = if selected {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.foreground)
+    };
+    let shortcut_style = if !shortcuts_active && selected {
+        row_style
+    } else if !shortcuts_active {
+        Style::default().fg(palette.muted)
+    } else if selected {
+        row_style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    let label = Line::from(vec![
+        Span::styled("[", row_style),
+        Span::styled(item.shortcut().to_string(), shortcut_style),
+        Span::styled(format!("]{}", item.label()), row_style),
+    ]);
+    Row::new([
+        Cell::from(if selected { "▌" } else { " " }),
+        Cell::from(label),
+        Cell::from(app.setting_value(item)),
+    ])
+    .style(row_style)
+}
+
+fn render_settings_group(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    title: &'static str,
+    items: &[SettingItem],
+    show_hint: bool,
+    hitbox: &mut SettingsControlsHitbox,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let mut block = panel(title, app.theme);
+    if show_hint {
+        block = block.title_bottom(settings_hint(app));
+    }
+    let inner = block.inner(area);
+    for (offset, item) in items.iter().enumerate() {
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        if y < inner.bottom() {
+            hitbox.rows[item.index()] = Rect::new(inner.x, y, inner.width, 1);
+        }
+    }
+    let rows = items
+        .iter()
+        .copied()
+        .map(|item| settings_row(app, item))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Min(18),
+                Constraint::Length(8),
+            ],
+        )
+        .block(block),
+        area,
+    );
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let mut hitbox = SettingsControlsHitbox::default();
+    if area.height < 14 {
+        render_settings_group(
+            frame,
+            area,
+            app,
+            " Settings",
+            &SettingItem::ALL,
+            true,
+            &mut hitbox,
+        );
+    } else {
+        let rows = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        render_settings_group(
+            frame,
+            rows[0],
+            app,
+            " Display",
+            &SettingItem::ALL[..4],
+            false,
+            &mut hitbox,
+        );
+        render_settings_group(
+            frame,
+            rows[1],
+            app,
+            " Table columns",
+            &SettingItem::ALL[4..],
+            true,
+            &mut hitbox,
+        );
+        let description = [
+            "Column choices apply to Tasks, Turns, and Models.",
+            "API EQ. uses the selected 5h/week scope and is independent of EST Longx.",
+            "Narrow panes keep API EQ. visible first and may omit lower-priority columns.",
+        ];
+        frame.render_widget(
+            Paragraph::new(description.map(Line::from).to_vec())
+                .block(panel(" Behavior", app.theme))
+                .style(Style::default().fg(app.theme.palette().muted))
+                .wrap(Wrap { trim: true }),
+            rows[2],
+        );
+    }
+    app.settings_controls_hitbox = Some(hitbox);
 }
 
 fn render_trend_controls(
@@ -6080,7 +6581,7 @@ fn render_weekly_estimated_trend_panel(
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
     let base_title = if data.api_long_context_multiplier {
-        "Weekly ~EST Usage · EST Long ON"
+        "Weekly ~EST Usage · EST Longx ON"
     } else {
         "Weekly ~EST Usage"
     };
@@ -6176,7 +6677,7 @@ fn render_half_hour_estimated_trend_panel(
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
     let base_title = if data.api_long_context_multiplier {
-        "15m ~EST Usage · EST Long ON"
+        "15m ~EST Usage · EST Longx ON"
     } else {
         "15m ~EST Usage"
     };
@@ -7678,6 +8179,95 @@ fn render_centered_gauge_span(
     }
 }
 
+fn configured_table_min_width(
+    columns: UiTableColumns,
+    structural_widths: &[u16],
+    metric_widths: [u16; 4],
+) -> u16 {
+    let mut widths = structural_widths.to_vec();
+    for (visible, width) in [
+        (columns.tokens, metric_widths[0]),
+        (columns.token_share, metric_widths[1]),
+        (columns.estimated_quota, metric_widths[2]),
+        (columns.api_equivalent, metric_widths[3]),
+    ] {
+        if visible {
+            widths.push(width);
+        }
+    }
+    widths
+        .iter()
+        .copied()
+        .fold(0_u16, u16::saturating_add)
+        .saturating_add(u16::try_from(widths.len().saturating_sub(1)).unwrap_or(u16::MAX))
+}
+
+fn fit_table_columns(
+    mut columns: UiTableColumns,
+    available_width: u16,
+    structural_widths: &[u16],
+    metric_widths: [u16; 4],
+) -> UiTableColumns {
+    for hide in [
+        SettingItem::TokenShare,
+        SettingItem::EstimatedQuota,
+        SettingItem::Tokens,
+        SettingItem::ApiEquivalent,
+    ] {
+        if configured_table_min_width(columns, structural_widths, metric_widths) <= available_width
+        {
+            break;
+        }
+        match hide {
+            SettingItem::Tokens => columns.tokens = false,
+            SettingItem::TokenShare => columns.token_share = false,
+            SettingItem::EstimatedQuota => columns.estimated_quota = false,
+            SettingItem::ApiEquivalent => columns.api_equivalent = false,
+            SettingItem::Theme
+            | SettingItem::Turns
+            | SettingItem::Models
+            | SettingItem::ApiLongContext => unreachable!("display settings are not columns"),
+        }
+    }
+    columns
+}
+
+fn task_visible_columns(
+    columns: UiTableColumns,
+    table_inner_width: u16,
+    api_cost_width: u16,
+) -> UiTableColumns {
+    fit_table_columns(
+        columns,
+        table_inner_width.saturating_sub(TASK_HIGHLIGHT_WIDTH),
+        &[24],
+        [
+            TASK_TOKENS_WIDTH,
+            TASK_TOKEN_SHARE_WIDTH,
+            TASK_QUOTA_WIDTH,
+            api_cost_width,
+        ],
+    )
+}
+
+fn task_table_constraints(columns: UiTableColumns, api_cost_width: u16) -> Vec<Constraint> {
+    let mut constraints = Vec::new();
+    if columns.tokens {
+        constraints.push(Constraint::Length(TASK_TOKENS_WIDTH));
+    }
+    if columns.token_share {
+        constraints.push(Constraint::Length(TASK_TOKEN_SHARE_WIDTH));
+    }
+    if columns.estimated_quota {
+        constraints.push(Constraint::Length(TASK_QUOTA_WIDTH));
+    }
+    if columns.api_equivalent {
+        constraints.push(Constraint::Length(api_cost_width));
+    }
+    constraints.push(Constraint::Min(24));
+    constraints
+}
+
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: bool) {
     let filtered = app.filtered_task_rows();
     let selected_position = filtered
@@ -7709,7 +8299,40 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
     let palette = theme.palette();
     let tasks_focused = app.focus == Focus::Tasks;
     let tree_mode = app.task_list_mode == TaskListMode::Tree;
-    let task_column = task_table_columns(table_inner)[3];
+    let cost_scope = if window_only {
+        app.window_scope
+    } else {
+        WindowScope::FiveHours
+    };
+    let api_cost_analysis = window_analysis(&app.snapshot, cost_scope);
+    let api_cost_state = api_cost_window_state(api_cost_analysis);
+    let api_cost_values = if app.table_columns.api_equivalent {
+        filtered
+            .iter()
+            .skip(offset)
+            .take(visible_capacity)
+            .map(|row| {
+                let cost = aggregate_task_row_usage_with_api_long_context(
+                    &app.snapshot,
+                    cost_scope,
+                    row,
+                    window_only,
+                    false,
+                )
+                .api_equivalent_cost;
+                format_scoped_api_cost_amount(api_cost_state, cost)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let api_cost_width = api_cost_column_width(api_cost_analysis, &api_cost_values);
+    let visible_columns =
+        task_visible_columns(app.table_columns, table_inner.width, api_cost_width);
+    let task_column = task_table_columns(table_inner, visible_columns, api_cost_width)
+        .last()
+        .copied()
+        .unwrap_or(table_inner);
     if tree_mode {
         app.task_tree_marker_hitboxes = filtered
             .iter()
@@ -7744,8 +8367,14 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .iter()
         .skip(offset)
         .take(visible_capacity)
-        .filter_map(|row| app.snapshot.tasks.get(row.index).map(|task| (task, row)))
-        .map(|(task, row)| {
+        .enumerate()
+        .filter_map(|(visible_position, row)| {
+            app.snapshot
+                .tasks
+                .get(row.index)
+                .map(|task| (task, row, visible_position))
+        })
+        .map(|(task, row, visible_position)| {
             let usage = aggregate_task_row_usage_with_api_long_context(
                 &app.snapshot,
                 app.window_scope,
@@ -7758,6 +8387,11 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             let estimated_quota = usage.estimated_quota_percent;
             let quota_confidence = usage.quota_confidence;
             let tone = task_status_tone(task.status);
+            let status_prefix = if visible_columns.tokens {
+                String::new()
+            } else {
+                format!("{} ", status_marker(tone))
+            };
             let task_cell = if tree_mode {
                 let marker_style = Style::default().fg(palette.muted);
                 let shortcut_style =
@@ -7780,48 +8414,73 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
                     spans.push(Span::raw("   "));
                 }
                 spans.push(Span::raw(" "));
+                spans.push(Span::raw(status_prefix));
                 spans.push(Span::raw(task_display_label(task, row.depth > 0)));
                 Cell::from(Line::from(spans))
             } else {
-                Cell::from(task_display_label(task, false))
+                Cell::from(format!(
+                    "{status_prefix}{}",
+                    task_display_label(task, false)
+                ))
             };
-            Row::new([
-                Cell::from(format!("{} {}", status_marker(tone), format_tokens(tokens))),
-                Cell::from(format!("{local_share:.1}%")),
-                Cell::from(format_estimated_quota(estimated_quota, quota_confidence)),
-                task_cell,
-            ])
-            .style(status_tone_style(tone, theme))
+            let mut cells = Vec::new();
+            if visible_columns.tokens {
+                cells.push(Cell::from(format!(
+                    "{} {}",
+                    status_marker(tone),
+                    format_tokens(tokens)
+                )));
+            }
+            if visible_columns.token_share {
+                cells.push(Cell::from(format!("{local_share:.1}%")));
+            }
+            if visible_columns.estimated_quota {
+                cells.push(Cell::from(format_estimated_quota(
+                    estimated_quota,
+                    quota_confidence,
+                )));
+            }
+            if visible_columns.api_equivalent {
+                cells.push(Cell::from(api_cost_values[visible_position].clone()));
+            }
+            cells.push(task_cell);
+            Row::new(cells).style(status_tone_style(tone, theme))
         })
         .collect::<Vec<_>>();
+    let mut headers = Vec::new();
+    if visible_columns.tokens {
+        headers.push("TOKENS");
+    }
+    if visible_columns.token_share {
+        headers.push(if window_only {
+            app.window_scope.token_share_header()
+        } else {
+            WindowScope::FiveHours.token_share_header()
+        });
+    }
+    if visible_columns.estimated_quota {
+        headers.push(if window_only {
+            app.window_scope.quota_header()
+        } else {
+            WindowScope::FiveHours.quota_header()
+        });
+    }
+    if visible_columns.api_equivalent {
+        headers.push("API EQ.");
+    }
+    headers.push("TASK");
+    let header = Row::new(headers).style(
+        Style::default()
+            .fg(app.theme.palette().accent)
+            .add_modifier(Modifier::BOLD),
+    );
     let table = Table::new(
         task_rows,
-        [
-            Constraint::Length(TASK_TOKENS_WIDTH),
-            Constraint::Length(TASK_TOKEN_SHARE_WIDTH),
-            Constraint::Length(TASK_QUOTA_WIDTH),
-            Constraint::Min(12),
-        ],
+        task_table_constraints(visible_columns, api_cost_width),
     )
     .flex(Flex::Legacy)
     .column_spacing(TASK_COLUMN_SPACING)
-    .header(table_header(
-        [
-            "TOKENS",
-            if window_only {
-                app.window_scope.token_share_header()
-            } else {
-                WindowScope::FiveHours.token_share_header()
-            },
-            if window_only {
-                app.window_scope.quota_header()
-            } else {
-                WindowScope::FiveHours.quota_header()
-            },
-            "TASK",
-        ],
-        app.theme,
-    ))
+    .header(header)
     .block(block)
     .row_highlight_style(
         Style::default()
@@ -8387,6 +9046,65 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
     )
 }
 
+fn turn_visible_columns(
+    columns: UiTableColumns,
+    table_inner_width: u16,
+    api_cost_width: u16,
+) -> (UiTableColumns, bool) {
+    let available_width = table_inner_width.saturating_sub(TASK_HIGHLIGHT_WIDTH);
+    let metric_widths = [
+        TURN_TOKENS_WIDTH,
+        TURN_TOKEN_SHARE_WIDTH,
+        TURN_QUOTA_WIDTH,
+        api_cost_width,
+    ];
+    let full = [TURN_MODEL_WIDTH, TURN_EFFORT_WIDTH, TURN_MESSAGE_WIDTH];
+    if configured_table_min_width(columns, &full, metric_widths) <= available_width {
+        return (columns, true);
+    }
+    (
+        fit_table_columns(
+            columns,
+            available_width,
+            &[TURN_COMPACT_MODEL_WIDTH, TURN_COMPACT_MESSAGE_WIDTH],
+            metric_widths,
+        ),
+        false,
+    )
+}
+
+fn turn_table_constraints(
+    columns: UiTableColumns,
+    show_effort: bool,
+    api_cost_width: u16,
+) -> Vec<Constraint> {
+    let mut constraints = if show_effort {
+        vec![
+            Constraint::Length(TURN_MODEL_WIDTH),
+            Constraint::Length(TURN_EFFORT_WIDTH),
+            Constraint::Min(TURN_MESSAGE_WIDTH),
+        ]
+    } else {
+        vec![
+            Constraint::Length(TURN_COMPACT_MODEL_WIDTH),
+            Constraint::Min(TURN_COMPACT_MESSAGE_WIDTH),
+        ]
+    };
+    if columns.tokens {
+        constraints.push(Constraint::Length(TURN_TOKENS_WIDTH));
+    }
+    if columns.token_share {
+        constraints.push(Constraint::Length(TURN_TOKEN_SHARE_WIDTH));
+    }
+    if columns.estimated_quota {
+        constraints.push(Constraint::Length(TURN_QUOTA_WIDTH));
+    }
+    if columns.api_equivalent {
+        constraints.push(Constraint::Length(api_cost_width));
+    }
+    constraints
+}
+
 fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: bool) {
     let detail_height = turn_detail_height(area.height);
     let (table_area, detail_area) = if detail_height == 0 {
@@ -8436,129 +9154,175 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
         .selected_turn
         .checked_sub(offset)
         .filter(|index| *index < visible_capacity);
-    let show_effort_column = table_area.width >= 72;
-    let model_column_width = if show_effort_column {
-        16
+    let cost_scope = if window_only {
+        app.window_scope
     } else {
-        usize::from(table_area.width.saturating_sub(38).clamp(12, 17))
+        WindowScope::FiveHours
+    };
+    let api_cost_analysis = window_analysis(&app.snapshot, cost_scope);
+    let api_cost_state = api_cost_window_state(api_cost_analysis);
+    let api_cost_values = if app.table_columns.api_equivalent {
+        turns
+            .iter()
+            .skip(offset)
+            .take(visible_capacity)
+            .map(|turn| {
+                let cost = turn_usage_for_scope_with_api_long_context(
+                    &app.snapshot,
+                    cost_scope,
+                    turn,
+                    false,
+                )
+                .api_equivalent_cost;
+                format_scoped_api_cost_amount(api_cost_state, cost)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let api_cost_width = api_cost_column_width(api_cost_analysis, &api_cost_values);
+    let (visible_columns, show_effort_column) =
+        turn_visible_columns(app.table_columns, table_inner.width, api_cost_width);
+    let model_column_width = if show_effort_column {
+        usize::from(TURN_MODEL_WIDTH)
+    } else {
+        usize::from(TURN_COMPACT_MODEL_WIDTH)
     };
     let theme = app.theme;
-    let rows = turns.iter().skip(offset).map(|turn| {
-        let usage = turn_usage_for_scope_with_api_long_context(
-            &app.snapshot,
-            app.window_scope,
-            turn,
-            app.api_long_context_multiplier,
-        );
-        let tokens = if window_only {
-            usage.token_usage
-        } else {
-            turn.token_usage
-        };
-        let local_share = if window_only {
-            usage.local_token_share_percent
-        } else {
-            turn.local_token_share_percent
-        };
-        let estimated_quota = if window_only {
-            usage.estimated_quota_percent
-        } else {
-            turn.estimated_quota_percent
-        };
-        let quota_confidence = if window_only {
-            usage.quota_confidence
-        } else {
-            turn.quota_confidence
-        };
-        let model = terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"));
-        let effort = terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown"));
-        let message = terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"));
-        let tone = turn_status_tone(turn.status);
-        let mut cells = Vec::new();
-        let model = if turn.is_fast() {
-            fast_model_line(&model, model_column_width, theme)
-        } else {
-            Line::from(model)
-        };
-        if show_effort_column {
-            cells.push(Cell::from(model));
-            cells.push(Cell::from(effort));
-            cells.push(Cell::from(message));
-        } else {
-            let compact_model = if turn.is_fast() {
-                fast_model_line(
-                    &format!(
+    let rows = turns
+        .iter()
+        .skip(offset)
+        .take(visible_capacity)
+        .enumerate()
+        .map(|(visible_position, turn)| {
+            let usage = turn_usage_for_scope_with_api_long_context(
+                &app.snapshot,
+                app.window_scope,
+                turn,
+                app.api_long_context_multiplier,
+            );
+            let tokens = if window_only {
+                usage.token_usage
+            } else {
+                turn.token_usage
+            };
+            let local_share = if window_only {
+                usage.local_token_share_percent
+            } else {
+                turn.local_token_share_percent
+            };
+            let estimated_quota = if window_only {
+                usage.estimated_quota_percent
+            } else {
+                turn.estimated_quota_percent
+            };
+            let quota_confidence = if window_only {
+                usage.quota_confidence
+            } else {
+                turn.quota_confidence
+            };
+            let model = terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"));
+            let effort = terminal_safe_text(turn.reasoning_effort.as_deref().unwrap_or("unknown"));
+            let tone = turn_status_tone(turn.status);
+            let message = terminal_safe_text(turn.message_preview.as_deref().unwrap_or("-"));
+            let message = if visible_columns.tokens {
+                message
+            } else {
+                format!("{} {message}", status_marker(tone))
+            };
+            let mut cells = Vec::new();
+            let model = if turn.is_fast() {
+                fast_model_line(&model, model_column_width, theme)
+            } else {
+                Line::from(model)
+            };
+            if show_effort_column {
+                cells.push(Cell::from(model));
+                cells.push(Cell::from(effort));
+                cells.push(Cell::from(message));
+            } else {
+                let compact_model = if turn.is_fast() {
+                    fast_model_line(
+                        &format!(
+                            "{effort}/{}",
+                            terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"))
+                        ),
+                        model_column_width,
+                        theme,
+                    )
+                } else {
+                    Line::from(format!(
                         "{effort}/{}",
                         terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"))
-                    ),
-                    model_column_width,
-                    theme,
-                )
-            } else {
-                Line::from(format!(
-                    "{effort}/{}",
-                    terminal_safe_text(turn.model.as_deref().unwrap_or("unknown"))
-                ))
-            };
-            cells.push(Cell::from(compact_model));
-            cells.push(Cell::from(message));
-        }
-        cells.extend([
-            Cell::from(format!("{} {}", status_marker(tone), format_tokens(tokens))),
-            Cell::from(format!("{local_share:.1}%")),
-            Cell::from(format_estimated_quota(estimated_quota, quota_confidence)),
-        ]);
-        Row::new(cells).style(status_tone_style(tone, theme))
-    });
-    let (constraints, header) = if show_effort_column {
-        (
-            vec![
-                Constraint::Length(16),
-                Constraint::Length(7),
-                Constraint::Min(14),
-                Constraint::Length(9),
-                Constraint::Length(7),
-                Constraint::Length(7),
-            ],
-            table_header(
-                ["MODEL", "EFFORT", "MESSAGE", "TOKENS", "TOKEN%", "EST.Q"],
-                theme,
-            ),
-        )
+                    ))
+                };
+                cells.push(Cell::from(compact_model));
+                cells.push(Cell::from(message));
+            }
+            if visible_columns.tokens {
+                cells.push(Cell::from(format!(
+                    "{} {}",
+                    status_marker(tone),
+                    format_tokens(tokens)
+                )));
+            }
+            if visible_columns.token_share {
+                cells.push(Cell::from(format!("{local_share:.1}%")));
+            }
+            if visible_columns.estimated_quota {
+                cells.push(Cell::from(format_estimated_quota(
+                    estimated_quota,
+                    quota_confidence,
+                )));
+            }
+            if visible_columns.api_equivalent {
+                cells.push(Cell::from(api_cost_values[visible_position].clone()));
+            }
+            Row::new(cells).style(status_tone_style(tone, theme))
+        });
+    let mut headers = if show_effort_column {
+        vec!["MODEL", "EFFORT", "MESSAGE"]
     } else {
-        // Reserve nine message cells after borders, spacing, and numeric columns.
-        (
-            vec![
-                Constraint::Length(u16::try_from(model_column_width).unwrap_or(u16::MAX)),
-                Constraint::Min(9),
-                Constraint::Length(9),
-                Constraint::Length(7),
-                Constraint::Length(7),
-            ],
-            table_header(
-                ["EFFORT/MODEL", "MESSAGE", "TOKENS", "TOKEN%", "EST.Q"],
-                theme,
-            ),
-        )
+        vec!["EFFORT/MODEL", "MESSAGE"]
     };
-    let table = Table::new(rows, constraints)
-        .header(header)
-        .block(table_block)
-        .row_highlight_style(
-            Style::default()
-                .fg(if turns_focused {
-                    theme.palette().accent
-                } else {
-                    theme.palette().muted
-                })
-                .add_modifier(if turns_focused {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        )
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_symbol(if turns_focused { "▌" } else { "▏" });
+    if visible_columns.tokens {
+        headers.push("TOKENS");
+    }
+    if visible_columns.token_share {
+        headers.push("TOKEN%");
+    }
+    if visible_columns.estimated_quota {
+        headers.push("EST.Q");
+    }
+    if visible_columns.api_equivalent {
+        headers.push("API EQ.");
+    }
+    let header = Row::new(headers).style(
+        Style::default()
+            .fg(theme.palette().accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(
+        rows,
+        turn_table_constraints(visible_columns, show_effort_column, api_cost_width),
+    )
+    .header(header)
+    .block(table_block)
+    .row_highlight_style(
+        Style::default()
+            .fg(if turns_focused {
+                theme.palette().accent
+            } else {
+                theme.palette().muted
+            })
+            .add_modifier(if turns_focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    )
+    .highlight_spacing(HighlightSpacing::Always)
+    .highlight_symbol(if turns_focused { "▌" } else { "▏" });
     let mut state = TableState::default().with_selected(selected_in_view);
     frame.render_stateful_widget(table, table_area, &mut state);
 
@@ -8636,6 +9400,7 @@ fn render_turns(frame: &mut Frame<'_>, area: Rect, app: &mut App, window_only: b
             window_only,
             detail_scope,
             selected_usage,
+            api_cost_state,
             theme,
         );
     }
@@ -8664,6 +9429,7 @@ fn render_turn_detail(
     window_only: bool,
     window_scope: WindowScope,
     selected_window_usage: WindowUsage,
+    api_cost_state: ApiCostWindowState,
     theme: Theme,
 ) {
     let Some(turn) = turn else {
@@ -8742,7 +9508,7 @@ fn render_turn_detail(
         let api_allocation = format!(
             "api[{}]={}{}",
             window_scope.label(),
-            format_api_cost_amount(api_cost),
+            format_scoped_api_cost_amount(api_cost_state, api_cost),
             coverage,
         );
         let combined = format!("{quota_allocation} · {api_allocation}");
@@ -8939,10 +9705,21 @@ fn api_equivalent_summary_line(analysis: &WindowAnalysis) -> Option<String> {
         return None;
     }
 
+    let state = api_cost_window_state(Some(analysis));
+    let amount = format_scoped_api_cost_amount(state, analysis.api_equivalent_cost.amount);
+    let coverage = if matches!(
+        state,
+        ApiCostWindowState::Unavailable | ApiCostWindowState::NoLocalData
+    ) {
+        "-".to_string()
+    } else {
+        format!(
+            "{:.1}%",
+            analysis.api_equivalent_cost.amount.priced_token_percent()
+        )
+    };
     Some(format!(
-        "API equivalent {} · model calls only · coverage {:.1}% · rates {}",
-        format_api_equivalent_cost(&analysis.api_equivalent_cost),
-        analysis.api_equivalent_cost.amount.priced_token_percent(),
+        "API equivalent {amount} · model calls only · coverage {coverage} · rates {}",
         terminal_safe_text(rates_as_of),
     ))
 }
@@ -8978,12 +9755,63 @@ fn wrapped_text_height(lines: &[String], width: usize) -> usize {
         .sum()
 }
 
+fn model_visible_columns(
+    columns: UiTableColumns,
+    width: u16,
+    api_cost_width: u16,
+) -> UiTableColumns {
+    fit_table_columns(
+        columns,
+        width,
+        &[18],
+        [
+            MODEL_TOKENS_WIDTH,
+            MODEL_TOKEN_SHARE_WIDTH,
+            MODEL_QUOTA_WIDTH,
+            api_cost_width,
+        ],
+    )
+}
+
+fn model_table_constraints(columns: UiTableColumns, api_cost_width: u16) -> Vec<Constraint> {
+    let mut constraints = vec![Constraint::Min(18)];
+    if columns.tokens {
+        constraints.push(Constraint::Length(MODEL_TOKENS_WIDTH));
+    }
+    if columns.token_share {
+        constraints.push(Constraint::Length(MODEL_TOKEN_SHARE_WIDTH));
+    }
+    if columns.estimated_quota {
+        constraints.push(Constraint::Length(MODEL_QUOTA_WIDTH));
+    }
+    if columns.api_equivalent {
+        constraints.push(Constraint::Length(api_cost_width));
+    }
+    constraints
+}
+
+fn model_api_cost_for_analysis(
+    analysis: Option<&WindowAnalysis>,
+    model: &ModelUsage,
+) -> ApiCostAmount {
+    analysis
+        .and_then(|analysis| {
+            analysis
+                .models
+                .iter()
+                .find(|base| base.model == model.model)
+                .map(|base| base.api_equivalent_cost)
+        })
+        .unwrap_or(model.api_equivalent_cost)
+}
+
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
     // API-equivalent cost always follows the published API pricing rules. The
     // optional long-context switch changes only the Codex quota estimate.
     let api_cost_analysis = window_analysis(&app.snapshot, window_scope);
+    let api_cost_state = api_cost_window_state(api_cost_analysis);
     let analysis = window_analysis_with_api_long_context(
         &app.snapshot,
         window_scope,
@@ -9010,7 +9838,6 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let panel_inner = Block::default().borders(Borders::ALL).inner(area);
     let compact = panel_inner.width < 100;
     let api_summary_line = api_cost_analysis.and_then(api_equivalent_summary_line);
-    let show_api_cost_column = !compact && api_summary_line.is_some();
     let selected_partial = analysis
         .map(|analysis| analysis.partial)
         .unwrap_or(window_scope == WindowScope::FiveHours && app.snapshot.partial);
@@ -9039,13 +9866,30 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .split(panel_inner);
     let model_area = regions[1];
     let visible_capacity = usize::from(model_area.height.saturating_sub(1));
+    let api_cost_values = if app.table_columns.api_equivalent {
+        models
+            .iter()
+            .take(visible_capacity)
+            .map(|model| {
+                format_scoped_api_cost_amount(
+                    api_cost_state,
+                    model_api_cost_for_analysis(api_cost_analysis, model),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let api_cost_width = api_cost_column_width(api_cost_analysis, &api_cost_values);
+    let visible_columns =
+        model_visible_columns(app.table_columns, model_area.width, api_cost_width);
     let visible_count = models.len().min(visible_capacity);
     let scope = attribution
         .and_then(|attribution| attribution.window.as_ref())
         .map(|window| window.label.clone());
     let mut title_suffix = scope.as_deref().unwrap_or(window_scope.label()).to_string();
     if app.api_long_context_multiplier {
-        title_suffix.push_str(" · EST Long ON");
+        title_suffix.push_str(" · EST Longx ON");
     }
     if attribution.is_none() {
         title_suffix.push_str(" unavailable");
@@ -9095,40 +9939,41 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let rows = models
         .iter()
         .take(visible_capacity)
-        .map(|model| {
-            let mut cells = vec![
-                Cell::from(terminal_safe_text(&model.model)),
-                Cell::from(format_tokens(model.token_usage)),
-                Cell::from(format!("{:.1}%", model.local_token_share_percent)),
-                Cell::from(format_estimated_quota(
+        .enumerate()
+        .map(|(visible_position, model)| {
+            let mut cells = vec![Cell::from(terminal_safe_text(&model.model))];
+            if visible_columns.tokens {
+                cells.push(Cell::from(format_tokens(model.token_usage)));
+            }
+            if visible_columns.token_share {
+                cells.push(Cell::from(format!(
+                    "{:.1}%",
+                    model.local_token_share_percent
+                )));
+            }
+            if visible_columns.estimated_quota {
+                cells.push(Cell::from(format_estimated_quota(
                     model.estimated_quota_percent,
                     model.quota_confidence,
-                )),
-            ];
-            if show_api_cost_column {
-                let api_cost = api_cost_analysis
-                    .and_then(|analysis| {
-                        analysis
-                            .models
-                            .iter()
-                            .find(|base| base.model == model.model)
-                    })
-                    .map(|base| base.api_equivalent_cost)
-                    .unwrap_or(model.api_equivalent_cost);
-                cells.push(Cell::from(format_api_cost_amount(api_cost)));
+                )));
+            }
+            if visible_columns.api_equivalent {
+                cells.push(Cell::from(api_cost_values[visible_position].clone()));
             }
             Row::new(cells)
         })
         .collect::<Vec<_>>();
-    let mut constraints = vec![
-        Constraint::Min(18),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-    ];
-    let mut headers = vec!["MODEL", "TOKENS", "TOKEN SHARE", "EST. QUOTA"];
-    if show_api_cost_column {
-        constraints.push(Constraint::Length(16));
+    let mut headers = vec!["MODEL"];
+    if visible_columns.tokens {
+        headers.push("TOKENS");
+    }
+    if visible_columns.token_share {
+        headers.push("TOKEN SHARE");
+    }
+    if visible_columns.estimated_quota {
+        headers.push("EST. QUOTA");
+    }
+    if visible_columns.api_equivalent {
         headers.push("API EQ.");
     }
     let header = Row::new(headers).style(
@@ -9136,7 +9981,11 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .fg(theme.palette().accent)
             .add_modifier(Modifier::BOLD),
     );
-    let table = Table::new(rows, constraints).header(header);
+    let table = Table::new(
+        rows,
+        model_table_constraints(visible_columns, api_cost_width),
+    )
+    .header(header);
     frame.render_widget(table, model_area);
 }
 
@@ -9331,21 +10180,17 @@ fn task_footer_legend(theme: Theme, width: u16, status_width: u16) -> (Line<'sta
     }
 }
 
-fn task_table_columns(area: Rect) -> [Rect; 4] {
-    let [_highlight, columns] = Layout::horizontal([
+fn task_table_columns(area: Rect, columns: UiTableColumns, api_cost_width: u16) -> Vec<Rect> {
+    let [_highlight, column_area] = Layout::horizontal([
         Constraint::Length(TASK_HIGHLIGHT_WIDTH),
         Constraint::Fill(0),
     ])
     .areas(area);
-    Layout::horizontal([
-        Constraint::Length(TASK_TOKENS_WIDTH),
-        Constraint::Length(TASK_TOKEN_SHARE_WIDTH),
-        Constraint::Length(TASK_QUOTA_WIDTH),
-        Constraint::Min(12),
-    ])
-    .flex(Flex::Legacy)
-    .spacing(TASK_COLUMN_SPACING)
-    .areas(columns)
+    Layout::horizontal(task_table_constraints(columns, api_cost_width))
+        .flex(Flex::Legacy)
+        .spacing(TASK_COLUMN_SPACING)
+        .split(column_area)
+        .to_vec()
 }
 
 fn task_display_label(task: &TaskRecord, omit_project: bool) -> String {

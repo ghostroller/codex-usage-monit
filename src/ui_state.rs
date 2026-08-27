@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
 
-pub const UI_STATE_VERSION: u32 = 3;
+pub const UI_STATE_VERSION: u32 = 4;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -31,6 +31,7 @@ pub enum UiView {
     Overview,
     Trends,
     Health,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +60,26 @@ pub enum UiTaskSourceFilter {
     Cli,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UiTableColumns {
+    pub tokens: bool,
+    pub token_share: bool,
+    pub estimated_quota: bool,
+    pub api_equivalent: bool,
+}
+
+impl Default for UiTableColumns {
+    fn default() -> Self {
+        Self {
+            tokens: true,
+            token_share: true,
+            estimated_quota: true,
+            api_equivalent: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiState {
@@ -71,6 +92,7 @@ pub struct UiState {
     /// Applies API long-context multipliers to local quota estimates. This is
     /// opt-in because subscription credit billing does not publish that rule.
     pub api_long_context_multiplier: bool,
+    pub table_columns: UiTableColumns,
     pub task_list_mode: UiTaskListMode,
     pub task_source_filter: UiTaskSourceFilter,
 }
@@ -85,6 +107,7 @@ impl Default for UiState {
             turns_visible: true,
             models_visible: true,
             api_long_context_multiplier: false,
+            table_columns: UiTableColumns::default(),
             task_list_mode: UiTaskListMode::Flat,
             task_source_filter: UiTaskSourceFilter::All,
         }
@@ -314,6 +337,7 @@ mod tests {
                 turns_visible: true,
                 models_visible: true,
                 api_long_context_multiplier: false,
+                table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Flat,
                 task_source_filter: UiTaskSourceFilter::All,
             }
@@ -331,11 +355,17 @@ mod tests {
         let expected = UiState {
             version: UI_STATE_VERSION,
             theme: UiTheme::Light,
-            view: UiView::Trends,
+            view: UiView::Settings,
             window_scope: UiWindowScope::Week,
             turns_visible: false,
             models_visible: false,
             api_long_context_multiplier: true,
+            table_columns: UiTableColumns {
+                tokens: true,
+                token_share: false,
+                estimated_quota: true,
+                api_equivalent: false,
+            },
             task_list_mode: UiTaskListMode::Tree,
             task_source_filter: UiTaskSourceFilter::Subagent,
         };
@@ -343,11 +373,17 @@ mod tests {
         assert_eq!(store.load(), expected);
 
         let json = fs::read_to_string(path).unwrap();
-        assert!(json.contains("\"view\": \"trends\""));
+        assert!(json.contains("\"view\": \"settings\""));
         assert!(json.contains("\"windowScope\": \"week\""));
         assert!(json.contains("\"taskListMode\": \"tree\""));
         assert!(json.contains("\"apiLongContextMultiplier\": true"));
+        assert!(json.contains("\"tableColumns\""));
+        assert!(json.contains("\"tokenShare\": false"));
+        assert!(json.contains("\"estimatedQuota\": true"));
+        assert!(json.contains("\"apiEquivalent\": false"));
         assert!(!json.contains("window_scope"));
+        assert!(!json.contains("table_columns"));
+        assert!(!json.contains("token_share"));
         assert_eq!(
             fs::read_dir(directory.path().join("nested"))
                 .unwrap()
@@ -386,6 +422,7 @@ mod tests {
                 turns_visible: false,
                 models_visible: false,
                 api_long_context_multiplier: false,
+                table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Tree,
                 task_source_filter: UiTaskSourceFilter::Cli,
             }

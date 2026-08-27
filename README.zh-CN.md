@@ -173,7 +173,7 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` 是可选工具，只用于上面的管道示例。
 
-有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends** 和 **Other**；`health` 仍然是一次性 snapshot 的 section 名称。
+有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends**、**Other** 和 **Settings**；`health` 仍然是一次性 snapshot 的 section 名称。
 
 ### 持续记录历史
 
@@ -220,7 +220,7 @@ codex-usage-monit record --foreground
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度、Tasks、Turns、Models，以及本地模型调用的纯 token API 等价费用放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。
+**Overview** tab 把账户额度、Tasks、Turns、Models，以及本地模型调用的纯 token API 等价费用放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。**Settings** 集中管理显示偏好和所有表格共用的指标列。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -229,7 +229,7 @@ codex-usage-monit record --foreground
 | 按键 | 操作 |
 | --- | --- |
 | `Tab` / `→`、`Shift+Tab` / `←` | 在视图之间移动。 |
-| `1`、`2`、`3` | 打开 Overview、Trends 或 Other。 |
+| `1`、`2`、`3`、`4` | 打开 Overview、Trends、Other 或 Settings。 |
 | 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 15-minute 图表。 |
 | Trends 中的 `[`、`]`、`n` | 把 24 小时图表窗口向前/向后移动，或回到 Now。 |
 | Trends 中的 `i` | 切换 Inspect 模式。 |
@@ -242,12 +242,15 @@ codex-usage-monit record --foreground
 | `r`、`E`、`-`、`+` | 切换平铺/树形模式，全部收起/展开，或收起/展开一个父任务。 |
 | `a`、`d`、`s`、`c`、`[` / `]` | 筛选 All、Desktop、Subagent、CLI 来源，或循环切换来源。 |
 | `v`、`m` | 显示/隐藏 Turns 或 Models。 |
-| Overview 中的 `l` | 切换 TUI 额度 `~EST` 的可选长上下文倍率（`EST Long×`）。 |
+| Overview 中的 `l` | 切换 TUI 额度 `~EST` 的可选长上下文倍率（`EST Longx`）。 |
+| Settings 中的 `↑` / `↓`、`Enter` 或高亮字母 | 选择或切换显示/表格列偏好。 |
 | `o` | 在新 Zellij pane 中打开选中的已停止 root task，或为其他终端提供 resume 命令。 |
 | `t` | 切换深色/浅色主题。 |
 | `q` | 退出。在主视图按 `Esc` 会打开退出确认。 |
 
 文本输入框聚焦时，可打印字符会先由输入框处理，再考虑全局快捷键。控件、Tasks/Turns 行、tab 和滚动条也支持鼠标操作。在 Trends 中，点击图表可以检查最近的已记录数据点；按住鼠标左键拖动可以连续选择数据点。
+
+`4 Settings` 页包含两组设置。**Display** 控制主题、Turns/Models 面板显隐和 `EST Longx`；**Table columns** 全局控制 Tasks、Turns 和 Models 表格中的 Tokens、Token share、Estimated quota 和 API equivalent 列。设置会在 TUI 进程之间持久化。Task/model 的身份列与 turn 的 model/effort/message 列始终保留；面板过窄时，布局可以按优先级临时省略较低优先级的已启用指标列，但不会改写已保存的选择。
 
 ## 字段含义
 
@@ -279,7 +282,7 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `TOKENS` | 本地观察到的 token 总量。在带周期范围的 TUI 视图中，它表示所选普通 `codex` 重置周期内符合条件的非 Spark 用量；在一次性 `tasks`/`turns` 及其 JSON `tokenUsage` 中，它覆盖配置的扫描范围。 |
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | 该实体在所选普通 `codex` 周期的本地可观察、符合条件的非 Spark token 中所占比例。它是 token 占比，不是账户额度百分比。 |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | 归因到该实体的低置信度额度消耗估算，单位为百分点。`~` 表示近似值；`-` 表示无法计算。 |
-| `API EQ.` / `API.EQ5H` | 按内置 OpenAI API 费率换算本地模型 token；一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示已计价小计不含部分未计价 usage sample；`-` 表示没有可应用的公开价格。 |
+| `API EQ.` / `API.EQ5H` | 按内置 OpenAI API 费率换算本地模型 token。TUI 中每个 Tasks 和 Turns 行都显示当前所选 5 小时或周 scope 内的独立值；它不是 lifetime 总额，窗口缺失时显示 `-`，且不随 `EST Longx` 切换。一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示这是下界，因为未计价 sample 或不完整的本地 rollout 覆盖可能遗漏额外费用；`-` 也表示没有可用本地数据或没有可应用的公开价格。 |
 | `EFFORT` | Codex 记录的 reasoning-effort 值。 |
 | `FAST` | rollout 使用了可识别的 Fast 服务层（`serviceTier=fast` 或兼容的 `priority`）；归因会应用官方 Fast credit 倍率。 |
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
@@ -289,13 +292,13 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 
 对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
 
-TUI 的 `[L]EST Long×` 开关**默认关闭**。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
+TUI 的 `[L]EST Longx` 开关**默认关闭**。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
 
 `API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。程序按每个本地可观察模型请求分别计算普通 input、cached input、cache write 和 output；reasoning token 已包含在 output 中，不会重复相加。单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。模型未知、服务层未知或缺失、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备模型价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
 
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
-任务树默认全部收起；可见的父任务行会包含被隐藏后代的 token/占比。
+任务树默认全部收起；可见的父任务行会汇总被隐藏后代的 token、占比、估算额度和 API 等价金额；展开后恢复各会话的独立行。
 
 ### 状态标识
 
@@ -322,7 +325,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Long×` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Longx` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 

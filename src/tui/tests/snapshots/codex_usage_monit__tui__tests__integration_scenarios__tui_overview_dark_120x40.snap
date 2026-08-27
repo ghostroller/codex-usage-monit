@@ -4,17 +4,17 @@ expression: overview.frame().snapshot_text()
 ---
 size=120x40
 rows:
-00| 1 Overview  |  2 Trends  |  3 Other  | [V]Turns [M]Models [5h] [Week] [L]EST Long×
+00| 1 Overview  |  2 Trends  |  3 Other  |  4 Settings  | [V]Turns [M]Models [5h] [Week] [L]EST Longx
 01|┌5h · codex · SERVER───────────────────────────────────────┐┌week · codex · SERVER─────────────────────────────────────┐
 02|│██████████████████████                                    ││████████████████████████                                  │
 03|│█████████38% used | 62% left | reset 07-12 06:30          ││█████████42% used | 58% left | reset 07-16 04:30          │
 04|│██████████████████████                                    ││████! RESET CREDIT EXPIRES 2026-07-14 04:30:00 +00:00     │
 05|└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
 06|┌ 5h tasks ↵[O][R][E][A][D][S][C] Filter: ───────────────────┐┌Turns · 5h cycle   Filter: ─────────────────────────────┐
-07|│ TOKENS     TOKEN5H% EST.Q5H  TASK                          ││ EFFORT/MODEL      MESSAGE     TOKENS    TOKEN%  EST.Q  │
-08|│▌D 10.0K    66.7%    ~25.0%   codex-usage-monit | desktop | ││▏high/gpt-5.3-code Add determi D 0       0.0%    -      │
-09|│ W 5.0K     33.3%    ~12.5%   codex-usage-monit | subagent |││ medium/gpt-… FAST Inspect the D 0       0.0%    -      │
-10|│ F 0        0.0%     -        codex-usage-monit | cli | 1t |││                                                        │
+07|│ TOKENS     EST.Q5H  API EQ. TASK                           ││ EFFORT/MODEL      MESSAGE     TOKENS    EST.Q   API EQ.│
+08|│▌D 10.0K    ~25.0%   $0.0000 codex-usage-monit | desktop | 2││▏high/gpt-5.3-code Add determi D 0       -       $0.0000│
+09|│ W 5.0K     ~12.5%   $0.0000 codex-usage-monit | subagent | ││ medium/gpt-… FAST Inspect the D 0       -       $0.0000│
+10|│ F 0        -        $0.0000 codex-usage-monit | cli | 1t | ││                                                        │
 11|│                                                            ││                                                        │
 12|│                                                            ││                                                        │
 13|│                                                            ││                                                        │
@@ -38,8 +38,8 @@ rows:
 31|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 │
 32|│10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              │
 33|│Credit-rate-weighted quota proxy, not server per-task accounting                                                      │
-34|│MODEL                                                                           TOKENS       TOKEN SHARE  EST. QUOTA  │
-35|│gpt-5.3-codex                                                                   10.0K        100.0%       ~37.5%      │
+34|│MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ.│
+35|│gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000│
 36|│                                                                                                                      │
 37|│                                                                                                                      │
 38|│                                                                                                                      │
@@ -51,21 +51,23 @@ styles:
 00:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="2"
 00:017+012 fg=#7e8691 bg=#121417 mods=none text=" Trends  |  "
 00:029+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
-00:030+010 fg=#7e8691 bg=#121417 mods=none text=" Other  | "
-00:040+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:041+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="V"
-00:042+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Turns"
-00:049+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:050+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="M"
-00:051+007 fg=#121417 bg=#3fb9c0 mods=bold text="]Models"
-00:059+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:060+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="5"
-00:061+002 fg=#121417 bg=#3fb9c0 mods=bold text="h]"
-00:063+002 fg=#7e8691 bg=#121417 mods=none text=" ["
-00:065+001 fg=#3fb9c0 bg=#121417 mods=bold text="W"
-00:066+006 fg=#7e8691 bg=#121417 mods=none text="eek] ["
-00:072+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
-00:073+047 fg=#7e8691 bg=#121417 mods=none text="]EST Long×                                     "
+00:030+011 fg=#7e8691 bg=#121417 mods=none text=" Other  |  "
+00:041+001 fg=#3fb9c0 bg=#121417 mods=bold text="4"
+00:042+013 fg=#7e8691 bg=#121417 mods=none text=" Settings  | "
+00:055+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:056+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="V"
+00:057+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Turns"
+00:064+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:065+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="M"
+00:066+007 fg=#121417 bg=#3fb9c0 mods=bold text="]Models"
+00:074+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:075+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="5"
+00:076+002 fg=#121417 bg=#3fb9c0 mods=bold text="h]"
+00:078+002 fg=#7e8691 bg=#121417 mods=none text=" ["
+00:080+001 fg=#3fb9c0 bg=#121417 mods=bold text="W"
+00:081+006 fg=#7e8691 bg=#121417 mods=none text="eek] ["
+00:087+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
+00:088+032 fg=#7e8691 bg=#121417 mods=none text="]EST Longx                      "
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+019 fg=#f4f6f8 bg=#121417 mods=bold text="5h · codex · SERVER"
 01:020+041 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────┐┌"
@@ -120,27 +122,27 @@ styles:
 06:082+007 fg=#7e8691 bg=#121417 mods=none text="Filter:"
 06:089+031 fg=#4b525c bg=#121417 mods=none text=" ─────────────────────────────┐"
 07:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
-07:001+060 fg=#3fb9c0 bg=#121417 mods=bold text=" TOKENS     TOKEN5H% EST.Q5H  TASK                          "
+07:001+060 fg=#3fb9c0 bg=#121417 mods=bold text=" TOKENS     EST.Q5H  API EQ. TASK                           "
 07:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 07:062+001 fg=#4b525c bg=#121417 mods=none text="│"
-07:063+056 fg=#3fb9c0 bg=#121417 mods=bold text=" EFFORT/MODEL      MESSAGE     TOKENS    TOKEN%  EST.Q  "
+07:063+056 fg=#3fb9c0 bg=#121417 mods=bold text=" EFFORT/MODEL      MESSAGE     TOKENS    EST.Q   API EQ."
 07:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 08:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
-08:001+060 fg=#3fb9c0 bg=#182a2f mods=bold text="▌D 10.0K    66.7%    ~25.0%   codex-usage-monit | desktop | "
+08:001+060 fg=#3fb9c0 bg=#182a2f mods=bold text="▌D 10.0K    ~25.0%   $0.0000 codex-usage-monit | desktop | 2"
 08:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 08:062+001 fg=#4b525c bg=#121417 mods=none text="│"
-08:063+056 fg=#7e8691 bg=#182a2f mods=none text="▏high/gpt-5.3-code Add determi D 0       0.0%    -      "
+08:063+056 fg=#7e8691 bg=#182a2f mods=none text="▏high/gpt-5.3-code Add determi D 0       -       $0.0000"
 08:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 09:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
-09:001+060 fg=#d2d6dc bg=#363018 mods=none text=" W 5.0K     33.3%    ~12.5%   codex-usage-monit | subagent |"
+09:001+060 fg=#d2d6dc bg=#363018 mods=none text=" W 5.0K     ~12.5%   $0.0000 codex-usage-monit | subagent | "
 09:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 09:062+001 fg=#4b525c bg=#121417 mods=none text="│"
 09:063+013 fg=#d2d6dc bg=#182a2f mods=none text=" medium/gpt-…"
 09:076+005 fg=#facc15 bg=#182a2f mods=bold text=" FAST"
-09:081+038 fg=#d2d6dc bg=#182a2f mods=none text=" Inspect the D 0       0.0%    -      "
+09:081+038 fg=#d2d6dc bg=#182a2f mods=none text=" Inspect the D 0       -       $0.0000"
 09:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 10:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
-10:001+060 fg=#d2d6dc bg=#391c1f mods=none text=" F 0        0.0%     -        codex-usage-monit | cli | 1t |"
+10:001+060 fg=#d2d6dc bg=#391c1f mods=none text=" F 0        -        $0.0000 codex-usage-monit | cli | 1t | "
 10:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 10:062+001 fg=#4b525c bg=#121417 mods=none text="│"
 10:119+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -247,10 +249,10 @@ styles:
 33:001+118 fg=#7e8691 bg=#121417 mods=none text="Credit-rate-weighted quota proxy, not server per-task accounting                                                      "
 33:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 34:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-34:001+118 fg=#3fb9c0 bg=#121417 mods=bold text="MODEL                                                                           TOKENS       TOKEN SHARE  EST. QUOTA  "
+34:001+118 fg=#3fb9c0 bg=#121417 mods=bold text="MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ."
 34:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 35:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-35:001+118 fg=#dadee4 bg=#121417 mods=none text="gpt-5.3-codex                                                                   10.0K        100.0%       ~37.5%      "
+35:001+118 fg=#dadee4 bg=#121417 mods=none text="gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000"
 35:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 36:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 36:119+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -263,10 +265,11 @@ controls:
 ViewOverview binding=1 rect=0,0,12,1
 ViewTrends binding=2 rect=15,0,10,1
 ViewOther binding=3 rect=28,0,9,1
-ToggleTurns binding=V rect=40,0,8,1
-ToggleModels binding=M rect=49,0,9,1
-ScopeFiveHours binding=5 rect=59,0,4,1
-ScopeWeek binding=W rect=64,0,6,1
+ViewSettings binding=4 rect=40,0,12,1
+ToggleTurns binding=V rect=55,0,8,1
+ToggleModels binding=M rect=64,0,9,1
+ScopeFiveHours binding=5 rect=74,0,4,1
+ScopeWeek binding=W rect=79,0,6,1
 SourceAll binding=A rect=21,6,3,1
 SourceDesktop binding=D rect=24,6,3,1
 SourceSubagent binding=S rect=27,6,3,1

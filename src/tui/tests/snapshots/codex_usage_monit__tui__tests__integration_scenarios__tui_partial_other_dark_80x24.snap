@@ -4,7 +4,7 @@ expression: diagnostics.frame().snapshot_text()
 ---
 size=80x24
 rows:
-00| 1 Overview  |  2 Trends  |  3 Other
+00| 1 Overview  |  2 Trends  |  3 Other  |  4 Settings
 01|┌Sources───────────────────────────────────────────────────────────────────────┐
 02|│SOURCE             STATE      AS OF      DETAIL                               │
 03|│rollout_jsonl      partial    04:30:00   4 files, 1 truncated, 1 line skipped │
@@ -35,6 +35,9 @@ styles:
 00:017+012 fg=#7e8691 bg=#121417 mods=none text=" Trends  |  "
 00:029+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
 00:031+005 fg=#f4f6f8 bg=#121417 mods=bold text="Other"
+00:036+005 fg=#7e8691 bg=#121417 mods=none text="  |  "
+00:041+001 fg=#3fb9c0 bg=#121417 mods=bold text="4"
+00:042+038 fg=#7e8691 bg=#121417 mods=none text=" Settings                             "
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+007 fg=#f4f6f8 bg=#121417 mods=bold text="Sources"
 01:008+072 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────────────────────────────────────┐"
@@ -95,3 +98,4 @@ controls:
 ViewOverview binding=1 rect=0,0,12,1
 ViewTrends binding=2 rect=15,0,10,1
 ViewOther binding=3 rect=28,0,9,1
+ViewSettings binding=4 rect=40,0,12,1

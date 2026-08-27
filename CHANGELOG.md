@@ -8,14 +8,17 @@ All notable changes to this project are documented in this file.
 
 - Added token-only API-equivalent model-call costs for the current 5-hour and weekly Codex reset cycles. The calculation uses a versioned OpenAI API price catalog, preserves Standard/Fast and short/long-context request boundaries, prices regular input, cached input, cache writes, and output separately, and reports unpriced coverage instead of applying a fallback to unknown models or tiers.
 - Added exact fixed-point pico-USD values to snapshot JSON and API-equivalent totals/ranges to the Models summary, per-model rows, task/turn window output, and selected-turn detail. Totals include per-model coverage and distinguish rollout usage samples from request counts. Tool-call, container, storage, search-call, tax, regional, and contract-specific charges are intentionally excluded.
+- Added a `4 Settings` top-level TUI page. Its Display group controls theme, Turns/Models panels, and `EST Longx`; its global Table columns group controls Tokens, Token share, Estimated quota, and API equivalent columns across Tasks, Turns, and Models. These choices are persisted with the other TUI preferences.
 
 ### Changed
 
-- Clarified the Overview long-context control as `[L]EST Long×`: it changes only the optional Codex quota estimate projection. API-equivalent cost always follows the API pricing catalog and is unaffected by this display preference.
+- Clarified the Overview long-context control as `[L]EST Longx`: it changes only the optional Codex quota estimate projection. API-equivalent cost always follows the API pricing catalog and is unaffected by this display preference.
+- Tasks and Turns now show an independent `API EQ.` value for each visible row in the selected 5-hour or weekly scope. These values are not lifetime totals, show `-` when the selected window or all local data is unavailable, append `+` when incomplete rollout coverage makes the subtotal a lower bound, and do not change when `EST Longx` is toggled. API columns size to the rendered values instead of truncating ranges; identity columns remain fixed, while narrow panels may temporarily omit lower-priority enabled metric columns.
 
 ### Compatibility
 
 - Bumped snapshot JSON to schema version 2 and added `apiPricing`, per-window `apiEquivalentCost`, and per-entity fixed-point cost fields. Pico-USD values serialize as decimal strings so large totals remain exact in JavaScript clients.
+- Bumped the TUI preference state to version 4 and added default-on global `tableColumns` flags. Older state files load the new columns as enabled; future-version files remain protected from overwrite.
 
 ## [0.2.9] - 2026-08-27
 

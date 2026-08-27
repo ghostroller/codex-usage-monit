@@ -17,6 +17,7 @@ pub(super) enum ControlId {
     ViewOverview,
     ViewTrends,
     ViewOther,
+    ViewSettings,
     ToggleTurns,
     ToggleModels,
     ScopeFiveHours,
@@ -34,6 +35,14 @@ pub(super) enum ControlId {
     BackTasks,
     TurnSearch,
     TurnSearchClear,
+    SettingTheme,
+    SettingTurns,
+    SettingModels,
+    SettingLongContext,
+    SettingTokens,
+    SettingTokenShare,
+    SettingEstimatedQuota,
+    SettingApiEquivalent,
     QuitConfirm,
     QuitCancel,
     ResumeConfirm,
@@ -47,6 +56,7 @@ impl ControlId {
             Self::ViewOverview => "1",
             Self::ViewTrends => "2",
             Self::ViewOther => "3",
+            Self::ViewSettings => "4",
             Self::ToggleTurns => "V",
             Self::ToggleModels => "M",
             Self::ScopeFiveHours => "5",
@@ -64,6 +74,14 @@ impl ControlId {
             Self::BackTasks => "←",
             Self::QuitCancel | Self::ResumeCancel => "Esc",
             Self::ResumeCopy => "C",
+            Self::SettingTheme => "T",
+            Self::SettingTurns => "V",
+            Self::SettingModels => "M",
+            Self::SettingLongContext => "L",
+            Self::SettingTokens => "K",
+            Self::SettingTokenShare => "P",
+            Self::SettingEstimatedQuota => "E",
+            Self::SettingApiEquivalent => "A",
         }
     }
 }
@@ -366,6 +384,11 @@ impl TuiHarness {
                 .view_tabs_hitbox
                 .map(|hitbox| hitbox.tabs[View::Health.index()])
                 .unwrap_or_default(),
+            ControlId::ViewSettings => self
+                .app
+                .view_tabs_hitbox
+                .map(|hitbox| hitbox.tabs[View::Settings.index()])
+                .unwrap_or_default(),
             ControlId::ToggleTurns => self
                 .app
                 .window_controls_hitbox
@@ -435,6 +458,14 @@ impl TuiHarness {
                 .turn_controls_hitbox
                 .map(|hitbox| hitbox.clear_search)
                 .unwrap_or_default(),
+            ControlId::SettingTheme => self.setting_rect(SettingItem::Theme),
+            ControlId::SettingTurns => self.setting_rect(SettingItem::Turns),
+            ControlId::SettingModels => self.setting_rect(SettingItem::Models),
+            ControlId::SettingLongContext => self.setting_rect(SettingItem::ApiLongContext),
+            ControlId::SettingTokens => self.setting_rect(SettingItem::Tokens),
+            ControlId::SettingTokenShare => self.setting_rect(SettingItem::TokenShare),
+            ControlId::SettingEstimatedQuota => self.setting_rect(SettingItem::EstimatedQuota),
+            ControlId::SettingApiEquivalent => self.setting_rect(SettingItem::ApiEquivalent),
             ControlId::QuitConfirm => self
                 .app
                 .quit_confirmation_hitbox
@@ -483,10 +514,33 @@ impl TuiHarness {
         );
     }
 
+    pub(super) fn assert_shortcut_inactive(&self, control: ControlId) {
+        let area = self.control_rect(control);
+        assert!(!area.is_empty(), "{control:?} is not visible");
+        let binding = control.binding();
+        let palette = self.app.theme.palette();
+        let cell = (area.x..area.right())
+            .map(|column| &self.terminal.backend().buffer()[(column, area.y)])
+            .find(|cell| cell.symbol() == binding)
+            .unwrap_or_else(|| panic!("{control:?} does not render binding {binding}"));
+        assert_ne!(cell.fg, palette.accent, "{control:?} shortcut color");
+        assert!(
+            !cell.modifier.contains(Modifier::UNDERLINED),
+            "{control:?} inactive shortcut must not be underlined"
+        );
+    }
+
     fn task_source_rect(&self, index: usize) -> Rect {
         self.app
             .task_controls_hitbox
             .map(|hitbox| hitbox.sources[index])
+            .unwrap_or_default()
+    }
+
+    fn setting_rect(&self, item: SettingItem) -> Rect {
+        self.app
+            .settings_controls_hitbox
+            .map(|hitbox| hitbox.rows[item.index()])
             .unwrap_or_default()
     }
 
@@ -495,6 +549,7 @@ impl TuiHarness {
             ControlId::ViewOverview,
             ControlId::ViewTrends,
             ControlId::ViewOther,
+            ControlId::ViewSettings,
             ControlId::ToggleTurns,
             ControlId::ToggleModels,
             ControlId::ScopeFiveHours,
@@ -512,6 +567,14 @@ impl TuiHarness {
             ControlId::BackTasks,
             ControlId::TurnSearch,
             ControlId::TurnSearchClear,
+            ControlId::SettingTheme,
+            ControlId::SettingTurns,
+            ControlId::SettingModels,
+            ControlId::SettingLongContext,
+            ControlId::SettingTokens,
+            ControlId::SettingTokenShare,
+            ControlId::SettingEstimatedQuota,
+            ControlId::SettingApiEquivalent,
             ControlId::QuitConfirm,
             ControlId::QuitCancel,
             ControlId::ResumeConfirm,

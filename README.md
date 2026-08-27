@@ -173,7 +173,7 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` is optional and is only used in the pipeline example above.
 
-The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, and **Other**; `health` remains the one-shot snapshot section name.
+The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, **Other**, and **Settings**; `health` remains the one-shot snapshot section name.
 
 ### Continuous history recording
 
@@ -220,7 +220,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, Models, and the local token-only API-equivalent cost of model calls. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health.
+The **Overview** tab combines account limits with Tasks, Turns, Models, and the local token-only API-equivalent cost of model calls. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health. **Settings** provides one place to manage display preferences and the metric columns shared by all tables.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -229,7 +229,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | Keys | Action |
 | --- | --- |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
-| `1`, `2`, `3` | Open Overview, Trends, or Other. |
+| `1`, `2`, `3`, `4` | Open Overview, Trends, Other, or Settings. |
 | `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or 15-minute charts. |
 | `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
 | `i` on Trends | Toggle Inspect mode. |
@@ -242,12 +242,15 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `r`, `E`, `-`, `+` | Toggle flat/tree mode, collapse/expand all, or collapse/expand one parent. |
 | `a`, `d`, `s`, `c`, `[` / `]` | Filter All, Desktop, Subagent, or CLI sources, or cycle source filters. |
 | `v`, `m` | Show/hide Turns or Models. |
-| `l` on Overview | Toggle the optional long-context multiplier for TUI quota `~EST` values (`EST Long×`). |
+| `l` on Overview | Toggle the optional long-context multiplier for TUI quota `~EST` values (`EST Longx`). |
+| `↑` / `↓`, `Enter`, or the highlighted letter on Settings | Select or toggle a display/column preference. |
 | `o` | Open the selected stopped root task in a new Zellij pane, or offer a resume command for other terminals. |
 | `t` | Toggle dark/light theme. |
 | `q` | Quit. `Esc` opens quit confirmation from the main view. |
 
 Printable keys are consumed by a focused text field before global shortcuts. Mouse input is also available for controls, Tasks/Turns rows, tabs, and scrollbars. On Trends, click a chart to inspect its nearest recorded point, or hold the left mouse button and drag to scrub across points.
+
+The `4 Settings` page has two groups. **Display** controls the theme, Turns and Models panel visibility, and `EST Longx`. **Table columns** globally control Tokens, Token share, Estimated quota, and API equivalent for the Tasks, Turns, and Models tables. Settings are persisted across TUI runs. The task/model identity and turn model/effort/message columns stay fixed; if a panel is too narrow, the layout may temporarily omit lower-priority enabled metric columns without changing the saved choices.
 
 ## Understanding the fields
 
@@ -279,7 +282,7 @@ Reset and turn timestamps in the TUI are shown in local time; Collection/Snapsho
 | `TOKENS` | Locally observed total tokens. In scoped TUI views, this is eligible non-Spark usage inside the selected ordinary `codex` reset cycle; in one-shot `tasks`/`turns` and their JSON `tokenUsage`, it covers the configured scan range. |
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | The entity's share of locally observed, eligible non-Spark tokens in the selected ordinary `codex` cycle. This is a token share, not an account quota percentage. |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | A low-confidence estimate of account quota percentage points attributed to the entity. `~` means approximate; `-` means unavailable. |
-| `API EQ.` / `API.EQ5H` | Local model tokens valued at the bundled OpenAI API rates. One-shot task/turn rows use the current 5-hour reset cycle. A range means request boundaries could be short or long context; trailing `+` means the priced subtotal excludes unpriced usage samples; `-` means no public price can be applied. |
+| `API EQ.` / `API.EQ5H` | Local model tokens valued at the bundled OpenAI API rates. Each Tasks and Turns row in the TUI has its own value for the selected 5-hour or weekly scope; it is not a lifetime total, shows `-` when that window is unavailable, and is independent of `EST Longx`. One-shot task/turn rows use the current 5-hour reset cycle. A range means request boundaries could be short or long context; trailing `+` marks a lower bound because unpriced samples or incomplete local rollout coverage may hide additional cost; `-` also means no usable local data or no applicable public price. |
 | `EFFORT` | The reasoning-effort value recorded by Codex. |
 | `FAST` | The rollout used a recognized Fast tier (`serviceTier=fast` or the compatible `priority` value); attribution applies the published Fast credit multiplier. |
 | `MESSAGE` | A short local preview of the turn message, up to 72 characters. |
@@ -289,13 +292,13 @@ The estimator follows OpenAI's current [token-based Codex rate card](https://lea
 
 For recognized ChatGPT Fast calls the estimator applies the published [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) multiplier: `2.5x` for GPT-5.6/GPT-5.5 and `2x` for GPT-5.4. The compatible `serviceTier=priority` value found in local signed-in rollouts is treated as Fast for this attribution; this is not API Priority billing, which the official Speed page describes separately. Exact `gpt-5.3-codex-spark` calls remain outside this attribution because its credit rate is still a research preview; an unlisted or missing non-Spark model uses the corresponding GPT-5.6 Luna fallback and marks the scope partial.
 
-The TUI's `[L]EST Long×` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models for the Codex quota `~EST` projection. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
+The TUI's `[L]EST Longx` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models for the Codex quota `~EST` projection. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
 
 `API EQ.` is a separate calculation based on the current [OpenAI API pricing table](https://developers.openai.com/api/docs/pricing). It prices each locally observed model request using regular input, cached input, cache-write, and output rates; reasoning tokens are already part of output and are not added twice. The calculation applies a published API long-context price when an exact request exceeds 272K input tokens; models with one flat price keep it across their supported context. If a larger cumulative delta has unknown request boundaries, the UI shows a short/long cost range. Unknown models, unknown or missing service tiers, unavailable Fast/long rows, missing token breakdowns, and cache writes without a published rate reduce the displayed priced coverage instead of using a fallback. Per-call tool and other non-model charges are not included; model input/output tokens surrounding tool execution are still valued at model rates. This is an equivalent value at current API rates, not an API invoice or a Codex subscription charge.
 
 GPT-Image-2.0 is not assigned one of its published rows: the official card separates image and text billing, while rollout usage does not expose enough modality information to choose reliably. If such a model name appears in an ordinary token call, it uses the partial-marked unknown-model fallback instead of pretending the image rate is exact.
 
-Task trees start fully collapsed. A visible parent row includes the tokens/share of its hidden descendants.
+Task trees start fully collapsed. A visible parent row includes the tokens, shares, estimates, and API-equivalent costs of its hidden descendants; expanding it restores the independent per-session rows.
 
 ### Status markers
 
@@ -322,7 +325,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Long×` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Longx` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 

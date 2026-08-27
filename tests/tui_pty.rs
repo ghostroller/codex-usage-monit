@@ -211,11 +211,18 @@ fn label_is_bold(screen: &vt100::Screen, label: &str) -> bool {
     screen.cell(0, column as u16).is_some_and(vt100::Cell::bold)
 }
 
+fn line_contains(screen: &vt100::Screen, label: &str, value: &str) -> bool {
+    screen
+        .contents()
+        .lines()
+        .any(|line| line.contains(label) && line.contains(value))
+}
+
 #[test]
 fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     let mut session = PtySession::spawn();
-    session.wait_for("initial fixture task", |screen| {
-        screen.contents().contains("Fixture-driven integration")
+    session.wait_for("initial fixture session", |screen| {
+        screen.contents().contains("codex-usage-monit | desktop")
     });
     session.wait_for("selected Overview tab", |screen| {
         label_is_bold(screen, "Overview")
@@ -225,6 +232,25 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     session.send(b"3");
     session.wait_for("keyboard switch to Other", |screen| {
         label_is_bold(screen, "Other")
+    });
+
+    session.send(b"4");
+    session.wait_for("keyboard switch to Settings", |screen| {
+        label_is_bold(screen, "Settings")
+            && screen.contents().contains("Table columns")
+            && screen.contents().contains("EST Longx")
+    });
+    session.wait_for("API equivalent column enabled", |screen| {
+        line_contains(screen, "API equivalent", "On")
+    });
+
+    session.send(b"a");
+    session.wait_for("API equivalent column disabled", |screen| {
+        line_contains(screen, "API equivalent", "Off")
+    });
+    session.send(b"a");
+    session.wait_for("API equivalent column restored", |screen| {
+        line_contains(screen, "API equivalent", "On")
     });
 
     session.send(b"1");
@@ -259,10 +285,14 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     session.resize(60, 24);
     session.wait_for_new_output("compact controls after resize", |screen| {
         screen.size() == (24, 60)
-            && screen
-                .rows(0, 60)
-                .next()
-                .is_some_and(|row| row.contains("[V]") && row.contains("[M]"))
+            && screen.rows(0, 60).next().is_some_and(|row| {
+                row.contains("4 Set") && row.contains("[V]") && row.contains("[M]")
+            })
+    });
+
+    session.send(b"4");
+    session.wait_for("compact keyboard switch to Settings", |screen| {
+        label_is_bold(screen, "Set") && screen.contents().contains("API equivalent")
     });
 
     session.send(b"q");

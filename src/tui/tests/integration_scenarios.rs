@@ -38,6 +38,10 @@ fn semantic_frames_cover_full_compact_and_diagnostic_layouts() {
         "tui_partial_other_dark_80x24",
         diagnostics.frame().snapshot_text()
     );
+
+    let mut settings = TuiHarness::from_fixture("normal", 80, 24, Theme::Dark);
+    settings.key(KeyCode::Char('4'));
+    insta::assert_snapshot!("tui_settings_dark_80x24", settings.frame().snapshot_text());
 }
 
 #[test]
@@ -49,6 +53,7 @@ fn keyboard_and_mouse_controls_have_equivalent_state_transitions() {
             (KeyCode::Char('W'), ControlId::ScopeWeek),
             (KeyCode::Char('2'), ControlId::ViewTrends),
             (KeyCode::Char('3'), ControlId::ViewOther),
+            (KeyCode::Char('4'), ControlId::ViewSettings),
             (KeyCode::Char('R'), ControlId::ToggleTree),
             (KeyCode::Char('D'), ControlId::SourceDesktop),
         ] {
@@ -84,6 +89,7 @@ fn shortcut_graphemes_are_visually_distinct_when_the_binding_is_active() {
             ControlId::ViewOverview,
             ControlId::ViewTrends,
             ControlId::ViewOther,
+            ControlId::ViewSettings,
             ControlId::ToggleTurns,
             ControlId::ToggleModels,
             ControlId::ScopeFiveHours,
@@ -115,6 +121,10 @@ fn whole_labels_are_clickable_at_both_layout_breakpoints() {
             assert!(tab.click(ControlId::ViewOther, edge));
             assert_eq!(tab.state().ui_state.view, UiView::Health);
 
+            let mut settings = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+            assert!(settings.click(ControlId::ViewSettings, edge));
+            assert_eq!(settings.state().ui_state.view, UiView::Settings);
+
             let mut trends = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
             assert!(trends.click(ControlId::ViewTrends, edge));
             assert_eq!(trends.state().ui_state.view, UiView::Trends);
@@ -130,6 +140,62 @@ fn whole_labels_are_clickable_at_both_layout_breakpoints() {
                 source.state().ui_state.task_source_filter,
                 UiTaskSourceFilter::Desktop
             );
+        }
+    }
+}
+
+#[test]
+fn settings_rows_have_keyboard_mouse_parity_and_whole_row_hitboxes() {
+    for (width, height) in [(120, 40), (60, 24)] {
+        for (key, control) in [
+            (KeyCode::Char('T'), ControlId::SettingTheme),
+            (KeyCode::Char('V'), ControlId::SettingTurns),
+            (KeyCode::Char('M'), ControlId::SettingModels),
+            (KeyCode::Char('L'), ControlId::SettingLongContext),
+            (KeyCode::Char('K'), ControlId::SettingTokens),
+            (KeyCode::Char('P'), ControlId::SettingTokenShare),
+            (KeyCode::Char('E'), ControlId::SettingEstimatedQuota),
+            (KeyCode::Char('A'), ControlId::SettingApiEquivalent),
+        ] {
+            let mut keyboard = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+            let mut mouse = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+            keyboard.key(KeyCode::Char('4'));
+            mouse.key(KeyCode::Char('4'));
+            keyboard.key(key);
+            assert!(mouse.click(control, ClickEdge::End));
+            assert_eq!(keyboard.state(), mouse.state(), "{control:?} state");
+            assert_eq!(keyboard.frame(), mouse.frame(), "{control:?} frame");
+        }
+
+        let mut settings = TuiHarness::from_fixture("normal", width, height, Theme::Dark);
+        settings.key(KeyCode::Char('4'));
+        for control in [
+            ControlId::SettingTheme,
+            ControlId::SettingTurns,
+            ControlId::SettingModels,
+            ControlId::SettingLongContext,
+            ControlId::SettingTokens,
+            ControlId::SettingTokenShare,
+            ControlId::SettingEstimatedQuota,
+            ControlId::SettingApiEquivalent,
+        ] {
+            settings.assert_shortcut_distinct(control);
+            assert!(!settings.control_rect(control).is_empty());
+        }
+
+        settings.key(KeyCode::Esc);
+        assert!(settings.state().quit_confirmation);
+        for control in [
+            ControlId::SettingTheme,
+            ControlId::SettingTurns,
+            ControlId::SettingModels,
+            ControlId::SettingLongContext,
+            ControlId::SettingTokens,
+            ControlId::SettingTokenShare,
+            ControlId::SettingEstimatedQuota,
+            ControlId::SettingApiEquivalent,
+        ] {
+            settings.assert_shortcut_inactive(control);
         }
     }
 }

@@ -1167,6 +1167,18 @@ fn exact_api_cost(pico_usd: u128) -> ApiCostAmount {
     }
 }
 
+fn ranged_api_cost(minimum_dollars: u128, maximum_dollars: u128) -> ApiCostAmount {
+    const PICO_USD_PER_USD: u128 = 1_000_000_000_000;
+    ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(minimum_dollars * PICO_USD_PER_USD),
+        maximum_pico_usd: PicoUsd::new(maximum_dollars * PICO_USD_PER_USD),
+        observed_samples: 2,
+        priced_samples: 1,
+        observed_tokens: 200,
+        priced_tokens: 100,
+    }
+}
+
 fn add_window_analysis(
     app: &mut App,
     scope: WindowScope,
@@ -1241,6 +1253,43 @@ fn add_window_analysis(
         api_pricing: Default::default(),
         api_long_context: None,
     });
+}
+
+fn set_window_entity_api_costs(
+    app: &mut App,
+    scope: WindowScope,
+    thread_pico_usd: u128,
+    turn_pico_usd: &[u128],
+) {
+    let thread_id = app.snapshot.tasks[0].thread_id.clone();
+    let turn_ids = app
+        .snapshot
+        .turns
+        .iter()
+        .filter(|turn| turn.thread_id == thread_id)
+        .map(|turn| turn.turn_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(turn_ids.len(), turn_pico_usd.len());
+    let analysis = app
+        .snapshot
+        .window_analyses
+        .iter_mut()
+        .find(|analysis| analysis.duration_mins == scope.duration_mins())
+        .unwrap();
+    let template = analysis.turns[0].usage;
+    analysis.threads[0].usage.api_equivalent_cost = exact_api_cost(thread_pico_usd);
+    analysis.turns = turn_ids
+        .into_iter()
+        .zip(turn_pico_usd.iter().copied())
+        .map(|(turn_id, amount)| TurnWindowUsage {
+            thread_id: thread_id.clone(),
+            turn_id,
+            usage: WindowUsage {
+                api_equivalent_cost: exact_api_cost(amount),
+                ..template
+            },
+        })
+        .collect();
 }
 
 fn set_window_reset(app: &mut App, scope: WindowScope, reset_at: chrono::DateTime<chrono::Utc>) {
@@ -2135,7 +2184,7 @@ fn light_theme_uses_an_explicit_bright_canvas_and_toggles() {
 }
 
 #[test]
-fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority() {
+fn saved_ui_state_restores_stable_menu_and_column_preferences_with_theme_override_priority() {
     let mut app = interaction_test_app(3, 1);
     set_task_metadata(&mut app, 1, "subagent task", Some("subagent"));
     let saved = UiState {
@@ -2145,6 +2194,12 @@ fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority(
         turns_visible: false,
         models_visible: false,
         api_long_context_multiplier: true,
+        table_columns: UiTableColumns {
+            tokens: false,
+            token_share: true,
+            estimated_quota: false,
+            api_equivalent: true,
+        },
         task_list_mode: UiTaskListMode::Tree,
         task_source_filter: UiTaskSourceFilter::Subagent,
         ..UiState::default()
@@ -2163,6 +2218,7 @@ fn saved_ui_state_restores_stable_menu_preferences_with_theme_override_priority(
     app.apply_ui_state(&saved, Some(Theme::Dark));
     assert_eq!(app.theme, Theme::Dark);
     assert_eq!(app.ui_state().theme, UiTheme::Dark);
+    assert_eq!(app.ui_state().table_columns, saved.table_columns);
 }
 
 #[test]
@@ -2399,7 +2455,7 @@ fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
 }
 
 #[test]
-fn compact_models_table_uses_four_columns_without_confidence() {
+fn compact_models_table_prioritizes_tokens_estimate_and_api_cost_without_confidence() {
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
 
@@ -2407,10 +2463,11 @@ fn compact_models_table_uses_four_columns_without_confidence() {
 
     assert!(content.contains("MODEL"));
     assert!(content.contains("TOKENS"));
-    assert!(content.contains("TOKEN SHARE"));
+    assert!(content.contains("API EQ."));
+    assert!(!content.contains("TOKEN SHARE"));
     assert!(content.contains("EST. QUOTA"));
     assert!(content.contains("gpt-window"));
-    assert!(content.contains("~23.0%"));
+    assert!(content.contains("$0.0000"));
     assert!(!content.contains("CONF"));
 }
 
@@ -2447,7 +2504,8 @@ fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
     assert!(compact.contains("model calls only"));
     assert!(compact.contains("coverage 75.0%"));
     assert!(compact.contains("rates 2026-08-27"));
-    assert!(!compact.contains("API EQ."));
+    assert!(compact.contains("API EQ."));
+    assert!(compact.contains("$0.2500"));
 }
 
 #[test]
@@ -2852,6 +2910,9 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
         task.local_token_share_percent = shares[index];
         task.estimated_quota_percent = quotas[index];
         task.quota_confidence = confidences[index];
+        task.api_equivalent_cost = Some(exact_api_cost(
+            u128::try_from(index + 1).unwrap() * 100_000_000_000,
+        ));
     }
     let weekly_usages = [
         WindowUsage {
@@ -2862,7 +2923,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 20.0,
             estimated_quota_percent: 2.0,
             quota_confidence: Confidence::High,
-            api_equivalent_cost: Default::default(),
+            api_equivalent_cost: exact_api_cost(400_000_000_000),
         },
         WindowUsage {
             token_usage: TokenUsage {
@@ -2872,7 +2933,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 30.0,
             estimated_quota_percent: 3.0,
             quota_confidence: Confidence::Low,
-            api_equivalent_cost: Default::default(),
+            api_equivalent_cost: exact_api_cost(500_000_000_000),
         },
         WindowUsage {
             token_usage: TokenUsage {
@@ -2882,7 +2943,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             local_token_share_percent: 10.0,
             estimated_quota_percent: 1.0,
             quota_confidence: Confidence::Medium,
-            api_equivalent_cost: Default::default(),
+            api_equivalent_cost: exact_api_cost(600_000_000_000),
         },
     ];
     app.snapshot.window_analyses.push(WindowAnalysis {
@@ -2935,12 +2996,20 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
     assert_eq!(five_hours.local_token_share_percent, 60.0);
     assert!((five_hours.estimated_quota_percent - 0.6).abs() < f64::EPSILON);
     assert_eq!(five_hours.quota_confidence, Confidence::Unknown);
+    assert_eq!(
+        five_hours.api_equivalent_cost.minimum_pico_usd,
+        PicoUsd::new(600_000_000_000)
+    );
 
     let week = aggregate_task_row_usage(&app.snapshot, WindowScope::Week, root, true);
     assert_eq!(week.token_usage.total_tokens, 600);
     assert_eq!(week.local_token_share_percent, 60.0);
     assert_eq!(week.estimated_quota_percent, 6.0);
     assert_eq!(week.quota_confidence, Confidence::Low);
+    assert_eq!(
+        week.api_equivalent_cost.minimum_pico_usd,
+        PicoUsd::new(1_500_000_000_000)
+    );
 
     for task in &mut app.snapshot.tasks {
         task.estimated_quota_percent = 0.0;
@@ -3097,7 +3166,15 @@ fn tree_marker_mouse_click_selects_once_and_has_stable_geometry_and_placeholder(
             .iter()
             .position(|index| *index == 1)
             .unwrap();
-        let task_column = task_table_columns(app.task_table_hitbox.unwrap().viewport)[3];
+        let viewport = app.task_table_hitbox.unwrap().viewport;
+        let api_cost_width = api_cost_column_width(None, &[]);
+        let task_column = *task_table_columns(
+            viewport,
+            task_visible_columns(app.table_columns, viewport.width, api_cost_width),
+            api_cost_width,
+        )
+        .last()
+        .unwrap();
         let leaf_y = app
             .task_table_hitbox
             .unwrap()
@@ -3690,6 +3767,9 @@ fn shortcut_labels_highlight_real_bindings_and_direct_source_keys() {
 #[test]
 fn window_scope_shortcuts_and_mouse_switch_reset_cycle_data() {
     let mut app = interaction_test_app(3, 2);
+    // Keep the scope-specific share/quota columns visible in the split Overview
+    // layout; responsive defaults prioritize API EQ. at this width.
+    app.table_columns.api_equivalent = false;
     add_window_analysis(&mut app, WindowScope::FiveHours, 111, 11.0);
     add_window_analysis(&mut app, WindowScope::Week, 777, 63.0);
     app.view = View::Overview;
@@ -3821,7 +3901,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
             .draw(|frame| controls = Some(render_overview_controls(frame, frame.area(), &app)))
             .unwrap();
         let controls_start =
-            view_tabs_hitbox(Rect::new(0, 0, width, 1)).tabs[View::Health.index()].right();
+            view_tabs_hitbox(Rect::new(0, 0, width, 1)).tabs[View::Settings.index()].right();
         let rendered = (controls_start..width)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect::<String>();
@@ -3971,7 +4051,7 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(initial_content.contains("[L]EST Long×"));
+    assert!(initial_content.contains("[L]EST Longx"));
     assert!(initial_content.contains("API equivalent $1.2345"));
     assert!(initial_content.contains("$0.2500"));
     assert!(initial_content.contains("share="));
@@ -3993,7 +4073,7 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(content.contains("Models · 5h · EST Long ON"));
+    assert!(content.contains("Models · 5h · EST Longx ON"));
     assert!(content.contains("API equivalent $1.2345"));
     assert!(content.contains("$0.2500"));
     assert!(content.contains("share="));
@@ -4036,6 +4116,414 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
             .toggle_api_long_context
             .is_empty()
     );
+}
+
+#[test]
+fn overview_shows_independent_task_and_turn_api_costs_for_the_selected_scope() {
+    let mut app = interaction_test_app(1, 2);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    set_window_entity_api_costs(
+        &mut app,
+        WindowScope::FiveHours,
+        300_000_000_000,
+        &[100_000_000_000, 200_000_000_000],
+    );
+    add_window_analysis(&mut app, WindowScope::Week, 400, 100.0);
+    set_window_entity_api_costs(
+        &mut app,
+        WindowScope::Week,
+        900_000_000_000,
+        &[400_000_000_000, 500_000_000_000],
+    );
+    app.models_visible = false;
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let five_hours = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(five_hours.matches("API EQ.").count() >= 2);
+    assert!(five_hours.contains("$0.3000"));
+    assert!(five_hours.contains("$0.1000"));
+    assert!(five_hours.contains("$0.2000"));
+
+    app.toggle_api_long_context_multiplier();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let longx = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(longx.contains("$0.3000"));
+    assert!(longx.contains("$0.1000"));
+    assert!(longx.contains("$0.2000"));
+
+    app.set_window_scope(WindowScope::Week);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let week = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(week.contains("$0.9000"));
+    assert!(week.contains("$0.4000"));
+    assert!(week.contains("$0.5000"));
+    assert!(!week.contains("$0.3000"));
+
+    app.table_columns.api_equivalent = false;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let hidden = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!hidden.contains("API EQ."));
+}
+
+#[test]
+fn api_cost_columns_distinguish_an_unavailable_window_from_observed_zero() {
+    let mut app = interaction_test_app(1, 1);
+    app.models_visible = false;
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let unavailable = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(unavailable.matches("API EQ.").count() >= 2);
+    assert!(!unavailable.contains("$0.0000"));
+
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let observed_zero = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(observed_zero.contains("$0.0000"));
+}
+
+#[test]
+fn overview_maps_api_costs_to_each_thread_and_its_own_turns() {
+    let mut app = interaction_test_app(2, 2);
+    app.models_visible = false;
+    app.snapshot.tasks[0].cwd = Some("/tmp/alpha".into());
+    app.snapshot.tasks[1].cwd = Some("/tmp/beta".into());
+    for (turn, message) in app
+        .snapshot
+        .turns
+        .iter_mut()
+        .zip(["m00", "m01", "m10", "m11"])
+    {
+        turn.message_preview = Some(message.to_string());
+    }
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    let template = analysis.threads[0].usage;
+    analysis.threads = app
+        .snapshot
+        .tasks
+        .iter()
+        .zip([300_000_000_000, 700_000_000_000])
+        .map(|(task, amount)| ThreadWindowUsage {
+            thread_id: task.thread_id.clone(),
+            usage: WindowUsage {
+                api_equivalent_cost: exact_api_cost(amount),
+                ..template
+            },
+        })
+        .collect();
+    analysis.turns = app
+        .snapshot
+        .turns
+        .iter()
+        .zip([
+            100_000_000_000,
+            200_000_000_000,
+            400_000_000_000,
+            500_000_000_000,
+        ])
+        .map(|(turn, amount)| TurnWindowUsage {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            usage: WindowUsage {
+                api_equivalent_cost: exact_api_cost(amount),
+                ..template
+            },
+        })
+        .collect();
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let rows = (0..40)
+        .map(|y| buffer_rect_row_text(terminal.backend().buffer(), Rect::new(0, 0, 160, 40), y))
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("alpha") && row.contains("$0.3000"))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("beta") && row.contains("$0.7000"))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("m00") && row.contains("$0.1000"))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("m01") && row.contains("$0.2000"))
+    );
+
+    app.selected_task = 1;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let rows = (0..40)
+        .map(|y| buffer_rect_row_text(terminal.backend().buffer(), Rect::new(0, 0, 160, 40), y))
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("m10") && row.contains("$0.4000"))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("m11") && row.contains("$0.5000"))
+    );
+}
+
+#[test]
+fn api_cost_rows_mark_incomplete_local_coverage_as_a_lower_bound() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    analysis.partial = true;
+    analysis.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+    analysis.api_equivalent_cost.amount = exact_api_cost(500_000_000_000);
+    analysis.threads[0].usage.api_equivalent_cost = exact_api_cost(300_000_000_000);
+    analysis.turns[0].usage.api_equivalent_cost = ApiCostAmount::default();
+    analysis.models[0].api_equivalent_cost = exact_api_cost(200_000_000_000);
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let incomplete = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(incomplete.contains("$0.3000+"));
+    assert!(incomplete.contains("$0.0000+"));
+    assert!(incomplete.contains("$0.2000+"));
+
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    analysis.partial_reasons = vec!["local_scan_disabled".to_string()];
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let disabled = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!disabled.contains("$0.3000"));
+    assert!(!disabled.contains("$0.2000"));
+}
+
+#[test]
+fn api_cost_columns_keep_large_range_and_lower_bound_markers_visible() {
+    let mut app = interaction_test_app(1, 1);
+    app.snapshot.tasks[0].cwd = Some("/tmp/alpha".into());
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    analysis.api_equivalent_cost.amount = ranged_api_cost(7_000, 8_000);
+    analysis.threads[0].usage.api_equivalent_cost = ranged_api_cost(1_000, 2_000);
+    analysis.turns[0].usage.api_equivalent_cost = ranged_api_cost(3_000, 4_000);
+    analysis.models[0].api_equivalent_cost = ranged_api_cost(5_000, 6_000);
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let rows = (0..40)
+        .map(|y| buffer_rect_row_text(terminal.backend().buffer(), Rect::new(0, 0, 160, 40), y))
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|row| { row.contains("alpha") && row.contains("$1000.00–$2000.00+") })
+    );
+    assert!(
+        rows.iter()
+            .any(|row| { row.contains("model-0") && row.contains("$3000.00–$4000.00+") })
+    );
+    assert!(
+        rows.iter()
+            .any(|row| { row.contains("gpt-window") && row.contains("$5000.00–$6000.00+") })
+    );
+}
+
+#[test]
+fn api_cost_columns_keep_precision_breakpoint_values_visible() {
+    const ONE_THOUSAND_DOLLARS: u128 = 1_000_000_000_000_000;
+    const JUST_BELOW_ONE_THOUSAND_DOLLARS: u128 = 999_999_900_000_000;
+
+    let mut app = interaction_test_app(1, 1);
+    app.snapshot.tasks[0].cwd = Some("/tmp/alpha".into());
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    analysis.api_equivalent_cost.amount = exact_api_cost(ONE_THOUSAND_DOLLARS);
+    analysis.threads[0].usage.api_equivalent_cost = exact_api_cost(JUST_BELOW_ONE_THOUSAND_DOLLARS);
+    analysis.turns[0].usage.api_equivalent_cost = exact_api_cost(JUST_BELOW_ONE_THOUSAND_DOLLARS);
+    analysis.models[0].api_equivalent_cost = exact_api_cost(JUST_BELOW_ONE_THOUSAND_DOLLARS);
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let rows = (0..40)
+        .map(|y| buffer_rect_row_text(terminal.backend().buffer(), Rect::new(0, 0, 160, 40), y))
+        .collect::<Vec<_>>();
+    for identity in ["alpha", "model-0", "gpt-window"] {
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(identity) && row.contains("$999.9999")),
+            "missing untruncated precision-boundary amount for {identity}"
+        );
+    }
+}
+
+#[test]
+fn table_column_preferences_apply_to_tasks_turns_and_models() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+    let render_content = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+
+    let visible = render_content(&mut app, &mut terminal);
+    for header in [
+        "TOKENS",
+        "TOKEN5H%",
+        "TOKEN%",
+        "TOKEN SHARE",
+        "EST.Q5H",
+        "EST.Q",
+        "EST. QUOTA",
+        "API EQ.",
+    ] {
+        assert!(visible.contains(header), "missing {header}");
+    }
+
+    app.table_columns.tokens = false;
+    let without_tokens = render_content(&mut app, &mut terminal);
+    assert!(!without_tokens.contains("TOKENS"));
+    app.table_columns.tokens = true;
+
+    app.table_columns.token_share = false;
+    let without_share = render_content(&mut app, &mut terminal);
+    for header in ["TOKEN5H%", "TOKEN%", "TOKEN SHARE"] {
+        assert!(!without_share.contains(header), "unexpected {header}");
+    }
+    app.table_columns.token_share = true;
+
+    app.table_columns.estimated_quota = false;
+    let without_estimate = render_content(&mut app, &mut terminal);
+    for header in ["EST.Q5H", "EST.Q", "EST. QUOTA"] {
+        assert!(!without_estimate.contains(header), "unexpected {header}");
+    }
+    app.table_columns.estimated_quota = true;
+
+    app.table_columns.api_equivalent = false;
+    let without_api = render_content(&mut app, &mut terminal);
+    assert!(!without_api.contains("API EQ."));
+}
+
+#[test]
+fn hidden_tokens_column_keeps_task_and_turn_status_markers_in_identity_columns() {
+    for (width, height) in [(120, 40), (60, 24)] {
+        let mut app = interaction_test_app(3, 3);
+        app.models_visible = false;
+        app.table_columns.tokens = false;
+
+        for (task, (status, project)) in app.snapshot.tasks.iter_mut().zip([
+            (TaskStatus::Running, "run-task"),
+            (TaskStatus::Completed, "done-task"),
+            (TaskStatus::Interrupted, "stop-task"),
+        ]) {
+            task.status = status;
+            task.cwd = Some(format!("/tmp/{project}").into());
+        }
+        for (turn, (status, message)) in app.snapshot.turns.iter_mut().take(3).zip([
+            (TurnStatus::InProgress, "run"),
+            (TurnStatus::Completed, "done"),
+            (TurnStatus::Interrupted, "stop"),
+        ]) {
+            turn.status = status;
+            turn.message_preview = Some(message.to_string());
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let task_rows = app.task_table_hitbox.expect("task rows should render").rows;
+        let turn_rows = app.turn_table_hitbox.expect("turn rows should render").rows;
+        assert!(task_rows.height >= 3, "{width}x{height} task rows");
+        assert!(turn_rows.height >= 3, "{width}x{height} turn rows");
+
+        let buffer = terminal.backend().buffer();
+        let row_texts = |rows: Rect| {
+            (0..3)
+                .map(|offset| {
+                    (rows.x..rows.right())
+                        .map(|x| buffer[(x, rows.y + offset)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let header_text = |rows: Rect| {
+            (rows.x..rows.right())
+                .map(|x| buffer[(x, rows.y.saturating_sub(1))].symbol())
+                .collect::<String>()
+        };
+        let task_lines = row_texts(task_rows);
+        let turn_lines = row_texts(turn_rows);
+
+        assert!(!header_text(task_rows).contains("TOKENS"));
+        assert!(!header_text(turn_rows).contains("TOKENS"));
+        for expected in ["R run-task", "D done-task", "X stop-task"] {
+            assert!(
+                task_lines.iter().any(|line| line.contains(expected)),
+                "{width}x{height} missing {expected:?} from task identity rows: {task_lines:?}"
+            );
+        }
+        for expected in ["R run", "D done", "X stop"] {
+            assert!(
+                turn_lines.iter().any(|line| line.contains(expected)),
+                "{width}x{height} missing {expected:?} from turn identity rows: {turn_lines:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -8576,7 +9064,7 @@ fn renders_all_views_at_common_terminal_sizes() {
                     assert!(content.contains("1ms"));
                     assert!(content.contains("D 42"));
                     assert!(content.contains("TOKEN"));
-                    assert!(content.contains("EST.Q"));
+                    assert!(content.contains("API EQ."));
                     assert!(content.contains("DONE"));
                     assert!(content.contains("STALE"));
                     assert!(!content.contains("STATE EVIDENCE"));
@@ -8620,18 +9108,24 @@ fn renders_all_views_at_common_terminal_sizes() {
                         assert!(content.contains("Weekly Local Tokens"));
                         assert!(content.contains("15m Local Tokens"));
                     }
+                } else if view == View::Health {
+                    let content = buffer
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(content.contains("Other"));
+                    assert!(content.contains("Resets"));
+                } else if view == View::Settings {
+                    let content = buffer
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(content.contains("Table columns"));
+                    assert!(content.contains("API equivalent"));
                 }
             }
-
-            let content = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(content.contains("Other"));
-            assert!(content.contains("Resets"));
 
             if theme == Theme::Light {
                 let light_background = theme.palette().background;
