@@ -727,10 +727,25 @@ fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
             14,
             json!({"type": "task_complete", "turn_id": "unknown-tier-turn"}),
         ),
+        event(
+            15,
+            json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": null}
+            }),
+        ),
+        event(
+            16,
+            json!({"type": "task_started", "turn_id": "unproven-null-tier-turn"}),
+        ),
+        event(
+            17,
+            json!({"type": "task_complete", "turn_id": "unproven-null-tier-turn"}),
+        ),
     ];
     write_jsonl(&path, &records, false);
 
-    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(15)).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(18)).unwrap();
     let turn = |id: &str| {
         dataset
             .turns
@@ -764,6 +779,10 @@ fn captures_service_tier_at_turn_start_and_preserves_it_until_changed() {
         Some("future-tier")
     );
     assert!(!unknown_tier_turn.is_fast());
+
+    let unproven_null_tier_turn = turn("unproven-null-tier-turn");
+    assert_eq!(unproven_null_tier_turn.service_tier, None);
+    assert!(!unproven_null_tier_turn.is_fast());
 }
 
 #[test]
@@ -1606,7 +1625,10 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
                 "parent_thread_id": parent_id,
                 "timestamp": timestamp(child_created),
                 "cwd": "/work/child",
-                "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent_id}}}
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": parent_id,
+                    "agent_role": null
+                }}}
             }
         }),
         // Some real rollouts replay parent events before the explicit parent
@@ -1663,7 +1685,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             "type": "event_msg",
             "payload": {
                 "type": "thread_settings_applied",
-                "thread_settings": {"service_tier": "priority"}
+                "thread_settings": {"model": "gpt-child", "service_tier": "priority"}
             }
         }),
         json!({
@@ -1716,10 +1738,11 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
         Some("implement the child task")
     );
     assert_eq!(dataset.turns[0].token_usage.total_tokens, 25);
-    assert_eq!(dataset.turns[0].service_tier, None);
-    assert!(!dataset.turns[0].is_fast());
+    assert_eq!(dataset.turns[0].service_tier.as_deref(), Some("priority"));
+    assert!(dataset.turns[0].is_fast());
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 25);
+    assert_eq!(dataset.calls[0].service_tier.as_deref(), Some("priority"));
     assert_eq!(dataset.rate_observations.len(), 1);
     assert_eq!(
         dataset.rate_observations[0]
@@ -1735,6 +1758,281 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             .iter()
             .all(|warning| !warning.contains("counter reset"))
     );
+}
+
+#[test]
+fn inherits_only_compatible_plain_subagent_thread_settings() {
+    let cases = [
+        (
+            "priority",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![json!({"model": "gpt-child", "service_tier": "priority"})],
+            "gpt-child",
+            Some("priority"),
+        ),
+        (
+            "implicit-default",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![json!({"model": "gpt-child", "service_tier": null})],
+            "gpt-child",
+            Some("default"),
+        ),
+        (
+            "omitted-default",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![json!({"model": "gpt-child"})],
+            "gpt-child",
+            Some("default"),
+        ),
+        (
+            "newer-omitted-default",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![
+                json!({"model": "gpt-child", "service_tier": "priority"}),
+                json!({"model": "gpt-child"}),
+            ],
+            "gpt-child",
+            Some("default"),
+        ),
+        (
+            "custom-role",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": "reviewer"}}),
+            vec![json!({"model": "gpt-child", "service_tier": "priority"})],
+            "gpt-child",
+            None,
+        ),
+        (
+            "legacy-metadata",
+            json!({"thread_spawn": {"parent_thread_id": "parent"}}),
+            vec![json!({"model": "gpt-child", "service_tier": "priority"})],
+            "gpt-child",
+            None,
+        ),
+        (
+            "model-override",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![json!({"model": "gpt-parent", "service_tier": "priority"})],
+            "gpt-child",
+            None,
+        ),
+        (
+            "invalid-tier",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![json!({"model": "gpt-child", "service_tier": 42})],
+            "gpt-child",
+            None,
+        ),
+        (
+            "newer-invalid-clears-priority",
+            json!({"thread_spawn": {"parent_thread_id": "parent", "agent_role": null}}),
+            vec![
+                json!({"model": "gpt-child", "service_tier": "priority"}),
+                json!({"model": "gpt-child", "service_tier": 42}),
+            ],
+            "gpt-child",
+            None,
+        ),
+    ];
+
+    for (name, subagent, settings, child_model, expected_tier) in cases {
+        let temp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let child_id = format!("child-{name}");
+        let child_turn = format!("turn-{name}");
+        let path = temp.path().join(format!("sessions/rollout-{name}.jsonl"));
+        let mut records = vec![
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "timestamp": timestamp(now),
+                    "source": {"subagent": subagent}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "parent", "timestamp": timestamp(now)}
+            }),
+        ];
+        records.extend(settings.into_iter().map(|settings| {
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": settings
+                }
+            })
+        }));
+        records.extend([
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": usage(80, 30, 20, 4, 100)}}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": child_turn, "started_at": now.timestamp()}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "turn_context",
+                    "payload": {"turn_id": child_turn, "model": child_model}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": usage(100, 35, 25, 5, 125)}}
+                }),
+            ]);
+        write_jsonl(&path, &records, false);
+
+        let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+        assert_eq!(dataset.turns.len(), 1, "{name}");
+        assert_eq!(
+            dataset.turns[0].service_tier.as_deref(),
+            expected_tier,
+            "{name}"
+        );
+        assert_eq!(
+            dataset.calls[0].service_tier.as_deref(),
+            expected_tier,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn newer_child_settings_override_inherited_thread_spawn_settings() {
+    let cases = [
+        (
+            "priority",
+            json!({"model": "gpt-child", "service_tier": "priority"}),
+            Some("priority"),
+        ),
+        (
+            "null-default",
+            json!({"model": "gpt-child", "service_tier": null}),
+            Some("default"),
+        ),
+        (
+            "omitted-default",
+            json!({"model": "gpt-child"}),
+            Some("default"),
+        ),
+        (
+            "invalid",
+            json!({"model": "gpt-child", "service_tier": 42}),
+            None,
+        ),
+    ];
+
+    for (name, child_settings, expected_tier) in cases {
+        let temp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let path = temp
+            .path()
+            .join(format!("sessions/rollout-child-tier-{name}.jsonl"));
+        write_jsonl(
+            &path,
+            &[
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "child",
+                        "timestamp": timestamp(now),
+                        "source": {"subagent": {"thread_spawn": {
+                            "parent_thread_id": "parent",
+                            "agent_role": null
+                        }}}
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "session_meta",
+                    "payload": {"id": "parent", "timestamp": timestamp(now)}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {"model": "gpt-child", "service_tier": "priority"}
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": usage(80, 30, 20, 4, 100)}}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "setup-turn", "started_at": now.timestamp()}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "turn_context",
+                    "payload": {"turn_id": "setup-turn", "model": "gpt-child"}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": "setup-turn"}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {"model": "gpt-child", "service_tier": "priority"}
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "child-turn", "started_at": now.timestamp()}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": child_settings
+                    }
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "turn_context",
+                    "payload": {"turn_id": "child-turn", "model": "gpt-child"}
+                }),
+                json!({
+                    "timestamp": timestamp(now),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": usage(100, 35, 25, 5, 125)}}
+                }),
+            ],
+            false,
+        );
+
+        let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+        assert_eq!(dataset.turns.len(), 2, "{name}");
+        let child_turn = dataset
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == "child-turn")
+            .unwrap();
+        assert_eq!(child_turn.service_tier.as_deref(), expected_tier, "{name}");
+        assert_eq!(
+            dataset.calls[0].service_tier.as_deref(),
+            expected_tier,
+            "{name}"
+        );
+    }
 }
 
 #[test]

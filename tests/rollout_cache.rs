@@ -981,25 +981,52 @@ fn cache_preserves_foreign_parent_counter_baseline() {
     write_jsonl(
         &path,
         &[
-            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": child_id, "timestamp": timestamp(now)}}),
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {
+                "id": child_id,
+                "timestamp": timestamp(now),
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": "019f52ac-7a9f-7fd1-8dda-e775ef950785",
+                    "agent_role": null
+                }}}
+            }}),
             json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "019f52ac-7a9f-7fd1-8dda-e775ef950785"}}),
             json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(75)}}}),
             json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(100)}}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": child_turn}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(125)}}}),
         ],
     );
 
     let scan_config = config(temp.path());
     let mut cache = RolloutCache::new();
-    let first = cache.scan(&scan_config, now).unwrap();
-    assert_eq!(first.tasks[0].token_usage.total_tokens, 25);
-    assert_eq!(first.turns[0].token_usage.total_tokens, 25);
+    let prefix = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(prefix.tasks[0].token_usage.total_tokens, 0);
+    assert!(prefix.turns.is_empty());
     assert_eq!(cache.metrics().foreign_baseline_events, 1);
 
-    let second = cache.scan(&scan_config, now).unwrap();
+    append_jsonl(
+        &path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "gpt-child", "service_tier": null}}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": child_turn}}),
+            json!({"timestamp": timestamp(now), "type": "turn_context", "payload": {"turn_id": child_turn, "model": "gpt-child"}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(125)}}}),
+        ],
+    );
+
+    let completed = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(cache.last_refresh().tail_parsed_files, 1);
+    assert_eq!(completed.tasks[0].token_usage.total_tokens, 25);
+    assert_eq!(completed.turns[0].token_usage.total_tokens, 25);
+    assert_eq!(completed.turns[0].service_tier.as_deref(), Some("default"));
+    assert_eq!(completed.calls[0].service_tier.as_deref(), Some("default"));
+
+    let second = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
     assert_eq!(cache.last_refresh().reused_files, 1);
     assert_eq!(second.tasks[0].token_usage.total_tokens, 25);
+    assert_eq!(second.turns[0].service_tier.as_deref(), Some("default"));
     assert!(
         second
             .warnings

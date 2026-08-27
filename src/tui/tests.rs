@@ -3071,6 +3071,60 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
 }
 
 #[test]
+fn collapsed_tree_root_renders_its_full_subtree_api_cost_range_and_unpriced_marker() {
+    const PICO_USD_PER_USD: u128 = 1_000_000_000_000;
+
+    let mut app = interaction_test_app(3, 0);
+    set_task_metadata(&mut app, 2, "root pricing", Some("desktop"));
+    set_task_parent(&mut app, 0, 2);
+    set_task_parent(&mut app, 1, 0);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+
+    let analysis = app.snapshot.window_analyses.last_mut().unwrap();
+    let template = analysis.threads[0].usage;
+    let mut ranged_child = ranged_api_cost(2, 4);
+    ranged_child.priced_samples = ranged_child.observed_samples;
+    ranged_child.priced_tokens = ranged_child.observed_tokens;
+    let unpriced_grandchild = ApiCostAmount {
+        observed_samples: 1,
+        observed_tokens: 100,
+        ..ApiCostAmount::default()
+    };
+    analysis.threads = [
+        (2, exact_api_cost(PICO_USD_PER_USD)),
+        (0, ranged_child),
+        (1, unpriced_grandchild),
+    ]
+    .into_iter()
+    .map(|(task_index, api_equivalent_cost)| ThreadWindowUsage {
+        thread_id: app.snapshot.tasks[task_index].thread_id.clone(),
+        usage: WindowUsage {
+            api_equivalent_cost,
+            ..template
+        },
+    })
+    .collect();
+
+    expand_task_tree(&mut app);
+    app.selected_task = 2;
+    assert!(app.set_task_collapsed(2, true));
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+    terminal
+        .draw(|frame| render_tasks(frame, frame.area(), &mut app, true))
+        .unwrap();
+    let rows = (0..12)
+        .map(|y| buffer_rect_row_text(terminal.backend().buffer(), Rect::new(0, 0, 120, 12), y))
+        .collect::<Vec<_>>();
+    let root_row = rows
+        .iter()
+        .find(|row| row.contains("root pricing"))
+        .expect("collapsed root row should render");
+
+    assert!(root_row.contains("$3.0000–$5.0000+"), "{root_row}");
+}
+
+#[test]
 fn tree_plus_minus_toggle_selected_parent_but_search_consumes_the_symbols() {
     let mut app = interaction_test_app(3, 2);
     set_task_parent(&mut app, 0, 2);

@@ -5,7 +5,7 @@ use crate::domain::{
     UsageCall,
 };
 
-pub const API_PRICING_CATALOG_REVISION: u32 = 1;
+pub const API_PRICING_CATALOG_REVISION: u32 = 2;
 pub const API_PRICING_RATES_AS_OF: &str = "2026-08-27";
 pub const API_PRICING_SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing";
 
@@ -13,6 +13,7 @@ const LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
 const PICO_USD_PER_USD: u128 = 1_000_000_000_000;
 
 const MODEL_UNKNOWN: &str = "api_price_model_unknown";
+const AUTO_REVIEW_LUNA_PROXY: &str = "api_price_codex_auto_review_luna_proxy";
 const SERVICE_TIER_UNKNOWN: &str = "api_price_service_tier_unknown";
 const SERVICE_TIER_UNAVAILABLE: &str = "api_price_service_tier_unavailable";
 const TOKEN_BREAKDOWN_MISSING: &str = "api_price_token_breakdown_missing";
@@ -76,6 +77,7 @@ struct CallCost {
     observed_tokens: u64,
     priced: bool,
     partial_reason: Option<&'static str>,
+    assumption_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +102,9 @@ impl ApiCostAccumulator {
             self.maximum_pico_usd = self.maximum_pico_usd.saturating_add(cost.maximum_pico_usd);
         }
         if let Some(reason) = cost.partial_reason {
+            self.partial_reasons.insert(reason.to_string());
+        }
+        if let Some(reason) = cost.assumption_reason {
             self.partial_reasons.insert(reason.to_string());
         }
     }
@@ -240,11 +245,19 @@ pub fn format_pico_usd(value: PicoUsd) -> String {
 }
 
 fn price_call(call: &UsageCall) -> CallCost {
+    let mut cost = price_call_inner(call);
+    if is_codex_auto_review(call.model.as_deref()) {
+        cost.assumption_reason = Some(AUTO_REVIEW_LUNA_PROXY);
+    }
+    cost
+}
+
+fn price_call_inner(call: &UsageCall) -> CallCost {
     let observed_tokens = coverage_tokens(call.tokens);
     let Some(model_rates) = model_rates(call.model.as_deref()) else {
         return unpriced(observed_tokens, MODEL_UNKNOWN);
     };
-    let Some(service_tier) = service_tier(call.service_tier.as_deref()) else {
+    let Some(service_tier) = service_tier_for_call(call) else {
         return unpriced(observed_tokens, SERVICE_TIER_UNKNOWN);
     };
     let tier_rates = match service_tier {
@@ -356,6 +369,7 @@ fn priced(
         observed_tokens,
         priced: true,
         partial_reason,
+        assumption_reason: None,
     }
 }
 
@@ -366,6 +380,19 @@ fn unpriced(observed_tokens: u64, partial_reason: &'static str) -> CallCost {
         observed_tokens,
         priced: false,
         partial_reason: Some(partial_reason),
+        assumption_reason: None,
+    }
+}
+
+fn service_tier_for_call(call: &UsageCall) -> Option<ServiceTier> {
+    let recorded = call
+        .service_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match recorded {
+        None if is_codex_auto_review(call.model.as_deref()) => Some(ServiceTier::Standard),
+        _ => service_tier(recorded),
     }
 }
 
@@ -386,6 +413,10 @@ fn model_name(call: &UsageCall) -> &str {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .unwrap_or("unknown")
+}
+
+fn is_codex_auto_review(model: Option<&str>) -> bool {
+    model.is_some_and(|model| model.trim().eq_ignore_ascii_case("codex-auto-review"))
 }
 
 fn model_rates(model: Option<&str>) -> Option<ModelRates> {
@@ -435,7 +466,9 @@ fn model_rates(model: Option<&str>) -> Option<ModelRates> {
                 )),
             }),
         })
-    } else if model.eq_ignore_ascii_case("gpt-5.6-luna") {
+    } else if model.eq_ignore_ascii_case("gpt-5.6-luna")
+        || model.eq_ignore_ascii_case("codex-auto-review")
+    {
         Some(ModelRates {
             standard: TierRates {
                 short: TokenRates::new(200_000, 20_000, Some(250_000), 1_200_000),
@@ -841,7 +874,7 @@ mod tests {
         let fast = price_call(&call("gpt-5.6-terra", Some("priority"), tokens));
         assert_eq!(fast.minimum_pico_usd, 8_000_000_000_000);
 
-        let unknown_model = price_call(&call("codex-auto-review", None, tokens));
+        let unknown_model = price_call(&call("unknown-model", None, tokens));
         assert!(!unknown_model.priced);
         assert_eq!(unknown_model.partial_reason, Some(MODEL_UNKNOWN));
 
@@ -854,6 +887,103 @@ mod tests {
         let missing_tier = price_call(&missing_tier);
         assert!(!missing_tier.priced);
         assert_eq!(missing_tier.partial_reason, Some(SERVICE_TIER_UNKNOWN));
+    }
+
+    #[test]
+    fn auto_review_uses_the_luna_proxy_and_defaults_only_a_missing_tier() {
+        let tokens = TokenUsage {
+            input_tokens: 100_000,
+            cached_input_tokens: 20_000,
+            cache_write_input_tokens: 10_000,
+            output_tokens: 5_000,
+            total_tokens: 105_000,
+            ..TokenUsage::default()
+        };
+        let luna_standard = price_call(&call("gpt-5.6-luna", None, tokens));
+        let luna_fast = price_call(&call("gpt-5.6-luna", Some("priority"), tokens));
+
+        let mut missing_tier = call("codex-auto-review", None, tokens);
+        missing_tier.service_tier = None;
+        let auto_review_standard = price_call(&missing_tier);
+        assert!(auto_review_standard.priced);
+        assert_eq!(
+            auto_review_standard.minimum_pico_usd,
+            luna_standard.minimum_pico_usd
+        );
+        assert_eq!(
+            auto_review_standard.assumption_reason,
+            Some(AUTO_REVIEW_LUNA_PROXY)
+        );
+
+        let auto_review_fast = price_call(&call("codex-auto-review", Some("priority"), tokens));
+        assert_eq!(
+            auto_review_fast.minimum_pico_usd,
+            luna_fast.minimum_pico_usd
+        );
+
+        let unknown_tier = price_call(&call("codex-auto-review", Some("future-tier"), tokens));
+        assert!(!unknown_tier.priced);
+        assert_eq!(unknown_tier.partial_reason, Some(SERVICE_TIER_UNKNOWN));
+        assert_eq!(unknown_tier.assumption_reason, Some(AUTO_REVIEW_LUNA_PROXY));
+
+        let unknown_tier_call = call("codex-auto-review", Some("future-tier"), tokens);
+        let mut unknown_tier_aggregation = ApiCostAggregation::default();
+        unknown_tier_aggregation.add_call(&unknown_tier_call);
+        let unknown_tier_summary = unknown_tier_aggregation.total();
+        assert_eq!(unknown_tier_summary.amount.priced_samples, 0);
+        assert_eq!(unknown_tier_summary.amount.priced_tokens, 0);
+        assert_eq!(
+            unknown_tier_summary.partial_reasons,
+            vec![
+                AUTO_REVIEW_LUNA_PROXY.to_string(),
+                SERVICE_TIER_UNKNOWN.to_string()
+            ]
+        );
+        assert_eq!(format_api_equivalent_cost(&unknown_tier_summary), "-");
+
+        let mut aggregation = ApiCostAggregation::default();
+        aggregation.add_call(&missing_tier);
+        let summary = aggregation.total();
+        assert_eq!(summary.amount.observed_samples, 1);
+        assert_eq!(summary.amount.priced_samples, 1);
+        assert_eq!(summary.amount.priced_token_percent(), 100.0);
+        assert_eq!(
+            summary.partial_reasons,
+            vec![AUTO_REVIEW_LUNA_PROXY.to_string()]
+        );
+        assert_eq!(summary.model_breakdown.len(), 1);
+        assert_eq!(summary.model_breakdown[0].model, "codex-auto-review");
+        assert_eq!(summary.model_breakdown[0].amount, summary.amount);
+        assert_eq!(format_api_equivalent_cost(&summary), "$0.0229");
+
+        let long_tokens = TokenUsage {
+            input_tokens: 300_000,
+            cached_input_tokens: 100_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 20_000,
+            total_tokens: 320_000,
+            ..TokenUsage::default()
+        };
+        let luna_long = price_call(&call("gpt-5.6-luna", None, long_tokens));
+        let mut auto_review_long = call("codex-auto-review", None, long_tokens);
+        auto_review_long.service_tier = None;
+        let exact_long = price_call(&auto_review_long);
+        assert_eq!(exact_long.minimum_pico_usd, luna_long.minimum_pico_usd);
+        assert_eq!(exact_long.maximum_pico_usd, luna_long.maximum_pico_usd);
+
+        auto_review_long.request_usage_exact = false;
+        let ambiguous_long = price_call(&auto_review_long);
+        assert!(ambiguous_long.minimum_pico_usd < ambiguous_long.maximum_pico_usd);
+        assert_eq!(ambiguous_long.partial_reason, Some(LONG_CONTEXT_AMBIGUOUS));
+        let mut aggregation = ApiCostAggregation::default();
+        aggregation.add_call(&auto_review_long);
+        assert_eq!(
+            aggregation.total().partial_reasons,
+            vec![
+                AUTO_REVIEW_LUNA_PROXY.to_string(),
+                LONG_CONTEXT_AMBIGUOUS.to_string()
+            ]
+        );
     }
 
     #[test]

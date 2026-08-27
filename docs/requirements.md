@@ -112,6 +112,7 @@ task/thread -> turn -> model token events
 - task 完成后迟到的最终 token 仍归入刚完成的 turn；
 - 用户消息有显式 `turn_id` 时按其归属；缺失时只归入当前 active turn，没有 active turn 时不猜测归属；
 - subagent rollout 内嵌的 parent 历史不得重复计入 parent 或 child；
+- 当前结构化的普通 ThreadSpawn subagent 可从经过 provenance gate 的 settings snapshot 还原 service tier，但必须同时满足 metadata 明确为 `agent_role=null` 且 child model 完全匹配；较新 snapshot 覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。旧版、自定义 role、model mismatch 及其他缺 tier 记录不得猜价；唯一策略例外是 `codex-auto-review` 的 `API EQ.` 固定使用 `gpt-5.6-luna` 价格 profile，缺失 tier 按 Standard，保留原始 model label，并加入 `api_price_codex_auto_review_luna_proxy`；
 - TUI 显示 total，JSON 同时显示 input、cached input、output、reasoning output 和 total。
 
 ### FR-5 一次性输出

@@ -22,7 +22,7 @@ use crate::session_index::load_thread_titles;
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 4;
+const ROLLOUT_PARSER_REVISION: u32 = 5;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -113,13 +113,17 @@ enum ParsedEvent {
         payload: Map<String, Value>,
     },
     ForeignCounterBaseline(TokenUsage),
+    ForeignThreadSettingsBaseline {
+        model: Option<String>,
+        service_tier: Option<String>,
+    },
     UserMessage {
         preview: String,
         turn_id: Option<String>,
         source: UserMessageSource,
     },
     ThreadSettingsApplied {
-        service_tier: String,
+        service_tier: Option<String>,
     },
     TurnContext {
         timestamp: DateTime<Utc>,
@@ -200,6 +204,8 @@ struct ParsedFile {
     tail_guard: TailGuard,
     #[serde(default)]
     foreign_baseline_events: usize,
+    #[serde(default)]
+    inherit_foreign_thread_settings: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -559,6 +565,8 @@ struct ThreadBuilder {
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     service_tier: Option<String>,
+    service_tier_observed: bool,
+    inherited_thread_settings: Option<(String, String)>,
     active_turn_ids: Vec<String>,
     last_turn_id: Option<String>,
     previous_cumulative: Option<TokenUsage>,
@@ -2262,6 +2270,7 @@ fn parse_rollout_reader<R: BufRead>(
     let mut owning_thread_id = parsed.owner_thread_id.clone();
     let mut owning_created_at = parsed.owning_created_at;
     let mut replaying_foreign_history = parsed.replaying_foreign_history;
+    let mut inherit_foreign_thread_settings = parsed.inherit_foreign_thread_settings;
 
     for line in reader.lines() {
         parsed.source_lines = parsed.source_lines.saturating_add(1);
@@ -2325,6 +2334,8 @@ fn parse_rollout_reader<R: BufRead>(
                     owning_thread_id = Some(thread_id.clone());
                     parsed.owner_thread_id = Some(thread_id);
                     replaying_foreign_history = is_forked_session(payload);
+                    inherit_foreign_thread_settings =
+                        inherits_plain_thread_spawn_settings(payload, owning_thread_id.as_deref());
                     parsed.events.push(ParsedEvent::SessionMeta {
                         timestamp,
                         payload: projected_payload(
@@ -2396,11 +2407,22 @@ fn parse_rollout_reader<R: BufRead>(
                 // turns, titles, or rate observations.
                 if record_type == Some("event_msg")
                     && let Some(payload) = object_at(&record, &["payload"])
-                    && string_field_in(payload, &["type"]) == Some("token_count")
-                    && let Some(total_usage) = total_token_usage(payload)
-                    && retain_latest_foreign_baseline(&mut parsed.events, total_usage)
                 {
-                    parsed.foreign_baseline_events += 1;
+                    if string_field_in(payload, &["type"]) == Some("token_count")
+                        && let Some(total_usage) = total_token_usage(payload)
+                        && retain_latest_foreign_baseline(&mut parsed.events, total_usage)
+                    {
+                        parsed.foreign_baseline_events += 1;
+                    } else if inherit_foreign_thread_settings
+                        && string_field_in(payload, &["type"]) == Some("thread_settings_applied")
+                    {
+                        let (model, service_tier) = inherited_thread_settings_snapshot(payload);
+                        retain_latest_foreign_thread_settings(
+                            &mut parsed.events,
+                            model,
+                            service_tier,
+                        );
+                    }
                 }
                 continue;
             }
@@ -2445,18 +2467,16 @@ fn parse_rollout_reader<R: BufRead>(
                         }
                     } else if string_field_in(payload, &["type"]) == Some("thread_settings_applied")
                     {
-                        if let Some(service_tier) = payload
+                        let service_tier = payload
                             .get("thread_settings")
                             .or_else(|| payload.get("threadSettings"))
                             .and_then(Value::as_object)
                             .and_then(|settings| {
-                                string_field_in(settings, &["service_tier", "serviceTier"])
-                            })
-                        {
-                            parsed.events.push(ParsedEvent::ThreadSettingsApplied {
-                                service_tier: service_tier.to_owned(),
+                                normalized_service_tier(settings, inherit_foreign_thread_settings)
                             });
-                        }
+                        parsed
+                            .events
+                            .push(ParsedEvent::ThreadSettingsApplied { service_tier });
                     } else {
                         cache_event_message(&mut parsed.events, payload, timestamp, line_number);
                     }
@@ -2479,18 +2499,50 @@ fn parse_rollout_reader<R: BufRead>(
     }
     parsed.owning_created_at = owning_created_at;
     parsed.replaying_foreign_history = replaying_foreign_history;
+    parsed.inherit_foreign_thread_settings = inherit_foreign_thread_settings;
     parsed.complete = true;
     parsed
 }
 
 fn retain_latest_foreign_baseline(events: &mut Vec<ParsedEvent>, total_usage: TokenUsage) -> bool {
-    if let Some(ParsedEvent::ForeignCounterBaseline(previous)) = events.last_mut() {
-        *previous = total_usage;
-        false
-    } else {
-        events.push(ParsedEvent::ForeignCounterBaseline(total_usage));
-        true
+    for event in events.iter_mut().rev() {
+        match event {
+            ParsedEvent::ForeignCounterBaseline(previous) => {
+                *previous = total_usage;
+                return false;
+            }
+            ParsedEvent::ForeignThreadSettingsBaseline { .. } | ParsedEvent::SessionMeta { .. } => {
+            }
+            _ => break,
+        }
     }
+    events.push(ParsedEvent::ForeignCounterBaseline(total_usage));
+    true
+}
+
+fn retain_latest_foreign_thread_settings(
+    events: &mut Vec<ParsedEvent>,
+    model: Option<String>,
+    service_tier: Option<String>,
+) {
+    for event in events.iter_mut().rev() {
+        match event {
+            ParsedEvent::ForeignThreadSettingsBaseline {
+                model: previous_model,
+                service_tier: previous_service_tier,
+            } => {
+                *previous_model = model;
+                *previous_service_tier = service_tier;
+                return;
+            }
+            ParsedEvent::ForeignCounterBaseline(_) | ParsedEvent::SessionMeta { .. } => {}
+            _ => break,
+        }
+    }
+    events.push(ParsedEvent::ForeignThreadSettingsBaseline {
+        model,
+        service_tier,
+    });
 }
 
 fn cache_event_message(
@@ -2638,6 +2690,70 @@ fn is_forked_session(payload: &Map<String, Value>) -> bool {
         || is_subagent_session(payload)
 }
 
+fn inherits_plain_thread_spawn_settings(
+    payload: &Map<String, Value>,
+    owner_thread_id: Option<&str>,
+) -> bool {
+    // Current plain ThreadSpawn children start from the parent's effective turn
+    // configuration. Keep this deliberately version/provenance gated: older
+    // metadata and role-customized agents do not prove the same inheritance.
+    if nested_subagent_parent_thread_id(payload, owner_thread_id).is_none() {
+        return false;
+    }
+    let Some(thread_spawn) = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("subagent").or_else(|| source.get("subAgent")))
+        .and_then(Value::as_object)
+        .and_then(|subagent| {
+            subagent
+                .get("thread_spawn")
+                .or_else(|| subagent.get("threadSpawn"))
+        })
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+
+    thread_spawn
+        .get("agent_role")
+        .or_else(|| thread_spawn.get("agentRole"))
+        .is_some_and(Value::is_null)
+}
+
+fn inherited_thread_settings_snapshot(
+    payload: &Map<String, Value>,
+) -> (Option<String>, Option<String>) {
+    let Some(settings) = payload
+        .get("thread_settings")
+        .or_else(|| payload.get("threadSettings"))
+        .and_then(Value::as_object)
+    else {
+        return (None, None);
+    };
+    let model = string_field_in(settings, &["model"])
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned);
+    (model, normalized_service_tier(settings, true))
+}
+
+fn normalized_service_tier(
+    settings: &Map<String, Value>,
+    implicit_default_is_proven: bool,
+) -> Option<String> {
+    match settings
+        .get("service_tier")
+        .or_else(|| settings.get("serviceTier"))
+    {
+        // Only a provenance-gated plain ThreadSpawn proves that absent/null is
+        // the inherited implicit API default. Other records remain unknown.
+        None | Some(Value::Null) if implicit_default_is_proven => Some("default".to_owned()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+        _ => None,
+    }
+}
+
 fn session_parent_thread_id<'a>(
     payload: &'a Map<String, Value>,
     owner_thread_id: Option<&str>,
@@ -2759,6 +2875,15 @@ fn replay_rollout_file(
             ParsedEvent::ForeignCounterBaseline(total_usage) => {
                 thread.previous_cumulative = Some(*total_usage);
             }
+            ParsedEvent::ForeignThreadSettingsBaseline {
+                model,
+                service_tier,
+            } => {
+                thread.inherited_thread_settings = model
+                    .as_ref()
+                    .zip(service_tier.as_ref())
+                    .map(|(model, service_tier)| (model.clone(), service_tier.clone()));
+            }
             ParsedEvent::UserMessage {
                 preview,
                 turn_id,
@@ -2767,7 +2892,7 @@ fn replay_rollout_file(
                 apply_user_message(thread, preview, turn_id.as_deref(), *source);
             }
             ParsedEvent::ThreadSettingsApplied { service_tier } => {
-                thread.service_tier = Some(service_tier.clone());
+                apply_thread_settings(thread, service_tier.clone());
             }
             ParsedEvent::TurnContext { timestamp, payload } => {
                 apply_turn_context(thread, payload, *timestamp);
@@ -2924,14 +3049,40 @@ fn apply_turn_context(
     {
         activate_turn(thread, &turn_id, timestamp);
     }
+    let explicit_service_tier = thread.service_tier.clone();
+    let explicit_service_tier_observed = thread.service_tier_observed;
+    let inherited_thread_settings = thread.inherited_thread_settings.clone();
     let turn = ensure_turn(thread, &turn_id);
     if let Some(model) = string_field_in(payload, &["model"]) {
         turn.model = Some(model.to_owned());
+        if turn.service_tier.is_none() {
+            if explicit_service_tier_observed {
+                turn.service_tier = explicit_service_tier;
+            } else if let Some((inherited_model, inherited_service_tier)) =
+                inherited_thread_settings
+                && inherited_model.trim().eq_ignore_ascii_case(model.trim())
+            {
+                turn.service_tier = Some(inherited_service_tier);
+            }
+        }
     }
     if let Some(reasoning_effort) =
         string_field_in(payload, &["effort", "reasoning_effort", "reasoningEffort"])
     {
         turn.reasoning_effort = Some(reasoning_effort.to_owned());
+    }
+}
+
+fn apply_thread_settings(thread: &mut ThreadBuilder, service_tier: Option<String>) {
+    thread.service_tier_observed = true;
+    thread.service_tier = service_tier.clone();
+    // A settings event can arrive after task_started but before the turn's
+    // first model call. Supersede the activation snapshot for every live turn;
+    // completed historical turns are no longer present in active_turn_ids.
+    for turn_id in thread.active_turn_ids.clone() {
+        if let Some(turn) = thread.turns.get_mut(&turn_id) {
+            turn.service_tier = service_tier.clone();
+        }
     }
 }
 

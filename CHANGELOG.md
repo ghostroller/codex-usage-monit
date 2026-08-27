@@ -14,6 +14,12 @@ All notable changes to this project are documented in this file.
 
 - Clarified the Overview long-context control as `[L]EST Longx`: it changes only the optional Codex quota estimate projection. API-equivalent cost always follows the API pricing catalog and is unaffected by this display preference.
 - Tasks and Turns now show an independent `API EQ.` value for each visible row in the selected 5-hour or weekly scope. These values are not lifetime totals, show `-` when the selected window or all local data is unavailable, append `+` when incomplete rollout coverage makes the subtotal a lower bound, and do not change when `EST Longx` is toggled. API columns size to the rendered values instead of truncating ranges; identity columns remain fixed, while narrow panels may temporarily omit lower-priority enabled metric columns.
+- Current plain ThreadSpawn subagents can now recover their effective service tier from provenance-gated settings snapshots when structured spawn metadata explicitly records no custom role and the child model matches. Newer settings always supersede older state; only in this gated path does an absent or null tier mean API `default`. Legacy/custom-role/model-mismatch records and other missing or unknown tiers remain unpriced instead of using a guessed API rate.
+- `codex-auto-review` now uses `gpt-5.6-luna` as an explicit API-pricing proxy while retaining its observed model label. Recorded Standard/Fast tiers are honored, a missing tier defaults to Standard, and `api_price_codex_auto_review_luna_proxy` discloses the routing assumption without reducing priced coverage; the API pricing catalog revision is now 2.
+
+### Fixed
+
+- Added a rendered tree regression for collapsed API-equivalent totals: the visible parent includes its own amount and every hidden descendant, preserves min/max ranges, and appends `+` when any hidden usage remains unpriced.
 
 ### Compatibility
 

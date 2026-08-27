@@ -833,6 +833,59 @@ fn api_cost_keeps_unpriced_spark_in_coverage_without_degrading_quota_status() {
 }
 
 #[test]
+fn auto_review_uses_luna_only_for_api_pricing_and_keeps_its_observed_identity() {
+    let now = at(12, 0);
+    let analysis = analyze_windows(
+        &[],
+        &[],
+        &[call(
+            at(11, 0),
+            "review-thread",
+            "review-turn",
+            Some("codex-auto-review"),
+            100_000,
+        )],
+        &[],
+        &[codex_limit(now, 40.0, 300, at(14, 0))],
+        now,
+    )
+    .remove(0);
+
+    assert_eq!(analysis.api_equivalent_cost.amount.observed_samples, 1);
+    assert_eq!(analysis.api_equivalent_cost.amount.priced_samples, 1);
+    assert_eq!(
+        analysis.api_equivalent_cost.partial_reasons,
+        vec!["api_price_codex_auto_review_luna_proxy".to_string()]
+    );
+    let api_model = analysis
+        .api_equivalent_cost
+        .model_breakdown
+        .iter()
+        .find(|model| model.model == "codex-auto-review")
+        .unwrap();
+    assert_eq!(api_model.amount.priced_samples, 1);
+    assert_eq!(analysis.models[0].model, "codex-auto-review");
+    assert_eq!(analysis.models[0].api_equivalent_cost.priced_samples, 1);
+    assert_eq!(
+        analysis.threads[0].usage.api_equivalent_cost.priced_samples,
+        1
+    );
+    assert_eq!(
+        analysis.turns[0].usage.api_equivalent_cost.priced_samples,
+        1
+    );
+
+    // API pricing uses the explicit Luna proxy, while the independent Codex
+    // quota estimator keeps its existing unknown-model fallback semantics.
+    assert!(analysis.partial);
+    assert!(
+        analysis
+            .partial_reasons
+            .contains(&"unpriced_model_rate_fallback".to_string())
+    );
+}
+
+#[test]
 fn only_codex_limit_buckets_are_analyzed() {
     let now = at(12, 0);
     let reset = at(14, 0);

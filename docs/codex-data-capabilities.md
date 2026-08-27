@@ -107,7 +107,7 @@ TUI 中的 Tasks 会话行与 Turns 对话行分别从当前选中的 5 小时�
 
 每次调用按 `普通 input = input - cached input - cache-write input`、cached input、cache-write input 和 output 分项计价。`reasoningOutputTokens` 已包含在 output 中，不重复收费。金额以 pico-USD 整数累计并在 JSON 中序列化为十进制字符串，避免浮点和 JavaScript 大整数精度损失。
 
-准确的单次请求 input 严格大于 272K 时使用公开的 long-context 价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。若累计增量大于阈值但无法确认请求边界，并且该模型同时有完整的 short/long 费率，则输出两种解释形成的金额区间。未知模型、未知或缺失的服务层、官方没有公布的 Fast/long 行、缺少或互相矛盾的 token breakdown，以及出现 cache write 但该模型没有公开写入费率时，对应 token 保持未计价，并降低 `pricedTokens / observedTokens` 覆盖率，不会套用 Luna 或其他后备价格。`observedSamples` / `pricedSamples` 统计 rollout usage delta；非精确 sample 可能包含多个请求，不能解释为请求数。`modelBreakdown` 保留包括 Spark 在内的所有观察模型，使总覆盖率可以按模型对账。未计价 sample 或本地 rollout 覆盖不完整时，小计末尾显示 `+` 作为下界；极小正金额显示 `<$0.000001`，已知金额为零与完全无法计价分别显示为 `$0.0000` 和 `-`。
+准确的单次请求 input 严格大于 272K 时使用公开的 long-context 价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。若累计增量大于阈值但无法确认请求边界，并且该模型同时有完整的 short/long 费率，则输出两种解释形成的金额区间。当前结构化的普通 ThreadSpawn subagent 只有在 metadata 明确记录 `agent_role=null`，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，才还原其有效服务层；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。`codex-auto-review` 是唯一明确的模型计价代理：按 `gpt-5.6-luna` 费率、保留已记录的 Standard/Fast tier、缺失 tier 按 Standard，同时保留原始 model label 并加入 `api_price_codex_auto_review_luna_proxy`；该映射是应用假设，不是官方 API alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知的服务层、其他未知模型、缺少 Fast/long 行、缺少或互相矛盾的 token breakdown，以及出现 cache write 但该模型没有公开写入费率时，对应 token 保持未计价，并降低 `pricedTokens / observedTokens` 覆盖率，不会套用其他后备价格。`observedSamples` / `pricedSamples` 统计 rollout usage delta；非精确 sample 可能包含多个请求，不能解释为请求数。`modelBreakdown` 保留包括 Spark 在内的所有观察模型，使总覆盖率可以按模型对账。未计价 sample 或本地 rollout 覆盖不完整时，小计末尾显示 `+` 作为下界；极小正金额显示 `<$0.000001`，已知金额为零与完全无法计价分别显示为 `$0.0000` 和 `-`。
 
 Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有 `>272K` 的倍率说明，但通用价格表的 Cyber long-context 单元格仍为 `-`，且模型页同时列出 272K maximum input。实现以通用价格目录为准，将这种长调用保持未计价并降低 coverage，不猜测一个无法由公开价目表完整支持的金额。
 
@@ -185,7 +185,7 @@ turn_token_share = turn_total_tokens / observed_local_window_total_tokens
 
 公告中的 GPT-Image-2.0 同时给出 image 与 text 两套计费行；当前 rollout `UsageCall` 不暴露足以区分这两种计费模态的字段，因此实现不会仅凭模型名套用其中任意一行。若该模型名出现在普通 token 调用中，它会走未知模型的 Luna 后备并标记 partial，而不会伪装成精确的 GPT-Image 费率。
 
-模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。在额度 EST 中，`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。API 等价费用采用更严格的证据口径：缺失或未知 service tier 不假定 Standard，而是降低已计价覆盖率。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识，额度 EST 仍保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
+模型名采用去除首尾空白后的大小写不敏感精确匹配，不从未知后缀猜测基础模型。在额度 EST 中，`serviceTier=fast` 与本地登录态 rollout 中兼容的 `serviceTier=priority` 值都使用该模型适用的 ChatGPT Fast 倍率；缺失、`default` 或其他 service tier 使用 Standard。这里的 `priority` 是 rollout 兼容映射，不代表官方文档中另行计费的 API Priority。API 等价费用采用更严格的证据口径：只有按上述 ThreadSpawn 规则可靠还原后才把省略/null 字段解释为 `default`；除上述 `codex-auto-review` 策略例外外，其余缺失或未知 service tier 不假定 Standard，而是降低已计价覆盖率。GPT-5.3-Codex 和 GPT-5.2 没有列在 Speed 支持范围内，因此即使遇到异常的 Fast 标识，额度 EST 仍保留 Standard 费率。实现将表中小数按统一比例转成整数 credit units，比例在相对占比中抵消，避免浮点累计误差：
 
 ```text
 local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100

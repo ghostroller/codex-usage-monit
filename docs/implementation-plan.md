@@ -67,7 +67,7 @@ CODEX_HOME/archived_sessions/**/*.jsonl
 
 保留的规范化语义包括 session metadata、subagent 的直接 parent thread id、title preview、最多 72 字符的 turn 用户消息摘要、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。只有 `thread_source=subagent` 或结构化 `source.subagent` 确认身份后才建立 parent link，优先取 `source.subagent.thread_spawn.parent_thread_id`，再兼容顶层 `parent_thread_id` 与旧日志 `forked_from_id` 的 snake/camel 变体；普通 resume/fork 也会带 `forked_from_id`，不得被误归为 subagent。`session_id` 是根会话，不能用于直接父子关系。未知记录忽略，坏行/不可读文件计入 partial。缓存层另外检查 `$CODEX_HOME/session_index.jsonl` 的文件指纹，仅在创建、修改或替换时重新读取，并按 `updated_at` 为每个 thread 选择最新非空 `thread_name`；materialize 使用缓存标题覆盖 title preview。文件缺失、删除、不可读或记录损坏时保留 rollout 回退值，读取失败不缓存为成功结果并在后续刷新重试，redact 模式完全跳过标题索引。单独重命名会在 TUI 下一次刷新生效而无需重解析 rollout。
 
-subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。
+subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。当前普通 ThreadSpawn 的官方实现从 parent turn config 启动 child；parser 只在结构化 metadata 明确带有 `agent_role=null` 时保存经过 provenance gate 的 settings snapshot，并且只在 child `turn_context.model` 完全匹配时还原服务层。较新 snapshot 总会覆盖旧状态；只有在这条路径中省略或 null tier 才规范化为 API `default`，损坏值会清空旧 tier 并保持未知。旧日志缺少该 gate、自定义 role 或 model override 时不继承，也不由 parser 猜测价格。API cost 层另有一个明确、可审计的产品策略例外：`codex-auto-review` 保持原始 label，但使用 Luna 价格 profile，tier 缺失时按 Standard，并附加 proxy partial reason。
 
 ## 4. Rollout 缓存
 
