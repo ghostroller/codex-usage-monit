@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -16,12 +16,21 @@ use super::super::*;
 pub(super) enum ControlId {
     ViewOverview,
     ViewTrends,
+    ViewSummary,
     ViewOther,
     ViewSettings,
     ToggleTurns,
     ToggleModels,
     ScopeFiveHours,
     ScopeWeek,
+    SummaryRangeCycle,
+    SummaryRangeSevenDays,
+    SummaryRangeThirtyDays,
+    SummaryMetricTokens,
+    SummaryMetricEstimated,
+    SummaryMetricApiEquivalent,
+    SummaryLongContext,
+    SummaryToggle,
     SourceAll,
     SourceDesktop,
     SourceSubagent,
@@ -55,12 +64,21 @@ impl ControlId {
         match self {
             Self::ViewOverview => "1",
             Self::ViewTrends => "2",
+            Self::ViewSummary => "U",
             Self::ViewOther => "3",
             Self::ViewSettings => "4",
             Self::ToggleTurns => "V",
             Self::ToggleModels => "M",
             Self::ScopeFiveHours => "5",
             Self::ScopeWeek => "W",
+            Self::SummaryRangeCycle => "C",
+            Self::SummaryRangeSevenDays => "7",
+            Self::SummaryRangeThirtyDays => "M",
+            Self::SummaryMetricTokens => "K",
+            Self::SummaryMetricEstimated => "E",
+            Self::SummaryMetricApiEquivalent => "A",
+            Self::SummaryLongContext => "L",
+            Self::SummaryToggle => "↵",
             Self::SourceAll => "A",
             Self::SourceDesktop => "D",
             Self::SourceSubagent => "S",
@@ -96,6 +114,10 @@ pub(super) struct HarnessState {
     pub(super) turn_search: String,
     pub(super) task_offset: usize,
     pub(super) turn_offset: usize,
+    pub(super) summary_range: SummaryRange,
+    pub(super) summary_metric: SummaryMetric,
+    pub(super) summary_selected_id: Option<String>,
+    pub(super) summary_offset: usize,
     pub(super) quit_confirmation: bool,
     pub(super) resume_confirmation: bool,
 }
@@ -299,10 +321,14 @@ impl TuiHarness {
     }
 
     pub(super) fn render(&mut self) {
+        self.render_at(self.app.snapshot.as_of);
+    }
+
+    pub(super) fn render_at(&mut self, now: DateTime<Utc>) {
         let app = &mut self.app;
         with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
             self.terminal
-                .draw(|frame| super::super::render(frame, app))
+                .draw(|frame| super::super::render_at(frame, app, now))
                 .expect("test frame must render");
         });
     }
@@ -358,6 +384,10 @@ impl TuiHarness {
             turn_search: self.app.turn_search.clone(),
             task_offset: self.app.task_table_offset,
             turn_offset: self.app.turn_offset,
+            summary_range: self.app.summary_range,
+            summary_metric: self.app.summary_metric,
+            summary_selected_id: self.app.summary_selected_id.clone(),
+            summary_offset: self.app.summary_offset,
             quit_confirmation: self.app.quit_confirmation_visible,
             resume_confirmation: self.app.resume_confirmation.is_some(),
         }
@@ -378,6 +408,11 @@ impl TuiHarness {
                 .app
                 .view_tabs_hitbox
                 .map(|hitbox| hitbox.tabs[View::Trends.index()])
+                .unwrap_or_default(),
+            ControlId::ViewSummary => self
+                .app
+                .view_tabs_hitbox
+                .map(|hitbox| hitbox.tabs[View::Summary.index()])
                 .unwrap_or_default(),
             ControlId::ViewOther => self
                 .app
@@ -408,6 +443,24 @@ impl TuiHarness {
                 .app
                 .window_controls_hitbox
                 .map(|hitbox| hitbox.scopes[WindowScope::Week.index()])
+                .unwrap_or_default(),
+            ControlId::SummaryRangeCycle => self.summary_range_rect(SummaryRange::Cycle),
+            ControlId::SummaryRangeSevenDays => self.summary_range_rect(SummaryRange::SevenDays),
+            ControlId::SummaryRangeThirtyDays => self.summary_range_rect(SummaryRange::ThirtyDays),
+            ControlId::SummaryMetricTokens => self.summary_metric_rect(SummaryMetric::Tokens),
+            ControlId::SummaryMetricEstimated => self.summary_metric_rect(SummaryMetric::Estimated),
+            ControlId::SummaryMetricApiEquivalent => {
+                self.summary_metric_rect(SummaryMetric::ApiEquivalent)
+            }
+            ControlId::SummaryLongContext => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.toggle_long_context)
+                .unwrap_or_default(),
+            ControlId::SummaryToggle => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.toggle_selected)
                 .unwrap_or_default(),
             ControlId::SourceAll => self.task_source_rect(0),
             ControlId::SourceDesktop => self.task_source_rect(1),
@@ -537,6 +590,20 @@ impl TuiHarness {
             .unwrap_or_default()
     }
 
+    fn summary_range_rect(&self, range: SummaryRange) -> Rect {
+        self.app
+            .summary_controls_hitbox
+            .map(|hitbox| hitbox.ranges[range.index()])
+            .unwrap_or_default()
+    }
+
+    fn summary_metric_rect(&self, metric: SummaryMetric) -> Rect {
+        self.app
+            .summary_controls_hitbox
+            .map(|hitbox| hitbox.metrics[metric.index()])
+            .unwrap_or_default()
+    }
+
     fn setting_rect(&self, item: SettingItem) -> Rect {
         self.app
             .settings_controls_hitbox
@@ -548,12 +615,21 @@ impl TuiHarness {
         let mut controls = [
             ControlId::ViewOverview,
             ControlId::ViewTrends,
+            ControlId::ViewSummary,
             ControlId::ViewOther,
             ControlId::ViewSettings,
             ControlId::ToggleTurns,
             ControlId::ToggleModels,
             ControlId::ScopeFiveHours,
             ControlId::ScopeWeek,
+            ControlId::SummaryRangeCycle,
+            ControlId::SummaryRangeSevenDays,
+            ControlId::SummaryRangeThirtyDays,
+            ControlId::SummaryMetricTokens,
+            ControlId::SummaryMetricEstimated,
+            ControlId::SummaryMetricApiEquivalent,
+            ControlId::SummaryLongContext,
+            ControlId::SummaryToggle,
             ControlId::SourceAll,
             ControlId::SourceDesktop,
             ControlId::SourceSubagent,

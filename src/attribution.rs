@@ -17,6 +17,10 @@ const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 const LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
 pub(crate) const ESTIMATOR_REVISION: u32 = 5;
+/// Raw estimator units that represent one published Codex credit-rate unit.
+/// Token rates are expressed in eighths of a credit per million tokens, so
+/// both scales must be removed before an absolute weight is shown to users.
+pub(crate) const ESTIMATED_COST_UNITS_PER_CREDIT: u128 = 8_000_000;
 
 // OpenAI Codex token-based credit rates as of 2026-08-27:
 // https://learn.chatgpt.com/docs/pricing

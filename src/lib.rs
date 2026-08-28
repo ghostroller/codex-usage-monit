@@ -16,5 +16,6 @@ mod session_index;
 mod session_launch;
 pub mod snapshot;
 pub mod startup;
+pub mod summary;
 pub mod tui;
 pub mod ui_state;

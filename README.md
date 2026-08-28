@@ -26,6 +26,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **Local usage breakdown** — Explore tasks, turns, models, token totals, and token share for the current 5-hour or weekly reset cycle.
 - **API-equivalent model cost** — Value locally observed model tokens at current API rates with exact fixed-point math, long-context ranges, and explicit priced coverage; non-model tool charges are excluded.
 - **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 15-minute token/estimate buckets in local state.
+- **Project usage summary** — Rank projects for the current cycle, last 7 days, or last 30 days; expand project/task/subagent trees and compare token, estimated credit-rate, or API-equivalent usage with ranked bars and non-cumulative daily totals.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export human-readable text or schema-versioned camelCase JSON, select individual sections, and filter turns by thread.
@@ -173,7 +174,7 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` is optional and is only used in the pipeline example above.
 
-The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, **Other**, and **Settings**; `health` remains the one-shot snapshot section name.
+The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, **Summary**, **Other**, and **Settings**; `health` remains the one-shot snapshot section name.
 
 ### Continuous history recording
 
@@ -210,7 +211,7 @@ Global options should appear before the subcommand.
 | `--max-files <N>` | Scan at most N rollout files; default: `500`. |
 | `--active-grace-minutes <N>` | Freshness window used to infer active task state; default: `5`. |
 | `--offline` | Do not query the App Server; use local fallback data. |
-| `--redact-content` | Replace titles with `[redacted]`, omit message previews, and use a separate redacted cache. |
+| `--redact-content` | Replace titles with `[redacted]`, omit message previews, and use separate redacted cache and history namespaces. |
 | `--no-rollout-cache` | Disable the persistent parsed-rollout cache. |
 | `--theme dark|light` | Choose the TUI theme. `bright` is accepted as an alias for `light`. |
 | `--startup-log <FILE>` | Write startup timing events as JSONL. |
@@ -220,7 +221,7 @@ Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the c
 
 ## Interactive TUI
 
-The **Overview** tab combines account limits with Tasks, Turns, Models, and the local token-only API-equivalent cost of model calls. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health. **Settings** provides one place to manage display preferences and the metric columns shared by all tables.
+The **Overview** tab combines account limits with Tasks, Turns, Models, and the local token-only API-equivalent cost of model calls. Its weekly quota gauge also shows an expiry reminder when a fully known available Codex reset credit expires before the current server-defined weekly reset. **Trends** shows remaining quota, weekly local token and estimate trajectories, and 15-minute bars. **Summary** ranks project usage for the current cycle, 7 days, or 30 days and provides a collapsed project/task/subagent tree, top-project bars, and non-cumulative totals by local calendar day. Its Daily legend labels complete (`C`), partial (`P`), and missing (`M`) dates; missing project-level history is left as a gap instead of being plotted as zero. **Other** shows source health, collection statistics, diagnostics, quota windows, reset-credit details, and recorder health. **Settings** provides one place to manage display preferences and the metric columns shared by all tables.
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
@@ -229,7 +230,10 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | Keys | Action |
 | --- | --- |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
-| `1`, `2`, `3`, `4` | Open Overview, Trends, Other, or Settings. |
+| `1`, `2`, `u`, `3`, `4` | Open Overview, Trends, Summary, Other, or Settings. |
+| `c`, `7`, `m` on Summary | Select the current cycle, last 7 days, or last 30 days. |
+| `K`, `e`, `a` on Summary | Rank and chart Tokens, estimated credit-rate equivalents, or API-equivalent cost. |
+| `Enter` / `Space`, `l` on Summary | Expand/collapse the selected tree node, or toggle the optional Longx estimate. |
 | `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or 15-minute charts. |
 | `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
 | `i` on Trends | Toggle Inspect mode. |
@@ -283,6 +287,7 @@ Reset and turn timestamps in the TUI are shown in local time; Collection/Snapsho
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | The entity's share of locally observed, eligible non-Spark tokens in the selected ordinary `codex` cycle. This is a token share, not an account quota percentage. |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | A low-confidence estimate of account quota percentage points attributed to the entity. `~` means approximate; `-` means unavailable. |
 | `API EQ.` / `API.EQ5H` | Local model tokens valued at the bundled OpenAI API rates. Each Tasks and Turns row in the TUI has its own value for the selected 5-hour or weekly scope; it is not a lifetime total, shows `-` when that window is unavailable, and is independent of `EST Longx`. One-shot task/turn rows use the current 5-hour reset cycle. A range means request boundaries could be short or long context; trailing `+` marks a lower bound because unpriced samples or incomplete local rollout coverage may hide additional cost; `-` also means no usable local data or no applicable public price. |
+| `~EST CR.` on Summary | Additive Codex credit-rate equivalent for the selected arbitrary time range, normalized from estimator weight units and shown in credits. It is useful for relative comparison, not an account quota percentage or subscription invoice. |
 | `EFFORT` | The reasoning-effort value recorded by Codex. |
 | `FAST` | The rollout used a recognized Fast tier (`serviceTier=fast` or the compatible `priority` value); attribution applies the published Fast credit multiplier. |
 | `MESSAGE` | A short local preview of the turn message, up to 72 characters. |
@@ -325,7 +330,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Longx` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. After upgrade, overlapping local buckets and weekly points are rebuilt from rollout calls still inside the configured scan range. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. Summary's project breakdown is recorded prospectively. The first time the 30-day range is selected with incomplete project history, the TUI performs one local-only background scan with a 31-day lookback and an expanded file limit; the normal recorder remains on its lightweight configured lookback. A namespace-scoped marker prevents a partial scan from repeating on every launch, while incomplete coverage becomes eligible for another automatic attempt after seven days. Buckets that cannot be reconstructed remain `PARTIAL`, totals are labeled as the known lower bound, and unknown daily values are gaps rather than zero. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Longx` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Inspect mode shows each selected point's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute bar, the readout shows the precise UTC-aligned bucket interval in local time.
 

@@ -92,6 +92,10 @@ pub(crate) struct ApiCostAccumulator {
 }
 
 impl ApiCostAccumulator {
+    pub(crate) fn add_call(&mut self, call: &UsageCall) {
+        self.add(price_call(call));
+    }
+
     fn add(&mut self, cost: CallCost) {
         self.observed_samples = self.observed_samples.saturating_add(1);
         self.observed_tokens = self.observed_tokens.saturating_add(cost.observed_tokens);
@@ -117,7 +121,7 @@ impl ApiCostAccumulator {
         }
     }
 
-    fn amount(&self) -> ApiCostAmount {
+    pub(crate) fn amount(&self) -> ApiCostAmount {
         ApiCostAmount {
             minimum_pico_usd: PicoUsd::new(self.minimum_pico_usd),
             maximum_pico_usd: PicoUsd::new(self.maximum_pico_usd),

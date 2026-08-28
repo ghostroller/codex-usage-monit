@@ -590,7 +590,8 @@ fn run_recorder(config: CollectConfig, args: RecordArgs) -> Result<i32> {
         args.status_file
             .unwrap_or_else(|| default_status_file(&history_dir)),
     );
-    let mut history_store = HistoryStore::new(history_dir, &config.codex_home);
+    let mut history_store =
+        HistoryStore::new_with_redaction(history_dir, &config.codex_home, config.redact_content);
     let mut rollout_cache = RolloutCache::new();
     let mut cached_account = None;
     let local_interval = Duration::from_secs(args.local_interval_seconds);

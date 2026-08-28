@@ -30,6 +30,7 @@ pub enum UiView {
     #[default]
     Overview,
     Trends,
+    Summary,
     Health,
     Settings,
 }
@@ -355,7 +356,7 @@ mod tests {
         let expected = UiState {
             version: UI_STATE_VERSION,
             theme: UiTheme::Light,
-            view: UiView::Settings,
+            view: UiView::Summary,
             window_scope: UiWindowScope::Week,
             turns_visible: false,
             models_visible: false,
@@ -373,7 +374,7 @@ mod tests {
         assert_eq!(store.load(), expected);
 
         let json = fs::read_to_string(path).unwrap();
-        assert!(json.contains("\"view\": \"settings\""));
+        assert!(json.contains("\"view\": \"summary\""));
         assert!(json.contains("\"windowScope\": \"week\""));
         assert!(json.contains("\"taskListMode\": \"tree\""));
         assert!(json.contains("\"apiLongContextMultiplier\": true"));

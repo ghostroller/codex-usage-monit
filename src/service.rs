@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
-use crate::history::history_namespace;
+use crate::history::history_namespace_with_redaction;
 
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
@@ -278,7 +278,7 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
     let heartbeat = recorder
         .as_ref()
         .and_then(|status| status.last_history_heartbeat);
-    let expected_namespace = history_namespace(&options.codex_home);
+    let expected_namespace = expected_history_namespace(options);
     let namespace_mismatch = recorder
         .as_ref()
         .and_then(|status| status.history_namespace.as_deref())
@@ -313,6 +313,10 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
             .push_str(&format!("; last recorder error: {error}"));
     }
     Ok(service_status)
+}
+
+fn expected_history_namespace(options: &ServiceOptions) -> String {
+    history_namespace_with_redaction(&options.codex_home, options.redact_content)
 }
 
 pub fn uninstall(options: &ServiceOptions) -> Result<ServiceStatus> {
@@ -1320,6 +1324,19 @@ mod tests {
         assert!(arguments.contains(&OsString::from("record")));
         assert!(arguments.contains(&root.join("State Dir/history-v1").into_os_string()));
         assert!(arguments.contains(&root.join("State Dir/perf log.jsonl").into_os_string()));
+    }
+
+    #[test]
+    fn recorder_status_namespace_follows_content_redaction_mode() {
+        let root = Path::new("/tmp/root");
+        let mut options = options(root);
+        options.redact_content = false;
+        let visible_namespace = expected_history_namespace(&options);
+        options.redact_content = true;
+        let redacted_namespace = expected_history_namespace(&options);
+
+        assert_ne!(redacted_namespace, visible_namespace);
+        assert_eq!(redacted_namespace, format!("{visible_namespace}-redacted"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

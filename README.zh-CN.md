@@ -26,6 +26,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **本地用量拆分** — 按当前 5 小时或周重置周期查看 task、turn、模型、token 总量和 token 占比。
 - **API 等价模型费用** — 使用精确定点计算按当前 API 费率换算本地模型 token，并显示长上下文区间与已计价覆盖率；不包含非模型工具费用。
 - **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及 15 分钟 token/估算桶。
+- **项目用量汇总** — 按本周期、近 7 天或近 30 天排行项目；展开项目/task/subagent 树，并通过项目排行柱状图和非累计每日总量比较 token、估算 credit 费率或 API 等价用量。
 - **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 导出便于阅读的文本或带 schema 版本的 camelCase JSON，选择指定 section，或按 thread 筛选 turn。
@@ -173,7 +174,7 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` 是可选工具，只用于上面的管道示例。
 
-有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends**、**Other** 和 **Settings**；`health` 仍然是一次性 snapshot 的 section 名称。
+有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends**、**Summary**、**Other** 和 **Settings**；`health` 仍然是一次性 snapshot 的 section 名称。
 
 ### 持续记录历史
 
@@ -210,7 +211,7 @@ codex-usage-monit record --foreground
 | `--max-files <N>` | 最多扫描 N 个 rollout 文件；默认：`500`。 |
 | `--active-grace-minutes <N>` | 推断任务是否活跃时使用的时间阈值；默认：`5`。 |
 | `--offline` | 不查询 App Server，使用本地降级数据。 |
-| `--redact-content` | 把标题替换为 `[redacted]`、省略消息摘要，并使用独立的脱敏缓存。 |
+| `--redact-content` | 把标题替换为 `[redacted]`、省略消息摘要，并使用独立的脱敏缓存和历史 namespace。 |
 | `--no-rollout-cache` | 禁用持久化的 rollout 解析缓存。 |
 | `--theme dark|light` | 选择 TUI 主题。也可以用 `bright` 作为 `light` 的别名。 |
 | `--startup-log <FILE>` | 把启动计时事件写成 JSONL。 |
@@ -220,7 +221,7 @@ codex-usage-monit record --foreground
 
 ## 交互式 TUI
 
-**Overview** tab 把账户额度、Tasks、Turns、Models，以及本地模型调用的纯 token API 等价费用放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。**Settings** 集中管理显示偏好和所有表格共用的指标列。
+**Overview** tab 把账户额度、Tasks、Turns、Models，以及本地模型调用的纯 token API 等价费用放在同一页面。如果信息完整的可用 Codex 重置机会会在当前服务端周自然重置前过期，提醒会直接显示在周用量进度条内。**Trends** 显示剩余额度、本地周 token/估算走势和 15 分钟柱状图。**Summary** 按本周期、近 7 天或近 30 天排行项目，并提供默认收起的项目/task/subagent 树、项目柱状图，以及按本地自然日统计的非累计每日总量。Daily 图例中的 `C`、`P`、`M` 分别表示完整、部分和缺失日期；缺少项目级历史的日期会留空，而不是绘制成零。**Other** 显示数据源健康状态、采集统计、诊断信息、额度窗口、重置机会详情和后台 recorder 状态。**Settings** 集中管理显示偏好和所有表格共用的指标列。
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
@@ -229,7 +230,10 @@ codex-usage-monit record --foreground
 | 按键 | 操作 |
 | --- | --- |
 | `Tab` / `→`、`Shift+Tab` / `←` | 在视图之间移动。 |
-| `1`、`2`、`3`、`4` | 打开 Overview、Trends、Other 或 Settings。 |
+| `1`、`2`、`u`、`3`、`4` | 打开 Overview、Trends、Summary、Other 或 Settings。 |
+| Summary 中的 `c`、`7`、`m` | 选择本周期、近 7 天或近 30 天。 |
+| Summary 中的 `K`、`e`、`a` | 按 Tokens、估算 credit 费率等价值或 API 等价费用排行并绘图。 |
+| Summary 中的 `Enter` / `Space`、`l` | 展开/收起选中树节点，或切换可选 Longx 估算。 |
 | 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 15-minute 图表。 |
 | Trends 中的 `[`、`]`、`n` | 把 24 小时图表窗口向前/向后移动，或回到 Now。 |
 | Trends 中的 `i` | 切换 Inspect 模式。 |
@@ -283,6 +287,7 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | 该实体在所选普通 `codex` 周期的本地可观察、符合条件的非 Spark token 中所占比例。它是 token 占比，不是账户额度百分比。 |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | 归因到该实体的低置信度额度消耗估算，单位为百分点。`~` 表示近似值；`-` 表示无法计算。 |
 | `API EQ.` / `API.EQ5H` | 按内置 OpenAI API 费率换算本地模型 token。TUI 中每个 Tasks 和 Turns 行都显示当前所选 5 小时或周 scope 内的独立值；它不是 lifetime 总额，窗口缺失时显示 `-`，且不随 `EST Longx` 切换。一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示这是下界，因为未计价 sample 或不完整的本地 rollout 覆盖可能遗漏额外费用；`-` 也表示没有可用本地数据或没有可应用的公开价格。 |
+| Summary 中的 `~EST CR.` | 所选任意时间区间内可累加的 Codex credit 费率等价值；从估算权重归一化后以 credits 显示，适合比较相对消耗，但不是账户额度百分比或订阅账单。 |
 | `EFFORT` | Codex 记录的 reasoning-effort 值。 |
 | `FAST` | rollout 使用了可识别的 Fast 服务层（`serviceTier=fast` 或兼容的 `priority`）；归因会应用官方 Fast credit 倍率。 |
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
@@ -325,7 +330,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Longx` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。升级后，程序会从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶和周数据点。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录。首次选择近 30 天且项目历史不完整时，TUI 会在后台执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知日期留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Longx` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Inspect 模式直接显示所选数据点保存的准确时间戳和值，而不是从图表坐标反推。对于 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。
 

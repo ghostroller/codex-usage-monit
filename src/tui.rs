@@ -12,7 +12,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use chrono::FixedOffset;
-use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -45,14 +45,18 @@ use text::{
     truncate_display_text, truncate_middle_display_text,
 };
 
-use crate::api_cost::format_api_cost_amount;
+use crate::api_cost::{API_PRICING_CATALOG_REVISION, format_api_cost_amount, format_pico_usd};
+use crate::attribution::ESTIMATED_COST_UNITS_PER_CREDIT;
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, ApiCostAmount, AttributionSummary, Confidence, ModelUsage, Provenance,
     Snapshot, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis,
     WindowUsage, terminal_safe_text,
 };
-use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
+use crate::history::{
+    HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData,
+    HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES,
+};
 use crate::open_config::{OpenConfig, OpenConfigStore};
 use crate::perf::{HistoryMetrics, PerfLog};
 use crate::rollout::RolloutCache;
@@ -66,6 +70,10 @@ use crate::session_launch::{
 use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
 };
+use crate::summary::{
+    ProjectSummary, SummaryMetrics, SummarySample, SummaryWindow, ThreadSummary, UsageSummary,
+    summarize_samples_with_local_date,
+};
 use crate::ui_state::{
     UiState, UiStateStore, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
     UiWindowScope,
@@ -77,6 +85,9 @@ const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(5), Duration::from_secs(10)];
 const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
+const SUMMARY_HISTORY_DAYS: i64 = 31;
+const SUMMARY_BACKFILL_MAX_FILES: usize = 5_000;
+const SUMMARY_BACKFILL_RETRY_DAYS: i64 = 7;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
@@ -122,6 +133,29 @@ fn format_local_time(value: DateTime<Utc>, format: &str) -> String {
     }
 
     value.with_timezone(&Local).format(format).to_string()
+}
+
+fn display_local_date(value: DateTime<Utc>) -> chrono::NaiveDate {
+    #[cfg(test)]
+    if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
+        return value.with_timezone(&offset).date_naive();
+    }
+
+    value.with_timezone(&Local).date_naive()
+}
+
+fn local_time_is_midnight(value: DateTime<Utc>) -> bool {
+    value.timestamp_subsec_nanos() == 0 && format_local_time(value, "%H:%M:%S") == "00:00:00"
+}
+
+fn summary_day_is_partial_window_edge(window: SummaryWindow, date: NaiveDate) -> bool {
+    let starts_on_date = display_local_date(window.starts_at) == date;
+    let ends_on_date = window
+        .ends_at
+        .checked_sub_signed(ChronoDuration::nanoseconds(1))
+        .is_some_and(|last| display_local_date(last) == date);
+    (starts_on_date && !local_time_is_midnight(window.starts_at))
+        || (ends_on_date && !local_time_is_midnight(window.ends_at))
 }
 
 #[cfg(test)]
@@ -229,6 +263,7 @@ impl From<Theme> for UiTheme {
 enum View {
     Overview,
     Trends,
+    Summary,
     Health,
     Settings,
 }
@@ -238,6 +273,7 @@ impl From<UiView> for View {
         match value {
             UiView::Overview => Self::Overview,
             UiView::Trends => Self::Trends,
+            UiView::Summary => Self::Summary,
             UiView::Health => Self::Health,
             UiView::Settings => Self::Settings,
         }
@@ -249,6 +285,7 @@ impl From<View> for UiView {
         match value {
             View::Overview => Self::Overview,
             View::Trends => Self::Trends,
+            View::Summary => Self::Summary,
             View::Health => Self::Health,
             View::Settings => Self::Settings,
         }
@@ -633,6 +670,134 @@ impl WindowScope {
             Self::FiveHours => "5h tasks",
             Self::Week => "Week-cycle tasks",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SummaryRange {
+    #[default]
+    Cycle,
+    SevenDays,
+    ThirtyDays,
+}
+
+impl SummaryRange {
+    const ALL: [Self; 3] = [Self::Cycle, Self::SevenDays, Self::ThirtyDays];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Cycle => 0,
+            Self::SevenDays => 1,
+            Self::ThirtyDays => 2,
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::Cycle => 'C',
+            Self::SevenDays => '7',
+            Self::ThirtyDays => 'M',
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cycle => "Cycle",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+        }
+    }
+
+    fn window(
+        self,
+        snapshot: &Snapshot,
+        query_now: DateTime<Utc>,
+    ) -> (SummaryWindow, Option<&'static str>) {
+        let query_now = query_now.max(snapshot.as_of);
+        let ends_at = query_now
+            .checked_add_signed(ChronoDuration::nanoseconds(1))
+            .unwrap_or(query_now);
+        let (starts_at, fallback_note) = match self {
+            Self::Cycle => {
+                let starts_at = window_analysis(snapshot, WindowScope::Week)
+                    .filter(|analysis| {
+                        !analysis
+                            .partial_reasons
+                            .iter()
+                            .any(|reason| reason == "quota_window_stale")
+                    })
+                    .and_then(|analysis| analysis.attribution.window.as_ref())
+                    .filter(|window| window.starts_at <= query_now && query_now < window.ends_at)
+                    .map(|window| window.starts_at);
+                starts_at.map_or_else(
+                    || (query_now - ChronoDuration::days(7), Some("7d fallback")),
+                    |starts_at| (starts_at, None),
+                )
+            }
+            Self::SevenDays => (query_now - ChronoDuration::days(7), None),
+            Self::ThirtyDays => (query_now - ChronoDuration::days(30), None),
+        };
+        (
+            SummaryWindow::new(starts_at.min(query_now), ends_at)
+                .expect("summary ranges always have a positive duration"),
+            fallback_note,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SummaryMetric {
+    #[default]
+    Tokens,
+    Estimated,
+    ApiEquivalent,
+}
+
+impl SummaryMetric {
+    const ALL: [Self; 3] = [Self::Tokens, Self::Estimated, Self::ApiEquivalent];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Tokens => 0,
+            Self::Estimated => 1,
+            Self::ApiEquivalent => 2,
+        }
+    }
+
+    fn shortcut(self) -> char {
+        match self {
+            Self::Tokens => 'K',
+            Self::Estimated => 'E',
+            Self::ApiEquivalent => 'A',
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tokens => "Tokens",
+            Self::Estimated => "~EST CR.",
+            Self::ApiEquivalent => "API EQ.",
+        }
+    }
+
+    fn value(self, metrics: SummaryMetrics, api_long_context: bool) -> u128 {
+        match self {
+            Self::Tokens => u128::from(metrics.token_usage.total_tokens),
+            Self::Estimated => metrics.estimated_units(api_long_context),
+            Self::ApiEquivalent => metrics.api_equivalent_cost.minimum_pico_usd.value(),
+        }
+    }
+
+    fn share_percent(
+        self,
+        metrics: SummaryMetrics,
+        total: SummaryMetrics,
+        api_long_context: bool,
+    ) -> f64 {
+        percent_u128(
+            self.value(metrics, api_long_context),
+            self.value(total, api_long_context),
+        )
     }
 }
 
@@ -1169,6 +1334,18 @@ struct TaskTreeMarkerHitbox {
     task_index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SummaryTreeMarkerHitbox {
+    area: Rect,
+    node_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SummaryBarHitbox {
+    area: Rect,
+    project_key: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TurnControlsHitbox {
     back_tasks: Rect,
@@ -1178,7 +1355,15 @@ struct TurnControlsHitbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ViewTabsHitbox {
-    tabs: [Rect; 4],
+    tabs: [Rect; 5],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SummaryControlsHitbox {
+    ranges: [Rect; 3],
+    metrics: [Rect; 3],
+    toggle_long_context: Rect,
+    toggle_selected: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1201,6 +1386,186 @@ struct TrendControlsHitbox {
     previous_day: Rect,
     next_day: Rect,
     now: Rect,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSummary {
+    usage: UsageSummary,
+    range_note: Option<&'static str>,
+    represented_tokens: u64,
+    available_tokens: u64,
+    covered_buckets: usize,
+    expected_buckets: usize,
+    estimated_covered_tokens: u64,
+    long_context_breakdown_complete: bool,
+    daily_coverage: BTreeMap<NaiveDate, SummaryDailyCoverage>,
+    partial_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryDailyCoverage {
+    expected_buckets: usize,
+    covered_buckets: usize,
+    available_tokens: u64,
+    represented_tokens: u64,
+    estimated_covered_tokens: u64,
+    long_context_breakdown_complete: bool,
+    source_partial: bool,
+}
+
+impl Default for SummaryDailyCoverage {
+    fn default() -> Self {
+        Self {
+            expected_buckets: 0,
+            covered_buckets: 0,
+            available_tokens: 0,
+            represented_tokens: 0,
+            estimated_covered_tokens: 0,
+            long_context_breakdown_complete: true,
+            source_partial: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryDailyState {
+    Complete,
+    Partial,
+    Missing,
+}
+
+fn summary_daily_status_symbols(states: &[SummaryDailyState]) -> String {
+    states
+        .iter()
+        .map(|state| match state {
+            SummaryDailyState::Complete => 'C',
+            SummaryDailyState::Partial => 'P',
+            SummaryDailyState::Missing => 'M',
+        })
+        .collect()
+}
+
+impl PreparedSummary {
+    fn coverage_percent(&self, metric: SummaryMetric) -> f64 {
+        let token_coverage = if self.available_tokens == 0 {
+            100.0
+        } else {
+            self.represented_tokens as f64 / self.available_tokens as f64 * 100.0
+        };
+        let time_coverage = if self.expected_buckets == 0 {
+            100.0
+        } else {
+            self.covered_buckets as f64 / self.expected_buckets as f64 * 100.0
+        };
+        let pricing_coverage = if metric == SummaryMetric::ApiEquivalent {
+            self.usage.totals.api_equivalent_cost.priced_token_percent()
+        } else {
+            100.0
+        };
+        let estimator_coverage = if metric != SummaryMetric::Estimated || self.available_tokens == 0
+        {
+            100.0
+        } else {
+            self.estimated_covered_tokens as f64 / self.available_tokens as f64 * 100.0
+        };
+        token_coverage
+            .min(time_coverage)
+            .min(pricing_coverage)
+            .min(estimator_coverage)
+            .clamp(0.0, 100.0)
+    }
+
+    fn partial(&self, metric: SummaryMetric, api_long_context: bool) -> bool {
+        !self.partial_reasons.is_empty()
+            || self.represented_tokens < self.available_tokens
+            || self.covered_buckets < self.expected_buckets
+            || (metric == SummaryMetric::ApiEquivalent
+                && self.usage.totals.api_equivalent_cost.priced_samples
+                    < self.usage.totals.api_equivalent_cost.observed_samples)
+            || (metric == SummaryMetric::Estimated
+                && api_long_context
+                && !self.long_context_breakdown_complete)
+    }
+
+    fn api_chart_is_lower_bound(&self) -> bool {
+        let amount = self.usage.totals.api_equivalent_cost;
+        !amount.range_is_exact()
+            || amount.priced_samples < amount.observed_samples
+            || self.represented_tokens < self.available_tokens
+            || self.covered_buckets < self.expected_buckets
+            || self.partial_reasons.iter().any(|reason| {
+                reason.starts_with("rollout_")
+                    || matches!(
+                        reason.as_str(),
+                        "local_scan_disabled" | "range_starts_within_15m_bucket"
+                    )
+            })
+    }
+
+    fn daily_state(
+        &self,
+        date: NaiveDate,
+        totals: SummaryMetrics,
+        metric: SummaryMetric,
+        api_long_context: bool,
+    ) -> SummaryDailyState {
+        let Some(coverage) = self.daily_coverage.get(&date) else {
+            return SummaryDailyState::Missing;
+        };
+        if coverage.covered_buckets == 0 {
+            return SummaryDailyState::Missing;
+        }
+        let metric_partial = match metric {
+            SummaryMetric::Tokens => false,
+            SummaryMetric::Estimated => {
+                coverage.estimated_covered_tokens < coverage.available_tokens
+                    || (api_long_context && !coverage.long_context_breakdown_complete)
+            }
+            SummaryMetric::ApiEquivalent => {
+                let amount = totals.api_equivalent_cost;
+                amount.priced_samples < amount.observed_samples
+                    || amount.priced_tokens < amount.observed_tokens
+                    || !amount.range_is_exact()
+            }
+        };
+        if coverage.covered_buckets < coverage.expected_buckets
+            || coverage.represented_tokens < coverage.available_tokens
+            || coverage.source_partial
+            || metric_partial
+            || summary_day_is_partial_window_edge(self.usage.window, date)
+        {
+            SummaryDailyState::Partial
+        } else {
+            SummaryDailyState::Complete
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SummaryCache {
+    range: SummaryRange,
+    snapshot_as_of: DateTime<Utc>,
+    query_bucket: i64,
+    query_local_date: NaiveDate,
+    prepared: PreparedSummary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryRowKind {
+    Project,
+    Thread,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryTreeRow {
+    id: String,
+    kind: SummaryRowKind,
+    prefix: String,
+    label: String,
+    source: Option<String>,
+    metrics: SummaryMetrics,
+    has_children: bool,
+    collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1316,6 +1681,7 @@ struct RefreshCompletion {
     history: Option<HistoryData>,
     recorder_health: Option<RecorderHealth>,
     refreshed_account: bool,
+    summary_backfill: bool,
 }
 
 #[derive(Default)]
@@ -1435,6 +1801,7 @@ impl RedrawReasons {
 enum ScrollTarget {
     Tasks,
     Turns,
+    Summary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1469,12 +1836,19 @@ impl TableHitbox {
 }
 
 impl View {
-    const ALL: [Self; 4] = [Self::Overview, Self::Trends, Self::Health, Self::Settings];
+    const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Trends,
+        Self::Summary,
+        Self::Health,
+        Self::Settings,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
             Self::Trends => "Trends",
+            Self::Summary => "Summary",
             Self::Health => "Other",
             Self::Settings => "Settings",
         }
@@ -1484,6 +1858,7 @@ impl View {
         match self {
             Self::Overview => "Ovw",
             Self::Trends => "Tr",
+            Self::Summary => "Sum",
             Self::Health => "Other",
             Self::Settings => "Set",
         }
@@ -1493,6 +1868,7 @@ impl View {
         match self {
             Self::Overview => '1',
             Self::Trends => '2',
+            Self::Summary => 'U',
             Self::Health => '3',
             Self::Settings => '4',
         }
@@ -1502,15 +1878,17 @@ impl View {
         match self {
             Self::Overview => 0,
             Self::Trends => 1,
-            Self::Health => 2,
-            Self::Settings => 3,
+            Self::Summary => 2,
+            Self::Health => 3,
+            Self::Settings => 4,
         }
     }
 
     fn next(self) -> Self {
         match self {
             Self::Overview => Self::Trends,
-            Self::Trends => Self::Health,
+            Self::Trends => Self::Summary,
+            Self::Summary => Self::Health,
             Self::Health => Self::Settings,
             Self::Settings => Self::Overview,
         }
@@ -1520,7 +1898,8 @@ impl View {
         match self {
             Self::Overview => Self::Settings,
             Self::Trends => Self::Overview,
-            Self::Health => Self::Trends,
+            Self::Summary => Self::Trends,
+            Self::Health => Self::Summary,
             Self::Settings => Self::Health,
         }
     }
@@ -1586,6 +1965,19 @@ struct App {
     trend_inspect_mode: bool,
     trend_inspection: Option<TrendInspection>,
     trend_drag: Option<TrendDrag>,
+    summary_range: SummaryRange,
+    summary_metric: SummaryMetric,
+    summary_expanded_nodes: HashSet<String>,
+    summary_selected_id: Option<String>,
+    summary_offset: usize,
+    summary_cache: Option<SummaryCache>,
+    summary_controls_hitbox: Option<SummaryControlsHitbox>,
+    summary_table_hitbox: Option<TableHitbox>,
+    summary_tree_marker_hitboxes: Vec<SummaryTreeMarkerHitbox>,
+    summary_bar_hitboxes: Vec<SummaryBarHitbox>,
+    summary_scrollbar_hitbox: Option<ScrollbarHitbox>,
+    summary_backfill_pending: bool,
+    summary_backfill_running: bool,
     view_tabs_hitbox: Option<ViewTabsHitbox>,
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
@@ -1661,6 +2053,19 @@ impl App {
             trend_inspect_mode: false,
             trend_inspection: None,
             trend_drag: None,
+            summary_range: SummaryRange::Cycle,
+            summary_metric: SummaryMetric::Tokens,
+            summary_expanded_nodes: HashSet::new(),
+            summary_selected_id: None,
+            summary_offset: 0,
+            summary_cache: None,
+            summary_controls_hitbox: None,
+            summary_table_hitbox: None,
+            summary_tree_marker_hitboxes: Vec::new(),
+            summary_bar_hitboxes: Vec::new(),
+            summary_scrollbar_hitbox: None,
+            summary_backfill_pending: false,
+            summary_backfill_running: false,
             view_tabs_hitbox: None,
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
@@ -1751,7 +2156,12 @@ impl App {
     }
 
     fn replace_history(&mut self, history: HistoryData) {
+        if !self.summary_backfill_running {
+            let query_now = Utc::now().max(self.snapshot.as_of);
+            self.summary_backfill_pending = summary_history_backfill_needed(&history, query_now);
+        }
         self.history = history;
+        self.summary_cache = None;
     }
 
     fn replace_recorder_health(&mut self, recorder_health: RecorderHealth) {
@@ -2395,6 +2805,8 @@ impl App {
 
     fn toggle_api_long_context_multiplier(&mut self) {
         self.api_long_context_multiplier = !self.api_long_context_multiplier;
+        self.summary_selected_id = None;
+        self.summary_offset = 0;
         self.clear_trend_inspection();
     }
 
@@ -2856,6 +3268,7 @@ impl App {
             .map(|turn| turn.turn_id.clone());
         self.snapshot = result.snapshot;
         self.account = result.account;
+        self.summary_cache = None;
         let existing_threads = self
             .snapshot
             .tasks
@@ -2871,6 +3284,11 @@ impl App {
         self.turn_controls_hitbox = None;
         self.window_controls_hitbox = None;
         self.settings_controls_hitbox = None;
+        self.summary_controls_hitbox = None;
+        self.summary_table_hitbox = None;
+        self.summary_tree_marker_hitboxes.clear();
+        self.summary_bar_hitboxes.clear();
+        self.summary_scrollbar_hitbox = None;
         self.view_tabs_hitbox = None;
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
@@ -3309,6 +3727,196 @@ impl App {
         self.view = view;
     }
 
+    fn set_summary_range(&mut self, range: SummaryRange) {
+        if self.summary_range == range {
+            return;
+        }
+        self.summary_range = range;
+        self.summary_cache = None;
+        self.summary_selected_id = None;
+        self.summary_offset = 0;
+    }
+
+    fn set_summary_metric(&mut self, metric: SummaryMetric) {
+        if self.summary_metric == metric {
+            return;
+        }
+        self.summary_metric = metric;
+        self.summary_selected_id = None;
+        self.summary_offset = 0;
+    }
+
+    fn summary_rows(&self) -> Vec<SummaryTreeRow> {
+        self.summary_cache.as_ref().map_or_else(Vec::new, |cache| {
+            summary_tree_rows(
+                &cache.prepared.usage,
+                self.summary_metric,
+                self.api_long_context_multiplier,
+                &self.summary_expanded_nodes,
+            )
+        })
+    }
+
+    fn summary_selected_index(&self, rows: &[SummaryTreeRow]) -> usize {
+        self.summary_selected_id
+            .as_deref()
+            .and_then(|selected| rows.iter().position(|row| row.id == selected))
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1))
+    }
+
+    fn select_summary_index(&mut self, index: usize, reveal: bool) -> bool {
+        let rows = self.summary_rows();
+        let Some(row) = rows.get(index) else {
+            return false;
+        };
+        self.summary_selected_id = Some(row.id.clone());
+        if reveal && let Some(hitbox) = self.summary_table_hitbox {
+            self.summary_offset =
+                reveal_offset(self.summary_offset, index, rows.len(), hitbox.capacity);
+        }
+        true
+    }
+
+    fn move_summary_selection(&mut self, down: bool) {
+        let rows = self.summary_rows();
+        if rows.is_empty() {
+            self.summary_selected_id = None;
+            return;
+        }
+        let current = self.summary_selected_index(&rows);
+        let next = if down {
+            (current + 1).min(rows.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.select_summary_index(next, true);
+    }
+
+    fn select_summary_edge(&mut self, end: bool) {
+        let rows = self.summary_rows();
+        if rows.is_empty() {
+            self.summary_selected_id = None;
+            return;
+        }
+        self.select_summary_index(if end { rows.len() - 1 } else { 0 }, true);
+    }
+
+    fn toggle_summary_node(&mut self, node_id: &str) -> bool {
+        let rows = self.summary_rows();
+        let Some(row) = rows.iter().find(|row| row.id == node_id) else {
+            return false;
+        };
+        if !row.has_children {
+            return false;
+        }
+        if self.summary_expanded_nodes.contains(node_id) {
+            self.summary_expanded_nodes.remove(node_id);
+        } else {
+            self.summary_expanded_nodes.insert(node_id.to_string());
+        }
+        true
+    }
+
+    fn toggle_selected_summary_node(&mut self) -> bool {
+        self.summary_selected_id
+            .clone()
+            .is_some_and(|node_id| self.toggle_summary_node(&node_id))
+    }
+
+    fn activate_summary_control_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Summary {
+            return false;
+        }
+        let Some(hitbox) = self.summary_controls_hitbox else {
+            return false;
+        };
+        if let Some(range) = SummaryRange::ALL
+            .into_iter()
+            .find(|range| rect_contains(hitbox.ranges[range.index()], column, row))
+        {
+            self.set_summary_range(range);
+            return true;
+        }
+        if let Some(metric) = SummaryMetric::ALL
+            .into_iter()
+            .find(|metric| rect_contains(hitbox.metrics[metric.index()], column, row))
+        {
+            self.set_summary_metric(metric);
+            return true;
+        }
+        if rect_contains(hitbox.toggle_long_context, column, row) {
+            self.toggle_api_long_context_multiplier();
+            return true;
+        }
+        if rect_contains(hitbox.toggle_selected, column, row) {
+            return self.toggle_selected_summary_node();
+        }
+        false
+    }
+
+    fn activate_summary_tree_marker_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Summary {
+            return false;
+        }
+        let Some(hitbox) = self
+            .summary_tree_marker_hitboxes
+            .iter()
+            .find(|hitbox| rect_contains(hitbox.area, column, row))
+            .cloned()
+        else {
+            return false;
+        };
+        self.summary_selected_id = Some(hitbox.node_id.clone());
+        self.toggle_summary_node(&hitbox.node_id)
+    }
+
+    fn select_summary_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Summary {
+            return false;
+        }
+        let Some(index) = self
+            .summary_table_hitbox
+            .and_then(|hitbox| hitbox.index_at(column, row))
+        else {
+            return false;
+        };
+        self.select_summary_index(index, false)
+    }
+
+    fn activate_summary_bar_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Summary {
+            return false;
+        }
+        let Some(project_key) = self
+            .summary_bar_hitboxes
+            .iter()
+            .find(|hitbox| rect_contains(hitbox.area, column, row))
+            .map(|hitbox| hitbox.project_key.clone())
+        else {
+            return false;
+        };
+        let node_id = summary_project_node_id(&project_key);
+        let rows = self.summary_rows();
+        let Some(index) = rows.iter().position(|row| row.id == node_id) else {
+            return false;
+        };
+        self.select_summary_index(index, true)
+    }
+
+    fn scroll_summary(&mut self, down: bool, lines: usize) {
+        let Some(hitbox) = self.summary_table_hitbox else {
+            return;
+        };
+        self.summary_offset = scroll_offset(
+            self.summary_offset,
+            self.summary_rows().len(),
+            hitbox.capacity,
+            down,
+            lines,
+        );
+    }
+
     fn set_window_scope(&mut self, scope: WindowScope) {
         self.window_scope = scope;
     }
@@ -3604,24 +4212,29 @@ impl App {
         match target {
             ScrollTarget::Tasks => self.task_scrollbar_hitbox,
             ScrollTarget::Turns => self.turn_scrollbar_hitbox,
+            ScrollTarget::Summary => self.summary_scrollbar_hitbox,
         }
     }
 
     fn begin_scrollbar_drag_at(&mut self, column: u16, row: u16) -> bool {
-        let Some((target, hitbox)) = [ScrollTarget::Turns, ScrollTarget::Tasks]
-            .into_iter()
-            .find_map(|target| {
-                self.scrollbar_hitbox(target)
-                    .filter(|hitbox| rect_contains(hitbox.track, column, row))
-                    .map(|hitbox| (target, hitbox))
-            })
-        else {
+        let Some((target, hitbox)) = [
+            ScrollTarget::Summary,
+            ScrollTarget::Turns,
+            ScrollTarget::Tasks,
+        ]
+        .into_iter()
+        .find_map(|target| {
+            self.scrollbar_hitbox(target)
+                .filter(|hitbox| rect_contains(hitbox.track, column, row))
+                .map(|hitbox| (target, hitbox))
+        }) else {
             return false;
         };
         self.accept_active_search();
         match target {
             ScrollTarget::Tasks => self.transition_to_tasks(),
             ScrollTarget::Turns => self.focus = Focus::Turns,
+            ScrollTarget::Summary => {}
         }
         let on_thumb = rect_contains(hitbox.thumb, column, row);
         self.scroll_drag = Some(ScrollDrag {
@@ -3669,6 +4282,7 @@ impl App {
                 self.turn_reveal_pending = false;
                 self.turn_offset = offset;
             }
+            ScrollTarget::Summary => self.summary_offset = offset,
         }
         true
     }
@@ -3809,10 +4423,13 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 || app.activate_setting_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
                 || app.activate_trend_control_at(event.column, event.row)
+                || app.activate_summary_control_at(event.column, event.row)
                 || app.begin_trend_drag_at(event.column, event.row)
                 || app.activate_task_control_at(event.column, event.row)
                 || app.activate_turn_control_at(event.column, event.row)
                 || app.activate_task_tree_marker_at(event.column, event.row)
+                || app.activate_summary_tree_marker_at(event.column, event.row)
+                || app.activate_summary_bar_at(event.column, event.row)
                 || app.begin_scrollbar_drag_at(event.column, event.row)
             {
                 true
@@ -3821,7 +4438,9 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                     app.focus == Focus::Tasks && app.selected_task_record().is_some();
                 let previously_selected_task = app.selected_task;
                 app.accept_active_search();
-                if app.select_turn_at(event.column, event.row) {
+                if app.select_summary_at(event.column, event.row) {
+                    true
+                } else if app.select_turn_at(event.column, event.row) {
                     app.focus = Focus::Turns;
                     true
                 } else if app.select_task_at(event.column, event.row) {
@@ -3851,6 +4470,15 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = matches!(event.kind, MouseEventKind::ScrollDown);
             if app
+                .summary_scrollbar_hitbox
+                .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
+                || app
+                    .summary_table_hitbox
+                    .is_some_and(|hitbox| hitbox.contains_viewport(event.column, event.row))
+            {
+                app.scroll_summary(down, MOUSE_SCROLL_LINES);
+                true
+            } else if app
                 .turn_scrollbar_hitbox
                 .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
                 || app
@@ -3882,7 +4510,7 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 
 fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
     let compact = view_tabs_compact(area.width);
-    let mut tabs = [Rect::default(); 4];
+    let mut tabs = [Rect::default(); 5];
     let mut x = area.x;
     for (position, view) in View::ALL.into_iter().enumerate() {
         let label = if compact {
@@ -4057,8 +4685,47 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::BackTab | KeyCode::Left => app.set_view(app.view.previous()),
         KeyCode::Char('1') => app.set_view(View::Overview),
         KeyCode::Char('2') => app.set_view(View::Trends),
+        KeyCode::Char('u' | 'U') => app.set_view(View::Summary),
         KeyCode::Char('3') => app.set_view(View::Health),
         KeyCode::Char('4') => app.set_view(View::Settings),
+        KeyCode::Char('c' | 'C') if app.view == View::Summary => {
+            app.set_summary_range(SummaryRange::Cycle);
+        }
+        KeyCode::Char('7') if app.view == View::Summary => {
+            app.set_summary_range(SummaryRange::SevenDays);
+        }
+        KeyCode::Char('m' | 'M') if app.view == View::Summary => {
+            app.set_summary_range(SummaryRange::ThirtyDays);
+        }
+        KeyCode::Char('K') if app.view == View::Summary => {
+            app.set_summary_metric(SummaryMetric::Tokens);
+        }
+        KeyCode::Char('e' | 'E') if app.view == View::Summary => {
+            app.set_summary_metric(SummaryMetric::Estimated);
+        }
+        KeyCode::Char('a' | 'A') if app.view == View::Summary => {
+            app.set_summary_metric(SummaryMetric::ApiEquivalent);
+        }
+        KeyCode::Char('l' | 'L') if app.view == View::Summary => {
+            app.toggle_api_long_context_multiplier();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Summary => {
+            app.toggle_selected_summary_node();
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.view == View::Summary => {
+            app.move_summary_selection(true);
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.view == View::Summary => {
+            app.move_summary_selection(false);
+        }
+        KeyCode::Home if app.view == View::Summary => app.select_summary_edge(false),
+        KeyCode::End if app.view == View::Summary => app.select_summary_edge(true),
+        KeyCode::PageDown if app.view == View::Summary => {
+            app.scroll_summary(true, PAGE_SCROLL_LINES);
+        }
+        KeyCode::PageUp if app.view == View::Summary => {
+            app.scroll_summary(false, PAGE_SCROLL_LINES);
+        }
         KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Settings => {
             app.toggle_setting(app.selected_setting_item());
         }
@@ -4340,7 +5007,8 @@ fn prepare_initial_tui(
         )
     });
     let history_span = config.startup_trace.span("tui.history_load");
-    let mut history_store = HistoryStore::discover(&config.codex_home);
+    let mut history_store =
+        HistoryStore::discover_with_redaction(&config.codex_home, config.redact_content);
     let initial_history_observation = collection_history_observation(&initial, config.offline);
     let (history, recorder_health) = stage_and_load_history(
         &mut history_store,
@@ -4393,9 +5061,33 @@ fn stage_and_load_history(
     perf_log: &PerfLog,
     force_flush: bool,
 ) -> (HistoryData, RecorderHealth) {
+    stage_and_load_history_with_mode(store, observation, now, perf_log, force_flush, false)
+}
+
+fn stage_full_and_load_history(
+    store: &mut HistoryStore,
+    observation: &HistoryObservation,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+) -> (HistoryData, RecorderHealth) {
+    stage_and_load_history_with_mode(store, observation, now, perf_log, true, true)
+}
+
+fn stage_and_load_history_with_mode(
+    store: &mut HistoryStore,
+    observation: &HistoryObservation,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+    force_flush: bool,
+    full_observation: bool,
+) -> (HistoryData, RecorderHealth) {
     let total_started = Instant::now();
     let stage_started = Instant::now();
-    store.stage(observation);
+    if full_observation {
+        store.stage_full_observation(observation);
+    } else {
+        store.stage(observation);
+    }
     let stage_elapsed = stage_started.elapsed();
     let record_started = Instant::now();
     let write_result = if force_flush {
@@ -4542,7 +5234,84 @@ fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let aligned_seconds = now.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
     DateTime::from_timestamp(aligned_seconds, 0).unwrap_or(now)
-        - ChronoDuration::days(HISTORY_VIEW_DAYS)
+        - ChronoDuration::days(SUMMARY_HISTORY_DAYS)
+}
+
+fn summary_backfill_config(config: &CollectConfig) -> CollectConfig {
+    let mut config = config.clone();
+    config.lookback_days = SUMMARY_HISTORY_DAYS;
+    config.max_files = config.max_files.max(SUMMARY_BACKFILL_MAX_FILES);
+    // The backfill only reconstructs local project history. Avoid a redundant
+    // App Server request while the regular refresh worker owns account data.
+    config.offline = true;
+    config
+}
+
+fn summary_history_backfill_needed(history: &HistoryData, now: DateTime<Utc>) -> bool {
+    if history.read_only {
+        return false;
+    }
+    if history
+        .summary_backfill_attempted_at
+        .is_some_and(|attempted_at| {
+            attempted_at > now
+                || now - attempted_at < ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS)
+        })
+    {
+        return false;
+    }
+    history.summary_backfill_attempt_complete == Some(false)
+        || !summary_history_coverage_complete(history, now)
+}
+
+fn summary_history_coverage_complete(history: &HistoryData, now: DateTime<Utc>) -> bool {
+    let ends_at = now
+        .checked_add_signed(ChronoDuration::nanoseconds(1))
+        .unwrap_or(now);
+    let Some(window) = SummaryWindow::new(now - ChronoDuration::days(30), ends_at) else {
+        return true;
+    };
+    let expected = expected_summary_daily_coverage(window)
+        .values()
+        .map(|coverage| coverage.expected_buckets)
+        .fold(0_usize, usize::saturating_add);
+    let covered = history
+        .half_hour_buckets
+        .iter()
+        .filter(|bucket| {
+            window.contains(bucket.starts_at)
+                && bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
+                && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+                && bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION
+                && bucket.api_long_context_extra_cost_units.is_some()
+        })
+        .count();
+    covered >= expected
+}
+
+fn summary_backfill_scan_complete(snapshot: &Snapshot) -> bool {
+    let stats = &snapshot.stats;
+    stats.truncated_files == 0
+        && stats.unreadable_files == 0
+        && stats.skipped_lines == 0
+        && stats.ambiguous_token_resets == 0
+        && stats.scanned_files == stats.discovered_files
+        && snapshot
+            .sources
+            .iter()
+            .any(|source| source.source == "rollout_jsonl" && source.status == "ok")
+}
+
+fn retain_summary_backfill_evidence_buckets(observation: &mut HistoryObservation) {
+    // A complete filesystem walk proves that every retained rollout was read; it
+    // cannot prove that an absent rollout never existed or was not deleted. A
+    // backfill therefore persists only buckets backed by a model call. Zero
+    // buckets recorded prospectively by the recorder remain in HistoryStore and
+    // are not deleted by this merge. Spark calls do not increment the bucket-level
+    // call count, but still create a project group, so either signal is evidence.
+    observation
+        .half_hour_buckets
+        .retain(|bucket| bucket.call_count > 0 || !bucket.project_groups.is_empty());
 }
 
 fn load_recorder_health(store: &HistoryStore) -> RecorderHealth {
@@ -4618,6 +5387,9 @@ fn run_loop(
     loop {
         while let Ok(completion) = channels.refresh_receiver.try_recv() {
             let mut refresh_changed = false;
+            if completion.summary_backfill {
+                app.summary_backfill_running = false;
+            }
             if let Some(result) = completion.result {
                 app.replace(result, completion.refreshed_account);
                 refresh_changed = true;
@@ -4666,14 +5438,16 @@ fn run_loop(
             redraw_reasons.clear();
         }
 
-        start_refresh_if_due(
+        if start_refresh_if_due(
             app,
             config,
             channels,
             &rollout_cache,
             &history_store,
             &mut refresh_worker,
-        );
+        ) {
+            redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+        }
 
         if event::poll(next_run_loop_poll_timeout(
             app,
@@ -4735,12 +5509,96 @@ fn start_refresh_if_due(
     rollout_cache: &Arc<Mutex<RolloutCache>>,
     history_store: &Arc<Mutex<HistoryStore>>,
     refresh_worker: &mut RefreshWorker,
-) {
+) -> bool {
     let now = Instant::now();
     let local_refresh_due = now.saturating_duration_since(app.last_local_refresh) >= LOCAL_REFRESH;
     let account_refresh_due = !config.offline && app.account_refresh_due(now);
-    if app.worker_running || (!local_refresh_due && !account_refresh_due) {
-        return;
+    if local_refresh_due
+        && app.view == View::Summary
+        && app.summary_range == SummaryRange::ThirtyDays
+        && !app.summary_backfill_running
+    {
+        let query_now = Utc::now().max(app.snapshot.as_of);
+        app.summary_backfill_pending = summary_history_backfill_needed(&app.history, query_now);
+    }
+    let summary_backfill_due = app.view == View::Summary
+        && app.summary_range == SummaryRange::ThirtyDays
+        && app.summary_backfill_pending
+        && !account_refresh_due;
+    if app.worker_running || (!summary_backfill_due && !local_refresh_due && !account_refresh_due) {
+        return false;
+    }
+
+    if summary_backfill_due {
+        let worker_config = summary_backfill_config(config);
+        let worker_sender = channels.refresh_sender.clone();
+        let worker_history = Arc::clone(history_store);
+        app.worker_running = true;
+        app.summary_backfill_pending = false;
+        app.summary_backfill_running = true;
+        refresh_worker.start(thread::spawn(move || {
+            let mut cache = RolloutCache::new();
+            let result = collect_snapshot_cached(&worker_config, None, false, &mut cache);
+            let scan_complete = summary_backfill_scan_complete(&result.snapshot);
+            let CollectionResult {
+                snapshot,
+                account,
+                mut history_observation,
+            } = result;
+            let observed_at = snapshot.as_of;
+            // Summary reconstruction is deliberately local-only. Never let
+            // offline fallback quota/weekly points replace server history.
+            history_observation.quota_points.clear();
+            history_observation.weekly_local_points.clear();
+            retain_summary_backfill_evidence_buckets(&mut history_observation);
+            drop(snapshot);
+            drop(account);
+            drop(cache);
+            let (mut history, recorder_health) = {
+                let mut history_store = worker_history
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut history, recorder_health) = stage_full_and_load_history(
+                    &mut history_store,
+                    &history_observation,
+                    observed_at,
+                    &worker_config.perf_log,
+                );
+                let coverage_complete = summary_history_coverage_complete(&history, observed_at);
+                match history_store
+                    .mark_summary_backfill_attempt(observed_at, scan_complete && coverage_complete)
+                {
+                    Ok(()) => {
+                        history.summary_backfill_attempted_at = Some(observed_at);
+                        history.summary_backfill_attempt_complete =
+                            Some(scan_complete && coverage_complete);
+                    }
+                    Err(error) => {
+                        // Keep an in-memory cooldown even when the durable
+                        // marker cannot be written, otherwise a read-only or
+                        // full state directory would trigger an immediate
+                        // expensive rescan loop.
+                        history.summary_backfill_attempted_at = Some(observed_at);
+                        history.summary_backfill_attempt_complete =
+                            Some(scan_complete && coverage_complete);
+                        history
+                            .warnings
+                            .push(format!("summary backfill marker failed: {error}"));
+                    }
+                }
+                (history, recorder_health)
+            };
+            history.warnings.sort();
+            history.warnings.dedup();
+            let _ = worker_sender.send(RefreshCompletion {
+                result: None,
+                history: Some(history),
+                recorder_health: Some(recorder_health),
+                refreshed_account: false,
+                summary_backfill: true,
+            });
+        }));
+        return true;
     }
 
     let worker_config = config.clone();
@@ -4797,8 +5655,10 @@ fn start_refresh_if_due(
             history,
             recorder_health,
             refreshed_account: account_refresh_due,
+            summary_backfill: false,
         });
     }));
+    false
 }
 
 fn mouse_event_requests_redraw(kind: MouseEventKind, handled: bool) -> bool {
@@ -4903,6 +5763,11 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.settings_controls_hitbox = None;
     app.trend_controls_hitbox = None;
     app.trend_chart_hitboxes.clear();
+    app.summary_controls_hitbox = None;
+    app.summary_table_hitbox = None;
+    app.summary_tree_marker_hitboxes.clear();
+    app.summary_bar_hitboxes.clear();
+    app.summary_scrollbar_hitbox = None;
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
@@ -4997,6 +5862,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     match app.view {
         View::Overview => render_overview(frame, root[1], app),
         View::Trends => render_trends_at(frame, root[1], app, now),
+        View::Summary => render_summary_at(frame, root[1], app, now),
         View::Health => render_health(frame, root[1], app),
         View::Settings => render_settings(frame, root[1], app),
     };
@@ -5804,6 +6670,1324 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     }
     app.settings_controls_hitbox = Some(hitbox);
+}
+
+fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
+    let (window, range_note) = app.summary_range.window(&app.snapshot, query_now);
+    let mut samples = Vec::new();
+    let mut represented_tokens = 0_u64;
+    let mut available_tokens = 0_u64;
+    let mut covered_buckets = 0_usize;
+    let mut estimated_covered_tokens = 0_u64;
+    let mut long_context_breakdown_complete = true;
+    let mut daily_coverage = expected_summary_daily_coverage(window);
+    let mut partial_reasons = app.history.warnings.clone();
+    if range_note.is_some() {
+        partial_reasons.push("cycle_window_unavailable".to_string());
+    }
+
+    for bucket in &app.history.half_hour_buckets {
+        let selected = window.contains(bucket.starts_at);
+        if !selected {
+            continue;
+        }
+        let daily = daily_coverage
+            .entry(display_local_date(bucket.starts_at))
+            .or_default();
+        daily.available_tokens = daily
+            .available_tokens
+            .saturating_add(bucket.token_usage.total_tokens);
+        daily.long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
+        daily.source_partial |= !bucket.partial_reasons.is_empty();
+        let project_breakdown_current =
+            bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION;
+        if project_breakdown_current {
+            covered_buckets = covered_buckets.saturating_add(1);
+            daily.covered_buckets = daily.covered_buckets.saturating_add(1);
+        } else {
+            partial_reasons.push("project_breakdown_unavailable".to_string());
+        }
+        available_tokens = available_tokens.saturating_add(bucket.token_usage.total_tokens);
+        partial_reasons.extend(bucket.partial_reasons.iter().cloned());
+        long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
+        if bucket.api_pricing_catalog_revision != API_PRICING_CATALOG_REVISION {
+            partial_reasons.push("api_pricing_catalog_outdated".to_string());
+        }
+        let estimator_current = bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION;
+        if estimator_current {
+            estimated_covered_tokens =
+                estimated_covered_tokens.saturating_add(bucket.token_usage.total_tokens);
+            daily.estimated_covered_tokens = daily
+                .estimated_covered_tokens
+                .saturating_add(bucket.token_usage.total_tokens);
+        } else {
+            partial_reasons.push("estimator_revision_changed".to_string());
+        }
+        if !project_breakdown_current {
+            continue;
+        }
+        for group in &bucket.project_groups {
+            represented_tokens = represented_tokens.saturating_add(group.token_usage.total_tokens);
+            daily.represented_tokens = daily
+                .represented_tokens
+                .saturating_add(group.token_usage.total_tokens);
+            if estimator_current
+                && (!group.token_usage.is_zero() || group.estimated_cost_units > 0)
+                && group.api_long_context_extra_cost_units.is_none()
+            {
+                long_context_breakdown_complete = false;
+                daily.long_context_breakdown_complete = false;
+            }
+            let (estimated_cost_units, api_long_context_extra_cost_units) =
+                summary_estimated_units_for_revision(
+                    group.estimated_cost_units,
+                    group.api_long_context_extra_cost_units.unwrap_or_default(),
+                    bucket.estimator_revision,
+                );
+            samples.push(SummarySample {
+                timestamp: bucket.starts_at,
+                thread_id: group.thread_id.clone(),
+                parent_thread_id: group.parent_thread_id.clone(),
+                project_key: group.project_id.clone(),
+                project_label: group.project_label.clone(),
+                cwd: None,
+                title: group.title.clone(),
+                source: group.source.clone(),
+                token_usage: group.token_usage,
+                estimated_cost_units,
+                api_long_context_extra_cost_units,
+                api_equivalent_cost: summary_api_cost_for_catalog(
+                    group.api_equivalent_cost,
+                    bucket.api_pricing_catalog_revision,
+                ),
+                call_count: group.call_count,
+            });
+        }
+    }
+
+    // The live task index is the freshest metadata source. Overlay it without
+    // adding usage so post-completion renames and redaction take effect even
+    // when a closed history bucket has no new token evidence.
+    samples.extend(app.snapshot.tasks.iter().map(|task| {
+        SummarySample {
+            timestamp: app.snapshot.as_of,
+            thread_id: task.thread_id.clone(),
+            parent_thread_id: task.parent_thread_id.clone(),
+            project_key: None,
+            project_label: task
+                .cwd
+                .as_deref()
+                .and_then(|cwd| cwd.file_name())
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            cwd: task.cwd.clone(),
+            title: Some(task.title.clone()),
+            source: task.source.clone(),
+            token_usage: TokenUsage::default(),
+            estimated_cost_units: 0,
+            api_long_context_extra_cost_units: 0,
+            api_equivalent_cost: ApiCostAmount::default(),
+            call_count: 0,
+        }
+    }));
+
+    if window
+        .starts_at
+        .timestamp()
+        .rem_euclid(LOCAL_BUCKET_MINUTES * 60)
+        != 0
+    {
+        partial_reasons.push("range_starts_within_15m_bucket".to_string());
+    }
+    if app.history.read_only {
+        partial_reasons.push("history_read_only".to_string());
+    }
+    partial_reasons.sort();
+    partial_reasons.dedup();
+
+    let expected_buckets = daily_coverage
+        .values()
+        .map(|coverage| coverage.expected_buckets)
+        .fold(0_usize, usize::saturating_add);
+    let usage = summarize_samples_with_local_date(&samples, window, display_local_date);
+    PreparedSummary {
+        usage,
+        range_note,
+        represented_tokens,
+        available_tokens,
+        covered_buckets,
+        expected_buckets,
+        estimated_covered_tokens,
+        long_context_breakdown_complete,
+        daily_coverage,
+        partial_reasons,
+    }
+}
+
+fn expected_summary_daily_coverage(
+    window: SummaryWindow,
+) -> BTreeMap<NaiveDate, SummaryDailyCoverage> {
+    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
+    let mut starts_at_seconds = window
+        .starts_at
+        .timestamp()
+        .div_euclid(bucket_seconds)
+        .saturating_mul(bucket_seconds);
+    let aligned = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
+    if aligned < window.starts_at {
+        starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
+    }
+    let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
+    let mut coverage = BTreeMap::<NaiveDate, SummaryDailyCoverage>::new();
+    while starts_at < window.ends_at {
+        let daily = coverage.entry(display_local_date(starts_at)).or_default();
+        daily.expected_buckets = daily.expected_buckets.saturating_add(1);
+        let Some(next) = starts_at.checked_add_signed(ChronoDuration::seconds(bucket_seconds))
+        else {
+            break;
+        };
+        starts_at = next;
+    }
+    coverage
+}
+
+fn summary_api_cost_for_catalog(amount: ApiCostAmount, catalog_revision: u32) -> ApiCostAmount {
+    if catalog_revision == API_PRICING_CATALOG_REVISION {
+        amount
+    } else {
+        ApiCostAmount {
+            observed_samples: amount.observed_samples,
+            observed_tokens: amount.observed_tokens,
+            ..ApiCostAmount::default()
+        }
+    }
+}
+
+fn summary_estimated_units_for_revision(
+    base_units: u128,
+    long_context_extra_units: u128,
+    estimator_revision: u32,
+) -> (u128, u128) {
+    if estimator_revision == HISTORY_ESTIMATOR_REVISION {
+        (base_units, long_context_extra_units)
+    } else {
+        (0, 0)
+    }
+}
+
+fn ensure_summary_cache(app: &mut App, query_now: DateTime<Utc>) {
+    let query_now = query_now.max(app.snapshot.as_of);
+    let query_bucket = query_now.timestamp().div_euclid(LOCAL_BUCKET_MINUTES * 60);
+    let query_local_date = display_local_date(query_now);
+    let current = app.summary_cache.as_ref().is_some_and(|cache| {
+        cache.range == app.summary_range
+            && cache.snapshot_as_of == app.snapshot.as_of
+            && cache.query_bucket == query_bucket
+            && cache.query_local_date == query_local_date
+    });
+    if current {
+        return;
+    }
+    app.summary_cache = Some(SummaryCache {
+        range: app.summary_range,
+        snapshot_as_of: app.snapshot.as_of,
+        query_bucket,
+        query_local_date,
+        prepared: prepare_summary(app, query_now),
+    });
+}
+
+fn summary_project_node_id(project_key: &str) -> String {
+    format!("project:{project_key}")
+}
+
+fn summary_thread_node_id(thread_id: &str) -> String {
+    format!("thread:{thread_id}")
+}
+
+fn summary_tree_prefix(guides: &[bool]) -> String {
+    let mut prefix = String::new();
+    if let Some((&is_last, ancestors)) = guides.split_last() {
+        for ancestor_is_last in ancestors {
+            prefix.push_str(if *ancestor_is_last { "  " } else { "│ " });
+        }
+        prefix.push_str(if is_last { "└─ " } else { "├─ " });
+    }
+    prefix
+}
+
+fn summary_project_order(
+    summary: &UsageSummary,
+    metric: SummaryMetric,
+    api_long_context: bool,
+) -> Vec<&ProjectSummary> {
+    let mut projects = summary.projects.iter().collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        metric
+            .value(right.totals, api_long_context)
+            .cmp(&metric.value(left.totals, api_long_context))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    projects
+}
+
+fn summary_project_display_labels(summary: &UsageSummary) -> HashMap<String, String> {
+    let mut counts = HashMap::<&str, usize>::new();
+    for project in &summary.projects {
+        *counts.entry(project.label.as_str()).or_default() += 1;
+    }
+    summary
+        .projects
+        .iter()
+        .map(|project| {
+            let label = if counts.get(project.label.as_str()).copied().unwrap_or(0) > 1 {
+                format!(
+                    "{} · {:06x}",
+                    project.label,
+                    stable_summary_key_hash(&project.key) & 0x00ff_ffff
+                )
+            } else {
+                project.label.clone()
+            };
+            (project.key.clone(), terminal_safe_text(&label))
+        })
+        .collect()
+}
+
+fn stable_summary_key_hash(value: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    value.bytes().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+fn sorted_summary_threads(
+    threads: &[ThreadSummary],
+    metric: SummaryMetric,
+    api_long_context: bool,
+) -> Vec<&ThreadSummary> {
+    let mut threads = threads.iter().collect::<Vec<_>>();
+    threads.sort_by(|left, right| {
+        metric
+            .value(right.subtree, api_long_context)
+            .cmp(&metric.value(left.subtree, api_long_context))
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    threads
+}
+
+fn append_summary_thread_rows(
+    thread: &ThreadSummary,
+    metric: SummaryMetric,
+    api_long_context: bool,
+    expanded: &HashSet<String>,
+    guides: &mut Vec<bool>,
+    rows: &mut Vec<SummaryTreeRow>,
+) {
+    let id = summary_thread_node_id(&thread.thread_id);
+    let has_children = !thread.children.is_empty();
+    let collapsed = has_children && !expanded.contains(&id);
+    rows.push(SummaryTreeRow {
+        id,
+        kind: SummaryRowKind::Thread,
+        prefix: summary_tree_prefix(guides),
+        label: thread
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .map(terminal_safe_text)
+            .unwrap_or_else(|| format!("Thread {}", short_thread_id(&thread.thread_id))),
+        source: thread.source.clone(),
+        metrics: if collapsed {
+            thread.subtree
+        } else {
+            thread.own
+        },
+        has_children,
+        collapsed,
+    });
+    if collapsed {
+        return;
+    }
+    let children = sorted_summary_threads(&thread.children, metric, api_long_context);
+    let child_count = children.len();
+    for (position, child) in children.into_iter().enumerate() {
+        guides.push(position + 1 == child_count);
+        append_summary_thread_rows(child, metric, api_long_context, expanded, guides, rows);
+        guides.pop();
+    }
+}
+
+fn summary_tree_rows(
+    summary: &UsageSummary,
+    metric: SummaryMetric,
+    api_long_context: bool,
+    expanded: &HashSet<String>,
+) -> Vec<SummaryTreeRow> {
+    let mut rows = Vec::new();
+    let display_labels = summary_project_display_labels(summary);
+    for project in summary_project_order(summary, metric, api_long_context) {
+        let id = summary_project_node_id(&project.key);
+        let has_children = !project.threads.is_empty();
+        let collapsed = has_children && !expanded.contains(&id);
+        rows.push(SummaryTreeRow {
+            id,
+            kind: SummaryRowKind::Project,
+            prefix: String::new(),
+            label: display_labels
+                .get(&project.key)
+                .cloned()
+                .unwrap_or_else(|| terminal_safe_text(&project.label)),
+            source: None,
+            metrics: project.totals,
+            has_children,
+            collapsed,
+        });
+        if collapsed {
+            continue;
+        }
+        let threads = sorted_summary_threads(&project.threads, metric, api_long_context);
+        let thread_count = threads.len();
+        let mut guides = Vec::new();
+        for (position, thread) in threads.into_iter().enumerate() {
+            guides.push(position + 1 == thread_count);
+            append_summary_thread_rows(
+                thread,
+                metric,
+                api_long_context,
+                expanded,
+                &mut guides,
+                &mut rows,
+            );
+            guides.pop();
+        }
+    }
+    rows
+}
+
+fn percent_u128(value: u128, total: u128) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64 / total as f64 * 100.0
+    }
+}
+
+fn format_compact_u128(value: u128) -> String {
+    let value = value as f64;
+    if value >= 1_000_000_000_000.0 {
+        format!("{:.2}T", value / 1_000_000_000_000.0)
+    } else if value >= 1_000_000_000.0 {
+        format!("{:.2}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_estimated_credits(units: u128, spaced_unit: bool) -> String {
+    let credits = units as f64 / ESTIMATED_COST_UNITS_PER_CREDIT as f64;
+    let compact = if credits >= 1_000_000.0 {
+        format!("{:.2}M", credits / 1_000_000.0)
+    } else if credits >= 1_000.0 {
+        format!("{:.2}K", credits / 1_000.0)
+    } else if credits >= 100.0 {
+        format!("{credits:.1}")
+    } else {
+        format!("{credits:.2}")
+    };
+    format!("~{compact}{}cr", if spaced_unit { " " } else { "" })
+}
+
+fn format_summary_metric(
+    metrics: SummaryMetrics,
+    metric: SummaryMetric,
+    api_long_context: bool,
+) -> String {
+    match metric {
+        SummaryMetric::Tokens => format_tokens(metrics.token_usage),
+        SummaryMetric::Estimated => {
+            format_estimated_credits(metrics.estimated_units(api_long_context), true)
+        }
+        SummaryMetric::ApiEquivalent => format_api_cost_amount(metrics.api_equivalent_cost),
+    }
+}
+
+fn summary_chart_metric_label(app: &App, prepared: &PreparedSummary) -> String {
+    if app.summary_metric == SummaryMetric::Estimated {
+        "~EST credit-rate eq.".to_string()
+    } else if app.summary_metric == SummaryMetric::ApiEquivalent
+        && prepared.api_chart_is_lower_bound()
+    {
+        format!("{} lower bound", app.summary_metric.label())
+    } else {
+        app.summary_metric.label().to_string()
+    }
+}
+
+fn summary_chart_color(index: usize, theme: Theme) -> Color {
+    const DARK: [Color; 6] = [
+        Color::Rgb(63, 185, 192),
+        Color::Rgb(96, 165, 250),
+        Color::Rgb(167, 139, 250),
+        Color::Rgb(244, 114, 182),
+        Color::Rgb(251, 146, 60),
+        Color::Rgb(148, 163, 184),
+    ];
+    const LIGHT: [Color; 6] = [
+        Color::Rgb(0, 108, 117),
+        Color::Rgb(37, 99, 235),
+        Color::Rgb(109, 40, 217),
+        Color::Rgb(190, 24, 93),
+        Color::Rgb(194, 65, 12),
+        Color::Rgb(71, 85, 105),
+    ];
+    match theme {
+        Theme::Dark => DARK[index % DARK.len()],
+        Theme::Light => LIGHT[index % LIGHT.len()],
+    }
+}
+
+struct SummaryControlSpec {
+    leading: &'static str,
+    shortcut: String,
+    suffix: &'static str,
+    selected: bool,
+    shortcuts_active: bool,
+    theme: Theme,
+}
+
+fn append_summary_control(
+    spans: &mut Vec<Span<'static>>,
+    area: Rect,
+    x: &mut u16,
+    spec: SummaryControlSpec,
+) -> Rect {
+    let SummaryControlSpec {
+        leading,
+        shortcut,
+        suffix,
+        selected,
+        shortcuts_active,
+        theme,
+    } = spec;
+    let palette = theme.palette();
+    let leading_width = u16::try_from(UnicodeWidthStr::width(leading)).unwrap_or(u16::MAX);
+    let label = format!("[{shortcut}]{suffix}");
+    let width = u16::try_from(UnicodeWidthStr::width(label.as_str())).unwrap_or(u16::MAX);
+    if x.saturating_add(leading_width).saturating_add(width) > area.right() {
+        return Rect::default();
+    }
+    if !leading.is_empty() {
+        spans.push(Span::styled(
+            leading.to_string(),
+            Style::default().fg(palette.muted),
+        ));
+        *x = x.saturating_add(leading_width);
+    }
+    let normal = if selected {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let shortcut_style = if !shortcuts_active {
+        normal
+    } else if selected {
+        normal.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    let hitbox = Rect::new(*x, area.y, width, 1);
+    spans.push(Span::styled("[", normal));
+    spans.push(Span::styled(shortcut, shortcut_style));
+    spans.push(Span::styled(format!("]{suffix}"), normal));
+    *x = x.saturating_add(width);
+    hitbox
+}
+
+fn render_summary_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    selected_can_toggle: bool,
+) -> SummaryControlsHitbox {
+    let mut hitbox = SummaryControlsHitbox::default();
+    if area.is_empty() {
+        return hitbox;
+    }
+    let compact = area.width < 80;
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (position, range) in SummaryRange::ALL.into_iter().enumerate() {
+        hitbox.ranges[range.index()] = append_summary_control(
+            &mut spans,
+            area,
+            &mut x,
+            SummaryControlSpec {
+                leading: if position == 0 || compact { "" } else { " " },
+                shortcut: range.shortcut().to_string(),
+                suffix: if compact { "" } else { range.label() },
+                selected: app.summary_range == range,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+    }
+    for (position, metric) in SummaryMetric::ALL.into_iter().enumerate() {
+        hitbox.metrics[metric.index()] = append_summary_control(
+            &mut spans,
+            area,
+            &mut x,
+            SummaryControlSpec {
+                leading: if position == 0 {
+                    if compact { " " } else { " | " }
+                } else if compact {
+                    ""
+                } else {
+                    " "
+                },
+                shortcut: metric.shortcut().to_string(),
+                suffix: if compact { "" } else { metric.label() },
+                selected: app.summary_metric == metric,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+    }
+    hitbox.toggle_long_context = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: if compact { " " } else { " | " },
+            shortcut: "L".to_string(),
+            suffix: if compact { "" } else { "Longx" },
+            selected: app.api_long_context_multiplier,
+            shortcuts_active: app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
+    hitbox.toggle_selected = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: if compact { " " } else { " | " },
+            shortcut: ENTER_FOCUS_HINT.to_string(),
+            suffix: if compact { "" } else { "Toggle" },
+            selected: false,
+            shortcuts_active: selected_can_toggle && app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
+    if app.summary_backfill_running {
+        let status = if compact {
+            " · BACKFILL 30d…"
+        } else {
+            " · BACKFILLING 30d HISTORY…"
+        };
+        if x.saturating_add(u16::try_from(UnicodeWidthStr::width(status)).unwrap_or(u16::MAX))
+            <= area.right()
+        {
+            spans.push(Span::styled(
+                status,
+                Style::default()
+                    .fg(app.theme.palette().warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(app.theme.base_style()),
+        area,
+    );
+    hitbox
+}
+
+fn render_summary_tree(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    prepared: &PreparedSummary,
+    rows: &[SummaryTreeRow],
+) {
+    const DEFAULT_VALUE_WIDTH: u16 = 14;
+    const MAX_VALUE_WIDTH: u16 = 28;
+    const SHARE_WIDTH: u16 = 8;
+    let palette = app.theme.palette();
+    let partial = prepared.partial(app.summary_metric, app.api_long_context_multiplier);
+    let mut total = format_summary_metric(
+        prepared.usage.totals,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    );
+    if partial {
+        total = format!("known {total}");
+    }
+    let range_label = prepared.range_note.map_or_else(
+        || app.summary_range.label().to_string(),
+        |note| format!("{} ({note})", app.summary_range.label()),
+    );
+    let mut title = format!(
+        "Usage tree · {range_label} · {total} · {:.0}% coverage",
+        prepared.coverage_percent(app.summary_metric)
+    );
+    if partial {
+        title.push_str(" · PARTIAL");
+    }
+    if app.summary_backfill_running {
+        title.push_str(" · BACKFILLING 30d");
+    } else if app.summary_range == SummaryRange::ThirtyDays
+        && app.history.summary_backfill_attempt_complete == Some(false)
+        && !summary_history_coverage_complete(
+            &app.history,
+            prepared.usage.window.ends_at - ChronoDuration::nanoseconds(1),
+        )
+    {
+        title.push_str(" · BACKFILL PARTIAL");
+    }
+    let block = panel(&title, app.theme);
+    let inner = block.inner(area);
+    let metric_values = rows
+        .iter()
+        .map(|row| {
+            format_summary_metric(
+                row.metrics,
+                app.summary_metric,
+                app.api_long_context_multiplier,
+            )
+        })
+        .collect::<Vec<_>>();
+    let widest_value = metric_values
+        .iter()
+        .map(|value| UnicodeWidthStr::width(value.as_str()))
+        .chain([UnicodeWidthStr::width(app.summary_metric.label())])
+        .max()
+        .unwrap_or(usize::from(DEFAULT_VALUE_WIDTH));
+    // Preserve the complete ordinary API range and its trailing lower-bound
+    // marker. At tiny widths the value column takes priority over share/label;
+    // exceptionally long values are middle-truncated so their suffix survives.
+    let maximum_value_width = if inner.width < 40 {
+        inner.width
+    } else {
+        inner
+            .width
+            .saturating_sub(SHARE_WIDTH)
+            .saturating_sub(14)
+            .min(MAX_VALUE_WIDTH)
+    };
+    let value_width = u16::try_from(widest_value)
+        .unwrap_or(u16::MAX)
+        .max(DEFAULT_VALUE_WIDTH.min(maximum_value_width))
+        .min(maximum_value_width);
+    let visible_capacity = usize::from(inner.height.saturating_sub(1));
+    app.summary_offset = app
+        .summary_offset
+        .min(rows.len().saturating_sub(visible_capacity));
+    let selected_position = app.summary_selected_index(rows);
+    app.summary_selected_id = rows.get(selected_position).map(|row| row.id.clone());
+    let offset = app.summary_offset;
+    let selected_in_view = selected_position
+        .checked_sub(offset)
+        .filter(|index| *index < visible_capacity);
+    let label_x = inner
+        .x
+        .saturating_add(1)
+        .saturating_add(value_width)
+        .saturating_add(1)
+        .saturating_add(SHARE_WIDTH)
+        .saturating_add(1);
+    app.summary_tree_marker_hitboxes = rows
+        .iter()
+        .skip(offset)
+        .take(visible_capacity)
+        .enumerate()
+        .filter_map(|(position, row)| {
+            if !row.has_children {
+                return None;
+            }
+            let marker_x = label_x.saturating_add(
+                u16::try_from(UnicodeWidthStr::width(row.prefix.as_str())).unwrap_or(u16::MAX),
+            );
+            (marker_x.saturating_add(3) <= inner.right()).then_some(SummaryTreeMarkerHitbox {
+                area: Rect::new(
+                    marker_x,
+                    inner
+                        .y
+                        .saturating_add(1)
+                        .saturating_add(u16::try_from(position).unwrap_or(u16::MAX)),
+                    3,
+                    1,
+                ),
+                node_id: row.id.clone(),
+            })
+        })
+        .collect();
+    let table_rows = rows
+        .iter()
+        .zip(&metric_values)
+        .skip(offset)
+        .take(visible_capacity)
+        .map(|(row, metric_value)| {
+            let selected = app.summary_selected_id.as_deref() == Some(row.id.as_str());
+            let base = if row.kind == SummaryRowKind::Project {
+                Style::default()
+                    .fg(palette.foreground)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.foreground)
+            };
+            let marker = if row.has_children {
+                if row.collapsed { "+" } else { "-" }
+            } else {
+                " "
+            };
+            let marker_style = if selected && row.has_children && app.shortcuts_active() {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(palette.muted)
+            };
+            let source = row
+                .source
+                .as_deref()
+                .filter(|source| !source.is_empty())
+                .map(|source| format!(" · {}", terminal_safe_text(source)))
+                .unwrap_or_default();
+            let label = Line::from(vec![
+                Span::styled(row.prefix.clone(), Style::default().fg(palette.muted)),
+                Span::styled("[", Style::default().fg(palette.muted)),
+                Span::styled(marker, marker_style),
+                Span::styled("] ", Style::default().fg(palette.muted)),
+                Span::styled(row.label.clone(), base),
+                Span::styled(source, Style::default().fg(palette.muted)),
+            ]);
+            let share = app.summary_metric.share_percent(
+                row.metrics,
+                prepared.usage.totals,
+                app.api_long_context_multiplier,
+            );
+            Row::new([
+                Cell::from(truncate_middle_display_text(
+                    metric_value,
+                    usize::from(value_width),
+                )),
+                Cell::from(format!("{share:.1}%")),
+                Cell::from(label),
+            ])
+            .style(base)
+        })
+        .collect::<Vec<_>>();
+    let share_header = if partial { "KNOWN%" } else { "SHARE" };
+    let header = Row::new([app.summary_metric.label(), share_header, "PROJECT · TASK"]).style(
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(value_width),
+            Constraint::Length(SHARE_WIDTH),
+            Constraint::Min(16),
+        ],
+    )
+    .flex(Flex::Legacy)
+    .column_spacing(1)
+    .header(header)
+    .block(block)
+    .row_highlight_style(
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_spacing(HighlightSpacing::Always)
+    .highlight_symbol("▌");
+    let mut state = TableState::default().with_selected(selected_in_view);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    let remaining_rows = rows.len().saturating_sub(offset);
+    let visible_height = inner
+        .height
+        .saturating_sub(1)
+        .min(u16::try_from(remaining_rows).unwrap_or(u16::MAX));
+    let row_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        visible_height,
+    );
+    app.summary_table_hitbox = (!row_area.is_empty()).then_some(TableHitbox {
+        viewport: inner,
+        rows: row_area,
+        offset,
+        capacity: visible_capacity,
+    });
+    app.summary_scrollbar_hitbox = scrollbar_geometry(
+        Rect::new(
+            area.right().saturating_sub(1),
+            row_area.y,
+            1,
+            row_area.height,
+        ),
+        rows.len(),
+        visible_capacity,
+        offset,
+    );
+    if let Some(scrollbar) = app.summary_scrollbar_hitbox {
+        render_scrollbar(
+            frame,
+            scrollbar,
+            app.theme,
+            app.scroll_drag
+                .is_some_and(|drag| drag.target == ScrollTarget::Summary),
+        );
+    }
+}
+
+fn render_summary_bars(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    prepared: &PreparedSummary,
+) {
+    let title = format!(
+        "Top projects · {}{}",
+        summary_chart_metric_label(app, prepared),
+        if prepared.partial(app.summary_metric, app.api_long_context_multiplier) {
+            " · share of known"
+        } else {
+            ""
+        }
+    );
+    let block = panel(&title, app.theme);
+    let inner = block.inner(area);
+    if inner.is_empty() {
+        frame.render_widget(block, area);
+        return;
+    }
+    let projects = summary_project_order(
+        &prepared.usage,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    );
+    let projects = projects
+        .into_iter()
+        .take(usize::from(inner.height).min(8))
+        .collect::<Vec<_>>();
+    let total_value = app
+        .summary_metric
+        .value(prepared.usage.totals, app.api_long_context_multiplier);
+    if projects.is_empty() || total_value == 0 {
+        frame.render_widget(
+            Paragraph::new("No project usage recorded for this range")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(app.theme.palette().muted))
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let selected_project = app
+        .summary_selected_id
+        .as_deref()
+        .and_then(|selected| selected.strip_prefix("project:"));
+    let display_labels = summary_project_display_labels(&prepared.usage);
+    let metric_values = projects
+        .iter()
+        .map(|project| {
+            format_summary_metric(
+                project.totals,
+                app.summary_metric,
+                app.api_long_context_multiplier,
+            )
+        })
+        .collect::<Vec<_>>();
+    let value_width = metric_values
+        .iter()
+        .map(|value| UnicodeWidthStr::width(value.as_str()))
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    let share_width = 6_usize;
+    let available_width = usize::from(inner.width);
+    let bar_width = if available_width >= 36 {
+        (available_width / 5).clamp(6, 14)
+    } else {
+        0
+    };
+    let reserved_width = value_width
+        .saturating_add(share_width)
+        .saturating_add(bar_width)
+        .saturating_add(if bar_width == 0 { 2 } else { 3 });
+    let label_width = available_width.saturating_sub(reserved_width).max(1);
+    let lines = projects
+        .iter()
+        .enumerate()
+        .map(|(index, project)| {
+            let share = app.summary_metric.share_percent(
+                project.totals,
+                prepared.usage.totals,
+                app.api_long_context_multiplier,
+            );
+            let label = display_labels
+                .get(&project.key)
+                .map(String::as_str)
+                .unwrap_or(project.label.as_str());
+            let label = truncate_display_text(label, label_width);
+            let label_padding = label_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let metric_value = &metric_values[index];
+            let metric_padding =
+                value_width.saturating_sub(UnicodeWidthStr::width(metric_value.as_str()));
+            let color = summary_chart_color(index, app.theme);
+            let mut label_style = Style::default().fg(color);
+            if selected_project == Some(project.key.as_str()) {
+                label_style = label_style.add_modifier(Modifier::BOLD);
+            }
+            let mut spans = vec![
+                Span::styled(label, label_style),
+                Span::raw(" ".repeat(label_padding.saturating_add(1))),
+                Span::raw(" ".repeat(metric_padding)),
+                Span::styled(
+                    metric_value.clone(),
+                    Style::default().fg(app.theme.palette().foreground),
+                ),
+                Span::styled(
+                    format!(" {share:>5.1}%"),
+                    Style::default().fg(app.theme.palette().muted),
+                ),
+            ];
+            if bar_width > 0 {
+                let filled = if share <= 0.0 {
+                    0
+                } else {
+                    ((share / 100.0 * bar_width as f64).round() as usize).clamp(1, bar_width)
+                };
+                spans.extend([
+                    Span::raw(" "),
+                    Span::styled(
+                        "█".repeat(filled),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "·".repeat(bar_width.saturating_sub(filled)),
+                        Style::default().fg(app.theme.palette().muted),
+                    ),
+                ]);
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    app.summary_bar_hitboxes = projects
+        .iter()
+        .enumerate()
+        .map(|(index, project)| SummaryBarHitbox {
+            area: Rect::new(
+                inner.x,
+                inner
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                inner.width,
+                1,
+            ),
+            project_key: project.key.clone(),
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app.theme.base_style())
+            .block(block),
+        area,
+    );
+}
+
+fn format_summary_axis(value: f64, metric: SummaryMetric) -> String {
+    let value = value.max(0.0).round() as u128;
+    match metric {
+        SummaryMetric::Tokens => format_compact_u128(value),
+        SummaryMetric::Estimated => format_estimated_credits(value, false),
+        SummaryMetric::ApiEquivalent => format_pico_usd(crate::domain::PicoUsd::new(value)),
+    }
+}
+
+fn render_summary_daily(frame: &mut Frame<'_>, area: Rect, app: &App, prepared: &PreparedSummary) {
+    let states = prepared
+        .usage
+        .days
+        .iter()
+        .map(|day| {
+            prepared.daily_state(
+                day.date,
+                day.totals,
+                app.summary_metric,
+                app.api_long_context_multiplier,
+            )
+        })
+        .collect::<Vec<_>>();
+    let complete_days = states
+        .iter()
+        .filter(|state| **state == SummaryDailyState::Complete)
+        .count();
+    let partial_days = states
+        .iter()
+        .filter(|state| **state == SummaryDailyState::Partial)
+        .count();
+    let known_days = complete_days.saturating_add(partial_days);
+    let total_days = states.len();
+    let missing_days = total_days.saturating_sub(known_days);
+    let metric = match app.summary_metric {
+        SummaryMetric::Tokens => "Tokens",
+        SummaryMetric::Estimated => "~EST CR.",
+        SummaryMetric::ApiEquivalent => "API EQ.",
+    };
+    let title = format!(
+        "Daily · {metric} · 1 bar/local day · {complete_days}C/{partial_days}P/{missing_days}M"
+    );
+    let lower_bound = known_days < total_days
+        || prepared.partial(app.summary_metric, app.api_long_context_multiplier);
+    let block = panel(&title, app.theme);
+    let inner = block.inner(area);
+    if inner.is_empty() {
+        frame.render_widget(block, area);
+        return;
+    }
+    frame.render_widget(block, area);
+    let show_legend = inner.height >= 4;
+    let show_status = inner.height >= 6
+        && usize::from(inner.width) >= UnicodeWidthStr::width("days ") + states.len();
+    let annotation_height = u16::from(show_legend) + u16::from(show_status);
+    let chart_area = if annotation_height > 0 {
+        let palette = app.theme.palette();
+        if show_legend {
+            let mut legend = Vec::new();
+            if lower_bound {
+                legend.push(Span::styled(
+                    "LOWER BOUND · ",
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            legend.extend([
+                Span::styled("C", Style::default().fg(palette.accent)),
+                Span::styled(" complete · ", Style::default().fg(palette.muted)),
+                Span::styled("P", Style::default().fg(palette.warning)),
+                Span::styled(" partial · M missing", Style::default().fg(palette.muted)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(Line::from(legend)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+        }
+        if show_status {
+            let mut status = vec![Span::styled("days ", Style::default().fg(palette.muted))];
+            let symbols = summary_daily_status_symbols(&states);
+            status.extend(states.iter().zip(symbols.chars()).map(|(state, symbol)| {
+                let style = match state {
+                    SummaryDailyState::Complete => Style::default().fg(palette.accent),
+                    SummaryDailyState::Partial => Style::default().fg(palette.warning),
+                    SummaryDailyState::Missing => Style::default()
+                        .fg(palette.muted)
+                        .add_modifier(Modifier::DIM),
+                };
+                Span::styled(symbol.to_string(), style)
+            }));
+            frame.render_widget(
+                Paragraph::new(Line::from(status)),
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(u16::from(show_legend)),
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(annotation_height),
+            inner.width,
+            inner.height.saturating_sub(annotation_height),
+        )
+    } else {
+        inner
+    };
+    let points = prepared
+        .usage
+        .days
+        .iter()
+        .zip(states.iter().copied())
+        .enumerate()
+        .filter_map(|(index, (day, state))| {
+            (state != SummaryDailyState::Missing).then_some((
+                index as f64,
+                app.summary_metric
+                    .value(day.totals, app.api_long_context_multiplier) as f64,
+                state,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No project-level daily history for this range; missing days are unknown",
+            )
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(app.theme.palette().muted)),
+            chart_area,
+        );
+        return;
+    }
+    let maximum_value = points
+        .iter()
+        .map(|(_, value, _)| *value)
+        .fold(0.0_f64, f64::max);
+    let y_max = if maximum_value <= 0.0 {
+        1.0
+    } else {
+        nice_trend_maximum(maximum_value)
+    };
+    let x_max = prepared.usage.days.len().saturating_sub(1).max(1) as f64;
+    let first = prepared
+        .usage
+        .days
+        .first()
+        .map(|day| day.date.format("%m-%d").to_string())
+        .unwrap_or_default();
+    let last = prepared
+        .usage
+        .days
+        .last()
+        .map(|day| day.date.format("%m-%d").to_string())
+        .unwrap_or_default();
+    let middle = prepared
+        .usage
+        .days
+        .get(prepared.usage.days.len() / 2)
+        .map(|day| day.date.format("%m-%d").to_string())
+        .unwrap_or_default();
+    let complete_points = points
+        .iter()
+        .filter(|(_, _, state)| *state == SummaryDailyState::Complete)
+        .map(|(x, y, _)| (*x, *y))
+        .collect::<Vec<_>>();
+    let partial_points = points
+        .iter()
+        .filter(|(_, _, state)| *state == SummaryDailyState::Partial)
+        .map(|(x, y, _)| (*x, *y))
+        .collect::<Vec<_>>();
+    let mut datasets = Vec::new();
+    if !complete_points.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .data(&complete_points)
+                .graph_type(GraphType::Bar)
+                .marker(Marker::Block)
+                .style(Style::default().fg(app.theme.palette().accent)),
+        );
+    }
+    if !partial_points.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .data(&partial_points)
+                .graph_type(GraphType::Bar)
+                .marker(Marker::Block)
+                .style(Style::default().fg(app.theme.palette().warning)),
+        );
+    }
+    frame.render_widget(
+        Chart::new(datasets)
+            .style(app.theme.base_style())
+            .x_axis(
+                Axis::default()
+                    .bounds([0.0, x_max])
+                    .labels(vec![first, middle, last])
+                    .style(Style::default().fg(app.theme.palette().muted)),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, y_max])
+                    .labels(vec![
+                        format_summary_axis(0.0, app.summary_metric),
+                        format_summary_axis(y_max / 2.0, app.summary_metric),
+                        format_summary_axis(y_max, app.summary_metric),
+                    ])
+                    .style(Style::default().fg(app.theme.palette().muted)),
+            ),
+        chart_area,
+    );
+}
+
+fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
+    ensure_summary_cache(app, now);
+    let rows = app.summary_rows();
+    if rows.is_empty() {
+        app.summary_selected_id = None;
+        app.summary_offset = 0;
+    } else if app
+        .summary_selected_id
+        .as_deref()
+        .is_none_or(|selected| !rows.iter().any(|row| row.id == selected))
+    {
+        app.summary_selected_id = Some(rows[0].id.clone());
+    }
+    let Some(cache) = app.summary_cache.take() else {
+        return;
+    };
+    let controls_and_body =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let selected_can_toggle = app.summary_selected_id.as_deref().is_some_and(|selected| {
+        rows.iter()
+            .any(|row| row.id == selected && row.has_children)
+    });
+    app.summary_controls_hitbox = Some(render_summary_controls(
+        frame,
+        controls_and_body[0],
+        app,
+        selected_can_toggle,
+    ));
+    let body = controls_and_body[1];
+    if body.height < 18 {
+        let sections =
+            Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).split(body);
+        render_summary_tree(frame, sections[0], app, &cache.prepared, &rows);
+        render_summary_bars(frame, sections[1], app, &cache.prepared);
+    } else if body.width < 110 || body.height < 28 {
+        let sections = Layout::vertical([
+            Constraint::Percentage(34),
+            Constraint::Percentage(23),
+            Constraint::Percentage(43),
+        ])
+        .split(body);
+        render_summary_tree(frame, sections[0], app, &cache.prepared, &rows);
+        render_summary_bars(frame, sections[1], app, &cache.prepared);
+        render_summary_daily(frame, sections[2], app, &cache.prepared);
+    } else {
+        let columns = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(body);
+        let desired_bars_height = u16::try_from(cache.prepared.usage.projects.len().min(8))
+            .unwrap_or(8)
+            .saturating_add(2)
+            .max(4);
+        let bars_height = desired_bars_height.min(columns[1].height.saturating_sub(8));
+        let charts = Layout::vertical([Constraint::Length(bars_height), Constraint::Min(8)])
+            .split(columns[1]);
+        render_summary_tree(frame, columns[0], app, &cache.prepared, &rows);
+        render_summary_bars(frame, charts[0], app, &cache.prepared);
+        render_summary_daily(frame, charts[1], app, &cache.prepared);
+    }
+    app.summary_cache = Some(cache);
 }
 
 fn render_trend_controls(

@@ -225,7 +225,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
         screen.contents().contains("codex-usage-monit | desktop")
     });
     session.wait_for("selected Overview tab", |screen| {
-        label_is_bold(screen, "Overview")
+        label_is_bold(screen, "Overview") || label_is_bold(screen, "Ovw")
     });
     assert!(!session.label_is_bold("Other"));
 
@@ -236,7 +236,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
 
     session.send(b"4");
     session.wait_for("keyboard switch to Settings", |screen| {
-        label_is_bold(screen, "Settings")
+        (label_is_bold(screen, "Settings") || label_is_bold(screen, "Set"))
             && screen.contents().contains("Table columns")
             && screen.contents().contains("EST Longx")
     });
@@ -255,7 +255,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
 
     session.send(b"1");
     session.wait_for("keyboard switch back to Overview", |screen| {
-        label_is_bold(screen, "Overview")
+        label_is_bold(screen, "Overview") || label_is_bold(screen, "Ovw")
     });
 
     session.send(b"/2");
@@ -279,15 +279,20 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
 
     session.click(2, 0);
     session.wait_for("mouse switch back to Overview", |screen| {
-        label_is_bold(screen, "Overview")
+        label_is_bold(screen, "Overview") || label_is_bold(screen, "Ovw")
     });
 
     session.resize(60, 24);
     session.wait_for_new_output("compact controls after resize", |screen| {
+        let contents = screen.contents();
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap_or_default();
+        let controls = lines.next().unwrap_or_default();
         screen.size() == (24, 60)
-            && screen.rows(0, 60).next().is_some_and(|row| {
-                row.contains("4 Set") && row.contains("[V]") && row.contains("[M]")
-            })
+            && header.contains("4 Set")
+            && [header, controls]
+                .iter()
+                .any(|row| row.contains("[V]") && row.contains("[M]"))
     });
 
     session.send(b"4");

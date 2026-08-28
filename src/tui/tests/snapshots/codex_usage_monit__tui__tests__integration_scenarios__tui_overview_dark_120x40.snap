@@ -4,7 +4,7 @@ expression: overview.frame().snapshot_text()
 ---
 size=120x40
 rows:
-00| 1 Overview  |  2 Trends  |  3 Other  |  4 Settings  | [V]Turns [M]Models [5h] [Week] [L]EST Longx
+00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings  | [V]Turns [M]Models [5h] [Week] [L]EST Longx
 01|┌5h · codex · SERVER───────────────────────────────────────┐┌week · codex · SERVER─────────────────────────────────────┐
 02|│██████████████████████                                    ││████████████████████████                                  │
 03|│█████████38% used | 62% left | reset 07-12 06:30          ││█████████42% used | 58% left | reset 07-16 04:30          │
@@ -50,24 +50,26 @@ styles:
 00:011+005 fg=#7e8691 bg=#121417 mods=none text="  |  "
 00:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="2"
 00:017+012 fg=#7e8691 bg=#121417 mods=none text=" Trends  |  "
-00:029+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
-00:030+011 fg=#7e8691 bg=#121417 mods=none text=" Other  |  "
-00:041+001 fg=#3fb9c0 bg=#121417 mods=bold text="4"
-00:042+013 fg=#7e8691 bg=#121417 mods=none text=" Settings  | "
-00:055+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:056+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="V"
-00:057+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Turns"
-00:064+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:065+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="M"
-00:066+007 fg=#121417 bg=#3fb9c0 mods=bold text="]Models"
-00:074+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-00:075+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="5"
-00:076+002 fg=#121417 bg=#3fb9c0 mods=bold text="h]"
-00:078+002 fg=#7e8691 bg=#121417 mods=none text=" ["
-00:080+001 fg=#3fb9c0 bg=#121417 mods=bold text="W"
-00:081+006 fg=#7e8691 bg=#121417 mods=none text="eek] ["
-00:087+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
-00:088+032 fg=#7e8691 bg=#121417 mods=none text="]EST Longx                      "
+00:029+001 fg=#3fb9c0 bg=#121417 mods=bold text="U"
+00:030+013 fg=#7e8691 bg=#121417 mods=none text=" Summary  |  "
+00:043+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
+00:044+011 fg=#7e8691 bg=#121417 mods=none text=" Other  |  "
+00:055+001 fg=#3fb9c0 bg=#121417 mods=bold text="4"
+00:056+013 fg=#7e8691 bg=#121417 mods=none text=" Settings  | "
+00:069+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:070+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="V"
+00:071+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Turns"
+00:078+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:079+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="M"
+00:080+007 fg=#121417 bg=#3fb9c0 mods=bold text="]Models"
+00:088+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+00:089+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="5"
+00:090+002 fg=#121417 bg=#3fb9c0 mods=bold text="h]"
+00:092+002 fg=#7e8691 bg=#121417 mods=none text=" ["
+00:094+001 fg=#3fb9c0 bg=#121417 mods=bold text="W"
+00:095+006 fg=#7e8691 bg=#121417 mods=none text="eek] ["
+00:101+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
+00:102+018 fg=#7e8691 bg=#121417 mods=none text="]EST Longx        "
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+019 fg=#f4f6f8 bg=#121417 mods=bold text="5h · codex · SERVER"
 01:020+041 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────┐┌"
@@ -264,12 +266,13 @@ styles:
 controls:
 ViewOverview binding=1 rect=0,0,12,1
 ViewTrends binding=2 rect=15,0,10,1
-ViewOther binding=3 rect=28,0,9,1
-ViewSettings binding=4 rect=40,0,12,1
-ToggleTurns binding=V rect=55,0,8,1
-ToggleModels binding=M rect=64,0,9,1
-ScopeFiveHours binding=5 rect=74,0,4,1
-ScopeWeek binding=W rect=79,0,6,1
+ViewSummary binding=U rect=28,0,11,1
+ViewOther binding=3 rect=42,0,9,1
+ViewSettings binding=4 rect=54,0,12,1
+ToggleTurns binding=V rect=69,0,8,1
+ToggleModels binding=M rect=78,0,9,1
+ScopeFiveHours binding=5 rect=88,0,4,1
+ScopeWeek binding=W rect=93,0,6,1
 SourceAll binding=A rect=21,6,3,1
 SourceDesktop binding=D rect=24,6,3,1
 SourceSubagent binding=S rect=27,6,3,1

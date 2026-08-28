@@ -502,9 +502,10 @@ fn collect_snapshot_with_local(
     }
     let local_coverage_starts_at = (scan_local && rollout_complete && !rollout_source_degraded)
         .then(|| now - Duration::days(config.lookback_days.clamp(1, HISTORY_RETENTION_DAYS)));
-    let history_observation = HistoryObservation::from_sources_with_coverage(
+    let history_observation = HistoryObservation::from_sources_with_tasks_and_coverage(
         now,
         &dataset.calls,
+        &tasks,
         &limits,
         &history_partial_reasons,
         local_coverage_starts_at,

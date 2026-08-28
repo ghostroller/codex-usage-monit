@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -10,13 +10,17 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::api_cost::ApiCostAggregation;
+use crate::api_cost::{API_PRICING_CATALOG_REVISION, ApiCostAccumulator};
 use crate::atomic_file::replace_file;
 use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_model};
-use crate::domain::{LimitBucket, Provenance, TokenUsage, UsageCall};
+use crate::domain::{ApiCostAmount, LimitBucket, Provenance, TaskRecord, TokenUsage, UsageCall};
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
 pub const HISTORY_METRIC_REVISION: u32 = 3;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
+pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 1;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
 pub const LOCAL_BUCKET_MINUTES: i64 = 15;
 
@@ -24,6 +28,8 @@ const APP_DIRECTORY: &str = "codex-usage-monit";
 const HISTORY_DIRECTORY: &str = "history-v1";
 const STATE_DIRECTORY_ENV: &str = "CODEX_USAGE_MONIT_STATE_DIR";
 const LOCK_FILE: &str = "history.lock";
+const SUMMARY_BACKFILL_MARKER_FILE: &str = "summary-backfill.json";
+const SUMMARY_BACKFILL_MARKER_VERSION: u32 = 1;
 const LEGACY_HISTORY_FORMAT_VERSION: u32 = 1;
 const LOCAL_BUCKET_SECS: i64 = LOCAL_BUCKET_MINUTES * 60;
 const WEEKLY_SAMPLE_SECS: i64 = 30 * 60;
@@ -35,6 +41,7 @@ const FULL_HISTORY_MERGE_SECS: i64 = 30 * 60;
 const RECENT_BUCKET_OVERLAP_SECS: i64 = 60 * 60;
 const HISTORY_READ_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
 const TEMP_FILE_ATTEMPTS: usize = 128;
+const PROJECT_TITLE_MAX_CHARS: usize = 160;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -69,6 +76,34 @@ pub struct LocalUsageGroup {
     pub used_long_context_detection_fallback: bool,
 }
 
+/// One thread's own usage within a fixed-width local bucket.
+///
+/// Parent totals are intentionally not materialized here. Summary views build
+/// subtree totals at query time so a subagent can never be counted both as its
+/// own usage and as part of an already-aggregated parent sample.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProjectUsageGroup {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub token_usage: TokenUsage,
+    pub estimated_cost_units: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_long_context_extra_cost_units: Option<u128>,
+    #[serde(default)]
+    pub api_equivalent_cost: ApiCostAmount,
+    pub call_count: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// A fixed-width local usage bucket.
@@ -86,9 +121,21 @@ pub struct LocalHalfHourBucket {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub long_context_usage_unknown: bool,
     pub estimator_revision: u32,
+    /// Version of the per-project/thread breakdown. Zero means the shard
+    /// predates project attribution, even when the bucket itself is a real
+    /// observed zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub project_breakdown_revision: u32,
+    /// API catalog used to materialize `project_groups[*].api_equivalent_cost`.
+    /// Outdated amounts are treated as unpriced by Summary instead of mixing
+    /// prices from different catalogs.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub api_pricing_catalog_revision: u32,
     pub call_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<LocalUsageGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_groups: Vec<LocalProjectUsageGroup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partial_reasons: Vec<String>,
 }
@@ -135,6 +182,24 @@ impl HistoryObservation {
         partial_reasons: &[String],
         local_coverage_starts_at: Option<DateTime<Utc>>,
     ) -> Self {
+        Self::from_sources_with_tasks_and_coverage(
+            observed_at,
+            calls,
+            &[],
+            limits,
+            partial_reasons,
+            local_coverage_starts_at,
+        )
+    }
+
+    pub fn from_sources_with_tasks_and_coverage(
+        observed_at: DateTime<Utc>,
+        calls: &[UsageCall],
+        tasks: &[TaskRecord],
+        limits: &[LimitBucket],
+        partial_reasons: &[String],
+        local_coverage_starts_at: Option<DateTime<Utc>>,
+    ) -> Self {
         let weekly_local_points = weekly_local_points_from_sources(
             observed_at,
             calls,
@@ -148,6 +213,7 @@ impl HistoryObservation {
             half_hour_buckets: local_buckets_from_calls(
                 observed_at,
                 calls,
+                tasks,
                 partial_reasons,
                 local_coverage_starts_at,
             ),
@@ -163,6 +229,11 @@ pub struct HistoryData {
     pub weekly_local_points: Vec<WeeklyLocalPoint>,
     pub warnings: Vec<String>,
     pub read_only: bool,
+    /// Most recent project-history reconstruction attempt for the current
+    /// metric, estimator, pricing, and bucket revisions in this Codex-home
+    /// namespace. Actual bucket coverage remains the source of truth.
+    pub(crate) summary_backfill_attempted_at: Option<DateTime<Utc>>,
+    pub(crate) summary_backfill_attempt_complete: Option<bool>,
 }
 
 impl HistoryData {
@@ -628,6 +699,7 @@ pub struct HistoryStore {
     history_root: Option<PathBuf>,
     namespace: String,
     namespace_dir: Option<PathBuf>,
+    redact_content: bool,
     read_only: bool,
     namespace_checked: bool,
     last_full_merge_at: Option<DateTime<Utc>>,
@@ -641,20 +713,37 @@ pub struct HistoryStore {
 
 impl HistoryStore {
     pub fn discover(codex_home: &Path) -> Self {
-        Self::from_optional_root(default_history_root(), codex_home)
+        Self::discover_with_redaction(codex_home, false)
+    }
+
+    pub fn discover_with_redaction(codex_home: &Path, redact_content: bool) -> Self {
+        Self::from_optional_root(default_history_root(), codex_home, redact_content)
     }
 
     pub fn new(history_root: PathBuf, codex_home: &Path) -> Self {
-        Self::from_optional_root(Some(history_root), codex_home)
+        Self::new_with_redaction(history_root, codex_home, false)
     }
 
-    fn from_optional_root(history_root: Option<PathBuf>, codex_home: &Path) -> Self {
-        let namespace = history_namespace(codex_home);
+    pub fn new_with_redaction(
+        history_root: PathBuf,
+        codex_home: &Path,
+        redact_content: bool,
+    ) -> Self {
+        Self::from_optional_root(Some(history_root), codex_home, redact_content)
+    }
+
+    fn from_optional_root(
+        history_root: Option<PathBuf>,
+        codex_home: &Path,
+        redact_content: bool,
+    ) -> Self {
+        let namespace = history_namespace_with_redaction(codex_home, redact_content);
         let namespace_dir = history_root.as_ref().map(|root| root.join(&namespace));
         Self {
             history_root,
             namespace,
             namespace_dir,
+            redact_content,
             read_only: false,
             namespace_checked: false,
             last_full_merge_at: None,
@@ -684,6 +773,10 @@ impl HistoryStore {
     }
 
     pub fn record(&mut self, observation: &HistoryObservation) -> io::Result<HistoryWriteReport> {
+        let redacted_observation = self
+            .redact_content
+            .then(|| redacted_history_observation(observation));
+        let observation = redacted_observation.as_ref().unwrap_or(observation);
         let full_merge = self.full_merge_due(observation.observed_at);
         self.record_with_merge_mode(observation, full_merge, full_merge)
     }
@@ -804,6 +897,10 @@ impl HistoryStore {
     /// reset transitions, closed local buckets, and stronger external evidence
     /// retain their normal semantics.
     pub(crate) fn stage(&mut self, observation: &HistoryObservation) {
+        let redacted_observation = self
+            .redact_content
+            .then(|| redacted_history_observation(observation));
+        let observation = redacted_observation.as_ref().unwrap_or(observation);
         let pending_clock_rollback = self
             .staged_observation
             .as_ref()
@@ -822,6 +919,67 @@ impl HistoryStore {
                 self.staged_observation = Some(staged);
             }
         }
+    }
+
+    /// Stage a complete lookback observation, preserving buckets outside the
+    /// normal recent-writer overlap. This is reserved for explicit history
+    /// reconstruction such as Summary's one-time 30-day backfill.
+    pub(crate) fn stage_full_observation(&mut self, observation: &HistoryObservation) {
+        let redacted_observation = self
+            .redact_content
+            .then(|| redacted_history_observation(observation));
+        let observation = redacted_observation.as_ref().unwrap_or(observation);
+        self.staged_force_full_merge = true;
+        match self.staged_observation.as_mut() {
+            Some(staged) => merge_history_observation(staged, observation, true),
+            None => {
+                let mut staged = HistoryObservation {
+                    observed_at: observation.observed_at,
+                    ..HistoryObservation::default()
+                };
+                merge_history_observation(&mut staged, observation, true);
+                self.staged_observation = Some(staged);
+            }
+        }
+    }
+
+    /// Persist a namespace-scoped marker after a Summary backfill has been
+    /// flushed. Complete and partial attempts share a retry cooldown so a
+    /// deterministic parser ambiguity cannot trigger the same expensive scan
+    /// on every launch.
+    pub(crate) fn mark_summary_backfill_attempt(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        complete: bool,
+    ) -> io::Result<()> {
+        let Some(directory) = self.namespace_dir.as_deref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "history state directory is unavailable",
+            ));
+        };
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "history store is read-only",
+            ));
+        }
+        if self.staged_observation.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "history backfill is not fully persisted",
+            ));
+        }
+        let marker = SummaryBackfillMarker::current(completed_at, complete);
+        let mut contents = serde_json::to_vec_pretty(&marker)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        contents.push(b'\n');
+        write_private_atomically(&directory.join(SUMMARY_BACKFILL_MARKER_FILE), &contents)?;
+        if let Some(data) = self.cached_data.as_mut() {
+            data.summary_backfill_attempted_at = Some(completed_at);
+            data.summary_backfill_attempt_complete = Some(complete);
+        }
+        Ok(())
     }
 
     /// Flush a staged observation regardless of the normal batching interval.
@@ -987,7 +1145,14 @@ impl HistoryStore {
             }
         }
         normalize_loaded_data(&mut data);
+        if self.redact_content {
+            redact_history_data_titles(&mut data);
+        }
         data.read_only = self.read_only;
+        if let Some(marker) = read_current_summary_backfill_marker(directory) {
+            data.summary_backfill_attempted_at = Some(marker.completed_at);
+            data.summary_backfill_attempt_complete = Some(marker.complete);
+        }
         self.cached_since = Some(since);
         self.cached_data = Some(data.clone());
         self.cache_loaded_at = Some(Instant::now());
@@ -1084,6 +1249,28 @@ fn merge_history_observation(
     staged
         .weekly_local_points
         .sort_by_key(|point| point.observed_at);
+}
+
+fn redacted_history_observation(observation: &HistoryObservation) -> HistoryObservation {
+    let mut observation = observation.clone();
+    for bucket in &mut observation.half_hour_buckets {
+        redact_project_group_titles(&mut bucket.project_groups);
+    }
+    observation
+}
+
+fn redact_history_data_titles(data: &mut HistoryData) {
+    for bucket in &mut data.half_hour_buckets {
+        redact_project_group_titles(&mut bucket.project_groups);
+    }
+}
+
+fn redact_project_group_titles(groups: &mut [LocalProjectUsageGroup]) {
+    for group in groups {
+        if group.title.is_some() {
+            group.title = Some("[redacted]".to_string());
+        }
+    }
 }
 
 fn merge_observation_into_history(
@@ -1366,22 +1553,57 @@ struct BucketAccumulator {
     long_context_usage_unknown: bool,
     call_count: u64,
     groups: BTreeMap<(Option<String>, Option<String>), LocalUsageGroup>,
+    project_groups: BTreeMap<String, LocalProjectUsageGroup>,
+    api_cost_by_thread: BTreeMap<String, ApiCostAccumulator>,
     partial_reasons: BTreeSet<String>,
 }
 
 fn local_buckets_from_calls(
     observed_at: DateTime<Utc>,
     calls: &[UsageCall],
+    tasks: &[TaskRecord],
     partial_reasons: &[String],
     local_coverage_starts_at: Option<DateTime<Utc>>,
 ) -> Vec<LocalHalfHourBucket> {
+    let tasks_by_thread = tasks
+        .iter()
+        .map(|task| (task.thread_id.as_str(), task))
+        .collect::<HashMap<_, _>>();
+    let project_group_templates = project_group_templates(&tasks_by_thread);
     let mut buckets: BTreeMap<DateTime<Utc>, BucketAccumulator> = BTreeMap::new();
     for call in calls {
-        if call.timestamp > observed_at || is_spark_model(call.model.as_deref()) {
+        if call.timestamp > observed_at {
             continue;
         }
         let starts_at = floor_local_bucket(call.timestamp);
         let bucket = buckets.entry(starts_at).or_default();
+        bucket
+            .api_cost_by_thread
+            .entry(call.thread_id.clone())
+            .or_default()
+            .add_call(call);
+        bucket
+            .partial_reasons
+            .extend(partial_reasons.iter().cloned());
+        insert_project_lineage(
+            &mut bucket.project_groups,
+            &call.thread_id,
+            &tasks_by_thread,
+            &project_group_templates,
+        );
+        if is_spark_model(call.model.as_deref()) {
+            let project_group = bucket
+                .project_groups
+                .entry(call.thread_id.clone())
+                .or_insert_with(|| {
+                    project_group_template(&call.thread_id, &project_group_templates)
+                });
+            project_group
+                .api_long_context_extra_cost_units
+                .get_or_insert(0);
+            project_group.call_count = project_group.call_count.saturating_add(1);
+            continue;
+        }
         let weight = estimate_call_weight(call);
         bucket.token_usage.add_assign(call.tokens);
         bucket.estimated_cost_units = bucket.estimated_cost_units.saturating_add(weight.units);
@@ -1390,9 +1612,6 @@ fn local_buckets_from_calls(
             .saturating_add(weight.api_long_context_extra_units);
         bucket.long_context_usage_unknown |= weight.used_long_context_detection_fallback;
         bucket.call_count = bucket.call_count.saturating_add(1);
-        bucket
-            .partial_reasons
-            .extend(partial_reasons.iter().cloned());
         if weight.used_model_fallback {
             bucket
                 .partial_reasons
@@ -1429,6 +1648,22 @@ fn local_buckets_from_calls(
         group.used_token_breakdown_fallback |= weight.used_token_breakdown_fallback;
         group.used_long_context_pricing |= weight.used_long_context_pricing;
         group.used_long_context_detection_fallback |= weight.used_long_context_detection_fallback;
+
+        let project_group = bucket
+            .project_groups
+            .entry(call.thread_id.clone())
+            .or_insert_with(|| project_group_template(&call.thread_id, &project_group_templates));
+        project_group.token_usage.add_assign(call.tokens);
+        project_group.estimated_cost_units = project_group
+            .estimated_cost_units
+            .saturating_add(weight.units);
+        project_group.api_long_context_extra_cost_units = Some(
+            project_group
+                .api_long_context_extra_cost_units
+                .unwrap_or_default()
+                .saturating_add(weight.api_long_context_extra_units),
+        );
+        project_group.call_count = project_group.call_count.saturating_add(1);
     }
 
     if let Some(coverage_starts_at) =
@@ -1452,6 +1687,18 @@ fn local_buckets_from_calls(
         .into_iter()
         .map(|(starts_at, bucket)| {
             let ends_at = starts_at + Duration::seconds(LOCAL_BUCKET_SECS);
+            let project_groups = bucket
+                .project_groups
+                .into_values()
+                .map(|mut group| {
+                    group.api_equivalent_cost = bucket
+                        .api_cost_by_thread
+                        .get(&group.thread_id)
+                        .map(ApiCostAccumulator::amount)
+                        .unwrap_or_default();
+                    group
+                })
+                .collect();
             LocalHalfHourBucket {
                 starts_at,
                 ends_at,
@@ -1463,12 +1710,138 @@ fn local_buckets_from_calls(
                 api_long_context_extra_cost_units: Some(bucket.api_long_context_extra_cost_units),
                 long_context_usage_unknown: bucket.long_context_usage_unknown,
                 estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+                api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
                 call_count: bucket.call_count,
                 groups: bucket.groups.into_values().collect(),
+                project_groups,
                 partial_reasons: bucket.partial_reasons.into_iter().collect(),
             }
         })
         .collect()
+}
+
+fn insert_project_lineage(
+    groups: &mut BTreeMap<String, LocalProjectUsageGroup>,
+    thread_id: &str,
+    tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    templates: &HashMap<String, LocalProjectUsageGroup>,
+) {
+    let mut current = Some(thread_id);
+    let mut visited = BTreeSet::new();
+    while let Some(candidate_id) = current {
+        if !visited.insert(candidate_id) {
+            break;
+        }
+        if groups.contains_key(candidate_id) {
+            break;
+        }
+        groups.insert(
+            candidate_id.to_string(),
+            project_group_template(candidate_id, templates),
+        );
+        current = tasks_by_thread
+            .get(candidate_id)
+            .and_then(|task| task.parent_thread_id.as_deref());
+    }
+}
+
+fn project_group_templates(
+    tasks_by_thread: &HashMap<&str, &TaskRecord>,
+) -> HashMap<String, LocalProjectUsageGroup> {
+    let mut project_descriptors = HashMap::<PathBuf, (String, String)>::new();
+    tasks_by_thread
+        .keys()
+        .map(|thread_id| {
+            (
+                (*thread_id).to_string(),
+                build_project_group_template(thread_id, tasks_by_thread, &mut project_descriptors),
+            )
+        })
+        .collect()
+}
+
+fn project_group_template(
+    thread_id: &str,
+    templates: &HashMap<String, LocalProjectUsageGroup>,
+) -> LocalProjectUsageGroup {
+    templates
+        .get(thread_id)
+        .cloned()
+        .unwrap_or_else(|| LocalProjectUsageGroup {
+            thread_id: thread_id.to_string(),
+            ..LocalProjectUsageGroup::default()
+        })
+}
+
+fn build_project_group_template(
+    thread_id: &str,
+    tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    project_descriptors: &mut HashMap<PathBuf, (String, String)>,
+) -> LocalProjectUsageGroup {
+    let task = tasks_by_thread.get(thread_id).copied();
+    let mut current = task;
+    let mut visited = BTreeSet::new();
+    let mut project_path = None;
+    while let Some(candidate) = current {
+        if !visited.insert(candidate.thread_id.as_str()) {
+            break;
+        }
+        if candidate.cwd.is_some() {
+            project_path = candidate.cwd.clone();
+            break;
+        }
+        current = candidate
+            .parent_thread_id
+            .as_deref()
+            .and_then(|parent| tasks_by_thread.get(parent).copied());
+    }
+    let project_descriptor = project_path.as_ref().map(|path| {
+        project_descriptors
+            .entry(path.clone())
+            .or_insert_with(|| (project_id(path), project_label(path)))
+            .clone()
+    });
+    LocalProjectUsageGroup {
+        thread_id: thread_id.to_string(),
+        parent_thread_id: task.and_then(|task| task.parent_thread_id.clone()),
+        project_id: project_descriptor.as_ref().map(|(id, _)| id.clone()),
+        project_label: project_descriptor.map(|(_, label)| label),
+        title: task
+            .map(|task| task.title.trim())
+            .filter(|title| !title.is_empty())
+            .map(|title| bounded_chars(title, PROJECT_TITLE_MAX_CHARS)),
+        source: task
+            .and_then(|task| task.source.as_deref())
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(str::to_string),
+        ..LocalProjectUsageGroup::default()
+    }
+}
+
+fn bounded_chars(value: &str, maximum: usize) -> String {
+    let mut characters = value.chars();
+    let mut bounded = characters.by_ref().take(maximum).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn project_id(path: &Path) -> String {
+    let normalized = normalized_path(path);
+    format!(
+        "project-{:016x}",
+        stable_hash(&history_namespace_bytes(&normalized))
+    )
+}
+
+fn project_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn normalized_optional(value: &Option<String>) -> Option<String> {
@@ -1477,6 +1850,10 @@ fn normalized_optional(value: &Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn floor_local_bucket(timestamp: DateTime<Utc>) -> DateTime<Utc> {
@@ -1507,6 +1884,51 @@ struct HistoryShard {
     half_hour_buckets: Vec<LocalHalfHourBucket>,
     #[serde(default)]
     weekly_local_points: Vec<WeeklyLocalPoint>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryBackfillMarker {
+    schema_version: u32,
+    completed_at: DateTime<Utc>,
+    #[serde(default)]
+    complete: bool,
+    history_metric_revision: u32,
+    estimator_revision: u32,
+    project_breakdown_revision: u32,
+    api_pricing_catalog_revision: u32,
+    bucket_minutes: i64,
+}
+
+impl SummaryBackfillMarker {
+    fn current(completed_at: DateTime<Utc>, complete: bool) -> Self {
+        Self {
+            schema_version: SUMMARY_BACKFILL_MARKER_VERSION,
+            completed_at,
+            complete,
+            history_metric_revision: HISTORY_METRIC_REVISION,
+            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            bucket_minutes: LOCAL_BUCKET_MINUTES,
+        }
+    }
+
+    fn revisions_are_current(&self) -> bool {
+        self.schema_version == SUMMARY_BACKFILL_MARKER_VERSION
+            && self.history_metric_revision == HISTORY_METRIC_REVISION
+            && self.estimator_revision == HISTORY_ESTIMATOR_REVISION
+            && self.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
+            && self.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+            && self.bucket_minutes == LOCAL_BUCKET_MINUTES
+    }
+}
+
+fn read_current_summary_backfill_marker(directory: &Path) -> Option<SummaryBackfillMarker> {
+    fs::read(directory.join(SUMMARY_BACKFILL_MARKER_FILE))
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<SummaryBackfillMarker>(&contents).ok())
+        .filter(SummaryBackfillMarker::revisions_are_current)
 }
 
 impl HistoryShard {
@@ -1701,7 +2123,7 @@ fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> boo
 
 fn upsert_half_hour_bucket(
     buckets: &mut Vec<LocalHalfHourBucket>,
-    incoming: LocalHalfHourBucket,
+    mut incoming: LocalHalfHourBucket,
 ) -> bool {
     if !is_current_local_bucket(&incoming) {
         return false;
@@ -1719,6 +2141,37 @@ fn upsert_half_hour_bucket(
             }
             return false;
         }
+        if project_breakdown_can_upgrade_without_replacing(&incoming, &buckets[index]) {
+            let existing = &mut buckets[index];
+            existing.sampled_at = existing.sampled_at.max(incoming.sampled_at);
+            existing.project_breakdown_revision = incoming.project_breakdown_revision;
+            existing.api_pricing_catalog_revision = incoming.api_pricing_catalog_revision;
+            existing.project_groups = incoming.project_groups;
+            // The aggregate counters can remain trustworthy while a rollout
+            // scan only partially reconstructs the project/API split. Keep
+            // that collection quality attached to the grafted breakdown so
+            // Summary cannot present it as exact. A later complete enrichment
+            // through this same branch clears the old collection issues.
+            existing
+                .partial_reasons
+                .retain(|reason| !is_collection_issue_reason(reason));
+            existing.partial_reasons.extend(
+                incoming
+                    .partial_reasons
+                    .into_iter()
+                    .filter(|reason| is_collection_issue_reason(reason)),
+            );
+            existing.partial_reasons.sort();
+            existing.partial_reasons.dedup();
+            return true;
+        }
+        if project_breakdown_can_upgrade_without_replacing(&buckets[index], &incoming) {
+            // Keep the richer breakdown while still allowing fresher bucket
+            // timing or stronger non-project evidence to advance normally.
+            incoming.project_breakdown_revision = buckets[index].project_breakdown_revision;
+            incoming.api_pricing_catalog_revision = buckets[index].api_pricing_catalog_revision;
+            incoming.project_groups = buckets[index].project_groups.clone();
+        }
         if should_replace_half_hour_bucket(&incoming, &buckets[index]) {
             buckets[index] = incoming;
             true
@@ -1729,6 +2182,144 @@ fn upsert_half_hour_bucket(
         buckets.push(incoming);
         true
     }
+}
+
+fn project_breakdown_can_upgrade_without_replacing(
+    incoming: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    let newer_breakdown = incoming.project_breakdown_revision > existing.project_breakdown_revision
+        || incoming.api_pricing_catalog_revision > existing.api_pricing_catalog_revision;
+    let richer_breakdown = incoming.project_breakdown_revision
+        == existing.project_breakdown_revision
+        && incoming.api_pricing_catalog_revision == existing.api_pricing_catalog_revision
+        && project_groups_are_strictly_richer(&incoming.project_groups, &existing.project_groups);
+    (newer_breakdown || richer_breakdown)
+        && incoming.project_breakdown_revision >= existing.project_breakdown_revision
+        && incoming.api_pricing_catalog_revision >= existing.api_pricing_catalog_revision
+        && incoming.estimator_revision == existing.estimator_revision
+        && incoming.token_usage == existing.token_usage
+        && incoming.estimated_cost_units == existing.estimated_cost_units
+        && incoming.api_long_context_extra_cost_units == existing.api_long_context_extra_cost_units
+        && incoming.long_context_usage_unknown == existing.long_context_usage_unknown
+        && incoming.call_count == existing.call_count
+}
+
+/// Returns true only when the candidate retains every known thread and every
+/// piece of metadata/API coverage while adding at least one piece of
+/// information. This partial order lets a later full scan enrich a breakdown
+/// grafted from a partial scan without allowing a sparse writer to undo it.
+fn project_groups_are_strictly_richer(
+    candidate: &[LocalProjectUsageGroup],
+    existing: &[LocalProjectUsageGroup],
+) -> bool {
+    let candidate_by_thread = candidate
+        .iter()
+        .map(|group| (group.thread_id.as_str(), group))
+        .collect::<HashMap<_, _>>();
+    if candidate_by_thread.len() != candidate.len() {
+        return false;
+    }
+
+    let mut strictly_richer = candidate.len() > existing.len();
+    for existing_group in existing {
+        let Some(candidate_group) = candidate_by_thread.get(existing_group.thread_id.as_str())
+        else {
+            return false;
+        };
+        let Some(group_is_richer) =
+            project_group_information_dominates(candidate_group, existing_group)
+        else {
+            return false;
+        };
+        strictly_richer |= group_is_richer;
+    }
+    strictly_richer
+}
+
+/// `Some(strict)` means the candidate retains all information in `existing`;
+/// `None` means it would regress or replace equally complete metadata with a
+/// conflicting value.
+fn project_group_information_dominates(
+    candidate: &LocalProjectUsageGroup,
+    existing: &LocalProjectUsageGroup,
+) -> Option<bool> {
+    let mut strictly_richer = false;
+    for (candidate_value, existing_value) in [
+        (&candidate.parent_thread_id, &existing.parent_thread_id),
+        (&candidate.project_id, &existing.project_id),
+        (&candidate.project_label, &existing.project_label),
+        (&candidate.source, &existing.source),
+    ] {
+        match (
+            informative_text(candidate_value),
+            informative_text(existing_value),
+        ) {
+            (Some(candidate_value), Some(existing_value)) if candidate_value != existing_value => {
+                return None;
+            }
+            (None, Some(_)) => return None,
+            (Some(_), None) => strictly_richer = true,
+            _ => {}
+        }
+    }
+    match (
+        informative_title(&candidate.title),
+        informative_title(&existing.title),
+    ) {
+        (Some(candidate_value), Some(existing_value)) if candidate_value != existing_value => {
+            return None;
+        }
+        (None, Some(_)) => return None,
+        (Some(_), None) => strictly_richer = true,
+        _ => {}
+    }
+
+    match (
+        candidate.api_long_context_extra_cost_units,
+        existing.api_long_context_extra_cost_units,
+    ) {
+        (None, Some(_)) => return None,
+        (Some(_), None) => strictly_richer = true,
+        _ => {}
+    }
+
+    let candidate_api = candidate.api_equivalent_cost;
+    let existing_api = existing.api_equivalent_cost;
+    for (candidate_value, existing_value) in [
+        (
+            candidate_api.observed_samples,
+            existing_api.observed_samples,
+        ),
+        (candidate_api.priced_samples, existing_api.priced_samples),
+        (candidate_api.observed_tokens, existing_api.observed_tokens),
+        (candidate_api.priced_tokens, existing_api.priced_tokens),
+    ] {
+        if candidate_value < existing_value {
+            return None;
+        }
+        strictly_richer |= candidate_value > existing_value;
+    }
+    let same_api_coverage = candidate_api.observed_samples == existing_api.observed_samples
+        && candidate_api.priced_samples == existing_api.priced_samples
+        && candidate_api.observed_tokens == existing_api.observed_tokens
+        && candidate_api.priced_tokens == existing_api.priced_tokens;
+    if same_api_coverage {
+        if existing_api.range_is_exact() && !candidate_api.range_is_exact() {
+            return None;
+        }
+        strictly_richer |= !existing_api.range_is_exact() && candidate_api.range_is_exact();
+    }
+
+    Some(strictly_richer)
+}
+
+fn informative_text(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+fn informative_title(value: &Option<String>) -> Option<&str> {
+    informative_text(value).filter(|value| *value != "Untitled task")
 }
 
 fn upsert_weekly_local_point(
@@ -1799,8 +2390,11 @@ fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHour
         && left.api_long_context_extra_cost_units == right.api_long_context_extra_cost_units
         && left.long_context_usage_unknown == right.long_context_usage_unknown
         && left.estimator_revision == right.estimator_revision
+        && left.project_breakdown_revision == right.project_breakdown_revision
+        && left.api_pricing_catalog_revision == right.api_pricing_catalog_revision
         && left.call_count == right.call_count
         && left.groups == right.groups
+        && left.project_groups == right.project_groups
         && left.partial_reasons == right.partial_reasons
 }
 
@@ -1879,8 +2473,12 @@ fn should_replace_weekly_local_point(
 fn collection_issue_count(partial_reasons: &[String]) -> usize {
     partial_reasons
         .iter()
-        .filter(|reason| reason.starts_with("rollout_") || reason.as_str() == "local_scan_disabled")
+        .filter(|reason| is_collection_issue_reason(reason))
         .count()
+}
+
+fn is_collection_issue_reason(reason: &str) -> bool {
+    reason.starts_with("rollout_") || reason == "local_scan_disabled"
 }
 
 fn bucket_evidence_dominates(candidate: &LocalHalfHourBucket, other: &LocalHalfHourBucket) -> bool {
@@ -1903,7 +2501,27 @@ fn bucket_unweighted_evidence_dominates(
         && candidate.token_usage.total_tokens >= other.token_usage.total_tokens
 }
 
-fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u64, u64, u64, u64) {
+fn bucket_evidence_key(
+    bucket: &LocalHalfHourBucket,
+) -> (
+    u64,
+    u128,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    usize,
+    u32,
+    u32,
+) {
+    let project_call_count = bucket
+        .project_groups
+        .iter()
+        .map(|group| group.call_count)
+        .fold(0_u64, u64::saturating_add);
     (
         bucket.token_usage.total_tokens,
         bucket.estimated_cost_units,
@@ -1913,6 +2531,10 @@ fn bucket_evidence_key(bucket: &LocalHalfHourBucket) -> (u64, u128, u64, u64, u6
         bucket.token_usage.cache_write_input_tokens,
         bucket.token_usage.output_tokens,
         bucket.token_usage.reasoning_output_tokens,
+        project_call_count,
+        bucket.project_groups.len(),
+        bucket.project_breakdown_revision,
+        bucket.api_pricing_catalog_revision,
     )
 }
 
@@ -2245,6 +2867,15 @@ pub fn history_namespace(codex_home: &Path) -> String {
     format!("{:016x}", stable_hash(&bytes))
 }
 
+pub fn history_namespace_with_redaction(codex_home: &Path, redact_content: bool) -> String {
+    let namespace = history_namespace(codex_home);
+    if redact_content {
+        format!("{namespace}-redacted")
+    } else {
+        namespace
+    }
+}
+
 #[cfg(unix)]
 fn history_namespace_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -2326,7 +2957,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::{LimitWindow, UsageCall};
+    use crate::domain::{Confidence, LimitWindow, TaskStatus, UsageCall};
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
@@ -2356,6 +2987,35 @@ mod tests {
             service_tier: service_tier.map(str::to_string),
             tokens: usage(total),
             request_usage_exact: true,
+        }
+    }
+
+    fn task(
+        thread_id: &str,
+        parent_thread_id: Option<&str>,
+        cwd: Option<&str>,
+        title: &str,
+        timestamp: DateTime<Utc>,
+    ) -> TaskRecord {
+        TaskRecord {
+            thread_id: thread_id.to_string(),
+            parent_thread_id: parent_thread_id.map(str::to_string),
+            archived: false,
+            title: title.to_string(),
+            cwd: cwd.map(PathBuf::from),
+            source: Some("cli".to_string()),
+            created_at: Some(timestamp),
+            updated_at: Some(timestamp),
+            status: TaskStatus::Completed,
+            status_provenance: Provenance::LocalExact,
+            status_confidence: Confidence::High,
+            token_usage: TokenUsage::default(),
+            turn_count: 1,
+            window_token_usage: TokenUsage::default(),
+            local_token_share_percent: 0.0,
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: None,
         }
     }
 
@@ -2444,6 +3104,14 @@ mod tests {
             history_namespace(&first),
             format!("{:016x}", stable_hash(legacy_bytes.as_bytes()))
         );
+        assert_eq!(
+            history_namespace_with_redaction(&first, false),
+            history_namespace(&first)
+        );
+        assert_eq!(
+            history_namespace_with_redaction(&first, true),
+            format!("{}-redacted", history_namespace(&first))
+        );
     }
 
     #[cfg(unix)]
@@ -2509,6 +3177,10 @@ mod tests {
                 .all(|point| point.provenance == Provenance::ServerSnapshot)
         );
         assert_eq!(observation.half_hour_buckets.len(), 2);
+        assert!(observation.half_hour_buckets.iter().all(|bucket| {
+            bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
+                && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+        }));
         assert_eq!(
             observation.half_hour_buckets[0].starts_at,
             at(2026, 7, 28, 11, 45, 0)
@@ -2539,6 +3211,250 @@ mod tests {
         assert_eq!(
             observation.half_hour_buckets[1].partial_reasons,
             vec!["rollout_scan_incomplete"]
+        );
+    }
+
+    #[test]
+    fn spark_only_project_bucket_keeps_collection_partial_reasons() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let observation = HistoryObservation::from_sources(
+            now,
+            &[call(
+                now - Duration::minutes(1),
+                "gpt-5.3-codex-spark",
+                None,
+                999,
+            )],
+            &[],
+            &["rollout_scan_incomplete".to_string()],
+        );
+
+        let bucket = observation.half_hour_buckets.last().unwrap();
+        assert_eq!(bucket.token_usage.total_tokens, 0);
+        assert_eq!(bucket.call_count, 0);
+        assert_eq!(bucket.project_groups.len(), 1);
+        assert_eq!(
+            bucket.project_groups[0].api_long_context_extra_cost_units,
+            Some(0)
+        );
+        assert_eq!(
+            bucket.partial_reasons,
+            ["rollout_scan_incomplete".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_groups_inherit_the_parent_project_and_preserve_zero_usage_ancestors() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task(
+                "root",
+                None,
+                Some("/work/alpha"),
+                "Root task",
+                timestamp - Duration::days(40),
+            ),
+            task("child", Some("root"), None, "Child task", timestamp),
+        ];
+        let mut child_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 200);
+        child_call.thread_id = "child".to_string();
+
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            now,
+            &[child_call],
+            &tasks,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(observation.half_hour_buckets.len(), 1);
+        let bucket = observation
+            .half_hour_buckets
+            .iter()
+            .find(|bucket| bucket.token_usage.total_tokens > 0)
+            .unwrap();
+        assert_eq!(bucket.project_groups.len(), 2);
+        let root = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "root")
+            .unwrap();
+        let child = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "child")
+            .unwrap();
+
+        assert_eq!(root.project_id, child.project_id);
+        assert_eq!(root.project_label.as_deref(), Some("alpha"));
+        assert_eq!(child.project_label.as_deref(), Some("alpha"));
+        assert_eq!(child.parent_thread_id.as_deref(), Some("root"));
+        assert_eq!(root.title.as_deref(), Some("Root task"));
+        assert_eq!(child.title.as_deref(), Some("Child task"));
+        assert_eq!(root.source.as_deref(), Some("cli"));
+        assert!(root.token_usage.is_zero());
+        assert_eq!(root.call_count, 0);
+        assert_eq!(root.api_equivalent_cost, ApiCostAmount::default());
+        assert_eq!(child.token_usage.total_tokens, 200);
+        assert_eq!(child.call_count, 1);
+    }
+
+    #[test]
+    fn project_group_titles_are_bounded_before_being_repeated_across_buckets() {
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let title = "界".repeat(PROJECT_TITLE_MAX_CHARS + 20);
+        let tasks = vec![task("thread", None, Some("/work/alpha"), &title, timestamp)];
+        let mut usage_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 10);
+        usage_call.thread_id = "thread".to_string();
+
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            timestamp,
+            &[usage_call],
+            &tasks,
+            &[],
+            &[],
+            None,
+        );
+        let stored = observation.half_hour_buckets[0].project_groups[0]
+            .title
+            .as_deref()
+            .unwrap();
+
+        assert_eq!(stored.chars().count(), PROJECT_TITLE_MAX_CHARS + 1);
+        assert!(stored.ends_with('…'));
+    }
+
+    #[test]
+    fn project_groups_keep_own_usage_only_and_reconcile_with_the_bucket() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task("root", None, Some("/work/alpha"), "Root task", timestamp),
+            task("child", Some("root"), None, "Child task", timestamp),
+        ];
+        let mut root_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 100);
+        root_call.thread_id = "root".to_string();
+        let mut child_call = call(
+            timestamp + Duration::minutes(1),
+            "gpt-5.6-luna",
+            Some("standard"),
+            200,
+        );
+        child_call.thread_id = "child".to_string();
+        let calls = vec![root_call, child_call];
+
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            now,
+            &calls,
+            &tasks,
+            &[],
+            &[],
+            None,
+        );
+
+        let bucket = &observation.half_hour_buckets[0];
+        let root = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "root")
+            .unwrap();
+        let child = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "child")
+            .unwrap();
+        assert_eq!(root.token_usage.total_tokens, 100);
+        assert_eq!(child.token_usage.total_tokens, 200);
+        assert_eq!(root.call_count, 1);
+        assert_eq!(child.call_count, 1);
+
+        let mut grouped_tokens = TokenUsage::default();
+        let mut grouped_estimated_cost = 0_u128;
+        let mut grouped_long_context_extra = 0_u128;
+        let mut grouped_call_count = 0_u64;
+        let mut grouped_api_cost = ApiCostAmount::default();
+        for group in &bucket.project_groups {
+            grouped_tokens.add_assign(group.token_usage);
+            grouped_estimated_cost =
+                grouped_estimated_cost.saturating_add(group.estimated_cost_units);
+            grouped_long_context_extra = grouped_long_context_extra
+                .saturating_add(group.api_long_context_extra_cost_units.unwrap_or_default());
+            grouped_call_count = grouped_call_count.saturating_add(group.call_count);
+            grouped_api_cost.add_assign(group.api_equivalent_cost);
+        }
+        let mut expected_api_cost = ApiCostAggregation::default();
+        for call in &calls {
+            expected_api_cost.add_call(call);
+        }
+
+        assert_eq!(grouped_tokens, bucket.token_usage);
+        assert_eq!(grouped_estimated_cost, bucket.estimated_cost_units);
+        assert_eq!(
+            grouped_long_context_extra,
+            bucket.api_long_context_extra_cost_units.unwrap()
+        );
+        assert_eq!(grouped_call_count, bucket.call_count);
+        assert_eq!(grouped_api_cost, expected_api_cost.total().amount);
+    }
+
+    #[test]
+    fn project_groups_apply_api_and_long_context_pricing_per_call() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![task("thread", None, Some("/work/alpha"), "Task", timestamp)];
+        let short = call(timestamp, "gpt-5.6-luna", Some("standard"), 100);
+        let long = call(
+            timestamp + Duration::minutes(1),
+            "gpt-5.6-luna",
+            Some("standard"),
+            272_001,
+        );
+        let calls = vec![short.clone(), long.clone()];
+
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            now,
+            &calls,
+            &tasks,
+            &[],
+            &[],
+            None,
+        );
+        let group = &observation.half_hour_buckets[0].project_groups[0];
+
+        let mut expected_api_cost = ApiCostAggregation::default();
+        expected_api_cost.add_call(&short);
+        expected_api_cost.add_call(&long);
+        let expected_api_cost = expected_api_cost.thread("thread");
+        let short_weight = estimate_call_weight(&short);
+        let long_weight = estimate_call_weight(&long);
+        let expected_long_context_extra = short_weight
+            .api_long_context_extra_units
+            .saturating_add(long_weight.api_long_context_extra_units);
+
+        assert_eq!(group.call_count, 2);
+        assert_eq!(group.api_equivalent_cost, expected_api_cost);
+        assert_eq!(group.api_equivalent_cost.observed_samples, 2);
+        assert_eq!(group.api_equivalent_cost.priced_samples, 2);
+        assert_eq!(
+            group.api_long_context_extra_cost_units,
+            Some(expected_long_context_extra)
+        );
+        assert_eq!(short_weight.api_long_context_extra_units, 0);
+        assert!(long_weight.api_long_context_extra_units > 0);
+
+        let mut combined = long;
+        combined.tokens.add_assign(short.tokens);
+        let mut aggregate_priced_as_one_call = ApiCostAggregation::default();
+        aggregate_priced_as_one_call.add_call(&combined);
+        assert_ne!(
+            group.api_equivalent_cost,
+            aggregate_priced_as_one_call.thread("thread")
+        );
+        assert_ne!(
+            expected_long_context_extra,
+            estimate_call_weight(&combined).api_long_context_extra_units
         );
     }
 
@@ -2719,6 +3635,87 @@ mod tests {
         assert_eq!(data.weekly_local_points[0].token_usage.total_tokens, 20);
         assert!(!shard_path(store.namespace_dir().unwrap(), old_at.date_naive()).exists());
         assert!(data.warnings.is_empty());
+    }
+
+    #[test]
+    fn redacted_store_isolates_visible_shards_and_scrubs_persisted_titles() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let now = at(2026, 7, 28, 12, 5, 0);
+        let mut bucket = local_bucket(at(2026, 7, 28, 12, 0, 0), now, 10, 100);
+        bucket.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "thread".to_string(),
+            title: Some("private customer migration".to_string()),
+            token_usage: usage(10),
+            estimated_cost_units: 100,
+            call_count: 1,
+            ..LocalProjectUsageGroup::default()
+        }];
+        let observation = HistoryObservation {
+            observed_at: now,
+            half_hour_buckets: vec![bucket],
+            ..HistoryObservation::default()
+        };
+
+        let mut visible = HistoryStore::new(history_root.clone(), &codex_home);
+        visible.record(&observation).unwrap();
+        let visible_namespace = visible.namespace().to_string();
+
+        let mut redacted = HistoryStore::new_with_redaction(history_root, &codex_home, true);
+        assert_ne!(redacted.namespace(), visible_namespace);
+        assert!(
+            redacted
+                .load_since(now - Duration::days(1))
+                .half_hour_buckets
+                .is_empty()
+        );
+
+        redacted.record(&observation).unwrap();
+        let path = shard_path(redacted.namespace_dir().unwrap(), now.date_naive());
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(!contents.contains("private customer migration"));
+        assert!(contents.contains("[redacted]"));
+
+        let data = redacted.load_since(now - Duration::days(1));
+        assert_eq!(
+            data.half_hour_buckets[0].project_groups[0].title.as_deref(),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn redacted_store_scrubs_staged_titles_before_live_display_and_flush() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let now = at(2026, 7, 28, 12, 5, 0);
+        let mut bucket = local_bucket(at(2026, 7, 28, 12, 0, 0), now, 10, 100);
+        bucket.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "thread".to_string(),
+            title: Some("private staged title".to_string()),
+            ..LocalProjectUsageGroup::default()
+        }];
+        let observation = HistoryObservation {
+            observed_at: now,
+            half_hour_buckets: vec![bucket],
+            ..HistoryObservation::default()
+        };
+        let mut store =
+            HistoryStore::new_with_redaction(directory.path().join("state"), &codex_home, true);
+
+        store.stage(&observation);
+        let live = store.load_since_with_staged(now - Duration::days(1));
+        assert_eq!(
+            live.half_hour_buckets[0].project_groups[0].title.as_deref(),
+            Some("[redacted]")
+        );
+        store.flush_staged().unwrap();
+        let path = shard_path(store.namespace_dir().unwrap(), now.date_naive());
+        assert!(
+            !fs::read_to_string(path)
+                .unwrap()
+                .contains("private staged title")
+        );
     }
 
     #[test]
@@ -2939,6 +3936,141 @@ mod tests {
         assert_eq!(staged.half_hour_buckets.len(), 2);
         assert_eq!(staged.weekly_local_points.len(), 2);
         assert!(store.staged_force_full_merge);
+    }
+
+    #[test]
+    fn explicitly_staged_full_observation_persists_old_backfill_buckets() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let observed_at = at(2026, 7, 28, 12, 5, 0);
+        let recent_start = at(2026, 7, 28, 12, 0, 0);
+        let old_start = at(2026, 7, 8, 12, 0, 0);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+
+        store.stage(&HistoryObservation {
+            observed_at,
+            half_hour_buckets: vec![local_bucket(recent_start, observed_at, 10, 100)],
+            ..HistoryObservation::default()
+        });
+        assert!(store.flush_staged().unwrap().is_some());
+        assert_eq!(store.last_full_merge_at, Some(observed_at));
+
+        let mut old_bucket = local_bucket(
+            old_start,
+            old_start + Duration::minutes(LOCAL_BUCKET_MINUTES),
+            20,
+            200,
+        );
+        old_bucket.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "old-thread".to_string(),
+            project_id: Some("old-project".to_string()),
+            project_label: Some("old project".to_string()),
+            token_usage: usage(20),
+            estimated_cost_units: 200,
+            api_long_context_extra_cost_units: Some(0),
+            call_count: 1,
+            ..LocalProjectUsageGroup::default()
+        }];
+        store.stage_full_observation(&HistoryObservation {
+            observed_at: observed_at + Duration::minutes(1),
+            half_hour_buckets: vec![old_bucket],
+            ..HistoryObservation::default()
+        });
+        assert!(store.flush_staged().unwrap().is_some());
+
+        let mut persisted = HistoryStore::new(history_root, &codex_home);
+        let history = persisted.load_since(old_start - Duration::minutes(1));
+        assert_eq!(history.half_hour_buckets.len(), 2);
+        let old_bucket = history
+            .half_hour_buckets
+            .iter()
+            .find(|bucket| bucket.starts_at == old_start)
+            .unwrap();
+        assert_eq!(old_bucket.project_groups.len(), 1);
+        assert_eq!(
+            old_bucket.project_groups[0].project_label.as_deref(),
+            Some("old project")
+        );
+    }
+
+    #[test]
+    fn summary_backfill_marker_is_namespace_scoped_and_revision_checked() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let completed_at = at(2026, 7, 28, 12, 5, 0);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+
+        store
+            .mark_summary_backfill_attempt(completed_at, true)
+            .unwrap();
+        let mut reloaded = HistoryStore::new(history_root.clone(), &codex_home);
+        assert_eq!(
+            reloaded
+                .load_since(completed_at - Duration::days(31))
+                .summary_backfill_attempted_at,
+            Some(completed_at)
+        );
+        assert_eq!(
+            reloaded
+                .load_since(completed_at - Duration::days(31))
+                .summary_backfill_attempt_complete,
+            Some(true)
+        );
+
+        store
+            .mark_summary_backfill_attempt(completed_at + Duration::minutes(1), false)
+            .unwrap();
+        let mut partial = HistoryStore::new(history_root.clone(), &codex_home);
+        let partial = partial.load_since(completed_at - Duration::days(31));
+        assert_eq!(partial.summary_backfill_attempt_complete, Some(false));
+        assert!(partial.warnings.is_empty());
+
+        let other_codex_home = directory.path().join("other-codex");
+        let mut other = HistoryStore::new(history_root.clone(), &other_codex_home);
+        assert_eq!(
+            other
+                .load_since(completed_at - Duration::days(31))
+                .summary_backfill_attempted_at,
+            None
+        );
+
+        let marker_path = store
+            .namespace_dir()
+            .unwrap()
+            .join(SUMMARY_BACKFILL_MARKER_FILE);
+        let mut marker: SummaryBackfillMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.estimator_revision = marker.estimator_revision.saturating_sub(1);
+        let mut contents = serde_json::to_vec_pretty(&marker).unwrap();
+        contents.push(b'\n');
+        write_private_atomically(&marker_path, &contents).unwrap();
+
+        let mut outdated = HistoryStore::new(history_root, &codex_home);
+        assert_eq!(
+            outdated
+                .load_since(completed_at - Duration::days(31))
+                .summary_backfill_attempted_at,
+            None
+        );
+    }
+
+    #[test]
+    fn partial_summary_backfill_marker_is_not_a_global_history_warning() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let completed_at = at(2026, 7, 28, 12, 5, 0);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store
+            .mark_summary_backfill_attempt(completed_at, false)
+            .unwrap();
+
+        let history = HistoryStore::new(history_root, &codex_home)
+            .load_since(completed_at - Duration::days(31));
+        assert_eq!(history.summary_backfill_attempt_complete, Some(false));
+        assert!(history.warnings.is_empty());
     }
 
     #[test]
@@ -3259,6 +4391,160 @@ mod tests {
         assert!(upsert_half_hour_bucket(&mut buckets, closed.clone()));
         assert_eq!(buckets, vec![closed.clone()]);
         assert!(!upsert_half_hour_bucket(&mut buckets, closed));
+    }
+
+    #[test]
+    fn project_breakdown_backfills_equal_legacy_bucket_without_later_regression() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let mut legacy = local_bucket(starts_at, sampled_at, 300, 3_000);
+        legacy.call_count = 2;
+        legacy.project_breakdown_revision = 0;
+        legacy.api_pricing_catalog_revision = 0;
+        let mut with_breakdown = legacy.clone();
+        with_breakdown.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+        with_breakdown.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION;
+        with_breakdown.project_groups = vec![
+            LocalProjectUsageGroup {
+                thread_id: "root".to_string(),
+                project_id: Some("project-alpha".to_string()),
+                project_label: Some("alpha".to_string()),
+                token_usage: usage(100),
+                estimated_cost_units: 1_000,
+                api_long_context_extra_cost_units: Some(0),
+                call_count: 1,
+                ..LocalProjectUsageGroup::default()
+            },
+            LocalProjectUsageGroup {
+                thread_id: "child".to_string(),
+                parent_thread_id: Some("root".to_string()),
+                project_id: Some("project-alpha".to_string()),
+                project_label: Some("alpha".to_string()),
+                token_usage: usage(200),
+                estimated_cost_units: 2_000,
+                api_long_context_extra_cost_units: Some(0),
+                call_count: 1,
+                ..LocalProjectUsageGroup::default()
+            },
+        ];
+        let mut buckets = vec![legacy.clone()];
+
+        assert!(upsert_half_hour_bucket(
+            &mut buckets,
+            with_breakdown.clone()
+        ));
+        assert_eq!(buckets, vec![with_breakdown.clone()]);
+        assert!(!upsert_half_hour_bucket(&mut buckets, legacy));
+        assert_eq!(buckets, vec![with_breakdown]);
+
+        let mut legacy_zero = local_bucket(starts_at, sampled_at, 0, 0);
+        legacy_zero.call_count = 0;
+        legacy_zero.project_breakdown_revision = 0;
+        legacy_zero.api_pricing_catalog_revision = 0;
+        let mut current_zero = legacy_zero.clone();
+        current_zero.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+        current_zero.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION;
+        let mut zero_buckets = vec![legacy_zero];
+        assert!(upsert_half_hour_bucket(
+            &mut zero_buckets,
+            current_zero.clone()
+        ));
+        assert_eq!(zero_buckets, [current_zero]);
+    }
+
+    #[test]
+    fn project_backfill_marks_a_grafted_partial_scan_as_incomplete() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let mut legacy = local_bucket(starts_at, sampled_at, 300, 3_000);
+        legacy.call_count = 2;
+        legacy.project_breakdown_revision = 0;
+        legacy.api_pricing_catalog_revision = 0;
+        let mut incoming = legacy.clone();
+        incoming.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+        incoming.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION;
+        incoming.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        incoming.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "thread".to_string(),
+            project_id: Some("project".to_string()),
+            project_label: Some("project".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(0),
+            call_count: 2,
+            ..LocalProjectUsageGroup::default()
+        }];
+        let mut buckets = vec![legacy];
+
+        assert!(upsert_half_hour_bucket(&mut buckets, incoming));
+        assert_eq!(
+            buckets[0].partial_reasons,
+            ["rollout_scan_incomplete".to_string()]
+        );
+        assert_eq!(
+            buckets[0].project_breakdown_revision,
+            HISTORY_PROJECT_BREAKDOWN_REVISION
+        );
+        assert_eq!(
+            buckets[0].api_pricing_catalog_revision,
+            API_PRICING_CATALOG_REVISION
+        );
+        assert_eq!(buckets[0].project_groups.len(), 1);
+    }
+
+    #[test]
+    fn same_revision_project_breakdown_accepts_strict_enrichment_without_regression() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(10);
+        let mut legacy = local_bucket(starts_at, sampled_at, 300, 3_000);
+        legacy.call_count = 2;
+        legacy.project_breakdown_revision = 0;
+        legacy.api_pricing_catalog_revision = 0;
+
+        let mut sparse = legacy.clone();
+        sparse.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+        sparse.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION;
+        sparse.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        sparse.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "thread".to_string(),
+            title: Some("Untitled task".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            call_count: 2,
+            ..LocalProjectUsageGroup::default()
+        }];
+        let mut buckets = vec![legacy];
+        assert!(upsert_half_hour_bucket(&mut buckets, sparse.clone()));
+
+        let mut richer = sparse.clone();
+        richer.partial_reasons.clear();
+        let group = &mut richer.project_groups[0];
+        group.project_id = Some("project-alpha".to_string());
+        group.project_label = Some("alpha".to_string());
+        group.title = Some("Project history backfill".to_string());
+        group.source = Some("cli".to_string());
+        group.api_long_context_extra_cost_units = Some(0);
+        group.api_equivalent_cost = ApiCostAmount {
+            minimum_pico_usd: crate::domain::PicoUsd::new(250),
+            maximum_pico_usd: crate::domain::PicoUsd::new(300),
+            observed_samples: 2,
+            priced_samples: 2,
+            observed_tokens: 300,
+            priced_tokens: 300,
+        };
+
+        assert!(upsert_half_hour_bucket(&mut buckets, richer.clone()));
+        assert_eq!(buckets[0].project_groups, richer.project_groups);
+        assert!(buckets[0].partial_reasons.is_empty());
+        assert!(!upsert_half_hour_bucket(&mut buckets, sparse.clone()));
+        assert_eq!(buckets[0].project_groups, richer.project_groups);
+
+        let mut later_sparse = sparse;
+        later_sparse.partial_reasons.clear();
+        later_sparse.sampled_at = starts_at + Duration::minutes(12);
+        assert!(upsert_half_hour_bucket(&mut buckets, later_sparse));
+        assert_eq!(buckets[0].sampled_at, starts_at + Duration::minutes(12));
+        assert_eq!(buckets[0].project_groups, richer.project_groups);
     }
 
     #[test]
@@ -4003,8 +5289,11 @@ mod tests {
             api_long_context_extra_cost_units: Some(0),
             long_context_usage_unknown: false,
             estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
             call_count: 1,
             groups: Vec::new(),
+            project_groups: Vec::new(),
             partial_reasons: Vec::new(),
         }
     }

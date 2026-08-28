@@ -5,13 +5,404 @@ use crate::domain::{
     SourceStatus, ThreadWindowUsage, TurnWindowUsage, UsageCall, WindowAnalysis, WindowDescriptor,
     WindowUsage,
 };
-use crate::history::{LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint};
+use crate::history::{LocalHalfHourBucket, LocalProjectUsageGroup, QuotaPoint, WeeklyLocalPoint};
 use ratatui::backend::TestBackend;
 
 mod integration_scenarios;
 mod testkit;
 
 const RESUMABLE_THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
+
+#[test]
+fn summary_estimate_formats_credit_rate_equivalents_instead_of_raw_units() {
+    assert_eq!(format_estimated_credits(8_000_000, true), "~1.00 cr");
+    assert_eq!(format_estimated_credits(800_000_000, true), "~100.0 cr");
+    assert_eq!(format_estimated_credits(8_000_000_000, false), "~1.00Kcr");
+}
+
+#[test]
+fn summary_api_chart_marks_a_non_aligned_range_start_as_a_lower_bound() {
+    let starts_at = Utc::now();
+    let window = SummaryWindow::new(starts_at, starts_at + ChronoDuration::days(1)).unwrap();
+    let prepared = PreparedSummary {
+        usage: UsageSummary {
+            window,
+            totals: SummaryMetrics::default(),
+            days: Vec::new(),
+            projects: Vec::new(),
+        },
+        range_note: None,
+        represented_tokens: 0,
+        available_tokens: 0,
+        covered_buckets: 96,
+        expected_buckets: 96,
+        estimated_covered_tokens: 0,
+        long_context_breakdown_complete: true,
+        daily_coverage: BTreeMap::new(),
+        partial_reasons: vec!["range_starts_within_15m_bucket".to_string()],
+    };
+
+    assert!(prepared.api_chart_is_lower_bound());
+}
+
+#[test]
+fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
+    assert_eq!(
+        summary_daily_status_symbols(&[
+            SummaryDailyState::Complete,
+            SummaryDailyState::Missing,
+            SummaryDailyState::Partial,
+        ]),
+        "CMP",
+        "known zero-value days need a visible state distinct from missing days"
+    );
+
+    let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+    let window = SummaryWindow::new(
+        DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+        DateTime::parse_from_rfc3339("2026-08-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+    )
+    .unwrap();
+    let mut prepared = PreparedSummary {
+        usage: UsageSummary {
+            window,
+            totals: SummaryMetrics::default(),
+            days: Vec::new(),
+            projects: Vec::new(),
+        },
+        range_note: None,
+        represented_tokens: 0,
+        available_tokens: 0,
+        covered_buckets: 0,
+        expected_buckets: 0,
+        estimated_covered_tokens: 0,
+        long_context_breakdown_complete: true,
+        daily_coverage: BTreeMap::from([(
+            date,
+            SummaryDailyCoverage {
+                expected_buckets: 96,
+                covered_buckets: 96,
+                ..SummaryDailyCoverage::default()
+            },
+        )]),
+        partial_reasons: Vec::new(),
+    };
+    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        assert_eq!(
+            prepared.daily_state(
+                date,
+                SummaryMetrics::default(),
+                SummaryMetric::Tokens,
+                false
+            ),
+            SummaryDailyState::Complete
+        );
+    });
+
+    prepared
+        .daily_coverage
+        .get_mut(&date)
+        .unwrap()
+        .covered_buckets = 48;
+    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        assert_eq!(
+            prepared.daily_state(
+                date,
+                SummaryMetrics::default(),
+                SummaryMetric::Tokens,
+                false
+            ),
+            SummaryDailyState::Partial
+        );
+    });
+
+    prepared
+        .daily_coverage
+        .get_mut(&date)
+        .unwrap()
+        .covered_buckets = 0;
+    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        assert_eq!(
+            prepared.daily_state(
+                date,
+                SummaryMetrics::default(),
+                SummaryMetric::Tokens,
+                false
+            ),
+            SummaryDailyState::Missing
+        );
+    });
+}
+
+#[test]
+fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
+    with_test_display_offset(FixedOffset::east_opt(8 * 60 * 60).unwrap(), || {
+        let query_now = DateTime::parse_from_rfc3339("2026-08-28T06:51:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (days, expected_dates) in [(7, 8), (30, 31)] {
+            let window = SummaryWindow::new(
+                query_now - ChronoDuration::days(days),
+                query_now + ChronoDuration::nanoseconds(1),
+            )
+            .unwrap();
+            let mut daily_coverage = expected_summary_daily_coverage(window);
+            for coverage in daily_coverage.values_mut() {
+                coverage.covered_buckets = coverage.expected_buckets;
+            }
+            let dates = daily_coverage.keys().copied().collect::<Vec<_>>();
+            assert_eq!(dates.len(), expected_dates);
+            let prepared = PreparedSummary {
+                usage: UsageSummary {
+                    window,
+                    totals: SummaryMetrics::default(),
+                    days: Vec::new(),
+                    projects: Vec::new(),
+                },
+                range_note: None,
+                represented_tokens: 0,
+                available_tokens: 0,
+                covered_buckets: daily_coverage
+                    .values()
+                    .map(|coverage| coverage.covered_buckets)
+                    .sum(),
+                expected_buckets: daily_coverage
+                    .values()
+                    .map(|coverage| coverage.expected_buckets)
+                    .sum(),
+                estimated_covered_tokens: 0,
+                long_context_breakdown_complete: true,
+                daily_coverage,
+                partial_reasons: Vec::new(),
+            };
+
+            assert_eq!(
+                prepared.daily_state(
+                    dates[0],
+                    SummaryMetrics::default(),
+                    SummaryMetric::Tokens,
+                    false
+                ),
+                SummaryDailyState::Partial
+            );
+            assert_eq!(
+                prepared.daily_state(
+                    *dates.last().unwrap(),
+                    SummaryMetrics::default(),
+                    SummaryMetric::Tokens,
+                    false
+                ),
+                SummaryDailyState::Partial
+            );
+            assert!(dates[1..dates.len() - 1].iter().all(|date| {
+                prepared.daily_state(
+                    *date,
+                    SummaryMetrics::default(),
+                    SummaryMetric::Tokens,
+                    false,
+                ) == SummaryDailyState::Complete
+            }));
+        }
+    });
+}
+
+#[test]
+fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() {
+    let mut config = CollectConfig {
+        lookback_days: 7,
+        max_files: 500,
+        offline: false,
+        ..CollectConfig::default()
+    };
+    let backfill = summary_backfill_config(&config);
+    assert_eq!(backfill.lookback_days, SUMMARY_HISTORY_DAYS);
+    assert_eq!(backfill.max_files, SUMMARY_BACKFILL_MAX_FILES);
+    assert!(backfill.offline);
+
+    config.lookback_days = 90;
+    assert_eq!(
+        summary_backfill_config(&config).lookback_days,
+        SUMMARY_HISTORY_DAYS
+    );
+
+    let now = DateTime::parse_from_rfc3339("2026-08-28T12:07:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut starts_at = now - ChronoDuration::days(30) + ChronoDuration::minutes(8);
+    let mut buckets = Vec::new();
+    while starts_at <= now {
+        buckets.push(LocalHalfHourBucket {
+            starts_at,
+            ends_at: starts_at + ChronoDuration::minutes(15),
+            sampled_at: starts_at + ChronoDuration::minutes(15),
+            token_usage: TokenUsage::default(),
+            estimated_cost_units: 0,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
+            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            call_count: 0,
+            groups: Vec::new(),
+            project_groups: Vec::new(),
+            partial_reasons: Vec::new(),
+        });
+        starts_at += ChronoDuration::minutes(15);
+    }
+    let complete = HistoryData {
+        half_hour_buckets: buckets,
+        ..HistoryData::default()
+    };
+    assert!(!summary_history_backfill_needed(&complete, now));
+
+    let mut failed_but_covered = complete.clone();
+    failed_but_covered.summary_backfill_attempt_complete = Some(false);
+    failed_but_covered.summary_backfill_attempted_at = Some(now - ChronoDuration::days(1));
+    assert!(!summary_history_backfill_needed(&failed_but_covered, now));
+    failed_but_covered.summary_backfill_attempted_at =
+        Some(now - ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1));
+    assert!(summary_history_backfill_needed(&failed_but_covered, now));
+    failed_but_covered.summary_backfill_attempted_at = Some(now + ChronoDuration::days(1));
+    assert!(!summary_history_backfill_needed(&failed_but_covered, now));
+
+    assert!(summary_history_backfill_needed(
+        &complete,
+        now + ChronoDuration::days(31)
+    ));
+
+    let mut incomplete = complete;
+    incomplete.half_hour_buckets.pop();
+    assert!(summary_history_backfill_needed(&incomplete, now));
+    incomplete.summary_backfill_attempted_at = Some(now);
+    assert!(!summary_history_backfill_needed(&incomplete, now));
+    assert!(summary_history_backfill_needed(
+        &incomplete,
+        now + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+    ));
+    incomplete.read_only = true;
+    assert!(!summary_history_backfill_needed(
+        &incomplete,
+        now + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+    ));
+}
+
+#[test]
+fn summary_backfill_scan_completeness_rejects_ambiguous_or_partial_sources() {
+    let mut snapshot = mouse_test_app(0).snapshot;
+    snapshot.stats = CollectionStats {
+        discovered_files: 1,
+        scanned_files: 1,
+        ..CollectionStats::default()
+    };
+    snapshot.sources = vec![SourceStatus {
+        source: "rollout_jsonl".to_string(),
+        status: "ok".to_string(),
+        as_of: snapshot.as_of,
+        message: None,
+    }];
+    assert!(summary_backfill_scan_complete(&snapshot));
+
+    snapshot.stats.ambiguous_token_resets = 1;
+    assert!(!summary_backfill_scan_complete(&snapshot));
+    snapshot.stats.ambiguous_token_resets = 0;
+    snapshot.sources[0].status = "partial".to_string();
+    assert!(!summary_backfill_scan_complete(&snapshot));
+}
+
+#[test]
+fn summary_backfill_persists_only_buckets_with_usage_evidence() {
+    let now = DateTime::parse_from_rfc3339("2026-08-28T12:07:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let first_usage = DateTime::parse_from_rfc3339("2026-08-26T10:15:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let call = UsageCall {
+        timestamp: first_usage,
+        thread_id: "thread-with-evidence".to_string(),
+        turn_id: Some("turn-with-evidence".to_string()),
+        model: Some("gpt-5.6-sol".to_string()),
+        service_tier: None,
+        tokens: TokenUsage {
+            input_tokens: 10,
+            total_tokens: 10,
+            ..TokenUsage::default()
+        },
+        request_usage_exact: true,
+    };
+    let coverage_starts_at = now - ChronoDuration::days(SUMMARY_HISTORY_DAYS);
+    let mut observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+        now,
+        &[call],
+        &[],
+        &[],
+        &[],
+        Some(coverage_starts_at),
+    );
+
+    assert!(
+        observation
+            .half_hour_buckets
+            .first()
+            .is_some_and(|bucket| bucket.starts_at < first_usage)
+    );
+    retain_summary_backfill_evidence_buckets(&mut observation);
+    assert_eq!(observation.half_hour_buckets.len(), 1);
+    assert_eq!(
+        observation
+            .half_hour_buckets
+            .first()
+            .map(|bucket| bucket.starts_at),
+        Some(first_usage)
+    );
+    assert!(
+        observation
+            .half_hour_buckets
+            .first()
+            .is_some_and(|bucket| bucket.call_count == 1)
+    );
+
+    let mut empty = HistoryObservation::from_sources_with_tasks_and_coverage(
+        now,
+        &[],
+        &[],
+        &[],
+        &[],
+        Some(coverage_starts_at),
+    );
+    assert!(!empty.half_hour_buckets.is_empty());
+    retain_summary_backfill_evidence_buckets(&mut empty);
+    assert!(empty.half_hour_buckets.is_empty());
+
+    let mut spark_only = HistoryObservation {
+        half_hour_buckets: vec![LocalHalfHourBucket {
+            starts_at: first_usage,
+            ends_at: first_usage + ChronoDuration::minutes(15),
+            sampled_at: first_usage + ChronoDuration::minutes(15),
+            token_usage: TokenUsage::default(),
+            estimated_cost_units: 0,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
+            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            call_count: 0,
+            groups: Vec::new(),
+            project_groups: vec![LocalProjectUsageGroup {
+                thread_id: "spark-thread".to_string(),
+                ..LocalProjectUsageGroup::default()
+            }],
+            partial_reasons: Vec::new(),
+        }],
+        ..HistoryObservation::default()
+    };
+    retain_summary_backfill_evidence_buckets(&mut spark_only);
+    assert_eq!(spark_only.half_hour_buckets.len(), 1);
+}
 
 #[cfg(not(windows))]
 #[test]
@@ -223,8 +614,11 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
         api_long_context_extra_cost_units: Some(0),
         long_context_usage_unknown: false,
         estimator_revision: 1,
+        project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
         call_count: 1,
         groups: Vec::new(),
+        project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
     let observation = HistoryObservation {
@@ -510,8 +904,11 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
                 api_long_context_extra_cost_units: Some(0),
                 long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+                api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
                 call_count: 1,
                 groups: Vec::new(),
+                project_groups: Vec::new(),
                 partial_reasons: if index == 1 {
                     vec!["fixture_partial".to_string()]
                 } else {
@@ -522,6 +919,8 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
         weekly_local_points: Vec::new(),
         warnings: Vec::new(),
         read_only: false,
+        summary_backfill_attempted_at: None,
+        summary_backfill_attempt_complete: None,
     }
 }
 
@@ -3888,7 +4287,7 @@ fn window_scope_shortcuts_and_mouse_switch_reset_cycle_data() {
 
 #[test]
 fn top_window_controls_keep_stable_compact_geometry() {
-    for width in [8, 20, 44, 54, 80, 120] {
+    for width in [8, 20, 44, 54, 64, 80, 120] {
         let mut app = interaction_test_app(1, 1);
         let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
         terminal
@@ -3924,7 +4323,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
             .unwrap();
         assert_eq!(app.window_controls_hitbox.unwrap(), initial);
 
-        if width >= 50 {
+        if width >= 64 {
             assert!(!initial.toggle_turns.is_empty());
             assert!(!initial.toggle_models.is_empty());
             assert!(initial.scopes.iter().all(|button| !button.is_empty()));
@@ -3934,7 +4333,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
             assert_eq!(buffer[(initial.scopes[0].x + 1, 0)].symbol(), "5");
             assert_eq!(buffer[(initial.scopes[1].x + 1, 0)].symbol(), "W");
         }
-        if width >= 54 {
+        if width >= 64 {
             assert!(!initial.toggle_api_long_context.is_empty());
             assert_eq!(
                 terminal.backend().buffer()[(
@@ -3987,7 +4386,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
     }
 
     let mut app = interaction_test_app(1, 1);
-    let mut terminal = Terminal::new(TestBackend::new(54, 1)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
     terminal
         .draw(|frame| {
             let controls = render_overview_controls(frame, frame.area(), &app);
@@ -4922,20 +5321,20 @@ fn search_input_has_priority_over_global_shortcuts_and_supports_cancel() {
     assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('/'))));
     assert_eq!(app.focus, Focus::TaskSearch);
 
-    for character in ['q', 't', '1', 'j', '测'] {
+    for character in ['q', 't', '1', 'U', 'j', '测'] {
         assert!(!handle_key_event(
             &mut app,
             key_event(KeyCode::Char(character)),
         ));
     }
-    assert_eq!(app.task_search, "qt1j测");
+    assert_eq!(app.task_search, "qt1Uj测");
     assert_eq!(app.theme, initial_theme);
     assert_eq!(app.view, initial_view);
     assert_eq!(app.selected_task, 0);
 
     handle_key_event(&mut app, key_event(KeyCode::Left));
     handle_key_event(&mut app, key_event(KeyCode::Backspace));
-    assert_eq!(app.task_search, "qt1测");
+    assert_eq!(app.task_search, "qt1U测");
     handle_key_event(&mut app, key_event(KeyCode::Esc));
     assert_eq!(app.focus, Focus::Tasks);
     assert!(app.task_search.is_empty());
@@ -6273,7 +6672,9 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
     let tabs = app.view_tabs_hitbox.expect("view tabs should render");
     assert_eq!(tabs.tabs[View::Overview.index()], Rect::new(0, 0, 12, 1));
     assert_eq!(tabs.tabs[View::Trends.index()], Rect::new(15, 0, 10, 1));
-    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(28, 0, 9, 1));
+    assert_eq!(tabs.tabs[View::Summary.index()], Rect::new(28, 0, 11, 1));
+    assert_eq!(tabs.tabs[View::Health.index()], Rect::new(42, 0, 9, 1));
+    assert_eq!(tabs.tabs[View::Settings.index()], Rect::new(54, 0, 12, 1));
 
     let divider = tabs.tabs[View::Overview.index()].right();
     assert!(!handle_mouse_event(
@@ -6981,8 +7382,11 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
                 api_long_context_extra_cost_units: Some(0),
                 long_context_usage_unknown: false,
                 estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+                project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+                api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
                 call_count: 1,
                 groups: Vec::new(),
+                project_groups: Vec::new(),
                 partial_reasons: Vec::new(),
             }
         })
@@ -7307,8 +7711,11 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
         api_long_context_extra_cost_units: Some(0),
         long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
         call_count: 1,
         groups: Vec::new(),
+        project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
     app.history.half_hour_buckets = vec![
@@ -7361,9 +7768,37 @@ fn history_view_cutoff_uses_15_minute_alignment() {
         .with_timezone(&Utc);
     assert_eq!(
         history_view_since(now),
-        DateTime::parse_from_rfc3339("2026-07-21T12:15:00Z")
+        DateTime::parse_from_rfc3339("2026-06-28T12:15:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    );
+}
+
+#[test]
+fn summary_does_not_mix_api_amounts_from_an_outdated_catalog() {
+    let amount = ApiCostAmount {
+        minimum_pico_usd: crate::domain::PicoUsd::new(10),
+        maximum_pico_usd: crate::domain::PicoUsd::new(20),
+        observed_samples: 2,
+        priced_samples: 2,
+        observed_tokens: 300,
+        priced_tokens: 300,
+    };
+
+    assert_eq!(
+        summary_api_cost_for_catalog(amount, crate::api_cost::API_PRICING_CATALOG_REVISION),
+        amount
+    );
+    assert_eq!(
+        summary_api_cost_for_catalog(
+            amount,
+            crate::api_cost::API_PRICING_CATALOG_REVISION.saturating_sub(1),
+        ),
+        ApiCostAmount {
+            observed_samples: 2,
+            observed_tokens: 300,
+            ..ApiCostAmount::default()
+        }
     );
 }
 
@@ -7409,8 +7844,11 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
         api_long_context_extra_cost_units: Some(0),
         long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
         call_count: 1,
         groups: Vec::new(),
+        project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
     let mut app = interaction_test_app(1, 1);
@@ -7509,8 +7947,11 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
         api_long_context_extra_cost_units: Some(0),
         long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
         call_count: 1,
         groups: Vec::new(),
+        project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
     let mut app = interaction_test_app(1, 1);
@@ -7653,8 +8094,11 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
         api_long_context_extra_cost_units: Some(0),
         long_context_usage_unknown: false,
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+        project_breakdown_revision: crate::history::HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: crate::api_cost::API_PRICING_CATALOG_REVISION,
         call_count: 0,
         groups: Vec::new(),
+        project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
     let history = HistoryData {
