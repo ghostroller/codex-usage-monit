@@ -12,7 +12,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use chrono::FixedOffset;
-use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
+use chrono::{
+    DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike, Utc,
+};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -37,9 +39,11 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod geometry;
+mod stacked_area;
 mod text;
 
 use geometry::{reveal_offset, scale_rounded, scroll_offset, scrollbar_geometry};
+use stacked_area::{StackedArea, StackedAreaSeries, StackedAreaState, date_index_at_column};
 use text::{
     byte_index_at_char, compact_search_text, search_cursor_window, short_thread_id,
     truncate_display_text, truncate_middle_display_text,
@@ -72,7 +76,7 @@ use crate::snapshot::{
 };
 use crate::summary::{
     ProjectSummary, SummaryMetrics, SummarySample, SummaryWindow, ThreadSummary, UsageSummary,
-    summarize_samples_with_local_date,
+    summarize_samples_with_local_time,
 };
 use crate::ui_state::{
     UiState, UiStateStore, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
@@ -118,6 +122,9 @@ const TURN_QUOTA_WIDTH: u16 = 7;
 const MODEL_TOKENS_WIDTH: u16 = 12;
 const MODEL_TOKEN_SHARE_WIDTH: u16 = 12;
 const MODEL_QUOTA_WIDTH: u16 = 12;
+const SUMMARY_STACKED_PROJECT_LIMIT: usize = 6;
+const SUMMARY_PROJECT_COLOR_CANDIDATES: usize = 24;
+const SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED: u32 = 5_000;
 const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
 
 #[cfg(test)]
@@ -144,6 +151,23 @@ fn display_local_date(value: DateTime<Utc>) -> chrono::NaiveDate {
     value.with_timezone(&Local).date_naive()
 }
 
+fn display_local_datetime(value: DateTime<Utc>) -> NaiveDateTime {
+    #[cfg(test)]
+    if let Some(offset) = TEST_DISPLAY_OFFSET.with(std::cell::Cell::get) {
+        return value.with_timezone(&offset).naive_local();
+    }
+
+    value.with_timezone(&Local).naive_local()
+}
+
+fn display_local_hour(value: DateTime<Utc>) -> NaiveDateTime {
+    let value = display_local_datetime(value);
+    value
+        .date()
+        .and_hms_opt(value.hour(), 0, 0)
+        .unwrap_or(value)
+}
+
 fn local_time_is_midnight(value: DateTime<Utc>) -> bool {
     value.timestamp_subsec_nanos() == 0 && format_local_time(value, "%H:%M:%S") == "00:00:00"
 }
@@ -156,6 +180,25 @@ fn summary_day_is_partial_window_edge(window: SummaryWindow, date: NaiveDate) ->
         .is_some_and(|last| display_local_date(last) == date);
     (starts_on_date && !local_time_is_midnight(window.starts_at))
         || (ends_on_date && !local_time_is_midnight(window.ends_at))
+}
+
+fn summary_bucket_is_partial_window_edge(
+    window: SummaryWindow,
+    starts_at: NaiveDateTime,
+    grain: SummaryGrain,
+) -> bool {
+    let local_start = display_local_datetime(window.starts_at);
+    let local_end = display_local_datetime(window.ends_at);
+    let local_last = window
+        .ends_at
+        .checked_sub_signed(ChronoDuration::nanoseconds(1))
+        .map(display_local_datetime)
+        .unwrap_or(local_end);
+    let bucket_end = starts_at
+        .checked_add_signed(ChronoDuration::hours(i64::from(grain.hours())))
+        .unwrap_or(starts_at);
+    (grain.bucket_start(local_start) == starts_at && local_start != starts_at)
+        || (grain.bucket_start(local_last) == starts_at && local_end != bucket_end)
 }
 
 #[cfg(test)]
@@ -742,6 +785,80 @@ impl SummaryRange {
                 .expect("summary ranges always have a positive duration"),
             fallback_note,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SummaryGrain {
+    #[default]
+    Day,
+    Hours12,
+    Hours6,
+    Hours3,
+    Hour,
+}
+
+impl SummaryGrain {
+    const ALL: [Self; 5] = [
+        Self::Day,
+        Self::Hours12,
+        Self::Hours6,
+        Self::Hours3,
+        Self::Hour,
+    ];
+
+    fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Day => 0,
+            Self::Hours12 => 1,
+            Self::Hours6 => 2,
+            Self::Hours3 => 3,
+            Self::Hour => 4,
+        }
+    }
+
+    fn hours(self) -> u32 {
+        match self {
+            Self::Day => 24,
+            Self::Hours12 => 12,
+            Self::Hours6 => 6,
+            Self::Hours3 => 3,
+            Self::Hour => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "1d",
+            Self::Hours12 => "12h",
+            Self::Hours6 => "6h",
+            Self::Hours3 => "3h",
+            Self::Hour => "1h",
+        }
+    }
+
+    /// Three cells for every value keeps the whole `[B]...` hitbox stable as
+    /// the selected grain changes.
+    fn control_suffix(self) -> &'static str {
+        match self {
+            Self::Day => " 1d",
+            Self::Hours12 => "12h",
+            Self::Hours6 => " 6h",
+            Self::Hours3 => " 3h",
+            Self::Hour => " 1h",
+        }
+    }
+
+    fn bucket_start(self, hour: NaiveDateTime) -> NaiveDateTime {
+        let bucket_hour = match self {
+            Self::Day => 0,
+            _ => hour.hour().div_euclid(self.hours()) * self.hours(),
+        };
+        hour.date().and_hms_opt(bucket_hour, 0, 0).unwrap_or(hour)
     }
 }
 
@@ -1346,6 +1463,39 @@ struct SummaryBarHitbox {
     project_key: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SummaryDailyHitbox {
+    plot: Rect,
+    dates: Vec<NaiveDateTime>,
+}
+
+impl SummaryDailyHitbox {
+    fn exact(plot: Rect, dates: Vec<NaiveDateTime>) -> Option<Self> {
+        if plot.is_empty() {
+            return None;
+        }
+        date_index_at_column(0, usize::from(plot.width), dates.len())?;
+        Some(Self { plot, dates })
+    }
+
+    fn contains(&self, column: u16, row: u16) -> bool {
+        rect_contains(self.plot, column, row)
+    }
+
+    fn date_at_column(&self, column: u16) -> Option<NaiveDateTime> {
+        if self.plot.is_empty() {
+            return None;
+        }
+        let column = column.clamp(self.plot.x, self.plot.right().saturating_sub(1));
+        let index = date_index_at_column(
+            usize::from(column.saturating_sub(self.plot.x)),
+            usize::from(self.plot.width),
+            self.dates.len(),
+        )?;
+        self.dates.get(index).copied()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TurnControlsHitbox {
     back_tasks: Rect,
@@ -1362,8 +1512,12 @@ struct ViewTabsHitbox {
 struct SummaryControlsHitbox {
     ranges: [Rect; 3],
     metrics: [Rect; 3],
+    bucket_grain: Rect,
+    toggle_all_projects: Rect,
     toggle_long_context: Rect,
+    inspect: Rect,
     toggle_selected: Rect,
+    collapse_all: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1399,6 +1553,7 @@ struct PreparedSummary {
     estimated_covered_tokens: u64,
     long_context_breakdown_complete: bool,
     daily_coverage: BTreeMap<NaiveDate, SummaryDailyCoverage>,
+    hourly_coverage: BTreeMap<NaiveDateTime, SummaryDailyCoverage>,
     partial_reasons: Vec<String>,
 }
 
@@ -1427,11 +1582,41 @@ impl Default for SummaryDailyCoverage {
     }
 }
 
+impl SummaryDailyCoverage {
+    fn add_assign(&mut self, other: &Self) {
+        self.expected_buckets = self.expected_buckets.saturating_add(other.expected_buckets);
+        self.covered_buckets = self.covered_buckets.saturating_add(other.covered_buckets);
+        self.available_tokens = self.available_tokens.saturating_add(other.available_tokens);
+        self.represented_tokens = self
+            .represented_tokens
+            .saturating_add(other.represented_tokens);
+        self.estimated_covered_tokens = self
+            .estimated_covered_tokens
+            .saturating_add(other.estimated_covered_tokens);
+        self.long_context_breakdown_complete &= other.long_context_breakdown_complete;
+        self.source_partial |= other.source_partial;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SummaryDailyState {
     Complete,
     Partial,
     Missing,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryChartBucket {
+    starts_at: NaiveDateTime,
+    totals: SummaryMetrics,
+    coverage: SummaryDailyCoverage,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryChartData {
+    grain: SummaryGrain,
+    buckets: Vec<SummaryChartBucket>,
+    project_values: HashMap<String, BTreeMap<NaiveDateTime, SummaryMetrics>>,
 }
 
 fn summary_daily_status_symbols(states: &[SummaryDailyState]) -> String {
@@ -1479,9 +1664,11 @@ impl PreparedSummary {
         !self.partial_reasons.is_empty()
             || self.represented_tokens < self.available_tokens
             || self.covered_buckets < self.expected_buckets
-            || (metric == SummaryMetric::ApiEquivalent
-                && self.usage.totals.api_equivalent_cost.priced_samples
-                    < self.usage.totals.api_equivalent_cost.observed_samples)
+            || (metric == SummaryMetric::ApiEquivalent && {
+                let amount = self.usage.totals.api_equivalent_cost;
+                amount.priced_samples < amount.observed_samples
+                    || amount.priced_tokens < amount.observed_tokens
+            })
             || (metric == SummaryMetric::Estimated
                 && api_long_context
                 && !self.long_context_breakdown_complete)
@@ -1491,6 +1678,7 @@ impl PreparedSummary {
         let amount = self.usage.totals.api_equivalent_cost;
         !amount.range_is_exact()
             || amount.priced_samples < amount.observed_samples
+            || amount.priced_tokens < amount.observed_tokens
             || self.represented_tokens < self.available_tokens
             || self.covered_buckets < self.expected_buckets
             || self.partial_reasons.iter().any(|reason| {
@@ -1539,6 +1727,50 @@ impl PreparedSummary {
             SummaryDailyState::Complete
         }
     }
+
+    fn chart_bucket_state(
+        &self,
+        bucket: &SummaryChartBucket,
+        grain: SummaryGrain,
+        metric: SummaryMetric,
+        api_long_context: bool,
+    ) -> SummaryDailyState {
+        if grain == SummaryGrain::Day {
+            return self.daily_state(
+                bucket.starts_at.date(),
+                bucket.totals,
+                metric,
+                api_long_context,
+            );
+        }
+        let coverage = &bucket.coverage;
+        if coverage.covered_buckets == 0 {
+            return SummaryDailyState::Missing;
+        }
+        let metric_partial = match metric {
+            SummaryMetric::Tokens => false,
+            SummaryMetric::Estimated => {
+                coverage.estimated_covered_tokens < coverage.available_tokens
+                    || (api_long_context && !coverage.long_context_breakdown_complete)
+            }
+            SummaryMetric::ApiEquivalent => {
+                let amount = bucket.totals.api_equivalent_cost;
+                amount.priced_samples < amount.observed_samples
+                    || amount.priced_tokens < amount.observed_tokens
+                    || !amount.range_is_exact()
+            }
+        };
+        if coverage.covered_buckets < coverage.expected_buckets
+            || coverage.represented_tokens < coverage.available_tokens
+            || coverage.source_partial
+            || metric_partial
+            || summary_bucket_is_partial_window_edge(self.usage.window, bucket.starts_at, grain)
+        {
+            SummaryDailyState::Partial
+        } else {
+            SummaryDailyState::Complete
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1548,12 +1780,14 @@ struct SummaryCache {
     query_bucket: i64,
     query_local_date: NaiveDate,
     prepared: PreparedSummary,
+    chart: SummaryChartData,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SummaryRowKind {
     Project,
-    Thread,
+    Session,
+    Subagent,
 }
 
 #[derive(Clone, Debug)]
@@ -1966,15 +2200,23 @@ struct App {
     trend_inspection: Option<TrendInspection>,
     trend_drag: Option<TrendDrag>,
     summary_range: SummaryRange,
+    summary_grain: SummaryGrain,
     summary_metric: SummaryMetric,
+    summary_show_all_projects: bool,
     summary_expanded_nodes: HashSet<String>,
     summary_selected_id: Option<String>,
     summary_offset: usize,
     summary_cache: Option<SummaryCache>,
+    // Run-local registry: existing project colors never move when refreshed
+    // history discovers another key. It is cleared only when the theme flips.
+    summary_project_colors: HashMap<String, Color>,
     summary_controls_hitbox: Option<SummaryControlsHitbox>,
     summary_table_hitbox: Option<TableHitbox>,
     summary_tree_marker_hitboxes: Vec<SummaryTreeMarkerHitbox>,
     summary_bar_hitboxes: Vec<SummaryBarHitbox>,
+    summary_daily_hitbox: Option<SummaryDailyHitbox>,
+    summary_inspected_date: Option<NaiveDateTime>,
+    summary_daily_dragging: bool,
     summary_scrollbar_hitbox: Option<ScrollbarHitbox>,
     summary_backfill_pending: bool,
     summary_backfill_running: bool,
@@ -2054,15 +2296,21 @@ impl App {
             trend_inspection: None,
             trend_drag: None,
             summary_range: SummaryRange::Cycle,
+            summary_grain: SummaryGrain::Day,
             summary_metric: SummaryMetric::Tokens,
+            summary_show_all_projects: false,
             summary_expanded_nodes: HashSet::new(),
             summary_selected_id: None,
             summary_offset: 0,
             summary_cache: None,
+            summary_project_colors: HashMap::new(),
             summary_controls_hitbox: None,
             summary_table_hitbox: None,
             summary_tree_marker_hitboxes: Vec::new(),
             summary_bar_hitboxes: Vec::new(),
+            summary_daily_hitbox: None,
+            summary_inspected_date: None,
+            summary_daily_dragging: false,
             summary_scrollbar_hitbox: None,
             summary_backfill_pending: false,
             summary_backfill_running: false,
@@ -2156,12 +2404,16 @@ impl App {
     }
 
     fn replace_history(&mut self, history: HistoryData) {
+        let summary_inputs_unchanged =
+            self.summary_cache.is_some() && summary_history_inputs_eq(&self.history, &history);
         if !self.summary_backfill_running {
             let query_now = Utc::now().max(self.snapshot.as_of);
             self.summary_backfill_pending = summary_history_backfill_needed(&history, query_now);
         }
         self.history = history;
-        self.summary_cache = None;
+        if !summary_inputs_unchanged {
+            self.summary_cache = None;
+        }
     }
 
     fn replace_recorder_health(&mut self, recorder_health: RecorderHealth) {
@@ -3240,6 +3492,16 @@ impl App {
         if refreshed_account {
             self.schedule_next_account_refresh(&result, Instant::now());
         }
+        let next_snapshot_as_of = result.snapshot.as_of;
+        let summary_inputs_unchanged = self.summary_cache.as_ref().is_some_and(|cache| {
+            summary_snapshot_inputs_eq(
+                &self.snapshot,
+                &result.snapshot,
+                cache,
+                self.summary_range,
+                next_snapshot_as_of.max(self.snapshot.as_of),
+            )
+        });
         let filtered = self.filtered_task_indices();
         let task_viewport_was_at_top = self.task_table_offset == 0;
         let selected_position = filtered
@@ -3268,7 +3530,18 @@ impl App {
             .map(|turn| turn.turn_id.clone());
         self.snapshot = result.snapshot;
         self.account = result.account;
-        self.summary_cache = None;
+        if summary_inputs_unchanged {
+            if let Some(cache) = self.summary_cache.as_mut()
+                && cache.range == self.summary_range
+            {
+                // `snapshot_as_of` guards the cache against source refreshes.
+                // When every Summary-relevant snapshot input is unchanged, move
+                // that guard forward without rebuilding the 30-day aggregate.
+                cache.snapshot_as_of = next_snapshot_as_of;
+            }
+        } else {
+            self.summary_cache = None;
+        }
         let existing_threads = self
             .snapshot
             .tasks
@@ -3288,6 +3561,8 @@ impl App {
         self.summary_table_hitbox = None;
         self.summary_tree_marker_hitboxes.clear();
         self.summary_bar_hitboxes.clear();
+        self.summary_daily_hitbox = None;
+        self.summary_daily_dragging = false;
         self.summary_scrollbar_hitbox = None;
         self.view_tabs_hitbox = None;
         self.task_scrollbar_hitbox = None;
@@ -3576,6 +3851,12 @@ impl App {
 
     fn toggle_theme(&mut self) {
         self.theme = self.theme.toggle();
+        self.summary_project_colors.clear();
+        extend_summary_project_colors_from_history(
+            &mut self.summary_project_colors,
+            &self.history,
+            self.theme,
+        );
     }
 
     fn select_task_at(&mut self, column: u16, row: u16) -> bool {
@@ -3719,6 +4000,7 @@ impl App {
         }
         if self.view != view {
             self.clear_trend_inspection();
+            self.summary_daily_dragging = false;
         }
         if view != View::Overview {
             self.close_temporary_turns();
@@ -3735,6 +4017,14 @@ impl App {
         self.summary_cache = None;
         self.summary_selected_id = None;
         self.summary_offset = 0;
+        self.summary_inspected_date = None;
+        self.summary_daily_dragging = false;
+    }
+
+    fn cycle_summary_grain(&mut self) {
+        self.summary_grain = self.summary_grain.next();
+        self.summary_inspected_date = None;
+        self.summary_daily_dragging = false;
     }
 
     fn set_summary_metric(&mut self, metric: SummaryMetric) {
@@ -3742,8 +4032,108 @@ impl App {
             return;
         }
         self.summary_metric = metric;
+        if self.summary_cache.as_ref().is_some_and(|cache| {
+            summary_chart_project_count(&cache.prepared, metric, self.api_long_context_multiplier)
+                <= SUMMARY_STACKED_PROJECT_LIMIT
+        }) {
+            self.summary_show_all_projects = false;
+        }
         self.summary_selected_id = None;
         self.summary_offset = 0;
+    }
+
+    fn can_toggle_summary_all_projects(&self) -> bool {
+        self.summary_cache.as_ref().is_some_and(|cache| {
+            summary_chart_project_count(
+                &cache.prepared,
+                self.summary_metric,
+                self.api_long_context_multiplier,
+            ) > SUMMARY_STACKED_PROJECT_LIMIT
+        })
+    }
+
+    fn toggle_summary_all_projects(&mut self) -> bool {
+        if !self.can_toggle_summary_all_projects() {
+            return false;
+        }
+        self.summary_show_all_projects = !self.summary_show_all_projects;
+        true
+    }
+
+    fn default_summary_inspection_date(&self) -> Option<NaiveDateTime> {
+        let hitbox = self.summary_daily_hitbox.as_ref()?;
+        let cache = self.summary_cache.as_ref()?;
+        hitbox
+            .dates
+            .iter()
+            .rev()
+            .find(|date| {
+                cache.chart.buckets.iter().any(|bucket| {
+                    bucket.starts_at == **date
+                        && cache.prepared.chart_bucket_state(
+                            bucket,
+                            cache.chart.grain,
+                            self.summary_metric,
+                            self.api_long_context_multiplier,
+                        ) != SummaryDailyState::Missing
+                })
+            })
+            .or_else(|| hitbox.dates.last())
+            .copied()
+    }
+
+    fn toggle_summary_inspection(&mut self) -> bool {
+        if self.summary_inspected_date.take().is_some() {
+            return true;
+        }
+        if self.summary_daily_hitbox.is_none() {
+            return false;
+        }
+        let Some(date) = self.default_summary_inspection_date() else {
+            return false;
+        };
+        self.summary_inspected_date = Some(date);
+        true
+    }
+
+    fn step_summary_inspection(&mut self, forward: bool) -> bool {
+        let Some(selected) = self.summary_inspected_date else {
+            return false;
+        };
+        let Some(dates) = self
+            .summary_daily_hitbox
+            .as_ref()
+            .map(|hitbox| hitbox.dates.as_slice())
+        else {
+            return false;
+        };
+        let Some(index) = dates.iter().position(|date| *date == selected) else {
+            self.summary_inspected_date = self.default_summary_inspection_date();
+            return self.summary_inspected_date.is_some();
+        };
+        let next = if forward {
+            (index + 1).min(dates.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        self.summary_inspected_date = dates.get(next).copied();
+        true
+    }
+
+    fn edge_summary_inspection(&mut self, end: bool) -> bool {
+        let Some(dates) = self
+            .summary_daily_hitbox
+            .as_ref()
+            .map(|hitbox| hitbox.dates.as_slice())
+        else {
+            return false;
+        };
+        self.summary_inspected_date = if end {
+            dates.last().copied()
+        } else {
+            dates.first().copied()
+        };
+        self.summary_inspected_date.is_some()
     }
 
     fn summary_rows(&self) -> Vec<SummaryTreeRow> {
@@ -3824,6 +4214,32 @@ impl App {
             .is_some_and(|node_id| self.toggle_summary_node(&node_id))
     }
 
+    fn collapse_all_summary_nodes(&mut self) -> bool {
+        if self.summary_expanded_nodes.is_empty() {
+            return false;
+        }
+        let rows = self.summary_rows();
+        let selected_project_id = if rows.is_empty() {
+            None
+        } else {
+            let selected_index = self.summary_selected_index(&rows);
+            rows[..=selected_index]
+                .iter()
+                .rev()
+                .find(|row| row.kind == SummaryRowKind::Project)
+                .map(|row| row.id.clone())
+        };
+        self.summary_expanded_nodes.clear();
+        let collapsed_rows = self.summary_rows();
+        let selected_index = selected_project_id
+            .as_deref()
+            .and_then(|project_id| collapsed_rows.iter().position(|row| row.id == project_id))
+            .unwrap_or(0);
+        self.summary_offset = 0;
+        self.select_summary_index(selected_index, true);
+        true
+    }
+
     fn activate_summary_control_at(&mut self, column: u16, row: u16) -> bool {
         if self.view != View::Summary {
             return false;
@@ -3845,12 +4261,25 @@ impl App {
             self.set_summary_metric(metric);
             return true;
         }
+        if rect_contains(hitbox.bucket_grain, column, row) {
+            self.cycle_summary_grain();
+            return true;
+        }
+        if rect_contains(hitbox.toggle_all_projects, column, row) {
+            return self.toggle_summary_all_projects();
+        }
         if rect_contains(hitbox.toggle_long_context, column, row) {
             self.toggle_api_long_context_multiplier();
             return true;
         }
+        if rect_contains(hitbox.inspect, column, row) {
+            return self.toggle_summary_inspection();
+        }
         if rect_contains(hitbox.toggle_selected, column, row) {
             return self.toggle_selected_summary_node();
+        }
+        if rect_contains(hitbox.collapse_all, column, row) {
+            return self.collapse_all_summary_nodes();
         }
         false
     }
@@ -3902,6 +4331,43 @@ impl App {
             return false;
         };
         self.select_summary_index(index, true)
+    }
+
+    fn begin_summary_daily_drag_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Summary {
+            return false;
+        }
+        let Some(date) = self
+            .summary_daily_hitbox
+            .as_ref()
+            .filter(|hitbox| hitbox.contains(column, row))
+            .and_then(|hitbox| hitbox.date_at_column(column))
+        else {
+            return false;
+        };
+        self.scroll_drag = None;
+        self.trend_drag = None;
+        self.summary_daily_dragging = true;
+        self.summary_inspected_date = Some(date);
+        true
+    }
+
+    fn drag_summary_daily_to(&mut self, column: u16) -> bool {
+        if !self.summary_daily_dragging {
+            return false;
+        }
+        let Some(date) = self
+            .summary_daily_hitbox
+            .as_ref()
+            .and_then(|hitbox| hitbox.date_at_column(column))
+        else {
+            return false;
+        };
+        if self.summary_inspected_date == Some(date) {
+            return false;
+        }
+        self.summary_inspected_date = Some(date);
+        true
     }
 
     fn scroll_summary(&mut self, down: bool, lines: usize) {
@@ -4189,6 +4655,7 @@ impl App {
         self.quit_requested = false;
         self.scroll_drag = None;
         self.trend_drag = None;
+        self.summary_daily_dragging = false;
     }
 
     fn close_quit_confirmation(&mut self) {
@@ -4419,6 +4886,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         MouseEventKind::Down(MouseButton::Left) => {
             app.scroll_drag = None;
             app.trend_drag = None;
+            app.summary_daily_dragging = false;
             if app.activate_view_at(event.column, event.row)
                 || app.activate_setting_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
@@ -4430,6 +4898,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 || app.activate_task_tree_marker_at(event.column, event.row)
                 || app.activate_summary_tree_marker_at(event.column, event.row)
                 || app.activate_summary_bar_at(event.column, event.row)
+                || app.begin_summary_daily_drag_at(event.column, event.row)
                 || app.begin_scrollbar_drag_at(event.column, event.row)
             {
                 true
@@ -4458,6 +4927,8 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         MouseEventKind::Drag(MouseButton::Left) => {
             if app.scroll_drag.is_some() {
                 app.drag_scrollbar_to(event.row)
+            } else if app.summary_daily_dragging {
+                app.drag_summary_daily_to(event.column)
             } else {
                 app.drag_trend_to(event.column)
             }
@@ -4465,7 +4936,8 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         MouseEventKind::Up(MouseButton::Left) => {
             let ended_scroll_drag = app.scroll_drag.take().is_some();
             let ended_trend_drag = app.trend_drag.take().is_some();
-            ended_scroll_drag || ended_trend_drag
+            let ended_summary_drag = std::mem::take(&mut app.summary_daily_dragging);
+            ended_scroll_drag || ended_trend_drag || ended_summary_drag
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = matches!(event.kind, MouseEventKind::ScrollDown);
@@ -4678,6 +5150,39 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
+    if app.view == View::Summary && app.summary_inspected_date.is_some() {
+        match key.code {
+            KeyCode::Char('i' | 'I') | KeyCode::Esc => {
+                app.summary_inspected_date = None;
+            }
+            KeyCode::Left | KeyCode::Char('[') => {
+                app.step_summary_inspection(false);
+            }
+            KeyCode::Right | KeyCode::Char(']') => {
+                app.step_summary_inspection(true);
+            }
+            KeyCode::Home => {
+                app.edge_summary_inspection(false);
+            }
+            KeyCode::End => {
+                app.edge_summary_inspection(true);
+            }
+            _ => {}
+        }
+        if matches!(
+            key.code,
+            KeyCode::Char('i' | 'I')
+                | KeyCode::Esc
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('[' | ']')
+                | KeyCode::Home
+                | KeyCode::End
+        ) {
+            return false;
+        }
+    }
+
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => app.open_quit_confirmation(),
@@ -4706,11 +5211,23 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('a' | 'A') if app.view == View::Summary => {
             app.set_summary_metric(SummaryMetric::ApiEquivalent);
         }
+        KeyCode::Char('b' | 'B') if app.view == View::Summary => {
+            app.cycle_summary_grain();
+        }
+        KeyCode::Char('g' | 'G') if app.view == View::Summary => {
+            app.toggle_summary_all_projects();
+        }
+        KeyCode::Char('i' | 'I') if app.view == View::Summary => {
+            app.toggle_summary_inspection();
+        }
         KeyCode::Char('l' | 'L') if app.view == View::Summary => {
             app.toggle_api_long_context_multiplier();
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Summary => {
             app.toggle_selected_summary_node();
+        }
+        KeyCode::Char('x' | 'X') if app.view == View::Summary => {
+            app.collapse_all_summary_nodes();
         }
         KeyCode::Down | KeyCode::Char('j') if app.view == View::Summary => {
             app.move_summary_selection(true);
@@ -5767,6 +6284,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.summary_table_hitbox = None;
     app.summary_tree_marker_hitboxes.clear();
     app.summary_bar_hitboxes.clear();
+    app.summary_daily_hitbox = None;
     app.summary_scrollbar_hitbox = None;
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
@@ -6672,6 +7190,78 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.settings_controls_hitbox = Some(hitbox);
 }
 
+fn summary_snapshot_inputs_eq(
+    current: &Snapshot,
+    incoming: &Snapshot,
+    cache: &SummaryCache,
+    range: SummaryRange,
+    query_now: DateTime<Utc>,
+) -> bool {
+    cache.range == range
+        && summary_cache_window_matches(cache, incoming, range, query_now)
+        && summary_task_metadata_eq(&current.tasks, &incoming.tasks)
+}
+
+fn summary_cache_window_matches(
+    cache: &SummaryCache,
+    snapshot: &Snapshot,
+    range: SummaryRange,
+    query_now: DateTime<Utc>,
+) -> bool {
+    if range != SummaryRange::Cycle {
+        return true;
+    }
+    let (incoming_window, incoming_note) = range.window(snapshot, query_now);
+    match (cache.prepared.range_note, incoming_note) {
+        (None, None) => cache.prepared.usage.window.starts_at == incoming_window.starts_at,
+        (Some(current), Some(incoming)) => current == incoming,
+        _ => false,
+    }
+}
+
+fn summary_task_metadata_eq(current: &[TaskRecord], incoming: &[TaskRecord]) -> bool {
+    if current.len() != incoming.len() {
+        return false;
+    }
+    let incoming_by_id = incoming
+        .iter()
+        .map(|task| (task.thread_id.as_str(), task))
+        .collect::<HashMap<_, _>>();
+    current.iter().all(|task| {
+        incoming_by_id
+            .get(task.thread_id.as_str())
+            .is_some_and(|candidate| {
+                task.parent_thread_id == candidate.parent_thread_id
+                    && task.cwd == candidate.cwd
+                    && task.title == candidate.title
+                    && task.source == candidate.source
+            })
+    })
+}
+
+fn summary_history_inputs_eq(current: &HistoryData, incoming: &HistoryData) -> bool {
+    current.read_only == incoming.read_only
+        && current.warnings == incoming.warnings
+        && current.half_hour_buckets.len() == incoming.half_hour_buckets.len()
+        && current
+            .half_hour_buckets
+            .iter()
+            .rev()
+            .zip(incoming.half_hour_buckets.iter().rev())
+            .all(|(current, incoming)| {
+                current.starts_at == incoming.starts_at
+                    && current.ends_at == incoming.ends_at
+                    && current.sampled_at == incoming.sampled_at
+                    && current.token_usage == incoming.token_usage
+                    && current.long_context_usage_unknown == incoming.long_context_usage_unknown
+                    && current.estimator_revision == incoming.estimator_revision
+                    && current.project_breakdown_revision == incoming.project_breakdown_revision
+                    && current.api_pricing_catalog_revision == incoming.api_pricing_catalog_revision
+                    && current.project_groups == incoming.project_groups
+                    && current.partial_reasons == incoming.partial_reasons
+            })
+}
+
 fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
     let (window, range_note) = app.summary_range.window(&app.snapshot, query_now);
     let mut samples = Vec::new();
@@ -6681,6 +7271,7 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
     let mut estimated_covered_tokens = 0_u64;
     let mut long_context_breakdown_complete = true;
     let mut daily_coverage = expected_summary_daily_coverage(window);
+    let mut hourly_coverage = expected_summary_hourly_coverage(window);
     let mut partial_reasons = app.history.warnings.clone();
     if range_note.is_some() {
         partial_reasons.push("cycle_window_unavailable".to_string());
@@ -6691,19 +7282,32 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
         if !selected {
             continue;
         }
-        let daily = daily_coverage
-            .entry(display_local_date(bucket.starts_at))
-            .or_default();
-        daily.available_tokens = daily
-            .available_tokens
-            .saturating_add(bucket.token_usage.total_tokens);
-        daily.long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
-        daily.source_partial |= !bucket.partial_reasons.is_empty();
+        let local_date = display_local_date(bucket.starts_at);
+        let local_hour = display_local_hour(bucket.starts_at);
+        for coverage in [
+            daily_coverage.entry(local_date).or_default(),
+            hourly_coverage.entry(local_hour).or_default(),
+        ] {
+            coverage.available_tokens = coverage
+                .available_tokens
+                .saturating_add(bucket.token_usage.total_tokens);
+            coverage.long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
+            coverage.source_partial |=
+                !bucket.partial_reasons.is_empty() || bucket.sampled_at < bucket.ends_at;
+        }
+        if bucket.sampled_at < bucket.ends_at {
+            partial_reasons.push("history_bucket_open".to_string());
+        }
         let project_breakdown_current =
             bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION;
         if project_breakdown_current {
             covered_buckets = covered_buckets.saturating_add(1);
-            daily.covered_buckets = daily.covered_buckets.saturating_add(1);
+            for coverage in [
+                daily_coverage.entry(local_date).or_default(),
+                hourly_coverage.entry(local_hour).or_default(),
+            ] {
+                coverage.covered_buckets = coverage.covered_buckets.saturating_add(1);
+            }
         } else {
             partial_reasons.push("project_breakdown_unavailable".to_string());
         }
@@ -6717,9 +7321,14 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
         if estimator_current {
             estimated_covered_tokens =
                 estimated_covered_tokens.saturating_add(bucket.token_usage.total_tokens);
-            daily.estimated_covered_tokens = daily
-                .estimated_covered_tokens
-                .saturating_add(bucket.token_usage.total_tokens);
+            for coverage in [
+                daily_coverage.entry(local_date).or_default(),
+                hourly_coverage.entry(local_hour).or_default(),
+            ] {
+                coverage.estimated_covered_tokens = coverage
+                    .estimated_covered_tokens
+                    .saturating_add(bucket.token_usage.total_tokens);
+            }
         } else {
             partial_reasons.push("estimator_revision_changed".to_string());
         }
@@ -6728,15 +7337,27 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
         }
         for group in &bucket.project_groups {
             represented_tokens = represented_tokens.saturating_add(group.token_usage.total_tokens);
-            daily.represented_tokens = daily
-                .represented_tokens
-                .saturating_add(group.token_usage.total_tokens);
+            for coverage in [
+                daily_coverage.entry(local_date).or_default(),
+                hourly_coverage.entry(local_hour).or_default(),
+            ] {
+                coverage.represented_tokens = coverage
+                    .represented_tokens
+                    .saturating_add(group.token_usage.total_tokens);
+            }
             if estimator_current
                 && (!group.token_usage.is_zero() || group.estimated_cost_units > 0)
                 && group.api_long_context_extra_cost_units.is_none()
             {
                 long_context_breakdown_complete = false;
-                daily.long_context_breakdown_complete = false;
+                daily_coverage
+                    .entry(local_date)
+                    .or_default()
+                    .long_context_breakdown_complete = false;
+                hourly_coverage
+                    .entry(local_hour)
+                    .or_default()
+                    .long_context_breakdown_complete = false;
             }
             let (estimated_cost_units, api_long_context_extra_cost_units) =
                 summary_estimated_units_for_revision(
@@ -6810,7 +7431,7 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
         .values()
         .map(|coverage| coverage.expected_buckets)
         .fold(0_usize, usize::saturating_add);
-    let usage = summarize_samples_with_local_date(&samples, window, display_local_date);
+    let usage = summarize_samples_with_local_time(&samples, window, display_local_datetime);
     PreparedSummary {
         usage,
         range_note,
@@ -6821,6 +7442,7 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
         estimated_covered_tokens,
         long_context_breakdown_complete,
         daily_coverage,
+        hourly_coverage,
         partial_reasons,
     }
 }
@@ -6828,6 +7450,19 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
 fn expected_summary_daily_coverage(
     window: SummaryWindow,
 ) -> BTreeMap<NaiveDate, SummaryDailyCoverage> {
+    expected_summary_coverage(window, display_local_date)
+}
+
+fn expected_summary_hourly_coverage(
+    window: SummaryWindow,
+) -> BTreeMap<NaiveDateTime, SummaryDailyCoverage> {
+    expected_summary_coverage(window, display_local_hour)
+}
+
+fn expected_summary_coverage<K: Ord>(
+    window: SummaryWindow,
+    local_key: impl Fn(DateTime<Utc>) -> K,
+) -> BTreeMap<K, SummaryDailyCoverage> {
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let mut starts_at_seconds = window
         .starts_at
@@ -6839,10 +7474,10 @@ fn expected_summary_daily_coverage(
         starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
     }
     let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
-    let mut coverage = BTreeMap::<NaiveDate, SummaryDailyCoverage>::new();
+    let mut coverage = BTreeMap::<K, SummaryDailyCoverage>::new();
     while starts_at < window.ends_at {
-        let daily = coverage.entry(display_local_date(starts_at)).or_default();
-        daily.expected_buckets = daily.expected_buckets.saturating_add(1);
+        let bucket = coverage.entry(local_key(starts_at)).or_default();
+        bucket.expected_buckets = bucket.expected_buckets.saturating_add(1);
         let Some(next) = starts_at.checked_add_signed(ChronoDuration::seconds(bucket_seconds))
         else {
             break;
@@ -6850,6 +7485,61 @@ fn expected_summary_daily_coverage(
         starts_at = next;
     }
     coverage
+}
+
+fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) -> SummaryChartData {
+    let mut coverage_by_bucket = BTreeMap::<NaiveDateTime, SummaryDailyCoverage>::new();
+    for (hour, coverage) in &prepared.hourly_coverage {
+        coverage_by_bucket
+            .entry(grain.bucket_start(*hour))
+            .or_default()
+            .add_assign(coverage);
+    }
+
+    let mut totals_by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
+    for hour in &prepared.usage.hours {
+        totals_by_bucket
+            .entry(grain.bucket_start(hour.starts_at))
+            .or_default()
+            .add_assign(hour.totals);
+    }
+    for starts_at in totals_by_bucket.keys().copied().collect::<Vec<_>>() {
+        coverage_by_bucket.entry(starts_at).or_default();
+    }
+
+    let starts = coverage_by_bucket.keys().copied().collect::<Vec<_>>();
+    let buckets = starts
+        .iter()
+        .map(|starts_at| SummaryChartBucket {
+            starts_at: *starts_at,
+            totals: totals_by_bucket.get(starts_at).copied().unwrap_or_default(),
+            coverage: coverage_by_bucket
+                .get(starts_at)
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect();
+    let project_values = prepared
+        .usage
+        .projects
+        .iter()
+        .map(|project| {
+            let mut by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
+            for hour in &project.hours {
+                by_bucket
+                    .entry(grain.bucket_start(hour.starts_at))
+                    .or_default()
+                    .add_assign(hour.totals);
+            }
+            (project.key.clone(), by_bucket)
+        })
+        .collect();
+
+    SummaryChartData {
+        grain,
+        buckets,
+        project_values,
+    }
 }
 
 fn summary_api_cost_for_catalog(amount: ApiCostAmount, catalog_revision: u32) -> ApiCostAmount {
@@ -6885,16 +7575,33 @@ fn ensure_summary_cache(app: &mut App, query_now: DateTime<Utc>) {
             && cache.snapshot_as_of == app.snapshot.as_of
             && cache.query_bucket == query_bucket
             && cache.query_local_date == query_local_date
+            && summary_cache_window_matches(cache, &app.snapshot, app.summary_range, query_now)
     });
     if current {
+        if let Some(cache) = app.summary_cache.as_mut()
+            && cache.chart.grain != app.summary_grain
+        {
+            cache.chart = prepare_summary_chart(&cache.prepared, app.summary_grain);
+        }
         return;
     }
+    let prepared = prepare_summary(app, query_now);
+    if summary_chart_project_count(
+        &prepared,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    ) <= SUMMARY_STACKED_PROJECT_LIMIT
+    {
+        app.summary_show_all_projects = false;
+    }
+    let chart = prepare_summary_chart(&prepared, app.summary_grain);
     app.summary_cache = Some(SummaryCache {
         range: app.summary_range,
         snapshot_as_of: app.snapshot.as_of,
         query_bucket,
         query_local_date,
-        prepared: prepare_summary(app, query_now),
+        prepared,
+        chart,
     });
 }
 
@@ -6989,9 +7696,19 @@ fn append_summary_thread_rows(
     let id = summary_thread_node_id(&thread.thread_id);
     let has_children = !thread.children.is_empty();
     let collapsed = has_children && !expanded.contains(&id);
+    let kind = if thread.parent_thread_id.is_some()
+        || thread
+            .source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+    {
+        SummaryRowKind::Subagent
+    } else {
+        SummaryRowKind::Session
+    };
     rows.push(SummaryTreeRow {
         id,
-        kind: SummaryRowKind::Thread,
+        kind,
         prefix: summary_tree_prefix(guides),
         label: thread
             .title
@@ -7130,27 +7847,168 @@ fn summary_chart_metric_label(app: &App, prepared: &PreparedSummary) -> String {
     }
 }
 
-fn summary_chart_color(index: usize, theme: Theme) -> Color {
-    const DARK: [Color; 6] = [
-        Color::Rgb(63, 185, 192),
-        Color::Rgb(96, 165, 250),
-        Color::Rgb(167, 139, 250),
-        Color::Rgb(244, 114, 182),
-        Color::Rgb(251, 146, 60),
-        Color::Rgb(148, 163, 184),
-    ];
-    const LIGHT: [Color; 6] = [
-        Color::Rgb(0, 108, 117),
-        Color::Rgb(37, 99, 235),
-        Color::Rgb(109, 40, 217),
-        Color::Rgb(190, 24, 93),
-        Color::Rgb(194, 65, 12),
-        Color::Rgb(71, 85, 105),
-    ];
-    match theme {
-        Theme::Dark => DARK[index % DARK.len()],
-        Theme::Light => LIGHT[index % LIGHT.len()],
+fn summary_project_color(project_key: &str, theme: Theme) -> Color {
+    let hash = summary_project_hash(project_key);
+    summary_project_color_candidate(hash, 0, theme)
+}
+
+#[cfg(test)]
+fn summary_project_colors(
+    summary: &UsageSummary,
+    history: &HistoryData,
+    theme: Theme,
+) -> HashMap<String, Color> {
+    let mut colors = HashMap::new();
+    extend_summary_project_colors(&mut colors, summary, history, theme);
+    colors
+}
+
+#[cfg(test)]
+fn extend_summary_project_colors(
+    colors: &mut HashMap<String, Color>,
+    summary: &UsageSummary,
+    history: &HistoryData,
+    theme: Theme,
+) {
+    extend_summary_project_colors_from_history(colors, history, theme);
+    extend_assigned_summary_project_colors(
+        colors,
+        summary.projects.iter().map(|project| project.key.as_str()),
+        theme,
+    );
+}
+
+fn extend_summary_project_colors_from_history(
+    colors: &mut HashMap<String, Color>,
+    history: &HistoryData,
+    theme: Theme,
+) {
+    let project_keys = history
+        .half_hour_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.project_groups)
+        .filter_map(|group| group.project_id.as_deref())
+        .filter(|project_id| !project_id.is_empty())
+        .collect::<HashSet<_>>();
+
+    // Summary history is loaded over one fixed 31-day horizon regardless of
+    // the selected Cycle/7d/30d range. Assigning against that full project
+    // universe keeps a project's color stable when a range hides or reveals
+    // another project that sorts before it in the collision resolver.
+    extend_assigned_summary_project_colors(colors, project_keys, theme);
+}
+
+#[cfg(test)]
+fn assign_summary_project_colors<'a>(
+    project_keys: impl IntoIterator<Item = &'a str>,
+    theme: Theme,
+) -> HashMap<String, Color> {
+    let mut colors = HashMap::new();
+    extend_assigned_summary_project_colors(&mut colors, project_keys, theme);
+    colors
+}
+
+fn extend_assigned_summary_project_colors<'a>(
+    colors: &mut HashMap<String, Color>,
+    project_keys: impl IntoIterator<Item = &'a str>,
+    theme: Theme,
+) {
+    let mut projects = project_keys
+        .into_iter()
+        .filter(|key| !colors.contains_key(*key))
+        .map(|key| (summary_project_hash(key), key.to_string()))
+        .collect::<Vec<_>>();
+    projects.sort_unstable();
+
+    // Reserve the neutral Other color and then choose the first deterministic
+    // candidate with enough distance from every color already assigned. The
+    // stable hash/key order makes this independent of the current metric rank.
+    let mut assigned = Vec::with_capacity(colors.len().saturating_add(1));
+    assigned.push(theme.palette().muted);
+    assigned.extend(colors.values().copied());
+    for (hash, key) in projects {
+        let mut best = summary_project_color_candidate(hash, 0, theme);
+        let mut best_distance = 0_u32;
+        for attempt in 0..SUMMARY_PROJECT_COLOR_CANDIDATES {
+            let candidate = summary_project_color_candidate(hash, attempt, theme);
+            let minimum_distance = assigned
+                .iter()
+                .map(|existing| summary_color_distance_squared(candidate, *existing))
+                .min()
+                .unwrap_or(u32::MAX);
+            if minimum_distance >= SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED {
+                best = candidate;
+                break;
+            }
+            if minimum_distance > best_distance {
+                best = candidate;
+                best_distance = minimum_distance;
+            }
+        }
+        assigned.push(best);
+        colors.insert(key, best);
     }
+}
+
+fn summary_project_color_candidate(hash: u64, attempt: usize, theme: Theme) -> Color {
+    const GOLDEN_ANGLE: f64 = 137.507_764_050_037_85;
+    let attempt = u64::try_from(attempt).unwrap_or(u64::MAX);
+    let candidate_hash = hash ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let hue = ((hash % 36_000) as f64 / 100.0 + attempt as f64 * GOLDEN_ANGLE).rem_euclid(360.0);
+    summary_project_color_with_hue(candidate_hash, hue, theme)
+}
+
+fn summary_color_distance_squared(left: Color, right: Color) -> u32 {
+    let (
+        Color::Rgb(left_red, left_green, left_blue),
+        Color::Rgb(right_red, right_green, right_blue),
+    ) = (left, right)
+    else {
+        return 0;
+    };
+    let red_mean = (u32::from(left_red) + u32::from(right_red)) / 2;
+    let red = i32::from(left_red) - i32::from(right_red);
+    let green = i32::from(left_green) - i32::from(right_green);
+    let blue = i32::from(left_blue) - i32::from(right_blue);
+    let red = red.unsigned_abs().saturating_pow(2);
+    let green = green.unsigned_abs().saturating_pow(2);
+    let blue = blue.unsigned_abs().saturating_pow(2);
+    ((512 + red_mean).saturating_mul(red) >> 8)
+        .saturating_add(4_u32.saturating_mul(green))
+        .saturating_add((767_u32.saturating_sub(red_mean)).saturating_mul(blue) >> 8)
+}
+
+fn summary_project_hash(project_key: &str) -> u64 {
+    let hash = project_key
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        });
+    let hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
+}
+
+fn summary_project_color_with_hue(hash: u64, hue: f64, theme: Theme) -> Color {
+    let saturation = 0.62 + ((hash >> 16) % 11) as f64 / 100.0;
+    let lightness = match theme {
+        Theme::Dark => 0.58 + ((hash >> 24) % 7) as f64 / 100.0,
+        Theme::Light => 0.36 + ((hash >> 24) % 7) as f64 / 100.0,
+    };
+    hsl_color(hue, saturation, lightness)
+}
+
+fn hsl_color(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let hue = hue.rem_euclid(360.0) / 30.0;
+    let chroma = saturation * lightness.min(1.0 - lightness);
+    let channel = |offset: f64| {
+        let k = (offset + hue).rem_euclid(12.0);
+        let shape = (-1.0_f64).max((k - 3.0).min((9.0 - k).min(1.0)));
+        ((lightness - chroma * shape) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(channel(0.0), channel(8.0), channel(4.0))
 }
 
 struct SummaryControlSpec {
@@ -7220,12 +8078,17 @@ fn render_summary_controls(
     area: Rect,
     app: &App,
     selected_can_toggle: bool,
+    can_collapse_all: bool,
+    can_toggle_all_projects: bool,
+    can_inspect: bool,
 ) -> SummaryControlsHitbox {
+    const FULL_CONTROLS_WIDTH: u16 = 118;
     let mut hitbox = SummaryControlsHitbox::default();
     if area.is_empty() {
         return hitbox;
     }
-    let compact = area.width < 80;
+    let compact = area.width < FULL_CONTROLS_WIDTH;
+    let roomy_compact = compact && area.width >= 49;
     let mut spans = Vec::new();
     let mut x = area.x;
     for (position, range) in SummaryRange::ALL.into_iter().enumerate() {
@@ -7264,12 +8127,55 @@ fn render_summary_controls(
             },
         );
     }
-    hitbox.toggle_long_context = append_summary_control(
+    hitbox.bucket_grain = append_summary_control(
         &mut spans,
         area,
         &mut x,
         SummaryControlSpec {
             leading: if compact { " " } else { " | " },
+            shortcut: "B".to_string(),
+            suffix: app.summary_grain.control_suffix(),
+            selected: false,
+            shortcuts_active: app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
+    hitbox.inspect = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: " ",
+            shortcut: "I".to_string(),
+            suffix: if compact && !roomy_compact {
+                ""
+            } else {
+                "Inspect"
+            },
+            selected: app.summary_inspected_date.is_some(),
+            shortcuts_active: can_inspect && app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
+    hitbox.toggle_all_projects = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: if compact { " " } else { " | " },
+            shortcut: "G".to_string(),
+            suffix: if compact && !roomy_compact { "" } else { "All" },
+            selected: app.summary_show_all_projects,
+            shortcuts_active: can_toggle_all_projects && app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
+    hitbox.toggle_long_context = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: " ",
             shortcut: "L".to_string(),
             suffix: if compact { "" } else { "Longx" },
             selected: app.api_long_context_multiplier,
@@ -7290,15 +8196,27 @@ fn render_summary_controls(
             theme: app.theme,
         },
     );
+    hitbox.collapse_all = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: " ",
+            shortcut: "X".to_string(),
+            suffix: if compact { "" } else { "Collapse" },
+            selected: false,
+            shortcuts_active: can_collapse_all && app.shortcuts_active(),
+            theme: app.theme,
+        },
+    );
     if app.summary_backfill_running {
-        let status = if compact {
-            " · BACKFILL 30d…"
-        } else {
-            " · BACKFILLING 30d HISTORY…"
-        };
-        if x.saturating_add(u16::try_from(UnicodeWidthStr::width(status)).unwrap_or(u16::MAX))
-            <= area.right()
-        {
+        let status = [" · BACKFILLING 30d HISTORY…", " · BACKFILL 30d…"]
+            .into_iter()
+            .find(|status| {
+                x.saturating_add(u16::try_from(UnicodeWidthStr::width(*status)).unwrap_or(u16::MAX))
+                    <= area.right()
+            });
+        if let Some(status) = status {
             spans.push(Span::styled(
                 status,
                 Style::default()
@@ -7320,10 +8238,12 @@ fn render_summary_tree(
     app: &mut App,
     prepared: &PreparedSummary,
     rows: &[SummaryTreeRow],
+    project_colors: &HashMap<String, Color>,
 ) {
     const DEFAULT_VALUE_WIDTH: u16 = 14;
     const MAX_VALUE_WIDTH: u16 = 28;
     const SHARE_WIDTH: u16 = 8;
+    const PROJECT_SWATCH_OFFSET_AFTER_PREFIX: u16 = 9;
     let palette = app.theme.palette();
     let partial = prepared.partial(app.summary_metric, app.api_long_context_multiplier);
     let mut total = format_summary_metric(
@@ -7346,7 +8266,11 @@ fn render_summary_tree(
         title.push_str(" · PARTIAL");
     }
     if app.summary_backfill_running {
-        title.push_str(" · BACKFILLING 30d");
+        title = format!(
+            "Usage tree · BACKFILLING 30d · {range_label} · {total} · {:.0}% coverage{}",
+            prepared.coverage_percent(app.summary_metric),
+            if partial { " · PARTIAL" } else { "" }
+        );
     } else if app.summary_range == SummaryRange::ThirtyDays
         && app.history.summary_backfill_attempt_complete == Some(false)
         && !summary_history_coverage_complete(
@@ -7440,12 +8364,35 @@ fn render_summary_tree(
         .take(visible_capacity)
         .map(|(row, metric_value)| {
             let selected = app.summary_selected_id.as_deref() == Some(row.id.as_str());
+            let project_color = (row.kind == SummaryRowKind::Project)
+                .then(|| row.id.strip_prefix("project:"))
+                .flatten()
+                .and_then(|project_key| project_colors.get(project_key))
+                .copied();
             let base = if row.kind == SummaryRowKind::Project {
                 Style::default()
                     .fg(palette.foreground)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(palette.foreground)
+            };
+            let label_style = project_color
+                .map(|color| {
+                    summary_project_body_style(app.theme, color, selected)
+                        .add_modifier(Modifier::BOLD)
+                })
+                .unwrap_or(base);
+            let kind = match row.kind {
+                SummaryRowKind::Project => "PROJ ",
+                SummaryRowKind::Session => "SESS ",
+                SummaryRowKind::Subagent => "SUB  ",
+            };
+            let kind_style = match row.kind {
+                SummaryRowKind::Project => Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+                SummaryRowKind::Session => Style::default().fg(palette.foreground),
+                SummaryRowKind::Subagent => Style::default().fg(palette.muted),
             };
             let marker = if row.has_children {
                 if row.collapsed { "+" } else { "-" }
@@ -7465,14 +8412,21 @@ fn render_summary_tree(
                 .filter(|source| !source.is_empty())
                 .map(|source| format!(" · {}", terminal_safe_text(source)))
                 .unwrap_or_default();
-            let label = Line::from(vec![
+            let mut label_spans = vec![
                 Span::styled(row.prefix.clone(), Style::default().fg(palette.muted)),
                 Span::styled("[", Style::default().fg(palette.muted)),
                 Span::styled(marker, marker_style),
                 Span::styled("] ", Style::default().fg(palette.muted)),
-                Span::styled(row.label.clone(), base),
+                Span::styled(kind, kind_style),
+            ];
+            if let Some(color) = project_color {
+                label_spans.push(Span::styled("■ ", Style::default().fg(color)));
+            }
+            label_spans.extend([
+                Span::styled(row.label.clone(), label_style),
                 Span::styled(source, Style::default().fg(palette.muted)),
             ]);
+            let label = Line::from(label_spans);
             let share = app.summary_metric.share_percent(
                 row.metrics,
                 prepared.usage.totals,
@@ -7490,7 +8444,12 @@ fn render_summary_tree(
         })
         .collect::<Vec<_>>();
     let share_header = if partial { "KNOWN%" } else { "SHARE" };
-    let header = Row::new([app.summary_metric.label(), share_header, "PROJECT · TASK"]).style(
+    let header = Row::new([
+        app.summary_metric.label(),
+        share_header,
+        "TYPE · PROJECT / SESSION",
+    ])
+    .style(
         Style::default()
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD),
@@ -7517,6 +8476,38 @@ fn render_summary_tree(
     .highlight_symbol("▌");
     let mut state = TableState::default().with_selected(selected_in_view);
     frame.render_stateful_widget(table, area, &mut state);
+
+    // Ratatui applies the row highlight after rendering cell spans, so its
+    // inverse foreground would otherwise erase the selected project's stable
+    // swatch color. Restore only cells that actually rendered the swatch;
+    // narrow layouts that clipped it remain untouched.
+    for (position, row) in rows.iter().skip(offset).take(visible_capacity).enumerate() {
+        let Some(project_key) = (row.kind == SummaryRowKind::Project)
+            .then(|| row.id.strip_prefix("project:"))
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(color) = project_colors.get(project_key).copied() else {
+            continue;
+        };
+        let swatch_x = label_x
+            .saturating_add(
+                u16::try_from(UnicodeWidthStr::width(row.prefix.as_str())).unwrap_or(u16::MAX),
+            )
+            .saturating_add(PROJECT_SWATCH_OFFSET_AFTER_PREFIX);
+        let swatch_y = inner
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(position).unwrap_or(u16::MAX));
+        if swatch_x < inner.right()
+            && swatch_y < inner.bottom()
+            && let Some(cell) = frame.buffer_mut().cell_mut((swatch_x, swatch_y))
+            && cell.symbol() == "■"
+        {
+            cell.set_fg(color);
+        }
+    }
 
     let remaining_rows = rows.len().saturating_sub(offset);
     let visible_height = inner
@@ -7557,11 +8548,24 @@ fn render_summary_tree(
     }
 }
 
+fn summary_project_body_style(theme: Theme, color: Color, selected: bool) -> Style {
+    let foreground = match theme {
+        Theme::Dark => color,
+        Theme::Light => theme.palette().foreground,
+    };
+    Style::default().fg(foreground).add_modifier(if selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    })
+}
+
 fn render_summary_bars(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &mut App,
     prepared: &PreparedSummary,
+    project_colors: &HashMap<String, Color>,
 ) {
     let title = format!(
         "Top projects · {}{}",
@@ -7628,7 +8632,9 @@ fn render_summary_bars(
     } else {
         0
     };
-    let reserved_width = value_width
+    let swatch_width = 2_usize;
+    let reserved_width = swatch_width
+        .saturating_add(value_width)
         .saturating_add(share_width)
         .saturating_add(bar_width)
         .saturating_add(if bar_width == 0 { 2 } else { 3 });
@@ -7651,12 +8657,14 @@ fn render_summary_bars(
             let metric_value = &metric_values[index];
             let metric_padding =
                 value_width.saturating_sub(UnicodeWidthStr::width(metric_value.as_str()));
-            let color = summary_chart_color(index, app.theme);
-            let mut label_style = Style::default().fg(color);
-            if selected_project == Some(project.key.as_str()) {
-                label_style = label_style.add_modifier(Modifier::BOLD);
-            }
+            let color = project_colors
+                .get(&project.key)
+                .copied()
+                .unwrap_or_else(|| summary_project_color(&project.key, app.theme));
+            let selected = selected_project == Some(project.key.as_str());
+            let label_style = summary_project_body_style(app.theme, color, selected);
             let mut spans = vec![
+                Span::styled("■ ", Style::default().fg(color)),
                 Span::styled(label, label_style),
                 Span::raw(" ".repeat(label_padding.saturating_add(1))),
                 Span::raw(" ".repeat(metric_padding)),
@@ -7722,41 +8730,527 @@ fn format_summary_axis(value: f64, metric: SummaryMetric) -> String {
     }
 }
 
-fn render_summary_daily(frame: &mut Frame<'_>, area: Rect, app: &App, prepared: &PreparedSummary) {
-    let states = prepared
+#[derive(Clone, Debug)]
+struct SummaryProjectSeries {
+    project_key: Option<String>,
+    label: String,
+    color: Color,
+    /// Only the synthetic `Other` series needs a materialized aggregate.
+    /// Direct project series stay sparse in `SummaryChartData` and are looked
+    /// up by bucket, which keeps 30d/1h memory proportional to observed data.
+    aggregate_values: Option<Vec<SummaryMetrics>>,
+}
+
+fn summary_project_metrics_at(
+    candidate: &SummaryProjectSeries,
+    chart: &SummaryChartData,
+    index: usize,
+) -> SummaryMetrics {
+    let Some(bucket) = chart.buckets.get(index) else {
+        return SummaryMetrics::default();
+    };
+    if let Some(project_key) = candidate.project_key.as_deref() {
+        return chart
+            .project_values
+            .get(project_key)
+            .and_then(|values| values.get(&bucket.starts_at))
+            .copied()
+            .unwrap_or_default();
+    }
+    candidate
+        .aggregate_values
+        .as_ref()
+        .and_then(|values| values.get(index))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn summary_chart_project_count(
+    prepared: &PreparedSummary,
+    metric: SummaryMetric,
+    api_long_context: bool,
+) -> usize {
+    prepared
         .usage
-        .days
+        .projects
         .iter()
-        .map(|day| {
-            prepared.daily_state(
-                day.date,
-                day.totals,
+        .filter(|project| metric.value(project.totals, api_long_context) > 0)
+        .count()
+}
+
+fn summary_project_series(
+    app: &App,
+    prepared: &PreparedSummary,
+    chart: &SummaryChartData,
+    project_colors: &HashMap<String, Color>,
+) -> Vec<SummaryProjectSeries> {
+    let projects = summary_project_order(
+        &prepared.usage,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    )
+    .into_iter()
+    // A project with a zero total for the selected additive metric cannot
+    // contribute a visible value on any day. Keep it in the tree and ranking
+    // panels, but do not allocate and rasterize an all-zero chart series.
+    .filter(|project| {
+        app.summary_metric
+            .value(project.totals, app.api_long_context_multiplier)
+            > 0
+    })
+    .collect::<Vec<_>>();
+    let direct_count = if app.summary_show_all_projects {
+        projects.len()
+    } else {
+        projects.len().min(SUMMARY_STACKED_PROJECT_LIMIT)
+    };
+    let display_labels = summary_project_display_labels(&prepared.usage);
+    let mut series = projects[..direct_count]
+        .iter()
+        .map(|project| SummaryProjectSeries {
+            project_key: Some(project.key.clone()),
+            label: display_labels
+                .get(&project.key)
+                .cloned()
+                .unwrap_or_else(|| project.label.clone()),
+            color: project_colors
+                .get(&project.key)
+                .copied()
+                .unwrap_or_else(|| summary_project_color(&project.key, app.theme)),
+            aggregate_values: None,
+        })
+        .collect::<Vec<_>>();
+    if direct_count < projects.len() {
+        let mut other_days = vec![SummaryMetrics::default(); chart.buckets.len()];
+        for project in &projects[direct_count..] {
+            if let Some(values) = chart.project_values.get(&project.key) {
+                for (starts_at, value) in values {
+                    if let Ok(index) = chart
+                        .buckets
+                        .binary_search_by_key(starts_at, |bucket| bucket.starts_at)
+                    {
+                        other_days[index].add_assign(*value);
+                    }
+                }
+            }
+        }
+        series.push(SummaryProjectSeries {
+            project_key: None,
+            label: "Other".to_string(),
+            color: app.theme.palette().muted,
+            aggregate_values: Some(other_days),
+        });
+    }
+    series
+}
+
+fn summary_bucket_label(starts_at: NaiveDateTime, grain: SummaryGrain, axis: bool) -> String {
+    if grain == SummaryGrain::Day {
+        starts_at.format("%m-%d").to_string()
+    } else if axis {
+        starts_at.format("%m-%d %Hh").to_string()
+    } else {
+        starts_at.format("%m-%d %H:%M").to_string()
+    }
+}
+
+fn summary_bucket_dst_note(
+    bucket: &SummaryChartBucket,
+    grain: SummaryGrain,
+) -> Option<&'static str> {
+    let nominal_buckets = usize::try_from(grain.hours())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::try_from(60 / LOCAL_BUCKET_MINUTES).unwrap_or_default());
+    (bucket.coverage.expected_buckets > nominal_buckets).then_some("DST overlap")
+}
+
+fn summary_project_series_has_values(
+    series: &[SummaryProjectSeries],
+    chart: &SummaryChartData,
+    states: &[SummaryDailyState],
+    metric: SummaryMetric,
+    long_context_multiplier: bool,
+) -> bool {
+    series.iter().any(|candidate| {
+        states.iter().enumerate().any(|(index, state)| {
+            *state != SummaryDailyState::Missing
+                && metric.value(
+                    summary_project_metrics_at(candidate, chart, index),
+                    long_context_multiplier,
+                ) > 0
+        })
+    })
+}
+
+fn prioritized_summary_project_series<'a>(
+    series: &'a [SummaryProjectSeries],
+    selected_project: Option<&str>,
+) -> Vec<&'a SummaryProjectSeries> {
+    let selected = selected_project.and_then(|selected| {
+        series
+            .iter()
+            .find(|candidate| candidate.project_key.as_deref() == Some(selected))
+    });
+    let other = series
+        .iter()
+        .find(|candidate| candidate.project_key.is_none());
+    selected
+        .into_iter()
+        .chain(other)
+        .chain(series.iter().filter(|candidate| {
+            selected.is_none_or(|selected| !std::ptr::eq(*candidate, selected))
+                && other.is_none_or(|other| !std::ptr::eq(*candidate, other))
+        }))
+        .collect()
+}
+
+fn summary_project_legend_line(
+    series: &[SummaryProjectSeries],
+    selected_project: Option<&str>,
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let mut used = 0_usize;
+    let mut spans = Vec::new();
+    let mut shown = 0_usize;
+    for candidate in prioritized_summary_project_series(series, selected_project) {
+        let label = truncate_display_text(&candidate.label, 18);
+        let separator = if shown == 0 { "" } else { "  " };
+        let item_width = UnicodeWidthStr::width(separator)
+            .saturating_add(2)
+            .saturating_add(UnicodeWidthStr::width(label.as_str()));
+        if used.saturating_add(item_width) > width {
+            break;
+        }
+        spans.push(Span::raw(separator.to_string()));
+        spans.push(Span::styled("■ ", Style::default().fg(candidate.color)));
+        let selected = candidate.project_key.as_deref() == selected_project;
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(if selected {
+                    theme.palette().title
+                } else {
+                    theme.palette().foreground
+                })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        used = used.saturating_add(item_width);
+        shown = shown.saturating_add(1);
+    }
+    let omitted = series.len().saturating_sub(shown);
+    if omitted > 0 {
+        let suffix = format!("  +{omitted}");
+        if used.saturating_add(UnicodeWidthStr::width(suffix.as_str())) <= width {
+            spans.push(Span::styled(
+                suffix,
+                Style::default().fg(theme.palette().muted),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+fn summary_daily_readout_line(
+    chart: &SummaryChartData,
+    series: &[SummaryProjectSeries],
+    selected_project: Option<&str>,
+    index: usize,
+    state: SummaryDailyState,
+    width: u16,
+    app: &App,
+) -> Line<'static> {
+    let Some(bucket) = chart.buckets.get(index) else {
+        return Line::default();
+    };
+    let mut bucket_label = summary_bucket_label(bucket.starts_at, chart.grain, false);
+    if let Some(note) = summary_bucket_dst_note(bucket, chart.grain) {
+        bucket_label.push_str(" (");
+        bucket_label.push_str(note);
+        bucket_label.push(')');
+    }
+    let palette = app.theme.palette();
+    let status = match state {
+        SummaryDailyState::Complete => ("C", palette.accent),
+        SummaryDailyState::Partial => ("P lower bound", palette.warning),
+        SummaryDailyState::Missing => ("MISSING", palette.warning),
+    };
+    let mut spans = vec![
+        Span::styled(
+            bucket_label.clone(),
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            status.0,
+            Style::default().fg(status.1).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut used = UnicodeWidthStr::width(bucket_label.as_str())
+        .saturating_add(3)
+        .saturating_add(UnicodeWidthStr::width(status.0));
+    if state == SummaryDailyState::Missing {
+        let message = " · no local project evidence";
+        if used.saturating_add(UnicodeWidthStr::width(message)) <= usize::from(width) {
+            spans.push(Span::styled(message, Style::default().fg(palette.muted)));
+        }
+        return Line::from(spans);
+    }
+
+    let visible = prioritized_summary_project_series(series, selected_project)
+        .into_iter()
+        .filter(|candidate| {
+            let selected = candidate.project_key.as_deref() == selected_project;
+            let metrics = summary_project_metrics_at(candidate, chart, index);
+            selected
+                || app
+                    .summary_metric
+                    .value(metrics, app.api_long_context_multiplier)
+                    > 0
+                || metrics.api_equivalent_cost.observed_samples > 0
+        })
+        .collect::<Vec<_>>();
+    let total = format_summary_metric(
+        bucket.totals,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    );
+    let total_text = format!(" · Total {total}");
+    let total_width = UnicodeWidthStr::width(total_text.as_str());
+    let minimum_item_width = |candidate: &SummaryProjectSeries| {
+        let value = format_summary_metric(
+            summary_project_metrics_at(candidate, chart, index),
+            app.summary_metric,
+            app.api_long_context_multiplier,
+        );
+        // Preserve the complete "Other" label because it is the sole cue that
+        // the remaining projects were aggregated. A selected project may use a
+        // one-cell truncated label in very narrow layouts, but its swatch and
+        // complete value remain visible.
+        let label_width = if candidate.project_key.is_none() {
+            UnicodeWidthStr::width(candidate.label.as_str()).min(14)
+        } else {
+            1
+        };
+        6_usize
+            .saturating_add(label_width.max(1))
+            .saturating_add(UnicodeWidthStr::width(value.as_str()))
+    };
+    let omission_width = |omitted: usize| {
+        if omitted == 0 {
+            0
+        } else {
+            UnicodeWidthStr::width(format!(" · +{omitted}").as_str())
+        }
+    };
+    let preferred_count = if visible.first().is_some_and(|candidate| {
+        candidate.project_key.as_deref() == selected_project && selected_project.is_some()
+    }) && visible
+        .get(1)
+        .is_some_and(|candidate| candidate.project_key.is_none())
+    {
+        2
+    } else {
+        visible.len().min(1)
+    };
+    let preferred_reserve = visible
+        .iter()
+        .take(preferred_count)
+        .map(|candidate| minimum_item_width(candidate))
+        .fold(0_usize, usize::saturating_add)
+        .saturating_add(omission_width(
+            visible.len().saturating_sub(preferred_count),
+        ));
+    let mandatory_count =
+        if preferred_count > 1 && used.saturating_add(preferred_reserve) > usize::from(width) {
+            1
+        } else {
+            preferred_count
+        };
+    let mandatory_reserve = visible
+        .iter()
+        .take(mandatory_count)
+        .map(|candidate| minimum_item_width(candidate))
+        .fold(0_usize, usize::saturating_add)
+        .saturating_add(omission_width(
+            visible.len().saturating_sub(mandatory_count),
+        ));
+    if used
+        .saturating_add(total_width)
+        .saturating_add(mandatory_reserve)
+        <= usize::from(width)
+    {
+        used = used.saturating_add(total_width);
+        spans.push(Span::styled(
+            total_text,
+            Style::default().fg(palette.foreground),
+        ));
+    }
+    let mut shown = 0_usize;
+    for (position, candidate) in visible.iter().enumerate() {
+        let metrics = summary_project_metrics_at(candidate, chart, index);
+        let value =
+            format_summary_metric(metrics, app.summary_metric, app.api_long_context_multiplier);
+        let reserve_after = if position < mandatory_count {
+            visible
+                .iter()
+                .skip(position.saturating_add(1))
+                .take(mandatory_count.saturating_sub(position.saturating_add(1)))
+                .map(|candidate| minimum_item_width(candidate))
+                .fold(0_usize, usize::saturating_add)
+                .saturating_add(omission_width(
+                    visible.len().saturating_sub(mandatory_count),
+                ))
+        } else {
+            omission_width(visible.len().saturating_sub(position.saturating_add(1)))
+        };
+        let available = usize::from(width)
+            .saturating_sub(used)
+            .saturating_sub(reserve_after);
+        // " · " + "■ " + " " before the value.
+        let fixed_width = 6_usize.saturating_add(UnicodeWidthStr::width(value.as_str()));
+        if available <= fixed_width {
+            break;
+        }
+        let label_width = available.saturating_sub(fixed_width).min(14);
+        let label = truncate_display_text(&candidate.label, label_width);
+        let selected = candidate.project_key.as_deref() == selected_project;
+        let body_style = summary_project_body_style(app.theme, candidate.color, selected);
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled("■ ", Style::default().fg(candidate.color)));
+        spans.push(Span::styled(label.clone(), body_style));
+        spans.push(Span::styled(format!(" {value}"), body_style));
+        let item_width = fixed_width.saturating_add(UnicodeWidthStr::width(label.as_str()));
+        used = used.saturating_add(item_width);
+        shown = shown.saturating_add(1);
+    }
+    let omitted = visible.len().saturating_sub(shown);
+    if omitted > 0 {
+        let suffix = format!(" · +{omitted}");
+        if used.saturating_add(UnicodeWidthStr::width(suffix.as_str())) <= usize::from(width) {
+            spans.push(Span::styled(suffix, Style::default().fg(palette.muted)));
+        }
+    }
+    Line::from(spans)
+}
+
+fn summary_date_column(plot: Rect, date_index: usize, date_count: usize) -> Option<u16> {
+    if plot.is_empty() || date_index >= date_count {
+        return None;
+    }
+    if plot.width <= 1 || date_count <= 1 {
+        return Some(plot.x);
+    }
+    let numerator = date_index
+        .saturating_mul(usize::from(plot.width - 1))
+        .saturating_mul(2)
+        .saturating_add(date_count - 1);
+    let denominator = (date_count - 1).saturating_mul(2);
+    let offset = numerator.checked_div(denominator).unwrap_or_default();
+    Some(
+        plot.x
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
+    )
+}
+
+fn render_summary_annotations(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    theme: Theme,
+    annotations: &[Line<'static>],
+) {
+    for (index, line) in annotations.iter().cloned().enumerate() {
+        frame.render_widget(
+            Paragraph::new(line).style(theme.base_style()),
+            Rect::new(
+                inner.x,
+                inner
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                inner.width,
+                1,
+            ),
+        );
+    }
+}
+
+fn summary_daily_is_lower_bound(
+    prepared: &PreparedSummary,
+    metric: SummaryMetric,
+    api_long_context: bool,
+    complete_buckets: usize,
+    total_buckets: usize,
+) -> bool {
+    complete_buckets < total_buckets
+        || prepared.partial(metric, api_long_context)
+        || (metric == SummaryMetric::ApiEquivalent && prepared.api_chart_is_lower_bound())
+}
+
+fn render_summary_daily(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    prepared: &PreparedSummary,
+    chart: &SummaryChartData,
+    project_colors: &HashMap<String, Color>,
+) {
+    let states = chart
+        .buckets
+        .iter()
+        .map(|bucket| {
+            prepared.chart_bucket_state(
+                bucket,
+                chart.grain,
                 app.summary_metric,
                 app.api_long_context_multiplier,
             )
         })
         .collect::<Vec<_>>();
-    let complete_days = states
+    let complete_buckets = states
         .iter()
         .filter(|state| **state == SummaryDailyState::Complete)
         .count();
-    let partial_days = states
+    let partial_buckets = states
         .iter()
         .filter(|state| **state == SummaryDailyState::Partial)
         .count();
-    let known_days = complete_days.saturating_add(partial_days);
-    let total_days = states.len();
-    let missing_days = total_days.saturating_sub(known_days);
+    let known_buckets = complete_buckets.saturating_add(partial_buckets);
+    let total_buckets = states.len();
+    let missing_buckets = total_buckets.saturating_sub(known_buckets);
     let metric = match app.summary_metric {
         SummaryMetric::Tokens => "Tokens",
         SummaryMetric::Estimated => "~EST CR.",
         SummaryMetric::ApiEquivalent => "API EQ.",
     };
-    let title = format!(
-        "Daily · {metric} · 1 bar/local day · {complete_days}C/{partial_days}P/{missing_days}M"
+    let chart_project_count = summary_chart_project_count(
+        prepared,
+        app.summary_metric,
+        app.api_long_context_multiplier,
     );
-    let lower_bound = known_days < total_days
-        || prepared.partial(app.summary_metric, app.api_long_context_multiplier);
+    let project_mode =
+        if app.summary_show_all_projects || chart_project_count <= SUMMARY_STACKED_PROJECT_LIMIT {
+            "all projects".to_string()
+        } else {
+            format!("Top {SUMMARY_STACKED_PROJECT_LIMIT} + Other")
+        };
+    let title = format!(
+        "Project mix · {metric} · {} local · {complete_buckets}C/{partial_buckets}P/{missing_buckets}M · {project_mode}",
+        chart.grain.label()
+    );
+    let lower_bound = summary_daily_is_lower_bound(
+        prepared,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+        complete_buckets,
+        total_buckets,
+    );
     let block = panel(&title, app.theme);
     let inner = block.inner(area);
     if inner.is_empty() {
@@ -7764,169 +9258,275 @@ fn render_summary_daily(frame: &mut Frame<'_>, area: Rect, app: &App, prepared: 
         return;
     }
     frame.render_widget(block, area);
-    let show_legend = inner.height >= 4;
-    let show_status = inner.height >= 6
-        && usize::from(inner.width) >= UnicodeWidthStr::width("days ") + states.len();
-    let annotation_height = u16::from(show_legend) + u16::from(show_status);
-    let chart_area = if annotation_height > 0 {
-        let palette = app.theme.palette();
-        if show_legend {
-            let mut legend = Vec::new();
-            if lower_bound {
-                legend.push(Span::styled(
-                    "LOWER BOUND · ",
-                    Style::default()
-                        .fg(palette.warning)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            legend.extend([
-                Span::styled("C", Style::default().fg(palette.accent)),
-                Span::styled(" complete · ", Style::default().fg(palette.muted)),
-                Span::styled("P", Style::default().fg(palette.warning)),
-                Span::styled(" partial · M missing", Style::default().fg(palette.muted)),
-            ]);
-            frame.render_widget(
-                Paragraph::new(Line::from(legend)),
-                Rect::new(inner.x, inner.y, inner.width, 1),
-            );
-        }
-        if show_status {
-            let mut status = vec![Span::styled("days ", Style::default().fg(palette.muted))];
-            let symbols = summary_daily_status_symbols(&states);
-            status.extend(states.iter().zip(symbols.chars()).map(|(state, symbol)| {
-                let style = match state {
-                    SummaryDailyState::Complete => Style::default().fg(palette.accent),
-                    SummaryDailyState::Partial => Style::default().fg(palette.warning),
-                    SummaryDailyState::Missing => Style::default()
-                        .fg(palette.muted)
-                        .add_modifier(Modifier::DIM),
-                };
-                Span::styled(symbol.to_string(), style)
-            }));
-            frame.render_widget(
-                Paragraph::new(Line::from(status)),
-                Rect::new(
-                    inner.x,
-                    inner.y.saturating_add(u16::from(show_legend)),
-                    inner.width,
-                    1,
-                ),
-            );
-        }
-        Rect::new(
-            inner.x,
-            inner.y.saturating_add(annotation_height),
-            inner.width,
-            inner.height.saturating_sub(annotation_height),
-        )
-    } else {
-        inner
-    };
-    let points = prepared
-        .usage
-        .days
+    let palette = app.theme.palette();
+    let series = summary_project_series(app, prepared, chart, project_colors);
+    let has_plotted_values = summary_project_series_has_values(
+        &series,
+        chart,
+        &states,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    );
+    let can_plot = known_buckets > 0 && !series.is_empty() && has_plotted_values;
+    if !can_plot {
+        app.summary_inspected_date = None;
+        app.summary_daily_dragging = false;
+    }
+    let mut explicit_inspection = app.summary_inspected_date.and_then(|date| {
+        chart
+            .buckets
+            .iter()
+            .position(|candidate| candidate.starts_at == date)
+    });
+    if app.summary_inspected_date.is_some() && explicit_inspection.is_none() {
+        app.summary_inspected_date = None;
+    }
+    let automatic_readout_index = states
         .iter()
-        .zip(states.iter().copied())
-        .enumerate()
-        .filter_map(|(index, (day, state))| {
-            (state != SummaryDailyState::Missing).then_some((
-                index as f64,
-                app.summary_metric
-                    .value(day.totals, app.api_long_context_multiplier) as f64,
-                state,
-            ))
-        })
-        .collect::<Vec<_>>();
-    if points.is_empty() {
+        .rposition(|state| *state != SummaryDailyState::Missing);
+    let readout_index = explicit_inspection.or(automatic_readout_index);
+    let selected_project = app
+        .summary_selected_id
+        .as_deref()
+        .and_then(|selected| selected.strip_prefix("project:"));
+    let readout = readout_index.map(|index| {
+        summary_daily_readout_line(
+            chart,
+            &series,
+            selected_project,
+            index,
+            states[index],
+            inner.width,
+            app,
+        )
+    });
+    let project_legend = (!series.is_empty())
+        .then(|| summary_project_legend_line(&series, selected_project, inner.width, app.theme));
+    let mut coverage_legend = Vec::new();
+    if lower_bound {
+        coverage_legend.push(Span::styled(
+            "LOWER BOUND · ",
+            Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    coverage_legend.extend([
+        Span::styled("C", Style::default().fg(palette.accent)),
+        Span::styled(" complete · ", Style::default().fg(palette.muted)),
+        Span::styled("P", Style::default().fg(palette.warning)),
+        Span::styled(" partial · M missing", Style::default().fg(palette.muted)),
+    ]);
+    let coverage_legend = Line::from(coverage_legend);
+    let status_prefix = if lower_bound {
+        "LOWER · C/P/M "
+    } else {
+        "C/P/M "
+    };
+    let status = if usize::from(inner.width) >= UnicodeWidthStr::width(status_prefix) + states.len()
+    {
+        let mut status = vec![Span::styled(
+            status_prefix,
+            Style::default().fg(if lower_bound {
+                palette.warning
+            } else {
+                palette.muted
+            }),
+        )];
+        let symbols = summary_daily_status_symbols(&states);
+        status.extend(states.iter().zip(symbols.chars()).map(|(state, symbol)| {
+            let style = match state {
+                SummaryDailyState::Complete => Style::default().fg(palette.accent),
+                SummaryDailyState::Partial => Style::default().fg(palette.warning),
+                SummaryDailyState::Missing => Style::default()
+                    .fg(palette.muted)
+                    .add_modifier(Modifier::DIM),
+            };
+            Span::styled(symbol.to_string(), style)
+        }));
+        Some(Line::from(status))
+    } else {
+        None
+    };
+    let annotation_limit = usize::from(inner.height.saturating_sub(5));
+    let mut annotations = Vec::<Line<'static>>::new();
+    if let Some(readout) = readout {
+        annotations.push(readout);
+    }
+    let remaining = annotation_limit.saturating_sub(annotations.len());
+    if remaining >= 3 {
+        if let Some(project_legend) = project_legend {
+            annotations.push(project_legend);
+        }
+        annotations.push(coverage_legend);
+        if let Some(status) = status {
+            annotations.push(status);
+        }
+    } else if remaining == 2 {
+        if let Some(project_legend) = project_legend {
+            annotations.push(project_legend);
+        }
+        if let Some(status) = status {
+            annotations.push(status);
+        } else {
+            annotations.push(coverage_legend);
+        }
+    } else if remaining == 1 {
+        if let Some(status) = status {
+            annotations.push(status);
+        } else {
+            annotations.push(coverage_legend);
+        }
+    }
+    annotations.truncate(annotation_limit);
+    let annotation_height = u16::try_from(annotations.len()).unwrap_or(inner.height);
+    let chart_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(annotation_height),
+        inner.width,
+        inner.height.saturating_sub(annotation_height),
+    );
+    if !can_plot {
+        render_summary_annotations(frame, inner, app.theme, &annotations);
+        let message = if known_buckets == 0 {
+            "No project-level history for these local time buckets; missing buckets are unknown"
+        } else if !has_plotted_values {
+            "Known time buckets contain no non-zero project usage for this metric"
+        } else {
+            "No project-level time series for this range"
+        };
         frame.render_widget(
-            Paragraph::new(
-                "No project-level daily history for this range; missing days are unknown",
-            )
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(app.theme.palette().muted)),
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(app.theme.palette().muted)),
             chart_area,
         );
         return;
     }
-    let maximum_value = points
+    let maximum_value = chart
+        .buckets
         .iter()
-        .map(|(_, value, _)| *value)
+        .zip(states.iter().copied())
+        .filter(|(_, state)| *state != SummaryDailyState::Missing)
+        .map(|(bucket, _)| {
+            app.summary_metric
+                .value(bucket.totals, app.api_long_context_multiplier) as f64
+        })
         .fold(0.0_f64, f64::max);
     let y_max = if maximum_value <= 0.0 {
         1.0
     } else {
         nice_trend_maximum(maximum_value)
     };
-    let x_max = prepared.usage.days.len().saturating_sub(1).max(1) as f64;
-    let first = prepared
-        .usage
-        .days
+    let x_max = chart.buckets.len().saturating_sub(1).max(1) as f64;
+    let first = chart
+        .buckets
         .first()
-        .map(|day| day.date.format("%m-%d").to_string())
+        .map(|bucket| summary_bucket_label(bucket.starts_at, chart.grain, true))
         .unwrap_or_default();
-    let last = prepared
-        .usage
-        .days
+    let last = chart
+        .buckets
         .last()
-        .map(|day| day.date.format("%m-%d").to_string())
+        .map(|bucket| summary_bucket_label(bucket.starts_at, chart.grain, true))
         .unwrap_or_default();
-    let middle = prepared
-        .usage
-        .days
-        .get(prepared.usage.days.len() / 2)
-        .map(|day| day.date.format("%m-%d").to_string())
+    let middle = chart
+        .buckets
+        .get(chart.buckets.len() / 2)
+        .map(|bucket| summary_bucket_label(bucket.starts_at, chart.grain, true))
         .unwrap_or_default();
-    let complete_points = points
-        .iter()
-        .filter(|(_, _, state)| *state == SummaryDailyState::Complete)
-        .map(|(x, y, _)| (*x, *y))
-        .collect::<Vec<_>>();
-    let partial_points = points
-        .iter()
-        .filter(|(_, _, state)| *state == SummaryDailyState::Partial)
-        .map(|(x, y, _)| (*x, *y))
-        .collect::<Vec<_>>();
-    let mut datasets = Vec::new();
-    if !complete_points.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .data(&complete_points)
-                .graph_type(GraphType::Bar)
-                .marker(Marker::Block)
-                .style(Style::default().fg(app.theme.palette().accent)),
-        );
+    let x_labels = vec![first, middle, last];
+    let y_labels = vec![
+        format_summary_axis(0.0, app.summary_metric),
+        format_summary_axis(y_max / 2.0, app.summary_metric),
+        format_summary_axis(y_max, app.summary_metric),
+    ];
+    let geometry = trend_chart_geometry(chart_area, &x_labels, &y_labels, &[]);
+    let exact_hitbox = geometry.and_then(|geometry| {
+        SummaryDailyHitbox::exact(
+            geometry.plot,
+            chart
+                .buckets
+                .iter()
+                .map(|bucket| bucket.starts_at)
+                .collect(),
+        )
+    });
+    if exact_hitbox.is_none() {
+        app.summary_inspected_date = None;
+        app.summary_daily_dragging = false;
+        explicit_inspection = None;
+        if let (Some(index), Some(readout)) = (automatic_readout_index, annotations.first_mut()) {
+            *readout = summary_daily_readout_line(
+                chart,
+                &series,
+                selected_project,
+                index,
+                states[index],
+                inner.width,
+                app,
+            );
+        }
     }
-    if !partial_points.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .data(&partial_points)
-                .graph_type(GraphType::Bar)
-                .marker(Marker::Block)
-                .style(Style::default().fg(app.theme.palette().warning)),
-        );
-    }
+    app.summary_daily_hitbox = exact_hitbox;
+    render_summary_annotations(frame, inner, app.theme, &annotations);
     frame.render_widget(
-        Chart::new(datasets)
+        Chart::new(Vec::<Dataset<'_>>::new())
             .style(app.theme.base_style())
             .x_axis(
                 Axis::default()
                     .bounds([0.0, x_max])
-                    .labels(vec![first, middle, last])
+                    .labels(x_labels)
                     .style(Style::default().fg(app.theme.palette().muted)),
             )
             .y_axis(
                 Axis::default()
                     .bounds([0.0, y_max])
-                    .labels(vec![
-                        format_summary_axis(0.0, app.summary_metric),
-                        format_summary_axis(y_max / 2.0, app.summary_metric),
-                        format_summary_axis(y_max, app.summary_metric),
-                    ])
+                    .labels(y_labels)
                     .style(Style::default().fg(app.theme.palette().muted)),
             ),
         chart_area,
     );
+    let Some(geometry) = geometry else {
+        return;
+    };
+    let area_series = series
+        .iter()
+        .map(|candidate| {
+            StackedAreaSeries::new(
+                candidate.color,
+                (0..chart.buckets.len())
+                    .map(|index| {
+                        app.summary_metric.value(
+                            summary_project_metrics_at(candidate, chart, index),
+                            app.api_long_context_multiplier,
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let area_states = states
+        .iter()
+        .map(|state| match state {
+            SummaryDailyState::Complete => StackedAreaState::Complete,
+            SummaryDailyState::Partial => StackedAreaState::Partial,
+            SummaryDailyState::Missing => StackedAreaState::Missing,
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        StackedArea::new(&area_series, &area_states, y_max, palette.background),
+        geometry.plot,
+    );
+    if app.summary_daily_hitbox.is_some()
+        && let Some(index) = explicit_inspection
+        && let Some(column) = summary_date_column(geometry.plot, index, chart.buckets.len())
+    {
+        for row in geometry.plot.y..geometry.plot.bottom() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+                cell.set_symbol("│").set_fg(palette.title);
+            }
+        }
+    }
 }
 
 fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
@@ -7945,24 +9545,49 @@ fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
     let Some(cache) = app.summary_cache.take() else {
         return;
     };
+    let chart_project_count = summary_chart_project_count(
+        &cache.prepared,
+        app.summary_metric,
+        app.api_long_context_multiplier,
+    );
+    if chart_project_count <= SUMMARY_STACKED_PROJECT_LIMIT {
+        app.summary_show_all_projects = false;
+    }
+    let mut project_colors = std::mem::take(&mut app.summary_project_colors);
+    if project_colors.is_empty() {
+        extend_summary_project_colors_from_history(&mut project_colors, &app.history, app.theme);
+    }
+    extend_assigned_summary_project_colors(
+        &mut project_colors,
+        cache
+            .prepared
+            .usage
+            .projects
+            .iter()
+            .map(|project| project.key.as_str()),
+        app.theme,
+    );
     let controls_and_body =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let body = controls_and_body[1];
     let selected_can_toggle = app.summary_selected_id.as_deref().is_some_and(|selected| {
         rows.iter()
             .any(|row| row.id == selected && row.has_children)
     });
-    app.summary_controls_hitbox = Some(render_summary_controls(
-        frame,
-        controls_and_body[0],
-        app,
-        selected_can_toggle,
-    ));
-    let body = controls_and_body[1];
+    let can_collapse_all = !app.summary_expanded_nodes.is_empty();
+    let can_toggle_all_projects = chart_project_count > SUMMARY_STACKED_PROJECT_LIMIT;
     if body.height < 18 {
         let sections =
             Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).split(body);
-        render_summary_tree(frame, sections[0], app, &cache.prepared, &rows);
-        render_summary_bars(frame, sections[1], app, &cache.prepared);
+        render_summary_tree(
+            frame,
+            sections[0],
+            app,
+            &cache.prepared,
+            &rows,
+            &project_colors,
+        );
+        render_summary_bars(frame, sections[1], app, &cache.prepared, &project_colors);
     } else if body.width < 110 || body.height < 28 {
         let sections = Layout::vertical([
             Constraint::Percentage(34),
@@ -7970,23 +9595,54 @@ fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
             Constraint::Percentage(43),
         ])
         .split(body);
-        render_summary_tree(frame, sections[0], app, &cache.prepared, &rows);
-        render_summary_bars(frame, sections[1], app, &cache.prepared);
-        render_summary_daily(frame, sections[2], app, &cache.prepared);
+        render_summary_tree(
+            frame,
+            sections[0],
+            app,
+            &cache.prepared,
+            &rows,
+            &project_colors,
+        );
+        render_summary_bars(frame, sections[1], app, &cache.prepared, &project_colors);
+        render_summary_daily(
+            frame,
+            sections[2],
+            app,
+            &cache.prepared,
+            &cache.chart,
+            &project_colors,
+        );
     } else {
-        let columns = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(body);
-        let desired_bars_height = u16::try_from(cache.prepared.usage.projects.len().min(8))
-            .unwrap_or(8)
-            .saturating_add(2)
-            .max(4);
-        let bars_height = desired_bars_height.min(columns[1].height.saturating_sub(8));
-        let charts = Layout::vertical([Constraint::Length(bars_height), Constraint::Min(8)])
-            .split(columns[1]);
-        render_summary_tree(frame, columns[0], app, &cache.prepared, &rows);
-        render_summary_bars(frame, charts[0], app, &cache.prepared);
-        render_summary_daily(frame, charts[1], app, &cache.prepared);
+        let sections =
+            Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(body);
+        let top = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[0]);
+        render_summary_tree(frame, top[0], app, &cache.prepared, &rows, &project_colors);
+        render_summary_bars(frame, top[1], app, &cache.prepared, &project_colors);
+        render_summary_daily(
+            frame,
+            sections[1],
+            app,
+            &cache.prepared,
+            &cache.chart,
+            &project_colors,
+        );
     }
+    let can_inspect = app.summary_daily_hitbox.is_some();
+    if !can_inspect {
+        app.summary_inspected_date = None;
+        app.summary_daily_dragging = false;
+    }
+    app.summary_controls_hitbox = Some(render_summary_controls(
+        frame,
+        controls_and_body[0],
+        app,
+        selected_can_toggle,
+        can_collapse_all,
+        can_toggle_all_projects,
+        can_inspect,
+    ));
+    app.summary_project_colors = project_colors;
     app.summary_cache = Some(cache);
 }
 

@@ -1,11 +1,11 @@
 ---
 source: src/tui/tests/integration_scenarios.rs
-expression: "summary_harness(width, height, theme).frame().snapshot_text()"
+expression: summary.frame().snapshot_text()
 ---
 size=120x40
 rows:
 00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings
-01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 1d [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
+01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 6h [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐┌Top projects · Tokens · share of known────────────────────┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION         ││■ alpha-service                  190.0K  59.4% ███████····│
 04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         ││■ billing-cli                     90.0K  28.1% ███········│
@@ -23,26 +23,26 @@ rows:
 16|│                                                          ││                                                          │
 17|│                                                          ││                                                          │
 18|└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
-19|┌Project mix · Tokens · 1d local · 0C/4P/0M · all projects─────────────────────────────────────────────────────────────┐
-20|│07-12 · P lower bound · Total 40.0K · ■ alpha-service 0 · ■ docs-site 40.0K                                           │
+19|┌Project mix · Tokens · 6h local · 0C/4P/9M · all projects─────────────────────────────────────────────────────────────┐
+20|│07-12 00:00 · P lower bound · Total 40.0K · ■ alpha-service 0 · ■ docs-site 40.0K                                     │
 21|│■ alpha-service  ■ billing-cli  ■ docs-site                                                                           │
 22|│LOWER BOUND · C complete · P partial · M missing                                                                      │
-23|│LOWER · C/P/M PPPP                                                                                                    │
-24|│200.0K│                                                                                                               │
-25|│      │                                                                                                               │
-26|│      │                                                                                                               │
-27|│      │                                                                                                               │
-28|│      │                                                                                                               │
-29|│      │ ▄▄▄▄▄▄                                                                                                        │
-30|│100.0K│            ▄▄▄▄▄▄                                                                                             │
-31|│      │                        ▄▄▄▄▄                            ▄▄▄▄▄▄▄▄▄▄▄▄▄▄   ▀▄▄▄▄▄▄                              │
-32|│      │                                   ▄▄▄▄▄▄▄▄                                      ▀▀▀  ▄▄▄▄▄▄                   │
-33|│      │                                            ▀▀▀▀                                       ▀▀▀        ▄▄▄▄▄        │
-34|│      │                                                    ▀▀▀▀                                     ▀▀▀             ▄▄│
-35|│      │                                                            ▀▀▀▀                                    ▀▀▀        │
-36|│0     │                                                                    ▀▀▀▀                                  ▀▀▀  │
-37|│      └───────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-38|│  07-09                                                     07-11                                                07-12│
+23|│LOWER · C/P/M MPMMMPMMMPMMP                                                                                           │
+24|│200.0K  │                                                                                                             │
+25|│        │                                                                                                             │
+26|│        │                                                                                                             │
+27|│        │                                                                                                             │
+28|│        │                                                                                                             │
+29|│        │                                                                                                             │
+30|│100.0K  │                                                                                                             │
+31|│        │                                                                                                             │
+32|│        │                                         ▄▄▄▄▄▄▄▄▄                                                           │
+33|│        │                                                                                                             │
+34|│        │                                                                                                        ▄▄▄▄▄│
+35|│        │                                                                                                             │
+36|│0       │                                                                                                             │
+37|│        └─────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+38|│07-09 00h                                                  07-10 12h                                         07-12 00h│
 39|└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 styles:
 00:001+001 fg=#3fb9c0 bg=#121417 mods=bold text="1"
@@ -73,7 +73,7 @@ styles:
 01:047+001 fg=#3fb9c0 bg=#121417 mods=bold text="A"
 01:048+012 fg=#7e8691 bg=#121417 mods=none text="]API EQ. | ["
 01:060+001 fg=#3fb9c0 bg=#121417 mods=bold text="B"
-01:061+006 fg=#7e8691 bg=#121417 mods=none text="] 1d ["
+01:061+006 fg=#7e8691 bg=#121417 mods=none text="] 6h ["
 01:067+001 fg=#3fb9c0 bg=#121417 mods=bold text="I"
 01:068+019 fg=#7e8691 bg=#121417 mods=none text="]Inspect | [G]All ["
 01:087+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
@@ -164,17 +164,17 @@ styles:
 17:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 18:000+120 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘"
 19:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
-19:001+057 fg=#f4f6f8 bg=#121417 mods=bold text="Project mix · Tokens · 1d local · 0C/4P/0M · all projects"
+19:001+057 fg=#f4f6f8 bg=#121417 mods=bold text="Project mix · Tokens · 6h local · 0C/4P/9M · all projects"
 19:058+062 fg=#4b525c bg=#121417 mods=none text="─────────────────────────────────────────────────────────────┐"
 20:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-20:001+005 fg=#f4f6f8 bg=#121417 mods=bold text="07-12"
-20:006+003 fg=#dadee4 bg=#121417 mods=none text=" · "
-20:009+013 fg=#facc15 bg=#121417 mods=bold text="P lower bound"
-20:022+017 fg=#dadee4 bg=#121417 mods=none text=" · Total 40.0K · "
-20:039+002 fg=#d8af5a bg=#121417 mods=none text="■ "
-20:041+015 fg=#d8af5a bg=#121417 mods=bold text="alpha-service 0"
-20:056+003 fg=#dadee4 bg=#121417 mods=none text=" · "
-20:059+017 fg=#56dca4 bg=#121417 mods=none text="■ docs-site 40.0K"
+20:001+011 fg=#f4f6f8 bg=#121417 mods=bold text="07-12 00:00"
+20:012+003 fg=#dadee4 bg=#121417 mods=none text=" · "
+20:015+013 fg=#facc15 bg=#121417 mods=bold text="P lower bound"
+20:028+017 fg=#dadee4 bg=#121417 mods=none text=" · Total 40.0K · "
+20:045+002 fg=#d8af5a bg=#121417 mods=none text="■ "
+20:047+015 fg=#d8af5a bg=#121417 mods=bold text="alpha-service 0"
+20:062+003 fg=#dadee4 bg=#121417 mods=none text=" · "
+20:065+017 fg=#56dca4 bg=#121417 mods=none text="■ docs-site 40.0K"
 20:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:001+002 fg=#d8af5a bg=#121417 mods=none text="■ "
@@ -192,95 +192,85 @@ styles:
 22:029+020 fg=#7e8691 bg=#121417 mods=none text=" partial · M missing"
 22:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 23:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-23:001+018 fg=#facc15 bg=#121417 mods=none text="LOWER · C/P/M PPPP"
+23:001+014 fg=#facc15 bg=#121417 mods=none text="LOWER · C/P/M "
+23:015+001 fg=#7e8691 bg=#121417 mods=dim text="M"
+23:016+001 fg=#facc15 bg=#121417 mods=none text="P"
+23:017+003 fg=#7e8691 bg=#121417 mods=dim text="MMM"
+23:020+001 fg=#facc15 bg=#121417 mods=none text="P"
+23:021+003 fg=#7e8691 bg=#121417 mods=dim text="MMM"
+23:024+001 fg=#facc15 bg=#121417 mods=none text="P"
+23:025+002 fg=#7e8691 bg=#121417 mods=dim text="MM"
+23:027+001 fg=#facc15 bg=#121417 mods=none text="P"
 23:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 24:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-24:001+006 fg=#dadee4 bg=#121417 mods=none text="200.0K"
-24:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
+24:001+008 fg=#dadee4 bg=#121417 mods=none text="200.0K  "
+24:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
 24:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 25:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-25:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
+25:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
 25:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 26:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-26:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
+26:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
 26:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 27:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-27:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
+27:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
 27:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 28:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-28:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
+28:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
 28:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 29:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-29:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-29:008+001 fg=#b0904d bg=#b0904d mods=none text=" "
-29:009+006 fg=#b0904d bg=#121417 mods=none text="▄▄▄▄▄▄"
+29:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+29:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
 29:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 30:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-30:001+006 fg=#dadee4 bg=#121417 mods=none text="100.0K"
-30:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-30:008+012 fg=#b0904d bg=#b0904d mods=none text="            "
-30:020+006 fg=#b0904d bg=#121417 mods=none text="▄▄▄▄▄▄"
+30:001+008 fg=#dadee4 bg=#121417 mods=none text="100.0K  "
+30:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+30:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
 30:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 31:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-31:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-31:008+024 fg=#b0904d bg=#b0904d mods=none text="                        "
-31:032+005 fg=#b0904d bg=#121417 mods=none text="▄▄▄▄▄"
-31:065+014 fg=#b14761 bg=#121417 mods=none text="▄▄▄▄▄▄▄▄▄▄▄▄▄▄"
-31:079+003 fg=#b14761 bg=#b14761 mods=none text="   "
-31:082+001 fg=#48b488 bg=#b14761 mods=none text="▀"
-31:083+003 fg=#b14761 bg=#121417 mods=none text="▄▄▄"
-31:086+003 fg=#48b488 bg=#121417 mods=none text="▄▄▄"
+31:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+31:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+31:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
 31:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 32:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-32:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-32:008+035 fg=#b0904d bg=#b0904d mods=none text="                                   "
-32:043+005 fg=#b0904d bg=#121417 mods=none text="▄▄▄▄▄"
-32:048+003 fg=#b14761 bg=#121417 mods=none text="▄▄▄"
-32:051+038 fg=#b14761 bg=#b14761 mods=none text="                                      "
-32:089+003 fg=#48b488 bg=#b14761 mods=none text="▀▀▀"
-32:092+002 fg=#48b488 bg=#48b488 mods=none text="  "
-32:094+006 fg=#48b488 bg=#121417 mods=none text="▄▄▄▄▄▄"
+32:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+32:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+32:051+009 fg=#b0904d bg=#121417 mods=none text="▄▄▄▄▄▄▄▄▄"
+32:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
 32:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 33:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-33:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-33:008+044 fg=#b0904d bg=#b0904d mods=none text="                                            "
-33:052+004 fg=#b14761 bg=#b0904d mods=none text="▀▀▀▀"
-33:056+039 fg=#b14761 bg=#b14761 mods=none text="                                       "
-33:095+003 fg=#48b488 bg=#b14761 mods=none text="▀▀▀"
-33:098+008 fg=#48b488 bg=#48b488 mods=none text="        "
-33:106+005 fg=#48b488 bg=#121417 mods=none text="▄▄▄▄▄"
+33:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+33:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+33:051+009 fg=#b0904d bg=#b0904d mods=none text="         "
+33:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
 33:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 34:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-34:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-34:008+052 fg=#b0904d bg=#b0904d mods=none text="                                                    "
-34:060+004 fg=#b14761 bg=#b0904d mods=none text="▀▀▀▀"
-34:064+037 fg=#b14761 bg=#b14761 mods=none text="                                     "
-34:101+003 fg=#48b488 bg=#b14761 mods=none text="▀▀▀"
-34:104+013 fg=#48b488 bg=#48b488 mods=none text="             "
-34:117+002 fg=#48b488 bg=#121417 mods=none text="▄▄"
+34:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+34:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+34:051+009 fg=#b0904d bg=#b0904d mods=none text="         "
+34:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
+34:114+005 fg=#48b488 bg=#121417 mods=none text="▄▄▄▄▄"
 34:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 35:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-35:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-35:008+060 fg=#b0904d bg=#b0904d mods=none text="                                                            "
-35:068+004 fg=#b14761 bg=#b0904d mods=none text="▀▀▀▀"
-35:072+036 fg=#b14761 bg=#b14761 mods=none text="                                    "
-35:108+003 fg=#48b488 bg=#b14761 mods=none text="▀▀▀"
-35:111+008 fg=#48b488 bg=#48b488 mods=none text="        "
+35:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+35:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+35:051+009 fg=#b0904d bg=#b0904d mods=none text="         "
+35:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
+35:114+005 fg=#48b488 bg=#48b488 mods=none text="     "
 35:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 36:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-36:001+006 fg=#dadee4 bg=#121417 mods=none text="0     "
-36:007+001 fg=#7e8691 bg=#121417 mods=none text="│"
-36:008+068 fg=#b0904d bg=#b0904d mods=none text="                                                                    "
-36:076+004 fg=#b14761 bg=#b0904d mods=none text="▀▀▀▀"
-36:080+034 fg=#b14761 bg=#b14761 mods=none text="                                  "
-36:114+003 fg=#48b488 bg=#b14761 mods=none text="▀▀▀"
-36:117+002 fg=#48b488 bg=#48b488 mods=none text="  "
+36:001+008 fg=#dadee4 bg=#121417 mods=none text="0       "
+36:009+001 fg=#7e8691 bg=#121417 mods=none text="│"
+36:015+009 fg=#b0904d bg=#b0904d mods=none text="         "
+36:051+009 fg=#b0904d bg=#b0904d mods=none text="         "
+36:087+009 fg=#b14761 bg=#b14761 mods=none text="         "
+36:114+005 fg=#48b488 bg=#48b488 mods=none text="     "
 36:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 37:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-37:007+112 fg=#7e8691 bg=#121417 mods=none text="└───────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+37:009+110 fg=#7e8691 bg=#121417 mods=none text="└─────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 37:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 38:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-38:001+118 fg=#dadee4 bg=#121417 mods=none text="  07-09                                                     07-11                                                07-12"
+38:001+118 fg=#dadee4 bg=#121417 mods=none text="07-09 00h                                                  07-10 12h                                         07-12 00h"
 38:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 39:000+120 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 controls:

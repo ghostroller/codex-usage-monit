@@ -6,6 +6,7 @@ use crate::domain::{
     WindowUsage,
 };
 use crate::history::{LocalHalfHourBucket, LocalProjectUsageGroup, QuotaPoint, WeeklyLocalPoint};
+use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
 mod integration_scenarios;
@@ -29,6 +30,7 @@ fn summary_api_chart_marks_a_non_aligned_range_start_as_a_lower_bound() {
             window,
             totals: SummaryMetrics::default(),
             days: Vec::new(),
+            hours: Vec::new(),
             projects: Vec::new(),
         },
         range_note: None,
@@ -39,6 +41,7 @@ fn summary_api_chart_marks_a_non_aligned_range_start_as_a_lower_bound() {
         estimated_covered_tokens: 0,
         long_context_breakdown_complete: true,
         daily_coverage: BTreeMap::new(),
+        hourly_coverage: BTreeMap::new(),
         partial_reasons: vec!["range_starts_within_15m_bucket".to_string()],
     };
 
@@ -72,6 +75,7 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
             window,
             totals: SummaryMetrics::default(),
             days: Vec::new(),
+            hours: Vec::new(),
             projects: Vec::new(),
         },
         range_note: None,
@@ -89,6 +93,7 @@ fn summary_daily_coverage_distinguishes_complete_partial_and_missing_days() {
                 ..SummaryDailyCoverage::default()
             },
         )]),
+        hourly_coverage: BTreeMap::new(),
         partial_reasons: Vec::new(),
     };
     with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
@@ -161,6 +166,7 @@ fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
                     window,
                     totals: SummaryMetrics::default(),
                     days: Vec::new(),
+                    hours: Vec::new(),
                     projects: Vec::new(),
                 },
                 range_note: None,
@@ -177,6 +183,7 @@ fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
                 estimated_covered_tokens: 0,
                 long_context_breakdown_complete: true,
                 daily_coverage,
+                hourly_coverage: BTreeMap::new(),
                 partial_reasons: Vec::new(),
             };
 
@@ -208,6 +215,228 @@ fn rolling_summary_ranges_mark_first_and_last_local_days_partial() {
             }));
         }
     });
+}
+
+#[test]
+fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
+    let starts_at = DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let ends_at = starts_at + ChronoDuration::days(1);
+    let window = SummaryWindow::new(starts_at, ends_at).unwrap();
+    let mut total = SummaryMetrics::default();
+    let mut alpha_total = SummaryMetrics::default();
+    let mut beta_total = SummaryMetrics::default();
+    let mut hours = Vec::new();
+    let mut alpha_hours = Vec::new();
+    let mut beta_hours = Vec::new();
+    let mut hourly_coverage = BTreeMap::new();
+    for hour in 0_i64..24 {
+        let starts_at = (window.starts_at + ChronoDuration::hours(hour)).naive_utc();
+        let alpha = SummaryMetrics {
+            token_usage: TokenUsage {
+                input_tokens: (hour + 1) as u64,
+                total_tokens: (hour + 1) as u64,
+                ..TokenUsage::default()
+            },
+            ..SummaryMetrics::default()
+        };
+        let beta = SummaryMetrics {
+            token_usage: TokenUsage {
+                input_tokens: ((hour + 1) * 2) as u64,
+                total_tokens: ((hour + 1) * 2) as u64,
+                ..TokenUsage::default()
+            },
+            ..SummaryMetrics::default()
+        };
+        let mut combined = alpha;
+        combined.add_assign(beta);
+        total.add_assign(combined);
+        alpha_total.add_assign(alpha);
+        beta_total.add_assign(beta);
+        hours.push(crate::summary::HourlySummary {
+            starts_at,
+            totals: combined,
+        });
+        alpha_hours.push(crate::summary::HourlySummary {
+            starts_at,
+            totals: alpha,
+        });
+        beta_hours.push(crate::summary::HourlySummary {
+            starts_at,
+            totals: beta,
+        });
+        hourly_coverage.insert(
+            starts_at,
+            SummaryDailyCoverage {
+                expected_buckets: 4,
+                covered_buckets: 4,
+                available_tokens: combined.token_usage.total_tokens,
+                represented_tokens: combined.token_usage.total_tokens,
+                estimated_covered_tokens: combined.token_usage.total_tokens,
+                ..SummaryDailyCoverage::default()
+            },
+        );
+    }
+    let project = |key: &str, totals: SummaryMetrics, hours: Vec<crate::summary::HourlySummary>| {
+        ProjectSummary {
+            key: key.to_string(),
+            label: key.to_string(),
+            cwd: None,
+            totals,
+            days: Vec::new(),
+            hours,
+            threads: Vec::new(),
+        }
+    };
+    let prepared = PreparedSummary {
+        usage: UsageSummary {
+            window,
+            totals: total,
+            days: Vec::new(),
+            hours,
+            projects: vec![
+                project("alpha", alpha_total, alpha_hours),
+                project("beta", beta_total, beta_hours),
+            ],
+        },
+        range_note: None,
+        represented_tokens: total.token_usage.total_tokens,
+        available_tokens: total.token_usage.total_tokens,
+        covered_buckets: 96,
+        expected_buckets: 96,
+        estimated_covered_tokens: total.token_usage.total_tokens,
+        long_context_breakdown_complete: true,
+        daily_coverage: BTreeMap::from([(
+            starts_at.date_naive(),
+            SummaryDailyCoverage {
+                expected_buckets: 96,
+                covered_buckets: 96,
+                available_tokens: total.token_usage.total_tokens,
+                represented_tokens: total.token_usage.total_tokens,
+                estimated_covered_tokens: total.token_usage.total_tokens,
+                ..SummaryDailyCoverage::default()
+            },
+        )]),
+        hourly_coverage,
+        partial_reasons: Vec::new(),
+    };
+
+    with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        for (grain, expected_buckets) in [
+            (SummaryGrain::Day, 1),
+            (SummaryGrain::Hours12, 2),
+            (SummaryGrain::Hours6, 4),
+            (SummaryGrain::Hours3, 8),
+            (SummaryGrain::Hour, 24),
+        ] {
+            let chart = prepare_summary_chart(&prepared, grain);
+            assert_eq!(chart.buckets.len(), expected_buckets, "{grain:?}");
+            assert_eq!(
+                chart
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.totals.token_usage.total_tokens)
+                    .sum::<u64>(),
+                total.token_usage.total_tokens,
+                "{grain:?}"
+            );
+            for bucket in &chart.buckets {
+                let project_total = chart
+                    .project_values
+                    .values()
+                    .map(|values| {
+                        values
+                            .get(&bucket.starts_at)
+                            .copied()
+                            .unwrap_or_default()
+                            .token_usage
+                            .total_tokens
+                    })
+                    .sum::<u64>();
+                assert_eq!(project_total, bucket.totals.token_usage.total_tokens);
+                assert_eq!(
+                    prepared.chart_bucket_state(bucket, grain, SummaryMetric::Tokens, false),
+                    SummaryDailyState::Complete
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn summary_hourly_coverage_handles_dst_fallback_and_spring_forward() {
+    let local_hour = |timestamp: DateTime<Utc>, offset_hours: i64| {
+        let local = (timestamp + ChronoDuration::hours(offset_hours)).naive_utc();
+        local
+            .date()
+            .and_hms_opt(local.hour(), 0, 0)
+            .expect("a shifted UTC timestamp remains a valid local hour")
+    };
+
+    let fallback_start = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
+    let fallback_transition = Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).unwrap();
+    let fallback = expected_summary_coverage(
+        SummaryWindow::new(fallback_start, fallback_start + ChronoDuration::hours(4)).unwrap(),
+        |timestamp| {
+            local_hour(
+                timestamp,
+                if timestamp < fallback_transition {
+                    -4
+                } else {
+                    -5
+                },
+            )
+        },
+    );
+    assert_eq!(
+        fallback
+            .values()
+            .map(|coverage| coverage.expected_buckets)
+            .sum::<usize>(),
+        16
+    );
+    assert_eq!(fallback.len(), 3);
+    assert_eq!(
+        fallback[&NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap()]
+            .expected_buckets,
+        8
+    );
+
+    let spring_start = Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap();
+    let spring_transition = Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap();
+    let spring = expected_summary_coverage(
+        SummaryWindow::new(spring_start, spring_start + ChronoDuration::hours(4)).unwrap(),
+        |timestamp| {
+            local_hour(
+                timestamp,
+                if timestamp < spring_transition {
+                    -5
+                } else {
+                    -4
+                },
+            )
+        },
+    );
+    assert_eq!(
+        spring
+            .values()
+            .map(|coverage| coverage.expected_buckets)
+            .sum::<usize>(),
+        16
+    );
+    assert_eq!(spring.len(), 4);
+    assert!(
+        !spring.contains_key(
+            &NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(2, 0, 0)
+                .unwrap()
+        )
+    );
 }
 
 #[test]

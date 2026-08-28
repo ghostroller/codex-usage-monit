@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use crossterm::event::KeyCode;
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::style::Modifier;
 
 use crate::domain::{ApiCostAmount, PicoUsd, TokenUsage};
 use crate::history::{HISTORY_ESTIMATOR_REVISION, LocalHalfHourBucket, LocalProjectUsageGroup};
@@ -146,6 +148,49 @@ fn summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     harness
 }
 
+fn summary_many_projects_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
+    let groups = (0_u64..8)
+        .map(|index| {
+            let thread = format!("project-{index}-thread");
+            let project = format!("project-{index}-id");
+            let label = format!("project-{index}");
+            let title = format!("Project {index} task");
+            summary_group(
+                &thread,
+                None,
+                &project,
+                &label,
+                &title,
+                "cli",
+                (index + 1) * 10_000,
+            )
+        })
+        .collect();
+    harness.app.history.half_hour_buckets = vec![summary_bucket(
+        summary_timestamp("2026-07-12T03:45:00Z"),
+        groups,
+    )];
+    harness.app.summary_cache = None;
+    harness.key(KeyCode::Char('U'));
+    harness.key(KeyCode::Char('U'));
+    harness
+}
+
+fn summary_mouse(harness: &mut TuiHarness, kind: MouseEventKind, column: u16, row: u16) -> bool {
+    let handled = handle_mouse_event(
+        &mut harness.app,
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    harness.render();
+    handled
+}
+
 #[test]
 fn snapshot_fixtures_render_with_fixed_utc_labels() {
     let normal = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
@@ -197,6 +242,28 @@ fn semantic_frames_cover_full_compact_and_diagnostic_layouts() {
                 .snapshot_text()
         );
     }
+
+    for (name, width, height, theme) in [
+        ("tui_summary_6h_dark_120x40", 120, 40, Theme::Dark),
+        ("tui_summary_6h_light_60x24", 60, 24, Theme::Light),
+    ] {
+        let mut summary = summary_harness(width, height, theme);
+        summary.key(KeyCode::Char('B'));
+        summary.key(KeyCode::Char('B'));
+        insta::assert_snapshot!(name, summary.frame().snapshot_text());
+    }
+
+    let many_projects = summary_many_projects_harness(120, 40, Theme::Dark);
+    insta::assert_snapshot!(
+        "tui_summary_top_six_other_dark_120x40",
+        many_projects.frame().snapshot_text()
+    );
+    let mut all_projects = summary_many_projects_harness(120, 40, Theme::Dark);
+    all_projects.key(KeyCode::Char('G'));
+    insta::assert_snapshot!(
+        "tui_summary_all_projects_dark_120x40",
+        all_projects.frame().snapshot_text()
+    );
 }
 
 #[test]
@@ -209,7 +276,7 @@ fn summary_30d_labels_known_history_and_removes_the_redundant_share_chart() {
     assert!(frame.contains("0C/4P/27M"), "{frame}");
     assert!(frame.contains("LOWER BOUND"), "{frame}");
     assert!(frame.contains("C complete"), "{frame}");
-    assert!(frame.contains("days M"), "{frame}");
+    assert!(frame.contains("C/P/M M"), "{frame}");
     assert!(!frame.contains("Usage share"), "{frame}");
 }
 
@@ -245,13 +312,276 @@ fn summary_daily_status_strip_distinguishes_known_zero_partial_and_missing_dates
 
         let frame = harness.frame().snapshot_text();
         assert!(frame.contains("1C/1P/6M"), "width={width}: {frame}");
-        assert!(frame.contains("days MMMMCPMM"), "width={width}: {frame}");
+        assert!(frame.contains("C/P/M MMMMCPMM"), "width={width}: {frame}");
     }
 }
 
 #[test]
+fn summary_stacked_area_click_and_drag_inspect_exact_dates_without_hiding_gaps() {
+    for (width, height, theme) in [
+        (120, 40, Theme::Dark),
+        (120, 40, Theme::Light),
+        (60, 24, Theme::Dark),
+        (60, 24, Theme::Light),
+    ] {
+        let mut harness = summary_harness(width, height, theme);
+        harness.key(KeyCode::Char('7'));
+        let hitbox = harness.app.summary_daily_hitbox.clone().unwrap();
+        let first_date = hitbox.dates[0];
+        let last_date = *hitbox.dates.last().unwrap();
+
+        assert!(summary_mouse(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            hitbox.plot.x,
+            hitbox.plot.y,
+        ));
+        assert_eq!(harness.app.summary_inspected_date, Some(first_date));
+        assert!(harness.app.summary_daily_dragging);
+        assert!(
+            !summary_mouse(
+                &mut harness,
+                MouseEventKind::Drag(MouseButton::Left),
+                hitbox.plot.x,
+                hitbox.plot.y,
+            ),
+            "dragging within the same date must not request another full redraw"
+        );
+        assert_eq!(harness.app.summary_inspected_date, Some(first_date));
+        let missing = harness.frame().snapshot_text();
+        assert!(missing.contains("MISSING"), "{missing}");
+        assert!(missing.contains("no local project evidence"), "{missing}");
+
+        assert!(summary_mouse(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            hitbox.plot.right().saturating_sub(1),
+            hitbox.plot.y,
+        ));
+        assert_eq!(harness.app.summary_inspected_date, Some(last_date));
+        let partial = harness.frame().snapshot_text();
+        assert!(partial.contains("P lower bound"), "{partial}");
+
+        assert!(summary_mouse(
+            &mut harness,
+            MouseEventKind::Up(MouseButton::Left),
+            hitbox.plot.right().saturating_sub(1),
+            hitbox.plot.y,
+        ));
+        assert!(!harness.app.summary_daily_dragging);
+        assert_eq!(harness.app.summary_inspected_date, Some(last_date));
+    }
+}
+
+#[test]
+fn summary_stacked_area_column_mapping_never_reports_a_different_date_bucket() {
+    let dates = (1..=4)
+        .map(|day| {
+            NaiveDate::from_ymd_opt(2026, 7, day)
+                .expect("valid date")
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for width in [4_u16, 9, 52] {
+        let hitbox = SummaryDailyHitbox {
+            plot: Rect::new(7, 3, width, 2),
+            dates: dates.clone(),
+        };
+        for offset in 0..width {
+            let expected =
+                date_index_at_column(usize::from(offset), usize::from(width), dates.len())
+                    .map(|index| dates[index]);
+            assert_eq!(hitbox.date_at_column(7 + offset), expected);
+        }
+    }
+
+    let narrow = SummaryDailyHitbox {
+        plot: Rect::new(0, 0, 3, 1),
+        dates,
+    };
+    assert!((0..3).all(|column| narrow.date_at_column(column).is_none()));
+}
+
+#[test]
+fn summary_inspect_control_and_keyboard_navigation_cover_exact_dates() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut harness = summary_harness(width, height, theme);
+        harness.assert_shortcut_distinct(ControlId::SummaryInspect);
+
+        harness.key(KeyCode::Char('I'));
+        assert_eq!(
+            harness.app.summary_inspected_date,
+            Some(summary_timestamp("2026-07-12T00:00:00Z").naive_utc())
+        );
+        assert_eq!(harness.app.view, View::Summary);
+        harness.assert_shortcut_distinct(ControlId::SummaryInspect);
+
+        harness.key(KeyCode::Left);
+        assert_eq!(
+            harness.app.summary_inspected_date,
+            Some(summary_timestamp("2026-07-11T00:00:00Z").naive_utc())
+        );
+        harness.key(KeyCode::Char('['));
+        assert_eq!(
+            harness.app.summary_inspected_date,
+            Some(summary_timestamp("2026-07-10T00:00:00Z").naive_utc())
+        );
+        harness.key(KeyCode::Home);
+        assert_eq!(
+            harness.app.summary_inspected_date,
+            Some(summary_timestamp("2026-07-09T00:00:00Z").naive_utc())
+        );
+        harness.key(KeyCode::End);
+        assert_eq!(
+            harness.app.summary_inspected_date,
+            Some(summary_timestamp("2026-07-12T00:00:00Z").naive_utc())
+        );
+        harness.key(KeyCode::Esc);
+        assert_eq!(harness.app.summary_inspected_date, None);
+        assert!(!harness.app.quit_confirmation_visible);
+    }
+}
+
+#[test]
+fn summary_stacked_area_inspection_preserves_the_date_across_metrics_and_clears_on_range_change() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let hitbox = harness.app.summary_daily_hitbox.clone().unwrap();
+    let target_index = hitbox
+        .dates
+        .iter()
+        .position(|date| *date == summary_timestamp("2026-07-09T00:00:00Z").naive_utc())
+        .unwrap();
+    let column = summary_date_column(hitbox.plot, target_index, hitbox.dates.len()).unwrap();
+    assert!(summary_mouse(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        hitbox.plot.y,
+    ));
+    summary_mouse(
+        &mut harness,
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        hitbox.plot.y,
+    );
+    assert_eq!(
+        harness.app.summary_inspected_date,
+        Some(summary_timestamp("2026-07-09T00:00:00Z").naive_utc())
+    );
+    let tokens = harness.frame().snapshot_text();
+    assert!(
+        tokens.contains("07-09 · P lower bound · Total 120.0K"),
+        "{tokens}"
+    );
+
+    harness.key(KeyCode::Char('A'));
+    assert_eq!(
+        harness.app.summary_inspected_date,
+        Some(summary_timestamp("2026-07-09T00:00:00Z").naive_utc())
+    );
+    let api = harness.frame().snapshot_text();
+    assert!(
+        api.contains("07-09 · P lower bound · Total $0.1200"),
+        "{api}"
+    );
+
+    harness.key(KeyCode::Char('M'));
+    assert_eq!(harness.app.summary_inspected_date, None);
+}
+
+#[test]
+fn summary_daily_hitbox_is_cleared_when_the_compact_layout_hides_the_chart() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let old = harness.app.summary_daily_hitbox.clone().unwrap();
+
+    harness.resize(60, 12);
+    assert!(harness.app.summary_daily_hitbox.is_none());
+    harness.assert_shortcut_inactive(ControlId::SummaryInspect);
+    harness.key(KeyCode::Char('I'));
+    assert_eq!(harness.app.summary_inspected_date, None);
+    assert!(!harness.click(ControlId::SummaryInspect, ClickEdge::Middle));
+    assert!(!summary_mouse(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        old.plot.x,
+        old.plot.y,
+    ));
+    assert_eq!(harness.app.summary_inspected_date, None);
+}
+
+#[test]
+fn summary_inspection_is_inactive_when_the_compact_plot_aggregates_dates() {
+    let mut harness = summary_harness(34, 24, Theme::Dark);
+    harness.key(KeyCode::Char('M'));
+
+    assert!(harness.app.summary_daily_hitbox.is_none());
+    harness.assert_shortcut_inactive(ControlId::SummaryInspect);
+
+    harness.app.summary_inspected_date =
+        Some(summary_timestamp("2026-07-09T00:00:00Z").naive_utc());
+    harness.render();
+    assert_eq!(harness.app.summary_inspected_date, None);
+    assert!(!harness.app.summary_daily_dragging);
+
+    harness.key(KeyCode::Char('I'));
+    assert_eq!(harness.app.summary_inspected_date, None);
+    assert!(!harness.click(ControlId::SummaryInspect, ClickEdge::Middle));
+}
+
+#[test]
+fn summary_inspection_is_inactive_without_a_nonzero_project_series() {
+    let mut known_zero = TuiHarness::from_fixture("normal", 60, 24, Theme::Light);
+    let mut group = summary_group(
+        "zero-api-thread",
+        None,
+        "zero-api-project",
+        "zero-api-project",
+        "Known zero API equivalent",
+        "cli",
+        100_000,
+    );
+    group.api_equivalent_cost = ApiCostAmount {
+        observed_samples: 1,
+        priced_samples: 1,
+        observed_tokens: 100_000,
+        priced_tokens: 100_000,
+        ..ApiCostAmount::default()
+    };
+    known_zero.app.history.half_hour_buckets = vec![summary_bucket(
+        summary_timestamp("2026-07-12T03:45:00Z"),
+        vec![group],
+    )];
+    known_zero.app.summary_cache = None;
+    known_zero.key(KeyCode::Char('U'));
+    known_zero.key(KeyCode::Char('A'));
+
+    assert!(known_zero.app.summary_daily_hitbox.is_none());
+    known_zero.assert_shortcut_inactive(ControlId::SummaryInspect);
+    let frame = known_zero.frame().snapshot_text();
+    assert!(frame.contains("no non-zero project usage"), "{frame}");
+    known_zero.key(KeyCode::Char('I'));
+    assert_eq!(known_zero.app.summary_inspected_date, None);
+    assert!(!known_zero.click(ControlId::SummaryInspect, ClickEdge::Middle));
+
+    let mut no_series = TuiHarness::from_fixture("normal", 60, 24, Theme::Dark);
+    no_series.app.history.half_hour_buckets = vec![summary_bucket(
+        summary_timestamp("2026-07-12T03:45:00Z"),
+        Vec::new(),
+    )];
+    no_series.app.summary_cache = None;
+    no_series.key(KeyCode::Char('U'));
+
+    assert!(no_series.app.summary_daily_hitbox.is_none());
+    no_series.assert_shortcut_inactive(ControlId::SummaryInspect);
+    no_series.key(KeyCode::Char('I'));
+    assert_eq!(no_series.app.summary_inspected_date, None);
+    assert!(!no_series.click(ControlId::SummaryInspect, ClickEdge::Middle));
+}
+
+#[test]
 fn summary_backfill_status_does_not_move_control_hitboxes() {
-    for (width, expected) in [(120, "BACKFILLING 30d HISTORY"), (60, "BACKFILL 30d")] {
+    for width in [120, 60] {
         let mut harness = summary_harness(width, 24, Theme::Dark);
         let controls = [
             ControlId::SummaryRangeCycle,
@@ -260,8 +590,12 @@ fn summary_backfill_status_does_not_move_control_hitboxes() {
             ControlId::SummaryMetricTokens,
             ControlId::SummaryMetricEstimated,
             ControlId::SummaryMetricApiEquivalent,
+            ControlId::SummaryBucketGrain,
+            ControlId::SummaryAllProjects,
             ControlId::SummaryLongContext,
+            ControlId::SummaryInspect,
             ControlId::SummaryToggle,
+            ControlId::SummaryCollapseAll,
         ];
         let before = controls.map(|control| harness.control_rect(control));
         harness.app.summary_backfill_running = true;
@@ -269,7 +603,8 @@ fn summary_backfill_status_does_not_move_control_hitboxes() {
         let after = controls.map(|control| harness.control_rect(control));
 
         assert_eq!(before, after);
-        assert!(harness.frame().snapshot_text().contains(expected));
+        let frame = harness.frame().snapshot_text();
+        assert!(frame.contains("BACKFILL"), "width={width}: {frame}");
     }
 }
 
@@ -388,7 +723,9 @@ fn summary_controls_have_keyboard_mouse_parity_and_whole_label_hitboxes() {
         (KeyCode::Char('K'), ControlId::SummaryMetricTokens),
         (KeyCode::Char('E'), ControlId::SummaryMetricEstimated),
         (KeyCode::Char('A'), ControlId::SummaryMetricApiEquivalent),
+        (KeyCode::Char('B'), ControlId::SummaryBucketGrain),
         (KeyCode::Char('L'), ControlId::SummaryLongContext),
+        (KeyCode::Char('I'), ControlId::SummaryInspect),
         (KeyCode::Enter, ControlId::SummaryToggle),
     ];
 
@@ -432,22 +769,867 @@ fn summary_controls_have_keyboard_mouse_parity_and_whole_label_hitboxes() {
 }
 
 #[test]
+fn summary_all_projects_toggle_has_keyboard_mouse_parity_and_stable_hitboxes() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut inactive = summary_harness(width, height, theme);
+        inactive.assert_shortcut_inactive(ControlId::SummaryAllProjects);
+        inactive.key(KeyCode::Char('G'));
+        assert!(!inactive.app.summary_show_all_projects);
+        assert!(!inactive.click(ControlId::SummaryAllProjects, ClickEdge::Middle));
+
+        let base = summary_many_projects_harness(width, height, theme);
+        base.assert_shortcut_distinct(ControlId::SummaryAllProjects);
+        let original_rect = base.control_rect(ControlId::SummaryAllProjects);
+
+        for edge in [ClickEdge::Start, ClickEdge::Middle, ClickEdge::End] {
+            let mut keyboard = summary_many_projects_harness(width, height, theme);
+            let mut mouse = summary_many_projects_harness(width, height, theme);
+            keyboard.key(KeyCode::Char('G'));
+            assert!(mouse.click(ControlId::SummaryAllProjects, edge));
+
+            assert!(keyboard.app.summary_show_all_projects);
+            assert_eq!(keyboard.state(), mouse.state());
+            assert_eq!(keyboard.frame(), mouse.frame());
+            assert_eq!(
+                keyboard.control_rect(ControlId::SummaryAllProjects),
+                original_rect
+            );
+            keyboard.assert_shortcut_distinct(ControlId::SummaryAllProjects);
+        }
+    }
+}
+
+#[test]
+fn summary_all_projects_resets_when_the_new_range_has_six_or_fewer_projects() {
+    let mut harness = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
+    let now = harness.app.snapshot.as_of;
+    let older_groups = (0_u64..7)
+        .map(|index| {
+            summary_group(
+                &format!("older-{index}-thread"),
+                None,
+                &format!("older-{index}-id"),
+                &format!("older-{index}"),
+                &format!("Older project {index}"),
+                "cli",
+                (index + 1) * 10_000,
+            )
+        })
+        .collect();
+    harness.app.history.half_hour_buckets = vec![
+        summary_bucket(now - ChronoDuration::days(20), older_groups),
+        summary_bucket(
+            now - ChronoDuration::minutes(15),
+            vec![summary_group(
+                "recent-thread",
+                None,
+                "recent-id",
+                "recent",
+                "Recent project",
+                "cli",
+                10_000,
+            )],
+        ),
+    ];
+    harness.app.summary_cache = None;
+    harness.key(KeyCode::Char('U'));
+    harness.key(KeyCode::Char('M'));
+    assert_eq!(
+        harness
+            .app
+            .summary_cache
+            .as_ref()
+            .unwrap()
+            .prepared
+            .usage
+            .projects
+            .len(),
+        8
+    );
+    harness.key(KeyCode::Char('G'));
+    assert!(harness.app.summary_show_all_projects);
+
+    harness.key(KeyCode::Char('C'));
+
+    assert!(
+        harness
+            .app
+            .summary_cache
+            .as_ref()
+            .unwrap()
+            .prepared
+            .usage
+            .projects
+            .len()
+            <= SUMMARY_STACKED_PROJECT_LIMIT
+    );
+    assert!(!harness.app.summary_show_all_projects);
+    harness.assert_shortcut_inactive(ControlId::SummaryAllProjects);
+}
+
+#[test]
+fn summary_daily_readout_prioritizes_selection_and_other_and_reserves_omission_count() {
+    let harness = summary_many_projects_harness(120, 40, Theme::Light);
+    let cache = harness.app.summary_cache.as_ref().unwrap();
+    let prepared = &cache.prepared;
+    let chart = &cache.chart;
+    let colors = summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme);
+    let series = summary_project_series(&harness.app, prepared, chart, &colors);
+    let index = chart
+        .buckets
+        .iter()
+        .position(|bucket| bucket.starts_at.date() == NaiveDate::from_ymd_opt(2026, 7, 12).unwrap())
+        .unwrap();
+    let state = prepared.chart_bucket_state(
+        &chart.buckets[index],
+        chart.grain,
+        harness.app.summary_metric,
+        harness.app.api_long_context_multiplier,
+    );
+    let selected = "project-2-id";
+    let line = summary_daily_readout_line(
+        chart,
+        &series,
+        Some(selected),
+        index,
+        state,
+        90,
+        &harness.app,
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let selected_at = text.find("project-2").unwrap();
+    let other_at = text.find("Other").unwrap();
+    let omitted_at = text.rfind("+").unwrap();
+    assert!(selected_at < other_at && other_at < omitted_at, "{text}");
+
+    let selected_span = line
+        .spans
+        .iter()
+        .position(|span| span.content.contains("project-2"))
+        .unwrap();
+    assert_eq!(line.spans[selected_span - 1].content.as_ref(), "■ ");
+    assert_eq!(
+        line.spans[selected_span - 1].style.fg,
+        Some(colors[selected])
+    );
+    assert_eq!(
+        line.spans[selected_span].style.fg,
+        Some(Theme::Light.palette().foreground)
+    );
+    assert!(
+        line.spans[selected_span]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+
+    let compact = summary_daily_readout_line(
+        chart,
+        &series,
+        Some(selected),
+        index,
+        state,
+        48,
+        &harness.app,
+    );
+    let compact_text = compact
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(compact_text.contains("■ project-2 30.0K"), "{compact_text}");
+    assert!(compact_text.contains("+6"), "{compact_text}");
+}
+
+#[test]
+fn summary_open_history_bucket_is_partial_and_dst_overlap_is_explicit() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let open = &mut harness.app.history.half_hour_buckets[1];
+    open.sampled_at = open.starts_at + ChronoDuration::minutes(5);
+    let open_starts_at = open.starts_at;
+    let prepared = prepare_summary(&harness.app, harness.app.snapshot.as_of);
+    assert!(
+        prepared
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "history_bucket_open")
+    );
+    let chart = prepare_summary_chart(&prepared, SummaryGrain::Hour);
+    let open_local_hour = display_local_hour(open_starts_at);
+    let open_bucket = chart
+        .buckets
+        .iter()
+        .find(|bucket| bucket.starts_at == open_local_hour)
+        .unwrap();
+    assert_eq!(
+        prepared.chart_bucket_state(
+            open_bucket,
+            SummaryGrain::Hour,
+            SummaryMetric::Tokens,
+            false
+        ),
+        SummaryDailyState::Partial
+    );
+    let mut closed_history = harness.app.history.clone();
+    closed_history.half_hour_buckets[1].sampled_at = closed_history.half_hour_buckets[1].ends_at;
+    assert!(!summary_history_inputs_eq(
+        &harness.app.history,
+        &closed_history
+    ));
+
+    let repeated_hour = SummaryChartData {
+        grain: SummaryGrain::Hour,
+        buckets: vec![SummaryChartBucket {
+            starts_at: NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap(),
+            totals: SummaryMetrics::default(),
+            coverage: SummaryDailyCoverage {
+                expected_buckets: 8,
+                ..SummaryDailyCoverage::default()
+            },
+        }],
+        project_values: HashMap::new(),
+    };
+    let readout = summary_daily_readout_line(
+        &repeated_hour,
+        &[],
+        None,
+        0,
+        SummaryDailyState::Missing,
+        80,
+        &harness.app,
+    );
+    let text = readout
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("11-01 01:00 (DST overlap)"), "{text}");
+}
+
+#[test]
+fn summary_light_project_body_uses_foreground_while_swatch_keeps_project_color() {
+    let harness = summary_many_projects_harness(120, 40, Theme::Light);
+    let second = &harness.app.summary_bar_hitboxes[1];
+    let project_color = harness.app.summary_project_colors[&second.project_key];
+    let (swatch, swatch_color, swatch_modifiers) = harness.cell_style(second.area.x, second.area.y);
+    let (_, label_color, label_modifiers) =
+        harness.cell_style(second.area.x.saturating_add(2), second.area.y);
+
+    assert_eq!(swatch, "■");
+    assert_eq!(swatch_color, project_color);
+    assert!(swatch_modifiers.is_empty());
+    assert_eq!(label_color, Theme::Light.palette().foreground);
+    assert!(!label_modifiers.contains(Modifier::BOLD));
+    assert_eq!(
+        summary_project_body_style(Theme::Dark, project_color, false).fg,
+        Some(project_color)
+    );
+
+    let tree = harness.app.summary_table_hitbox.unwrap();
+    let tree_row = harness.app.summary_rows()[1].clone();
+    let tree_project = tree_row.id.strip_prefix("project:").unwrap();
+    let tree_color = harness.app.summary_project_colors[tree_project];
+    let tree_y = tree.rows.y.saturating_add(1);
+    let tree_swatch_x = (tree.rows.x..tree.rows.right())
+        .find(|column| {
+            let (symbol, color, _) = harness.cell_style(*column, tree_y);
+            symbol == "■" && color == tree_color
+        })
+        .expect("project row should expose its stable color as a swatch");
+    let (_, tree_label_color, tree_label_modifiers) =
+        harness.cell_style(tree_swatch_x.saturating_add(2), tree_y);
+    assert_eq!(tree_label_color, Theme::Light.palette().foreground);
+    assert!(tree_label_modifiers.contains(Modifier::BOLD));
+}
+
+#[test]
+fn summary_selected_project_row_keeps_its_stable_swatch_color() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut harness = summary_many_projects_harness(120, 40, theme);
+        for movement in 0..2 {
+            if movement > 0 {
+                harness.key(KeyCode::Down);
+            }
+            let rows = harness.app.summary_rows();
+            let selected = harness.app.summary_selected_index(&rows);
+            let row = &rows[selected];
+            let project_key = row.id.strip_prefix("project:").unwrap();
+            let expected_color = harness.app.summary_project_colors[project_key];
+            let table = harness.app.summary_table_hitbox.unwrap();
+            let row_y = table.rows.y.saturating_add(
+                u16::try_from(selected.saturating_sub(table.offset)).unwrap_or(u16::MAX),
+            );
+            let (_, swatch_color, _) = (table.rows.x..table.rows.right())
+                .find_map(|column| {
+                    let cell = harness.cell_style(column, row_y);
+                    (cell.0 == "■").then_some(cell)
+                })
+                .expect("selected project row should render a color swatch");
+            assert_eq!(swatch_color, expected_color, "theme={theme:?}");
+        }
+    }
+}
+
+#[test]
+fn summary_stacked_area_defaults_to_top_six_plus_other_and_can_show_every_project() {
+    let mut harness = summary_many_projects_harness(120, 40, Theme::Dark);
+    let cache = harness.app.summary_cache.as_ref().unwrap();
+    let prepared = &cache.prepared;
+    let chart = &cache.chart;
+    let colors = summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme);
+    assert_eq!(colors.values().copied().collect::<HashSet<_>>().len(), 8);
+    let assigned = colors.values().copied().collect::<Vec<_>>();
+    for (index, left) in assigned.iter().copied().enumerate() {
+        for right in assigned.iter().copied().skip(index + 1) {
+            assert!(
+                summary_color_distance_squared(left, right)
+                    >= SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED,
+                "project colors {left:?} and {right:?} are too similar"
+            );
+        }
+    }
+    let stable_color = colors["project-0-id"];
+    let compacted = summary_project_series(&harness.app, prepared, chart, &colors);
+    assert_eq!(compacted.len(), SUMMARY_STACKED_PROJECT_LIMIT + 1);
+    assert_eq!(compacted.last().unwrap().label, "Other");
+    for index in 0..chart.buckets.len() {
+        let stacked_total = compacted
+            .iter()
+            .map(|series| {
+                summary_project_metrics_at(series, chart, index)
+                    .token_usage
+                    .total_tokens
+            })
+            .fold(0_u64, u64::saturating_add);
+        assert_eq!(
+            stacked_total,
+            chart.buckets[index].totals.token_usage.total_tokens
+        );
+    }
+    assert!(harness.frame().snapshot_text().contains("Top 6 + Other"));
+
+    harness.key(KeyCode::Char('G'));
+    let cache = harness.app.summary_cache.as_ref().unwrap();
+    let prepared = &cache.prepared;
+    let chart = &cache.chart;
+    let all_colors =
+        summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme);
+    let all = summary_project_series(&harness.app, prepared, chart, &all_colors);
+    assert_eq!(all.len(), 8);
+    assert!(all.iter().all(|series| series.project_key.is_some()));
+
+    harness.key(KeyCode::Char('A'));
+    let prepared = &harness.app.summary_cache.as_ref().unwrap().prepared;
+    let api_colors =
+        summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme);
+    assert_eq!(api_colors["project-0-id"], stable_color);
+
+    for theme in [Theme::Dark, Theme::Light] {
+        let keys = prepared
+            .usage
+            .projects
+            .iter()
+            .map(|project| project.key.as_str())
+            .collect::<Vec<_>>();
+        let themed = assign_summary_project_colors(keys, theme);
+        let themed_colors = themed.values().copied().collect::<Vec<_>>();
+        for (index, left) in themed_colors.iter().copied().enumerate() {
+            assert!(
+                summary_color_distance_squared(left, theme.palette().background)
+                    >= SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED
+            );
+            for right in themed_colors.iter().copied().skip(index + 1) {
+                assert!(
+                    summary_color_distance_squared(left, right)
+                        >= SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED
+                );
+            }
+        }
+        let forward = assign_summary_project_colors(["project-207", "project-326"], theme);
+        let reverse = assign_summary_project_colors(["project-326", "project-207"], theme);
+        assert_eq!(forward, reverse);
+        assert!(
+            summary_color_distance_squared(forward["project-207"], forward["project-326"])
+                >= SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED
+        );
+    }
+}
+
+#[test]
+fn summary_30d_hour_chart_keeps_each_projects_observations_sparse() {
+    let mut harness = summary_many_projects_harness(120, 40, Theme::Dark);
+    harness.key(KeyCode::Char('M'));
+    for _ in 0..4 {
+        harness.key(KeyCode::Char('B'));
+    }
+
+    let chart = &harness.app.summary_cache.as_ref().unwrap().chart;
+    assert_eq!(chart.grain, SummaryGrain::Hour);
+    assert!(chart.buckets.len() >= 30 * 24);
+    assert_eq!(chart.project_values.len(), 8);
+    assert!(
+        chart
+            .project_values
+            .values()
+            .all(|values| values.len() == 1)
+    );
+}
+
+#[test]
+fn summary_stacked_area_omits_projects_that_are_zero_for_the_selected_metric() {
+    let mut harness = summary_many_projects_harness(120, 40, Theme::Dark);
+    let zero_api_project = harness.app.history.half_hour_buckets[0].project_groups[0]
+        .project_id
+        .clone()
+        .unwrap();
+    let zero_api_group = &mut harness.app.history.half_hour_buckets[0].project_groups[0];
+    zero_api_group.api_equivalent_cost = ApiCostAmount {
+        observed_samples: 1,
+        observed_tokens: zero_api_group.token_usage.total_tokens,
+        ..ApiCostAmount::default()
+    };
+    harness.app.summary_metric = SummaryMetric::ApiEquivalent;
+    harness.app.summary_show_all_projects = true;
+    let prepared = prepare_summary(&harness.app, harness.app.snapshot.as_of);
+    let chart = prepare_summary_chart(&prepared, harness.app.summary_grain);
+    let colors = summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme);
+
+    let series = summary_project_series(&harness.app, &prepared, &chart, &colors);
+
+    assert_eq!(series.len(), 7);
+    assert!(
+        series.iter().all(|candidate| {
+            candidate.project_key.as_deref() != Some(zero_api_project.as_str())
+        })
+    );
+    assert!(series.iter().all(|candidate| {
+        chart.buckets.iter().enumerate().any(|(index, _)| {
+            SummaryMetric::ApiEquivalent
+                .value(summary_project_metrics_at(candidate, &chart, index), false)
+                > 0
+        })
+    }));
+}
+
+#[test]
+fn summary_all_projects_uses_the_selected_metrics_nonzero_project_count() {
+    let mut harness = summary_many_projects_harness(120, 40, Theme::Dark);
+    harness.key(KeyCode::Char('G'));
+    assert!(harness.app.summary_show_all_projects);
+
+    let bucket = &mut harness.app.history.half_hour_buckets[0];
+    for group in bucket.project_groups.iter_mut().take(3) {
+        group.api_equivalent_cost = ApiCostAmount {
+            observed_samples: 1,
+            observed_tokens: group.token_usage.total_tokens,
+            ..ApiCostAmount::default()
+        };
+    }
+    harness.app.summary_cache = None;
+    harness.key(KeyCode::Char('A'));
+
+    assert!(!harness.app.summary_show_all_projects);
+    harness.assert_shortcut_inactive(ControlId::SummaryAllProjects);
+    let frame = harness.frame().snapshot_text();
+    assert!(frame.contains("Project mix · API EQ. · 1d local"));
+    assert!(frame.contains("all projects"));
+    assert!(!frame.contains("Top 6 + Other"));
+    harness.key(KeyCode::Char('G'));
+    assert!(!harness.app.summary_show_all_projects);
+}
+
+#[test]
+fn summary_cache_survives_refreshes_that_do_not_change_summary_inputs() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let next_as_of = harness.app.snapshot.as_of + ChronoDuration::seconds(2);
+    let mut snapshot = harness.app.snapshot.clone();
+    snapshot.as_of = next_as_of;
+    harness.app.replace(
+        CollectionResult {
+            snapshot,
+            account: harness.app.account.clone(),
+            history_observation: HistoryObservation::default(),
+        },
+        false,
+    );
+
+    assert_eq!(
+        harness
+            .app
+            .summary_cache
+            .as_ref()
+            .map(|cache| cache.snapshot_as_of),
+        Some(next_as_of)
+    );
+
+    let mut marker_changed = harness.app.history.clone();
+    marker_changed.summary_backfill_attempted_at = Some(next_as_of);
+    harness.app.replace_history(marker_changed);
+    assert!(harness.app.summary_cache.is_some());
+}
+
+#[test]
+fn summary_cache_is_invalidated_by_live_metadata_or_bucket_usage_changes() {
+    let mut metadata = summary_harness(120, 40, Theme::Dark);
+    let mut snapshot = metadata.app.snapshot.clone();
+    snapshot.as_of += ChronoDuration::seconds(2);
+    snapshot.tasks[0].title.push_str(" renamed");
+    metadata.app.replace(
+        CollectionResult {
+            snapshot,
+            account: metadata.app.account.clone(),
+            history_observation: HistoryObservation::default(),
+        },
+        false,
+    );
+    assert!(metadata.app.summary_cache.is_none());
+
+    let mut usage = summary_harness(120, 40, Theme::Dark);
+    let mut changed = usage.app.history.clone();
+    changed.half_hour_buckets[0].token_usage.total_tokens += 1;
+    changed.half_hour_buckets[0].project_groups[0]
+        .token_usage
+        .total_tokens += 1;
+    usage.app.replace_history(changed);
+    assert!(usage.app.summary_cache.is_none());
+}
+
+#[test]
+fn summary_project_colors_stay_stable_across_range_subsets() {
+    let mut harness = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
+    let mut collision_pair = ["project-207", "project-326"];
+    collision_pair.sort_unstable_by_key(|project| summary_project_hash(project));
+    let [older_project, recent_project] = collision_pair;
+    assert!(
+        summary_color_distance_squared(
+            summary_project_color(older_project, harness.app.theme),
+            summary_project_color(recent_project, harness.app.theme),
+        ) < SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED,
+        "fixture must exercise a pair that requires collision resolution"
+    );
+
+    let now = harness.app.snapshot.as_of;
+    harness.app.history.half_hour_buckets = vec![
+        summary_bucket(
+            now - ChronoDuration::days(20),
+            vec![summary_group(
+                "older-thread",
+                None,
+                older_project,
+                "older-project",
+                "Older task",
+                "cli",
+                20_000,
+            )],
+        ),
+        summary_bucket(
+            now - ChronoDuration::minutes(15),
+            vec![summary_group(
+                "recent-thread",
+                None,
+                recent_project,
+                "recent-project",
+                "Recent task",
+                "cli",
+                10_000,
+            )],
+        ),
+    ];
+
+    let mut prepared_for = |range| {
+        harness.app.summary_range = range;
+        prepare_summary(&harness.app, now)
+    };
+    let cycle = prepared_for(SummaryRange::Cycle);
+    let seven_days = prepared_for(SummaryRange::SevenDays);
+    let thirty_days = prepared_for(SummaryRange::ThirtyDays);
+    for prepared in [&cycle, &seven_days, &thirty_days] {
+        assert!(
+            prepared
+                .usage
+                .projects
+                .iter()
+                .any(|project| project.key == recent_project)
+        );
+    }
+    assert_eq!(cycle.usage.projects.len(), 1);
+    assert_eq!(seven_days.usage.projects.len(), 1);
+    assert_eq!(thirty_days.usage.projects.len(), 2);
+
+    let scoped_seven = assign_summary_project_colors(
+        seven_days
+            .usage
+            .projects
+            .iter()
+            .map(|project| project.key.as_str()),
+        harness.app.theme,
+    );
+    let scoped_thirty = assign_summary_project_colors(
+        thirty_days
+            .usage
+            .projects
+            .iter()
+            .map(|project| project.key.as_str()),
+        harness.app.theme,
+    );
+    assert_ne!(
+        scoped_seven[recent_project], scoped_thirty[recent_project],
+        "fixture must reproduce the old range-dependent assignment"
+    );
+
+    let colors = [&cycle, &seven_days, &thirty_days].map(|prepared| {
+        summary_project_colors(&prepared.usage, &harness.app.history, harness.app.theme)
+            [recent_project]
+    });
+    assert_eq!(colors[0], colors[1]);
+    assert_eq!(colors[1], colors[2]);
+
+    let older_bucket = harness.app.history.half_hour_buckets[0].clone();
+    let recent_bucket = harness.app.history.half_hour_buckets[1].clone();
+    let mut refreshed = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
+    refreshed.app.summary_project_colors.clear();
+    refreshed.app.replace_history(HistoryData {
+        half_hour_buckets: vec![recent_bucket.clone()],
+        ..HistoryData::default()
+    });
+    refreshed.key(KeyCode::Char('U'));
+    let color_before_refresh = refreshed.app.summary_project_colors[recent_project];
+    refreshed.app.replace_history(HistoryData {
+        half_hour_buckets: vec![older_bucket, recent_bucket],
+        ..HistoryData::default()
+    });
+    refreshed.render();
+    assert_eq!(
+        refreshed.app.summary_project_colors[recent_project],
+        color_before_refresh
+    );
+}
+
+#[test]
 fn summary_controls_clip_only_whole_buttons_in_tiny_terminals() {
     for (width, height) in [(40, 12), (20, 8), (8, 3)] {
         let harness = summary_harness(width, height, Theme::Dark);
         let controls = harness.app.summary_controls_hitbox.unwrap();
-        for control in controls
-            .ranges
-            .into_iter()
-            .chain(controls.metrics)
-            .chain([controls.toggle_long_context, controls.toggle_selected])
-        {
+        for control in controls.ranges.into_iter().chain(controls.metrics).chain([
+            controls.bucket_grain,
+            controls.toggle_all_projects,
+            controls.toggle_long_context,
+            controls.inspect,
+            controls.toggle_selected,
+            controls.collapse_all,
+        ]) {
             if !control.is_empty() {
-                assert_eq!(control.width, 3, "width={width}");
+                assert!(matches!(control.width, 3 | 6), "width={width}");
                 assert!(control.right() <= width, "width={width}");
                 assert!(control.bottom() <= height, "height={height}");
             }
         }
+    }
+}
+
+#[test]
+fn summary_controls_keep_collapse_all_visible_at_standard_and_full_label_widths() {
+    for (width, expected_width) in [(80, 3), (100, 3), (109, 3), (118, 11)] {
+        let harness = summary_harness(width, 24, Theme::Dark);
+        for control in [
+            ControlId::SummaryRangeCycle,
+            ControlId::SummaryRangeSevenDays,
+            ControlId::SummaryRangeThirtyDays,
+            ControlId::SummaryMetricTokens,
+            ControlId::SummaryMetricEstimated,
+            ControlId::SummaryMetricApiEquivalent,
+            ControlId::SummaryBucketGrain,
+            ControlId::SummaryAllProjects,
+            ControlId::SummaryLongContext,
+            ControlId::SummaryInspect,
+            ControlId::SummaryToggle,
+            ControlId::SummaryCollapseAll,
+        ] {
+            assert!(
+                !harness.control_rect(control).is_empty(),
+                "{control:?} missing at width {width}"
+            );
+        }
+        assert_eq!(
+            harness.control_rect(ControlId::SummaryCollapseAll).width,
+            expected_width
+        );
+    }
+}
+
+#[test]
+fn summary_bucket_grain_cycles_with_keyboard_and_mouse_and_keeps_a_stable_hitbox() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut harness = summary_harness(width, height, theme);
+        let stable_rect = harness.control_rect(ControlId::SummaryBucketGrain);
+        assert_eq!(stable_rect.width, 6);
+        harness.assert_shortcut_distinct(ControlId::SummaryBucketGrain);
+
+        let mut point_counts = vec![
+            harness
+                .app
+                .summary_cache
+                .as_ref()
+                .unwrap()
+                .chart
+                .buckets
+                .len(),
+        ];
+        for expected in [
+            SummaryGrain::Hours12,
+            SummaryGrain::Hours6,
+            SummaryGrain::Hours3,
+            SummaryGrain::Hour,
+            SummaryGrain::Day,
+        ] {
+            harness.key(KeyCode::Char('B'));
+            assert_eq!(harness.app.summary_grain, expected);
+            assert_eq!(
+                harness.app.summary_cache.as_ref().unwrap().chart.grain,
+                expected
+            );
+            assert_eq!(
+                harness.control_rect(ControlId::SummaryBucketGrain),
+                stable_rect
+            );
+            let frame = harness.frame().snapshot_text();
+            assert!(
+                frame.contains(&format!("{} local", expected.label())),
+                "{frame}"
+            );
+            assert!(
+                frame.contains(&format!("[B]{}", expected.control_suffix())),
+                "{frame}"
+            );
+            point_counts.push(
+                harness
+                    .app
+                    .summary_cache
+                    .as_ref()
+                    .unwrap()
+                    .chart
+                    .buckets
+                    .len(),
+            );
+        }
+        assert!(point_counts[..5].windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(point_counts.first(), point_counts.last());
+    }
+
+    for edge in [ClickEdge::Start, ClickEdge::Middle, ClickEdge::End] {
+        let mut keyboard = summary_harness(60, 24, Theme::Dark);
+        let mut mouse = summary_harness(60, 24, Theme::Dark);
+        keyboard.key(KeyCode::Char('B'));
+        assert!(mouse.click(ControlId::SummaryBucketGrain, edge));
+        assert_eq!(keyboard.state(), mouse.state());
+        assert_eq!(keyboard.frame(), mouse.frame());
+    }
+}
+
+#[test]
+fn summary_subday_chart_shows_local_time_and_disables_exact_inspect_when_compressed() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    harness.key(KeyCode::Char('B'));
+    let frame = harness.frame().snapshot_text();
+    assert!(frame.contains("12h local"), "{frame}");
+    assert!(frame.contains("07-12 00:00"), "{frame}");
+
+    harness.key(KeyCode::Char('M'));
+    for _ in 0..3 {
+        harness.key(KeyCode::Char('B'));
+    }
+    assert_eq!(harness.app.summary_grain, SummaryGrain::Hour);
+    assert!(
+        harness
+            .app
+            .summary_cache
+            .as_ref()
+            .unwrap()
+            .chart
+            .buckets
+            .len()
+            > 700
+    );
+    assert!(harness.app.summary_daily_hitbox.is_none());
+    harness.assert_shortcut_inactive(ControlId::SummaryInspect);
+}
+
+#[test]
+fn summary_collapse_all_has_keyboard_mouse_parity_and_stable_whole_label_hitbox() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut inactive = summary_harness(width, height, theme);
+        let inactive_rect = inactive.control_rect(ControlId::SummaryCollapseAll);
+        assert!(!inactive_rect.is_empty(), "missing at {width}x{height}");
+        inactive.assert_shortcut_inactive(ControlId::SummaryCollapseAll);
+        let selected_before = inactive.app.summary_selected_id.clone();
+        inactive.key(KeyCode::Char('X'));
+        assert!(inactive.app.summary_expanded_nodes.is_empty());
+        assert_eq!(inactive.app.summary_selected_id, selected_before);
+        assert!(!inactive.click(ControlId::SummaryCollapseAll, ClickEdge::Middle));
+
+        for edge in [ClickEdge::Start, ClickEdge::Middle, ClickEdge::End] {
+            let mut keyboard = summary_harness(width, height, theme);
+            let mut mouse = summary_harness(width, height, theme);
+            for harness in [&mut keyboard, &mut mouse] {
+                harness.key(KeyCode::Enter);
+                harness.key(KeyCode::Down);
+                harness.key(KeyCode::Enter);
+                assert_eq!(harness.app.summary_expanded_nodes.len(), 2);
+                assert_eq!(
+                    harness.control_rect(ControlId::SummaryCollapseAll),
+                    inactive_rect,
+                    "collapse-all hitbox moved at {width}x{height}"
+                );
+                harness.assert_shortcut_distinct(ControlId::SummaryCollapseAll);
+            }
+
+            keyboard.key(KeyCode::Char('X'));
+            assert!(mouse.click(ControlId::SummaryCollapseAll, edge));
+
+            assert_eq!(keyboard.state(), mouse.state());
+            assert_eq!(keyboard.frame(), mouse.frame());
+            for harness in [&keyboard, &mouse] {
+                assert!(harness.app.summary_expanded_nodes.is_empty());
+                assert!(
+                    harness
+                        .app
+                        .summary_rows()
+                        .iter()
+                        .all(|row| row.kind == SummaryRowKind::Project && row.collapsed)
+                );
+                assert_eq!(
+                    harness.app.summary_selected_id.as_deref(),
+                    Some("project:alpha-id")
+                );
+                harness.assert_shortcut_inactive(ControlId::SummaryCollapseAll);
+            }
+        }
+    }
+}
+
+#[test]
+fn summary_wide_layout_balances_the_top_panels_and_gives_the_bottom_chart_full_width() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let harness = summary_harness(120, 40, theme);
+        let tree = harness.app.summary_table_hitbox.unwrap().viewport;
+        let bars = harness.app.summary_bar_hitboxes.first().unwrap().area;
+        let plot = harness.app.summary_daily_hitbox.as_ref().unwrap().plot;
+
+        assert_eq!(tree.width, bars.width);
+        assert_eq!(bars.x.saturating_sub(tree.x), 60);
+        assert!(
+            plot.x < bars.x,
+            "plot must begin in the left half: {plot:?}"
+        );
+        assert!(plot.right() >= bars.x + bars.width, "{plot:?}");
+        assert!(plot.y > tree.bottom().saturating_sub(1), "{plot:?}");
     }
 }
 
@@ -488,6 +1670,46 @@ fn summary_cycle_falls_back_after_a_frozen_server_window_expires() {
 
     harness.render_at(after_weekly_reset);
 
+    assert!(
+        harness
+            .frame()
+            .snapshot_text()
+            .contains("Cycle (7d fallback)")
+    );
+}
+
+#[test]
+fn summary_cycle_cache_expires_inside_the_same_fifteen_minute_bucket() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let before_reset = harness.app.snapshot.as_of;
+    let reset_at = before_reset + ChronoDuration::minutes(5);
+    let weekly = harness
+        .app
+        .snapshot
+        .window_analyses
+        .iter_mut()
+        .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+        .unwrap();
+    weekly.attribution.window.as_mut().unwrap().ends_at = reset_at;
+    harness.app.summary_cache = None;
+
+    harness.render_at(before_reset);
+    let initial_bucket = harness.app.summary_cache.as_ref().unwrap().query_bucket;
+    assert_eq!(
+        harness
+            .app
+            .summary_cache
+            .as_ref()
+            .unwrap()
+            .prepared
+            .range_note,
+        None
+    );
+
+    harness.render_at(reset_at + ChronoDuration::seconds(1));
+    let cache = harness.app.summary_cache.as_ref().unwrap();
+    assert_eq!(cache.query_bucket, initial_bucket);
+    assert_eq!(cache.prepared.range_note, Some("7d fallback"));
     assert!(
         harness
             .frame()
@@ -573,8 +1795,10 @@ fn summary_live_task_metadata_overrides_stale_history_title() {
     harness.key(KeyCode::Char('U'));
     harness.key(KeyCode::Enter);
 
+    let rows = harness.app.summary_rows();
+    assert_eq!(rows[1].label, "Build the integration test harness");
     let frame = harness.frame().snapshot_text();
-    assert!(frame.contains("Build the integration test harnes"));
+    assert!(frame.contains("Build the integration"));
     assert!(!frame.contains("Untitled task"));
 }
 
@@ -613,6 +1837,99 @@ fn summary_api_range_and_lower_bound_marker_remain_visible() {
             "API range was clipped at width {width}: {frame}"
         );
     }
+}
+
+#[test]
+fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
+    let mut harness = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
+    let now = harness.app.snapshot.as_of;
+    let (window, _) = SummaryRange::SevenDays.window(&harness.app.snapshot, now);
+    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
+    let mut starts_at_seconds = window
+        .starts_at
+        .timestamp()
+        .div_euclid(bucket_seconds)
+        .saturating_mul(bucket_seconds);
+    let aligned = DateTime::from_timestamp(starts_at_seconds, 0).unwrap();
+    if aligned < window.starts_at {
+        starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
+    }
+    let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap();
+    let mut buckets = Vec::new();
+    let mut inserted_usage = false;
+    while starts_at < window.ends_at {
+        let groups = if inserted_usage {
+            Vec::new()
+        } else {
+            inserted_usage = true;
+            let mut group = summary_group(
+                "api-range-thread",
+                None,
+                "api-range-project",
+                "api-range-project",
+                "Fully priced API range",
+                "cli",
+                2_000,
+            );
+            group.api_equivalent_cost = ApiCostAmount {
+                minimum_pico_usd: PicoUsd::new(123_400_000_000),
+                maximum_pico_usd: PicoUsd::new(567_800_000_000),
+                observed_samples: 1,
+                priced_samples: 1,
+                observed_tokens: 2_000,
+                priced_tokens: 2_000,
+            };
+            vec![group]
+        };
+        buckets.push(summary_bucket(starts_at, groups));
+        starts_at += ChronoDuration::minutes(LOCAL_BUCKET_MINUTES);
+    }
+    assert!(inserted_usage);
+    harness.app.history = HistoryData {
+        half_hour_buckets: buckets,
+        ..HistoryData::default()
+    };
+    harness.app.summary_cache = None;
+    harness.key(KeyCode::Char('U'));
+    harness.key(KeyCode::Char('7'));
+    harness.key(KeyCode::Char('A'));
+
+    let prepared = &harness.app.summary_cache.as_ref().unwrap().prepared;
+    assert_eq!(prepared.covered_buckets, prepared.expected_buckets);
+    assert_eq!(prepared.represented_tokens, prepared.available_tokens);
+    assert!(!prepared.partial(SummaryMetric::ApiEquivalent, false));
+    assert!(prepared.api_chart_is_lower_bound());
+    assert!(summary_daily_is_lower_bound(
+        prepared,
+        SummaryMetric::ApiEquivalent,
+        false,
+        prepared.usage.days.len(),
+        prepared.usage.days.len(),
+    ));
+    assert!(harness.frame().snapshot_text().contains("LOWER BOUND"));
+}
+
+#[test]
+fn summary_api_marks_equal_sample_but_partial_token_pricing_as_a_lower_bound() {
+    let harness = summary_harness(120, 40, Theme::Dark);
+    let mut prepared = prepare_summary(&harness.app, harness.app.snapshot.as_of);
+    prepared.partial_reasons.clear();
+    prepared.available_tokens = 2_000;
+    prepared.represented_tokens = 2_000;
+    prepared.covered_buckets = 1;
+    prepared.expected_buckets = 1;
+    prepared.usage.totals.api_equivalent_cost = ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(123_400_000_000),
+        maximum_pico_usd: PicoUsd::new(123_400_000_000),
+        observed_samples: 1,
+        priced_samples: 1,
+        observed_tokens: 2_000,
+        priced_tokens: 1_000,
+    };
+
+    assert!(prepared.partial(SummaryMetric::ApiEquivalent, false));
+    assert!(prepared.api_chart_is_lower_bound());
+    assert!(prepared.coverage_percent(SummaryMetric::ApiEquivalent) < 100.0);
 }
 
 #[test]
@@ -695,11 +2012,12 @@ fn summary_longx_does_not_treat_spark_only_metadata_as_unknown_est_usage() {
 }
 
 #[test]
-fn summary_tree_defaults_collapsed_and_enter_expands_project_then_task() {
+fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
     let rows = harness.app.summary_rows();
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| row.id.starts_with("project:")));
+    assert!(rows.iter().all(|row| row.kind == SummaryRowKind::Project));
     assert!(rows.iter().all(|row| row.collapsed));
     assert_eq!(rows[0].label, "alpha-service");
     assert_eq!(rows[0].metrics.token_usage.total_tokens, 190_000);
@@ -719,7 +2037,7 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_task() {
     );
     assert_eq!(
         project_expanded[1].metrics.token_usage.total_tokens, 190_000,
-        "a collapsed task row should include its descendants"
+        "a collapsed session row should include its descendants"
     );
     assert!(
         harness
@@ -736,20 +2054,45 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_task() {
 
     harness.key(KeyCode::Down);
     harness.key(KeyCode::Enter);
-    let task_expanded = harness.app.summary_rows();
-    assert_eq!(task_expanded.len(), 5);
-    assert_eq!(task_expanded[0].metrics.token_usage.total_tokens, 190_000);
+    let session_expanded = harness.app.summary_rows();
+    assert_eq!(session_expanded.len(), 5);
     assert_eq!(
-        task_expanded[1].metrics.token_usage.total_tokens, 120_000,
-        "an expanded task row should show only its own usage"
+        session_expanded[0].metrics.token_usage.total_tokens,
+        190_000
     );
-    assert_eq!(task_expanded[2].metrics.token_usage.total_tokens, 70_000);
-    assert!(
-        harness
-            .frame()
-            .snapshot_text()
-            .contains("Price catalog research")
+    assert_eq!(
+        session_expanded[1].metrics.token_usage.total_tokens, 120_000,
+        "an expanded session row should show only its own usage"
     );
+    assert_eq!(session_expanded[2].metrics.token_usage.total_tokens, 70_000);
+    assert!(harness.frame().snapshot_text().contains("Price catalog"));
+    assert_eq!(session_expanded[0].kind, SummaryRowKind::Project);
+    assert_eq!(session_expanded[1].kind, SummaryRowKind::Session);
+    assert_eq!(session_expanded[2].kind, SummaryRowKind::Subagent);
+}
+
+#[test]
+fn summary_tree_labels_projects_sessions_and_subagents_without_color_only_cues() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut harness = summary_harness(width, height, theme);
+        let collapsed = harness.frame().snapshot_text();
+        assert!(
+            collapsed.contains("TYPE · PROJECT / SESSION"),
+            "{collapsed}"
+        );
+        assert!(
+            collapsed.contains("[+] PROJ ■ alpha-service"),
+            "{collapsed}"
+        );
+
+        harness.key(KeyCode::Enter);
+        harness.key(KeyCode::Down);
+        harness.key(KeyCode::Enter);
+        let expanded = harness.frame().snapshot_text();
+        assert!(expanded.contains("PROJ ■ alpha-service"), "{expanded}");
+        assert!(expanded.contains("SESS API billing"), "{expanded}");
+        assert!(expanded.contains("SUB  Price catalog"), "{expanded}");
+    }
 }
 
 #[test]

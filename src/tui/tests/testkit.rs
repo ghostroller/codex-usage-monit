@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -29,8 +29,12 @@ pub(super) enum ControlId {
     SummaryMetricTokens,
     SummaryMetricEstimated,
     SummaryMetricApiEquivalent,
+    SummaryBucketGrain,
+    SummaryAllProjects,
     SummaryLongContext,
+    SummaryInspect,
     SummaryToggle,
+    SummaryCollapseAll,
     SourceAll,
     SourceDesktop,
     SourceSubagent,
@@ -77,8 +81,12 @@ impl ControlId {
             Self::SummaryMetricTokens => "K",
             Self::SummaryMetricEstimated => "E",
             Self::SummaryMetricApiEquivalent => "A",
+            Self::SummaryBucketGrain => "B",
+            Self::SummaryAllProjects => "G",
             Self::SummaryLongContext => "L",
+            Self::SummaryInspect => "I",
             Self::SummaryToggle => "↵",
+            Self::SummaryCollapseAll => "X",
             Self::SourceAll => "A",
             Self::SourceDesktop => "D",
             Self::SourceSubagent => "S",
@@ -115,7 +123,10 @@ pub(super) struct HarnessState {
     pub(super) task_offset: usize,
     pub(super) turn_offset: usize,
     pub(super) summary_range: SummaryRange,
+    pub(super) summary_grain: SummaryGrain,
     pub(super) summary_metric: SummaryMetric,
+    pub(super) summary_show_all_projects: bool,
+    pub(super) summary_inspected_date: Option<NaiveDateTime>,
     pub(super) summary_selected_id: Option<String>,
     pub(super) summary_offset: usize,
     pub(super) quit_confirmation: bool,
@@ -385,7 +396,10 @@ impl TuiHarness {
             task_offset: self.app.task_table_offset,
             turn_offset: self.app.turn_offset,
             summary_range: self.app.summary_range,
+            summary_grain: self.app.summary_grain,
             summary_metric: self.app.summary_metric,
+            summary_show_all_projects: self.app.summary_show_all_projects,
+            summary_inspected_date: self.app.summary_inspected_date,
             summary_selected_id: self.app.summary_selected_id.clone(),
             summary_offset: self.app.summary_offset,
             quit_confirmation: self.app.quit_confirmation_visible,
@@ -395,6 +409,11 @@ impl TuiHarness {
 
     pub(super) fn frame(&self) -> SemanticFrame {
         SemanticFrame::from_buffer(self.terminal.backend().buffer(), self.visible_controls())
+    }
+
+    pub(super) fn cell_style(&self, column: u16, row: u16) -> (String, Color, Modifier) {
+        let cell = &self.terminal.backend().buffer()[(column, row)];
+        (cell.symbol().to_string(), cell.fg, cell.modifier)
     }
 
     pub(super) fn control_rect(&self, control: ControlId) -> Rect {
@@ -452,15 +471,35 @@ impl TuiHarness {
             ControlId::SummaryMetricApiEquivalent => {
                 self.summary_metric_rect(SummaryMetric::ApiEquivalent)
             }
+            ControlId::SummaryBucketGrain => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.bucket_grain)
+                .unwrap_or_default(),
+            ControlId::SummaryAllProjects => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.toggle_all_projects)
+                .unwrap_or_default(),
             ControlId::SummaryLongContext => self
                 .app
                 .summary_controls_hitbox
                 .map(|hitbox| hitbox.toggle_long_context)
                 .unwrap_or_default(),
+            ControlId::SummaryInspect => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.inspect)
+                .unwrap_or_default(),
             ControlId::SummaryToggle => self
                 .app
                 .summary_controls_hitbox
                 .map(|hitbox| hitbox.toggle_selected)
+                .unwrap_or_default(),
+            ControlId::SummaryCollapseAll => self
+                .app
+                .summary_controls_hitbox
+                .map(|hitbox| hitbox.collapse_all)
                 .unwrap_or_default(),
             ControlId::SourceAll => self.task_source_rect(0),
             ControlId::SourceDesktop => self.task_source_rect(1),
@@ -628,8 +667,12 @@ impl TuiHarness {
             ControlId::SummaryMetricTokens,
             ControlId::SummaryMetricEstimated,
             ControlId::SummaryMetricApiEquivalent,
+            ControlId::SummaryBucketGrain,
+            ControlId::SummaryAllProjects,
             ControlId::SummaryLongContext,
+            ControlId::SummaryInspect,
             ControlId::SummaryToggle,
+            ControlId::SummaryCollapseAll,
             ControlId::SourceAll,
             ControlId::SourceDesktop,
             ControlId::SourceSubagent,

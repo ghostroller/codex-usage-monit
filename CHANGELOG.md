@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added a project usage Summary view for the current cycle, the last 7 days, and the last 30 days, with Tokens, estimated credit-rate, and API-equivalent metrics. Its project-colored stacked-area chart supports local `1d`, `12h`, `6h`, `3h`, and `1h` buckets, Top 6 + Other or all-project composition, exact mouse and keyboard inspection when points fit the plot, and honest Complete/Partial/Missing coverage gaps.
+
+### Changed
+
+- Balanced the wide Summary layout with a 1:1 tree/top-project row and a full-width chart below it, added explicit project/session/subagent row labels and a collapse-all control, and assigned project colors from stable project identities instead of the current ranking.
+
 ## [0.3.0] - 2026-08-28
 
 ### Added

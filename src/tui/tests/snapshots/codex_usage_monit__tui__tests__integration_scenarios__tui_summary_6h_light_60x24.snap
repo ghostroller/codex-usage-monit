@@ -1,11 +1,11 @@
 ---
 source: src/tui/tests/integration_scenarios.rs
-expression: "summary_harness(width, height, theme).frame().snapshot_text()"
+expression: summary.frame().snapshot_text()
 ---
 size=60x24
 rows:
 00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
-01|[C][7][M] [K][E][A] [B] 1d [I]Inspect [G]All [L] [↵] [X]
+01|[C][7][M] [K][E][A] [B] 6h [I]Inspect [G]All [L] [↵] [X]
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION         │
 04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         │
@@ -19,14 +19,14 @@ rows:
 12|│■ docs-site                       40.0K  12.5% █··········│
 13|│                                                          │
 14|└──────────────────────────────────────────────────────────┘
-15|┌Project mix · Tokens · 1d local · 0C/4P/0M · all projects─┐
-16|│07-12 · P lower bound · Total 40.0K · ■ alpha-serv… 0 · +1│
-17|│LOWER · C/P/M PPPP                                        │
-18|│200.0K│                                                   │
-19|│100.0K│  ▄▄▄▄▄▄▄▄▄▄▄               ▄▄▄▄▄▄▄▄               │
-20|│0     │                      ▀▀▀▀▀▀▀▀           ▀▀▀▀▀▀▄▄▄▄│
-21|│      └───────────────────────────────────────────────────│
-22|│  07-09                       07-11                  07-12│
+15|┌Project mix · Tokens · 6h local · 0C/4P/9M · all projects─┐
+16|│07-12 00:00 · P lower bound · Total 40.0K · ■ alph… 0 · +1│
+17|│LOWER · C/P/M MPMMMPMMMPMMP                               │
+18|│200.0K  │                                                 │
+19|│100.0K  │                                  ▄▄▄▄           │
+20|│0       │                                              ▄▄▄│
+21|│        └─────────────────────────────────────────────────│
+22|│07-09 00h                    07-10 12h           07-12 00h│
 23|└──────────────────────────────────────────────────────────┘
 styles:
 00:001+001 fg=#006c75 bg=#f7f9fc mods=bold text="1"
@@ -57,7 +57,7 @@ styles:
 01:017+001 fg=#006c75 bg=#f7f9fc mods=bold text="A"
 01:018+003 fg=#5f6b7a bg=#f7f9fc mods=none text="] ["
 01:021+001 fg=#006c75 bg=#f7f9fc mods=bold text="B"
-01:022+006 fg=#5f6b7a bg=#f7f9fc mods=none text="] 1d ["
+01:022+006 fg=#5f6b7a bg=#f7f9fc mods=none text="] 6h ["
 01:028+001 fg=#006c75 bg=#f7f9fc mods=bold text="I"
 01:029+017 fg=#5f6b7a bg=#f7f9fc mods=none text="]Inspect [G]All ["
 01:046+001 fg=#006c75 bg=#f7f9fc mods=bold text="L"
@@ -123,46 +123,51 @@ styles:
 13:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 14:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 15:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
-15:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Project mix · Tokens · 1d local · 0C/4P/0M · all projects"
+15:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Project mix · Tokens · 6h local · 0C/4P/9M · all projects"
 15:058+002 fg=#7d8998 bg=#f7f9fc mods=none text="─┐"
 16:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-16:001+005 fg=#17202a bg=#f7f9fc mods=bold text="07-12"
-16:006+003 fg=#17202a bg=#f7f9fc mods=none text=" · "
-16:009+013 fg=#8a5900 bg=#f7f9fc mods=bold text="P lower bound"
-16:022+017 fg=#17202a bg=#f7f9fc mods=none text=" · Total 40.0K · "
-16:039+002 fg=#9d7625 bg=#f7f9fc mods=none text="■ "
-16:041+013 fg=#17202a bg=#f7f9fc mods=bold text="alpha-serv… 0"
+16:001+011 fg=#17202a bg=#f7f9fc mods=bold text="07-12 00:00"
+16:012+003 fg=#17202a bg=#f7f9fc mods=none text=" · "
+16:015+013 fg=#8a5900 bg=#f7f9fc mods=bold text="P lower bound"
+16:028+017 fg=#17202a bg=#f7f9fc mods=none text=" · Total 40.0K · "
+16:045+002 fg=#9d7625 bg=#f7f9fc mods=none text="■ "
+16:047+007 fg=#17202a bg=#f7f9fc mods=bold text="alph… 0"
 16:054+005 fg=#5f6b7a bg=#f7f9fc mods=none text=" · +1"
 16:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 17:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-17:001+018 fg=#8a5900 bg=#f7f9fc mods=none text="LOWER · C/P/M PPPP"
+17:001+014 fg=#8a5900 bg=#f7f9fc mods=none text="LOWER · C/P/M "
+17:015+001 fg=#5f6b7a bg=#f7f9fc mods=dim text="M"
+17:016+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
+17:017+003 fg=#5f6b7a bg=#f7f9fc mods=dim text="MMM"
+17:020+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
+17:021+003 fg=#5f6b7a bg=#f7f9fc mods=dim text="MMM"
+17:024+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
+17:025+002 fg=#5f6b7a bg=#f7f9fc mods=dim text="MM"
+17:027+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
 17:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 18:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-18:001+006 fg=#17202a bg=#f7f9fc mods=none text="200.0K"
-18:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+18:001+008 fg=#17202a bg=#f7f9fc mods=none text="200.0K  "
+18:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
 18:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 19:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-19:001+006 fg=#17202a bg=#f7f9fc mods=none text="100.0K"
-19:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
-19:008+002 fg=#af9050 bg=#af9050 mods=none text="  "
-19:010+011 fg=#af9050 bg=#f7f9fc mods=none text="▄▄▄▄▄▄▄▄▄▄▄"
-19:036+007 fg=#ad4d66 bg=#f7f9fc mods=none text="▄▄▄▄▄▄▄"
-19:043+001 fg=#4cb388 bg=#f7f9fc mods=none text="▄"
+19:001+008 fg=#17202a bg=#f7f9fc mods=none text="100.0K  "
+19:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+19:012+004 fg=#af9050 bg=#af9050 mods=none text="    "
+19:044+004 fg=#ad4d66 bg=#f7f9fc mods=none text="▄▄▄▄"
 19:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 20:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-20:001+006 fg=#17202a bg=#f7f9fc mods=none text="0     "
-20:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
-20:008+022 fg=#af9050 bg=#af9050 mods=none text="                      "
-20:030+008 fg=#ad4d66 bg=#af9050 mods=none text="▀▀▀▀▀▀▀▀"
-20:038+011 fg=#ad4d66 bg=#ad4d66 mods=none text="           "
-20:049+006 fg=#4cb388 bg=#ad4d66 mods=none text="▀▀▀▀▀▀"
-20:055+004 fg=#4cb388 bg=#f7f9fc mods=none text="▄▄▄▄"
+20:001+008 fg=#17202a bg=#f7f9fc mods=none text="0       "
+20:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+20:012+004 fg=#af9050 bg=#af9050 mods=none text="    "
+20:028+004 fg=#af9050 bg=#af9050 mods=none text="    "
+20:044+004 fg=#ad4d66 bg=#ad4d66 mods=none text="    "
+20:056+003 fg=#4cb388 bg=#f7f9fc mods=none text="▄▄▄"
 20:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 21:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-21:007+052 fg=#5f6b7a bg=#f7f9fc mods=none text="└───────────────────────────────────────────────────"
+21:009+050 fg=#5f6b7a bg=#f7f9fc mods=none text="└─────────────────────────────────────────────────"
 21:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 22:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-22:001+058 fg=#17202a bg=#f7f9fc mods=none text="  07-09                       07-11                  07-12"
+22:001+058 fg=#17202a bg=#f7f9fc mods=none text="07-09 00h                    07-10 12h           07-12 00h"
 22:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 23:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 controls:

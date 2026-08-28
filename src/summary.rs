@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 
 use crate::api_cost::ApiCostAccumulator;
 use crate::attribution::{estimate_call_weight, is_spark_model};
@@ -133,6 +133,13 @@ pub struct DailySummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HourlySummary {
+    /// Start of the local wall-clock hour represented by this bucket.
+    pub starts_at: NaiveDateTime,
+    pub totals: SummaryMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadSummary {
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
@@ -157,6 +164,10 @@ pub struct ProjectSummary {
     pub cwd: Option<PathBuf>,
     pub totals: SummaryMetrics,
     pub days: Vec<DailySummary>,
+    /// Sparse local wall-clock hourly totals used by the interactive Summary
+    /// chart. Empty/unknown hours are materialized by the caller together with
+    /// its independent history coverage metadata.
+    pub hours: Vec<HourlySummary>,
     pub threads: Vec<ThreadSummary>,
 }
 
@@ -165,6 +176,7 @@ pub struct UsageSummary {
     pub window: SummaryWindow,
     pub totals: SummaryMetrics,
     pub days: Vec<DailySummary>,
+    pub hours: Vec<HourlySummary>,
     pub projects: Vec<ProjectSummary>,
 }
 
@@ -183,6 +195,7 @@ struct ThreadMetadata {
 struct ProjectAccumulator {
     totals: SummaryMetrics,
     days: BTreeMap<NaiveDate, SummaryMetrics>,
+    hours: BTreeMap<NaiveDateTime, SummaryMetrics>,
     label: Option<(DateTime<Utc>, String)>,
     cwd: Option<PathBuf>,
 }
@@ -198,8 +211,8 @@ pub fn summarize_samples(
     window: SummaryWindow,
     day_offset: FixedOffset,
 ) -> UsageSummary {
-    summarize_samples_with_local_date(samples, window, |timestamp| {
-        timestamp.with_timezone(&day_offset).date_naive()
+    summarize_samples_with_local_time(samples, window, |timestamp| {
+        timestamp.with_timezone(&day_offset).naive_local()
     })
 }
 
@@ -210,6 +223,31 @@ pub fn summarize_samples_with_local_date(
     samples: &[SummarySample],
     window: SummaryWindow,
     local_date: impl Fn(DateTime<Utc>) -> NaiveDate,
+) -> UsageSummary {
+    summarize_samples_with_local_mapping(samples, window, local_date, |_| None)
+}
+
+/// Variant used by the TUI to retain a sparse one-hour series while resolving
+/// project identity and thread ancestry in the same aggregation pass.
+pub fn summarize_samples_with_local_time(
+    samples: &[SummarySample],
+    window: SummaryWindow,
+    local_time: impl Fn(DateTime<Utc>) -> NaiveDateTime,
+) -> UsageSummary {
+    let local_time = &local_time;
+    summarize_samples_with_local_mapping(
+        samples,
+        window,
+        |timestamp| local_time(timestamp).date(),
+        |timestamp| Some(local_hour_start(local_time(timestamp))),
+    )
+}
+
+fn summarize_samples_with_local_mapping(
+    samples: &[SummarySample],
+    window: SummaryWindow,
+    local_date: impl Fn(DateTime<Utc>) -> NaiveDate,
+    local_hour: impl Fn(DateTime<Utc>) -> Option<NaiveDateTime>,
 ) -> UsageSummary {
     let mut metadata = HashMap::<String, ThreadMetadata>::new();
     let mut metadata_samples = samples.iter().collect::<Vec<_>>();
@@ -252,6 +290,7 @@ pub fn summarize_samples_with_local_date(
         .copied()
         .map(|date| (date, SummaryMetrics::default()))
         .collect::<BTreeMap<_, _>>();
+    let mut hours = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
     let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
     let mut own_by_thread = HashMap::<String, SummaryMetrics>::new();
 
@@ -261,6 +300,7 @@ pub fn summarize_samples_with_local_date(
     {
         let metrics = sample.metrics();
         let date = local_date(sample.timestamp);
+        let hour = local_hour(sample.timestamp);
         let cwd = resolved_cwds
             .get(&sample.thread_id)
             .cloned()
@@ -273,6 +313,9 @@ pub fn summarize_samples_with_local_date(
 
         totals.add_assign(metrics);
         days.entry(date).or_default().add_assign(metrics);
+        if let Some(hour) = hour {
+            hours.entry(hour).or_default().add_assign(metrics);
+        }
         own_by_thread
             .entry(sample.thread_id.clone())
             .or_default()
@@ -280,6 +323,9 @@ pub fn summarize_samples_with_local_date(
         let project = projects.entry(key).or_default();
         project.totals.add_assign(metrics);
         project.days.entry(date).or_default().add_assign(metrics);
+        if let Some(hour) = hour {
+            project.hours.entry(hour).or_default().add_assign(metrics);
+        }
         if project.cwd.is_none() {
             project.cwd = cwd;
         }
@@ -300,9 +346,14 @@ pub fn summarize_samples_with_local_date(
     let mut project_summaries = projects
         .into_iter()
         .map(|(key, accumulator)| {
-            let cwd = accumulator.cwd;
-            let label = accumulator
-                .label
+            let ProjectAccumulator {
+                totals,
+                days: project_days,
+                hours: project_hours,
+                label,
+                cwd,
+            } = accumulator;
+            let label = label
                 .map(|(_, label)| label)
                 .unwrap_or_else(|| project_label(cwd.as_deref()));
             let threads = build_project_threads(
@@ -316,14 +367,18 @@ pub fn summarize_samples_with_local_date(
                 key,
                 label,
                 cwd,
-                totals: accumulator.totals,
+                totals,
                 days: dates
                     .iter()
                     .copied()
                     .map(|date| DailySummary {
                         date,
-                        totals: accumulator.days.get(&date).copied().unwrap_or_default(),
+                        totals: project_days.get(&date).copied().unwrap_or_default(),
                     })
+                    .collect(),
+                hours: project_hours
+                    .into_iter()
+                    .map(|(starts_at, totals)| HourlySummary { starts_at, totals })
                     .collect(),
                 threads,
             }
@@ -351,8 +406,19 @@ pub fn summarize_samples_with_local_date(
             .into_iter()
             .map(|(date, totals)| DailySummary { date, totals })
             .collect(),
+        hours: hours
+            .into_iter()
+            .map(|(starts_at, totals)| HourlySummary { starts_at, totals })
+            .collect(),
         projects: project_summaries,
     }
+}
+
+fn local_hour_start(value: NaiveDateTime) -> NaiveDateTime {
+    value
+        .date()
+        .and_hms_opt(value.hour(), 0, 0)
+        .unwrap_or(value)
 }
 
 /// Adapts raw rollout calls to the same additive representation used by
@@ -825,6 +891,15 @@ mod tests {
         }
     }
 
+    fn summed_metrics(values: impl IntoIterator<Item = SummaryMetrics>) -> SummaryMetrics {
+        values
+            .into_iter()
+            .fold(SummaryMetrics::default(), |mut total, value| {
+                total.add_assign(value);
+                total
+            })
+    }
+
     #[test]
     fn aggregates_projects_and_collapsed_thread_subtrees_without_double_counting() {
         let window = SummaryWindow::new(at(1, 0), at(3, 0)).unwrap();
@@ -909,6 +984,166 @@ mod tests {
         assert_eq!(summary.days[1].date.to_string(), "2026-08-03");
         assert_eq!(summary.days[1].totals.token_usage.total_tokens, 0);
         assert_eq!(summary.projects[0].days.len(), 2);
+    }
+
+    #[test]
+    fn aggregates_quarter_hour_samples_into_sparse_local_hours_and_preserves_totals() {
+        let starts_at = at(1, 0);
+        let window = SummaryWindow::new(starts_at, at(1, 2)).unwrap();
+        let samples = vec![
+            sample(
+                starts_at,
+                "alpha-1",
+                None,
+                Some("/work/alpha"),
+                metrics(10, 100, 1_000),
+            ),
+            sample(
+                starts_at + Duration::minutes(15),
+                "alpha-2",
+                None,
+                Some("/work/alpha"),
+                metrics(20, 200, 2_000),
+            ),
+            sample(
+                starts_at + Duration::minutes(45),
+                "beta-1",
+                None,
+                Some("/work/beta"),
+                metrics(5, 50, 500),
+            ),
+            sample(
+                starts_at + Duration::hours(1),
+                "alpha-3",
+                None,
+                Some("/work/alpha"),
+                metrics(7, 70, 700),
+            ),
+            sample(
+                starts_at + Duration::hours(1) + Duration::minutes(15),
+                "beta-2",
+                None,
+                Some("/work/beta"),
+                metrics(3, 30, 300),
+            ),
+        ];
+
+        let summary =
+            summarize_samples_with_local_time(&samples, window, |timestamp| timestamp.naive_utc());
+
+        assert_eq!(
+            summary
+                .hours
+                .iter()
+                .map(|hour| (hour.starts_at, hour.totals.token_usage.total_tokens))
+                .collect::<Vec<_>>(),
+            [
+                (starts_at.naive_utc(), 35),
+                ((starts_at + Duration::hours(1)).naive_utc(), 10),
+            ]
+        );
+        assert_eq!(
+            summary.totals,
+            summed_metrics(summary.hours.iter().map(|hour| hour.totals))
+        );
+        assert_eq!(
+            summary.totals,
+            summed_metrics(summary.projects.iter().map(|project| project.totals))
+        );
+
+        let alpha = summary
+            .projects
+            .iter()
+            .find(|project| project.key == "/work/alpha")
+            .unwrap();
+        let beta = summary
+            .projects
+            .iter()
+            .find(|project| project.key == "/work/beta")
+            .unwrap();
+        assert_eq!(
+            alpha
+                .hours
+                .iter()
+                .map(|hour| (hour.starts_at, hour.totals.token_usage.total_tokens))
+                .collect::<Vec<_>>(),
+            [
+                (starts_at.naive_utc(), 30),
+                ((starts_at + Duration::hours(1)).naive_utc(), 7),
+            ]
+        );
+        assert_eq!(
+            beta.hours
+                .iter()
+                .map(|hour| (hour.starts_at, hour.totals.token_usage.total_tokens))
+                .collect::<Vec<_>>(),
+            [
+                (starts_at.naive_utc(), 5),
+                ((starts_at + Duration::hours(1)).naive_utc(), 3),
+            ]
+        );
+        for project in &summary.projects {
+            assert_eq!(
+                project.totals,
+                summed_metrics(project.hours.iter().map(|hour| hour.totals))
+            );
+        }
+    }
+
+    #[test]
+    fn local_hour_mapper_merges_the_repeated_fallback_hour_without_losing_usage() {
+        let starts_at = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).single().unwrap();
+        let transition = Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).single().unwrap();
+        let ends_at = Utc.with_ymd_and_hms(2026, 11, 1, 8, 0, 0).single().unwrap();
+        let samples = [
+            (Duration::minutes(15), 10),
+            (Duration::hours(1) + Duration::minutes(15), 20),
+            (Duration::hours(2) + Duration::minutes(15), 30),
+            (Duration::hours(3) + Duration::minutes(15), 40),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, tokens))| {
+            sample(
+                starts_at + offset,
+                &format!("thread-{index}"),
+                None,
+                Some("/work/alpha"),
+                metrics(tokens, u128::from(tokens), u128::from(tokens)),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let summary = summarize_samples_with_local_time(
+            &samples,
+            SummaryWindow::new(starts_at, ends_at).unwrap(),
+            |timestamp| {
+                let offset_hours = if timestamp < transition { -4 } else { -5 };
+                (timestamp + Duration::hours(offset_hours)).naive_utc()
+            },
+        );
+        let local_day = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let local_hour = |hour| local_day.and_hms_opt(hour, 0, 0).unwrap();
+
+        assert_eq!(
+            summary
+                .hours
+                .iter()
+                .map(|hour| (hour.starts_at, hour.totals.token_usage.total_tokens))
+                .collect::<Vec<_>>(),
+            [
+                (local_hour(0), 10),
+                (local_hour(1), 50),
+                (local_hour(2), 40),
+            ]
+        );
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.projects[0].hours, summary.hours);
+        assert_eq!(
+            summary.totals,
+            summed_metrics(summary.hours.iter().map(|hour| hour.totals))
+        );
+        assert_eq!(summary.totals, summary.projects[0].totals);
     }
 
     #[test]
