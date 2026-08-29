@@ -2146,6 +2146,7 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
     assert_eq!(session_expanded[2].id, "turn:alpha-root:alpha-user-turn");
     let expanded = harness.frame().snapshot_text();
     assert!(expanded.contains("TURN Explain"));
+    assert!(!expanded.contains("[ ] TURN"));
     assert!(!expanded.contains("Price catalog research"));
     assert!(!expanded.contains("SUB "));
     assert_eq!(session_expanded[0].kind, SummaryRowKind::Project);
@@ -2320,6 +2321,7 @@ fn summary_tree_labels_projects_sessions_and_turns_without_color_only_cues() {
         assert!(expanded.contains("PROJ ■ alpha-service"), "{expanded}");
         assert!(expanded.contains("SESS API billing"), "{expanded}");
         assert!(expanded.contains("TURN Explain"), "{expanded}");
+        assert!(!expanded.contains("[ ] TURN"), "{expanded}");
         assert!(!expanded.contains("SUB "), "{expanded}");
     }
 }

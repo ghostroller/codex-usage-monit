@@ -8473,31 +8473,32 @@ fn render_summary_tree(
                 SummaryRowKind::Session => Style::default().fg(palette.foreground),
                 SummaryRowKind::Turn => Style::default().fg(palette.muted),
             };
-            let marker = if row.has_children {
-                if row.collapsed { "+" } else { "-" }
-            } else {
-                " "
-            };
-            let marker_style = if selected && row.has_children && app.shortcuts_active() {
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(palette.muted)
-            };
             let source = row
                 .source
                 .as_deref()
                 .filter(|source| !source.is_empty())
                 .map(|source| format!(" · {}", terminal_safe_text(source)))
                 .unwrap_or_default();
-            let mut label_spans = vec![
-                Span::styled(row.prefix.clone(), Style::default().fg(palette.muted)),
-                Span::styled("[", Style::default().fg(palette.muted)),
-                Span::styled(marker, marker_style),
-                Span::styled("] ", Style::default().fg(palette.muted)),
-                Span::styled(kind, kind_style),
-            ];
+            let mut label_spans = vec![Span::styled(
+                row.prefix.clone(),
+                Style::default().fg(palette.muted),
+            )];
+            if row.has_children {
+                let marker = if row.collapsed { "+" } else { "-" };
+                let marker_style = if selected && app.shortcuts_active() {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(palette.muted)
+                };
+                label_spans.extend([
+                    Span::styled("[", Style::default().fg(palette.muted)),
+                    Span::styled(marker, marker_style),
+                    Span::styled("] ", Style::default().fg(palette.muted)),
+                ]);
+            }
+            label_spans.push(Span::styled(kind, kind_style));
             if let Some(color) = project_color {
                 label_spans.push(Span::styled("■ ", Style::default().fg(color)));
             }

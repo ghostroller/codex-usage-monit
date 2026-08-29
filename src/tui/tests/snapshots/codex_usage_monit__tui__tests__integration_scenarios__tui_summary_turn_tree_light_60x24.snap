@@ -10,7 +10,7 @@ rows:
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  │
 04|│ 190.0K         59.4%    [-] PROJ ■ alpha-service         █
 05|│▌190.0K         59.4%    └─ [-] SESS API billing dashboard█
-06|│ 190.0K         59.4%      └─ [ ] TURN Explain the API bil█
+06|│ 190.0K         59.4%      └─ TURN Explain the API billing█
 07|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           │
 08|└──────────────────────────────────────────────────────────┘
 09|┌Top projects · Tokens · share of known────────────────────┐
@@ -86,8 +86,8 @@ styles:
 05:059+001 fg=#5f6b7a bg=#f7f9fc mods=bold text="█"
 06:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 06:001+025 fg=#17202a bg=#f7f9fc mods=none text=" 190.0K         59.4%    "
-06:026+014 fg=#5f6b7a bg=#f7f9fc mods=none text="  └─ [ ] TURN "
-06:040+019 fg=#17202a bg=#f7f9fc mods=none text="Explain the API bil"
+06:026+010 fg=#5f6b7a bg=#f7f9fc mods=none text="  └─ TURN "
+06:036+023 fg=#17202a bg=#f7f9fc mods=none text="Explain the API billing"
 06:059+001 fg=#5f6b7a bg=#f7f9fc mods=bold text="█"
 07:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 07:001+025 fg=#17202a bg=#f7f9fc mods=bold text=" 90.0K          28.1%    "
