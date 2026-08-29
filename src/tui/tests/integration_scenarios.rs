@@ -2072,6 +2072,25 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
 }
 
 #[test]
+fn summary_tree_plus_minus_match_the_highlighted_marker_shortcuts() {
+    let mut harness = summary_harness(120, 40, Theme::Dark);
+    let marker = harness.app.summary_tree_marker_hitboxes[0].area;
+    let (symbol, _, modifier) = harness.cell_style(marker.x + 1, marker.y);
+    assert_eq!(symbol, "+");
+    assert!(modifier.contains(Modifier::BOLD | Modifier::UNDERLINED));
+
+    harness.key(KeyCode::Char('+'));
+    assert_eq!(harness.app.summary_rows().len(), 4);
+    let marker = harness.app.summary_tree_marker_hitboxes[0].area;
+    assert_eq!(harness.cell_style(marker.x + 1, marker.y).0, "-");
+
+    harness.key(KeyCode::Char('-'));
+    assert_eq!(harness.app.summary_rows().len(), 3);
+    let marker = harness.app.summary_tree_marker_hitboxes[0].area;
+    assert_eq!(harness.cell_style(marker.x + 1, marker.y).0, "+");
+}
+
+#[test]
 fn summary_tree_labels_projects_sessions_and_subagents_without_color_only_cues() {
     for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
         let mut harness = summary_harness(width, height, theme);
@@ -2228,6 +2247,40 @@ fn settings_rows_have_keyboard_mouse_parity_and_whole_row_hitboxes() {
             settings.assert_shortcut_inactive(control);
         }
     }
+}
+
+#[test]
+fn compact_settings_scrolls_to_keep_keyboard_selection_visible() {
+    let mut settings = TuiHarness::from_fixture("normal", 60, 10, Theme::Dark);
+    settings.key(KeyCode::Char('4'));
+    assert!(
+        settings
+            .control_rect(ControlId::SettingApiEquivalent)
+            .is_empty()
+    );
+
+    settings.key(KeyCode::End);
+    assert_eq!(
+        settings.app.selected_setting,
+        SettingItem::ApiEquivalent.index()
+    );
+    assert!(
+        !settings
+            .control_rect(ControlId::SettingApiEquivalent)
+            .is_empty()
+    );
+    assert!(settings.frame().snapshot_text().contains("API equivalent"));
+    assert!(settings.control_rect(ControlId::SettingTheme).is_empty());
+
+    let before = settings.app.table_columns.api_equivalent;
+    settings.key(KeyCode::Enter);
+    assert_ne!(settings.app.table_columns.api_equivalent, before);
+    assert!(settings.click(ControlId::SettingApiEquivalent, ClickEdge::End));
+    assert_eq!(settings.app.table_columns.api_equivalent, before);
+
+    settings.key(KeyCode::Home);
+    assert_eq!(settings.app.selected_setting, SettingItem::Theme.index());
+    assert!(!settings.control_rect(ControlId::SettingTheme).is_empty());
 }
 
 #[test]

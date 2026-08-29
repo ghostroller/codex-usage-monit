@@ -236,7 +236,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `b` on Summary | Cycle the chart bucket size through `1d`, `12h`, `6h`, `3h`, and `1h`. |
 | `g` on Summary | Toggle the stacked chart between Top 6 + Other and all projects. |
 | `i` on Summary | Toggle exact time-bucket inspection when the series fits the plot; use `Left` / `Right`, `[` / `]`, `Home`, or `End` to navigate while active. |
-| `Enter` / `Space`, `x`, `l` on Summary | Expand/collapse the selected tree node, collapse the whole tree, or toggle the optional Longx estimate. |
+| `Enter` / `Space`, `+` / `-`, `x`, `l` on Summary | Toggle, expand/collapse the selected tree node, collapse the whole tree, or toggle the optional Longx estimate. |
 | `r`, `w`, `h` on compact Trends | Show Remaining, Weekly, or 15-minute charts. |
 | `[`, `]`, `n` on Trends | Move the 24-hour chart window backward/forward, or return to Now. |
 | `i` on Trends | Toggle Inspect mode. |

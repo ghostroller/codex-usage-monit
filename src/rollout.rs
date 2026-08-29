@@ -22,7 +22,7 @@ use crate::session_index::load_thread_titles;
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 5;
+const ROLLOUT_PARSER_REVISION: u32 = 8;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -35,6 +35,10 @@ const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DISCOVERY_FULL_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_INCOMPLETE_RESCAN_INTERVAL: Duration = Duration::from_secs(10);
 const TAIL_GUARD_BYTES: usize = 256;
+const OWNER_PROBE_MAX_BYTES: u64 = 64 * 1024;
+const OWNER_PROBE_MAX_LINES: usize = 32;
+const OWNER_PROBE_MAX_FILES_PER_SCAN: usize = 64;
+const LOCAL_COVERAGE_BUCKET_SECONDS: i64 = 15 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -196,6 +200,18 @@ struct ParsedFile {
     source_lines: usize,
     #[serde(default)]
     owning_created_at: Option<DateTime<Utc>>,
+    /// Stable, content-derived bounds used to order multiple files belonging
+    /// to the same thread. Unlike filesystem mtimes these survive copies,
+    /// restores, and explicit `touch` operations.
+    #[serde(default)]
+    replay_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    replay_updated_at: Option<DateTime<Utc>>,
+    /// Whether every content event that participates in replay supplied a
+    /// stable timestamp. This must be true before timestamp bounds can safely
+    /// order multiple files for the same thread.
+    #[serde(default)]
+    replay_timestamps_complete: bool,
     #[serde(default)]
     replaying_foreign_history: bool,
     #[serde(default)]
@@ -226,6 +242,29 @@ struct ReducedRollouts {
     dataset: RolloutDataset,
     replay_warnings: HashMap<PathBuf, Vec<String>>,
     ambiguous_token_resets: HashMap<PathBuf, usize>,
+    replay_order_warnings: HashMap<PathBuf, Vec<String>>,
+    ambiguous_replay_orders: HashMap<PathBuf, usize>,
+    incomplete_counter_threads: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OwnerProbe {
+    Found(String),
+    NoOwner,
+    Uncertain,
+}
+
+#[derive(Clone, Debug)]
+struct CachedOwnerProbe {
+    fingerprint: FileFingerprint,
+    result: OwnerProbe,
+}
+
+#[derive(Debug, Default)]
+struct ReplayPlan {
+    incomplete_counter_threads: HashSet<String>,
+    replay_order_warnings: HashMap<PathBuf, Vec<String>>,
+    ambiguous_replay_orders: HashMap<PathBuf, usize>,
 }
 
 /// Diagnostics for the most recent cached scan.
@@ -315,6 +354,7 @@ struct DiscoveryKey {
 struct DiscoveryCache {
     key: DiscoveryKey,
     inventory: HashMap<PathBuf, RolloutFile>,
+    owner_index: DiscoveryOwnerIndex,
     directories: HashMap<PathBuf, FileFingerprint>,
     roots: Vec<(PathBuf, Option<FileFingerprint>)>,
     warnings: Vec<String>,
@@ -322,6 +362,19 @@ struct DiscoveryCache {
     complete: bool,
     full_scan_at: Instant,
     logical_now: DateTime<Utc>,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryOwnerIndex {
+    selected_paths: HashSet<PathBuf>,
+    omitted_filename_threads: HashSet<String>,
+    /// Paths without a canonical thread UUID in the filename. Keep one extra
+    /// sentinel entry so replay can distinguish an exact bounded set from an
+    /// overflow without traversing the lifetime inventory again.
+    omitted_ambiguous_candidates: Vec<PathBuf>,
+    /// Canonical paths are only content-probe candidates when selected
+    /// filenames cannot themselves establish a trustworthy UUID mapping.
+    omitted_canonical_candidates: Vec<PathBuf>,
 }
 
 /// Reuses parsed rollout files across refreshes while preserving global token
@@ -345,6 +398,9 @@ pub struct RolloutCache {
     last_materialized_active_grace: Option<Duration>,
     last_discovery: Option<DiscoveryState>,
     discovery_cache: Option<DiscoveryCache>,
+    omitted_owner_probes: HashMap<PathBuf, CachedOwnerProbe>,
+    local_coverage_started_at: Option<DateTime<Utc>>,
+    local_coverage_last_complete_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -570,6 +626,7 @@ struct ThreadBuilder {
     active_turn_ids: Vec<String>,
     last_turn_id: Option<String>,
     previous_cumulative: Option<TokenUsage>,
+    incomplete_counter_boundary: bool,
     token_usage: TokenUsage,
     turns: HashMap<String, TurnBuilder>,
 }
@@ -608,6 +665,43 @@ impl RolloutCache {
 
     pub fn metrics(&self) -> RolloutCacheMetrics {
         self.metrics
+    }
+
+    /// Advances the in-process lower bound for continuous, complete local
+    /// rollout observation. A single complete scan proves coverage only from
+    /// the time this cache began observing; it cannot prove that older missing
+    /// rollout files represented zero usage.
+    pub(crate) fn update_local_coverage(
+        &mut self,
+        now: DateTime<Utc>,
+        complete: bool,
+    ) -> Option<DateTime<Utc>> {
+        let discovery_complete = self
+            .discovery_cache
+            .as_ref()
+            .is_some_and(|discovery| discovery.complete);
+        if !complete || !discovery_complete {
+            self.local_coverage_started_at = None;
+            self.local_coverage_last_complete_at = None;
+            return None;
+        }
+        let lookback = self
+            .discovery_cache
+            .as_ref()
+            .and_then(|discovery| ChronoDuration::try_days(discovery.key.lookback_days.max(0)));
+        let coverage_is_continuous =
+            self.local_coverage_last_complete_at
+                .is_some_and(|last_complete_at| {
+                    last_complete_at <= now
+                        && lookback.is_none_or(|lookback| {
+                            now.signed_duration_since(last_complete_at) <= lookback
+                        })
+                });
+        if !coverage_is_continuous {
+            self.local_coverage_started_at = Some(now);
+        }
+        self.local_coverage_last_complete_at = Some(now);
+        self.local_coverage_started_at
     }
 
     fn discover_rollout_files(
@@ -668,7 +762,19 @@ impl RolloutCache {
             .discovery_cache
             .as_ref()
             .expect("discovery always initializes its inventory");
-        select_rollout_files(cache, config, now, dataset)
+        let files = select_rollout_files(cache, config, now, dataset);
+        let selected_paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        if cache.owner_index.selected_paths != selected_paths {
+            let cache = self
+                .discovery_cache
+                .as_mut()
+                .expect("discovery always initializes its inventory");
+            cache.owner_index = build_discovery_owner_index(&cache.inventory, selected_paths);
+        }
+        files
     }
 
     /// Scans recent rollouts, reparsing rollout files and reloading the session
@@ -719,6 +825,9 @@ impl RolloutCache {
             self.last_materialized_active_grace = None;
             self.last_discovery = None;
             self.discovery_cache = None;
+            self.omitted_owner_probes.clear();
+            self.local_coverage_started_at = None;
+            self.local_coverage_last_complete_at = None;
             self.key = Some(key.clone());
         }
 
@@ -745,14 +854,10 @@ impl RolloutCache {
             discovery.stats.truncated_files
         ));
 
-        // Parsing older files first preserves cumulative counter order when a
-        // thread happens to span more than one rollout file.
+        // Parsing itself is file-local. Use a stable path order here, then
+        // derive the semantic replay order from parsed event timestamps below.
         let sort_span = config.startup_trace.span("rollout.sort_selected");
-        files.sort_by(|left, right| {
-            left.modified_at
-                .cmp(&right.modified_at)
-                .then_with(|| left.path.cmp(&right.path))
-        });
+        files.sort_by(|left, right| left.path.cmp(&right.path));
         sort_span.finish_with(|| format!("files={}", files.len()));
 
         let title_span = config.startup_trace.span("rollout.session_titles");
@@ -909,6 +1014,15 @@ impl RolloutCache {
             refresh.stability_retries
         ));
 
+        sort_rollout_files_for_replay(&mut files, &self.files);
+        let replay_plan = build_replay_plan(
+            &files,
+            &self.files,
+            self.discovery_cache.as_ref(),
+            &mut self.omitted_owner_probes,
+            config,
+        );
+
         let cache_save_started = perf_active.then(Instant::now);
         let cache_save_span = config.startup_trace.span("rollout.cache_save");
         let write = self.persist_dirty_files(config, &key, cache_usage);
@@ -987,8 +1101,36 @@ impl RolloutCache {
             &self.files,
             &mut changed_thread_ids,
         );
+        let replay_plan_changed = self.reduced.as_ref().is_none_or(|reduced| {
+            reduced.incomplete_counter_threads != replay_plan.incomplete_counter_threads
+                || reduced.replay_order_warnings != replay_plan.replay_order_warnings
+                || reduced.ambiguous_replay_orders != replay_plan.ambiguous_replay_orders
+        });
+        if let Some(reduced) = self.reduced.as_ref()
+            && replay_plan_changed
+        {
+            changed_thread_ids.extend(
+                reduced
+                    .incomplete_counter_threads
+                    .symmetric_difference(&replay_plan.incomplete_counter_threads)
+                    .cloned(),
+            );
+            let changed_order_paths = reduced
+                .replay_order_warnings
+                .keys()
+                .chain(replay_plan.replay_order_warnings.keys())
+                .collect::<HashSet<_>>();
+            changed_thread_ids.extend(changed_order_paths.into_iter().filter_map(|path| {
+                self.files
+                    .get(path)
+                    .and_then(|cached| cached.parsed.owner_thread_id.clone())
+            }));
+        }
         let selected_changed = selected != self.selected;
-        let must_rebuild = self.reduced.is_none() || selected_changed || refresh.reparsed_files > 0;
+        let must_rebuild = self.reduced.is_none()
+            || selected_changed
+            || refresh.reparsed_files > 0
+            || replay_plan_changed;
 
         let reduce_started = perf_active.then(Instant::now);
         let reduce_span = config.startup_trace.span("rollout.reduce");
@@ -1000,10 +1142,16 @@ impl RolloutCache {
                     &files,
                     &self.files,
                     config,
+                    &replay_plan,
                 );
                 refresh.incrementally_reduced_threads = changed_thread_ids.len();
             } else {
-                self.reduced = Some(reduce_cached_files(&files, &self.files, config));
+                self.reduced = Some(reduce_cached_files(
+                    &files,
+                    &self.files,
+                    config,
+                    &replay_plan,
+                ));
                 refresh.full_rebuild = true;
             }
             refresh.rebuilt = true;
@@ -1039,6 +1187,10 @@ impl RolloutCache {
             .retain(|path, _| selected_paths.contains(path.as_path()));
         self.dirty_files
             .retain(|path| selected_paths.contains(path.as_path()));
+        if let Some(discovery_cache) = self.discovery_cache.as_ref() {
+            self.omitted_owner_probes
+                .retain(|path, _| discovery_cache.inventory.contains_key(path));
+        }
         let discovery_state = DiscoveryState {
             stats: discovery.stats.clone(),
             warnings: discovery.warnings.clone(),
@@ -1047,6 +1199,10 @@ impl RolloutCache {
         let title_changed = !config.redact_content && !refresh.session_index_reused;
         let freshness_changed = self.last_materialized_at.is_some_and(|last| last > now)
             || self.last_materialized_active_grace != Some(config.active_grace)
+            || (self.local_coverage_started_at.is_some()
+                && self
+                    .last_materialized_at
+                    .is_some_and(|last| crossed_local_coverage_bucket(last, now)))
             || self.last_materialized_at.is_some_and(|last| {
                 crossed_freshness_deadline(
                     self.reduced
@@ -1579,12 +1735,276 @@ fn stable_hash(parts: &[&[u8]]) -> u64 {
     hash
 }
 
+fn sort_rollout_files_for_replay(files: &mut [RolloutFile], cache: &HashMap<PathBuf, CachedFile>) {
+    files.sort_by(|left, right| {
+        let left_started_at = cache
+            .get(&left.path)
+            .and_then(|cached| cached.parsed.replay_started_at);
+        let right_started_at = cache
+            .get(&right.path)
+            .and_then(|cached| cached.parsed.replay_started_at);
+        match (left_started_at, right_started_at) {
+            (Some(left_started_at), Some(right_started_at)) => left_started_at
+                .cmp(&right_started_at)
+                .then_with(|| left.path.cmp(&right.path)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.path.cmp(&right.path),
+        }
+    });
+}
+
+fn build_replay_plan(
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    discovery: Option<&DiscoveryCache>,
+    owner_probes: &mut HashMap<PathBuf, CachedOwnerProbe>,
+    config: &CollectConfig,
+) -> ReplayPlan {
+    let mut plan = ReplayPlan::default();
+    let mut files_by_thread = HashMap::<String, Vec<&RolloutFile>>::new();
+    let mut selected_owner_uncertain = false;
+    for file in files {
+        let Some(parsed) = cache.get(&file.path).map(|cached| &cached.parsed) else {
+            selected_owner_uncertain = true;
+            continue;
+        };
+        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
+            continue;
+        }
+        if let Some(thread_id) = parsed.owner_thread_id.as_ref() {
+            files_by_thread
+                .entry(thread_id.clone())
+                .or_default()
+                .push(file);
+            if !parsed.complete || parsed.skipped_lines > 0 || parsed.unreadable_files > 0 {
+                plan.incomplete_counter_threads.insert(thread_id.clone());
+            }
+        } else {
+            selected_owner_uncertain = true;
+        }
+    }
+
+    for (thread_id, thread_files) in &files_by_thread {
+        if thread_files.len() < 2 {
+            continue;
+        }
+        let mut previous_end = None;
+        let mut ambiguous = false;
+        for file in thread_files {
+            let parsed = &cache
+                .get(&file.path)
+                .expect("replay plan only groups cached files")
+                .parsed;
+            if !parsed.replay_timestamps_complete {
+                ambiguous = true;
+                break;
+            }
+            let Some(started_at) = parsed.replay_started_at else {
+                ambiguous = true;
+                break;
+            };
+            let Some(updated_at) = parsed.replay_updated_at else {
+                ambiguous = true;
+                break;
+            };
+            if previous_end.is_some_and(|previous_end| previous_end >= started_at) {
+                ambiguous = true;
+                break;
+            }
+            previous_end = Some(updated_at);
+        }
+        if ambiguous {
+            let path = thread_files[0].path.clone();
+            plan.incomplete_counter_threads.insert(thread_id.clone());
+            plan.replay_order_warnings.insert(
+                path.clone(),
+                vec![format!(
+                    "could not establish a non-overlapping content timestamp order for thread {thread_id}; replayed its rollout files in a stable fallback order"
+                )],
+            );
+            plan.ambiguous_replay_orders.insert(path, 1);
+        }
+    }
+
+    let selected_threads = files_by_thread.keys().cloned().collect::<HashSet<_>>();
+    if selected_owner_uncertain {
+        plan.incomplete_counter_threads
+            .extend(selected_threads.iter().cloned());
+    }
+    let Some(discovery) = discovery else {
+        return plan;
+    };
+    if !discovery.complete || discovery.unreadable_files > 0 {
+        plan.incomplete_counter_threads
+            .extend(selected_threads.iter().cloned());
+    }
+    let selected_filenames_are_trustworthy = !selected_threads.is_empty()
+        && selected_threads.iter().all(|thread_id| {
+            files_by_thread.get(thread_id).is_some_and(|thread_files| {
+                thread_files
+                    .iter()
+                    .any(|file| rollout_filename_thread_id(&file.path) == Some(thread_id.as_str()))
+            })
+        });
+    let mut owner_uncertain = false;
+    let mut owner_probe_reads = 0_usize;
+    for thread_id in &selected_threads {
+        if discovery
+            .owner_index
+            .omitted_filename_threads
+            .contains(thread_id)
+        {
+            plan.incomplete_counter_threads.insert(thread_id.clone());
+        }
+    }
+    let candidate_paths = if selected_filenames_are_trustworthy {
+        discovery
+            .owner_index
+            .omitted_ambiguous_candidates
+            .iter()
+            .take(OWNER_PROBE_MAX_FILES_PER_SCAN + 1)
+            .collect::<Vec<_>>()
+    } else {
+        discovery
+            .owner_index
+            .omitted_ambiguous_candidates
+            .iter()
+            .chain(discovery.owner_index.omitted_canonical_candidates.iter())
+            .take(OWNER_PROBE_MAX_FILES_PER_SCAN + 1)
+            .collect::<Vec<_>>()
+    };
+    let mut omitted_files =
+        Vec::with_capacity(candidate_paths.len().min(OWNER_PROBE_MAX_FILES_PER_SCAN));
+    if candidate_paths.len() > OWNER_PROBE_MAX_FILES_PER_SCAN {
+        owner_uncertain = true;
+    } else {
+        for path in candidate_paths {
+            match discovery.inventory.get(path) {
+                Some(file) => omitted_files.push(file),
+                None => {
+                    owner_uncertain = true;
+                    break;
+                }
+            }
+        }
+    }
+    omitted_files.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for omitted in omitted_files {
+        if plan.incomplete_counter_threads.len() == selected_threads.len() {
+            break;
+        }
+        let probe = match owner_probes.get(&omitted.path) {
+            Some(cached) if cached.fingerprint == omitted.fingerprint => cached.result.clone(),
+            _ => {
+                if owner_probe_reads >= OWNER_PROBE_MAX_FILES_PER_SCAN {
+                    owner_uncertain = true;
+                    break;
+                }
+                owner_probe_reads += 1;
+                let result = probe_rollout_owner(omitted);
+                owner_probes.insert(
+                    omitted.path.clone(),
+                    CachedOwnerProbe {
+                        fingerprint: omitted.fingerprint.clone(),
+                        result: result.clone(),
+                    },
+                );
+                result
+            }
+        };
+        match probe {
+            OwnerProbe::Found(thread_id) if selected_threads.contains(&thread_id) => {
+                plan.incomplete_counter_threads.insert(thread_id);
+            }
+            OwnerProbe::Uncertain => owner_uncertain = true,
+            OwnerProbe::Found(_) | OwnerProbe::NoOwner => {}
+        }
+    }
+    if owner_uncertain {
+        // If an omitted file cannot be identified, no selected thread can
+        // safely claim its first cumulative counter started at zero.
+        plan.incomplete_counter_threads.extend(selected_threads);
+    }
+    plan
+}
+
+fn rollout_filename_thread_id(path: &Path) -> Option<&str> {
+    let stem = path.file_stem()?.to_str()?;
+    let start = stem.len().checked_sub(36)?;
+    let candidate = stem.get(start..)?;
+    let bytes = candidate.as_bytes();
+    if bytes.len() != 36 {
+        return None;
+    }
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return None;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+    }
+    Some(candidate)
+}
+
+fn probe_rollout_owner(file: &RolloutFile) -> OwnerProbe {
+    let handle = match File::open(&file.path) {
+        Ok(handle) => handle,
+        Err(_) => return OwnerProbe::Uncertain,
+    };
+    let mut reader = BufReader::new(handle).take(OWNER_PROBE_MAX_BYTES);
+    let mut line = String::new();
+    for _ in 0..OWNER_PROBE_MAX_LINES {
+        line.clear();
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(_) => return OwnerProbe::Uncertain,
+        };
+        if read == 0 {
+            return if reader.limit() == 0 {
+                OwnerProbe::Uncertain
+            } else {
+                OwnerProbe::NoOwner
+            };
+        }
+        let Ok(Value::Object(record)) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if string_field_in(&record, &["type"]) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(thread_id) = string_field_in(payload, &["id"])
+            .map(str::trim)
+            .filter(|thread_id| !thread_id.is_empty())
+        {
+            return OwnerProbe::Found(thread_id.to_owned());
+        }
+    }
+    OwnerProbe::Uncertain
+}
+
 fn reduce_cached_files(
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
+    replay_plan: &ReplayPlan,
 ) -> ReducedRollouts {
-    let mut reduced = ReducedRollouts::default();
+    let mut reduced = ReducedRollouts {
+        incomplete_counter_threads: replay_plan.incomplete_counter_threads.clone(),
+        replay_order_warnings: replay_plan.replay_order_warnings.clone(),
+        ambiguous_replay_orders: replay_plan.ambiguous_replay_orders.clone(),
+        ..ReducedRollouts::default()
+    };
     for file in files {
         let Some(cached) = cache.get(&file.path) else {
             continue;
@@ -1637,6 +2057,7 @@ fn incrementally_reduce_cached_files(
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
+    replay_plan: &ReplayPlan,
 ) {
     for thread_id in changed_thread_ids {
         reduced.threads.remove(thread_id);
@@ -1668,6 +2089,9 @@ fn incrementally_reduce_cached_files(
                 .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
                 .is_none_or(|thread_id| !changed_thread_ids.contains(thread_id))
     });
+    reduced.incomplete_counter_threads = replay_plan.incomplete_counter_threads.clone();
+    reduced.replay_order_warnings = replay_plan.replay_order_warnings.clone();
+    reduced.ambiguous_replay_orders = replay_plan.ambiguous_replay_orders.clone();
 
     for file in files {
         let Some(cached) = cache.get(&file.path) else {
@@ -1693,6 +2117,18 @@ fn replay_file_into_reduced(
     parsed: &ParsedFile,
     config: &CollectConfig,
 ) {
+    if let Some(thread_id) = parsed.owner_thread_id.as_ref()
+        && !reduced.threads.contains_key(thread_id)
+    {
+        reduced.threads.insert(
+            thread_id.clone(),
+            ThreadBuilder {
+                thread_id: thread_id.clone(),
+                incomplete_counter_boundary: reduced.incomplete_counter_threads.contains(thread_id),
+                ..ThreadBuilder::default()
+            },
+        );
+    }
     let mut replay = RolloutDataset::default();
     replay_rollout_file(
         &file.path,
@@ -1738,8 +2174,16 @@ fn rebuild_reduced_metadata(
         if let Some(warnings) = reduced.replay_warnings.get(&file.path) {
             reduced.dataset.warnings.extend(warnings.clone());
         }
+        if let Some(warnings) = reduced.replay_order_warnings.get(&file.path) {
+            reduced.dataset.warnings.extend(warnings.clone());
+        }
         reduced.dataset.stats.ambiguous_token_resets += reduced
             .ambiguous_token_resets
+            .get(&file.path)
+            .copied()
+            .unwrap_or_default();
+        reduced.dataset.stats.ambiguous_token_resets += reduced
+            .ambiguous_replay_orders
             .get(&file.path)
             .copied()
             .unwrap_or_default();
@@ -1811,6 +2255,13 @@ fn crossed_freshness_deadline(
                     .is_some_and(|deadline| deadline >= last_materialized_at && deadline < now)
             })
     })
+}
+
+fn crossed_local_coverage_bucket(last_materialized_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    last_materialized_at
+        .timestamp()
+        .div_euclid(LOCAL_COVERAGE_BUCKET_SECONDS)
+        != now.timestamp().div_euclid(LOCAL_COVERAGE_BUCKET_SECONDS)
 }
 
 fn discover_rollout_inventory(
@@ -1937,9 +2388,12 @@ fn discover_rollout_inventory(
         }
     }
 
+    let selected_paths = selected_rollout_inventory_paths(&inventory, config, now);
+    let owner_index = build_discovery_owner_index(&inventory, selected_paths);
     DiscoveryCache {
         key: key.clone(),
         inventory,
+        owner_index,
         directories,
         roots: root_fingerprints,
         warnings,
@@ -1947,6 +2401,66 @@ fn discover_rollout_inventory(
         complete,
         full_scan_at: Instant::now(),
         logical_now: now,
+    }
+}
+
+fn selected_rollout_inventory_paths(
+    inventory: &HashMap<PathBuf, RolloutFile>,
+    config: &CollectConfig,
+    now: DateTime<Utc>,
+) -> HashSet<PathBuf> {
+    let lookback_days = config.lookback_days.max(0);
+    let cutoff = ChronoDuration::try_days(lookback_days)
+        .and_then(|lookback| now.checked_sub_signed(lookback))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let mut files = inventory
+        .values()
+        .filter(|file| file.modified_at >= cutoff)
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    files
+        .into_iter()
+        .take(config.max_files)
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn build_discovery_owner_index(
+    inventory: &HashMap<PathBuf, RolloutFile>,
+    selected_paths: HashSet<PathBuf>,
+) -> DiscoveryOwnerIndex {
+    let mut index = DiscoveryOwnerIndex {
+        selected_paths,
+        ..DiscoveryOwnerIndex::default()
+    };
+    for file in inventory.values() {
+        if index.selected_paths.contains(&file.path) {
+            continue;
+        }
+        if let Some(thread_id) = rollout_filename_thread_id(&file.path) {
+            index.omitted_filename_threads.insert(thread_id.to_owned());
+            push_bounded_owner_candidate(
+                &mut index.omitted_canonical_candidates,
+                file.path.clone(),
+            );
+        } else {
+            push_bounded_owner_candidate(
+                &mut index.omitted_ambiguous_candidates,
+                file.path.clone(),
+            );
+        }
+    }
+    index
+}
+
+fn push_bounded_owner_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if candidates.len() <= OWNER_PROBE_MAX_FILES_PER_SCAN {
+        candidates.push(path);
     }
 }
 
@@ -2258,7 +2772,15 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
         }
     };
 
-    parse_rollout_reader(file, config, ParsedFile::default(), BufReader::new(handle))
+    parse_rollout_reader(
+        file,
+        config,
+        ParsedFile {
+            replay_timestamps_complete: true,
+            ..ParsedFile::default()
+        },
+        BufReader::new(handle),
+    )
 }
 
 fn parse_rollout_reader<R: BufRead>(
@@ -2309,9 +2831,8 @@ fn parse_rollout_reader<R: BufRead>(
         parsed.parsed_lines += 1;
 
         let record_type = string_field(&record, &["type"]);
-        let timestamp = value_at(&record, &["timestamp"])
-            .and_then(parse_timestamp)
-            .unwrap_or(file.modified_at);
+        let explicit_timestamp = value_at(&record, &["timestamp"]).and_then(parse_timestamp);
+        let timestamp = explicit_timestamp.unwrap_or(file.modified_at);
 
         if record_type == Some("session_meta") {
             let Some(payload) = object_at(&record, &["payload"]) else {
@@ -2336,6 +2857,14 @@ fn parse_rollout_reader<R: BufRead>(
                     replaying_foreign_history = is_forked_session(payload);
                     inherit_foreign_thread_settings =
                         inherits_plain_thread_spawn_settings(payload, owning_thread_id.as_deref());
+                    let stable_timestamp = explicit_timestamp
+                        .or_else(|| payload.get("timestamp").and_then(parse_timestamp));
+                    if let Some(stable_timestamp) = stable_timestamp {
+                        set_min_timestamp(&mut parsed.replay_started_at, stable_timestamp);
+                        set_max_timestamp(&mut parsed.replay_updated_at, stable_timestamp);
+                    } else {
+                        parsed.replay_timestamps_complete = false;
+                    }
                     parsed.events.push(ParsedEvent::SessionMeta {
                         timestamp,
                         payload: projected_payload(
@@ -2357,6 +2886,14 @@ fn parse_rollout_reader<R: BufRead>(
                 }
                 Some(owner) if owner == thread_id => {
                     replaying_foreign_history = false;
+                    let stable_timestamp = explicit_timestamp
+                        .or_else(|| payload.get("timestamp").and_then(parse_timestamp));
+                    if let Some(stable_timestamp) = stable_timestamp {
+                        set_min_timestamp(&mut parsed.replay_started_at, stable_timestamp);
+                        set_max_timestamp(&mut parsed.replay_updated_at, stable_timestamp);
+                    } else {
+                        parsed.replay_timestamps_complete = false;
+                    }
                     parsed.events.push(ParsedEvent::SessionMeta {
                         timestamp,
                         payload: projected_payload(
@@ -2426,6 +2963,15 @@ fn parse_rollout_reader<R: BufRead>(
                 }
                 continue;
             }
+        }
+        if let Some(explicit_timestamp) = explicit_timestamp {
+            set_min_timestamp(&mut parsed.replay_started_at, explicit_timestamp);
+            set_max_timestamp(&mut parsed.replay_updated_at, explicit_timestamp);
+        } else if matches!(
+            record_type,
+            Some("turn_context" | "event_msg" | "response_item")
+        ) {
+            parsed.replay_timestamps_complete = false;
         }
         set_max_timestamp(&mut parsed.activity_updated_at, timestamp);
 
@@ -2874,6 +3420,7 @@ fn replay_rollout_file(
             }
             ParsedEvent::ForeignCounterBaseline(total_usage) => {
                 thread.previous_cumulative = Some(*total_usage);
+                thread.incomplete_counter_boundary = false;
             }
             ParsedEvent::ForeignThreadSettingsBaseline {
                 model,
@@ -3160,6 +3707,27 @@ fn apply_token_count(
     };
 
     let delta = match thread.previous_cumulative {
+        None if thread.incomplete_counter_boundary => {
+            thread.incomplete_counter_boundary = false;
+            thread.previous_cumulative = Some(total_usage);
+            if usage.last == Some(total_usage) {
+                total_usage
+            } else {
+                dataset.warnings.push(format!(
+                    "token counter baseline for thread {} is outside the selected rollout boundary at {} line {line_number}; counted only the explicitly reported last request, when valid, and did not attribute the unknown cumulative gap",
+                    thread.thread_id,
+                    path.display()
+                ));
+                dataset.stats.ambiguous_token_resets += 1;
+                let Some(last_usage) = usage
+                    .last
+                    .filter(|last_usage| total_usage.delta_from(*last_usage).is_some())
+                else {
+                    return;
+                };
+                last_usage
+            }
+        }
         None => total_usage,
         Some(previous) if previous == total_usage => return,
         Some(_) if usage.last == Some(total_usage) => total_usage,

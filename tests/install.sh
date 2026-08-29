@@ -62,6 +62,10 @@ done
 
 cat > "$mock_bin/uname" <<'EOF'
 #!/bin/sh
+if [ -n "${MOCK_ENV_LOG:-}" ]; then
+    printf 'ZDOTDIR=%s\nENV=%s\nBASH_ENV=%s\n' \
+        "${ZDOTDIR:-}" "${ENV:-}" "${BASH_ENV:-}" >> "$MOCK_ENV_LOG"
+fi
 case "${1:-}" in
     -s) printf '%s\n' "$MOCK_UNAME_S" ;;
     -m) printf '%s\n' "$MOCK_UNAME_M" ;;
@@ -120,12 +124,16 @@ mock_uname_m=arm64
 mock_shell=/bin/zsh
 mock_signal_asset=
 mock_mv_fail_dest=
+mock_env_log=
 
 run_installer() {
     test_home=$1
     shift
     mkdir -p "$test_home"
     HOME="$test_home" \
+    ZDOTDIR="$test_home" \
+    ENV= \
+    BASH_ENV= \
     SHELL="$mock_shell" \
     TMPDIR="$temp_dir" \
     PATH="$mock_bin:$SYSTEM_PATH" \
@@ -135,9 +143,32 @@ run_installer() {
     MOCK_UNAME_M="$mock_uname_m" \
     MOCK_SIGNAL_ASSET="$mock_signal_asset" \
     MOCK_MV_FAIL_DEST="$mock_mv_fail_dest" \
+    MOCK_ENV_LOG="$mock_env_log" \
     REAL_MV="$REAL_MV" \
         sh "$INSTALLER" "$@"
 }
+
+outside_zdotdir="$TEST_ROOT/outside-zdotdir"
+isolated_home="$TEST_ROOT/home-isolated-environment"
+inherited_shell_hook="$TEST_ROOT/inherited-shell-hook"
+environment_log="$TEST_ROOT/installer-environment.log"
+mkdir -p "$outside_zdotdir"
+printf 'export KEEP_REAL_PROFILE=yes\n' > "$outside_zdotdir/.zshrc"
+printf 'exit 97\n' > "$inherited_shell_hook"
+: > "$environment_log"
+mock_env_log=$environment_log
+ZDOTDIR="$outside_zdotdir" \
+ENV="$inherited_shell_hook" \
+BASH_ENV="$inherited_shell_hook" \
+    run_installer "$isolated_home" >/dev/null
+mock_env_log=
+assert_file_contains "$isolated_home/.zshrc" "# codex-usage-monit installer"
+[ "$(cat "$outside_zdotdir/.zshrc")" = "export KEEP_REAL_PROFILE=yes" ] \
+    || fail "inherited ZDOTDIR changed a profile outside the test home"
+assert_file_contains "$environment_log" "ZDOTDIR=$isolated_home"
+if grep -F "$inherited_shell_hook" "$environment_log" >/dev/null 2>&1; then
+    fail "inherited ENV or BASH_ENV reached the installer"
+fi
 
 home="$TEST_ROOT/home-default"
 mkdir -p "$home"

@@ -18,7 +18,7 @@ use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_mode
 use crate::domain::{ApiCostAmount, LimitBucket, Provenance, TaskRecord, TokenUsage, UsageCall};
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
-pub const HISTORY_METRIC_REVISION: u32 = 3;
+pub const HISTORY_METRIC_REVISION: u32 = 4;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
 pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 1;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
@@ -1484,15 +1484,31 @@ fn weekly_local_points_from_sources(
     }
 
     let last_bucket = floor_weekly_sample(observed_at);
-    let materialize_zeros = local_coverage_starts_at.is_some();
-    let first_bucket = local_coverage_starts_at
-        .map(|coverage| floor_weekly_sample(coverage.max(starts_at)))
-        .or(first_call_bucket)
-        .unwrap_or(last_bucket);
-    if materialize_zeros {
-        let mut bucket_starts_at = first_bucket;
+    let coverage_starts_within_cycle =
+        local_coverage_starts_at.is_some_and(|coverage| coverage > starts_at);
+    let coverage_starts_at = local_coverage_starts_at.map(|coverage| coverage.max(starts_at));
+    let first_coverage_bucket = coverage_starts_at.map(floor_weekly_sample);
+    let first_bucket = match (first_call_bucket, first_coverage_bucket) {
+        (Some(call), Some(coverage)) => call.min(coverage),
+        (Some(call), None) => call,
+        (None, Some(coverage)) => coverage,
+        (None, None) => last_bucket,
+    };
+    if let Some(first_coverage_bucket) = first_coverage_bucket {
+        // A live recorder can prove zero usage only from the point at which it
+        // began observing. Keep older call-backed samples, but do not fill the
+        // unknown gap between those calls and prospective coverage with zeros.
+        let mut bucket_starts_at = first_coverage_bucket;
         while bucket_starts_at <= last_bucket {
-            buckets.entry(bucket_starts_at).or_default();
+            let bucket = buckets.entry(bucket_starts_at).or_default();
+            if bucket_starts_at == first_coverage_bucket
+                && coverage_starts_within_cycle
+                && coverage_starts_at.is_some_and(|coverage| coverage > first_coverage_bucket)
+            {
+                bucket
+                    .partial_reasons
+                    .insert("coverage_starts_within_local_bucket".to_string());
+            }
             bucket_starts_at += Duration::seconds(WEEKLY_SAMPLE_SECS);
         }
     } else {
@@ -1505,6 +1521,13 @@ fn weekly_local_points_from_sources(
     let mut long_context_usage_unknown = false;
     let mut call_count = 0_u64;
     let mut reasons = partial_reasons.iter().cloned().collect::<BTreeSet<_>>();
+    if coverage_starts_within_cycle {
+        // A prospective recorder cannot prove the reset-to-coverage prefix was
+        // zero. Every cumulative point in this window is therefore a lower
+        // bound, including call-backed points before coverage and samples
+        // emitted after an exactly aligned coverage boundary.
+        reasons.insert("rollout_local_coverage_unverified".to_string());
+    }
     if provenance != Provenance::ServerSnapshot {
         reasons.insert("weekly_window_stale".to_string());
     }
@@ -1669,6 +1692,17 @@ fn local_buckets_from_calls(
     if let Some(coverage_starts_at) =
         local_coverage_starts_at.filter(|starts_at| *starts_at <= observed_at)
     {
+        // Keep concrete calls that predate prospective coverage, but label
+        // those buckets as lower bounds. Mark only call-backed buckets here;
+        // the synthesized leading coverage bucket retains the more precise
+        // within-bucket edge reason below.
+        for (starts_at, bucket) in &mut buckets {
+            if *starts_at < coverage_starts_at {
+                bucket
+                    .partial_reasons
+                    .insert("rollout_local_coverage_unverified".to_string());
+            }
+        }
         let first_bucket = floor_local_bucket(coverage_starts_at);
         let last_bucket = floor_local_bucket(observed_at);
         let mut starts_at = first_bucket;
@@ -2052,12 +2086,42 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
         return ShardRead::FutureMetric(shard.metric_revision);
     }
 
+    let source_metric_revision = shard.metric_revision;
     let mut migrated = false;
     if version == LEGACY_HISTORY_FORMAT_VERSION || shard.metric_revision < 2 {
         // Revision 1 local buckets were 30-minute aggregates. They cannot be
-        // split honestly, so preserve quota and weekly cumulative history while
-        // letting retained rollout events rebuild local buckets at 15 minutes.
+        // split honestly, so let retained rollout events rebuild local buckets
+        // at 15 minutes.
         shard.half_hour_buckets.clear();
+        migrated = true;
+    }
+    if source_metric_revision < 4 {
+        // Revisions 1-3 treated a complete filesystem walk as proof of zero
+        // usage throughout the entire lookback. Once rollout files have been
+        // deleted there is no way to distinguish those synthetic zeros from
+        // genuinely observed prospective zeros. Revision 1 buckets were
+        // already removed above; for revisions 2-3 preserve only buckets with
+        // concrete call/project/usage evidence. Old weekly points are
+        // cumulative, so an unchanged plateau cannot be distinguished from a
+        // call-backed sample; discard them and let retained evidence rebuild.
+        if source_metric_revision >= 2 {
+            shard
+                .half_hour_buckets
+                .retain(local_bucket_has_call_evidence);
+            for bucket in &mut shard.half_hour_buckets {
+                if !bucket
+                    .partial_reasons
+                    .iter()
+                    .any(|reason| reason == "rollout_local_coverage_unverified")
+                {
+                    bucket
+                        .partial_reasons
+                        .push("rollout_local_coverage_unverified".to_string());
+                    bucket.partial_reasons.sort();
+                }
+            }
+        }
+        shard.weekly_local_points.clear();
         migrated = true;
     }
     if shard.metric_revision < HISTORY_METRIC_REVISION {
@@ -2088,6 +2152,17 @@ fn is_current_local_bucket(bucket: &LocalHalfHourBucket) -> bool {
         && floor_local_bucket(bucket.starts_at) == bucket.starts_at
         && bucket.sampled_at >= bucket.starts_at
         && bucket.sampled_at <= bucket.ends_at
+}
+
+fn local_bucket_has_call_evidence(bucket: &LocalHalfHourBucket) -> bool {
+    bucket.call_count > 0
+        || !bucket.token_usage.is_zero()
+        || bucket.estimated_cost_units > 0
+        || bucket
+            .api_long_context_extra_cost_units
+            .is_some_and(|units| units > 0)
+        || !bucket.groups.is_empty()
+        || !bucket.project_groups.is_empty()
 }
 
 fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
@@ -2140,6 +2215,25 @@ fn upsert_half_hour_bucket(
                 return true;
             }
             return false;
+        }
+        let existing_strictly_dominates = bucket_evidence_dominates(&buckets[index], &incoming)
+            && !bucket_evidence_dominates(&incoming, &buckets[index]);
+        if existing_strictly_dominates
+            && incoming.sampled_at > buckets[index].sampled_at
+            && has_coverage_issue(&incoming.partial_reasons)
+            && (coverage_issue_state_differs(
+                &incoming.partial_reasons,
+                &buckets[index].partial_reasons,
+            ) || incoming.sampled_at == incoming.ends_at)
+        {
+            // A restart can reconstruct fewer calls than a prior process while
+            // still providing newer evidence that coverage was discontinuous.
+            // Preserve the stronger counters, but advance closure and attach
+            // the newer gap so the old exact sample cannot survive unqualified.
+            let existing = &mut buckets[index];
+            existing.sampled_at = incoming.sampled_at;
+            merge_coverage_issues(&mut existing.partial_reasons, &incoming.partial_reasons);
+            return true;
         }
         if project_breakdown_can_upgrade_without_replacing(&incoming, &buckets[index]) {
             let existing = &mut buckets[index];
@@ -2342,6 +2436,21 @@ fn upsert_weekly_local_point(
         if weekly_local_point_payload_eq(&incoming, &points[index]) {
             return false;
         }
+        let existing_strictly_dominates = weekly_evidence_dominates(&points[index], &incoming)
+            && !weekly_evidence_dominates(&incoming, &points[index]);
+        if existing_strictly_dominates
+            && incoming.observed_at > points[index].observed_at
+            && has_coverage_issue(&incoming.partial_reasons)
+            && coverage_issue_state_differs(
+                &incoming.partial_reasons,
+                &points[index].partial_reasons,
+            )
+        {
+            let existing = &mut points[index];
+            existing.observed_at = incoming.observed_at;
+            merge_coverage_issues(&mut existing.partial_reasons, &incoming.partial_reasons);
+            return true;
+        }
         if should_replace_weekly_local_point(&incoming, &points[index]) {
             points[index] = incoming;
             return true;
@@ -2361,8 +2470,23 @@ fn upsert_weekly_local_point(
             }
             return false;
         }
+        let latest_strictly_dominates = weekly_evidence_dominates(latest, &incoming)
+            && !weekly_evidence_dominates(&incoming, latest);
+        if latest_strictly_dominates
+            && incoming.observed_at > latest.observed_at
+            && has_coverage_issue(&incoming.partial_reasons)
+            && coverage_issue_state_differs(&incoming.partial_reasons, &latest.partial_reasons)
+        {
+            let mut merged = latest.clone();
+            merged.observed_at = incoming.observed_at;
+            merge_coverage_issues(&mut merged.partial_reasons, &incoming.partial_reasons);
+            points.push(merged);
+            return true;
+        }
         if incoming.observed_at > latest.observed_at
             && weekly_point_can_suppress_later(latest, &incoming)
+            && !(weekly_local_point_evidence_eq(latest, &incoming)
+                && coverage_issue_state_differs(&latest.partial_reasons, &incoming.partial_reasons))
             && collection_issue_count(&latest.partial_reasons)
                 <= collection_issue_count(&incoming.partial_reasons)
         {
@@ -2383,6 +2507,10 @@ fn quota_point_payload_eq(left: &QuotaPoint, right: &QuotaPoint) -> bool {
 }
 
 fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHourBucket) -> bool {
+    half_hour_bucket_evidence_eq(left, right) && left.partial_reasons == right.partial_reasons
+}
+
+fn half_hour_bucket_evidence_eq(left: &LocalHalfHourBucket, right: &LocalHalfHourBucket) -> bool {
     left.starts_at == right.starts_at
         && left.ends_at == right.ends_at
         && left.token_usage == right.token_usage
@@ -2395,10 +2523,13 @@ fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHour
         && left.call_count == right.call_count
         && left.groups == right.groups
         && left.project_groups == right.project_groups
-        && left.partial_reasons == right.partial_reasons
 }
 
 fn weekly_local_point_payload_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoint) -> bool {
+    weekly_local_point_evidence_eq(left, right) && left.partial_reasons == right.partial_reasons
+}
+
+fn weekly_local_point_evidence_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoint) -> bool {
     left.resets_at == right.resets_at
         && left.token_usage == right.token_usage
         && left.estimated_cost_units == right.estimated_cost_units
@@ -2406,13 +2537,22 @@ fn weekly_local_point_payload_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoi
         && left.long_context_usage_unknown == right.long_context_usage_unknown
         && left.estimator_revision == right.estimator_revision
         && left.call_count == right.call_count
-        && left.partial_reasons == right.partial_reasons
 }
 
 fn should_replace_half_hour_bucket(
     incoming: &LocalHalfHourBucket,
     existing: &LocalHalfHourBucket,
 ) -> bool {
+    if half_hour_bucket_evidence_eq(incoming, existing)
+        && coverage_issue_state_differs(&incoming.partial_reasons, &existing.partial_reasons)
+        && incoming.sampled_at != existing.sampled_at
+    {
+        // Prospective coverage quality is itself time-varying evidence. A
+        // newer observation may reveal a restart gap even when its counters
+        // are identical to an older exact open bucket; conversely, an older
+        // exact writer must not erase a newer partial/closed observation.
+        return incoming.sampled_at > existing.sampled_at;
+    }
     if incoming.estimator_revision != existing.estimator_revision {
         return incoming.estimator_revision > existing.estimator_revision
             && bucket_unweighted_evidence_dominates(incoming, existing)
@@ -2446,6 +2586,12 @@ fn should_replace_weekly_local_point(
     incoming: &WeeklyLocalPoint,
     existing: &WeeklyLocalPoint,
 ) -> bool {
+    if weekly_local_point_evidence_eq(incoming, existing)
+        && coverage_issue_state_differs(&incoming.partial_reasons, &existing.partial_reasons)
+        && incoming.observed_at != existing.observed_at
+    {
+        return incoming.observed_at > existing.observed_at;
+    }
     if incoming.estimator_revision != existing.estimator_revision {
         return incoming.estimator_revision > existing.estimator_revision
             && weekly_unweighted_evidence_dominates(incoming, existing)
@@ -2478,7 +2624,44 @@ fn collection_issue_count(partial_reasons: &[String]) -> usize {
 }
 
 fn is_collection_issue_reason(reason: &str) -> bool {
-    reason.starts_with("rollout_") || reason == "local_scan_disabled"
+    reason.starts_with("rollout_")
+        || reason == "coverage_starts_within_local_bucket"
+        || reason == "local_scan_disabled"
+}
+
+fn coverage_issue_state_differs(left: &[String], right: &[String]) -> bool {
+    [
+        "rollout_local_coverage_unverified",
+        "coverage_starts_within_local_bucket",
+    ]
+    .into_iter()
+    .any(|reason| {
+        left.iter().any(|value| value == reason) != right.iter().any(|value| value == reason)
+    })
+}
+
+fn has_coverage_issue(reasons: &[String]) -> bool {
+    reasons
+        .iter()
+        .any(|reason| is_coverage_issue_reason(reason))
+}
+
+fn is_coverage_issue_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "rollout_local_coverage_unverified" | "coverage_starts_within_local_bucket"
+    )
+}
+
+fn merge_coverage_issues(existing: &mut Vec<String>, incoming: &[String]) {
+    existing.extend(
+        incoming
+            .iter()
+            .filter(|reason| is_coverage_issue_reason(reason))
+            .cloned(),
+    );
+    existing.sort();
+    existing.dedup();
 }
 
 fn bucket_evidence_dominates(candidate: &LocalHalfHourBucket, other: &LocalHalfHourBucket) -> bool {
@@ -3584,6 +3767,98 @@ mod tests {
     }
 
     #[test]
+    fn prospective_coverage_preserves_older_calls_without_filling_the_unknown_gap() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let observation = HistoryObservation::from_sources_with_coverage(
+            now,
+            &[call(at(2026, 7, 28, 9, 5, 0), "gpt-5.4", None, 10)],
+            &[bucket(now, Provenance::ServerSnapshot, "codex")],
+            &[],
+            Some(at(2026, 7, 28, 11, 50, 0)),
+        );
+
+        assert_eq!(
+            observation
+                .weekly_local_points
+                .iter()
+                .map(|point| (point.observed_at, point.token_usage.total_tokens))
+                .collect::<Vec<_>>(),
+            vec![
+                (at(2026, 7, 28, 9, 30, 0), 10),
+                (at(2026, 7, 28, 12, 0, 0), 10),
+                (now, 10),
+            ]
+        );
+        assert_eq!(
+            observation.weekly_local_points[0].partial_reasons,
+            ["rollout_local_coverage_unverified".to_string()]
+        );
+        assert_eq!(
+            observation.weekly_local_points[1].partial_reasons,
+            [
+                "coverage_starts_within_local_bucket".to_string(),
+                "rollout_local_coverage_unverified".to_string(),
+            ]
+        );
+        assert_eq!(
+            observation.weekly_local_points[2].partial_reasons,
+            [
+                "coverage_starts_within_local_bucket".to_string(),
+                "rollout_local_coverage_unverified".to_string(),
+            ]
+        );
+        assert_eq!(observation.half_hour_buckets.len(), 3);
+        assert_eq!(
+            observation.half_hour_buckets[0].partial_reasons,
+            ["rollout_local_coverage_unverified".to_string()]
+        );
+        assert_eq!(
+            observation.half_hour_buckets[1].partial_reasons,
+            ["coverage_starts_within_local_bucket".to_string()]
+        );
+        assert!(observation.half_hour_buckets[2].partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn aligned_prospective_coverage_keeps_the_unknown_weekly_prefix_partial() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let observation = HistoryObservation::from_sources_with_coverage(
+            now,
+            &[call(at(2026, 7, 28, 9, 5, 0), "gpt-5.4", None, 10)],
+            &[bucket(now, Provenance::ServerSnapshot, "codex")],
+            &[],
+            Some(at(2026, 7, 28, 11, 30, 0)),
+        );
+
+        assert!(observation.weekly_local_points.iter().all(|point| {
+            point.partial_reasons == ["rollout_local_coverage_unverified".to_string()]
+        }));
+        assert_eq!(
+            observation.half_hour_buckets[0].partial_reasons,
+            ["rollout_local_coverage_unverified".to_string()]
+        );
+        assert!(
+            observation
+                .half_hour_buckets
+                .iter()
+                .skip(1)
+                .all(|bucket| bucket.partial_reasons.is_empty())
+        );
+    }
+
+    #[test]
+    fn coverage_before_a_nonaligned_weekly_cycle_does_not_create_a_partial_edge() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let limits = [bucket(now, Provenance::ServerSnapshot, "codex")];
+
+        let points =
+            weekly_local_points_from_sources(now, &[], &limits, &[], Some(now - Duration::days(5)));
+
+        assert!(!points.is_empty());
+        assert!(points.iter().all(|point| point.partial_reasons.is_empty()));
+    }
+
+    #[test]
     fn store_round_trips_upserts_and_prunes_old_shards() {
         let directory = tempdir().unwrap();
         let codex_home = directory.path().join("codex");
@@ -4394,6 +4669,47 @@ mod tests {
     }
 
     #[test]
+    fn newer_coverage_partial_closes_equal_exact_bucket_without_later_regression() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let exact_open = local_bucket(starts_at, starts_at + Duration::minutes(7), 10, 100);
+        let mut partial_closed = exact_open.clone();
+        partial_closed.sampled_at = partial_closed.ends_at;
+        partial_closed.partial_reasons = vec![
+            "coverage_starts_within_local_bucket".to_string(),
+            "rollout_local_coverage_unverified".to_string(),
+        ];
+        let mut buckets = vec![exact_open.clone()];
+
+        assert_eq!(bucket_collection_issue_count(&partial_closed), 2);
+        assert!(upsert_half_hour_bucket(
+            &mut buckets,
+            partial_closed.clone()
+        ));
+        assert_eq!(buckets, vec![partial_closed.clone()]);
+
+        let mut older_exact = exact_open;
+        older_exact.sampled_at = starts_at + Duration::minutes(10);
+        assert!(!upsert_half_hour_bucket(&mut buckets, older_exact));
+        assert_eq!(buckets, vec![partial_closed]);
+
+        let strong_exact = local_bucket(starts_at, starts_at + Duration::minutes(7), 100, 1_000);
+        let mut lower_partial = local_bucket(starts_at, starts_at + Duration::minutes(15), 80, 800);
+        lower_partial.partial_reasons = vec!["rollout_local_coverage_unverified".to_string()];
+        let mut stronger_buckets = vec![strong_exact.clone()];
+        assert!(upsert_half_hour_bucket(
+            &mut stronger_buckets,
+            lower_partial.clone()
+        ));
+        assert_eq!(stronger_buckets[0].token_usage, strong_exact.token_usage);
+        assert_eq!(stronger_buckets[0].estimated_cost_units, 1_000);
+        assert_eq!(stronger_buckets[0].sampled_at, lower_partial.ends_at);
+        assert_eq!(
+            stronger_buckets[0].partial_reasons,
+            lower_partial.partial_reasons
+        );
+    }
+
+    #[test]
     fn project_breakdown_backfills_equal_legacy_bucket_without_later_regression() {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
@@ -4628,6 +4944,51 @@ mod tests {
     }
 
     #[test]
+    fn newer_weekly_coverage_partial_replaces_or_follows_equal_exact_evidence() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let exact = weekly_point(at(2026, 7, 28, 12, 11, 0), reset, 50, 500);
+        let mut same_slot_partial = exact.clone();
+        same_slot_partial.observed_at = at(2026, 7, 28, 12, 12, 0);
+        same_slot_partial.partial_reasons = vec!["rollout_local_coverage_unverified".to_string()];
+        let mut same_slot = vec![exact.clone()];
+
+        assert!(upsert_weekly_local_point(
+            &mut same_slot,
+            same_slot_partial.clone()
+        ));
+        assert_eq!(same_slot, vec![same_slot_partial.clone()]);
+        assert!(!upsert_weekly_local_point(&mut same_slot, exact));
+        assert_eq!(same_slot, vec![same_slot_partial]);
+
+        let exact_plateau = weekly_point(at(2026, 7, 28, 12, 1, 0), reset, 50, 500);
+        let mut later_partial = exact_plateau.clone();
+        later_partial.observed_at = at(2026, 7, 28, 12, 7, 0);
+        later_partial.token_usage = usage(20);
+        later_partial.estimated_cost_units = 200;
+        later_partial.partial_reasons = vec!["coverage_starts_within_local_bucket".to_string()];
+        let mut cross_slot = vec![exact_plateau];
+        assert!(upsert_weekly_local_point(
+            &mut cross_slot,
+            later_partial.clone()
+        ));
+        let merged = cross_slot.last().unwrap();
+        assert_eq!(merged.observed_at, later_partial.observed_at);
+        assert_eq!(merged.token_usage.total_tokens, 50);
+        assert_eq!(merged.estimated_cost_units, 500);
+        assert_eq!(merged.partial_reasons, later_partial.partial_reasons);
+
+        let older_exact_same_slot = weekly_point(at(2026, 7, 28, 12, 6, 0), reset, 50, 500);
+        assert!(!upsert_weekly_local_point(
+            &mut cross_slot,
+            older_exact_same_slot
+        ));
+        assert_eq!(
+            cross_slot.last().unwrap().partial_reasons,
+            later_partial.partial_reasons
+        );
+    }
+
+    #[test]
     fn newer_estimator_revision_replaces_equivalent_weekly_evidence_at_a_lower_weight() {
         let reset = at(2026, 7, 31, 12, 17, 0);
         let first_at = at(2026, 7, 28, 12, 6, 0);
@@ -4790,7 +5151,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_shard_keeps_quota_and_weekly_history_without_mixing_bucket_grains() {
+    fn legacy_shard_keeps_quota_but_drops_unproven_local_history() {
         let directory = tempdir().unwrap();
         let codex_home = directory.path().join("codex");
         let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
@@ -4817,7 +5178,7 @@ mod tests {
 
         let migrated_view = store.load_since(starts_at - Duration::minutes(1));
         assert_eq!(migrated_view.quota_points.len(), 1);
-        assert_eq!(migrated_view.weekly_local_points.len(), 1);
+        assert!(migrated_view.weekly_local_points.is_empty());
         assert!(migrated_view.half_hour_buckets.is_empty());
 
         let current_bucket = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
@@ -4841,7 +5202,7 @@ mod tests {
         assert_eq!(persisted.format_version, HISTORY_FORMAT_VERSION);
         assert_eq!(persisted.metric_revision, HISTORY_METRIC_REVISION);
         assert_eq!(persisted.quota_points.len(), 1);
-        assert_eq!(persisted.weekly_local_points.len(), 1);
+        assert!(persisted.weekly_local_points.is_empty());
         assert_eq!(persisted.half_hour_buckets, vec![current_bucket.clone()]);
 
         let repeated = store
@@ -4857,7 +5218,7 @@ mod tests {
     }
 
     #[test]
-    fn metric_two_migration_preserves_released_base_history_and_drops_ambiguous_revision_four() {
+    fn metric_two_migration_keeps_call_evidence_but_drops_zeros_and_weekly_points() {
         let directory = tempdir().unwrap();
         let codex_home = directory.path().join("codex");
         let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
@@ -4884,6 +5245,13 @@ mod tests {
         let mut ambiguous_weekly = weekly_point(starts_at + Duration::minutes(30), reset, 30, 500);
         ambiguous_weekly.estimator_revision = 4;
         ambiguous_weekly.api_long_context_extra_cost_units = None;
+        let mut synthetic_zero = local_bucket(
+            starts_at + Duration::minutes(30),
+            starts_at + Duration::minutes(45),
+            0,
+            0,
+        );
+        synthetic_zero.call_count = 0;
 
         write_shard_atomically(
             &path,
@@ -4893,16 +5261,114 @@ mod tests {
                 namespace: store.namespace().to_string(),
                 utc_day: starts_at.date_naive(),
                 quota_points: vec![quota_point(starts_at, reset, 40.0)],
-                half_hour_buckets: vec![released.clone(), ambiguous],
+                half_hour_buckets: vec![released.clone(), ambiguous, synthetic_zero],
                 weekly_local_points: vec![released_weekly.clone(), ambiguous_weekly],
             },
         )
         .unwrap();
 
+        released
+            .partial_reasons
+            .push("rollout_local_coverage_unverified".to_string());
         let migrated = store.load_since(starts_at - Duration::minutes(1));
         assert_eq!(migrated.quota_points.len(), 1);
         assert_eq!(migrated.half_hour_buckets, vec![released]);
-        assert_eq!(migrated.weekly_local_points, vec![released_weekly]);
+        assert!(migrated.weekly_local_points.is_empty());
+    }
+
+    #[test]
+    fn metric_three_migration_removes_unproven_zeros_and_weekly_plateaus() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(directory.path().join("state"), &codex_home);
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        create_private_directory(&namespace_dir).unwrap();
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let reset = at(2026, 7, 31, 12, 0, 0);
+        let path = shard_path(&namespace_dir, starts_at.date_naive());
+
+        let call_backed = local_bucket(starts_at, starts_at + Duration::minutes(15), 10, 100);
+        let mut synthetic_zero = local_bucket(
+            starts_at + Duration::minutes(15),
+            starts_at + Duration::minutes(30),
+            0,
+            0,
+        );
+        synthetic_zero.call_count = 0;
+        let mut spark_backed = local_bucket(
+            starts_at + Duration::minutes(30),
+            starts_at + Duration::minutes(45),
+            0,
+            0,
+        );
+        spark_backed.call_count = 0;
+        spark_backed.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "spark-thread".to_string(),
+            ..LocalProjectUsageGroup::default()
+        }];
+        let quota = quota_point(starts_at, reset, 40.0);
+
+        write_shard_atomically(
+            &path,
+            &HistoryShard {
+                format_version: HISTORY_FORMAT_VERSION,
+                metric_revision: 3,
+                namespace: store.namespace().to_string(),
+                utc_day: starts_at.date_naive(),
+                quota_points: vec![quota.clone()],
+                half_hour_buckets: vec![call_backed.clone(), synthetic_zero, spark_backed.clone()],
+                weekly_local_points: vec![
+                    weekly_point(starts_at + Duration::minutes(30), reset, 10, 100),
+                    weekly_point(starts_at + Duration::minutes(60), reset, 10, 100),
+                ],
+            },
+        )
+        .unwrap();
+
+        let mut migrated_call_backed = call_backed.clone();
+        migrated_call_backed
+            .partial_reasons
+            .push("rollout_local_coverage_unverified".to_string());
+        let mut migrated_spark_backed = spark_backed.clone();
+        migrated_spark_backed
+            .partial_reasons
+            .push("rollout_local_coverage_unverified".to_string());
+        let migrated = store.load_since(starts_at - Duration::minutes(1));
+        assert_eq!(migrated.quota_points, vec![quota.clone()]);
+        assert_eq!(
+            migrated.half_hour_buckets,
+            vec![migrated_call_backed.clone(), migrated_spark_backed.clone()]
+        );
+        assert!(migrated.weekly_local_points.is_empty());
+
+        let new_bucket = local_bucket(
+            starts_at + Duration::minutes(45),
+            starts_at + Duration::minutes(60),
+            5,
+            50,
+        );
+        store
+            .record(&HistoryObservation {
+                observed_at: starts_at + Duration::minutes(60),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![new_bucket.clone()],
+                weekly_local_points: Vec::new(),
+            })
+            .unwrap();
+        let persisted = match read_shard(&path, store.namespace(), starts_at.date_naive()) {
+            ShardRead::Current { shard, migrated } => {
+                assert!(!migrated);
+                shard
+            }
+            _ => panic!("migrated metric-three shard should be readable"),
+        };
+        assert_eq!(persisted.metric_revision, HISTORY_METRIC_REVISION);
+        assert_eq!(persisted.quota_points, vec![quota]);
+        assert_eq!(
+            persisted.half_hour_buckets,
+            vec![migrated_call_backed, migrated_spark_backed, new_bucket]
+        );
+        assert!(persisted.weekly_local_points.is_empty());
     }
 
     #[test]

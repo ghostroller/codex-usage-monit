@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -306,6 +307,7 @@ pub fn run() -> Result<i32> {
 }
 
 fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i32> {
+    validate_output_path_conflicts(&cli)?;
     let trace_init_started = Instant::now();
     let debug_startup = matches!(cli.command.as_ref(), Some(Command::DebugStartup(_)));
     let trace = if debug_startup || cli.startup_log.is_some() {
@@ -754,6 +756,151 @@ fn absolute_path(path: PathBuf) -> PathBuf {
     }
 }
 
+fn validate_output_path_conflicts(cli: &Cli) -> Result<()> {
+    validate_output_path_conflicts_with_current_dir(cli, std::env::current_dir)
+}
+
+fn validate_output_path_conflicts_with_current_dir(
+    cli: &Cli,
+    current_dir: impl FnOnce() -> io::Result<PathBuf>,
+) -> Result<()> {
+    let paths = output_paths_for_command(cli);
+    if paths.len() < 2 {
+        return Ok(());
+    }
+    let current_dir = current_dir().map_err(anyhow::Error::from)?;
+    validate_output_paths_from(paths, &current_dir)
+}
+
+#[cfg(test)]
+fn validate_output_path_conflicts_from(cli: &Cli, current_dir: &Path) -> Result<()> {
+    validate_output_paths_from(output_paths_for_command(cli), current_dir)
+}
+
+fn output_paths_for_command(cli: &Cli) -> Vec<(&'static str, PathBuf)> {
+    let mut paths = Vec::new();
+    if let Some(path) = cli.startup_log.as_deref() {
+        paths.push(("--startup-log", path.to_path_buf()));
+    }
+    if let Some(path) = cli.perf_log.as_deref() {
+        paths.push(("--perf-log", path.to_path_buf()));
+    }
+    if let Some(path) = status_file_for_command(cli) {
+        paths.push(("--status-file", path));
+    }
+    paths
+}
+
+fn validate_output_paths_from(
+    paths: Vec<(&'static str, PathBuf)>,
+    current_dir: &Path,
+) -> Result<()> {
+    let paths = paths
+        .into_iter()
+        .map(|(name, path)| (name, normalize_output_path(&path, current_dir)))
+        .collect::<Vec<_>>();
+
+    for (index, (left_name, left_path)) in paths.iter().enumerate() {
+        for (right_name, right_path) in paths.iter().skip(index + 1) {
+            if output_paths_alias(left_path, right_path) {
+                bail!(
+                    "output path conflict: {left_name} and {right_name} both refer to {}",
+                    left_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn status_file_for_command(cli: &Cli) -> Option<PathBuf> {
+    match cli.command.as_ref() {
+        Some(Command::Record(args)) => args.status_file.clone().or_else(|| {
+            args.history_dir
+                .clone()
+                .or_else(default_history_root)
+                .map(|path| default_status_file(&path))
+        }),
+        Some(Command::Service(_)) => default_history_root().map(|path| default_status_file(&path)),
+        _ => None,
+    }
+}
+
+fn normalize_output_path(path: &Path, current_dir: &Path) -> PathBuf {
+    let absolute = lexical_normalize(&absolute_path_from(path.to_path_buf(), current_dir));
+    canonicalize_existing_ancestor(&absolute).unwrap_or(absolute)
+}
+
+fn absolute_path_from(path: PathBuf, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir) | None => normalized.push(component.as_os_str()),
+                Some(Component::CurDir) => unreachable!("current-directory components are skipped"),
+            },
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(ancestor) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(lexical_normalize(&canonical));
+        }
+        let file_name = ancestor.file_name()?.to_owned();
+        suffix.push(file_name);
+        ancestor = ancestor.parent()?;
+    }
+}
+
+fn output_paths_alias(left: &Path, right: &Path) -> bool {
+    if paths_equal_for_platform(left, right) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    false
+}
+
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "tui",
@@ -978,6 +1125,155 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(after.perf_log, Some(PathBuf::from("/tmp/perf.jsonl")));
+    }
+
+    #[test]
+    fn output_logs_reject_relative_and_absolute_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_dir = temp.path().join("working");
+        std::fs::create_dir(&current_dir).unwrap();
+        let absolute = current_dir.join("logs/events.jsonl");
+        let cli = Cli::try_parse_from([
+            OsString::from("codex-usage-monit"),
+            OsString::from("--startup-log"),
+            absolute.into_os_string(),
+            OsString::from("--perf-log"),
+            OsString::from("./logs/../logs/events.jsonl"),
+            OsString::from("snapshot"),
+        ])
+        .unwrap();
+
+        let error = validate_output_path_conflicts_from(&cli, &current_dir).unwrap_err();
+
+        assert!(error.to_string().contains("--startup-log and --perf-log"));
+    }
+
+    #[test]
+    fn fewer_than_two_output_paths_do_not_require_current_directory() {
+        let no_outputs = Cli::try_parse_from(["codex-usage-monit", "snapshot"]).unwrap();
+        let one_output = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--startup-log",
+            "events.jsonl",
+            "snapshot",
+        ])
+        .unwrap();
+
+        for cli in [&no_outputs, &one_output] {
+            validate_output_path_conflicts_with_current_dir(cli, || -> io::Result<PathBuf> {
+                panic!("current directory must not be read for fewer than two output paths")
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_logs_reject_aliases_with_parent_components_above_root() {
+        let cli = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--startup-log",
+            "/tmp/events.jsonl",
+            "--perf-log",
+            "/../tmp/events.jsonl",
+            "snapshot",
+        ])
+        .unwrap();
+
+        let error = validate_output_path_conflicts_from(&cli, Path::new("/")).unwrap_err();
+
+        assert!(error.to_string().contains("--startup-log and --perf-log"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lexical_normalize_keeps_windows_prefix_and_root() {
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:\..\logs\events.jsonl")),
+            PathBuf::from(r"C:\logs\events.jsonl")
+        );
+    }
+
+    #[test]
+    fn conflicting_output_paths_are_rejected_before_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(&path, b"keep this file\n").unwrap();
+        let cli = Cli::try_parse_from([
+            OsString::from("codex-usage-monit"),
+            OsString::from("--startup-log"),
+            path.as_os_str().to_owned(),
+            OsString::from("--perf-log"),
+            path.as_os_str().to_owned(),
+            OsString::from("snapshot"),
+        ])
+        .unwrap();
+        let started = Instant::now();
+
+        let error = run_with(cli, started, started).unwrap_err();
+
+        assert!(error.to_string().contains("output path conflict"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep this file\n");
+    }
+
+    #[test]
+    fn recorder_status_rejects_aliases_with_either_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_dir = temp.path();
+        for log_flag in ["--startup-log", "--perf-log"] {
+            let status_file = current_dir.join("state/recorder.json");
+            let cli = Cli::try_parse_from([
+                OsString::from("codex-usage-monit"),
+                OsString::from(log_flag),
+                status_file.into_os_string(),
+                OsString::from("record"),
+                OsString::from("--status-file"),
+                OsString::from("state/./recorder.json"),
+            ])
+            .unwrap();
+
+            let error = validate_output_path_conflicts_from(&cli, current_dir).unwrap_err();
+
+            assert!(error.to_string().contains(log_flag));
+            assert!(error.to_string().contains("--status-file"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_logs_reject_symlinked_parent_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        let cli = Cli::try_parse_from([
+            OsString::from("codex-usage-monit"),
+            OsString::from("--startup-log"),
+            real.join("events.jsonl").into_os_string(),
+            OsString::from("--perf-log"),
+            alias.join("events.jsonl").into_os_string(),
+            OsString::from("snapshot"),
+        ])
+        .unwrap();
+        assert!(validate_output_path_conflicts_from(&cli, temp.path()).is_err());
+
+        let first = real.join("first.jsonl");
+        let second = real.join("second.jsonl");
+        std::fs::write(&first, b"existing").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        let cli = Cli::try_parse_from([
+            OsString::from("codex-usage-monit"),
+            OsString::from("--startup-log"),
+            first.into_os_string(),
+            OsString::from("--perf-log"),
+            second.into_os_string(),
+            OsString::from("snapshot"),
+        ])
+        .unwrap();
+        assert!(validate_output_path_conflicts_from(&cli, temp.path()).is_err());
     }
 
     #[test]

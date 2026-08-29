@@ -15,7 +15,7 @@ use crate::domain::{
     RateLimitResetCreditsSnapshot, RateObservation, RolloutDataset, Snapshot, SourceStatus,
     WindowAnalysis,
 };
-use crate::history::{HISTORY_RETENTION_DAYS, HistoryObservation};
+use crate::history::HistoryObservation;
 use crate::perf::{RefreshMetrics, RefreshStageMetrics};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
 
@@ -33,6 +33,7 @@ struct LocalCollection {
     source: Option<SourceStatus>,
     error: Option<String>,
     unchanged: bool,
+    local_coverage_starts_at: Option<DateTime<Utc>>,
     rollout_refresh: Option<RolloutCacheRefresh>,
     rollout_metrics: Option<RolloutCacheMetrics>,
 }
@@ -44,6 +45,13 @@ struct AccountCollection {
 
 fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: bool) -> bool {
     scan_local && refresh_account && !offline
+}
+
+fn rollout_dataset_complete(dataset: &RolloutDataset) -> bool {
+    dataset.stats.truncated_files == 0
+        && dataset.stats.unreadable_files == 0
+        && dataset.stats.skipped_lines == 0
+        && dataset.stats.ambiguous_token_resets == 0
 }
 
 fn run_sources_in_parallel<Local, Account, LocalFn, AccountFn>(
@@ -71,17 +79,36 @@ fn collect_local_source(
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
     let collection = if scan_local {
-        let (scan_result, rollout_refresh, rollout_metrics) = match rollout_cache {
-            Some(cache) => {
-                let result = if only_if_changed {
-                    cache.scan_if_changed(config, now)
-                } else {
-                    cache.scan(config, now).map(Some)
-                };
-                (result, Some(cache.last_refresh()), Some(cache.metrics()))
-            }
-            None => (scan_rollouts(config, now).map(Some), None, None),
-        };
+        let (scan_result, local_coverage_starts_at, rollout_refresh, rollout_metrics) =
+            match rollout_cache {
+                Some(cache) => {
+                    let result = if only_if_changed {
+                        cache.scan_if_changed(config, now)
+                    } else {
+                        cache.scan(config, now).map(Some)
+                    };
+                    let local_coverage_starts_at = match &result {
+                        Ok(Some(dataset)) => {
+                            cache.update_local_coverage(now, rollout_dataset_complete(dataset))
+                        }
+                        Ok(None) => None,
+                        Err(_) => cache.update_local_coverage(now, false),
+                    };
+                    (
+                        result,
+                        local_coverage_starts_at,
+                        Some(cache.last_refresh()),
+                        Some(cache.metrics()),
+                    )
+                }
+                None => {
+                    let result = scan_rollouts(config, now).map(Some);
+                    // Stateless one-shot scans cannot establish continuity across
+                    // observations, so they provide call evidence but no zero-use
+                    // coverage interval.
+                    (result, None, None, None)
+                }
+            };
         match scan_result {
             Ok(Some(dataset)) => {
                 let truncated = dataset.stats.truncated_files;
@@ -111,6 +138,7 @@ fn collect_local_source(
                     dataset,
                     error: None,
                     unchanged: false,
+                    local_coverage_starts_at,
                     rollout_refresh,
                     rollout_metrics,
                 }
@@ -120,6 +148,7 @@ fn collect_local_source(
                 source: None,
                 error: None,
                 unchanged: true,
+                local_coverage_starts_at: None,
                 rollout_refresh,
                 rollout_metrics,
             },
@@ -133,6 +162,7 @@ fn collect_local_source(
                 }),
                 error: Some(format!("rollout scan failed: {error:#}")),
                 unchanged: false,
+                local_coverage_starts_at: None,
                 rollout_refresh,
                 rollout_metrics,
             },
@@ -143,6 +173,7 @@ fn collect_local_source(
             source: None,
             error: None,
             unchanged: false,
+            local_coverage_starts_at: None,
             rollout_refresh: None,
             rollout_metrics: None,
         }
@@ -297,6 +328,7 @@ fn collect_snapshot_with_local(
     }
     let rollout_refresh = local.rollout_refresh;
     let rollout_metrics = local.rollout_metrics;
+    let local_coverage_starts_at = local.local_coverage_starts_at;
     if let Some(source) = local.source {
         sources.push(source);
     }
@@ -415,12 +447,9 @@ fn collect_snapshot_with_local(
         );
     }
 
+    let rollout_complete = rollout_dataset_complete(&dataset);
     let mut tasks = dataset.tasks;
     let mut turns = dataset.turns;
-    let rollout_complete = dataset.stats.truncated_files == 0
-        && dataset.stats.unreadable_files == 0
-        && dataset.stats.skipped_lines == 0
-        && dataset.stats.ambiguous_token_resets == 0;
     let calls_count = dataset.calls.len();
     let analysis_perf_started = config.perf_log.is_enabled().then(Instant::now);
     let analysis_span = config.startup_trace.span("snapshot.window_analysis");
@@ -500,8 +529,12 @@ fn collect_snapshot_with_local(
             history_partial_reasons.push(reason.clone());
         }
     }
-    let local_coverage_starts_at = (scan_local && rollout_complete && !rollout_source_degraded)
-        .then(|| now - Duration::days(config.lookback_days.clamp(1, HISTORY_RETENTION_DAYS)));
+    // A successful filesystem walk proves only what this process observes from
+    // now forward. It cannot turn absent or deleted historical rollouts into
+    // confirmed zero usage for the full configured lookback.
+    let local_coverage_starts_at = (!rollout_source_degraded)
+        .then_some(local_coverage_starts_at)
+        .flatten();
     let history_observation = HistoryObservation::from_sources_with_tasks_and_coverage(
         now,
         &dataset.calls,
@@ -882,6 +915,30 @@ mod tests {
         assert!(!sources_run_in_parallel(false, true, false));
         assert!(!sources_run_in_parallel(true, false, false));
         assert!(!sources_run_in_parallel(true, true, true));
+    }
+
+    #[test]
+    fn empty_rollout_directory_only_establishes_prospective_zero_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            lookback_days: 30,
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let mut cache = RolloutCache::new();
+
+        let result = collect_snapshot_cached(&config, None, false, &mut cache);
+
+        assert_eq!(result.history_observation.half_hour_buckets.len(), 1);
+        let bucket = &result.history_observation.half_hour_buckets[0];
+        assert_eq!(bucket.sampled_at, result.snapshot.as_of);
+        assert!(bucket.token_usage.is_zero());
+        assert!(
+            bucket.starts_at >= result.snapshot.as_of - Duration::minutes(15),
+            "an empty directory must not manufacture zero buckets for the configured lookback"
+        );
     }
 
     #[test]

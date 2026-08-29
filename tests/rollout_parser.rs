@@ -274,12 +274,12 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(dataset.stats.scanned_files, 1);
     assert_eq!(dataset.stats.parsed_lines, records.len());
     assert_eq!(dataset.stats.skipped_lines, 1);
-    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 2);
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.turns.len(), 2);
     assert_eq!(
         dataset.calls.len(),
-        4,
+        3,
         "duplicate cumulative usage was counted"
     );
 
@@ -297,12 +297,12 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(
         task.token_usage,
         TokenUsage {
-            input_tokens: 20,
-            cached_input_tokens: 6,
+            input_tokens: 12,
+            cached_input_tokens: 4,
             cache_write_input_tokens: 0,
-            output_tokens: 5,
-            reasoning_output_tokens: 1,
-            total_tokens: 25,
+            output_tokens: 3,
+            reasoning_output_tokens: 0,
+            total_tokens: 15,
         }
     );
 
@@ -318,7 +318,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
         turn_1.message_preview.as_deref(),
         Some("Investigate the token counter")
     );
-    assert_eq!(turn_1.token_usage.total_tokens, 15);
+    assert_eq!(turn_1.token_usage.total_tokens, 5);
     assert_eq!(turn_1.duration_ms, Some(60_000));
 
     let turn_2 = dataset
@@ -496,6 +496,453 @@ fn counts_an_exact_first_sample_after_a_cumulative_counter_epoch_reset() {
             .iter()
             .all(|warning| !warning.contains("counter reset"))
     );
+}
+
+#[test]
+fn omitted_same_thread_predecessor_counts_only_known_last_request_and_marks_partial() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let thread_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
+    let old_at = now - chrono::Duration::days(2);
+    let old_path = temp.path().join(format!(
+        "sessions/2026/08/27/rollout-2026-08-27T00-00-00-{thread_id}.jsonl"
+    ));
+    let current_path = temp.path().join(format!(
+        "sessions/2026/08/29/rollout-2026-08-29T00-00-00-{thread_id}.jsonl"
+    ));
+    write_jsonl(
+        &old_path,
+        &[
+            json!({
+                "timestamp": timestamp(old_at),
+                "type": "session_meta",
+                "payload": {"id": thread_id, "timestamp": timestamp(old_at)}
+            }),
+            json!({
+                "timestamp": timestamp(old_at + chrono::Duration::seconds(1)),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(900, 0, 0, 0, 900),
+                    "last_token_usage": usage(100, 0, 0, 0, 100)
+                }}
+            }),
+        ],
+        false,
+    );
+    write_jsonl(
+        &current_path,
+        &[
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::minutes(1)),
+                "type": "session_meta",
+                "payload": {"id": thread_id, "timestamp": timestamp(old_at)}
+            }),
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(50)),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "current-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(40)),
+                "type": "turn_context",
+                "payload": {"turn_id": "current-turn", "model": "gpt-current"}
+            }),
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(30)),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(1_000, 0, 0, 0, 1_000),
+                    "last_token_usage": usage(100, 0, 0, 0, 100)
+                }}
+            }),
+        ],
+        false,
+    );
+    File::options()
+        .write(true)
+        .open(&old_path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+        .unwrap();
+
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = 1;
+    let dataset = scan_rollouts(&scan_config, now).unwrap();
+
+    assert_eq!(dataset.stats.discovered_files, 1);
+    assert_eq!(dataset.calls.len(), 1);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 100);
+    assert!(dataset.calls[0].request_usage_exact);
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 100);
+    assert_eq!(dataset.turns[0].token_usage.total_tokens, 100);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("outside the selected rollout boundary"))
+    );
+}
+
+#[test]
+fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    for index in 0..70 {
+        let path = temp
+            .path()
+            .join(format!("sessions/old/rollout-unknown-{index}.jsonl"));
+        write_jsonl(&path, &[json!({"type": "unknown"})], false);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+    }
+    let current_path = temp.path().join("sessions/current/rollout-selected.jsonl");
+    write_jsonl(
+        &current_path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "selected-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(10, 0, 0, 0, 10)
+                }}
+            }),
+        ],
+        false,
+    );
+
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = 1;
+    let dataset = scan_rollouts(&scan_config, now).unwrap();
+
+    assert!(dataset.calls.is_empty());
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("outside the selected rollout boundary"))
+    );
+}
+
+#[test]
+fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    for index in 0..70_u64 {
+        let unrelated_thread = format!("00000000-0000-0000-0000-{index:012x}");
+        let path = temp.path().join(format!(
+            "sessions/old/rollout-2026-08-27T00-00-00-{unrelated_thread}.jsonl"
+        ));
+        write_jsonl(
+            &path,
+            &[json!({"type": "session_meta", "payload": {"id": unrelated_thread}})],
+            false,
+        );
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+    }
+    let selected_thread = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    write_jsonl(
+        &temp.path().join(format!(
+            "sessions/current/rollout-2026-08-29T00-00-00-{selected_thread}.jsonl"
+        )),
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": selected_thread}}),
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(10, 0, 0, 0, 10)
+            }}}),
+        ],
+        false,
+    );
+
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = 1;
+    let dataset = scan_rollouts(&scan_config, now).unwrap();
+
+    assert_eq!(dataset.calls.len(), 1);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 10);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 0);
+}
+
+#[test]
+fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let old_path = temp.path().join("sessions/old/rollout-large-prelude.jsonl");
+    write_jsonl(
+        &old_path,
+        &[
+            json!({"type": "unknown", "payload": "x".repeat(70 * 1024)}),
+            json!({"type": "session_meta", "payload": {"id": "selected-thread"}}),
+        ],
+        false,
+    );
+    File::options()
+        .write(true)
+        .open(&old_path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+        .unwrap();
+    write_jsonl(
+        &temp.path().join("sessions/current/rollout-selected.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "selected-thread"}
+            }),
+            json!({
+                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(10, 0, 0, 0, 10)
+                }}
+            }),
+        ],
+        false,
+    );
+
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = 1;
+    let dataset = scan_rollouts(&scan_config, now).unwrap();
+
+    assert!(dataset.calls.is_empty());
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+}
+
+#[test]
+fn same_thread_files_replay_by_content_time_after_mtime_is_reversed() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let first_at = now - chrono::Duration::minutes(2);
+    let second_at = now - chrono::Duration::minutes(1);
+    let thread_id = "019f52c6-60d1-72e3-8f3f-b348d83da52e";
+    let first_path = temp
+        .path()
+        .join(format!("sessions/rollout-z-first-{thread_id}.jsonl"));
+    let second_path = temp
+        .path()
+        .join(format!("sessions/rollout-a-second-{thread_id}.jsonl"));
+    write_jsonl(
+        &first_path,
+        &[
+            json!({"timestamp": timestamp(first_at), "type": "session_meta", "payload": {"id": thread_id, "timestamp": timestamp(first_at)}}),
+            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "first-turn"}}),
+            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(100, 0, 0, 0, 100),
+                "last_token_usage": usage(100, 0, 0, 0, 100)
+            }}}),
+            json!({"timestamp": timestamp(first_at + chrono::Duration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "first-turn"}}),
+        ],
+        false,
+    );
+    write_jsonl(
+        &second_path,
+        &[
+            json!({"timestamp": timestamp(second_at), "type": "session_meta", "payload": {"id": thread_id, "timestamp": timestamp(first_at)}}),
+            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "second-turn"}}),
+            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(2)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(150, 0, 0, 0, 150),
+                "last_token_usage": usage(50, 0, 0, 0, 50)
+            }}}),
+            json!({"timestamp": timestamp(second_at + chrono::Duration::seconds(3)), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "second-turn"}}),
+        ],
+        false,
+    );
+    let modified = SystemTime::now();
+    File::options()
+        .write(true)
+        .open(&first_path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    File::options()
+        .write(true)
+        .open(&second_path)
+        .unwrap()
+        .set_modified(modified - Duration::from_secs(1))
+        .unwrap();
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 150);
+    assert_eq!(dataset.calls.len(), 2);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 100);
+    assert_eq!(dataset.calls[1].tokens.total_tokens, 50);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 0);
+}
+
+#[test]
+fn overlapping_same_thread_file_times_mark_replay_order_ambiguous() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let thread_id = "overlapping-thread";
+    let first_path = temp.path().join("sessions/rollout-a-overlap.jsonl");
+    let second_path = temp.path().join("sessions/rollout-b-overlap.jsonl");
+    write_jsonl(
+        &first_path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(10)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(100, 0, 0, 0, 100)}}}),
+        ],
+        false,
+    );
+    write_jsonl(
+        &second_path,
+        &[
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(5)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(15)), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(150, 0, 0, 0, 150)}}}),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.stats.ambiguous_token_resets, 2);
+    assert_eq!(dataset.calls.len(), 1);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 50);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-overlapping content timestamp order"))
+    );
+}
+
+#[test]
+fn missing_same_thread_content_times_mark_replay_order_ambiguous() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    for (name, total) in [("a", 100), ("b", 150)] {
+        write_jsonl(
+            &temp
+                .path()
+                .join(format!("sessions/rollout-{name}-untimed.jsonl")),
+            &[
+                json!({"type": "session_meta", "payload": {"id": "untimed-thread"}}),
+                json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(total, 0, 0, 0, total)
+                }}}),
+            ],
+            false,
+        );
+    }
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.stats.ambiguous_token_resets, 2);
+    assert_eq!(dataset.calls.len(), 1);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 50);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-overlapping content timestamp order"))
+    );
+}
+
+#[test]
+fn missing_replay_event_time_is_ambiguous_even_when_session_times_are_ordered() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let thread_id = "partially-timed-thread";
+    write_jsonl(
+        &temp.path().join("sessions/rollout-a-timed.jsonl"),
+        &[
+            json!({"timestamp": timestamp(now - chrono::Duration::minutes(2)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"timestamp": timestamp(now - chrono::Duration::minutes(2) + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(100, 0, 0, 0, 100),
+                "last_token_usage": usage(100, 0, 0, 0, 100)
+            }}}),
+        ],
+        false,
+    );
+    write_jsonl(
+        &temp.path().join("sessions/rollout-b-partially-timed.jsonl"),
+        &[
+            json!({"timestamp": timestamp(now - chrono::Duration::minutes(1)), "type": "session_meta", "payload": {"id": thread_id}}),
+            json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(150, 0, 0, 0, 150),
+                "last_token_usage": usage(50, 0, 0, 0, 50)
+            }}}),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+    assert!(
+        dataset
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-overlapping content timestamp order"))
+    );
+}
+
+#[test]
+fn selected_file_without_an_owner_makes_first_cumulative_total_partial() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-unknown-owner.jsonl"),
+        &[json!({"type": "unknown"})],
+        false,
+    );
+    write_jsonl(
+        &temp.path().join("sessions/rollout-selected-owner.jsonl"),
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "selected-owner-thread"}}),
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(10, 0, 0, 0, 10)
+            }}}),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert!(dataset.calls.is_empty());
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
+}
+
+#[test]
+fn skipped_selected_line_makes_first_cumulative_total_partial() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-skipped-line.jsonl"),
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "skipped-line-thread"}}),
+            json!({"timestamp": timestamp(now + chrono::Duration::seconds(1)), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": usage(10, 0, 0, 0, 10)
+            }}}),
+        ],
+        true,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+
+    assert_eq!(dataset.stats.skipped_lines, 1);
+    assert!(dataset.calls.is_empty());
+    assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 1);
 }
 
 #[test]

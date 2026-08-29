@@ -10,7 +10,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 
 const START_SIZE: PtySize = PtySize {
     rows: 24,
-    cols: 80,
+    cols: 120,
     pixel_width: 0,
     pixel_height: 0,
 };
@@ -101,8 +101,8 @@ impl PtySession {
             pixel_width: 0,
             pixel_height: 0,
         };
-        self.parser.set_size(rows, columns);
         self.master.resize(size).unwrap();
+        self.parser.set_size(rows, columns);
     }
 
     fn wait_for_new_output(
@@ -289,6 +289,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
         let header = lines.next().unwrap_or_default();
         let controls = lines.next().unwrap_or_default();
         screen.size() == (24, 60)
+            && header.contains("1 Ovw")
             && header.contains("4 Set")
             && [header, controls]
                 .iter()

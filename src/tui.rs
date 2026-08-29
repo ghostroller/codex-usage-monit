@@ -1506,6 +1506,7 @@ struct TurnControlsHitbox {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ViewTabsHitbox {
     tabs: [Rect; 5],
+    rendered_right: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4214,6 +4215,24 @@ impl App {
             .is_some_and(|node_id| self.toggle_summary_node(&node_id))
     }
 
+    fn set_selected_summary_node_collapsed(&mut self, collapsed: bool) -> bool {
+        let Some(node_id) = self.summary_selected_id.clone() else {
+            return false;
+        };
+        if !self
+            .summary_rows()
+            .iter()
+            .any(|row| row.id == node_id && row.has_children)
+        {
+            return false;
+        }
+        if collapsed {
+            self.summary_expanded_nodes.remove(&node_id)
+        } else {
+            self.summary_expanded_nodes.insert(node_id)
+        }
+    }
+
     fn collapse_all_summary_nodes(&mut self) -> bool {
         if self.summary_expanded_nodes.is_empty() {
             return false;
@@ -4995,7 +5014,7 @@ fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
             + UnicodeWidthStr::width(label)
             + UnicodeWidthStr::width(TAB_PADDING);
         let width = u16::try_from(width).unwrap_or(u16::MAX);
-        tabs[view.index()] = clipped_horizontal_hitbox(area, x, width);
+        tabs[view.index()] = fully_visible_horizontal_hitbox(area, x, width);
         x = x.saturating_add(width);
         if position + 1 < View::ALL.len() {
             x = x.saturating_add(
@@ -5003,7 +5022,10 @@ fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
             );
         }
     }
-    ViewTabsHitbox { tabs }
+    ViewTabsHitbox {
+        tabs,
+        rendered_right: x.min(area.right()),
+    }
 }
 
 fn view_tabs_compact(width: u16) -> bool {
@@ -5030,6 +5052,17 @@ fn clipped_horizontal_hitbox(area: Rect, x: u16, width: u16) -> Rect {
         end.saturating_sub(start),
         u16::from(area.height > 0),
     )
+}
+
+fn fully_visible_horizontal_hitbox(area: Rect, x: u16, width: u16) -> Rect {
+    let Some(end) = x.checked_add(width) else {
+        return Rect::default();
+    };
+    if area.height == 0 || x < area.x || end > area.right() {
+        Rect::default()
+    } else {
+        Rect::new(x, area.y, width, 1)
+    }
 }
 
 fn fast_model_line(value: &str, column_width: usize, theme: Theme) -> Line<'static> {
@@ -5225,6 +5258,12 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Summary => {
             app.toggle_selected_summary_node();
+        }
+        KeyCode::Char('+') if app.view == View::Summary => {
+            app.set_selected_summary_node_collapsed(false);
+        }
+        KeyCode::Char('-') if app.view == View::Summary => {
+            app.set_selected_summary_node_collapsed(true);
         }
         KeyCode::Char('x' | 'X') if app.view == View::Summary => {
             app.collapse_all_summary_nodes();
@@ -6296,15 +6335,8 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     let initial_tab_area = Rect::new(area.x, area.y, area.width, u16::from(area.height > 0));
     let initial_tabs = view_tabs_hitbox(initial_tab_area);
     let controls_on_second_row = app.view == View::Overview
-        && View::ALL
-            .last()
-            .map(|view| {
-                usize::from(
-                    area.right()
-                        .saturating_sub(initial_tabs.tabs[view.index()].right()),
-                ) < overview_controls_min_width()
-            })
-            .unwrap_or(false)
+        && usize::from(area.right().saturating_sub(initial_tabs.rendered_right))
+            < overview_controls_min_width()
         && area.height > 2;
     let header_height = 1 + u16::from(controls_on_second_row);
     let root = Layout::default()
@@ -6406,10 +6438,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
 
 fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> WindowControlsHitbox {
     let tabs = view_tabs_hitbox(area);
-    let start_x = View::ALL
-        .last()
-        .map(|view| tabs.tabs[view.index()].right())
-        .unwrap_or(area.x);
+    let start_x = tabs.rendered_right;
     render_overview_controls_from(frame, area, app, start_x)
 }
 
@@ -7140,12 +7169,20 @@ fn render_settings_group(
 fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut hitbox = SettingsControlsHitbox::default();
     if area.height < 14 {
+        let capacity = usize::from(area.height.saturating_sub(2)).min(SettingItem::ALL.len());
+        let end = app
+            .selected_setting
+            .min(SettingItem::ALL.len() - 1)
+            .saturating_add(1)
+            .max(capacity)
+            .min(SettingItem::ALL.len());
+        let start = end.saturating_sub(capacity);
         render_settings_group(
             frame,
             area,
             app,
             " Settings",
-            &SettingItem::ALL,
+            &SettingItem::ALL[start..end],
             true,
             &mut hitbox,
         );
@@ -12736,14 +12773,14 @@ fn task_panel_block(
 fn title_hitbox(area: Rect, x: u16, width: u16) -> Rect {
     let inner_left = area.x.saturating_add(1);
     let inner_right = area.right().saturating_sub(1);
-    let start = x.max(inner_left).min(inner_right);
-    let end = x.saturating_add(width).min(inner_right);
-    Rect::new(
-        start,
-        area.y,
-        end.saturating_sub(start),
-        u16::from(area.height > 0),
-    )
+    let Some(end) = x.checked_add(width) else {
+        return Rect::default();
+    };
+    if area.height == 0 || x < inner_left || end > inner_right {
+        Rect::default()
+    } else {
+        Rect::new(x, area.y, width, 1)
+    }
 }
 
 fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, TurnControlsHitbox) {

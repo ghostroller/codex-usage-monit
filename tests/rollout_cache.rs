@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
@@ -247,6 +247,88 @@ fn changed_in_memory_file_skips_the_stale_disk_entry() {
     assert_eq!(dataset.turns[0].status, TurnStatus::Completed);
     assert_eq!(cache.last_refresh().disk_corrupt_files, 0);
     assert_eq!(cache.last_refresh().reparsed_files, 1);
+}
+
+#[test]
+fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let old_modified = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    for index in 0..64 {
+        let path = temp
+            .path()
+            .join(format!("sessions/old/rollout-ambiguous-{index}.jsonl"));
+        write_jsonl(
+            &path,
+            &[json!({
+                "type": "session_meta",
+                "payload": {"id": format!("unrelated-{index}")}
+            })],
+        );
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old_modified)
+            .unwrap();
+    }
+    write_jsonl(
+        &temp
+            .path()
+            .join("sessions/current/rollout-selected-owner.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "selected-owner"}
+            }),
+            json!({
+                "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "total_token_usage": usage(10)
+                }}
+            }),
+        ],
+    );
+    let mut scan_config = config(temp.path());
+    scan_config.lookback_days = 1;
+    let mut cache = RolloutCache::new();
+
+    let first = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(first.calls.len(), 1);
+    assert_eq!(first.stats.ambiguous_token_resets, 0);
+
+    let overflow = temp
+        .path()
+        .join("sessions/old/rollout-ambiguous-overflow.jsonl");
+    write_jsonl(
+        &overflow,
+        &[json!({
+            "type": "session_meta",
+            "payload": {"id": "unrelated-overflow"}
+        })],
+    );
+    File::options()
+        .write(true)
+        .open(overflow)
+        .unwrap()
+        .set_modified(old_modified)
+        .unwrap();
+
+    let overflowed = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert!(overflowed.calls.is_empty());
+    assert_eq!(overflowed.tasks[0].token_usage.total_tokens, 0);
+    assert_eq!(overflowed.stats.ambiguous_token_resets, 1);
+
+    let warm = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert!(cache.last_refresh().discovery_cache_hit);
+    assert!(warm.calls.is_empty());
+    assert_eq!(warm.stats.ambiguous_token_resets, 1);
 }
 
 #[test]
@@ -893,6 +975,8 @@ fn session_index_read_errors_are_retried() {
 fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
+    let first_at = now - chrono::Duration::minutes(2);
+    let second_at = now - chrono::Duration::minutes(1);
     let first_path = temp.path().join("sessions/rollout-a.jsonl");
     let changed_path = temp.path().join("sessions/rollout-b.jsonl");
     let unrelated_path = temp.path().join("sessions/rollout-c.jsonl");
@@ -900,20 +984,20 @@ fn changing_one_file_reuses_others_and_matches_a_fresh_scan() {
     write_jsonl(
         &first_path,
         &[
-            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "shared-thread"}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(10)}}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}}),
+            json!({"timestamp": timestamp(first_at), "type": "session_meta", "payload": {"id": "shared-thread"}}),
+            json!({"timestamp": timestamp(first_at), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}}),
+            json!({"timestamp": timestamp(first_at), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(10)}}}),
+            json!({"timestamp": timestamp(first_at), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}}),
         ],
     );
     write_jsonl(
         &changed_path,
         &[
-            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "shared-thread"}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}}),
-            json!({"timestamp": timestamp(now), "type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-cache"}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(15)}}}),
-            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-2"}}),
+            json!({"timestamp": timestamp(second_at), "type": "session_meta", "payload": {"id": "shared-thread"}}),
+            json!({"timestamp": timestamp(second_at), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}}),
+            json!({"timestamp": timestamp(second_at), "type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-cache"}}),
+            json!({"timestamp": timestamp(second_at), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage(15)}}}),
+            json!({"timestamp": timestamp(second_at), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-2"}}),
         ],
     );
     write_jsonl(

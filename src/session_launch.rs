@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::domain::{TaskRecord, TaskStatus};
 
 const ENV_BIN: &str = "/usr/bin/env";
+const POWERSHELL_BIN: &str = "powershell.exe";
 const PANE_NAME_MAX_WIDTH: usize = 48;
 const PROCESS_MESSAGE_MAX_WIDTH: usize = 512;
 
@@ -241,7 +242,7 @@ impl fmt::Display for PrepareError {
             }
             Self::UnrepresentableShellCommand => write!(
                 formatter,
-                "Resume command contains non-UTF-8 or control characters and cannot be copied"
+                "Resume command contains non-UTF-8 or control characters and cannot be represented safely"
             ),
             Self::InvalidDimension { name, value } => {
                 write!(
@@ -283,6 +284,22 @@ pub(crate) struct CommandPlan {
     pub(crate) args: Vec<OsString>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeCommandPlatform {
+    Posix,
+    Windows,
+}
+
+impl ResumeCommandPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResumeCommandPlan {
     pub(crate) thread_id: String,
@@ -310,6 +327,14 @@ pub(crate) fn prepare_resume_command(
     target: &ResumeTarget,
     context: &LaunchContext,
 ) -> Result<ResumeCommandPlan, PrepareError> {
+    prepare_resume_command_for_platform(target, context, ResumeCommandPlatform::current())
+}
+
+fn prepare_resume_command_for_platform(
+    target: &ResumeTarget,
+    context: &LaunchContext,
+    platform: ResumeCommandPlatform,
+) -> Result<ResumeCommandPlan, PrepareError> {
     let cwd = check_eligibility(target)?.to_path_buf();
 
     // A relative --codex-home is relative to the monitor, not the target cwd.
@@ -323,21 +348,84 @@ pub(crate) fn prepare_resume_command(
         &context.path,
         &context.monitor_cwd,
     )?;
-    let mut args = vec![
-        env_assignment("PATH", &context.path),
-        env_assignment("CODEX_HOME", codex_home.as_os_str()),
-        codex_bin.as_os_str().to_owned(),
-    ];
-    args.extend(resume_arguments(&cwd, &target.thread_id));
+    let command = platform_resume_command(
+        platform,
+        &context.path,
+        &codex_home,
+        &codex_bin,
+        &cwd,
+        &target.thread_id,
+        &context.monitor_cwd,
+    )?;
 
     Ok(ResumeCommandPlan {
         thread_id: target.thread_id.clone(),
         cwd,
-        command: CommandPlan {
-            program: PathBuf::from(ENV_BIN),
-            args,
-        },
+        command,
     })
+}
+
+fn platform_resume_command(
+    platform: ResumeCommandPlatform,
+    path: &OsStr,
+    codex_home: &Path,
+    codex_bin: &Path,
+    cwd: &Path,
+    thread_id: &str,
+    monitor_cwd: &Path,
+) -> Result<CommandPlan, PrepareError> {
+    let resume_args = resume_arguments(cwd, thread_id);
+    match platform {
+        ResumeCommandPlatform::Posix => {
+            let mut args = vec![
+                env_assignment("PATH", path),
+                env_assignment("CODEX_HOME", codex_home.as_os_str()),
+                codex_bin.as_os_str().to_owned(),
+            ];
+            args.extend(resume_args);
+            Ok(CommandPlan {
+                program: PathBuf::from(ENV_BIN),
+                args,
+            })
+        }
+        ResumeCommandPlatform::Windows => {
+            let powershell_bin = resolve_powershell_program(path, monitor_cwd)?;
+            let path = powershell_word(path)?;
+            let codex_home = powershell_word(codex_home.as_os_str())?;
+            let command = std::iter::once(codex_bin.as_os_str())
+                .chain(resume_args.iter().map(OsString::as_os_str))
+                .map(powershell_word)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(" ");
+            let script = format!(
+                "$env:PATH = {path}; $env:CODEX_HOME = {codex_home}; \
+                 $global:LASTEXITCODE = 1; & {command}; exit $LASTEXITCODE"
+            );
+            Ok(CommandPlan {
+                program: powershell_bin,
+                args: [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_powershell_program(path: &OsStr, monitor_cwd: &Path) -> Result<PathBuf, PrepareError> {
+    resolve_executable(POWERSHELL_BIN, None, path, monitor_cwd)
+}
+
+#[cfg(not(windows))]
+fn resolve_powershell_program(_path: &OsStr, _monitor_cwd: &Path) -> Result<PathBuf, PrepareError> {
+    Ok(PathBuf::from(POWERSHELL_BIN))
 }
 
 pub(crate) fn prepare_resume_copy_command(

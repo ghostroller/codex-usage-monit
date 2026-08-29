@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn continuous_local_coverage_materializes_at_quarter_hour_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("sessions")).unwrap();
+    let boundary = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let initial_at = boundary - ChronoDuration::seconds(10);
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+
+    assert!(
+        cache
+            .scan_if_changed(&config, initial_at)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        cache.update_local_coverage(initial_at, true),
+        Some(initial_at)
+    );
+    assert!(
+        cache
+            .scan_if_changed(&config, boundary - ChronoDuration::seconds(1))
+            .unwrap()
+            .is_none()
+    );
+    assert!(cache.scan_if_changed(&config, boundary).unwrap().is_some());
+    assert_eq!(
+        cache.update_local_coverage(boundary, true),
+        Some(initial_at)
+    );
+
+    let rolled_back = initial_at - ChronoDuration::seconds(1);
+    assert_eq!(
+        cache.update_local_coverage(rolled_back, true),
+        Some(rolled_back)
+    );
+    cache.discovery_cache.as_mut().unwrap().complete = false;
+    assert_eq!(cache.update_local_coverage(boundary, true), None);
+    assert!(cache.local_coverage_last_complete_at.is_none());
+}
+
+#[test]
+fn local_coverage_restarts_after_a_gap_longer_than_the_scan_lookback() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("sessions")).unwrap();
+    let initial_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        lookback_days: 1,
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+    cache.scan(&config, initial_at).unwrap();
+
+    assert_eq!(
+        cache.update_local_coverage(initial_at, true),
+        Some(initial_at)
+    );
+    let within_lookback = initial_at + ChronoDuration::hours(23);
+    assert_eq!(
+        cache.update_local_coverage(within_lookback, true),
+        Some(initial_at)
+    );
+
+    let after_gap = within_lookback + ChronoDuration::days(1) + ChronoDuration::seconds(1);
+    assert_eq!(
+        cache.update_local_coverage(after_gap, true),
+        Some(after_gap)
+    );
+    assert_eq!(cache.local_coverage_last_complete_at, Some(after_gap));
+}
+
+#[test]
 fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");
@@ -56,6 +131,43 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     assert!(cache.last_refresh().discovery_full_scan);
     assert_eq!(retried.stats.unreadable_files, 0);
     assert!(retried.warnings.is_empty());
+}
+
+#[test]
+fn incomplete_discovery_makes_the_selected_counter_boundary_partial() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let now = Utc::now();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread\"}}}}\n{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":0,\"reasoning_output_tokens\":0,\"total_tokens\":10}}}}}}}}\n",
+            now.to_rfc3339(),
+            (now + ChronoDuration::seconds(1)).to_rfc3339(),
+        ),
+    )
+    .unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+
+    let complete = cache.scan(&config, now).unwrap();
+    assert_eq!(complete.calls.len(), 1);
+    let discovery = cache.discovery_cache.as_mut().unwrap();
+    discovery.complete = false;
+    discovery.unreadable_files = 1;
+    discovery.full_scan_at = Instant::now();
+
+    let incomplete = cache
+        .scan(&config, now + ChronoDuration::seconds(2))
+        .unwrap();
+    assert!(cache.last_refresh().discovery_cache_hit);
+    assert!(incomplete.calls.is_empty());
+    assert_eq!(incomplete.tasks[0].token_usage.total_tokens, 0);
+    assert_eq!(incomplete.stats.ambiguous_token_resets, 1);
 }
 
 #[test]

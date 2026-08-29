@@ -172,6 +172,8 @@ fn fixture() -> (TempDir, ResumeTarget, LaunchContext) {
     fs::create_dir_all(&bin).unwrap();
     executable(&executable_path(&bin, "codex"));
     executable(&executable_path(&bin, "zellij"));
+    #[cfg(windows)]
+    executable(&bin.join(POWERSHELL_BIN));
     let context = LaunchContext::new(
         PathBuf::from("relative home"),
         None,
@@ -263,25 +265,38 @@ fn launch_plan_preserves_argv_boundaries_and_environment() {
 
     let separator = args.iter().position(|arg| arg == "--").unwrap();
     let command = &args[separator + 1..];
-    assert_eq!(command[0], ENV_BIN);
-    assert_eq!(command[1], env_assignment("PATH", &context.path));
-    assert_eq!(
-        command[2],
-        env_assignment(
-            "CODEX_HOME",
-            context.monitor_cwd.join("relative home").as_os_str()
-        )
-    );
-    assert!(Path::new(&command[3]).is_absolute());
-    assert_eq!(
-        &command[4..],
-        [
-            OsString::from("resume"),
-            OsString::from("--cd"),
-            target.cwd.as_ref().unwrap().as_os_str().to_owned(),
-            OsString::from(THREAD_ID),
-        ]
-    );
+    #[cfg(not(windows))]
+    {
+        assert_eq!(command[0], ENV_BIN);
+        assert_eq!(command[1], env_assignment("PATH", &context.path));
+        assert_eq!(
+            command[2],
+            env_assignment(
+                "CODEX_HOME",
+                context.monitor_cwd.join("relative home").as_os_str()
+            )
+        );
+        assert!(Path::new(&command[3]).is_absolute());
+        assert_eq!(
+            &command[4..],
+            [
+                OsString::from("resume"),
+                OsString::from("--cd"),
+                target.cwd.as_ref().unwrap().as_os_str().to_owned(),
+                OsString::from(THREAD_ID),
+            ]
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(Path::new(&command[0]).is_absolute());
+        assert_eq!(Path::new(&command[0]).file_name().unwrap(), POWERSHELL_BIN);
+        assert_eq!(
+            &command[1..5],
+            ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+        );
+        assert!(command[5].to_string_lossy().contains("$env:CODEX_HOME"));
+    }
 }
 
 #[test]
@@ -293,25 +308,67 @@ fn resume_command_does_not_require_a_zellij_context() {
 
     assert_eq!(plan.thread_id, THREAD_ID);
     assert_eq!(plan.cwd, target.cwd.as_ref().unwrap().as_path());
-    assert_eq!(plan.command.program, Path::new(ENV_BIN));
-    assert_eq!(plan.command.args[0], env_assignment("PATH", &context.path));
+    #[cfg(not(windows))]
+    {
+        assert_eq!(plan.command.program, Path::new(ENV_BIN));
+        assert_eq!(plan.command.args[0], env_assignment("PATH", &context.path));
+        assert_eq!(
+            plan.command.args[1],
+            env_assignment(
+                "CODEX_HOME",
+                context.monitor_cwd.join("relative home").as_os_str()
+            )
+        );
+        assert!(Path::new(&plan.command.args[2]).is_absolute());
+        assert_eq!(
+            &plan.command.args[3..],
+            [
+                OsString::from("resume"),
+                OsString::from("--cd"),
+                target.cwd.as_ref().unwrap().as_os_str().to_owned(),
+                OsString::from(THREAD_ID),
+            ]
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(plan.command.program.is_absolute());
+        assert_eq!(plan.command.program.file_name().unwrap(), POWERSHELL_BIN);
+    }
+}
+
+#[test]
+fn windows_resume_command_uses_powershell_and_preserves_environment_and_arguments() {
+    let (_temp, target, context) = fixture();
+
+    let plan =
+        prepare_resume_command_for_platform(&target, &context, ResumeCommandPlatform::Windows)
+            .unwrap();
+
+    #[cfg(not(windows))]
+    assert_eq!(plan.command.program, Path::new(POWERSHELL_BIN));
+    #[cfg(windows)]
+    {
+        assert!(plan.command.program.is_absolute());
+        assert_eq!(plan.command.program.file_name().unwrap(), POWERSHELL_BIN);
+    }
     assert_eq!(
-        plan.command.args[1],
-        env_assignment(
-            "CODEX_HOME",
-            context.monitor_cwd.join("relative home").as_os_str()
-        )
+        &plan.command.args[..4],
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
     );
-    assert!(Path::new(&plan.command.args[2]).is_absolute());
-    assert_eq!(
-        &plan.command.args[3..],
-        [
-            OsString::from("resume"),
-            OsString::from("--cd"),
-            target.cwd.as_ref().unwrap().as_os_str().to_owned(),
-            OsString::from(THREAD_ID),
-        ]
-    );
+    let script = plan.command.args[4].to_string_lossy();
+    assert!(script.contains(&format!(
+        "$env:PATH = {}",
+        powershell_word(&context.path).unwrap()
+    )));
+    assert!(script.contains(&format!(
+        "$env:CODEX_HOME = {}",
+        powershell_word(context.monitor_cwd.join("relative home").as_os_str()).unwrap()
+    )));
+    assert!(script.contains(&powershell_word(target.cwd.as_ref().unwrap().as_os_str()).unwrap()));
+    assert!(script.contains(&powershell_word(OsStr::new(THREAD_ID)).unwrap()));
+    assert!(script.ends_with("exit $LASTEXITCODE"));
+    assert!(!script.contains(ENV_BIN));
 }
 
 #[test]
@@ -499,15 +556,17 @@ fn relative_codex_override_is_resolved_against_monitor_cwd() {
         .iter()
         .position(|arg| arg == "--")
         .unwrap();
-    assert_eq!(
-        PathBuf::from(&plan.command.args[separator + 4]),
-        fs::canonicalize(tools.join("custom-codex")).unwrap()
+    let resolved = fs::canonicalize(tools.join("custom-codex")).unwrap();
+    #[cfg(not(windows))]
+    assert_eq!(PathBuf::from(&plan.command.args[separator + 4]), resolved);
+    #[cfg(windows)]
+    assert!(
+        plan.command.args[separator + 6]
+            .to_string_lossy()
+            .contains(&powershell_word(resolved.as_os_str()).unwrap())
     );
     let copy = prepare_resume_copy_command(&target, &context).unwrap();
-    assert_eq!(
-        copy.command.program,
-        fs::canonicalize(tools.join("custom-codex")).unwrap()
-    );
+    assert_eq!(copy.command.program, resolved);
     assert!(!render_resume_command(&copy).unwrap().contains("PATH="));
 }
 

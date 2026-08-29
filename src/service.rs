@@ -16,6 +16,19 @@ use crate::history::history_namespace_with_redaction;
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
 const WINDOWS_TASK_PREFIX: &str = r"\CodexUsageMonitRecorder";
+const HRESULT_FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
+const WINDOWS_TASK_STATE_ENV: &str = "CODEX_USAGE_MONIT_TASK_NAME";
+const WINDOWS_TASK_STATE_DISABLED: i32 = 1;
+const WINDOWS_TASK_STATE_QUEUED: i32 = 2;
+const WINDOWS_TASK_STATE_READY: i32 = 3;
+const WINDOWS_TASK_STATE_RUNNING: i32 = 4;
+const WINDOWS_TASK_STATE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$folder = $service.GetFolder('\')
+$task = $folder.GetTask($env:CODEX_USAGE_MONIT_TASK_NAME)
+[Console]::Out.Write([int]$task.State)
+"#;
 const STATUS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RECORDER_STALE_SECONDS: u64 = 12 * 60;
 const RECORDER_STALE_GRACE_SECONDS: u64 = 2 * 60;
@@ -778,11 +791,76 @@ WantedBy=default.target
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WindowsTaskOperation {
+    Query { task_name: String },
+    State { task_name: String },
+    End { task_name: String },
+    Delete { task_name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsTaskOperationResult {
+    success: bool,
+    code: Option<i32>,
+    detail: String,
+}
+
+fn run_windows_task_operation(
+    operation: WindowsTaskOperation,
+) -> Result<WindowsTaskOperationResult> {
+    let (mut command, description, preserve_stdout) = match operation {
+        WindowsTaskOperation::Query { task_name } => {
+            let mut command = Command::new("schtasks.exe");
+            command.args(["/Query", "/TN", &task_name, "/HRESULT"]);
+            (command, "schtasks /Query /HRESULT", false)
+        }
+        WindowsTaskOperation::State { task_name } => {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    WINDOWS_TASK_STATE_SCRIPT,
+                ])
+                .env(WINDOWS_TASK_STATE_ENV, task_name);
+            (command, "Task Scheduler state query", true)
+        }
+        WindowsTaskOperation::End { task_name } => {
+            let mut command = Command::new("schtasks.exe");
+            command.args(["/End", "/TN", &task_name]);
+            (command, "schtasks /End", false)
+        }
+        WindowsTaskOperation::Delete { task_name } => {
+            let mut command = Command::new("schtasks.exe");
+            command.args(["/Delete", "/TN", &task_name, "/F"]);
+            (command, "schtasks /Delete", false)
+        }
+    };
+    let output = command
+        .output()
+        .with_context(|| format!("could not run {description}"))?;
+    let success = output.status.success();
+    Ok(WindowsTaskOperationResult {
+        success,
+        code: output.status.code(),
+        detail: if success && preserve_stdout {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else if success {
+            String::new()
+        } else {
+            output_detail(&output)
+        },
+    })
+}
+
 fn install_windows_task(options: &ServiceOptions) -> Result<()> {
     let user_sid = windows_current_user_sid()?;
     let task_name = windows_task_name(&user_sid);
     if windows_task_is_installed(&task_name)? {
-        end_windows_task(&task_name);
+        end_windows_task(&task_name)?;
     }
     register_windows_task(options, &task_name, &user_sid)?;
     run_checked(
@@ -794,19 +872,7 @@ fn install_windows_task(options: &ServiceOptions) -> Result<()> {
 fn uninstall_windows_task(_options: &ServiceOptions) -> Result<()> {
     let user_sid = windows_current_user_sid()?;
     let task_name = windows_task_name(&user_sid);
-    if !windows_task_is_installed(&task_name)? {
-        return Ok(());
-    }
-    end_windows_task(&task_name);
-    let output = Command::new("schtasks.exe")
-        .args(["/Delete", "/TN", &task_name, "/F"])
-        .output()
-        .context("could not run schtasks /Delete")?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        bail!("schtasks /Delete failed: {}", output_detail(&output))
-    }
+    uninstall_windows_task_registration(&task_name, run_windows_task_operation)
 }
 
 fn windows_task_status(
@@ -834,18 +900,143 @@ fn windows_task_status(
 }
 
 fn windows_task_is_installed(task_name: &str) -> Result<bool> {
-    Ok(Command::new("schtasks.exe")
-        .args(["/Query", "/TN", task_name])
-        .output()
-        .context("could not run schtasks /Query")?
-        .status
-        .success())
+    let mut run = run_windows_task_operation;
+    windows_task_is_installed_with(task_name, &mut run)
 }
 
-fn end_windows_task(task_name: &str) {
-    let _ = Command::new("schtasks.exe")
-        .args(["/End", "/TN", task_name])
-        .output();
+fn windows_task_is_installed_with(
+    task_name: &str,
+    run: &mut impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
+) -> Result<bool> {
+    let result = run(WindowsTaskOperation::Query {
+        task_name: task_name.to_string(),
+    })?;
+    if result.success {
+        Ok(true)
+    } else if result.code == Some(HRESULT_FILE_NOT_FOUND) {
+        Ok(false)
+    } else {
+        bail!(
+            "schtasks /Query failed for {task_name}: {}",
+            windows_task_query_failure_detail(&result)
+        )
+    }
+}
+
+fn end_windows_task(task_name: &str) -> Result<()> {
+    let mut run = run_windows_task_operation;
+    end_windows_task_with(task_name, &mut run)
+}
+
+fn end_windows_task_with(
+    task_name: &str,
+    run: &mut impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
+) -> Result<()> {
+    let running = match windows_task_is_running_with(task_name, run) {
+        Ok(running) => running,
+        Err(state_error) => match windows_task_is_installed_with(task_name, run) {
+            Ok(false) => return Ok(()),
+            Ok(true) => return Err(state_error),
+            Err(query_error) => bail!(
+                "could not read Task Scheduler state for {task_name}: {state_error}; \
+                 could not verify whether the task remains registered: {query_error}"
+            ),
+        },
+    };
+    if !running {
+        return Ok(());
+    }
+    let result = run(WindowsTaskOperation::End {
+        task_name: task_name.to_string(),
+    })?;
+    if result.success {
+        return Ok(());
+    }
+    let end_failure = windows_task_exit_failure_detail(&result);
+    match windows_task_is_installed_with(task_name, run) {
+        Ok(false) => Ok(()),
+        Ok(true) => match windows_task_is_running_with(task_name, run) {
+            Ok(false) => Ok(()),
+            Ok(true) => bail!("schtasks /End failed for {task_name}: {end_failure}"),
+            Err(error) => bail!(
+                "schtasks /End failed for {task_name}: {end_failure}; \
+                 could not verify whether the task stopped: {error}"
+            ),
+        },
+        Err(error) => bail!(
+            "schtasks /End failed for {task_name}: {end_failure}; \
+             could not verify whether the task remains registered: {error}"
+        ),
+    }
+}
+
+fn windows_task_is_running_with(
+    task_name: &str,
+    run: &mut impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
+) -> Result<bool> {
+    let result = run(WindowsTaskOperation::State {
+        task_name: task_name.to_string(),
+    })?;
+    if !result.success {
+        bail!(
+            "could not read Task Scheduler state for {task_name}: {}",
+            windows_task_exit_failure_detail(&result)
+        );
+    }
+    let state = result.detail.trim().parse::<i32>().with_context(|| {
+        format!(
+            "Task Scheduler returned invalid state {:?} for {task_name}",
+            result.detail
+        )
+    })?;
+    match state {
+        WINDOWS_TASK_STATE_QUEUED | WINDOWS_TASK_STATE_RUNNING => Ok(true),
+        WINDOWS_TASK_STATE_DISABLED | WINDOWS_TASK_STATE_READY => Ok(false),
+        _ => bail!("Task Scheduler returned unknown state {state} for {task_name}"),
+    }
+}
+
+fn uninstall_windows_task_registration(
+    task_name: &str,
+    mut run: impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
+) -> Result<()> {
+    if !windows_task_is_installed_with(task_name, &mut run)? {
+        return Ok(());
+    }
+    end_windows_task_with(task_name, &mut run)?;
+    let result = run(WindowsTaskOperation::Delete {
+        task_name: task_name.to_string(),
+    })?;
+    if result.success {
+        return Ok(());
+    }
+    let delete_failure = windows_task_exit_failure_detail(&result);
+    match windows_task_is_installed_with(task_name, &mut run) {
+        Ok(false) => Ok(()),
+        Ok(true) => bail!("schtasks /Delete failed for {task_name}: {delete_failure}"),
+        Err(error) => bail!(
+            "schtasks /Delete failed for {task_name}: {delete_failure}; \
+             could not verify whether the task remains registered: {error}"
+        ),
+    }
+}
+
+fn windows_task_query_failure_detail(result: &WindowsTaskOperationResult) -> String {
+    match (result.code, result.detail.trim()) {
+        (Some(code), "") => format!("HRESULT 0x{:08X}", code as u32),
+        (Some(code), detail) => format!("HRESULT 0x{:08X}: {detail}", code as u32),
+        (None, "") => "process terminated without an exit code".to_string(),
+        (None, detail) => detail.to_string(),
+    }
+}
+
+fn windows_task_exit_failure_detail(result: &WindowsTaskOperationResult) -> String {
+    match (result.code, result.detail.trim()) {
+        (Some(code), "") => format!("exit status {code}"),
+        (Some(code), detail) => format!("exit status {code}: {detail}"),
+        (None, "") => "process terminated without an exit code".to_string(),
+        (None, detail) => detail.to_string(),
+    }
 }
 
 fn register_windows_task(options: &ServiceOptions, task_name: &str, user_sid: &str) -> Result<()> {
@@ -1421,6 +1612,181 @@ mod tests {
         let xml = windows_task_xml(&options, "S-1-5-21-1234");
         assert!(xml.contains(
             r#"&quot;--service-path=-C:\Portable Node &amp; Tools;C:\Windows\System32&quot;"#
+        ));
+    }
+
+    #[test]
+    fn windows_task_query_distinguishes_missing_from_other_failures() {
+        let task_name = r"\CodexUsageMonitRecorder-test";
+        let mut missing = |_| {
+            Ok(WindowsTaskOperationResult {
+                success: false,
+                code: Some(HRESULT_FILE_NOT_FOUND),
+                detail: "localized task-not-found diagnostic".to_string(),
+            })
+        };
+        assert!(!windows_task_is_installed_with(task_name, &mut missing).unwrap());
+
+        let mut installed = |_| {
+            Ok(WindowsTaskOperationResult {
+                success: true,
+                code: Some(0),
+                detail: String::new(),
+            })
+        };
+        assert!(windows_task_is_installed_with(task_name, &mut installed).unwrap());
+
+        let mut denied = |_| {
+            Ok(WindowsTaskOperationResult {
+                success: false,
+                code: Some(0x8007_0005_u32 as i32),
+                detail: "localized access-denied diagnostic".to_string(),
+            })
+        };
+        let error = windows_task_is_installed_with(task_name, &mut denied).unwrap_err();
+        assert!(error.to_string().contains("schtasks /Query failed"));
+        assert!(error.to_string().contains("HRESULT 0x80070005"));
+        assert!(error.to_string().contains("localized access-denied"));
+    }
+
+    #[test]
+    fn windows_task_uninstall_skips_end_when_not_running_but_still_deletes() {
+        let task_name = r"\CodexUsageMonitRecorder-test";
+        let mut operations = Vec::new();
+
+        uninstall_windows_task_registration(task_name, |operation| {
+            operations.push(operation.clone());
+            Ok(match operation {
+                WindowsTaskOperation::Query { .. } | WindowsTaskOperation::Delete { .. } => {
+                    WindowsTaskOperationResult {
+                        success: true,
+                        code: Some(0),
+                        detail: String::new(),
+                    }
+                }
+                WindowsTaskOperation::State { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: WINDOWS_TASK_STATE_READY.to_string(),
+                },
+                WindowsTaskOperation::End { .. } => panic!("an idle task must not be ended"),
+            })
+        })
+        .unwrap();
+
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                WindowsTaskOperation::Query { .. },
+                WindowsTaskOperation::State { .. },
+                WindowsTaskOperation::Delete { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn windows_task_uninstall_stops_on_query_or_end_errors() {
+        let task_name = r"\CodexUsageMonitRecorder-test";
+        let mut query_operations = Vec::new();
+        let query_error = uninstall_windows_task_registration(task_name, |operation| {
+            query_operations.push(operation);
+            Ok(WindowsTaskOperationResult {
+                success: false,
+                code: Some(0x8004_1322_u32 as i32),
+                detail: "localized scheduler-unavailable diagnostic".to_string(),
+            })
+        })
+        .unwrap_err();
+        assert!(query_error.to_string().contains("schtasks /Query failed"));
+        assert!(matches!(
+            query_operations.as_slice(),
+            [WindowsTaskOperation::Query { .. }]
+        ));
+
+        let mut end_operations = Vec::new();
+        let end_error = uninstall_windows_task_registration(task_name, |operation| {
+            end_operations.push(operation.clone());
+            Ok(match operation {
+                WindowsTaskOperation::Query { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: String::new(),
+                },
+                WindowsTaskOperation::State { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: WINDOWS_TASK_STATE_RUNNING.to_string(),
+                },
+                WindowsTaskOperation::End { .. } => WindowsTaskOperationResult {
+                    success: false,
+                    code: Some(5),
+                    detail: "localized access-denied diagnostic".to_string(),
+                },
+                WindowsTaskOperation::Delete { .. } => {
+                    panic!("delete must not run after an End failure")
+                }
+            })
+        })
+        .unwrap_err();
+        assert!(end_error.to_string().contains("schtasks /End failed"));
+        assert!(end_error.to_string().contains("exit status 5"));
+        assert!(!end_error.to_string().contains("HRESULT"));
+        assert!(matches!(
+            end_operations.as_slice(),
+            [
+                WindowsTaskOperation::Query { .. },
+                WindowsTaskOperation::State { .. },
+                WindowsTaskOperation::End { .. },
+                WindowsTaskOperation::Query { .. },
+                WindowsTaskOperation::State { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn windows_task_uninstall_verifies_state_after_delete_failure() {
+        let task_name = r"\CodexUsageMonitRecorder-test";
+        let mut query_count = 0;
+        let mut operations = Vec::new();
+
+        uninstall_windows_task_registration(task_name, |operation| {
+            operations.push(operation.clone());
+            Ok(match operation {
+                WindowsTaskOperation::Query { .. } => {
+                    query_count += 1;
+                    WindowsTaskOperationResult {
+                        success: query_count == 1,
+                        code: if query_count == 1 {
+                            Some(0)
+                        } else {
+                            Some(HRESULT_FILE_NOT_FOUND)
+                        },
+                        detail: "localized query diagnostic".to_string(),
+                    }
+                }
+                WindowsTaskOperation::State { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: WINDOWS_TASK_STATE_READY.to_string(),
+                },
+                WindowsTaskOperation::End { .. } => panic!("an idle task must not be ended"),
+                WindowsTaskOperation::Delete { .. } => WindowsTaskOperationResult {
+                    success: false,
+                    code: Some(1),
+                    detail: "localized delete diagnostic".to_string(),
+                },
+            })
+        })
+        .unwrap();
+
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                WindowsTaskOperation::Query { .. },
+                WindowsTaskOperation::State { .. },
+                WindowsTaskOperation::Delete { .. },
+                WindowsTaskOperation::Query { .. }
+            ]
         ));
     }
 

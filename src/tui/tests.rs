@@ -4536,7 +4536,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
         .chain(initial.scopes)
         {
             if !button.is_empty() {
-                assert!(button.x >= tabs.tabs[View::Health.index()].right());
+                assert!(button.x >= tabs.rendered_right);
                 assert!(button.right() <= width);
             }
         }
@@ -4582,8 +4582,7 @@ fn top_window_controls_keep_stable_compact_geometry() {
         terminal
             .draw(|frame| controls = Some(render_overview_controls(frame, frame.area(), &app)))
             .unwrap();
-        let controls_start =
-            view_tabs_hitbox(Rect::new(0, 0, width, 1)).tabs[View::Settings.index()].right();
+        let controls_start = view_tabs_hitbox(Rect::new(0, 0, width, 1)).rendered_right;
         let rendered = (controls_start..width)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect::<String>();
@@ -6904,6 +6903,7 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
     assert_eq!(tabs.tabs[View::Summary.index()], Rect::new(28, 0, 11, 1));
     assert_eq!(tabs.tabs[View::Health.index()], Rect::new(42, 0, 9, 1));
     assert_eq!(tabs.tabs[View::Settings.index()], Rect::new(54, 0, 12, 1));
+    assert_eq!(tabs.rendered_right, 66);
 
     let divider = tabs.tabs[View::Overview.index()].right();
     assert!(!handle_mouse_event(
@@ -6943,6 +6943,28 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
                 .all(|tab| tab.x >= area.x && tab.right() <= area.right())
         );
     }
+
+    let mut narrow = interaction_test_app(3, 2);
+    let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+    terminal.draw(|frame| render(frame, &mut narrow)).unwrap();
+    let tabs = narrow.view_tabs_hitbox.unwrap();
+    assert!(!tabs.tabs[View::Overview.index()].is_empty());
+    assert!(!tabs.tabs[View::Trends.index()].is_empty());
+    assert!(tabs.tabs[View::Summary.index()].is_empty());
+    assert_eq!(tabs.rendered_right, 20);
+    assert!(!handle_mouse_event(
+        &mut narrow,
+        mouse_event(MouseEventKind::Down(MouseButton::Left), 19, 0),
+    ));
+    assert_eq!(narrow.view, View::Overview);
+}
+
+#[test]
+fn title_hitboxes_require_the_complete_control_label() {
+    let area = Rect::new(0, 0, 29, 5);
+    assert_eq!(title_hitbox(area, 25, 3), Rect::new(25, 0, 3, 1));
+    assert!(title_hitbox(area, 26, 3).is_empty());
+    assert!(title_hitbox(area, 28, 1).is_empty());
 }
 
 #[test]
