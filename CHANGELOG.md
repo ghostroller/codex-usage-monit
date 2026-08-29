@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.3.1] - 2026-08-29
+
 ### Added
 
 - Added a project usage Summary view for the current cycle, the last 7 days, and the last 30 days, with Tokens, estimated credit-rate, and API-equivalent metrics. Its project-colored stacked-area chart supports local `1d`, `12h`, `6h`, `3h`, and `1h` buckets, Top 6 + Other or all-project composition, exact mouse and keyboard inspection when points fit the plot, and honest Complete/Partial/Missing coverage gaps.
@@ -210,7 +212,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.7...v0.2.8
