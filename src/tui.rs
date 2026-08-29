@@ -1,5 +1,7 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -10,11 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Utc};
 #[cfg(test)]
-use chrono::FixedOffset;
-use chrono::{
-    DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike, Utc,
-};
+use chrono::{FixedOffset, Timelike};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -49,7 +49,9 @@ use text::{
     truncate_display_text, truncate_middle_display_text,
 };
 
-use crate::api_cost::{API_PRICING_CATALOG_REVISION, format_api_cost_amount, format_pico_usd};
+#[cfg(test)]
+use crate::api_cost::API_PRICING_CATALOG_REVISION;
+use crate::api_cost::{format_api_cost_amount, format_pico_usd};
 use crate::attribution::ESTIMATED_COST_UNITS_PER_CREDIT;
 use crate::config::CollectConfig;
 use crate::domain::{
@@ -57,10 +59,9 @@ use crate::domain::{
     Snapshot, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis,
     WindowUsage, terminal_safe_text,
 };
-use crate::history::{
-    HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData,
-    HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES,
-};
+#[cfg(test)]
+use crate::history::{HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION};
+use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
 use crate::open_config::{OpenConfig, OpenConfigStore};
 use crate::perf::{HistoryMetrics, PerfLog};
 use crate::rollout::RolloutCache;
@@ -74,10 +75,30 @@ use crate::session_launch::{
 use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
 };
+#[cfg(test)]
+use crate::summary::SummaryWindow;
 use crate::summary::{
-    ProjectSummary, SessionSummary, SummaryMetrics, SummarySample, SummaryTurnKey, SummaryWindow,
-    TurnSummary, UsageSummary, summarize_samples_with_local_time,
+    ProjectSummary, SessionSummary, SummaryMetrics, SummaryTurnKey, TurnSummary, UsageSummary,
 };
+use crate::summary_report::{
+    PreparedSummary, SummaryChartBucket, SummaryChartData,
+    SummaryCoverageState as SummaryDailyState, SummaryGrain, SummaryMetric, SummaryRange,
+    history_view_since, prepare_summary_chart,
+    prepare_summary_with_local_time as prepare_shared_summary,
+    retain_summary_backfill_evidence_buckets, summary_backfill_config,
+    summary_backfill_scan_complete, summary_history_backfill_needed,
+    summary_history_coverage_complete,
+};
+#[cfg(test)]
+use crate::summary_report::{
+    SUMMARY_BACKFILL_MAX_FILES, SUMMARY_BACKFILL_RETRY_DAYS, SUMMARY_HISTORY_DAYS,
+    SummaryDailyCoverage, expected_summary_coverage, summary_api_cost_for_catalog,
+};
+use crate::trends::{
+    TrendPoint, TrendReadout, TrendReadoutValue, TrendsReport, build_trends_report,
+};
+#[cfg(test)]
+use crate::trends::{remaining_trend, trend_day_bounds, weekly_resets_overlapping};
 use crate::ui_state::{
     UiState, UiStateStore, UiSummaryGrain, UiSummaryMetric, UiSummaryRange, UiTableColumns,
     UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
@@ -89,9 +110,6 @@ const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(5), Duration::from_secs(10)];
 const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
-const SUMMARY_HISTORY_DAYS: i64 = 31;
-const SUMMARY_BACKFILL_MAX_FILES: usize = 5_000;
-const SUMMARY_BACKFILL_RETRY_DAYS: i64 = 7;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
@@ -160,45 +178,13 @@ fn display_local_datetime(value: DateTime<Utc>) -> NaiveDateTime {
     value.with_timezone(&Local).naive_local()
 }
 
+#[cfg(test)]
 fn display_local_hour(value: DateTime<Utc>) -> NaiveDateTime {
     let value = display_local_datetime(value);
     value
         .date()
         .and_hms_opt(value.hour(), 0, 0)
         .unwrap_or(value)
-}
-
-fn local_time_is_midnight(value: DateTime<Utc>) -> bool {
-    value.timestamp_subsec_nanos() == 0 && format_local_time(value, "%H:%M:%S") == "00:00:00"
-}
-
-fn summary_day_is_partial_window_edge(window: SummaryWindow, date: NaiveDate) -> bool {
-    let starts_on_date = display_local_date(window.starts_at) == date;
-    let ends_on_date = window
-        .ends_at
-        .checked_sub_signed(ChronoDuration::nanoseconds(1))
-        .is_some_and(|last| display_local_date(last) == date);
-    (starts_on_date && !local_time_is_midnight(window.starts_at))
-        || (ends_on_date && !local_time_is_midnight(window.ends_at))
-}
-
-fn summary_bucket_is_partial_window_edge(
-    window: SummaryWindow,
-    starts_at: NaiveDateTime,
-    grain: SummaryGrain,
-) -> bool {
-    let local_start = display_local_datetime(window.starts_at);
-    let local_end = display_local_datetime(window.ends_at);
-    let local_last = window
-        .ends_at
-        .checked_sub_signed(ChronoDuration::nanoseconds(1))
-        .map(display_local_datetime)
-        .unwrap_or(local_end);
-    let bucket_end = starts_at
-        .checked_add_signed(ChronoDuration::hours(i64::from(grain.hours())))
-        .unwrap_or(starts_at);
-    (grain.bucket_start(local_start) == starts_at && local_start != starts_at)
-        || (grain.bucket_start(local_last) == starts_at && local_end != bucket_end)
 }
 
 #[cfg(test)]
@@ -215,6 +201,7 @@ impl Drop for TestDisplayOffsetGuard {
 fn with_test_display_offset<T>(offset: FixedOffset, render: impl FnOnce() -> T) -> T {
     let _guard =
         TestDisplayOffsetGuard(TEST_DISPLAY_OFFSET.with(|current| current.replace(Some(offset))));
+    let _summary_guard = crate::summary_report::set_test_local_offset(offset);
     render()
 }
 
@@ -442,36 +429,6 @@ impl TrendSection {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TrendPoint {
-    at: DateTime<Utc>,
-    value: f64,
-    readout_value: TrendReadoutValue,
-    sampled_at: Option<DateTime<Utc>>,
-    interval: Option<TrendInterval>,
-    partial: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrendInterval {
-    starts_at: DateTime<Utc>,
-    ends_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum TrendReadoutValue {
-    Percent(f64),
-    Tokens(u64),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TrendReadout {
-    sampled_at: DateTime<Utc>,
-    value: TrendReadoutValue,
-    interval: Option<TrendInterval>,
-    partial: bool,
-}
-
 #[derive(Clone, Copy)]
 struct TrendSeries<'a> {
     name: &'static str,
@@ -535,17 +492,6 @@ struct TrendChartHitbox {
 struct TrendChartGeometry {
     plot: Rect,
     legend: Option<Rect>,
-}
-
-impl TrendPoint {
-    fn readout(self) -> Option<TrendReadout> {
-        self.sampled_at.map(|sampled_at| TrendReadout {
-            sampled_at,
-            value: self.readout_value,
-            interval: self.interval,
-            partial: self.partial,
-        })
-    }
 }
 
 impl TrendChartHitbox {
@@ -716,14 +662,6 @@ impl WindowScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SummaryRange {
-    #[default]
-    Cycle,
-    SevenDays,
-    ThirtyDays,
-}
-
 impl From<UiSummaryRange> for SummaryRange {
     fn from(value: UiSummaryRange) -> Self {
         match value {
@@ -744,9 +682,12 @@ impl From<SummaryRange> for UiSummaryRange {
     }
 }
 
-impl SummaryRange {
-    const ALL: [Self; 3] = [Self::Cycle, Self::SevenDays, Self::ThirtyDays];
+trait SummaryRangeUiExt {
+    fn index(self) -> usize;
+    fn shortcut(self) -> char;
+}
 
+impl SummaryRangeUiExt for SummaryRange {
     fn index(self) -> usize {
         match self {
             Self::Cycle => 0,
@@ -762,60 +703,6 @@ impl SummaryRange {
             Self::ThirtyDays => 'M',
         }
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cycle => "Cycle",
-            Self::SevenDays => "7d",
-            Self::ThirtyDays => "30d",
-        }
-    }
-
-    fn window(
-        self,
-        snapshot: &Snapshot,
-        query_now: DateTime<Utc>,
-    ) -> (SummaryWindow, Option<&'static str>) {
-        let query_now = query_now.max(snapshot.as_of);
-        let ends_at = query_now
-            .checked_add_signed(ChronoDuration::nanoseconds(1))
-            .unwrap_or(query_now);
-        let (starts_at, fallback_note) = match self {
-            Self::Cycle => {
-                let starts_at = window_analysis(snapshot, WindowScope::Week)
-                    .filter(|analysis| {
-                        !analysis
-                            .partial_reasons
-                            .iter()
-                            .any(|reason| reason == "quota_window_stale")
-                    })
-                    .and_then(|analysis| analysis.attribution.window.as_ref())
-                    .filter(|window| window.starts_at <= query_now && query_now < window.ends_at)
-                    .map(|window| window.starts_at);
-                starts_at.map_or_else(
-                    || (query_now - ChronoDuration::days(7), Some("7d fallback")),
-                    |starts_at| (starts_at, None),
-                )
-            }
-            Self::SevenDays => (query_now - ChronoDuration::days(7), None),
-            Self::ThirtyDays => (query_now - ChronoDuration::days(30), None),
-        };
-        (
-            SummaryWindow::new(starts_at.min(query_now), ends_at)
-                .expect("summary ranges always have a positive duration"),
-            fallback_note,
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SummaryGrain {
-    #[default]
-    Day,
-    Hours12,
-    Hours6,
-    Hours3,
-    Hour,
 }
 
 impl From<UiSummaryGrain> for SummaryGrain {
@@ -842,15 +729,13 @@ impl From<SummaryGrain> for UiSummaryGrain {
     }
 }
 
-impl SummaryGrain {
-    const ALL: [Self; 5] = [
-        Self::Day,
-        Self::Hours12,
-        Self::Hours6,
-        Self::Hours3,
-        Self::Hour,
-    ];
+trait SummaryGrainUiExt {
+    fn next(self) -> Self;
+    fn index(self) -> usize;
+    fn control_suffix(self) -> &'static str;
+}
 
+impl SummaryGrainUiExt for SummaryGrain {
     fn next(self) -> Self {
         Self::ALL[(self.index() + 1) % Self::ALL.len()]
     }
@@ -865,26 +750,6 @@ impl SummaryGrain {
         }
     }
 
-    fn hours(self) -> u32 {
-        match self {
-            Self::Day => 24,
-            Self::Hours12 => 12,
-            Self::Hours6 => 6,
-            Self::Hours3 => 3,
-            Self::Hour => 1,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Day => "1d",
-            Self::Hours12 => "12h",
-            Self::Hours6 => "6h",
-            Self::Hours3 => "3h",
-            Self::Hour => "1h",
-        }
-    }
-
     /// Three cells for every value keeps the whole `[B]...` hitbox stable as
     /// the selected grain changes.
     fn control_suffix(self) -> &'static str {
@@ -896,22 +761,6 @@ impl SummaryGrain {
             Self::Hour => " 1h",
         }
     }
-
-    fn bucket_start(self, hour: NaiveDateTime) -> NaiveDateTime {
-        let bucket_hour = match self {
-            Self::Day => 0,
-            _ => hour.hour().div_euclid(self.hours()) * self.hours(),
-        };
-        hour.date().and_hms_opt(bucket_hour, 0, 0).unwrap_or(hour)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SummaryMetric {
-    #[default]
-    Tokens,
-    Estimated,
-    ApiEquivalent,
 }
 
 impl From<UiSummaryMetric> for SummaryMetric {
@@ -934,9 +783,13 @@ impl From<SummaryMetric> for UiSummaryMetric {
     }
 }
 
-impl SummaryMetric {
-    const ALL: [Self; 3] = [Self::Tokens, Self::Estimated, Self::ApiEquivalent];
+trait SummaryMetricUiExt {
+    fn index(self) -> usize;
+    fn shortcut(self) -> char;
+    fn label(self) -> &'static str;
+}
 
+impl SummaryMetricUiExt for SummaryMetric {
     fn index(self) -> usize {
         match self {
             Self::Tokens => 0,
@@ -959,26 +812,6 @@ impl SummaryMetric {
             Self::Estimated => "~EST CR.",
             Self::ApiEquivalent => "API EQ.",
         }
-    }
-
-    fn value(self, metrics: SummaryMetrics, api_long_context: bool) -> u128 {
-        match self {
-            Self::Tokens => u128::from(metrics.token_usage.total_tokens),
-            Self::Estimated => metrics.estimated_units(api_long_context),
-            Self::ApiEquivalent => metrics.api_equivalent_cost.minimum_pico_usd.value(),
-        }
-    }
-
-    fn share_percent(
-        self,
-        metrics: SummaryMetrics,
-        total: SummaryMetrics,
-        api_long_context: bool,
-    ) -> f64 {
-        percent_u128(
-            self.value(metrics, api_long_context),
-            self.value(total, api_long_context),
-        )
     }
 }
 
@@ -1607,83 +1440,6 @@ struct TrendControlsHitbox {
     now: Rect,
 }
 
-#[derive(Clone, Debug)]
-struct PreparedSummary {
-    usage: UsageSummary,
-    range_note: Option<&'static str>,
-    represented_tokens: u64,
-    available_tokens: u64,
-    covered_buckets: usize,
-    expected_buckets: usize,
-    estimated_covered_tokens: u64,
-    long_context_breakdown_complete: bool,
-    daily_coverage: BTreeMap<NaiveDate, SummaryDailyCoverage>,
-    hourly_coverage: BTreeMap<NaiveDateTime, SummaryDailyCoverage>,
-    partial_reasons: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct SummaryDailyCoverage {
-    expected_buckets: usize,
-    covered_buckets: usize,
-    available_tokens: u64,
-    represented_tokens: u64,
-    estimated_covered_tokens: u64,
-    long_context_breakdown_complete: bool,
-    source_partial: bool,
-}
-
-impl Default for SummaryDailyCoverage {
-    fn default() -> Self {
-        Self {
-            expected_buckets: 0,
-            covered_buckets: 0,
-            available_tokens: 0,
-            represented_tokens: 0,
-            estimated_covered_tokens: 0,
-            long_context_breakdown_complete: true,
-            source_partial: false,
-        }
-    }
-}
-
-impl SummaryDailyCoverage {
-    fn add_assign(&mut self, other: &Self) {
-        self.expected_buckets = self.expected_buckets.saturating_add(other.expected_buckets);
-        self.covered_buckets = self.covered_buckets.saturating_add(other.covered_buckets);
-        self.available_tokens = self.available_tokens.saturating_add(other.available_tokens);
-        self.represented_tokens = self
-            .represented_tokens
-            .saturating_add(other.represented_tokens);
-        self.estimated_covered_tokens = self
-            .estimated_covered_tokens
-            .saturating_add(other.estimated_covered_tokens);
-        self.long_context_breakdown_complete &= other.long_context_breakdown_complete;
-        self.source_partial |= other.source_partial;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SummaryDailyState {
-    Complete,
-    Partial,
-    Missing,
-}
-
-#[derive(Clone, Debug)]
-struct SummaryChartBucket {
-    starts_at: NaiveDateTime,
-    totals: SummaryMetrics,
-    coverage: SummaryDailyCoverage,
-}
-
-#[derive(Clone, Debug)]
-struct SummaryChartData {
-    grain: SummaryGrain,
-    buckets: Vec<SummaryChartBucket>,
-    project_values: HashMap<String, BTreeMap<NaiveDateTime, SummaryMetrics>>,
-}
-
 fn summary_daily_status_symbols(states: &[SummaryDailyState]) -> String {
     states
         .iter()
@@ -1693,149 +1449,6 @@ fn summary_daily_status_symbols(states: &[SummaryDailyState]) -> String {
             SummaryDailyState::Missing => 'M',
         })
         .collect()
-}
-
-impl PreparedSummary {
-    fn coverage_percent(&self, metric: SummaryMetric) -> f64 {
-        let token_coverage = if self.available_tokens == 0 {
-            100.0
-        } else {
-            self.represented_tokens as f64 / self.available_tokens as f64 * 100.0
-        };
-        let time_coverage = if self.expected_buckets == 0 {
-            100.0
-        } else {
-            self.covered_buckets as f64 / self.expected_buckets as f64 * 100.0
-        };
-        let pricing_coverage = if metric == SummaryMetric::ApiEquivalent {
-            self.usage.totals.api_equivalent_cost.priced_token_percent()
-        } else {
-            100.0
-        };
-        let estimator_coverage = if metric != SummaryMetric::Estimated || self.available_tokens == 0
-        {
-            100.0
-        } else {
-            self.estimated_covered_tokens as f64 / self.available_tokens as f64 * 100.0
-        };
-        token_coverage
-            .min(time_coverage)
-            .min(pricing_coverage)
-            .min(estimator_coverage)
-            .clamp(0.0, 100.0)
-    }
-
-    fn partial(&self, metric: SummaryMetric, api_long_context: bool) -> bool {
-        !self.partial_reasons.is_empty()
-            || self.represented_tokens < self.available_tokens
-            || self.covered_buckets < self.expected_buckets
-            || (metric == SummaryMetric::ApiEquivalent && {
-                let amount = self.usage.totals.api_equivalent_cost;
-                amount.priced_samples < amount.observed_samples
-                    || amount.priced_tokens < amount.observed_tokens
-            })
-            || (metric == SummaryMetric::Estimated
-                && api_long_context
-                && !self.long_context_breakdown_complete)
-    }
-
-    fn api_chart_is_lower_bound(&self) -> bool {
-        let amount = self.usage.totals.api_equivalent_cost;
-        !amount.range_is_exact()
-            || amount.priced_samples < amount.observed_samples
-            || amount.priced_tokens < amount.observed_tokens
-            || self.represented_tokens < self.available_tokens
-            || self.covered_buckets < self.expected_buckets
-            || self.partial_reasons.iter().any(|reason| {
-                reason.starts_with("rollout_")
-                    || matches!(
-                        reason.as_str(),
-                        "local_scan_disabled" | "range_starts_within_15m_bucket"
-                    )
-            })
-    }
-
-    fn daily_state(
-        &self,
-        date: NaiveDate,
-        totals: SummaryMetrics,
-        metric: SummaryMetric,
-        api_long_context: bool,
-    ) -> SummaryDailyState {
-        let Some(coverage) = self.daily_coverage.get(&date) else {
-            return SummaryDailyState::Missing;
-        };
-        if coverage.covered_buckets == 0 {
-            return SummaryDailyState::Missing;
-        }
-        let metric_partial = match metric {
-            SummaryMetric::Tokens => false,
-            SummaryMetric::Estimated => {
-                coverage.estimated_covered_tokens < coverage.available_tokens
-                    || (api_long_context && !coverage.long_context_breakdown_complete)
-            }
-            SummaryMetric::ApiEquivalent => {
-                let amount = totals.api_equivalent_cost;
-                amount.priced_samples < amount.observed_samples
-                    || amount.priced_tokens < amount.observed_tokens
-                    || !amount.range_is_exact()
-            }
-        };
-        if coverage.covered_buckets < coverage.expected_buckets
-            || coverage.represented_tokens < coverage.available_tokens
-            || coverage.source_partial
-            || metric_partial
-            || summary_day_is_partial_window_edge(self.usage.window, date)
-        {
-            SummaryDailyState::Partial
-        } else {
-            SummaryDailyState::Complete
-        }
-    }
-
-    fn chart_bucket_state(
-        &self,
-        bucket: &SummaryChartBucket,
-        grain: SummaryGrain,
-        metric: SummaryMetric,
-        api_long_context: bool,
-    ) -> SummaryDailyState {
-        if grain == SummaryGrain::Day {
-            return self.daily_state(
-                bucket.starts_at.date(),
-                bucket.totals,
-                metric,
-                api_long_context,
-            );
-        }
-        let coverage = &bucket.coverage;
-        if coverage.covered_buckets == 0 {
-            return SummaryDailyState::Missing;
-        }
-        let metric_partial = match metric {
-            SummaryMetric::Tokens => false,
-            SummaryMetric::Estimated => {
-                coverage.estimated_covered_tokens < coverage.available_tokens
-                    || (api_long_context && !coverage.long_context_breakdown_complete)
-            }
-            SummaryMetric::ApiEquivalent => {
-                let amount = bucket.totals.api_equivalent_cost;
-                amount.priced_samples < amount.observed_samples
-                    || amount.priced_tokens < amount.observed_tokens
-                    || !amount.range_is_exact()
-            }
-        };
-        if coverage.covered_buckets < coverage.expected_buckets
-            || coverage.represented_tokens < coverage.available_tokens
-            || coverage.source_partial
-            || metric_partial
-            || summary_bucket_is_partial_window_edge(self.usage.window, bucket.starts_at, grain)
-        {
-            SummaryDailyState::Partial
-        } else {
-            SummaryDailyState::Complete
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1920,25 +1533,6 @@ enum ResumeLaunchRequest {
         pane_id: PaneId,
         codex_home: PathBuf,
     },
-}
-
-struct PreparedTrendData {
-    five_hour_remaining: Vec<TrendPoint>,
-    weekly_remaining: Vec<TrendPoint>,
-    weekly_tokens: Vec<TrendPoint>,
-    weekly_estimated: Vec<TrendPoint>,
-    half_hour_tokens: Vec<TrendPoint>,
-    half_hour_estimated: Vec<TrendPoint>,
-    five_hour_remaining_readout: Option<TrendReadout>,
-    weekly_remaining_readout: Option<TrendReadout>,
-    weekly_tokens_readout: Option<TrendReadout>,
-    weekly_estimated_readout: Option<TrendReadout>,
-    half_hour_bounds: [DateTime<Utc>; 2],
-    weekly_history_present: bool,
-    half_hour_history_present: bool,
-    history_warning_count: usize,
-    history_read_only: bool,
-    api_long_context_multiplier: bool,
 }
 
 struct TrendPanelSpec<'a> {
@@ -5857,90 +5451,6 @@ fn flush_staged_history_on_exit(history_store: &Arc<Mutex<HistoryStore>>, perf_l
     perf_log.record_history(metrics);
 }
 
-fn history_view_since(now: DateTime<Utc>) -> DateTime<Utc> {
-    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
-    let aligned_seconds = now.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
-    DateTime::from_timestamp(aligned_seconds, 0).unwrap_or(now)
-        - ChronoDuration::days(SUMMARY_HISTORY_DAYS)
-}
-
-fn summary_backfill_config(config: &CollectConfig) -> CollectConfig {
-    let mut config = config.clone();
-    config.lookback_days = SUMMARY_HISTORY_DAYS;
-    config.max_files = config.max_files.max(SUMMARY_BACKFILL_MAX_FILES);
-    // The backfill only reconstructs local project history. Avoid a redundant
-    // App Server request while the regular refresh worker owns account data.
-    config.offline = true;
-    config
-}
-
-fn summary_history_backfill_needed(history: &HistoryData, now: DateTime<Utc>) -> bool {
-    if history.read_only {
-        return false;
-    }
-    if history
-        .summary_backfill_attempted_at
-        .is_some_and(|attempted_at| {
-            attempted_at > now
-                || now - attempted_at < ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS)
-        })
-    {
-        return false;
-    }
-    history.summary_backfill_attempt_complete == Some(false)
-        || !summary_history_coverage_complete(history, now)
-}
-
-fn summary_history_coverage_complete(history: &HistoryData, now: DateTime<Utc>) -> bool {
-    let ends_at = now
-        .checked_add_signed(ChronoDuration::nanoseconds(1))
-        .unwrap_or(now);
-    let Some(window) = SummaryWindow::new(now - ChronoDuration::days(30), ends_at) else {
-        return true;
-    };
-    let expected = expected_summary_daily_coverage(window)
-        .values()
-        .map(|coverage| coverage.expected_buckets)
-        .fold(0_usize, usize::saturating_add);
-    let covered = history
-        .half_hour_buckets
-        .iter()
-        .filter(|bucket| {
-            window.contains(bucket.starts_at)
-                && bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
-                && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
-                && bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION
-                && bucket.api_long_context_extra_cost_units.is_some()
-        })
-        .count();
-    covered >= expected
-}
-
-fn summary_backfill_scan_complete(snapshot: &Snapshot) -> bool {
-    let stats = &snapshot.stats;
-    stats.truncated_files == 0
-        && stats.unreadable_files == 0
-        && stats.skipped_lines == 0
-        && stats.ambiguous_token_resets == 0
-        && stats.scanned_files == stats.discovered_files
-        && snapshot
-            .sources
-            .iter()
-            .any(|source| source.source == "rollout_jsonl" && source.status == "ok")
-}
-
-fn retain_summary_backfill_evidence_buckets(observation: &mut HistoryObservation) {
-    // A complete filesystem walk proves that every retained rollout was read; it
-    // cannot prove that an absent rollout never existed or was not deleted. A
-    // backfill therefore persists only buckets backed by a model call. Zero
-    // buckets recorded prospectively by the recorder remain in HistoryStore and
-    // are not deleted by this merge. Spark calls do not increment the bucket-level
-    // call count, but still create a project group, so either signal is evidence.
-    observation
-        .half_hour_buckets
-        .retain(|bucket| bucket.call_count > 0 || !bucket.project_groups.is_empty());
-}
-
 fn load_recorder_health(store: &HistoryStore) -> RecorderHealth {
     let Some(history_root) = store.history_root() else {
         return RecorderHealth {
@@ -6192,13 +5702,11 @@ fn start_refresh_if_due(
                     &worker_config.perf_log,
                 );
                 let coverage_complete = summary_history_coverage_complete(&history, observed_at);
-                match history_store
-                    .mark_summary_backfill_attempt(observed_at, scan_complete && coverage_complete)
-                {
-                    Ok(()) => {
+                let requested_complete = scan_complete && coverage_complete;
+                match history_store.mark_summary_backfill_attempt(observed_at, requested_complete) {
+                    Ok(complete) => {
                         history.summary_backfill_attempted_at = Some(observed_at);
-                        history.summary_backfill_attempt_complete =
-                            Some(scan_complete && coverage_complete);
+                        history.summary_backfill_attempt_complete = Some(complete);
                     }
                     Err(error) => {
                         // Keep an in-memory cooldown even when the durable
@@ -6206,8 +5714,7 @@ fn start_refresh_if_due(
                         // full state directory would trigger an immediate
                         // expensive rescan loop.
                         history.summary_backfill_attempted_at = Some(observed_at);
-                        history.summary_backfill_attempt_complete =
-                            Some(scan_complete && coverage_complete);
+                        history.summary_backfill_attempt_complete = Some(requested_complete);
                         history
                             .warnings
                             .push(format!("summary backfill marker failed: {error}"));
@@ -7371,317 +6878,20 @@ fn summary_history_inputs_eq(current: &HistoryData, incoming: &HistoryData) -> b
 }
 
 fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
-    let (window, range_note) = app.summary_range.window(&app.snapshot, query_now);
-    let mut samples = Vec::new();
-    let mut represented_tokens = 0_u64;
-    let mut available_tokens = 0_u64;
-    let mut covered_buckets = 0_usize;
-    let mut estimated_covered_tokens = 0_u64;
-    let mut long_context_breakdown_complete = true;
-    let mut daily_coverage = expected_summary_daily_coverage(window);
-    let mut hourly_coverage = expected_summary_hourly_coverage(window);
-    let mut partial_reasons = app.history.warnings.clone();
-    if range_note.is_some() {
-        partial_reasons.push("cycle_window_unavailable".to_string());
-    }
-
-    for bucket in &app.history.half_hour_buckets {
-        let selected = window.contains(bucket.starts_at);
-        if !selected {
-            continue;
-        }
-        let local_date = display_local_date(bucket.starts_at);
-        let local_hour = display_local_hour(bucket.starts_at);
-        for coverage in [
-            daily_coverage.entry(local_date).or_default(),
-            hourly_coverage.entry(local_hour).or_default(),
-        ] {
-            coverage.available_tokens = coverage
-                .available_tokens
-                .saturating_add(bucket.token_usage.total_tokens);
-            coverage.long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
-            coverage.source_partial |=
-                !bucket.partial_reasons.is_empty() || bucket.sampled_at < bucket.ends_at;
-        }
-        if bucket.sampled_at < bucket.ends_at {
-            partial_reasons.push("history_bucket_open".to_string());
-        }
-        let project_breakdown_current =
-            bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION;
-        if project_breakdown_current {
-            covered_buckets = covered_buckets.saturating_add(1);
-            for coverage in [
-                daily_coverage.entry(local_date).or_default(),
-                hourly_coverage.entry(local_hour).or_default(),
-            ] {
-                coverage.covered_buckets = coverage.covered_buckets.saturating_add(1);
-            }
-        } else {
-            partial_reasons.push("project_breakdown_unavailable".to_string());
-        }
-        available_tokens = available_tokens.saturating_add(bucket.token_usage.total_tokens);
-        partial_reasons.extend(bucket.partial_reasons.iter().cloned());
-        long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
-        if bucket.api_pricing_catalog_revision != API_PRICING_CATALOG_REVISION {
-            partial_reasons.push("api_pricing_catalog_outdated".to_string());
-        }
-        let estimator_current = bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION;
-        if estimator_current {
-            estimated_covered_tokens =
-                estimated_covered_tokens.saturating_add(bucket.token_usage.total_tokens);
-            for coverage in [
-                daily_coverage.entry(local_date).or_default(),
-                hourly_coverage.entry(local_hour).or_default(),
-            ] {
-                coverage.estimated_covered_tokens = coverage
-                    .estimated_covered_tokens
-                    .saturating_add(bucket.token_usage.total_tokens);
-            }
-        } else {
-            partial_reasons.push("estimator_revision_changed".to_string());
-        }
-        if !project_breakdown_current {
-            continue;
-        }
-        for group in &bucket.project_groups {
-            represented_tokens = represented_tokens.saturating_add(group.token_usage.total_tokens);
-            for coverage in [
-                daily_coverage.entry(local_date).or_default(),
-                hourly_coverage.entry(local_hour).or_default(),
-            ] {
-                coverage.represented_tokens = coverage
-                    .represented_tokens
-                    .saturating_add(group.token_usage.total_tokens);
-            }
-            if estimator_current
-                && (!group.token_usage.is_zero() || group.estimated_cost_units > 0)
-                && group.api_long_context_extra_cost_units.is_none()
-            {
-                long_context_breakdown_complete = false;
-                daily_coverage
-                    .entry(local_date)
-                    .or_default()
-                    .long_context_breakdown_complete = false;
-                hourly_coverage
-                    .entry(local_hour)
-                    .or_default()
-                    .long_context_breakdown_complete = false;
-            }
-            let (estimated_cost_units, api_long_context_extra_cost_units) =
-                summary_estimated_units_for_revision(
-                    group.estimated_cost_units,
-                    group.api_long_context_extra_cost_units.unwrap_or_default(),
-                    bucket.estimator_revision,
-                );
-            samples.push(SummarySample {
-                timestamp: bucket.starts_at,
-                thread_id: group.thread_id.clone(),
-                parent_thread_id: group.parent_thread_id.clone(),
-                turn_id: group.turn_id.clone(),
-                session_thread_id: group.session_thread_id.clone(),
-                session_turn_id: group.session_turn_id.clone(),
-                message_preview: group.message_preview.clone(),
-                turn_started_at: group.turn_started_at,
-                project_key: group.project_id.clone(),
-                project_label: group.project_label.clone(),
-                cwd: None,
-                title: group.title.clone(),
-                source: group.source.clone(),
-                token_usage: group.token_usage,
-                estimated_cost_units,
-                api_long_context_extra_cost_units,
-                api_equivalent_cost: summary_api_cost_for_catalog(
-                    group.api_equivalent_cost,
-                    bucket.api_pricing_catalog_revision,
-                ),
-                call_count: group.call_count,
-            });
-        }
-    }
-
-    // The live task index is the freshest metadata source. Overlay it without
-    // adding usage so post-completion renames and redaction take effect even
-    // when a closed history bucket has no new token evidence.
-    samples.extend(app.snapshot.tasks.iter().map(|task| {
-        SummarySample {
-            timestamp: app.snapshot.as_of,
-            thread_id: task.thread_id.clone(),
-            parent_thread_id: task.parent_thread_id.clone(),
-            turn_id: None,
-            session_thread_id: None,
-            session_turn_id: None,
-            message_preview: None,
-            turn_started_at: None,
-            project_key: None,
-            project_label: task
-                .cwd
-                .as_deref()
-                .and_then(|cwd| cwd.file_name())
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .map(str::to_string),
-            cwd: task.cwd.clone(),
-            title: Some(task.title.clone()),
-            source: task.source.clone(),
-            token_usage: TokenUsage::default(),
-            estimated_cost_units: 0,
-            api_long_context_extra_cost_units: 0,
-            api_equivalent_cost: ApiCostAmount::default(),
-            call_count: 0,
-        }
-    }));
-
-    if window
-        .starts_at
-        .timestamp()
-        .rem_euclid(LOCAL_BUCKET_MINUTES * 60)
-        != 0
-    {
-        partial_reasons.push("range_starts_within_15m_bucket".to_string());
-    }
-    if app.history.read_only {
-        partial_reasons.push("history_read_only".to_string());
-    }
-    partial_reasons.sort();
-    partial_reasons.dedup();
-
-    let expected_buckets = daily_coverage
-        .values()
-        .map(|coverage| coverage.expected_buckets)
-        .fold(0_usize, usize::saturating_add);
-    let usage = summarize_samples_with_local_time(&samples, window, display_local_datetime);
-    PreparedSummary {
-        usage,
-        range_note,
-        represented_tokens,
-        available_tokens,
-        covered_buckets,
-        expected_buckets,
-        estimated_covered_tokens,
-        long_context_breakdown_complete,
-        daily_coverage,
-        hourly_coverage,
-        partial_reasons,
-    }
+    prepare_shared_summary(
+        &app.snapshot,
+        &app.history,
+        app.summary_range,
+        query_now,
+        display_local_datetime,
+    )
 }
 
+#[cfg(test)]
 fn expected_summary_daily_coverage(
     window: SummaryWindow,
 ) -> BTreeMap<NaiveDate, SummaryDailyCoverage> {
     expected_summary_coverage(window, display_local_date)
-}
-
-fn expected_summary_hourly_coverage(
-    window: SummaryWindow,
-) -> BTreeMap<NaiveDateTime, SummaryDailyCoverage> {
-    expected_summary_coverage(window, display_local_hour)
-}
-
-fn expected_summary_coverage<K: Ord>(
-    window: SummaryWindow,
-    local_key: impl Fn(DateTime<Utc>) -> K,
-) -> BTreeMap<K, SummaryDailyCoverage> {
-    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
-    let mut starts_at_seconds = window
-        .starts_at
-        .timestamp()
-        .div_euclid(bucket_seconds)
-        .saturating_mul(bucket_seconds);
-    let aligned = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
-    if aligned < window.starts_at {
-        starts_at_seconds = starts_at_seconds.saturating_add(bucket_seconds);
-    }
-    let mut starts_at = DateTime::from_timestamp(starts_at_seconds, 0).unwrap_or(window.starts_at);
-    let mut coverage = BTreeMap::<K, SummaryDailyCoverage>::new();
-    while starts_at < window.ends_at {
-        let bucket = coverage.entry(local_key(starts_at)).or_default();
-        bucket.expected_buckets = bucket.expected_buckets.saturating_add(1);
-        let Some(next) = starts_at.checked_add_signed(ChronoDuration::seconds(bucket_seconds))
-        else {
-            break;
-        };
-        starts_at = next;
-    }
-    coverage
-}
-
-fn prepare_summary_chart(prepared: &PreparedSummary, grain: SummaryGrain) -> SummaryChartData {
-    let mut coverage_by_bucket = BTreeMap::<NaiveDateTime, SummaryDailyCoverage>::new();
-    for (hour, coverage) in &prepared.hourly_coverage {
-        coverage_by_bucket
-            .entry(grain.bucket_start(*hour))
-            .or_default()
-            .add_assign(coverage);
-    }
-
-    let mut totals_by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
-    for hour in &prepared.usage.hours {
-        totals_by_bucket
-            .entry(grain.bucket_start(hour.starts_at))
-            .or_default()
-            .add_assign(hour.totals);
-    }
-    for starts_at in totals_by_bucket.keys().copied().collect::<Vec<_>>() {
-        coverage_by_bucket.entry(starts_at).or_default();
-    }
-
-    let starts = coverage_by_bucket.keys().copied().collect::<Vec<_>>();
-    let buckets = starts
-        .iter()
-        .map(|starts_at| SummaryChartBucket {
-            starts_at: *starts_at,
-            totals: totals_by_bucket.get(starts_at).copied().unwrap_or_default(),
-            coverage: coverage_by_bucket
-                .get(starts_at)
-                .cloned()
-                .unwrap_or_default(),
-        })
-        .collect();
-    let project_values = prepared
-        .usage
-        .projects
-        .iter()
-        .map(|project| {
-            let mut by_bucket = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
-            for hour in &project.hours {
-                by_bucket
-                    .entry(grain.bucket_start(hour.starts_at))
-                    .or_default()
-                    .add_assign(hour.totals);
-            }
-            (project.key.clone(), by_bucket)
-        })
-        .collect();
-
-    SummaryChartData {
-        grain,
-        buckets,
-        project_values,
-    }
-}
-
-fn summary_api_cost_for_catalog(amount: ApiCostAmount, catalog_revision: u32) -> ApiCostAmount {
-    if catalog_revision == API_PRICING_CATALOG_REVISION {
-        amount
-    } else {
-        ApiCostAmount {
-            observed_samples: amount.observed_samples,
-            observed_tokens: amount.observed_tokens,
-            ..ApiCostAmount::default()
-        }
-    }
-}
-
-fn summary_estimated_units_for_revision(
-    base_units: u128,
-    long_context_extra_units: u128,
-    estimator_revision: u32,
-) -> (u128, u128) {
-    if estimator_revision == HISTORY_ESTIMATOR_REVISION {
-        (base_units, long_context_extra_units)
-    } else {
-        (0, 0)
-    }
 }
 
 fn ensure_summary_cache(app: &mut App, query_now: DateTime<Utc>) {
@@ -7924,14 +7134,6 @@ fn summary_tree_rows(
         }
     }
     rows
-}
-
-fn percent_u128(value: u128, total: u128) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        value as f64 / total as f64 * 100.0
-    }
 }
 
 fn format_compact_u128(value: u128) -> String {
@@ -9326,14 +8528,11 @@ fn render_summary_annotations(
 
 fn summary_daily_is_lower_bound(
     prepared: &PreparedSummary,
+    chart: &SummaryChartData,
     metric: SummaryMetric,
     api_long_context: bool,
-    complete_buckets: usize,
-    total_buckets: usize,
 ) -> bool {
-    complete_buckets < total_buckets
-        || prepared.partial(metric, api_long_context)
-        || (metric == SummaryMetric::ApiEquivalent && prepared.api_chart_is_lower_bound())
+    prepared.chart_value_is_lower_bound(chart, metric, api_long_context)
 }
 
 fn render_summary_daily(
@@ -9389,10 +8588,9 @@ fn render_summary_daily(
     );
     let lower_bound = summary_daily_is_lower_bound(
         prepared,
+        chart,
         app.summary_metric,
         app.api_long_context_multiplier,
-        complete_buckets,
-        total_buckets,
     );
     let block = panel(&title, app.theme);
     let inner = block.inner(area);
@@ -9954,316 +9152,13 @@ fn append_trend_control(
     hitbox
 }
 
-fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> PreparedTrendData {
-    let five_hour_remaining = remaining_trend(&app.history, 300);
-    let weekly_remaining = remaining_trend(&app.history, 10_080);
-    let five_hour_remaining_readout = remaining_trend_readout(&app.history, 300, now);
-    let weekly_remaining_readout = remaining_trend_readout(&app.history, 10_080, now);
-    let half_hour_bounds = trend_day_bounds(now, app.trend_day_offset);
-    let weekly_reset = app.history.latest_weekly_reset();
-
-    let weekly_cumulative = weekly_reset
-        .map(|reset| app.history.weekly_cumulative_series(reset))
-        .unwrap_or_default();
-    let weekly_estimated_cumulative = weekly_reset
-        .map(|reset| {
-            app.history.weekly_cumulative_series_with_api_long_context(
-                reset,
-                app.api_long_context_multiplier,
-            )
-        })
-        .unwrap_or_default();
-    let weekly_history_present = weekly_cumulative
-        .iter()
-        .any(|point| point.sampled_at.is_some());
-    let weekly_tokens = weekly_cumulative
-        .iter()
-        .map(|point| TrendPoint {
-            at: point.at,
-            value: point.token_usage.total_tokens as f64,
-            readout_value: TrendReadoutValue::Tokens(point.token_usage.total_tokens),
-            sampled_at: point.sampled_at,
-            interval: None,
-            partial: !point.partial_reasons.is_empty(),
-        })
-        .collect();
-    let weekly_estimated = weekly_estimated_cumulative
-        .iter()
-        .filter_map(|point| {
-            point.estimated_quota_percent.map(|value| TrendPoint {
-                at: point.at,
-                value,
-                readout_value: TrendReadoutValue::Percent(value),
-                sampled_at: point.sampled_at,
-                interval: None,
-                partial: !point.partial_reasons.is_empty(),
-            })
-        })
-        .collect();
-    let weekly_readout_point = weekly_reset
-        .filter(|reset| {
-            let starts_at = *reset - ChronoDuration::minutes(10_080);
-            starts_at <= now && now < *reset
-        })
-        .and_then(|_| {
-            weekly_cumulative
-                .iter()
-                .rfind(|point| point.sampled_at.is_some_and(|sampled_at| sampled_at <= now))
-                .and_then(|point| point.sampled_at.map(|sampled_at| (point, sampled_at)))
-        });
-    let weekly_tokens_readout = weekly_readout_point.map(|(point, sampled_at)| TrendReadout {
-        sampled_at,
-        value: TrendReadoutValue::Tokens(point.token_usage.total_tokens),
-        interval: None,
-        partial: !point.partial_reasons.is_empty(),
-    });
-    let weekly_estimated_readout_point = weekly_reset
-        .filter(|reset| {
-            let starts_at = *reset - ChronoDuration::minutes(10_080);
-            starts_at <= now && now < *reset
-        })
-        .and_then(|_| {
-            weekly_estimated_cumulative
-                .iter()
-                .rfind(|point| point.sampled_at.is_some_and(|sampled_at| sampled_at <= now))
-                .and_then(|point| point.sampled_at.map(|sampled_at| (point, sampled_at)))
-        });
-    let weekly_estimated_readout =
-        weekly_estimated_readout_point.and_then(|(point, sampled_at)| {
-            point.estimated_quota_percent.map(|value| TrendReadout {
-                sampled_at,
-                value: TrendReadoutValue::Percent(value),
-                interval: None,
-                partial: !point.partial_reasons.is_empty(),
-            })
-        });
-
-    let half_hour_buckets = app
-        .history
-        .half_hour_series()
-        .iter()
-        .filter(|bucket| {
-            bucket.starts_at >= half_hour_bounds[0] && bucket.starts_at < half_hour_bounds[1]
-        })
-        .collect::<Vec<_>>();
-    let half_hour_history_present = !half_hour_buckets.is_empty();
-    let half_hour_tokens = half_hour_buckets
-        .iter()
-        .map(|bucket| TrendPoint {
-            at: bucket.starts_at + (bucket.ends_at - bucket.starts_at) / 2,
-            value: bucket.token_usage.total_tokens as f64,
-            readout_value: TrendReadoutValue::Tokens(bucket.token_usage.total_tokens),
-            sampled_at: Some(bucket.sampled_at),
-            interval: Some(TrendInterval {
-                starts_at: bucket.starts_at,
-                ends_at: bucket.ends_at,
-            }),
-            partial: !bucket.partial_reasons.is_empty(),
-        })
-        .collect();
-    let half_hour_estimated = half_hour_estimated_trend(
+fn prepare_trend_data_at(app: &App, now: DateTime<Utc>) -> TrendsReport {
+    build_trends_report(
         &app.history,
-        half_hour_bounds,
+        now,
+        app.trend_day_offset,
         app.api_long_context_multiplier,
-    );
-
-    PreparedTrendData {
-        five_hour_remaining,
-        weekly_remaining,
-        weekly_tokens,
-        weekly_estimated,
-        half_hour_tokens,
-        half_hour_estimated,
-        five_hour_remaining_readout,
-        weekly_remaining_readout,
-        weekly_tokens_readout,
-        weekly_estimated_readout,
-        half_hour_bounds,
-        weekly_history_present,
-        half_hour_history_present,
-        history_warning_count: app.history.warnings.len(),
-        history_read_only: app.history.read_only,
-        api_long_context_multiplier: app.api_long_context_multiplier,
-    }
-}
-
-fn remaining_trend_readout(
-    history: &HistoryData,
-    duration_mins: i64,
-    now: DateTime<Utc>,
-) -> Option<TrendReadout> {
-    history
-        .quota_points
-        .iter()
-        .filter(|point| {
-            point.duration_mins == duration_mins
-                && point.observed_at <= now
-                && now < point.resets_at
-        })
-        .max_by_key(|point| (point.observed_at, point.resets_at))
-        .map(|point| TrendReadout {
-            sampled_at: point.observed_at,
-            value: TrendReadoutValue::Percent(point.remaining_percent),
-            interval: None,
-            partial: false,
-        })
-}
-
-fn half_hour_estimated_trend(
-    history: &HistoryData,
-    bounds: [DateTime<Utc>; 2],
-    api_long_context: bool,
-) -> Vec<TrendPoint> {
-    const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
-    let resets = weekly_resets_overlapping(history, bounds);
-    let estimates_by_reset = resets
-        .iter()
-        .copied()
-        .map(|reset| {
-            let points = history
-                .estimated_half_hour_series_with_api_long_context(reset, api_long_context)
-                .into_iter()
-                .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
-                .map(|point| (point.starts_at, point))
-                .collect::<BTreeMap<_, _>>();
-            (reset, points)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut points = BTreeMap::new();
-    for bucket in history
-        .half_hour_series()
-        .iter()
-        .filter(|bucket| bucket.starts_at >= bounds[0] && bucket.starts_at < bounds[1])
-    {
-        let crosses_reset = resets.iter().any(|reset| {
-            let cycle_starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
-            bucket.starts_at < cycle_starts_at && cycle_starts_at < bucket.ends_at
-        });
-        if crosses_reset {
-            continue;
-        }
-        let Some(reset) = resets
-            .iter()
-            .copied()
-            .filter(|reset| {
-                let cycle_starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
-                bucket.starts_at >= cycle_starts_at && bucket.ends_at <= *reset
-            })
-            .max()
-        else {
-            continue;
-        };
-        let Some(point) = estimates_by_reset
-            .get(&reset)
-            .and_then(|points| points.get(&bucket.starts_at))
-        else {
-            continue;
-        };
-        let Some(value) = point.estimated_quota_percent else {
-            continue;
-        };
-        let at = point.starts_at + (point.ends_at - point.starts_at) / 2;
-        points.insert(
-            at,
-            TrendPoint {
-                at,
-                value,
-                readout_value: TrendReadoutValue::Percent(value),
-                sampled_at: Some(bucket.sampled_at),
-                interval: Some(TrendInterval {
-                    starts_at: point.starts_at,
-                    ends_at: point.ends_at,
-                }),
-                partial: !point.partial_reasons.is_empty(),
-            },
-        );
-    }
-    points.into_values().collect()
-}
-
-fn weekly_resets_overlapping(
-    history: &HistoryData,
-    bounds: [DateTime<Utc>; 2],
-) -> Vec<DateTime<Utc>> {
-    const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
-    const RESET_DRIFT_SECONDS: i64 = 120;
-
-    let mut candidates = history
-        .quota_points
-        .iter()
-        .filter(|point| point.duration_mins == WEEKLY_WINDOW_MINUTES)
-        .map(|point| (point.resets_at, point.observed_at))
-        .chain(
-            history
-                .weekly_local_points
-                .iter()
-                .map(|point| (point.resets_at, point.observed_at)),
-        )
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by_key(|(reset, observed_at)| (*reset, *observed_at));
-
-    let mut resets = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
-    let mut cluster_end = None;
-    let mut representative = None::<(DateTime<Utc>, DateTime<Utc>)>;
-    for (reset, observed_at) in candidates {
-        let joins_cluster = cluster_end
-            .is_some_and(|end| reset - end <= ChronoDuration::seconds(RESET_DRIFT_SECONDS));
-        if !joins_cluster && let Some(previous) = representative.take() {
-            resets.push(previous);
-        }
-        cluster_end = Some(reset);
-        if representative.is_none_or(|current| (observed_at, reset) > (current.1, current.0)) {
-            representative = Some((reset, observed_at));
-        }
-    }
-    if let Some(last) = representative {
-        resets.push(last);
-    }
-    resets.sort_by_key(|(reset, _)| *reset);
-
-    resets
-        .into_iter()
-        .map(|(reset, _)| reset)
-        .filter(|reset| {
-            let starts_at = *reset - ChronoDuration::minutes(WEEKLY_WINDOW_MINUTES);
-            starts_at < bounds[1] && *reset > bounds[0]
-        })
-        .collect()
-}
-
-fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
-    let mut points = history.remaining_series(duration_mins);
-    // Keep real observations from every loaded cycle. A reset credit can start
-    // a new cycle before the previous resets_at, so the observed timestamps are
-    // the honest transition boundary; the renderer still splits recorder gaps.
-    points.sort_by(|left, right| {
-        left.observed_at
-            .cmp(&right.observed_at)
-            .then_with(|| left.resets_at.cmp(&right.resets_at))
-    });
-    points
-        .into_iter()
-        .map(|point| TrendPoint {
-            at: point.observed_at,
-            value: point.remaining_percent,
-            readout_value: TrendReadoutValue::Percent(point.remaining_percent),
-            sampled_at: Some(point.observed_at),
-            interval: None,
-            partial: false,
-        })
-        .collect()
-}
-
-fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2] {
-    let shifted = as_of - ChronoDuration::days(i64::from(day_offset));
-    let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
-    let end_seconds = shifted
-        .timestamp()
-        .saturating_add(bucket_seconds - 1)
-        .div_euclid(bucket_seconds)
-        .saturating_mul(bucket_seconds);
-    let end = DateTime::from_timestamp(end_seconds, 0).unwrap_or(shifted);
-    [end - ChronoDuration::hours(24), end]
+    )
 }
 
 fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Utc>) {
@@ -10474,7 +9369,7 @@ fn render_trend_message_panel(
 fn render_remaining_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    data: &PreparedTrendData,
+    data: &TrendsReport,
     theme: Theme,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
@@ -10519,7 +9414,7 @@ fn render_remaining_trend_panel(
 fn render_weekly_token_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    data: &PreparedTrendData,
+    data: &TrendsReport,
     theme: Theme,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
@@ -10555,7 +9450,7 @@ fn render_weekly_token_trend_panel(
 fn render_weekly_estimated_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    data: &PreparedTrendData,
+    data: &TrendsReport,
     theme: Theme,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
@@ -10615,7 +9510,7 @@ fn render_weekly_estimated_trend_panel(
 fn render_half_hour_token_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    data: &PreparedTrendData,
+    data: &TrendsReport,
     theme: Theme,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
@@ -10651,7 +9546,7 @@ fn render_half_hour_token_trend_panel(
 fn render_half_hour_estimated_trend_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    data: &PreparedTrendData,
+    data: &TrendsReport,
     theme: Theme,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,

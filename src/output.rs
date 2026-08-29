@@ -48,6 +48,8 @@ pub struct OutputRequest {
     pub compact: bool,
     pub sections: BTreeSet<Section>,
     pub thread_filter: Option<String>,
+    /// Render the optional API long-context quota-estimate projection.
+    pub api_long_context: bool,
 }
 
 pub fn render_output(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
@@ -164,6 +166,12 @@ fn render_json(snapshot: &Snapshot, request: &OutputRequest) -> Result<String> {
         .expect("Snapshot always serializes as an object");
     let partial = request_is_partial(snapshot, request);
     object.insert("partial".to_string(), Value::Bool(partial));
+    if request.api_long_context {
+        object.insert(
+            "estimateProjection".to_string(),
+            Value::String("apiLongContext".to_string()),
+        );
+    }
 
     for (section, key) in [
         (Section::Limits, "limits"),
@@ -238,8 +246,13 @@ fn render_text(snapshot: &Snapshot, request: &OutputRequest) -> String {
     .find(|section| request.sections.contains(section));
     let _ = writeln!(
         output,
-        "Codex usage snapshot  {}{}",
+        "Codex usage snapshot  {}{}{}",
         snapshot.as_of.to_rfc3339(),
+        if request.api_long_context {
+            "  [EST LONGX]"
+        } else {
+            ""
+        },
         if partial { "  [PARTIAL]" } else { "" }
     );
 

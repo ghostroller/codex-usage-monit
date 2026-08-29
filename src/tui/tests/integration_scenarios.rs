@@ -1987,17 +1987,17 @@ fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
     harness.key(KeyCode::Char('7'));
     harness.key(KeyCode::Char('A'));
 
-    let prepared = &harness.app.summary_cache.as_ref().unwrap().prepared;
+    let cache = harness.app.summary_cache.as_ref().unwrap();
+    let prepared = &cache.prepared;
     assert_eq!(prepared.covered_buckets, prepared.expected_buckets);
     assert_eq!(prepared.represented_tokens, prepared.available_tokens);
     assert!(!prepared.partial(SummaryMetric::ApiEquivalent, false));
     assert!(prepared.api_chart_is_lower_bound());
     assert!(summary_daily_is_lower_bound(
         prepared,
+        &cache.chart,
         SummaryMetric::ApiEquivalent,
         false,
-        prepared.usage.days.len(),
-        prepared.usage.days.len(),
     ));
     assert!(harness.frame().snapshot_text().contains("LOWER BOUND"));
 }

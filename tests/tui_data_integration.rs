@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use chrono::{Duration, Utc};
 use serde_json::Value;
 
 fn binary() -> &'static str {
@@ -33,6 +34,83 @@ fn parse_json(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn write_current_rollout_fixture(codex_home: &Path) {
+    let sessions = codex_home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let started_at = Utc::now() - Duration::minutes(2);
+    let completed_at = started_at + Duration::seconds(5);
+    let thread_id = "019f52ac-7a9f-7fd1-8dda-e775ef950786";
+    let turn_id = "turn-cli-report-integration";
+    let records = [
+        serde_json::json!({
+            "timestamp": started_at,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": started_at,
+                "cwd": "/work/cli-report-project",
+                "originator": "codex_cli_rs"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": started_at + Duration::seconds(1),
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id,
+                "started_at": started_at + Duration::seconds(1)
+            }
+        }),
+        serde_json::json!({
+            "timestamp": started_at + Duration::seconds(2),
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "CLI report integration task"}
+        }),
+        serde_json::json!({
+            "timestamp": started_at + Duration::seconds(3),
+            "type": "turn_context",
+            "payload": {"turn_id": turn_id, "model": "gpt-5.3-codex", "effort": "high"}
+        }),
+        serde_json::json!({
+            "timestamp": started_at + Duration::seconds(4),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": 1200,
+                    "cached_input_tokens": 200,
+                    "output_tokens": 300,
+                    "reasoning_output_tokens": 100,
+                    "total_tokens": 1500
+                }}
+            }
+        }),
+        serde_json::json!({
+            "timestamp": completed_at,
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": turn_id}
+        }),
+    ];
+    let contents = records
+        .into_iter()
+        .map(|record| serde_json::to_string(&record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(sessions.join("rollout-cli-reports.jsonl"), contents).unwrap();
+    std::fs::write(
+        codex_home.join("session_index.jsonl"),
+        serde_json::to_string(&serde_json::json!({
+            "id": thread_id,
+            "thread_name": "CLI report integration task",
+            "updated_at": completed_at
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -76,6 +154,98 @@ fn real_binary_collects_the_fixture_codex_home_without_user_data() {
             .iter()
             .any(|source| source["source"] == "rollout_jsonl")
     );
+}
+
+#[test]
+fn real_binary_exposes_summary_trends_and_unified_health_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex_home = temp.path().join("codex-home");
+    let history_dir = temp.path().join("history");
+    write_current_rollout_fixture(&codex_home);
+
+    let common = [
+        "--codex-home",
+        codex_home.to_str().unwrap(),
+        "--days",
+        "1",
+        "--offline",
+        "--no-rollout-cache",
+    ];
+    let summary = isolated_command(temp.path())
+        .args(common)
+        .args([
+            "summary",
+            "--range",
+            "7d",
+            "--grain",
+            "1h",
+            "--metric",
+            "estimated",
+            "--long-context",
+            "--format",
+            "json",
+            "--compact",
+            "--history-dir",
+            history_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(summary.status.code(), Some(2));
+    let summary = parse_json(&summary);
+    assert_eq!(summary["schemaVersion"], 1);
+    assert_eq!(summary["range"], "7d");
+    assert_eq!(summary["grain"], "1h");
+    assert_eq!(summary["metric"], "estimated");
+    assert_eq!(summary["apiLongContext"], true);
+    assert_eq!(summary["projects"][0]["label"], "cli-report-project");
+    assert_eq!(
+        summary["projects"][0]["sessions"][0]["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let trends = isolated_command(temp.path())
+        .args(common)
+        .args([
+            "trends",
+            "--long-context",
+            "--format",
+            "json",
+            "--compact",
+            "--history-dir",
+            history_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(trends.status.code(), Some(2));
+    let trends = parse_json(&trends);
+    assert_eq!(trends["schemaVersion"], 1);
+    assert_eq!(trends["apiLongContextMultiplier"], true);
+    assert!(!trends["fifteenMinuteTokens"].as_array().unwrap().is_empty());
+    assert!(trends.get("halfHourTokens").is_none());
+
+    let health = isolated_command(temp.path())
+        .args(common)
+        .args([
+            "health",
+            "--format",
+            "json",
+            "--compact",
+            "--history-dir",
+            history_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(health.status.code(), Some(2));
+    let health = parse_json(&health);
+    assert_eq!(health["schemaVersion"], 1);
+    assert!(health.get("snapshot").is_some());
+    assert!(health.get("history").is_some());
+    assert!(health.get("recorder").is_some());
+    assert!(health.get("service").is_some() || health.get("serviceError").is_some());
+    assert!(health["snapshot"].get("codexHome").is_none());
 }
 
 #[cfg(unix)]

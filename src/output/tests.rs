@@ -339,6 +339,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     let tasks = OutputRequest {
         format: OutputFormat::Json,
         compact: true,
+        api_long_context: false,
         sections: BTreeSet::from([Section::Tasks]),
         thread_filter: None,
     };
@@ -359,6 +360,23 @@ fn partial_status_is_scoped_to_requested_sections() {
     assert!(tasks_json.get("accountUsage").is_none());
     assert!(tasks_json.get("rateLimitResetCredits").is_none());
     assert!(tasks_json.get("errors").is_some());
+    assert!(tasks_json.get("estimateProjection").is_none());
+    let long_context_request = OutputRequest {
+        api_long_context: true,
+        ..tasks.clone()
+    };
+    let long_context_json: Value =
+        serde_json::from_str(&render_output(&snapshot, &long_context_request).unwrap()).unwrap();
+    assert_eq!(long_context_json["estimateProjection"], "apiLongContext");
+    let long_context_text = render_output(
+        &snapshot,
+        &OutputRequest {
+            format: OutputFormat::Text,
+            ..long_context_request
+        },
+    )
+    .unwrap();
+    assert!(long_context_text.contains("[EST LONGX]"));
     let turns_json: Value = serde_json::from_str(
         &render_output(
             &snapshot,
@@ -393,6 +411,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Limits]),
             thread_filter: None,
         },
@@ -437,6 +456,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Limits]),
             thread_filter: None,
         },
@@ -504,6 +524,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Tasks, Section::Turns]),
             thread_filter: None,
         },
@@ -525,6 +546,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Turns]),
             thread_filter: None,
         },
@@ -538,6 +560,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Models]),
             thread_filter: None,
         },
@@ -620,6 +643,7 @@ fn partial_status_is_scoped_to_requested_sections() {
         &OutputRequest {
             format: OutputFormat::Text,
             compact: false,
+            api_long_context: false,
             sections: BTreeSet::from([Section::Models]),
             thread_filter: None,
         },
@@ -636,6 +660,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             &OutputRequest {
                 format: OutputFormat::Json,
                 compact: true,
+                api_long_context: false,
                 sections: BTreeSet::from([Section::Models]),
                 thread_filter: None,
             },
@@ -669,6 +694,7 @@ fn partial_status_is_scoped_to_requested_sections() {
                 &OutputRequest {
                     format: OutputFormat::Json,
                     compact: true,
+                    api_long_context: false,
                     sections: BTreeSet::from([section]),
                     thread_filter: None,
                 },
@@ -685,6 +711,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             &OutputRequest {
                 format: OutputFormat::Json,
                 compact: true,
+                api_long_context: false,
                 sections: BTreeSet::from([Section::Tasks]),
                 thread_filter: None,
             },
@@ -699,6 +726,7 @@ fn partial_status_is_scoped_to_requested_sections() {
     let filtered_cost_request = OutputRequest {
         format: OutputFormat::Json,
         compact: true,
+        api_long_context: false,
         sections: BTreeSet::from([Section::Turns]),
         thread_filter: Some("task-thread".to_string()),
     };
@@ -727,6 +755,7 @@ fn partial_status_is_scoped_to_requested_sections() {
             &OutputRequest {
                 format: OutputFormat::Json,
                 compact: true,
+                api_long_context: false,
                 sections: BTreeSet::from([Section::Limits]),
                 thread_filter: None,
             },
@@ -899,6 +928,23 @@ fn partial_status_is_scoped_to_requested_sections() {
     };
     assert!(!request_is_partial(&empty_snapshot, &empty_filtered_turns));
     assert!(!request_is_failure(&empty_snapshot, &empty_filtered_turns));
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut non_unicode = snapshot.clone();
+        non_unicode.codex_home =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/codex-\xff".to_vec()));
+        non_unicode.tasks[0].cwd = Some(std::path::PathBuf::from(OsString::from_vec(
+            b"/tmp/project-\xfe".to_vec(),
+        )));
+        let json: Value =
+            serde_json::from_str(&render_output(&non_unicode, &tasks).unwrap()).unwrap();
+        assert_eq!(json["codexHome"], "/tmp/codex-\u{fffd}");
+        assert_eq!(json["tasks"][0]["cwd"], "/tmp/project-\u{fffd}");
+    }
 
     let mut unavailable = snapshot;
     unavailable.sources[0].status = "error".to_string();

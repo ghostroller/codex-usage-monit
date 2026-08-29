@@ -997,7 +997,7 @@ impl HistoryStore {
         &mut self,
         completed_at: DateTime<Utc>,
         complete: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let Some(directory) = self.namespace_dir.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1010,12 +1010,10 @@ impl HistoryStore {
                 "history store is read-only",
             ));
         }
-        if self.staged_observation.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "history backfill is not fully persisted",
-            ));
-        }
+        // A warning-bearing or failed history write intentionally keeps the
+        // observation staged. Persist the cooldown marker anyway, but never
+        // claim that such an attempt completed successfully.
+        let complete = complete && self.staged_observation.is_none();
         let marker = SummaryBackfillMarker::current(completed_at, complete);
         let mut contents = serde_json::to_vec_pretty(&marker)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1025,7 +1023,7 @@ impl HistoryStore {
             data.summary_backfill_attempted_at = Some(completed_at);
             data.summary_backfill_attempt_complete = Some(complete);
         }
-        Ok(())
+        Ok(complete)
     }
 
     /// Flush a staged observation regardless of the normal batching interval.
@@ -5162,6 +5160,40 @@ mod tests {
             .load_since(completed_at - Duration::days(31));
         assert_eq!(history.summary_backfill_attempt_complete, Some(false));
         assert!(history.warnings.is_empty());
+    }
+
+    #[test]
+    fn staged_summary_backfill_persists_an_incomplete_cooldown_marker() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let completed_at = at(2026, 7, 28, 12, 5, 0);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store.stage_full_observation(&HistoryObservation {
+            observed_at: completed_at,
+            half_hour_buckets: vec![local_bucket(
+                completed_at - Duration::minutes(15),
+                completed_at,
+                10,
+                100,
+            )],
+            ..HistoryObservation::default()
+        });
+
+        assert!(
+            !store
+                .mark_summary_backfill_attempt(completed_at, true)
+                .unwrap()
+        );
+
+        let history = HistoryStore::new(history_root, &codex_home)
+            .load_since(completed_at - Duration::days(31));
+        assert_eq!(history.summary_backfill_attempted_at, Some(completed_at));
+        assert_eq!(history.summary_backfill_attempt_complete, Some(false));
+        assert!(!crate::summary_report::summary_history_backfill_needed(
+            &history,
+            completed_at + Duration::minutes(1)
+        ));
     }
 
     #[test]

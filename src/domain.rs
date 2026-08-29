@@ -410,6 +410,7 @@ pub struct TaskRecord {
     #[serde(default)]
     pub archived: bool,
     pub title: String,
+    #[serde(default, with = "crate::exact_json::optional_pathbuf_lossy")]
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
@@ -653,6 +654,7 @@ pub struct Snapshot {
     pub api_equivalent_cost: Option<ApiEquivalentCost>,
     pub as_of: DateTime<Utc>,
     pub partial: bool,
+    #[serde(with = "crate::exact_json::pathbuf_lossy")]
     pub codex_home: PathBuf,
     pub sources: Vec<SourceStatus>,
     pub limits: Vec<LimitBucket>,

@@ -35,7 +35,8 @@ const RECORDER_STALE_GRACE_SECONDS: u64 = 2 * 60;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceState {
     NotInstalled,
     Installed,
@@ -56,14 +57,20 @@ impl ServiceState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceStatus {
-    pub platform: &'static str,
+    pub platform: String,
     pub state: ServiceState,
     pub installed: bool,
     pub running: bool,
+    #[serde(default, with = "crate::exact_json::optional_pathbuf_lossy")]
     pub registration_path: Option<PathBuf>,
     pub last_history_heartbeat: Option<DateTime<Utc>>,
+    /// Whether the latest recorder heartbeat is recent and belongs to the
+    /// expected history namespace.
+    #[serde(default)]
+    pub heartbeat_recent: bool,
     pub detail: String,
 }
 
@@ -297,21 +304,22 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
         .and_then(|status| status.history_namespace.as_deref())
         .filter(|namespace| *namespace != expected_namespace)
         .map(str::to_string);
-    let heartbeat_running = recorder
+    let heartbeat_recent = recorder
         .as_ref()
         .is_some_and(|status| status.heartbeat_is_recent(Utc::now()))
         && namespace_mismatch.is_none();
     let mut service_status = match current_platform() {
-        Platform::MacOs => launchd_status(options, heartbeat, heartbeat_running),
-        Platform::Linux => systemd_status(options, heartbeat, heartbeat_running),
-        Platform::Windows => windows_task_status(options, heartbeat, heartbeat_running),
+        Platform::MacOs => launchd_status(options, heartbeat, heartbeat_recent),
+        Platform::Linux => systemd_status(options, heartbeat, heartbeat_recent),
+        Platform::Windows => windows_task_status(options, heartbeat, heartbeat_recent),
         Platform::Unsupported => Ok(ServiceStatus {
-            platform: "unsupported",
+            platform: "unsupported".to_string(),
             state: ServiceState::Unknown,
             installed: false,
             running: false,
             registration_path: None,
             last_history_heartbeat: heartbeat,
+            heartbeat_recent,
             detail: "service management is unsupported; use record --foreground".to_string(),
         }),
     }?;
@@ -878,21 +886,32 @@ fn uninstall_windows_task(_options: &ServiceOptions) -> Result<()> {
 fn windows_task_status(
     _options: &ServiceOptions,
     heartbeat: Option<DateTime<Utc>>,
-    heartbeat_running: bool,
+    heartbeat_recent: bool,
 ) -> Result<ServiceStatus> {
     let user_sid = windows_current_user_sid()?;
     let task_name = windows_task_name(&user_sid);
-    let installed = windows_task_is_installed(&task_name)?;
+    let mut run = run_windows_task_operation;
+    windows_task_status_with(&task_name, heartbeat, heartbeat_recent, &mut run)
+}
+
+fn windows_task_status_with(
+    task_name: &str,
+    heartbeat: Option<DateTime<Utc>>,
+    heartbeat_recent: bool,
+    run: &mut impl FnMut(WindowsTaskOperation) -> Result<WindowsTaskOperationResult>,
+) -> Result<ServiceStatus> {
+    let installed = windows_task_is_installed_with(task_name, run)?;
+    let manager_running = installed && windows_task_is_running_with(task_name, run)?;
     let mut status = service_status(
         "windows-task-scheduler",
         installed,
-        installed && heartbeat_running,
+        manager_running,
         None,
         heartbeat,
-        false,
-        heartbeat_running,
+        manager_running,
+        heartbeat_recent,
     );
-    if installed && heartbeat.is_none() {
+    if installed && !manager_running && heartbeat.is_none() {
         status.state = ServiceState::Installed;
         status.detail = "registered; waiting for the first recorder heartbeat".to_string();
     }
@@ -1273,12 +1292,13 @@ fn service_status(
         "no recorder registration found".to_string()
     };
     ServiceStatus {
-        platform,
+        platform: platform.to_string(),
         state,
         installed,
         running,
         registration_path,
         last_history_heartbeat: heartbeat,
+        heartbeat_recent,
         detail,
     }
 }
@@ -1650,6 +1670,53 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_status_uses_scheduler_state_separately_from_heartbeat() {
+        let task_name = r"\CodexUsageMonitRecorder-test";
+        let heartbeat = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let mut ready = |operation| {
+            Ok(match operation {
+                WindowsTaskOperation::Query { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: String::new(),
+                },
+                WindowsTaskOperation::State { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: WINDOWS_TASK_STATE_READY.to_string(),
+                },
+                operation => panic!("unexpected status operation: {operation:?}"),
+            })
+        };
+        let stopped =
+            windows_task_status_with(task_name, Some(heartbeat), true, &mut ready).unwrap();
+        assert_eq!(stopped.state, ServiceState::Stopped);
+        assert!(!stopped.running);
+        assert!(stopped.heartbeat_recent);
+
+        let mut running = |operation| {
+            Ok(match operation {
+                WindowsTaskOperation::Query { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: String::new(),
+                },
+                WindowsTaskOperation::State { .. } => WindowsTaskOperationResult {
+                    success: true,
+                    code: Some(0),
+                    detail: WINDOWS_TASK_STATE_RUNNING.to_string(),
+                },
+                operation => panic!("unexpected status operation: {operation:?}"),
+            })
+        };
+        let awaiting_heartbeat =
+            windows_task_status_with(task_name, None, false, &mut running).unwrap();
+        assert_eq!(awaiting_heartbeat.state, ServiceState::Running);
+        assert!(awaiting_heartbeat.running);
+        assert!(!awaiting_heartbeat.heartbeat_recent);
+    }
+
+    #[test]
     fn windows_task_uninstall_skips_end_when_not_running_but_still_deletes() {
         let task_name = r"\CodexUsageMonitRecorder-test";
         let mut operations = Vec::new();
@@ -1965,6 +2032,80 @@ mod tests {
         assert!(error.to_string().contains("could not verify"));
         assert!(error.to_string().contains("permission denied"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn service_status_has_a_stable_round_trip_json_shape() {
+        let heartbeat = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        let status = ServiceStatus {
+            platform: "linux-systemd-user".to_string(),
+            state: ServiceState::NotInstalled,
+            installed: false,
+            running: false,
+            registration_path: Some(PathBuf::from("/tmp/recorder.service")),
+            last_history_heartbeat: Some(heartbeat),
+            heartbeat_recent: false,
+            detail: "no registration".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "platform": "linux-systemd-user",
+                "state": "not_installed",
+                "installed": false,
+                "running": false,
+                "registrationPath": "/tmp/recorder.service",
+                "lastHistoryHeartbeat": "2026-08-30T12:00:00Z",
+                "heartbeatRecent": false,
+                "detail": "no registration"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceStatus>(serde_json::to_value(&status).unwrap())
+                .unwrap(),
+            status
+        );
+        assert_eq!(
+            [
+                ServiceState::NotInstalled,
+                ServiceState::Installed,
+                ServiceState::Running,
+                ServiceState::Stopped,
+                ServiceState::Unknown,
+            ]
+            .map(|state| serde_json::to_value(state).unwrap()),
+            [
+                serde_json::json!("not_installed"),
+                serde_json::json!("installed"),
+                serde_json::json!("running"),
+                serde_json::json!("stopped"),
+                serde_json::json!("unknown"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_status_json_lossily_encodes_non_unicode_registration_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let status = ServiceStatus {
+            platform: "test".to_string(),
+            state: ServiceState::Stopped,
+            installed: true,
+            running: false,
+            registration_path: Some(PathBuf::from(OsString::from_vec(vec![
+                b'/', b't', b'm', b'p', b'/', 0xff,
+            ]))),
+            last_history_heartbeat: None,
+            heartbeat_recent: false,
+            detail: "non-Unicode path".to_string(),
+        };
+
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["registrationPath"], "/tmp/\u{fffd}");
     }
 
     #[test]
