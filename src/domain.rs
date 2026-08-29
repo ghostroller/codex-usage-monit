@@ -460,6 +460,59 @@ impl TurnRecord {
     }
 }
 
+/// A locally observed, exact interaction between one parent turn and a child
+/// agent thread.
+///
+/// Rollout files expose the two halves independently: a parent-side function
+/// call carries the parent turn id and a later `sub_agent_activity` event
+/// carries the child thread id. Records are emitted only when their opaque
+/// call/event ids match exactly; metadata-only or time-based guesses are not
+/// represented here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInteraction {
+    #[serde(default)]
+    pub kind: AgentInteractionKind,
+    pub parent_thread_id: String,
+    pub parent_turn_id: String,
+    pub child_thread_id: String,
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+    #[serde(default = "unknown_provenance")]
+    pub provenance: Provenance,
+}
+
+impl Default for AgentInteraction {
+    fn default() -> Self {
+        Self {
+            kind: AgentInteractionKind::default(),
+            parent_thread_id: String::new(),
+            parent_turn_id: String::new(),
+            child_thread_id: String::new(),
+            call_id: String::new(),
+            requested_at: None,
+            occurred_at: None,
+            provenance: Provenance::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInteractionKind {
+    #[default]
+    Unknown,
+    SpawnStarted,
+    Interacted,
+}
+
+fn unknown_provenance() -> Provenance {
+    Provenance::Unknown
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsage {
@@ -662,6 +715,9 @@ pub struct RateObservation {
 pub struct RolloutDataset {
     pub tasks: Vec<TaskRecord>,
     pub turns: Vec<TurnRecord>,
+    /// Exact parent-turn to child-agent links reconstructed from matching
+    /// parent function calls and `sub_agent_activity` events.
+    pub agent_interactions: Vec<AgentInteraction>,
     pub calls: Vec<UsageCall>,
     pub rate_observations: Vec<RateObservation>,
     pub stats: CollectionStats,

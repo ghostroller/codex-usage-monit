@@ -10,7 +10,11 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- Balanced the wide Summary layout with a 1:1 tree/top-project row and a full-width chart below it, added explicit project/session/subagent row labels and a collapse-all control, and assigned project colors from stable project identities instead of the current ranking.
+- Balanced the wide Summary layout with a 1:1 tree/top-project row and a full-width chart below it, changed the expandable hierarchy to project/session/user turn, added a collapse-all control, and assigned project colors from stable project identities instead of the current ranking. Exact subagent branches are folded into the user turn that spawned them; unavailable delegated and direct-session turn links remain separate compact rows instead of being guessed.
+
+### Compatibility
+
+- Bumped the rollout parser cache revision and project-history breakdown revision for exact `spawn_agent` event linkage and per-turn message/usage attribution. Retained rollout evidence rebuilds older nonzero buckets, while trustworthy closed zero buckets are promoted without fabricating a turn split.
 
 ## [0.3.0] - 2026-08-28
 

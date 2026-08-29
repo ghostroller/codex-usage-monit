@@ -70,6 +70,7 @@ fn cache_entries(cache_root: &Path) -> Vec<PathBuf> {
 fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
     assert_eq!(left.tasks, right.tasks);
     assert_eq!(left.turns, right.turns);
+    assert_eq!(left.agent_interactions, right.agent_interactions);
     assert_eq!(left.calls, right.calls);
     assert_eq!(left.rate_observations, right.rate_observations);
     assert_eq!(left.stats, right.stats);
@@ -113,6 +114,88 @@ fn cached_snapshot_skips_derive_until_rollout_changes() {
     let changed = collect_snapshot_cached_if_changed(&scan_config, Some(first.account), &mut cache)
         .expect("an appended rollout record must produce a new snapshot");
     assert_eq!(changed.snapshot.turns.len(), 1);
+}
+
+#[test]
+fn tail_cache_joins_an_agent_activity_appended_after_its_function_call() {
+    let temp = TempDir::new().unwrap();
+    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let parent_path = temp.path().join("sessions/rollout-agent-parent.jsonl");
+    write_jsonl(
+        &parent_path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "agent-parent", "source": "vscode"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "agent-parent-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "agent-call",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "agent-parent-turn"
+                    }
+                }
+            }),
+        ],
+    );
+    write_jsonl(
+        &temp.path().join("sessions/rollout-agent-child.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {
+                "id": "agent-child",
+                "thread_source": "subagent",
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": "agent-parent",
+                    "agent_role": null
+                }}}
+            }
+        })],
+    );
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+
+    let before = cache.scan(&scan_config, now).unwrap();
+    assert!(before.agent_interactions.is_empty());
+
+    append_jsonl(
+        &parent_path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "kind": "started",
+                "event_id": "agent-call",
+                "agent_thread_id": "agent-child"
+            }
+        })],
+    );
+    let cached = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(cache.last_refresh().tail_parsed_files, 1);
+    assert_eq!(cache.last_refresh().incrementally_reduced_threads, 1);
+    assert_eq!(cached.agent_interactions.len(), 1);
+    assert_eq!(
+        cached.agent_interactions[0].parent_turn_id,
+        "agent-parent-turn"
+    );
+    assert_eq!(cached.agent_interactions[0].child_thread_id, "agent-child");
+
+    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
+    assert_dataset_eq(&cached, &fresh);
 }
 
 #[test]

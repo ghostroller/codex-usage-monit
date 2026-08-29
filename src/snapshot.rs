@@ -535,14 +535,17 @@ fn collect_snapshot_with_local(
     let local_coverage_starts_at = (!rollout_source_degraded)
         .then_some(local_coverage_starts_at)
         .flatten();
-    let history_observation = HistoryObservation::from_sources_with_tasks_and_coverage(
-        now,
-        &dataset.calls,
-        &tasks,
-        &limits,
-        &history_partial_reasons,
-        local_coverage_starts_at,
-    );
+    let history_observation =
+        HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+            now,
+            &dataset.calls,
+            &tasks,
+            &turns,
+            &dataset.agent_interactions,
+            &limits,
+            &history_partial_reasons,
+            local_coverage_starts_at,
+        );
 
     let result = CollectionResult {
         snapshot: Snapshot {

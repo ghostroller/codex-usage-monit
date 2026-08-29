@@ -15,12 +15,15 @@ use crate::api_cost::ApiCostAggregation;
 use crate::api_cost::{API_PRICING_CATALOG_REVISION, ApiCostAccumulator};
 use crate::atomic_file::replace_file;
 use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_model};
-use crate::domain::{ApiCostAmount, LimitBucket, Provenance, TaskRecord, TokenUsage, UsageCall};
+use crate::domain::{
+    AgentInteraction, AgentInteractionKind, ApiCostAmount, LimitBucket, Provenance, TaskRecord,
+    TokenUsage, TurnRecord, UsageCall,
+};
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
 pub const HISTORY_METRIC_REVISION: u32 = 4;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
-pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 1;
+pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 2;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
 pub const LOCAL_BUCKET_MINUTES: i64 = 15;
 
@@ -76,7 +79,8 @@ pub struct LocalUsageGroup {
     pub used_long_context_detection_fallback: bool,
 }
 
-/// One thread's own usage within a fixed-width local bucket.
+/// One emitting thread/turn's own usage within a fixed-width local bucket,
+/// plus its exact attribution to a root user session/turn when available.
 ///
 /// Parent totals are intentionally not materialized here. Summary views build
 /// subtree totals at query time so a subagent can never be counted both as its
@@ -85,8 +89,25 @@ pub struct LocalUsageGroup {
 #[serde(rename_all = "camelCase")]
 pub struct LocalProjectUsageGroup {
     pub thread_id: String,
+    /// The emitting thread's own turn. This remains distinct from the root
+    /// user turn so delegated work can be audited without being rendered as a
+    /// long list of subagents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    /// Top-level user session that owns this thread, including the root thread
+    /// itself when the task lineage is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_thread_id: Option<String>,
+    /// Exact root-session turn that spawned the direct child branch beneath
+    /// the root. Descendant subagents inherit that exact edge attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +221,29 @@ impl HistoryObservation {
         partial_reasons: &[String],
         local_coverage_starts_at: Option<DateTime<Utc>>,
     ) -> Self {
+        Self::from_sources_with_tasks_turns_and_interactions_and_coverage(
+            observed_at,
+            calls,
+            tasks,
+            &[],
+            &[],
+            limits,
+            partial_reasons,
+            local_coverage_starts_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_sources_with_tasks_turns_and_interactions_and_coverage(
+        observed_at: DateTime<Utc>,
+        calls: &[UsageCall],
+        tasks: &[TaskRecord],
+        turns: &[TurnRecord],
+        agent_interactions: &[AgentInteraction],
+        limits: &[LimitBucket],
+        partial_reasons: &[String],
+        local_coverage_starts_at: Option<DateTime<Utc>>,
+    ) -> Self {
         let weekly_local_points = weekly_local_points_from_sources(
             observed_at,
             calls,
@@ -214,6 +258,8 @@ impl HistoryObservation {
                 observed_at,
                 calls,
                 tasks,
+                turns,
+                agent_interactions,
                 partial_reasons,
                 local_coverage_starts_at,
             ),
@@ -1270,6 +1316,9 @@ fn redact_project_group_titles(groups: &mut [LocalProjectUsageGroup]) {
         if group.title.is_some() {
             group.title = Some("[redacted]".to_string());
         }
+        if group.message_preview.is_some() {
+            group.message_preview = Some("[redacted]".to_string());
+        }
     }
 }
 
@@ -1576,15 +1625,51 @@ struct BucketAccumulator {
     long_context_usage_unknown: bool,
     call_count: u64,
     groups: BTreeMap<(Option<String>, Option<String>), LocalUsageGroup>,
-    project_groups: BTreeMap<String, LocalProjectUsageGroup>,
-    api_cost_by_thread: BTreeMap<String, ApiCostAccumulator>,
+    project_groups: BTreeMap<ProjectGroupKey, LocalProjectUsageGroup>,
+    api_cost_by_group: BTreeMap<ProjectGroupKey, ApiCostAccumulator>,
     partial_reasons: BTreeSet<String>,
+}
+
+type ProjectGroupKey = (String, Option<String>, Option<String>, Option<String>);
+type SpawnEdge = (String, String);
+
+#[derive(Default)]
+struct ExactSpawnTurnIndex {
+    turns_by_edge: HashMap<SpawnEdge, String>,
+    ambiguous_edges: BTreeSet<SpawnEdge>,
+    parents_by_child: HashMap<String, String>,
+    ambiguous_children: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct ThreadLineageIndex {
+    parents_by_child: HashMap<String, String>,
+    ambiguous_children: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedThreadLineage {
+    threads: Vec<String>,
+    incomplete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectCallAttribution {
+    key: ProjectGroupKey,
+    lineage: Vec<String>,
+    session_thread_id: String,
+    session_turn_id: Option<String>,
+    message_preview: Option<String>,
+    turn_started_at: Option<DateTime<Utc>>,
+    missing_subagent_turn_attribution: bool,
 }
 
 fn local_buckets_from_calls(
     observed_at: DateTime<Utc>,
     calls: &[UsageCall],
     tasks: &[TaskRecord],
+    turns: &[TurnRecord],
+    agent_interactions: &[AgentInteraction],
     partial_reasons: &[String],
     local_coverage_starts_at: Option<DateTime<Utc>>,
 ) -> Vec<LocalHalfHourBucket> {
@@ -1592,7 +1677,13 @@ fn local_buckets_from_calls(
         .iter()
         .map(|task| (task.thread_id.as_str(), task))
         .collect::<HashMap<_, _>>();
-    let project_group_templates = project_group_templates(&tasks_by_thread);
+    let turns_by_id = turns
+        .iter()
+        .map(|turn| ((turn.thread_id.as_str(), turn.turn_id.as_str()), turn))
+        .collect::<HashMap<_, _>>();
+    let spawn_turns = exact_spawn_turns_by_edge(agent_interactions);
+    let lineage_index = thread_lineage_index(&tasks_by_thread, &spawn_turns);
+    let project_group_templates = project_group_templates(&tasks_by_thread, &lineage_index, calls);
     let mut buckets: BTreeMap<DateTime<Utc>, BucketAccumulator> = BTreeMap::new();
     for call in calls {
         if call.timestamp > observed_at {
@@ -1600,27 +1691,45 @@ fn local_buckets_from_calls(
         }
         let starts_at = floor_local_bucket(call.timestamp);
         let bucket = buckets.entry(starts_at).or_default();
+        let attribution = project_call_attribution(
+            call,
+            &turns_by_id,
+            &spawn_turns.turns_by_edge,
+            &spawn_turns.ambiguous_edges,
+            &lineage_index,
+        );
         bucket
-            .api_cost_by_thread
-            .entry(call.thread_id.clone())
+            .api_cost_by_group
+            .entry(attribution.key.clone())
             .or_default()
             .add_call(call);
         bucket
             .partial_reasons
             .extend(partial_reasons.iter().cloned());
+        if attribution.missing_subagent_turn_attribution {
+            bucket
+                .partial_reasons
+                .insert("subagent_turn_attribution_unavailable".to_string());
+        }
         insert_project_lineage(
             &mut bucket.project_groups,
-            &call.thread_id,
-            &tasks_by_thread,
+            &attribution.lineage,
+            &attribution.session_thread_id,
             &project_group_templates,
         );
+        let project_group = bucket
+            .project_groups
+            .entry(attribution.key.clone())
+            .or_insert_with(|| {
+                let mut group = project_group_template(&call.thread_id, &project_group_templates);
+                group.turn_id = normalized_optional(&call.turn_id);
+                group.session_thread_id = Some(attribution.session_thread_id.clone());
+                group.session_turn_id = attribution.session_turn_id.clone();
+                group.message_preview = attribution.message_preview.clone();
+                group.turn_started_at = attribution.turn_started_at;
+                group
+            });
         if is_spark_model(call.model.as_deref()) {
-            let project_group = bucket
-                .project_groups
-                .entry(call.thread_id.clone())
-                .or_insert_with(|| {
-                    project_group_template(&call.thread_id, &project_group_templates)
-                });
             project_group
                 .api_long_context_extra_cost_units
                 .get_or_insert(0);
@@ -1672,10 +1781,6 @@ fn local_buckets_from_calls(
         group.used_long_context_pricing |= weight.used_long_context_pricing;
         group.used_long_context_detection_fallback |= weight.used_long_context_detection_fallback;
 
-        let project_group = bucket
-            .project_groups
-            .entry(call.thread_id.clone())
-            .or_insert_with(|| project_group_template(&call.thread_id, &project_group_templates));
         project_group.token_usage.add_assign(call.tokens);
         project_group.estimated_cost_units = project_group
             .estimated_cost_units
@@ -1721,13 +1826,22 @@ fn local_buckets_from_calls(
         .into_iter()
         .map(|(starts_at, bucket)| {
             let ends_at = starts_at + Duration::seconds(LOCAL_BUCKET_SECS);
+            let active_project_threads = bucket
+                .project_groups
+                .values()
+                .filter(|group| group.call_count > 0)
+                .map(|group| group.thread_id.clone())
+                .collect::<BTreeSet<_>>();
             let project_groups = bucket
                 .project_groups
-                .into_values()
-                .map(|mut group| {
+                .into_iter()
+                .filter(|(_, group)| {
+                    group.call_count > 0 || !active_project_threads.contains(&group.thread_id)
+                })
+                .map(|(key, mut group)| {
                     group.api_equivalent_cost = bucket
-                        .api_cost_by_thread
-                        .get(&group.thread_id)
+                        .api_cost_by_group
+                        .get(&key)
                         .map(ApiCostAccumulator::amount)
                         .unwrap_or_default();
                     group
@@ -1756,40 +1870,244 @@ fn local_buckets_from_calls(
 }
 
 fn insert_project_lineage(
-    groups: &mut BTreeMap<String, LocalProjectUsageGroup>,
-    thread_id: &str,
-    tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    groups: &mut BTreeMap<ProjectGroupKey, LocalProjectUsageGroup>,
+    lineage: &[String],
+    session_thread_id: &str,
     templates: &HashMap<String, LocalProjectUsageGroup>,
 ) {
-    let mut current = Some(thread_id);
-    let mut visited = BTreeSet::new();
-    while let Some(candidate_id) = current {
-        if !visited.insert(candidate_id) {
-            break;
-        }
-        if groups.contains_key(candidate_id) {
-            break;
-        }
-        groups.insert(
-            candidate_id.to_string(),
-            project_group_template(candidate_id, templates),
+    for candidate_id in lineage.iter().skip(1) {
+        let key = (
+            candidate_id.clone(),
+            None,
+            Some(session_thread_id.to_string()),
+            None,
         );
-        current = tasks_by_thread
-            .get(candidate_id)
-            .and_then(|task| task.parent_thread_id.as_deref());
+        groups.entry(key).or_insert_with(|| {
+            let mut group = project_group_template(candidate_id, templates);
+            group.session_thread_id = Some(session_thread_id.to_string());
+            group
+        });
+    }
+}
+
+fn exact_spawn_turns_by_edge(interactions: &[AgentInteraction]) -> ExactSpawnTurnIndex {
+    let mut turns = HashMap::<(String, String), String>::new();
+    let mut ambiguous = BTreeSet::new();
+    let mut parents_by_child = HashMap::<String, String>::new();
+    let mut ambiguous_children = BTreeSet::new();
+    for interaction in interactions
+        .iter()
+        .filter(|interaction| interaction.kind == AgentInteractionKind::SpawnStarted)
+    {
+        let parent = interaction.parent_thread_id.trim();
+        let child = interaction.child_thread_id.trim();
+        let turn = interaction.parent_turn_id.trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            continue;
+        }
+        insert_parent_claim(
+            &mut parents_by_child,
+            &mut ambiguous_children,
+            child,
+            parent,
+        );
+        if turn.is_empty() {
+            continue;
+        }
+        let edge = (parent.to_string(), child.to_string());
+        if ambiguous.contains(&edge) {
+            continue;
+        }
+        match turns.get(&edge) {
+            Some(existing) if existing != turn => {
+                turns.remove(&edge);
+                ambiguous.insert(edge);
+            }
+            Some(_) => {}
+            None => {
+                turns.insert(edge, turn.to_string());
+            }
+        }
+    }
+    ExactSpawnTurnIndex {
+        turns_by_edge: turns,
+        ambiguous_edges: ambiguous,
+        parents_by_child,
+        ambiguous_children,
+    }
+}
+
+fn thread_lineage_index(
+    tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    spawn_turns: &ExactSpawnTurnIndex,
+) -> ThreadLineageIndex {
+    let mut index = ThreadLineageIndex::default();
+    for task in tasks_by_thread.values() {
+        let child = task.thread_id.trim();
+        let Some(parent) = task
+            .parent_thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty() && *parent != child)
+        else {
+            continue;
+        };
+        insert_parent_claim(
+            &mut index.parents_by_child,
+            &mut index.ambiguous_children,
+            child,
+            parent,
+        );
+    }
+    for child in &spawn_turns.ambiguous_children {
+        index.parents_by_child.remove(child);
+        index.ambiguous_children.insert(child.clone());
+    }
+    for (child, parent) in &spawn_turns.parents_by_child {
+        insert_parent_claim(
+            &mut index.parents_by_child,
+            &mut index.ambiguous_children,
+            child,
+            parent,
+        );
+    }
+    index
+}
+
+fn insert_parent_claim(
+    parents_by_child: &mut HashMap<String, String>,
+    ambiguous_children: &mut BTreeSet<String>,
+    child: &str,
+    parent: &str,
+) {
+    if ambiguous_children.contains(child) {
+        return;
+    }
+    match parents_by_child.get(child) {
+        Some(existing) if existing != parent => {
+            parents_by_child.remove(child);
+            ambiguous_children.insert(child.to_string());
+        }
+        Some(_) => {}
+        None => {
+            parents_by_child.insert(child.to_string(), parent.to_string());
+        }
+    }
+}
+
+fn project_call_attribution(
+    call: &UsageCall,
+    turns_by_id: &HashMap<(&str, &str), &TurnRecord>,
+    spawn_turn_by_edge: &HashMap<(String, String), String>,
+    ambiguous_spawn_edges: &BTreeSet<(String, String)>,
+    lineage_index: &ThreadLineageIndex,
+) -> ProjectCallAttribution {
+    let lineage = task_lineage(&call.thread_id, lineage_index);
+    let session_thread_id = lineage
+        .threads
+        .last()
+        .cloned()
+        .unwrap_or_else(|| call.thread_id.clone());
+    let is_root_thread = !lineage.incomplete && session_thread_id == call.thread_id;
+    let direct_child_id = (!lineage.incomplete && lineage.threads.len() > 1)
+        .then(|| lineage.threads[lineage.threads.len() - 2].clone());
+    let edge = direct_child_id
+        .as_ref()
+        .map(|child| (session_thread_id.clone(), child.clone()));
+    let session_turn_id = if is_root_thread {
+        normalized_optional(&call.turn_id)
+    } else {
+        edge.as_ref()
+            .filter(|edge| !ambiguous_spawn_edges.contains(*edge))
+            .and_then(|edge| spawn_turn_by_edge.get(edge).cloned())
+    };
+    let turn = session_turn_id.as_deref().and_then(|turn_id| {
+        turns_by_id
+            .get(&(session_thread_id.as_str(), turn_id))
+            .copied()
+    });
+    let message_preview = turn
+        .and_then(|turn| turn.message_preview.as_deref())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| bounded_chars(message, PROJECT_TITLE_MAX_CHARS));
+    let turn_started_at = turn.and_then(|turn| turn.started_at);
+    let turn_id = normalized_optional(&call.turn_id);
+    let key = (
+        call.thread_id.clone(),
+        turn_id,
+        Some(session_thread_id.clone()),
+        session_turn_id.clone(),
+    );
+
+    ProjectCallAttribution {
+        key,
+        lineage: lineage.threads,
+        session_thread_id,
+        session_turn_id,
+        message_preview,
+        turn_started_at,
+        missing_subagent_turn_attribution: lineage.incomplete
+            || (!is_root_thread
+                && edge.is_none_or(|edge| {
+                    ambiguous_spawn_edges.contains(&edge) || !spawn_turn_by_edge.contains_key(&edge)
+                })),
+    }
+}
+
+/// Returns `[emitting thread, ..., root session]` using the union of session
+/// metadata and exact spawn events. A conflicting parent claim or cycle stops
+/// the walk and marks the result incomplete instead of guessing a root.
+fn task_lineage(thread_id: &str, lineage_index: &ThreadLineageIndex) -> ResolvedThreadLineage {
+    let mut lineage = vec![thread_id.to_string()];
+    let mut current = thread_id;
+    let mut visited = BTreeSet::from([thread_id]);
+    let mut incomplete = false;
+    loop {
+        if lineage_index.ambiguous_children.contains(current) {
+            incomplete = true;
+            break;
+        }
+        let Some(parent) = lineage_index.parents_by_child.get(current) else {
+            break;
+        };
+        if !visited.insert(parent) {
+            incomplete = true;
+            break;
+        }
+        lineage.push(parent.clone());
+        current = parent;
+    }
+    ResolvedThreadLineage {
+        threads: lineage,
+        incomplete,
     }
 }
 
 fn project_group_templates(
     tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    lineage_index: &ThreadLineageIndex,
+    calls: &[UsageCall],
 ) -> HashMap<String, LocalProjectUsageGroup> {
     let mut project_descriptors = HashMap::<PathBuf, (String, String)>::new();
-    tasks_by_thread
+    let mut thread_ids = tasks_by_thread
         .keys()
+        .map(|thread_id| (*thread_id).to_string())
+        .collect::<BTreeSet<_>>();
+    thread_ids.extend(calls.iter().map(|call| call.thread_id.clone()));
+    thread_ids.extend(lineage_index.parents_by_child.keys().cloned());
+    thread_ids.extend(lineage_index.parents_by_child.values().cloned());
+    thread_ids
+        .iter()
         .map(|thread_id| {
             (
-                (*thread_id).to_string(),
-                build_project_group_template(thread_id, tasks_by_thread, &mut project_descriptors),
+                thread_id.clone(),
+                build_project_group_template(
+                    thread_id,
+                    tasks_by_thread,
+                    lineage_index,
+                    &mut project_descriptors,
+                ),
             )
         })
         .collect()
@@ -1811,24 +2129,28 @@ fn project_group_template(
 fn build_project_group_template(
     thread_id: &str,
     tasks_by_thread: &HashMap<&str, &TaskRecord>,
+    lineage_index: &ThreadLineageIndex,
     project_descriptors: &mut HashMap<PathBuf, (String, String)>,
 ) -> LocalProjectUsageGroup {
     let task = tasks_by_thread.get(thread_id).copied();
-    let mut current = task;
+    let mut current_thread_id = Some(thread_id);
     let mut visited = BTreeSet::new();
     let mut project_path = None;
-    while let Some(candidate) = current {
-        if !visited.insert(candidate.thread_id.as_str()) {
+    while let Some(candidate_id) = current_thread_id {
+        if !visited.insert(candidate_id) || lineage_index.ambiguous_children.contains(candidate_id)
+        {
             break;
         }
-        if candidate.cwd.is_some() {
+        if let Some(candidate) = tasks_by_thread.get(candidate_id).copied()
+            && candidate.cwd.is_some()
+        {
             project_path = candidate.cwd.clone();
             break;
         }
-        current = candidate
-            .parent_thread_id
-            .as_deref()
-            .and_then(|parent| tasks_by_thread.get(parent).copied());
+        current_thread_id = lineage_index
+            .parents_by_child
+            .get(candidate_id)
+            .map(String::as_str);
     }
     let project_descriptor = project_path.as_ref().map(|path| {
         project_descriptors
@@ -1838,7 +2160,7 @@ fn build_project_group_template(
     });
     LocalProjectUsageGroup {
         thread_id: thread_id.to_string(),
-        parent_thread_id: task.and_then(|task| task.parent_thread_id.clone()),
+        parent_thread_id: lineage_index.parents_by_child.get(thread_id).cloned(),
         project_id: project_descriptor.as_ref().map(|(id, _)| id.clone()),
         project_label: project_descriptor.map(|(_, label)| label),
         title: task
@@ -2140,6 +2462,12 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
         shard.metric_revision = HISTORY_METRIC_REVISION;
         migrated = true;
     }
+    for bucket in &mut shard.half_hour_buckets {
+        if can_promote_closed_empty_project_bucket(bucket) {
+            bucket.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+            migrated = true;
+        }
+    }
     let bucket_count = shard.half_hour_buckets.len();
     shard.half_hour_buckets.retain(is_current_local_bucket);
     migrated |= bucket_count != shard.half_hour_buckets.len();
@@ -2163,6 +2491,26 @@ fn local_bucket_has_call_evidence(bucket: &LocalHalfHourBucket) -> bool {
             .is_some_and(|units| units > 0)
         || !bucket.groups.is_empty()
         || !bucket.project_groups.is_empty()
+}
+
+/// Project-breakdown revision 2 only adds per-turn attribution. A closed,
+/// fully observed revision-1 zero has no project data to reinterpret, so it
+/// can be promoted losslessly. Nonzero, open, partial, or otherwise outdated
+/// buckets still require rollout-backed reconstruction.
+fn can_promote_closed_empty_project_bucket(bucket: &LocalHalfHourBucket) -> bool {
+    bucket.project_breakdown_revision == 1
+        && bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION
+        && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+        && is_current_local_bucket(bucket)
+        && bucket.sampled_at == bucket.ends_at
+        && bucket.token_usage.is_zero()
+        && bucket.estimated_cost_units == 0
+        && bucket.api_long_context_extra_cost_units == Some(0)
+        && !bucket.long_context_usage_unknown
+        && bucket.call_count == 0
+        && bucket.groups.is_empty()
+        && bucket.project_groups.is_empty()
+        && bucket.partial_reasons.is_empty()
 }
 
 fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
@@ -2299,7 +2647,8 @@ fn project_breakdown_can_upgrade_without_replacing(
         && incoming.call_count == existing.call_count
 }
 
-/// Returns true only when the candidate retains every known thread and every
+/// Returns true only when the candidate retains every known emitting
+/// thread/turn and every
 /// piece of metadata/API coverage while adding at least one piece of
 /// information. This partial order lets a later full scan enrich a breakdown
 /// grafted from a partial scan without allowing a sparse writer to undo it.
@@ -2307,18 +2656,20 @@ fn project_groups_are_strictly_richer(
     candidate: &[LocalProjectUsageGroup],
     existing: &[LocalProjectUsageGroup],
 ) -> bool {
-    let candidate_by_thread = candidate
+    let candidate_by_turn = candidate
         .iter()
-        .map(|group| (group.thread_id.as_str(), group))
+        .map(|group| ((group.thread_id.as_str(), group.turn_id.as_deref()), group))
         .collect::<HashMap<_, _>>();
-    if candidate_by_thread.len() != candidate.len() {
+    if candidate_by_turn.len() != candidate.len() {
         return false;
     }
 
     let mut strictly_richer = candidate.len() > existing.len();
     for existing_group in existing {
-        let Some(candidate_group) = candidate_by_thread.get(existing_group.thread_id.as_str())
-        else {
+        let Some(candidate_group) = candidate_by_turn.get(&(
+            existing_group.thread_id.as_str(),
+            existing_group.turn_id.as_deref(),
+        )) else {
             return false;
         };
         let Some(group_is_richer) =
@@ -2338,9 +2689,17 @@ fn project_group_information_dominates(
     candidate: &LocalProjectUsageGroup,
     existing: &LocalProjectUsageGroup,
 ) -> Option<bool> {
+    if candidate.token_usage != existing.token_usage
+        || candidate.estimated_cost_units != existing.estimated_cost_units
+        || candidate.call_count != existing.call_count
+    {
+        return None;
+    }
     let mut strictly_richer = false;
     for (candidate_value, existing_value) in [
         (&candidate.parent_thread_id, &existing.parent_thread_id),
+        (&candidate.session_thread_id, &existing.session_thread_id),
+        (&candidate.session_turn_id, &existing.session_turn_id),
         (&candidate.project_id, &existing.project_id),
         (&candidate.project_label, &existing.project_label),
         (&candidate.source, &existing.source),
@@ -2368,11 +2727,33 @@ fn project_group_information_dominates(
         (Some(_), None) => strictly_richer = true,
         _ => {}
     }
+    match (
+        informative_text(&candidate.message_preview),
+        informative_text(&existing.message_preview),
+    ) {
+        (Some(candidate_value), Some(existing_value)) if candidate_value != existing_value => {
+            return None;
+        }
+        (None, Some(_)) => return None,
+        (Some(_), None) => strictly_richer = true,
+        _ => {}
+    }
+    match (candidate.turn_started_at, existing.turn_started_at) {
+        (Some(candidate_value), Some(existing_value)) if candidate_value != existing_value => {
+            return None;
+        }
+        (None, Some(_)) => return None,
+        (Some(_), None) => strictly_richer = true,
+        _ => {}
+    }
 
     match (
         candidate.api_long_context_extra_cost_units,
         existing.api_long_context_extra_cost_units,
     ) {
+        (Some(candidate_value), Some(existing_value)) if candidate_value != existing_value => {
+            return None;
+        }
         (None, Some(_)) => return None,
         (Some(_), None) => strictly_richer = true,
         _ => {}
@@ -2398,11 +2779,11 @@ fn project_group_information_dominates(
         && candidate_api.priced_samples == existing_api.priced_samples
         && candidate_api.observed_tokens == existing_api.observed_tokens
         && candidate_api.priced_tokens == existing_api.priced_tokens;
-    if same_api_coverage {
-        if existing_api.range_is_exact() && !candidate_api.range_is_exact() {
-            return None;
-        }
-        strictly_richer |= !existing_api.range_is_exact() && candidate_api.range_is_exact();
+    if same_api_coverage
+        && (candidate_api.minimum_pico_usd != existing_api.minimum_pico_usd
+            || candidate_api.maximum_pico_usd != existing_api.maximum_pico_usd)
+    {
+        return None;
     }
 
     Some(strictly_richer)
@@ -2627,6 +3008,7 @@ fn is_collection_issue_reason(reason: &str) -> bool {
     reason.starts_with("rollout_")
         || reason == "coverage_starts_within_local_bucket"
         || reason == "local_scan_disabled"
+        || reason == "subagent_turn_attribution_unavailable"
 }
 
 fn coverage_issue_state_differs(left: &[String], right: &[String]) -> bool {
@@ -3140,7 +3522,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::domain::{Confidence, LimitWindow, TaskStatus, UsageCall};
+    use crate::domain::{
+        AgentInteraction, AgentInteractionKind, Confidence, LimitWindow, TaskStatus, TurnRecord,
+        TurnStatus, UsageCall,
+    };
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
@@ -3199,6 +3584,50 @@ mod tests {
             estimated_quota_percent: 0.0,
             quota_confidence: Confidence::Unknown,
             api_equivalent_cost: None,
+        }
+    }
+
+    fn turn(
+        thread_id: &str,
+        turn_id: &str,
+        message_preview: &str,
+        started_at: DateTime<Utc>,
+    ) -> TurnRecord {
+        TurnRecord {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            model: Some("gpt-5.6-luna".to_string()),
+            reasoning_effort: None,
+            service_tier: Some("standard".to_string()),
+            message_preview: Some(message_preview.to_string()),
+            started_at: Some(started_at),
+            completed_at: Some(started_at + Duration::minutes(1)),
+            duration_ms: Some(60_000),
+            status: TurnStatus::Completed,
+            token_usage: TokenUsage::default(),
+            window_token_usage: TokenUsage::default(),
+            local_token_share_percent: 0.0,
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: None,
+        }
+    }
+
+    fn spawn_interaction(
+        parent_thread_id: &str,
+        parent_turn_id: &str,
+        child_thread_id: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> AgentInteraction {
+        AgentInteraction {
+            kind: AgentInteractionKind::SpawnStarted,
+            parent_thread_id: parent_thread_id.to_string(),
+            parent_turn_id: parent_turn_id.to_string(),
+            child_thread_id: child_thread_id.to_string(),
+            call_id: format!("spawn-{child_thread_id}"),
+            requested_at: Some(occurred_at - Duration::seconds(1)),
+            occurred_at: Some(occurred_at),
+            provenance: Provenance::LocalExact,
         }
     }
 
@@ -3583,6 +4012,385 @@ mod tests {
     }
 
     #[test]
+    fn project_groups_bind_root_child_and_nested_usage_to_the_exact_root_turn() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task("root", None, Some("/work/alpha"), "Root task", timestamp),
+            task("child", Some("root"), None, "Child task", timestamp),
+            task("nested", Some("child"), None, "Nested task", timestamp),
+        ];
+        let turns = vec![
+            turn("root", "root-turn", "Review the usage tree", timestamp),
+            turn(
+                "child",
+                "child-turn",
+                "Delegated implementation",
+                timestamp + Duration::seconds(10),
+            ),
+            turn(
+                "nested",
+                "nested-turn",
+                "Nested verification",
+                timestamp + Duration::seconds(20),
+            ),
+        ];
+        let interactions = vec![
+            spawn_interaction(
+                "root",
+                "root-turn",
+                "child",
+                timestamp + Duration::seconds(5),
+            ),
+            spawn_interaction(
+                "child",
+                "child-turn",
+                "nested",
+                timestamp + Duration::seconds(15),
+            ),
+        ];
+        let mut root_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 100);
+        root_call.thread_id = "root".to_string();
+        root_call.turn_id = Some("root-turn".to_string());
+        let mut child_call = call(
+            timestamp + Duration::minutes(1),
+            "gpt-5.6-luna",
+            Some("standard"),
+            200,
+        );
+        child_call.thread_id = "child".to_string();
+        child_call.turn_id = Some("child-turn".to_string());
+        let mut nested_call = call(
+            timestamp + Duration::minutes(2),
+            "gpt-5.6-luna",
+            Some("standard"),
+            300,
+        );
+        nested_call.thread_id = "nested".to_string();
+        nested_call.turn_id = Some("nested-turn".to_string());
+        let calls = vec![root_call, child_call, nested_call];
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &calls,
+                &tasks,
+                &turns,
+                &interactions,
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        assert_eq!(bucket.project_groups.len(), 3);
+        assert!(
+            !bucket
+                .partial_reasons
+                .contains(&"subagent_turn_attribution_unavailable".to_string())
+        );
+
+        for (thread_id, own_turn_id) in [
+            ("root", "root-turn"),
+            ("child", "child-turn"),
+            ("nested", "nested-turn"),
+        ] {
+            let group = bucket
+                .project_groups
+                .iter()
+                .find(|group| group.thread_id == thread_id && group.call_count > 0)
+                .unwrap();
+            assert_eq!(group.turn_id.as_deref(), Some(own_turn_id));
+            assert_eq!(group.session_thread_id.as_deref(), Some("root"));
+            assert_eq!(group.session_turn_id.as_deref(), Some("root-turn"));
+            assert_eq!(
+                group.message_preview.as_deref(),
+                Some("Review the usage tree")
+            );
+            assert_eq!(group.turn_started_at, Some(timestamp));
+        }
+
+        let mut grouped_tokens = TokenUsage::default();
+        let mut grouped_estimated_cost = 0_u128;
+        let mut grouped_long_context_extra = 0_u128;
+        let mut grouped_calls = 0_u64;
+        let mut grouped_api_cost = ApiCostAmount::default();
+        for group in &bucket.project_groups {
+            grouped_tokens.add_assign(group.token_usage);
+            grouped_estimated_cost =
+                grouped_estimated_cost.saturating_add(group.estimated_cost_units);
+            grouped_long_context_extra = grouped_long_context_extra
+                .saturating_add(group.api_long_context_extra_cost_units.unwrap_or_default());
+            grouped_calls = grouped_calls.saturating_add(group.call_count);
+            grouped_api_cost.add_assign(group.api_equivalent_cost);
+        }
+        let mut expected_api_cost = ApiCostAggregation::default();
+        for call in &calls {
+            expected_api_cost.add_call(call);
+        }
+        assert_eq!(grouped_tokens, bucket.token_usage);
+        assert_eq!(grouped_estimated_cost, bucket.estimated_cost_units);
+        assert_eq!(
+            grouped_long_context_extra,
+            bucket.api_long_context_extra_cost_units.unwrap()
+        );
+        assert_eq!(grouped_calls, bucket.call_count);
+        assert_eq!(grouped_api_cost, expected_api_cost.total().amount);
+    }
+
+    #[test]
+    fn project_groups_keep_two_root_turns_in_the_same_bucket_separate() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let first_at = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![task(
+            "root",
+            None,
+            Some("/work/alpha"),
+            "Root task",
+            first_at,
+        )];
+        let turns = vec![
+            turn("root", "turn-a", "First request", first_at),
+            turn(
+                "root",
+                "turn-b",
+                "Second request",
+                first_at + Duration::minutes(2),
+            ),
+        ];
+        let mut first = call(first_at, "gpt-5.6-luna", Some("standard"), 100);
+        first.thread_id = "root".to_string();
+        first.turn_id = Some("turn-a".to_string());
+        let mut second = call(
+            first_at + Duration::minutes(2),
+            "gpt-5.6-luna",
+            Some("standard"),
+            200,
+        );
+        second.thread_id = "root".to_string();
+        second.turn_id = Some("turn-b".to_string());
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &[first, second],
+                &tasks,
+                &turns,
+                &[],
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        assert_eq!(bucket.project_groups.len(), 2);
+        let groups = bucket
+            .project_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.turn_id.as_deref().unwrap(),
+                    group.session_turn_id.as_deref().unwrap(),
+                    group.message_preview.as_deref().unwrap(),
+                    group.token_usage.total_tokens,
+                    group.api_equivalent_cost.observed_samples,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            groups,
+            BTreeSet::from([
+                ("turn-a", "turn-a", "First request", 100, 1),
+                ("turn-b", "turn-b", "Second request", 200, 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn project_groups_mark_missing_subagent_turn_link_without_guessing() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task("root", None, Some("/work/alpha"), "Root task", timestamp),
+            task("child", Some("root"), None, "Child task", timestamp),
+        ];
+        let turns = vec![turn("root", "root-turn", "Root request", timestamp)];
+        let mut child_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 200);
+        child_call.thread_id = "child".to_string();
+        child_call.turn_id = Some("child-turn".to_string());
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &[child_call],
+                &tasks,
+                &turns,
+                &[],
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        let child = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "child")
+            .unwrap();
+        assert_eq!(child.session_thread_id.as_deref(), Some("root"));
+        assert_eq!(child.session_turn_id, None);
+        assert_eq!(child.message_preview, None);
+        assert!(
+            bucket
+                .partial_reasons
+                .contains(&"subagent_turn_attribution_unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn exact_spawn_link_restores_lineage_when_child_metadata_has_no_parent() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task("root", None, Some("/work/alpha"), "Root task", timestamp),
+            task("child", None, None, "Child task", timestamp),
+        ];
+        let turns = vec![turn("root", "root-turn", "Root request", timestamp)];
+        let interactions = vec![spawn_interaction(
+            "root",
+            "root-turn",
+            "child",
+            timestamp + Duration::seconds(5),
+        )];
+        let mut child_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 200);
+        child_call.thread_id = "child".to_string();
+        child_call.turn_id = Some("child-turn".to_string());
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &[child_call],
+                &tasks,
+                &turns,
+                &interactions,
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        let child = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "child" && group.call_count == 1)
+            .unwrap();
+        assert_eq!(child.parent_thread_id.as_deref(), Some("root"));
+        assert_eq!(child.session_thread_id.as_deref(), Some("root"));
+        assert_eq!(child.session_turn_id.as_deref(), Some("root-turn"));
+        assert_eq!(child.message_preview.as_deref(), Some("Root request"));
+        assert_eq!(child.project_label.as_deref(), Some("alpha"));
+        assert!(bucket.partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn exact_spawn_links_restore_lineage_across_a_missing_intermediate_task() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![task(
+            "root",
+            None,
+            Some("/work/alpha"),
+            "Root task",
+            timestamp,
+        )];
+        let turns = vec![turn("root", "root-turn", "Root request", timestamp)];
+        let interactions = vec![
+            spawn_interaction(
+                "root",
+                "root-turn",
+                "child",
+                timestamp + Duration::seconds(5),
+            ),
+            spawn_interaction(
+                "child",
+                "child-turn",
+                "nested",
+                timestamp + Duration::seconds(10),
+            ),
+        ];
+        let mut nested_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 200);
+        nested_call.thread_id = "nested".to_string();
+        nested_call.turn_id = Some("nested-turn".to_string());
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &[nested_call],
+                &tasks,
+                &turns,
+                &interactions,
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        let nested = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "nested" && group.call_count == 1)
+            .unwrap();
+        assert_eq!(nested.parent_thread_id.as_deref(), Some("child"));
+        assert_eq!(nested.session_thread_id.as_deref(), Some("root"));
+        assert_eq!(nested.session_turn_id.as_deref(), Some("root-turn"));
+        assert_eq!(nested.project_label.as_deref(), Some("alpha"));
+        assert!(bucket.partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn conflicting_task_and_spawn_parents_are_not_guessed() {
+        let now = at(2026, 7, 28, 12, 7, 0);
+        let timestamp = at(2026, 7, 28, 12, 1, 0);
+        let tasks = vec![
+            task("root-a", None, Some("/work/a"), "Root A", timestamp),
+            task("root-b", None, Some("/work/b"), "Root B", timestamp),
+            task("child", Some("root-a"), None, "Child", timestamp),
+        ];
+        let turns = vec![turn("root-b", "root-turn", "Root request", timestamp)];
+        let interactions = vec![spawn_interaction(
+            "root-b",
+            "root-turn",
+            "child",
+            timestamp + Duration::seconds(5),
+        )];
+        let mut child_call = call(timestamp, "gpt-5.6-luna", Some("standard"), 200);
+        child_call.thread_id = "child".to_string();
+        child_call.turn_id = Some("child-turn".to_string());
+
+        let observation =
+            HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
+                now,
+                &[child_call],
+                &tasks,
+                &turns,
+                &interactions,
+                &[],
+                &[],
+                None,
+            );
+        let bucket = &observation.half_hour_buckets[0];
+        let child = bucket
+            .project_groups
+            .iter()
+            .find(|group| group.thread_id == "child" && group.call_count == 1)
+            .unwrap();
+        assert_eq!(child.parent_thread_id, None);
+        assert_eq!(child.session_thread_id.as_deref(), Some("child"));
+        assert_eq!(child.session_turn_id, None);
+        assert_eq!(child.message_preview, None);
+        assert!(
+            bucket
+                .partial_reasons
+                .contains(&"subagent_turn_attribution_unavailable".to_string())
+        );
+    }
+
+    #[test]
     fn project_groups_apply_api_and_long_context_pricing_per_call() {
         let now = at(2026, 7, 28, 12, 7, 0);
         let timestamp = at(2026, 7, 28, 12, 1, 0);
@@ -3922,6 +4730,7 @@ mod tests {
         bucket.project_groups = vec![LocalProjectUsageGroup {
             thread_id: "thread".to_string(),
             title: Some("private customer migration".to_string()),
+            message_preview: Some("rotate the secret customer credentials".to_string()),
             token_usage: usage(10),
             estimated_cost_units: 100,
             call_count: 1,
@@ -3950,11 +4759,18 @@ mod tests {
         let path = shard_path(redacted.namespace_dir().unwrap(), now.date_naive());
         let contents = fs::read_to_string(path).unwrap();
         assert!(!contents.contains("private customer migration"));
+        assert!(!contents.contains("rotate the secret customer credentials"));
         assert!(contents.contains("[redacted]"));
 
         let data = redacted.load_since(now - Duration::days(1));
         assert_eq!(
             data.half_hour_buckets[0].project_groups[0].title.as_deref(),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            data.half_hour_buckets[0].project_groups[0]
+                .message_preview
+                .as_deref(),
             Some("[redacted]")
         );
     }
@@ -4809,6 +5625,124 @@ mod tests {
     }
 
     #[test]
+    fn project_attribution_issue_is_preserved_by_graft_and_cleared_by_enrichment() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let mut revision_one = local_bucket(starts_at, sampled_at, 300, 3_000);
+        revision_one.call_count = 2;
+        revision_one.project_breakdown_revision = 1;
+
+        let mut partial = revision_one.clone();
+        partial.project_breakdown_revision = HISTORY_PROJECT_BREAKDOWN_REVISION;
+        partial.partial_reasons = vec!["subagent_turn_attribution_unavailable".to_string()];
+        partial.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "child".to_string(),
+            turn_id: Some("child-turn".to_string()),
+            parent_thread_id: Some("root".to_string()),
+            session_thread_id: Some("root".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(0),
+            call_count: 2,
+            ..LocalProjectUsageGroup::default()
+        }];
+        let mut buckets = vec![revision_one];
+
+        assert!(upsert_half_hour_bucket(&mut buckets, partial.clone()));
+        assert_eq!(buckets[0].partial_reasons, partial.partial_reasons);
+
+        let mut exact = partial;
+        exact.partial_reasons.clear();
+        exact.project_groups[0].session_turn_id = Some("root-turn".to_string());
+        exact.project_groups[0].message_preview = Some("Root request".to_string());
+        assert!(upsert_half_hour_bucket(&mut buckets, exact.clone()));
+        assert_eq!(buckets[0].project_groups, exact.project_groups);
+        assert!(buckets[0].partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn same_revision_metadata_enrichment_cannot_redistribute_turn_metrics() {
+        fn exact_api_cost(value: u128, tokens: u64) -> ApiCostAmount {
+            ApiCostAmount {
+                minimum_pico_usd: crate::domain::PicoUsd::new(value),
+                maximum_pico_usd: crate::domain::PicoUsd::new(value),
+                observed_samples: 1,
+                priced_samples: 1,
+                observed_tokens: tokens,
+                priced_tokens: tokens,
+            }
+        }
+
+        let existing = vec![
+            LocalProjectUsageGroup {
+                thread_id: "root".to_string(),
+                turn_id: Some("turn-a".to_string()),
+                token_usage: usage(100),
+                estimated_cost_units: 1_000,
+                api_long_context_extra_cost_units: Some(10),
+                api_equivalent_cost: exact_api_cost(100, 100),
+                call_count: 1,
+                ..LocalProjectUsageGroup::default()
+            },
+            LocalProjectUsageGroup {
+                thread_id: "root".to_string(),
+                turn_id: Some("turn-b".to_string()),
+                token_usage: usage(200),
+                estimated_cost_units: 2_000,
+                api_long_context_extra_cost_units: Some(20),
+                api_equivalent_cost: exact_api_cost(200, 200),
+                call_count: 2,
+                ..LocalProjectUsageGroup::default()
+            },
+        ];
+        let enriched = |mut groups: Vec<LocalProjectUsageGroup>| {
+            groups[0].message_preview = Some("Turn A".to_string());
+            groups
+        };
+
+        let mut swapped_tokens = enriched(existing.clone());
+        let first = swapped_tokens[0].token_usage;
+        swapped_tokens[0].token_usage = swapped_tokens[1].token_usage;
+        swapped_tokens[1].token_usage = first;
+        assert!(!project_groups_are_strictly_richer(
+            &swapped_tokens,
+            &existing
+        ));
+
+        let mut swapped_est = enriched(existing.clone());
+        let first = swapped_est[0].estimated_cost_units;
+        swapped_est[0].estimated_cost_units = swapped_est[1].estimated_cost_units;
+        swapped_est[1].estimated_cost_units = first;
+        assert!(!project_groups_are_strictly_richer(&swapped_est, &existing));
+
+        let mut swapped_long = enriched(existing.clone());
+        let first = swapped_long[0].api_long_context_extra_cost_units;
+        swapped_long[0].api_long_context_extra_cost_units =
+            swapped_long[1].api_long_context_extra_cost_units;
+        swapped_long[1].api_long_context_extra_cost_units = first;
+        assert!(!project_groups_are_strictly_richer(
+            &swapped_long,
+            &existing
+        ));
+
+        let mut swapped_calls = enriched(existing.clone());
+        let first = swapped_calls[0].call_count;
+        swapped_calls[0].call_count = swapped_calls[1].call_count;
+        swapped_calls[1].call_count = first;
+        assert!(!project_groups_are_strictly_richer(
+            &swapped_calls,
+            &existing
+        ));
+
+        let mut swapped_api = enriched(existing.clone());
+        swapped_api[0].api_equivalent_cost.minimum_pico_usd = crate::domain::PicoUsd::new(200);
+        swapped_api[0].api_equivalent_cost.maximum_pico_usd = crate::domain::PicoUsd::new(200);
+        swapped_api[1].api_equivalent_cost.minimum_pico_usd = crate::domain::PicoUsd::new(100);
+        swapped_api[1].api_equivalent_cost.maximum_pico_usd = crate::domain::PicoUsd::new(100);
+        assert!(!project_groups_are_strictly_richer(&swapped_api, &existing));
+    }
+
+    #[test]
     fn same_revision_project_breakdown_accepts_strict_enrichment_without_regression() {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let sampled_at = starts_at + Duration::minutes(10);
@@ -5215,6 +6149,70 @@ mod tests {
             .unwrap();
         assert_eq!(repeated.shards_written, 0);
         assert_eq!(repeated.shards_skipped, 1);
+    }
+
+    #[test]
+    fn read_promotes_only_trustworthy_closed_revision_one_zero_buckets() {
+        let directory = tempdir().unwrap();
+        let namespace = "history-test";
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let path = directory.path().join("history.json");
+
+        let mut safe = local_bucket(
+            starts_at,
+            starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES),
+            0,
+            0,
+        );
+        safe.call_count = 0;
+        safe.project_breakdown_revision = 1;
+
+        let mut open = safe.clone();
+        open.starts_at += Duration::minutes(LOCAL_BUCKET_MINUTES);
+        open.ends_at += Duration::minutes(LOCAL_BUCKET_MINUTES);
+        open.sampled_at = open.starts_at + Duration::minutes(5);
+
+        let mut partial = safe.clone();
+        partial.starts_at += Duration::minutes(LOCAL_BUCKET_MINUTES * 2);
+        partial.ends_at += Duration::minutes(LOCAL_BUCKET_MINUTES * 2);
+        partial.sampled_at = partial.ends_at;
+        partial.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+
+        let mut nonzero = safe.clone();
+        nonzero.starts_at += Duration::minutes(LOCAL_BUCKET_MINUTES * 3);
+        nonzero.ends_at += Duration::minutes(LOCAL_BUCKET_MINUTES * 3);
+        nonzero.sampled_at = nonzero.ends_at;
+        nonzero.token_usage = usage(1);
+        nonzero.call_count = 1;
+
+        write_shard_atomically(
+            &path,
+            &HistoryShard {
+                format_version: HISTORY_FORMAT_VERSION,
+                metric_revision: HISTORY_METRIC_REVISION,
+                namespace: namespace.to_string(),
+                utc_day: starts_at.date_naive(),
+                quota_points: Vec::new(),
+                half_hour_buckets: vec![safe, open, partial, nonzero],
+                weekly_local_points: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ShardRead::Current { shard, migrated } =
+            read_shard(&path, namespace, starts_at.date_naive())
+        else {
+            panic!("current shard should load");
+        };
+        assert!(migrated);
+        assert_eq!(
+            shard
+                .half_hour_buckets
+                .iter()
+                .map(|bucket| bucket.project_breakdown_revision)
+                .collect::<Vec<_>>(),
+            vec![HISTORY_PROJECT_BREAKDOWN_REVISION, 1, 1, 1]
+        );
     }
 
     #[test]

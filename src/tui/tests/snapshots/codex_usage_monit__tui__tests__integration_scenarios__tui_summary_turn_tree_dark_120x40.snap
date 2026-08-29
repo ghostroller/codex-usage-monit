@@ -1,6 +1,6 @@
 ---
 source: src/tui/tests/integration_scenarios.rs
-expression: "summary_harness(width, height, theme).frame().snapshot_text()"
+expression: summary.frame().snapshot_text()
 ---
 size=120x40
 rows:
@@ -8,11 +8,11 @@ rows:
 01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 1d [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐┌Top projects · Tokens · share of known────────────────────┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  ││■ alpha-service                  190.0K  59.4% ███████····│
-04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         ││■ billing-cli                     90.0K  28.1% ███········│
-05|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           ││■ docs-site                       40.0K  12.5% █··········│
-06|│ 40.0K          12.5%    [+] PROJ ■ docs-site             ││                                                          │
-07|│                                                          ││                                                          │
-08|│                                                          ││                                                          │
+04|│ 190.0K         59.4%    [-] PROJ ■ alpha-service         ││■ billing-cli                     90.0K  28.1% ███········│
+05|│▌190.0K         59.4%    └─ [-] SESS API billing dashboard││■ docs-site                       40.0K  12.5% █··········│
+06|│ 190.0K         59.4%      └─ [ ] TURN Explain the API bil││                                                          │
+07|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           ││                                                          │
+08|│ 40.0K          12.5%    [+] PROJ ■ docs-site             ││                                                          │
 09|│                                                          ││                                                          │
 10|│                                                          ││                                                          │
 11|│                                                          ││                                                          │
@@ -24,7 +24,7 @@ rows:
 17|│                                                          ││                                                          │
 18|└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
 19|┌Project mix · Tokens · 1d local · 0C/4P/0M · all projects─────────────────────────────────────────────────────────────┐
-20|│07-12 · P lower bound · Total 40.0K · ■ alpha-service 0 · ■ docs-site 40.0K                                           │
+20|│07-12 · P lower bound · Total 40.0K · ■ docs-site 40.0K                                                               │
 21|│■ alpha-service  ■ billing-cli  ■ docs-site                                                                           │
 22|│LOWER BOUND · C complete · P partial · M missing                                                                      │
 23|│LOWER · C/P/M PPPP                                                                                                    │
@@ -79,7 +79,9 @@ styles:
 01:087+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
 01:088+010 fg=#7e8691 bg=#121417 mods=none text="]Longx | ["
 01:098+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
-01:099+019 fg=#7e8691 bg=#121417 mods=none text="]Toggle [X]Collapse"
+01:099+009 fg=#7e8691 bg=#121417 mods=none text="]Toggle ["
+01:108+001 fg=#3fb9c0 bg=#121417 mods=bold text="X"
+01:109+009 fg=#7e8691 bg=#121417 mods=none text="]Collapse"
 02:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 02:001+057 fg=#f4f6f8 bg=#121417 mods=bold text="Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL"
 02:058+003 fg=#4b525c bg=#121417 mods=none text="─┐┌"
@@ -88,19 +90,18 @@ styles:
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+002 fg=#4b525c bg=#121417 mods=none text="││"
-03:061+002 fg=#d8af5a bg=#121417 mods=none text="■ "
-03:063+013 fg=#d8af5a bg=#121417 mods=bold text="alpha-service"
+03:061+015 fg=#d8af5a bg=#121417 mods=none text="■ alpha-service"
 03:076+024 fg=#dadee4 bg=#121417 mods=none text="                  190.0K"
 03:100+007 fg=#7e8691 bg=#121417 mods=none text="  59.4%"
 03:108+007 fg=#d8af5a bg=#121417 mods=bold text="███████"
 03:115+004 fg=#7e8691 bg=#121417 mods=none text="····"
 03:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 04:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-04:001+026 fg=#121417 bg=#3fb9c0 mods=bold text="▌190.0K         59.4%    ["
-04:027+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="+"
-04:028+007 fg=#121417 bg=#3fb9c0 mods=bold text="] PROJ "
-04:035+001 fg=#d8af5a bg=#3fb9c0 mods=bold text="■"
-04:036+023 fg=#121417 bg=#3fb9c0 mods=bold text=" alpha-service         "
+04:001+025 fg=#dadee4 bg=#121417 mods=bold text=" 190.0K         59.4%    "
+04:026+004 fg=#7e8691 bg=#121417 mods=bold text="[-] "
+04:030+005 fg=#3fb9c0 bg=#121417 mods=bold text="PROJ "
+04:035+015 fg=#d8af5a bg=#121417 mods=bold text="■ alpha-service"
+04:050+009 fg=#dadee4 bg=#121417 mods=bold text="         "
 04:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 04:061+013 fg=#d95474 bg=#121417 mods=none text="■ billing-cli"
 04:074+026 fg=#dadee4 bg=#121417 mods=none text="                     90.0K"
@@ -109,11 +110,9 @@ styles:
 04:111+008 fg=#7e8691 bg=#121417 mods=none text="········"
 04:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 05:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-05:001+025 fg=#dadee4 bg=#121417 mods=bold text=" 90.0K          28.1%    "
-05:026+004 fg=#7e8691 bg=#121417 mods=bold text="[+] "
-05:030+005 fg=#3fb9c0 bg=#121417 mods=bold text="PROJ "
-05:035+013 fg=#d95474 bg=#121417 mods=bold text="■ billing-cli"
-05:048+011 fg=#dadee4 bg=#121417 mods=bold text="           "
+05:001+029 fg=#121417 bg=#3fb9c0 mods=bold text="▌190.0K         59.4%    └─ ["
+05:030+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="-"
+05:031+028 fg=#121417 bg=#3fb9c0 mods=bold text="] SESS API billing dashboard"
 05:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 05:061+011 fg=#56dca4 bg=#121417 mods=none text="■ docs-site"
 05:072+028 fg=#dadee4 bg=#121417 mods=none text="                       40.0K"
@@ -122,17 +121,25 @@ styles:
 05:109+010 fg=#7e8691 bg=#121417 mods=none text="··········"
 05:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 06:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-06:001+025 fg=#dadee4 bg=#121417 mods=bold text=" 40.0K          12.5%    "
-06:026+004 fg=#7e8691 bg=#121417 mods=bold text="[+] "
-06:030+005 fg=#3fb9c0 bg=#121417 mods=bold text="PROJ "
-06:035+011 fg=#56dca4 bg=#121417 mods=bold text="■ docs-site"
-06:046+013 fg=#dadee4 bg=#121417 mods=bold text="             "
+06:001+025 fg=#dadee4 bg=#121417 mods=none text=" 190.0K         59.4%    "
+06:026+014 fg=#7e8691 bg=#121417 mods=none text="  └─ [ ] TURN "
+06:040+019 fg=#dadee4 bg=#121417 mods=none text="Explain the API bil"
 06:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 06:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 07:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+07:001+025 fg=#dadee4 bg=#121417 mods=bold text=" 90.0K          28.1%    "
+07:026+004 fg=#7e8691 bg=#121417 mods=bold text="[+] "
+07:030+005 fg=#3fb9c0 bg=#121417 mods=bold text="PROJ "
+07:035+013 fg=#d95474 bg=#121417 mods=bold text="■ billing-cli"
+07:048+011 fg=#dadee4 bg=#121417 mods=bold text="           "
 07:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 07:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 08:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+08:001+025 fg=#dadee4 bg=#121417 mods=bold text=" 40.0K          12.5%    "
+08:026+004 fg=#7e8691 bg=#121417 mods=bold text="[+] "
+08:030+005 fg=#3fb9c0 bg=#121417 mods=bold text="PROJ "
+08:035+011 fg=#56dca4 bg=#121417 mods=bold text="■ docs-site"
+08:046+013 fg=#dadee4 bg=#121417 mods=bold text="             "
 08:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 08:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 09:000+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -171,14 +178,11 @@ styles:
 20:006+003 fg=#dadee4 bg=#121417 mods=none text=" · "
 20:009+013 fg=#facc15 bg=#121417 mods=bold text="P lower bound"
 20:022+017 fg=#dadee4 bg=#121417 mods=none text=" · Total 40.0K · "
-20:039+002 fg=#d8af5a bg=#121417 mods=none text="■ "
-20:041+015 fg=#d8af5a bg=#121417 mods=bold text="alpha-service 0"
-20:056+003 fg=#dadee4 bg=#121417 mods=none text=" · "
-20:059+017 fg=#56dca4 bg=#121417 mods=none text="■ docs-site 40.0K"
+20:039+017 fg=#56dca4 bg=#121417 mods=none text="■ docs-site 40.0K"
 20:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:001+002 fg=#d8af5a bg=#121417 mods=none text="■ "
-21:003+013 fg=#f4f6f8 bg=#121417 mods=bold text="alpha-service"
+21:003+015 fg=#dadee4 bg=#121417 mods=none text="alpha-service  "
 21:018+002 fg=#d95474 bg=#121417 mods=none text="■ "
 21:020+013 fg=#dadee4 bg=#121417 mods=none text="billing-cli  "
 21:033+002 fg=#56dca4 bg=#121417 mods=none text="■ "

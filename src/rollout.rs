@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -14,15 +14,16 @@ use walkdir::WalkDir;
 use crate::cache::write_private_atomically;
 use crate::config::CollectConfig;
 use crate::domain::{
-    CollectionStats, Confidence, LimitWindow, Provenance, RateObservation, RolloutDataset,
-    TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, UsageCall,
+    AgentInteraction, AgentInteractionKind, CollectionStats, Confidence, LimitWindow, Provenance,
+    RateObservation, RolloutDataset, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus,
+    UsageCall,
 };
 use crate::session_index::load_thread_titles;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 8;
+const ROLLOUT_PARSER_REVISION: u32 = 9;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -125,6 +126,18 @@ enum ParsedEvent {
         preview: String,
         turn_id: Option<String>,
         source: UserMessageSource,
+    },
+    AgentCall {
+        requested_at: Option<DateTime<Utc>>,
+        call_id: String,
+        parent_turn_id: String,
+        kind: AgentInteractionKind,
+    },
+    AgentActivity {
+        occurred_at: Option<DateTime<Utc>>,
+        call_id: String,
+        child_thread_id: String,
+        kind: AgentInteractionKind,
     },
     ThreadSettingsApplied {
         service_tier: Option<String>,
@@ -629,6 +642,24 @@ struct ThreadBuilder {
     incomplete_counter_boundary: bool,
     token_usage: TokenUsage,
     turns: HashMap<String, TurnBuilder>,
+    agent_calls: Vec<AgentCallEvidence>,
+    agent_activities: Vec<AgentActivityEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentCallEvidence {
+    requested_at: Option<DateTime<Utc>>,
+    call_id: String,
+    parent_turn_id: String,
+    kind: AgentInteractionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentActivityEvidence {
+    occurred_at: Option<DateTime<Utc>>,
+    call_id: String,
+    child_thread_id: String,
+    kind: AgentInteractionKind,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3023,21 +3054,45 @@ fn parse_rollout_reader<R: BufRead>(
                         parsed
                             .events
                             .push(ParsedEvent::ThreadSettingsApplied { service_tier });
+                    } else if let Some((call_id, child_thread_id, kind)) =
+                        subagent_activity(payload)
+                    {
+                        let occurred_at = payload
+                            .get("occurred_at_ms")
+                            .or_else(|| payload.get("occurredAtMs"))
+                            .and_then(parse_timestamp)
+                            .or(explicit_timestamp);
+                        parsed.events.push(ParsedEvent::AgentActivity {
+                            occurred_at,
+                            call_id,
+                            child_thread_id,
+                            kind,
+                        });
                     } else {
                         cache_event_message(&mut parsed.events, payload, timestamp, line_number);
                     }
                 }
             }
             Some("response_item") => {
-                if !config.redact_content
-                    && let Some(payload) = object_at(&record, &["payload"])
-                    && let Some((preview, turn_id)) = response_item_user_message(payload)
-                {
-                    parsed.events.push(ParsedEvent::UserMessage {
-                        preview,
-                        turn_id,
-                        source: UserMessageSource::ResponseItem,
-                    });
+                if let Some(payload) = object_at(&record, &["payload"]) {
+                    if let Some((call_id, parent_turn_id, kind)) = response_item_agent_call(payload)
+                    {
+                        parsed.events.push(ParsedEvent::AgentCall {
+                            requested_at: explicit_timestamp,
+                            call_id,
+                            parent_turn_id,
+                            kind,
+                        });
+                    }
+                    if !config.redact_content
+                        && let Some((preview, turn_id)) = response_item_user_message(payload)
+                    {
+                        parsed.events.push(ParsedEvent::UserMessage {
+                            preview,
+                            turn_id,
+                            source: UserMessageSource::ResponseItem,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -3162,6 +3217,42 @@ fn cache_event_message(
         }
         _ => {}
     }
+}
+
+fn response_item_agent_call(
+    payload: &Map<String, Value>,
+) -> Option<(String, String, AgentInteractionKind)> {
+    if string_field_in(payload, &["type"]) != Some("function_call") {
+        return None;
+    }
+    let kind = match nonempty_string_field_in(payload, &["name"])? {
+        "spawn_agent" => AgentInteractionKind::SpawnStarted,
+        "followup_task" | "send_message" => AgentInteractionKind::Interacted,
+        _ => return None,
+    };
+    let call_id = nonempty_string_field_in(payload, &["call_id", "callId"])?;
+    let metadata = payload
+        .get("internal_chat_message_metadata_passthrough")
+        .or_else(|| payload.get("internalChatMessageMetadataPassthrough"))?
+        .as_object()?;
+    let parent_turn_id = nonempty_string_field_in(metadata, &["turn_id", "turnId"])?;
+    Some((call_id.to_owned(), parent_turn_id.to_owned(), kind))
+}
+
+fn subagent_activity(
+    payload: &Map<String, Value>,
+) -> Option<(String, String, AgentInteractionKind)> {
+    if string_field_in(payload, &["type"]) != Some("sub_agent_activity") {
+        return None;
+    }
+    let kind = match nonempty_string_field_in(payload, &["kind"])? {
+        "started" => AgentInteractionKind::SpawnStarted,
+        "interacted" => AgentInteractionKind::Interacted,
+        _ => return None,
+    };
+    let call_id = nonempty_string_field_in(payload, &["event_id", "eventId"])?;
+    let child_thread_id = nonempty_string_field_in(payload, &["agent_thread_id", "agentThreadId"])?;
+    Some((call_id.to_owned(), child_thread_id.to_owned(), kind))
 }
 
 fn response_item_user_message(payload: &Map<String, Value>) -> Option<(String, Option<String>)> {
@@ -3438,6 +3529,28 @@ fn replay_rollout_file(
             } => {
                 apply_user_message(thread, preview, turn_id.as_deref(), *source);
             }
+            ParsedEvent::AgentCall {
+                requested_at,
+                call_id,
+                parent_turn_id,
+                kind,
+            } => thread.agent_calls.push(AgentCallEvidence {
+                requested_at: *requested_at,
+                call_id: call_id.clone(),
+                parent_turn_id: parent_turn_id.clone(),
+                kind: *kind,
+            }),
+            ParsedEvent::AgentActivity {
+                occurred_at,
+                call_id,
+                child_thread_id,
+                kind,
+            } => thread.agent_activities.push(AgentActivityEvidence {
+                occurred_at: *occurred_at,
+                call_id: call_id.clone(),
+                child_thread_id: child_thread_id.clone(),
+                kind: *kind,
+            }),
             ParsedEvent::ThreadSettingsApplied { service_tier } => {
                 apply_thread_settings(thread, service_tier.clone());
             }
@@ -4034,6 +4147,8 @@ fn finish_dataset(
         });
     }
 
+    append_exact_agent_interactions(threads, dataset);
+
     dataset.tasks.sort_by(|left, right| {
         right
             .updated_at
@@ -4058,6 +4173,115 @@ fn finish_dataset(
             .cmp(&right.timestamp)
             .then_with(|| left.thread_id.cmp(&right.thread_id))
     });
+    dataset.agent_interactions.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.requested_at.cmp(&right.requested_at))
+            .then_with(|| left.parent_thread_id.cmp(&right.parent_thread_id))
+            .then_with(|| left.parent_turn_id.cmp(&right.parent_turn_id))
+            .then_with(|| left.child_thread_id.cmp(&right.child_thread_id))
+            .then_with(|| left.call_id.cmp(&right.call_id))
+    });
+}
+
+fn append_exact_agent_interactions(
+    threads: &HashMap<String, ThreadBuilder>,
+    dataset: &mut RolloutDataset,
+) {
+    for parent in threads.values() {
+        let mut calls_by_id = BTreeMap::<&str, Vec<&AgentCallEvidence>>::new();
+        for call in &parent.agent_calls {
+            calls_by_id.entry(&call.call_id).or_default().push(call);
+        }
+        let mut activities_by_id = BTreeMap::<&str, Vec<&AgentActivityEvidence>>::new();
+        for activity in &parent.agent_activities {
+            activities_by_id
+                .entry(&activity.call_id)
+                .or_default()
+                .push(activity);
+        }
+
+        for (call_id, calls) in calls_by_id {
+            let Some(activities) = activities_by_id.get(call_id) else {
+                continue;
+            };
+            let call = calls[0];
+            let activity = activities[0];
+            let call_is_unambiguous = calls.iter().all(|candidate| {
+                candidate.parent_turn_id == call.parent_turn_id && candidate.kind == call.kind
+            });
+            let activity_is_unambiguous = activities.iter().all(|candidate| {
+                candidate.child_thread_id == activity.child_thread_id
+                    && candidate.kind == activity.kind
+            });
+            if !call_is_unambiguous || !activity_is_unambiguous || call.kind != activity.kind {
+                continue;
+            }
+            if parent.thread_id == activity.child_thread_id {
+                continue;
+            }
+            // When child metadata is available it must agree with a claimed
+            // initial-spawn edge. Interactions may legitimately originate from
+            // an ancestor or coordinator other than the child's direct parent.
+            if call.kind == AgentInteractionKind::SpawnStarted
+                && threads
+                    .get(&activity.child_thread_id)
+                    .and_then(|child| child.parent_thread_id.as_deref())
+                    .is_some_and(|claimed_parent| claimed_parent != parent.thread_id)
+            {
+                continue;
+            }
+
+            dataset.agent_interactions.push(AgentInteraction {
+                kind: call.kind,
+                parent_thread_id: parent.thread_id.clone(),
+                parent_turn_id: call.parent_turn_id.clone(),
+                child_thread_id: activity.child_thread_id.clone(),
+                call_id: call_id.to_owned(),
+                requested_at: calls.iter().filter_map(|call| call.requested_at).min(),
+                occurred_at: activities
+                    .iter()
+                    .filter_map(|activity| activity.occurred_at)
+                    .min(),
+                provenance: Provenance::LocalExact,
+            });
+        }
+    }
+
+    // A child can have only one initial spawn. Repeated identical observations
+    // are harmless cache/file duplicates; contradictory exact-looking edges
+    // are unsafe, so omit every candidate for that child rather than guessing.
+    let mut spawn_edges_by_child = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, interaction) in dataset.agent_interactions.iter().enumerate() {
+        if interaction.kind == AgentInteractionKind::SpawnStarted {
+            spawn_edges_by_child
+                .entry(&interaction.child_thread_id)
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut remove = HashSet::new();
+    for indexes in spawn_edges_by_child.values() {
+        let first = &dataset.agent_interactions[indexes[0]];
+        let contradictory = indexes.iter().skip(1).any(|index| {
+            let candidate = &dataset.agent_interactions[*index];
+            candidate.parent_thread_id != first.parent_thread_id
+                || candidate.parent_turn_id != first.parent_turn_id
+        });
+        if contradictory {
+            remove.extend(indexes.iter().copied());
+        } else {
+            remove.extend(indexes.iter().skip(1).copied());
+        }
+    }
+    if !remove.is_empty() {
+        let mut index = 0_usize;
+        dataset.agent_interactions.retain(|_| {
+            let keep = !remove.contains(&index);
+            index += 1;
+            keep
+        });
+    }
 }
 
 fn task_status(
@@ -4245,6 +4469,16 @@ fn string_field_in<'a>(value: &'a Map<String, Value>, fields: &[&str]) -> Option
     fields
         .iter()
         .find_map(|field| value.get(*field).and_then(Value::as_str))
+}
+
+fn nonempty_string_field_in<'a>(value: &'a Map<String, Value>, fields: &[&str]) -> Option<&'a str> {
+    fields.iter().find_map(|field| {
+        value
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn u64_field_in(value: &Map<String, Value>, fields: &[&str]) -> Option<u64> {

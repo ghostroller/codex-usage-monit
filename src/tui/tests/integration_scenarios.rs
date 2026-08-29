@@ -29,9 +29,16 @@ fn summary_group(
     let input_tokens = total_tokens.saturating_mul(4) / 5;
     let output_tokens = total_tokens.saturating_sub(input_tokens);
     let pico_usd = u128::from(total_tokens).saturating_mul(1_000_000);
+    let session_thread_id = parent_thread_id.unwrap_or(thread_id);
+    let session_turn_id = format!("turn-{session_thread_id}");
     LocalProjectUsageGroup {
         thread_id: thread_id.to_string(),
+        turn_id: Some(format!("turn-{thread_id}")),
         parent_thread_id: parent_thread_id.map(str::to_string),
+        session_thread_id: Some(session_thread_id.to_string()),
+        session_turn_id: Some(session_turn_id),
+        message_preview: Some(format!("Review {project_label} usage")),
+        turn_started_at: None,
         project_id: Some(project_id.to_string()),
         project_label: Some(project_label.to_string()),
         title: Some(title.to_string()),
@@ -54,6 +61,22 @@ fn summary_group(
         },
         call_count: 1,
     }
+}
+
+fn attributed_summary_group(
+    mut group: LocalProjectUsageGroup,
+    turn_id: &str,
+    session_thread_id: &str,
+    session_turn_id: &str,
+    message_preview: &str,
+    turn_started_at: DateTime<Utc>,
+) -> LocalProjectUsageGroup {
+    group.turn_id = Some(turn_id.to_string());
+    group.session_thread_id = Some(session_thread_id.to_string());
+    group.session_turn_id = Some(session_turn_id.to_string());
+    group.message_preview = Some(message_preview.to_string());
+    group.turn_started_at = Some(turn_started_at);
+    group
 }
 
 fn summary_bucket(
@@ -96,26 +119,40 @@ fn summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     harness.app.history.half_hour_buckets = vec![
         summary_bucket(
             summary_timestamp("2026-07-09T06:00:00Z"),
-            vec![summary_group(
+            vec![attributed_summary_group(
+                summary_group(
+                    "alpha-root",
+                    None,
+                    "alpha-id",
+                    "alpha-service",
+                    "API billing dashboard",
+                    "desktop",
+                    120_000,
+                ),
+                "alpha-user-turn",
                 "alpha-root",
-                None,
-                "alpha-id",
-                "alpha-service",
-                "API billing dashboard",
-                "desktop",
-                120_000,
+                "alpha-user-turn",
+                "Explain the API billing discrepancy",
+                summary_timestamp("2026-07-09T05:55:00Z"),
             )],
         ),
         summary_bucket(
             summary_timestamp("2026-07-10T08:15:00Z"),
-            vec![summary_group(
-                "alpha-child",
-                Some("alpha-root"),
-                "alpha-id",
-                "alpha-service",
-                "Price catalog research",
-                "subagent",
-                70_000,
+            vec![attributed_summary_group(
+                summary_group(
+                    "alpha-child",
+                    Some("alpha-root"),
+                    "alpha-id",
+                    "alpha-service",
+                    "Price catalog research",
+                    "subagent",
+                    70_000,
+                ),
+                "alpha-child-turn",
+                "alpha-root",
+                "alpha-user-turn",
+                "Explain the API billing discrepancy",
+                summary_timestamp("2026-07-09T05:55:00Z"),
             )],
         ),
         summary_bucket(
@@ -241,6 +278,16 @@ fn semantic_frames_cover_full_compact_and_diagnostic_layouts() {
                 .frame()
                 .snapshot_text()
         );
+    }
+    for (name, width, height, theme) in [
+        ("tui_summary_turn_tree_dark_120x40", 120, 40, Theme::Dark),
+        ("tui_summary_turn_tree_light_60x24", 60, 24, Theme::Light),
+    ] {
+        let mut summary = summary_harness(width, height, theme);
+        summary.key(KeyCode::Enter);
+        summary.key(KeyCode::Down);
+        summary.key(KeyCode::Enter);
+        insta::assert_snapshot!(name, summary.frame().snapshot_text());
     }
 
     for (name, width, height, theme) in [
@@ -1581,7 +1628,12 @@ fn summary_collapse_all_has_keyboard_mouse_parity_and_stable_whole_label_hitbox(
                 harness.key(KeyCode::Enter);
                 harness.key(KeyCode::Down);
                 harness.key(KeyCode::Enter);
+                harness.key(KeyCode::Down);
                 assert_eq!(harness.app.summary_expanded_nodes.len(), 2);
+                assert_eq!(
+                    harness.app.summary_selected_id.as_deref(),
+                    Some("turn:alpha-root:alpha-user-turn")
+                );
                 assert_eq!(
                     harness.control_rect(ControlId::SummaryCollapseAll),
                     inactive_rect,
@@ -2014,6 +2066,29 @@ fn summary_longx_does_not_treat_spark_only_metadata_as_unknown_est_usage() {
 #[test]
 fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
+    let alpha = harness
+        .app
+        .summary_cache
+        .as_ref()
+        .unwrap()
+        .prepared
+        .usage
+        .projects
+        .iter()
+        .find(|project| project.key == "alpha-id")
+        .unwrap();
+    assert_eq!(alpha.sessions.len(), 1);
+    assert_eq!(alpha.sessions[0].turns.len(), 1);
+    assert_eq!(alpha.sessions[0].totals.token_usage.total_tokens, 190_000);
+    assert_eq!(
+        alpha.sessions[0].turns[0].totals.token_usage.total_tokens,
+        190_000
+    );
+    assert_eq!(
+        alpha.sessions[0].turns[0].message_preview.as_deref(),
+        Some("Explain the API billing discrepancy")
+    );
+
     let rows = harness.app.summary_rows();
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| row.id.starts_with("project:")));
@@ -2061,14 +2136,97 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
         190_000
     );
     assert_eq!(
-        session_expanded[1].metrics.token_usage.total_tokens, 120_000,
-        "an expanded session row should show only its own usage"
+        session_expanded[1].metrics.token_usage.total_tokens, 190_000,
+        "an expanded session row should retain the session aggregate"
     );
-    assert_eq!(session_expanded[2].metrics.token_usage.total_tokens, 70_000);
-    assert!(harness.frame().snapshot_text().contains("Price catalog"));
+    assert_eq!(
+        session_expanded[2].metrics.token_usage.total_tokens,
+        190_000
+    );
+    assert_eq!(session_expanded[2].id, "turn:alpha-root:alpha-user-turn");
+    let expanded = harness.frame().snapshot_text();
+    assert!(expanded.contains("TURN Explain"));
+    assert!(!expanded.contains("Price catalog research"));
+    assert!(!expanded.contains("SUB "));
     assert_eq!(session_expanded[0].kind, SummaryRowKind::Project);
     assert_eq!(session_expanded[1].kind, SummaryRowKind::Session);
-    assert_eq!(session_expanded[2].kind, SummaryRowKind::Subagent);
+    assert_eq!(session_expanded[2].kind, SummaryRowKind::Turn);
+}
+
+#[test]
+fn summary_tree_keeps_direct_and_delegated_unassigned_turn_rows_distinct() {
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut direct = summary_group(
+            "root",
+            None,
+            "alpha-id",
+            "alpha-service",
+            "Root session",
+            "desktop",
+            10_000,
+        );
+        direct.turn_id = None;
+        direct.session_turn_id = None;
+        direct.message_preview = Some("preview must not mask the direct fallback".to_string());
+
+        let mut delegated_a = summary_group(
+            "child-a",
+            Some("root"),
+            "alpha-id",
+            "alpha-service",
+            "Delegated A",
+            "subagent",
+            20_000,
+        );
+        delegated_a.session_turn_id = None;
+        delegated_a.message_preview =
+            Some("preview must not mask the delegated fallback".to_string());
+        let mut delegated_b = summary_group(
+            "child-b",
+            Some("root"),
+            "alpha-id",
+            "alpha-service",
+            "Delegated B",
+            "subagent",
+            30_000,
+        );
+        delegated_b.session_turn_id = None;
+
+        let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
+        harness.app.history.half_hour_buckets = vec![summary_bucket(
+            summary_timestamp("2026-07-12T03:45:00Z"),
+            vec![direct, delegated_a, delegated_b],
+        )];
+        harness.app.summary_cache = None;
+        harness.key(KeyCode::Char('U'));
+        harness.key(KeyCode::Enter);
+        harness.key(KeyCode::Down);
+        harness.key(KeyCode::Enter);
+
+        let rows = harness.app.summary_rows();
+        let direct = rows
+            .iter()
+            .find(|row| row.id == "turn-unassigned-session:root")
+            .unwrap();
+        assert_eq!(direct.label, "Unassigned session usage");
+        assert_eq!(direct.metrics.token_usage.total_tokens, 10_000);
+        let delegated = rows
+            .iter()
+            .find(|row| row.id == "turn-unassigned-delegated:root")
+            .unwrap();
+        assert_eq!(delegated.label, "Unassigned delegated usage");
+        assert_eq!(delegated.metrics.token_usage.total_tokens, 50_000);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SummaryRowKind::Turn)
+                .count(),
+            2
+        );
+
+        let frame = harness.frame().snapshot_text();
+        assert!(frame.contains("Unassigned"), "{frame}");
+        assert!(!frame.contains("preview must not mask"), "{frame}");
+    }
 }
 
 #[test]
@@ -2091,12 +2249,63 @@ fn summary_tree_plus_minus_match_the_highlighted_marker_shortcuts() {
 }
 
 #[test]
-fn summary_tree_labels_projects_sessions_and_subagents_without_color_only_cues() {
-    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+fn summary_tree_markers_are_whole_mouse_targets_for_project_and_session() {
+    for (width, height, theme) in [
+        (120, 40, Theme::Dark),
+        (120, 40, Theme::Light),
+        (60, 24, Theme::Dark),
+        (60, 24, Theme::Light),
+    ] {
+        for edge in [ClickEdge::Start, ClickEdge::Middle, ClickEdge::End] {
+            let mut harness = summary_harness(width, height, theme);
+            let project_marker = harness.app.summary_tree_marker_hitboxes[0].area;
+            let x = match edge {
+                ClickEdge::Start => project_marker.x,
+                ClickEdge::Middle => project_marker.x + project_marker.width / 2,
+                ClickEdge::End => project_marker.right() - 1,
+            };
+            assert!(summary_mouse(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                project_marker.y,
+            ));
+            assert_eq!(harness.app.summary_rows().len(), 4);
+            assert_eq!(
+                harness.app.summary_selected_id.as_deref(),
+                Some("project:alpha-id")
+            );
+
+            let session_marker = harness.app.summary_tree_marker_hitboxes[1].area;
+            assert!(summary_mouse(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                session_marker.x + session_marker.width / 2,
+                session_marker.y,
+            ));
+            let rows = harness.app.summary_rows();
+            assert_eq!(rows.len(), 5);
+            assert_eq!(rows[2].kind, SummaryRowKind::Turn);
+            assert_eq!(
+                harness.app.summary_selected_id.as_deref(),
+                Some("thread:alpha-root")
+            );
+        }
+    }
+}
+
+#[test]
+fn summary_tree_labels_projects_sessions_and_turns_without_color_only_cues() {
+    for (width, height, theme) in [
+        (120, 40, Theme::Dark),
+        (120, 40, Theme::Light),
+        (60, 24, Theme::Dark),
+        (60, 24, Theme::Light),
+    ] {
         let mut harness = summary_harness(width, height, theme);
         let collapsed = harness.frame().snapshot_text();
         assert!(
-            collapsed.contains("TYPE · PROJECT / SESSION"),
+            collapsed.contains("TYPE · PROJECT / SESSION / TURN"),
             "{collapsed}"
         );
         assert!(
@@ -2110,7 +2319,8 @@ fn summary_tree_labels_projects_sessions_and_subagents_without_color_only_cues()
         let expanded = harness.frame().snapshot_text();
         assert!(expanded.contains("PROJ ■ alpha-service"), "{expanded}");
         assert!(expanded.contains("SESS API billing"), "{expanded}");
-        assert!(expanded.contains("SUB  Price catalog"), "{expanded}");
+        assert!(expanded.contains("TURN Explain"), "{expanded}");
+        assert!(!expanded.contains("SUB "), "{expanded}");
     }
 }
 

@@ -75,8 +75,8 @@ use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
 };
 use crate::summary::{
-    ProjectSummary, SummaryMetrics, SummarySample, SummaryWindow, ThreadSummary, UsageSummary,
-    summarize_samples_with_local_time,
+    ProjectSummary, SessionSummary, SummaryMetrics, SummarySample, SummaryTurnKey, SummaryWindow,
+    TurnSummary, UsageSummary, summarize_samples_with_local_time,
 };
 use crate::ui_state::{
     UiState, UiStateStore, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
@@ -1788,7 +1788,7 @@ struct SummaryCache {
 enum SummaryRowKind {
     Project,
     Session,
-    Subagent,
+    Turn,
 }
 
 #[derive(Clone, Debug)]
@@ -7406,6 +7406,11 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
                 timestamp: bucket.starts_at,
                 thread_id: group.thread_id.clone(),
                 parent_thread_id: group.parent_thread_id.clone(),
+                turn_id: group.turn_id.clone(),
+                session_thread_id: group.session_thread_id.clone(),
+                session_turn_id: group.session_turn_id.clone(),
+                message_preview: group.message_preview.clone(),
+                turn_started_at: group.turn_started_at,
                 project_key: group.project_id.clone(),
                 project_label: group.project_label.clone(),
                 cwd: None,
@@ -7431,6 +7436,11 @@ fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
             timestamp: app.snapshot.as_of,
             thread_id: task.thread_id.clone(),
             parent_thread_id: task.parent_thread_id.clone(),
+            turn_id: None,
+            session_thread_id: None,
+            session_turn_id: None,
+            message_preview: None,
+            turn_started_at: None,
             project_key: None,
             project_label: task
                 .cwd
@@ -7650,6 +7660,18 @@ fn summary_thread_node_id(thread_id: &str) -> String {
     format!("thread:{thread_id}")
 }
 
+fn summary_turn_node_id(session_thread_id: &str, key: &SummaryTurnKey) -> String {
+    match key {
+        SummaryTurnKey::Exact(turn_id) => format!("turn:{session_thread_id}:{turn_id}"),
+        SummaryTurnKey::UnassignedSession => {
+            format!("turn-unassigned-session:{session_thread_id}")
+        }
+        SummaryTurnKey::UnassignedDelegated => {
+            format!("turn-unassigned-delegated:{session_thread_id}")
+        }
+    }
+}
+
 fn summary_tree_prefix(guides: &[bool]) -> String {
     let mut prefix = String::new();
     if let Some((&is_last, ancestors)) = guides.split_last() {
@@ -7707,69 +7729,89 @@ fn stable_summary_key_hash(value: &str) -> u64 {
     })
 }
 
-fn sorted_summary_threads(
-    threads: &[ThreadSummary],
+fn sorted_summary_sessions(
+    sessions: &[SessionSummary],
     metric: SummaryMetric,
     api_long_context: bool,
-) -> Vec<&ThreadSummary> {
-    let mut threads = threads.iter().collect::<Vec<_>>();
-    threads.sort_by(|left, right| {
+) -> Vec<&SessionSummary> {
+    let mut sessions = sessions.iter().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
         metric
-            .value(right.subtree, api_long_context)
-            .cmp(&metric.value(left.subtree, api_long_context))
+            .value(right.totals, api_long_context)
+            .cmp(&metric.value(left.totals, api_long_context))
             .then_with(|| left.thread_id.cmp(&right.thread_id))
     });
-    threads
+    sessions
 }
 
-fn append_summary_thread_rows(
-    thread: &ThreadSummary,
+fn sorted_summary_turns(
+    turns: &[TurnSummary],
+    metric: SummaryMetric,
+    api_long_context: bool,
+) -> Vec<&TurnSummary> {
+    let mut turns = turns.iter().collect::<Vec<_>>();
+    turns.sort_by(|left, right| {
+        metric
+            .value(right.totals, api_long_context)
+            .cmp(&metric.value(left.totals, api_long_context))
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    turns
+}
+
+fn append_summary_session_rows(
+    session: &SessionSummary,
     metric: SummaryMetric,
     api_long_context: bool,
     expanded: &HashSet<String>,
     guides: &mut Vec<bool>,
     rows: &mut Vec<SummaryTreeRow>,
 ) {
-    let id = summary_thread_node_id(&thread.thread_id);
-    let has_children = !thread.children.is_empty();
+    let id = summary_thread_node_id(&session.thread_id);
+    let has_children = !session.turns.is_empty();
     let collapsed = has_children && !expanded.contains(&id);
-    let kind = if thread.parent_thread_id.is_some()
-        || thread
-            .source
-            .as_deref()
-            .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
-    {
-        SummaryRowKind::Subagent
-    } else {
-        SummaryRowKind::Session
-    };
     rows.push(SummaryTreeRow {
         id,
-        kind,
+        kind: SummaryRowKind::Session,
         prefix: summary_tree_prefix(guides),
-        label: thread
+        label: session
             .title
             .as_deref()
             .filter(|title| !title.trim().is_empty())
             .map(terminal_safe_text)
-            .unwrap_or_else(|| format!("Thread {}", short_thread_id(&thread.thread_id))),
-        source: thread.source.clone(),
-        metrics: if collapsed {
-            thread.subtree
-        } else {
-            thread.own
-        },
+            .unwrap_or_else(|| format!("Session {}", short_thread_id(&session.thread_id))),
+        source: session.source.clone(),
+        metrics: session.totals,
         has_children,
         collapsed,
     });
     if collapsed {
         return;
     }
-    let children = sorted_summary_threads(&thread.children, metric, api_long_context);
-    let child_count = children.len();
-    for (position, child) in children.into_iter().enumerate() {
-        guides.push(position + 1 == child_count);
-        append_summary_thread_rows(child, metric, api_long_context, expanded, guides, rows);
+    let turns = sorted_summary_turns(&session.turns, metric, api_long_context);
+    let turn_count = turns.len();
+    for (position, turn) in turns.into_iter().enumerate() {
+        guides.push(position + 1 == turn_count);
+        rows.push(SummaryTreeRow {
+            id: summary_turn_node_id(&session.thread_id, &turn.key),
+            kind: SummaryRowKind::Turn,
+            prefix: summary_tree_prefix(guides),
+            label: match &turn.key {
+                SummaryTurnKey::Exact(turn_id) => turn
+                    .message_preview
+                    .as_deref()
+                    .filter(|message| !message.trim().is_empty())
+                    .map(terminal_safe_text)
+                    .unwrap_or_else(|| format!("Turn {}", short_thread_id(turn_id))),
+                SummaryTurnKey::UnassignedSession => "Unassigned session usage".to_string(),
+                SummaryTurnKey::UnassignedDelegated => "Unassigned delegated usage".to_string(),
+            },
+            source: None,
+            metrics: turn.totals,
+            has_children: false,
+            collapsed: false,
+        });
         guides.pop();
     }
 }
@@ -7784,7 +7826,7 @@ fn summary_tree_rows(
     let display_labels = summary_project_display_labels(summary);
     for project in summary_project_order(summary, metric, api_long_context) {
         let id = summary_project_node_id(&project.key);
-        let has_children = !project.threads.is_empty();
+        let has_children = !project.sessions.is_empty();
         let collapsed = has_children && !expanded.contains(&id);
         rows.push(SummaryTreeRow {
             id,
@@ -7802,13 +7844,13 @@ fn summary_tree_rows(
         if collapsed {
             continue;
         }
-        let threads = sorted_summary_threads(&project.threads, metric, api_long_context);
-        let thread_count = threads.len();
+        let sessions = sorted_summary_sessions(&project.sessions, metric, api_long_context);
+        let session_count = sessions.len();
         let mut guides = Vec::new();
-        for (position, thread) in threads.into_iter().enumerate() {
-            guides.push(position + 1 == thread_count);
-            append_summary_thread_rows(
-                thread,
+        for (position, session) in sessions.into_iter().enumerate() {
+            guides.push(position + 1 == session_count);
+            append_summary_session_rows(
+                session,
                 metric,
                 api_long_context,
                 expanded,
@@ -8422,14 +8464,14 @@ fn render_summary_tree(
             let kind = match row.kind {
                 SummaryRowKind::Project => "PROJ ",
                 SummaryRowKind::Session => "SESS ",
-                SummaryRowKind::Subagent => "SUB  ",
+                SummaryRowKind::Turn => "TURN ",
             };
             let kind_style = match row.kind {
                 SummaryRowKind::Project => Style::default()
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD),
                 SummaryRowKind::Session => Style::default().fg(palette.foreground),
-                SummaryRowKind::Subagent => Style::default().fg(palette.muted),
+                SummaryRowKind::Turn => Style::default().fg(palette.muted),
             };
             let marker = if row.has_children {
                 if row.collapsed { "+" } else { "-" }
@@ -8484,7 +8526,7 @@ fn render_summary_tree(
     let header = Row::new([
         app.summary_metric.label(),
         share_header,
-        "TYPE · PROJECT / SESSION",
+        "TYPE · PROJECT / SESSION / TURN",
     ])
     .style(
         Style::default()

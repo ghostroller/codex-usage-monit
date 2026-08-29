@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{
-    Confidence, Provenance, TaskRecord, TaskStatus, TokenUsage, TurnStatus,
+    AgentInteractionKind, Confidence, Provenance, TaskRecord, TaskStatus, TokenUsage, TurnStatus,
 };
 use codex_usage_monit::rollout::scan_rollouts;
 use serde_json::{Value, json};
@@ -1784,6 +1784,347 @@ fn source_labels_distinguish_clients_roles_and_fallbacks() {
 }
 
 #[test]
+fn joins_exact_spawn_and_interacted_agent_activity_to_parent_turns() {
+    let temp = TempDir::new().unwrap();
+    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let requested_at = now - chrono::Duration::seconds(4);
+    let started_at = now - chrono::Duration::seconds(3);
+    let interacted_at = now - chrono::Duration::seconds(1);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-parent.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(requested_at),
+                "type": "session_meta",
+                "payload": {"id": "parent-thread", "source": "vscode"}
+            }),
+            json!({
+                "timestamp": timestamp(requested_at),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "spawn-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(requested_at),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call-spawn",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "spawn-turn"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(started_at),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "kind": "started",
+                    "event_id": "call-spawn",
+                    "agent_thread_id": "child-thread",
+                    "occurred_at_ms": started_at.timestamp_millis()
+                }
+            }),
+            json!({
+                "timestamp": timestamp(started_at),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "spawn-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(interacted_at),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "followup-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(interacted_at),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "followup_task",
+                    "call_id": "call-followup",
+                    "internalChatMessageMetadataPassthrough": {"turnId": "followup-turn"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(interacted_at),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "kind": "interacted",
+                    "eventId": "call-followup",
+                    "agentThreadId": "child-thread",
+                    "occurredAtMs": interacted_at.timestamp_millis()
+                }
+            }),
+            json!({
+                "timestamp": timestamp(interacted_at),
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "followup-turn"}
+            }),
+        ],
+        false,
+    );
+    write_jsonl(
+        &temp.path().join("sessions/rollout-child.jsonl"),
+        &[json!({
+            "timestamp": timestamp(started_at),
+            "type": "session_meta",
+            "payload": {
+                "id": "child-thread",
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": "parent-thread",
+                    "agent_role": null
+                }}},
+                "thread_source": "subagent"
+            }
+        })],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(dataset.agent_interactions.len(), 2);
+    let spawn = dataset
+        .agent_interactions
+        .iter()
+        .find(|interaction| interaction.kind == AgentInteractionKind::SpawnStarted)
+        .unwrap();
+    assert_eq!(spawn.parent_thread_id, "parent-thread");
+    assert_eq!(spawn.parent_turn_id, "spawn-turn");
+    assert_eq!(spawn.child_thread_id, "child-thread");
+    assert_eq!(spawn.call_id, "call-spawn");
+    assert_eq!(spawn.requested_at, Some(requested_at));
+    assert_eq!(spawn.occurred_at, Some(started_at));
+    assert_eq!(spawn.provenance, Provenance::LocalExact);
+
+    let interacted = dataset
+        .agent_interactions
+        .iter()
+        .find(|interaction| interaction.kind == AgentInteractionKind::Interacted)
+        .unwrap();
+    assert_eq!(interacted.parent_turn_id, "followup-turn");
+    assert_eq!(interacted.child_thread_id, "child-thread");
+    assert_eq!(interacted.provenance, Provenance::LocalExact);
+    let serialized = serde_json::to_value(spawn).unwrap();
+    assert_eq!(serialized["kind"], "spawn_started");
+    assert_eq!(serialized["parentTurnId"], "spawn-turn");
+    assert_eq!(serialized["childThreadId"], "child-thread");
+
+    let mut redacted = config(temp.path());
+    redacted.redact_content = true;
+    let redacted = scan_rollouts(&redacted, now).unwrap();
+    assert_eq!(redacted.agent_interactions, dataset.agent_interactions);
+}
+
+#[test]
+fn joins_agent_activity_when_the_activity_precedes_its_function_call() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-parent.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(3)),
+                "type": "session_meta",
+                "payload": {"id": "parent-thread", "source": "vscode"}
+            }),
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(2)),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "kind": "started",
+                    "event_id": "call-out-of-order",
+                    "agent_thread_id": "child-thread"
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now - chrono::Duration::seconds(1)),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call-out-of-order",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "parent-turn"}
+                }
+            }),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(dataset.agent_interactions.len(), 1);
+    assert_eq!(dataset.agent_interactions[0].parent_turn_id, "parent-turn");
+    assert_eq!(
+        dataset.agent_interactions[0].child_thread_id,
+        "child-thread"
+    );
+}
+
+#[test]
+fn rejects_malformed_mismatched_and_contradictory_agent_links() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-parent.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "parent-thread", "source": "vscode"}
+            }),
+            // A call without an explicit parent turn is not attributable.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "call-no-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "sub_agent_activity", "kind": "started", "event_id": "call-no-turn", "agent_thread_id": "child-no-turn"}
+            }),
+            // Both halves are well-formed but their opaque ids do not match.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call", "name": "spawn_agent", "call_id": "call-left",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-left"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "sub_agent_activity", "kind": "started", "event_id": "call-right", "agent_thread_id": "child-mismatch"}
+            }),
+            // Matching event ids still cannot override contradictory child metadata.
+            json!({
+                "timestamp": timestamp(now),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call", "name": "spawn_agent", "call_id": "call-contradictory",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-contradictory"}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "sub_agent_activity", "kind": "started", "event_id": "call-contradictory", "agent_thread_id": "child-contradictory"}
+            }),
+        ],
+        false,
+    );
+    write_jsonl(
+        &temp.path().join("sessions/rollout-child.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {
+                "id": "child-contradictory",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "different-parent"}}},
+                "thread_source": "subagent"
+            }
+        })],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert!(dataset.agent_interactions.is_empty());
+}
+
+#[test]
+fn deduplicates_identical_agent_evidence_and_omits_ambiguous_links() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    let call = |call_id: &str, turn_id: &str| {
+        json!({
+            "timestamp": timestamp(now),
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "spawn_agent",
+                "call_id": call_id,
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id}
+            }
+        })
+    };
+    let activity = |call_id: &str, child_thread_id: &str| {
+        json!({
+            "timestamp": timestamp(now),
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "kind": "started",
+                "event_id": call_id,
+                "agent_thread_id": child_thread_id
+            }
+        })
+    };
+    write_jsonl(
+        &temp.path().join("sessions/rollout-parent.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "parent-thread", "source": "vscode"}
+            }),
+            // Replayed identical evidence must collapse to one exact edge.
+            call("call-duplicate", "turn-duplicate"),
+            call("call-duplicate", "turn-duplicate"),
+            activity("call-duplicate", "child-duplicate"),
+            activity("call-duplicate", "child-duplicate"),
+            // One call id claiming two turns is ambiguous.
+            call("call-turn-conflict", "turn-left"),
+            call("call-turn-conflict", "turn-right"),
+            activity("call-turn-conflict", "child-turn-conflict"),
+            // One event id claiming two children is ambiguous.
+            call("call-child-conflict", "turn-child-conflict"),
+            activity("call-child-conflict", "child-left"),
+            activity("call-child-conflict", "child-right"),
+            // A child cannot have two different initial parent-turn edges.
+            call("call-shared-one", "turn-shared-one"),
+            activity("call-shared-one", "child-shared"),
+            call("call-shared-two", "turn-shared-two"),
+            activity("call-shared-two", "child-shared"),
+        ],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(dataset.agent_interactions.len(), 1);
+    let interaction = &dataset.agent_interactions[0];
+    assert_eq!(interaction.call_id, "call-duplicate");
+    assert_eq!(interaction.parent_turn_id, "turn-duplicate");
+    assert_eq!(interaction.child_thread_id, "child-duplicate");
+}
+
+#[test]
+fn legacy_subagent_parent_metadata_does_not_fabricate_a_turn_link() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now();
+    write_jsonl(
+        &temp.path().join("sessions/rollout-child.jsonl"),
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {
+                "id": "legacy-child",
+                "parent_thread_id": "legacy-parent",
+                "source": {"subagent": {"other": "worker"}},
+                "thread_source": "subagent"
+            }
+        })],
+        false,
+    );
+
+    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    assert_eq!(
+        dataset.tasks[0].parent_thread_id.as_deref(),
+        Some("legacy-parent")
+    );
+    assert!(dataset.agent_interactions.is_empty());
+}
+
+#[test]
 fn preserves_direct_parent_chains_and_metadata_fallback_priority() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -2087,6 +2428,26 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             "payload": {"type": "task_started", "turn_id": parent_turn, "started_at": parent_started.timestamp()}
         }),
         json!({
+            "timestamp": timestamp(child_created + chrono::Duration::microseconds(110)),
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "spawn_agent",
+                "call_id": "foreign-pre-call",
+                "internal_chat_message_metadata_passthrough": {"turn_id": parent_turn}
+            }
+        }),
+        json!({
+            "timestamp": timestamp(child_created + chrono::Duration::microseconds(120)),
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "kind": "started",
+                "event_id": "foreign-pre-call",
+                "agent_thread_id": "foreign-pre-child"
+            }
+        }),
+        json!({
             "timestamp": timestamp(child_created + chrono::Duration::microseconds(150)),
             "type": "event_msg",
             "payload": {"type": "user_message", "message": "foreign parent prompt"}
@@ -2112,6 +2473,26 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
             "timestamp": timestamp(child_created + chrono::Duration::milliseconds(2)),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": parent_turn, "started_at": parent_started.timestamp()}
+        }),
+        json!({
+            "timestamp": timestamp(child_created + chrono::Duration::microseconds(2_100)),
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "spawn_agent",
+                "call_id": "foreign-replayed-call",
+                "internal_chat_message_metadata_passthrough": {"turn_id": parent_turn}
+            }
+        }),
+        json!({
+            "timestamp": timestamp(child_created + chrono::Duration::microseconds(2_200)),
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "kind": "started",
+                "event_id": "foreign-replayed-call",
+                "agent_thread_id": "foreign-replayed-child"
+            }
         }),
         json!({
             "timestamp": timestamp(child_created + chrono::Duration::milliseconds(2)),
@@ -2190,6 +2571,7 @@ fn ignores_embedded_parent_history_but_uses_its_cumulative_token_baseline() {
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 25);
     assert_eq!(dataset.calls[0].service_tier.as_deref(), Some("priority"));
+    assert!(dataset.agent_interactions.is_empty());
     assert_eq!(dataset.rate_observations.len(), 1);
     assert_eq!(
         dataset.rate_observations[0]

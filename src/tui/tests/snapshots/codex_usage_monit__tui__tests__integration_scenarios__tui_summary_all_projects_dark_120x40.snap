@@ -7,7 +7,7 @@ rows:
 00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings
 01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 1d [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
 02|┌Usage tree · Cycle · known 360.0K · 0% coverage · PARTIAL─┐┌Top projects · Tokens · share of known────────────────────┐
-03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION         ││■ project-7                       80.0K  22.2% ██·········│
+03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  ││■ project-7                       80.0K  22.2% ██·········│
 04|│▌80.0K          22.2%    [+] PROJ ■ project-7             ││■ project-6                       70.0K  19.4% ██·········│
 05|│ 70.0K          19.4%    [+] PROJ ■ project-6             ││■ project-5                       60.0K  16.7% ██·········│
 06|│ 60.0K          16.7%    [+] PROJ ■ project-5             ││■ project-4                       50.0K  13.9% ██·········│
@@ -90,7 +90,7 @@ styles:
 02:061+038 fg=#f4f6f8 bg=#121417 mods=bold text="Top projects · Tokens · share of known"
 02:099+021 fg=#4b525c bg=#121417 mods=none text="────────────────────┐"
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION         "
+03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 03:061+002 fg=#56bfe1 bg=#121417 mods=none text="■ "
 03:063+009 fg=#56bfe1 bg=#121417 mods=bold text="project-7"

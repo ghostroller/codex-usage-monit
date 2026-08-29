@@ -286,7 +286,7 @@ fn summary_chart_grains_preserve_hourly_totals_and_project_composition() {
             totals,
             days: Vec::new(),
             hours,
-            threads: Vec::new(),
+            sessions: Vec::new(),
         }
     };
     let prepared = PreparedSummary {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
@@ -36,8 +36,21 @@ impl SummaryWindow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SummarySample {
     pub timestamp: DateTime<Utc>,
+    /// Thread that emitted this usage. This may be a subagent thread.
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
+    /// Turn local to `thread_id`, retained for diagnostics and for direct
+    /// top-level-session attribution.
+    pub turn_id: Option<String>,
+    /// Root user session used by the conversation tree. Persisted history
+    /// fills this after resolving the subagent lineage. Raw samples may leave
+    /// it empty and let the summarizer resolve the root thread.
+    pub session_thread_id: Option<String>,
+    /// User turn in the root session that owns this usage. For a subagent this
+    /// is the turn that spawned its top-level delegated subtree.
+    pub session_turn_id: Option<String>,
+    pub message_preview: Option<String>,
+    pub turn_started_at: Option<DateTime<Utc>>,
     /// Optional opaque project identity supplied by persisted history. Raw
     /// rollout samples fall back to the canonical workspace path.
     pub project_key: Option<String>,
@@ -139,19 +152,45 @@ pub struct HourlySummary {
     pub totals: SummaryMetrics,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SummaryTurnKey {
+    /// An exact root-session turn id from rollout evidence.
+    Exact(String),
+    /// Usage emitted directly by the root session without a turn id.
+    UnassignedSession,
+    /// Delegated usage whose originating root-session turn is unavailable.
+    UnassignedDelegated,
+}
+
+impl SummaryTurnKey {
+    pub fn exact_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Exact(turn_id) => Some(turn_id),
+            Self::UnassignedSession | Self::UnassignedDelegated => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadSummary {
+pub struct TurnSummary {
+    pub key: SummaryTurnKey,
+    pub message_preview: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    /// The root turn's own model usage plus every delegated descendant that
+    /// can be attributed to that turn. Missing direct and delegated
+    /// attribution remain separate compact rows instead of guessing from
+    /// timestamps or merging semantically different usage.
+    pub totals: SummaryMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
     pub thread_id: String,
-    pub parent_thread_id: Option<String>,
     pub title: Option<String>,
     pub source: Option<String>,
     pub cwd: Option<PathBuf>,
-    /// Usage emitted by this thread only.
-    pub own: SummaryMetrics,
-    /// Usage emitted by this thread and all visible descendants in the same
-    /// project. Collapsed tree rows should display this value.
-    pub subtree: SummaryMetrics,
-    pub children: Vec<ThreadSummary>,
+    pub totals: SummaryMetrics,
+    pub turns: Vec<TurnSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +207,7 @@ pub struct ProjectSummary {
     /// chart. Empty/unknown hours are materialized by the caller together with
     /// its independent history coverage metadata.
     pub hours: Vec<HourlySummary>,
-    pub threads: Vec<ThreadSummary>,
+    pub sessions: Vec<SessionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +237,20 @@ struct ProjectAccumulator {
     hours: BTreeMap<NaiveDateTime, SummaryMetrics>,
     label: Option<(DateTime<Utc>, String)>,
     cwd: Option<PathBuf>,
+    sessions: BTreeMap<String, SessionAccumulator>,
+}
+
+#[derive(Default)]
+struct SessionAccumulator {
+    totals: SummaryMetrics,
+    turns: BTreeMap<SummaryTurnKey, TurnAccumulator>,
+}
+
+#[derive(Default)]
+struct TurnAccumulator {
+    totals: SummaryMetrics,
+    message_preview: Option<String>,
+    started_at: Option<DateTime<Utc>>,
 }
 
 /// Aggregates already-additive samples into project totals, a thread tree and
@@ -282,6 +335,16 @@ fn summarize_samples_with_local_mapping(
             &mut visiting,
         );
     }
+    let mut resolved_session_threads = HashMap::<String, String>::new();
+    for thread_id in metadata.keys() {
+        let mut visiting = HashSet::new();
+        resolve_session_thread(
+            thread_id,
+            &metadata,
+            &mut resolved_session_threads,
+            &mut visiting,
+        );
+    }
 
     let dates = dates_in_window(window, &local_date);
     let mut totals = SummaryMetrics::default();
@@ -292,7 +355,6 @@ fn summarize_samples_with_local_mapping(
         .collect::<BTreeMap<_, _>>();
     let mut hours = BTreeMap::<NaiveDateTime, SummaryMetrics>::new();
     let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
-    let mut own_by_thread = HashMap::<String, SummaryMetrics>::new();
 
     for sample in samples
         .iter()
@@ -316,10 +378,6 @@ fn summarize_samples_with_local_mapping(
         if let Some(hour) = hour {
             hours.entry(hour).or_default().add_assign(metrics);
         }
-        own_by_thread
-            .entry(sample.thread_id.clone())
-            .or_default()
-            .add_assign(metrics);
         let project = projects.entry(key).or_default();
         project.totals.add_assign(metrics);
         project.days.entry(date).or_default().add_assign(metrics);
@@ -341,6 +399,49 @@ fn summarize_samples_with_local_mapping(
                 project.label = Some((*label_at, label.clone()));
             }
         }
+        let session_thread_id = sample
+            .session_thread_id
+            .clone()
+            .filter(|thread_id| !thread_id.is_empty())
+            .or_else(|| resolved_session_threads.get(&sample.thread_id).cloned())
+            .unwrap_or_else(|| sample.thread_id.clone());
+        let session_turn_id = sample
+            .session_turn_id
+            .clone()
+            .filter(|turn_id| !turn_id.trim().is_empty())
+            .or_else(|| {
+                (session_thread_id == sample.thread_id)
+                    .then(|| sample.turn_id.clone())
+                    .flatten()
+                    .filter(|turn_id| !turn_id.trim().is_empty())
+            });
+        let turn_key = session_turn_id.map_or_else(
+            || {
+                if session_thread_id == sample.thread_id {
+                    SummaryTurnKey::UnassignedSession
+                } else {
+                    SummaryTurnKey::UnassignedDelegated
+                }
+            },
+            SummaryTurnKey::Exact,
+        );
+        let session = project.sessions.entry(session_thread_id).or_default();
+        session.totals.add_assign(metrics);
+        let turn = session.turns.entry(turn_key).or_default();
+        turn.totals.add_assign(metrics);
+        if sample
+            .message_preview
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty())
+        {
+            turn.message_preview = sample.message_preview.clone();
+        }
+        if let Some(started_at) = sample.turn_started_at {
+            turn.started_at = Some(
+                turn.started_at
+                    .map_or(started_at, |current| current.min(started_at)),
+            );
+        }
     }
 
     let mut project_summaries = projects
@@ -352,17 +453,12 @@ fn summarize_samples_with_local_mapping(
                 hours: project_hours,
                 label,
                 cwd,
+                sessions,
             } = accumulator;
             let label = label
                 .map(|(_, label)| label)
                 .unwrap_or_else(|| project_label(cwd.as_deref()));
-            let threads = build_project_threads(
-                &key,
-                &metadata,
-                &resolved_cwds,
-                &resolved_project_keys,
-                &own_by_thread,
-            );
+            let sessions = build_project_sessions(sessions, &metadata, &resolved_cwds);
             ProjectSummary {
                 key,
                 label,
@@ -380,7 +476,7 @@ fn summarize_samples_with_local_mapping(
                     .into_iter()
                     .map(|(starts_at, totals)| HourlySummary { starts_at, totals })
                     .collect(),
-                threads,
+                sessions,
             }
         })
         .collect::<Vec<_>>();
@@ -452,6 +548,11 @@ pub fn samples_from_calls(tasks: &[TaskRecord], calls: &[UsageCall]) -> Vec<Summ
                 timestamp: call.timestamp,
                 thread_id: call.thread_id.clone(),
                 parent_thread_id: task.and_then(|task| task.parent_thread_id.clone()),
+                turn_id: call.turn_id.clone(),
+                session_thread_id: None,
+                session_turn_id: None,
+                message_preview: None,
+                turn_started_at: None,
                 project_key: None,
                 project_label: None,
                 cwd: task.and_then(|task| task.cwd.clone()),
@@ -476,6 +577,11 @@ pub fn samples_from_calls(tasks: &[TaskRecord], calls: &[UsageCall]) -> Vec<Summ
                 .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
             thread_id: task.thread_id.clone(),
             parent_thread_id: task.parent_thread_id.clone(),
+            turn_id: None,
+            session_thread_id: None,
+            session_turn_id: None,
+            message_preview: None,
+            turn_started_at: None,
             project_key: None,
             project_label: None,
             cwd: task.cwd.clone(),
@@ -640,151 +746,79 @@ fn resolve_thread_project_label(
     resolved
 }
 
-fn build_project_threads(
-    project_key: &str,
-    metadata: &HashMap<String, ThreadMetadata>,
-    resolved_cwds: &HashMap<String, Option<PathBuf>>,
-    resolved_project_keys: &HashMap<String, String>,
-    own_by_thread: &HashMap<String, SummaryMetrics>,
-) -> Vec<ThreadSummary> {
-    let mut included = BTreeSet::<String>::new();
-    for thread_id in own_by_thread.keys() {
-        if project_key_for_thread(thread_id, resolved_project_keys) != project_key {
-            continue;
-        }
-        let mut current = Some(thread_id.as_str());
-        let mut seen = HashSet::new();
-        while let Some(id) = current {
-            if !seen.insert(id.to_string())
-                || project_key_for_thread(id, resolved_project_keys) != project_key
-            {
-                break;
-            }
-            included.insert(id.to_string());
-            current = metadata
-                .get(id)
-                .and_then(|thread| thread.parent_thread_id.as_deref());
-        }
-    }
-
-    let mut children = BTreeMap::<String, Vec<String>>::new();
-    let mut roots = Vec::new();
-    for thread_id in &included {
-        let parent = metadata
-            .get(thread_id)
-            .and_then(|thread| thread.parent_thread_id.as_ref())
-            .filter(|parent| included.contains(*parent))
-            .filter(|parent| !parent_edge_would_cycle(thread_id, parent, metadata));
-        if let Some(parent) = parent {
-            children
-                .entry(parent.clone())
-                .or_default()
-                .push(thread_id.clone());
-        } else {
-            roots.push(thread_id.clone());
-        }
-    }
-
-    let mut built = roots
-        .into_iter()
-        .map(|thread_id| {
-            build_thread_summary(
-                &thread_id,
-                metadata,
-                resolved_cwds,
-                own_by_thread,
-                &children,
-            )
-        })
-        .collect::<Vec<_>>();
-    sort_thread_summaries(&mut built);
-    built
-}
-
-fn build_thread_summary(
+fn resolve_session_thread(
     thread_id: &str,
     metadata: &HashMap<String, ThreadMetadata>,
-    resolved_cwds: &HashMap<String, Option<PathBuf>>,
-    own_by_thread: &HashMap<String, SummaryMetrics>,
-    children_by_thread: &BTreeMap<String, Vec<String>>,
-) -> ThreadSummary {
-    let mut children = children_by_thread
+    cache: &mut HashMap<String, String>,
+    visiting: &mut HashSet<String>,
+) -> String {
+    if let Some(cached) = cache.get(thread_id) {
+        return cached.clone();
+    }
+    if !visiting.insert(thread_id.to_string()) {
+        return thread_id.to_string();
+    }
+    let resolved = metadata
         .get(thread_id)
-        .into_iter()
-        .flatten()
-        .map(|child| {
-            build_thread_summary(
-                child,
-                metadata,
-                resolved_cwds,
-                own_by_thread,
-                children_by_thread,
-            )
-        })
-        .collect::<Vec<_>>();
-    sort_thread_summaries(&mut children);
-
-    let own = own_by_thread.get(thread_id).copied().unwrap_or_default();
-    let mut subtree = own;
-    for child in &children {
-        subtree.add_assign(child.subtree);
-    }
-    let thread = metadata.get(thread_id).cloned().unwrap_or_default();
-    ThreadSummary {
-        thread_id: thread_id.to_string(),
-        parent_thread_id: thread.parent_thread_id,
-        title: thread.title,
-        source: thread.source,
-        cwd: resolved_cwds.get(thread_id).cloned().flatten(),
-        own,
-        subtree,
-        children,
-    }
+        .and_then(|thread| thread.parent_thread_id.as_deref())
+        .filter(|parent| *parent != thread_id)
+        .map(|parent| resolve_session_thread(parent, metadata, cache, visiting))
+        .unwrap_or_else(|| thread_id.to_string());
+    visiting.remove(thread_id);
+    cache.insert(thread_id.to_string(), resolved.clone());
+    resolved
 }
 
-fn sort_thread_summaries(threads: &mut [ThreadSummary]) {
-    threads.sort_by(|left, right| {
+fn build_project_sessions(
+    sessions: BTreeMap<String, SessionAccumulator>,
+    metadata: &HashMap<String, ThreadMetadata>,
+    resolved_cwds: &HashMap<String, Option<PathBuf>>,
+) -> Vec<SessionSummary> {
+    let mut sessions = sessions
+        .into_iter()
+        .map(|(thread_id, session)| {
+            let metadata = metadata.get(&thread_id).cloned().unwrap_or_default();
+            let mut turns = session
+                .turns
+                .into_iter()
+                .map(|(key, turn)| TurnSummary {
+                    key,
+                    message_preview: turn.message_preview,
+                    started_at: turn.started_at,
+                    totals: turn.totals,
+                })
+                .collect::<Vec<_>>();
+            turns.sort_by(|left, right| {
+                right
+                    .started_at
+                    .cmp(&left.started_at)
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+            SessionSummary {
+                thread_id: thread_id.clone(),
+                title: metadata.title,
+                source: metadata.source,
+                cwd: resolved_cwds.get(&thread_id).cloned().flatten(),
+                totals: session.totals,
+                turns,
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
         right
-            .subtree
+            .totals
             .token_usage
             .total_tokens
-            .cmp(&left.subtree.token_usage.total_tokens)
+            .cmp(&left.totals.token_usage.total_tokens)
             .then_with(|| {
                 right
-                    .subtree
+                    .totals
                     .estimated_cost_units
-                    .cmp(&left.subtree.estimated_cost_units)
+                    .cmp(&left.totals.estimated_cost_units)
             })
             .then_with(|| left.thread_id.cmp(&right.thread_id))
     });
-}
-
-fn parent_edge_would_cycle(
-    child_id: &str,
-    parent_id: &str,
-    metadata: &HashMap<String, ThreadMetadata>,
-) -> bool {
-    let mut current = Some(parent_id);
-    let mut seen = HashSet::new();
-    while let Some(thread_id) = current {
-        if thread_id == child_id || !seen.insert(thread_id) {
-            return true;
-        }
-        current = metadata
-            .get(thread_id)
-            .and_then(|thread| thread.parent_thread_id.as_deref());
-    }
-    false
-}
-
-fn project_key_for_thread<'a>(
-    thread_id: &str,
-    resolved_project_keys: &'a HashMap<String, String>,
-) -> &'a str {
-    resolved_project_keys
-        .get(thread_id)
-        .map(String::as_str)
-        .unwrap_or(UNKNOWN_PROJECT_KEY)
+    sessions
 }
 
 fn project_key(cwd: Option<&Path>) -> String {
@@ -878,6 +912,11 @@ mod tests {
             timestamp,
             thread_id: thread_id.to_string(),
             parent_thread_id: parent_thread_id.map(str::to_string),
+            turn_id: Some(format!("turn-{thread_id}")),
+            session_thread_id: None,
+            session_turn_id: None,
+            message_preview: Some(format!("message {thread_id}")),
+            turn_started_at: Some(timestamp),
             project_key: None,
             project_label: None,
             cwd: cwd.map(PathBuf::from),
@@ -901,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_projects_and_collapsed_thread_subtrees_without_double_counting() {
+    fn aggregates_projects_into_root_sessions_and_turns_without_double_counting() {
         let window = SummaryWindow::new(at(1, 0), at(3, 0)).unwrap();
         let samples = vec![
             // Metadata-only parent retained even though its timestamp is out of range.
@@ -942,15 +981,142 @@ mod tests {
         assert_eq!(summary.projects.len(), 2);
         assert_eq!(summary.projects[0].key, "/work/alpha");
         assert_eq!(summary.projects[0].totals.token_usage.total_tokens, 50);
-        let root = &summary.projects[0].threads[0];
+        let root = &summary.projects[0].sessions[0];
         assert_eq!(root.thread_id, "root");
-        assert_eq!(root.own.token_usage.total_tokens, 20);
-        assert_eq!(root.subtree.token_usage.total_tokens, 50);
-        assert_eq!(root.children[0].thread_id, "child");
-        assert_eq!(root.children[0].subtree.token_usage.total_tokens, 30);
+        assert_eq!(root.totals.token_usage.total_tokens, 50);
+        assert_eq!(root.turns.len(), 2);
         assert_eq!(
-            root.subtree.api_equivalent_cost.minimum_pico_usd.value(),
+            root.turns
+                .iter()
+                .map(|turn| turn.totals.token_usage.total_tokens)
+                .sum::<u64>(),
+            50
+        );
+        assert_eq!(
+            root.totals.api_equivalent_cost.minimum_pico_usd.value(),
             5_000
+        );
+    }
+
+    #[test]
+    fn folds_delegated_descendants_into_their_root_user_turn() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        let mut root = sample(
+            at(1, 1),
+            "root",
+            None,
+            Some("/work/alpha"),
+            metrics(10, 100, 1_000),
+        );
+        root.turn_id = Some("root-turn".to_string());
+        root.message_preview = Some("Implement the summary tree".to_string());
+
+        let mut child = sample(
+            at(1, 2),
+            "child",
+            Some("root"),
+            None,
+            metrics(20, 200, 2_000),
+        );
+        child.session_thread_id = Some("root".to_string());
+        child.session_turn_id = Some("root-turn".to_string());
+        child.message_preview = root.message_preview.clone();
+
+        let mut nested = sample(
+            at(1, 3),
+            "nested",
+            Some("child"),
+            None,
+            metrics(30, 300, 3_000),
+        );
+        nested.session_thread_id = Some("root".to_string());
+        nested.session_turn_id = Some("root-turn".to_string());
+        nested.message_preview = root.message_preview.clone();
+
+        let summary = summarize_samples(
+            &[root, child, nested],
+            window,
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        let session = &summary.projects[0].sessions[0];
+        assert_eq!(session.thread_id, "root");
+        assert_eq!(session.totals.token_usage.total_tokens, 60);
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].key,
+            SummaryTurnKey::Exact("root-turn".to_string())
+        );
+        assert_eq!(
+            session.turns[0].message_preview.as_deref(),
+            Some("Implement the summary tree")
+        );
+        assert_eq!(session.turns[0].totals.token_usage.total_tokens, 60);
+    }
+
+    #[test]
+    fn separates_direct_and_delegated_unassigned_usage_into_compact_rows() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        let mut direct = sample(
+            at(1, 1),
+            "root",
+            None,
+            Some("/work/alpha"),
+            metrics(10, 100, 1_000),
+        );
+        direct.turn_id = Some(" ".to_string());
+        direct.session_turn_id = Some(String::new());
+        direct.message_preview = None;
+        let first = sample(
+            at(1, 2),
+            "child-a",
+            Some("root"),
+            Some("/work/alpha"),
+            metrics(20, 200, 2_000),
+        );
+        let second = sample(
+            at(1, 3),
+            "child-b",
+            Some("root"),
+            Some("/work/alpha"),
+            metrics(30, 300, 3_000),
+        );
+        let metadata = sample(
+            at(1, 0) - Duration::days(1),
+            "root",
+            None,
+            Some("/work/alpha"),
+            SummaryMetrics::default(),
+        );
+
+        let summary = summarize_samples(
+            &[metadata, direct, first, second],
+            window,
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        let session = &summary.projects[0].sessions[0];
+        assert_eq!(session.turns.len(), 2);
+        assert_eq!(session.totals.token_usage.total_tokens, 60);
+        assert_eq!(
+            session
+                .turns
+                .iter()
+                .find(|turn| turn.key == SummaryTurnKey::UnassignedSession)
+                .unwrap()
+                .totals
+                .token_usage
+                .total_tokens,
+            10
+        );
+        assert_eq!(
+            session
+                .turns
+                .iter()
+                .find(|turn| turn.key == SummaryTurnKey::UnassignedDelegated)
+                .unwrap()
+                .totals
+                .token_usage
+                .total_tokens,
+            50
         );
     }
 
@@ -1237,7 +1403,7 @@ mod tests {
         assert_eq!(summary.projects[0].key, "/work/current");
         assert_eq!(summary.projects[0].label, "current");
         assert_eq!(
-            summary.projects[0].threads[0].title.as_deref(),
+            summary.projects[0].sessions[0].title.as_deref(),
             Some("Current title")
         );
     }
@@ -1269,7 +1435,7 @@ mod tests {
             .unwrap();
         assert_eq!(merged.label, "new-name");
         assert_eq!(merged.totals.token_usage.total_tokens, 3);
-        assert_eq!(merged.threads.len(), 2);
+        assert_eq!(merged.sessions.len(), 2);
         assert!(
             summary
                 .projects

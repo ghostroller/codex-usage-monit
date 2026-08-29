@@ -7,7 +7,7 @@ rows:
 00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings
 01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 6h [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐┌Top projects · Tokens · share of known────────────────────┐
-03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION         ││■ alpha-service                  190.0K  59.4% ███████····│
+03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  ││■ alpha-service                  190.0K  59.4% ███████····│
 04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         ││■ billing-cli                     90.0K  28.1% ███········│
 05|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           ││■ docs-site                       40.0K  12.5% █··········│
 06|│ 40.0K          12.5%    [+] PROJ ■ docs-site             ││                                                          │
@@ -86,7 +86,7 @@ styles:
 02:061+038 fg=#f4f6f8 bg=#121417 mods=bold text="Top projects · Tokens · share of known"
 02:099+021 fg=#4b525c bg=#121417 mods=none text="────────────────────┐"
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION         "
+03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+002 fg=#4b525c bg=#121417 mods=none text="││"
 03:061+002 fg=#d8af5a bg=#121417 mods=none text="■ "
 03:063+013 fg=#d8af5a bg=#121417 mods=bold text="alpha-service"

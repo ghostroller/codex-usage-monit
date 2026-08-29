@@ -5,13 +5,13 @@ expression: summary.frame().snapshot_text()
 size=60x24
 rows:
 00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
-01|[C][7][M] [K][E][A] [B] 6h [I]Inspect [G]All [L] [↵] [X]
+01|[C][7][M] [K][E][A] [B] 1d [I]Inspect [G]All [L] [↵] [X]
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  │
-04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         │
-05|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           │
-06|│ 40.0K          12.5%    [+] PROJ ■ docs-site             │
-07|│                                                          │
+04|│ 190.0K         59.4%    [-] PROJ ■ alpha-service         █
+05|│▌190.0K         59.4%    └─ [-] SESS API billing dashboard█
+06|│ 190.0K         59.4%      └─ [ ] TURN Explain the API bil█
+07|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           │
 08|└──────────────────────────────────────────────────────────┘
 09|┌Top projects · Tokens · share of known────────────────────┐
 10|│■ alpha-service                  190.0K  59.4% ███████····│
@@ -19,14 +19,14 @@ rows:
 12|│■ docs-site                       40.0K  12.5% █··········│
 13|│                                                          │
 14|└──────────────────────────────────────────────────────────┘
-15|┌Project mix · Tokens · 6h local · 0C/4P/9M · all projects─┐
-16|│07-12 00:00 · P lower bound · Total 40.0K · ■ alph… 0 · +1│
-17|│LOWER · C/P/M MPMMMPMMMPMMP                               │
-18|│200.0K  │                                                 │
-19|│100.0K  │                                  ▄▄▄▄           │
-20|│0       │                                              ▄▄▄│
-21|│        └─────────────────────────────────────────────────│
-22|│07-09 00h                    07-10 12h           07-12 00h│
+15|┌Project mix · Tokens · 1d local · 0C/4P/0M · all projects─┐
+16|│07-12 · P lower bound · Total 40.0K · ■ docs-site 40.0K   │
+17|│LOWER · C/P/M PPPP                                        │
+18|│200.0K│                                                   │
+19|│100.0K│  ▄▄▄▄▄▄▄▄▄▄▄               ▄▄▄▄▄▄▄▄               │
+20|│0     │                      ▀▀▀▀▀▀▀▀           ▀▀▀▀▀▀▄▄▄▄│
+21|│      └───────────────────────────────────────────────────│
+22|│  07-09                       07-11                  07-12│
 23|└──────────────────────────────────────────────────────────┘
 styles:
 00:001+001 fg=#006c75 bg=#f7f9fc mods=bold text="1"
@@ -57,13 +57,15 @@ styles:
 01:017+001 fg=#006c75 bg=#f7f9fc mods=bold text="A"
 01:018+003 fg=#5f6b7a bg=#f7f9fc mods=none text="] ["
 01:021+001 fg=#006c75 bg=#f7f9fc mods=bold text="B"
-01:022+006 fg=#5f6b7a bg=#f7f9fc mods=none text="] 6h ["
+01:022+006 fg=#5f6b7a bg=#f7f9fc mods=none text="] 1d ["
 01:028+001 fg=#006c75 bg=#f7f9fc mods=bold text="I"
 01:029+017 fg=#5f6b7a bg=#f7f9fc mods=none text="]Inspect [G]All ["
 01:046+001 fg=#006c75 bg=#f7f9fc mods=bold text="L"
 01:047+003 fg=#5f6b7a bg=#f7f9fc mods=none text="] ["
 01:050+001 fg=#006c75 bg=#f7f9fc mods=bold text="↵"
-01:051+005 fg=#5f6b7a bg=#f7f9fc mods=none text="] [X]"
+01:051+003 fg=#5f6b7a bg=#f7f9fc mods=none text="] ["
+01:054+001 fg=#006c75 bg=#f7f9fc mods=bold text="X"
+01:055+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
 02:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
 02:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL"
 02:058+002 fg=#7d8998 bg=#f7f9fc mods=none text="─┐"
@@ -71,27 +73,28 @@ styles:
 03:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 04:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-04:001+026 fg=#f7f9fc bg=#006c75 mods=bold text="▌190.0K         59.4%    ["
-04:027+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="+"
-04:028+007 fg=#f7f9fc bg=#006c75 mods=bold text="] PROJ "
-04:035+001 fg=#9d7625 bg=#006c75 mods=bold text="■"
-04:036+023 fg=#f7f9fc bg=#006c75 mods=bold text=" alpha-service         "
-04:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
+04:001+025 fg=#17202a bg=#f7f9fc mods=bold text=" 190.0K         59.4%    "
+04:026+004 fg=#5f6b7a bg=#f7f9fc mods=bold text="[-] "
+04:030+005 fg=#006c75 bg=#f7f9fc mods=bold text="PROJ "
+04:035+002 fg=#9d7625 bg=#f7f9fc mods=bold text="■ "
+04:037+022 fg=#17202a bg=#f7f9fc mods=bold text="alpha-service         "
+04:059+001 fg=#5f6b7a bg=#f7f9fc mods=bold text="█"
 05:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-05:001+025 fg=#17202a bg=#f7f9fc mods=bold text=" 90.0K          28.1%    "
-05:026+004 fg=#5f6b7a bg=#f7f9fc mods=bold text="[+] "
-05:030+005 fg=#006c75 bg=#f7f9fc mods=bold text="PROJ "
-05:035+002 fg=#9b2240 bg=#f7f9fc mods=bold text="■ "
-05:037+022 fg=#17202a bg=#f7f9fc mods=bold text="billing-cli           "
-05:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
+05:001+029 fg=#f7f9fc bg=#006c75 mods=bold text="▌190.0K         59.4%    └─ ["
+05:030+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="-"
+05:031+028 fg=#f7f9fc bg=#006c75 mods=bold text="] SESS API billing dashboard"
+05:059+001 fg=#5f6b7a bg=#f7f9fc mods=bold text="█"
 06:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-06:001+025 fg=#17202a bg=#f7f9fc mods=bold text=" 40.0K          12.5%    "
-06:026+004 fg=#5f6b7a bg=#f7f9fc mods=bold text="[+] "
-06:030+005 fg=#006c75 bg=#f7f9fc mods=bold text="PROJ "
-06:035+002 fg=#21a16b bg=#f7f9fc mods=bold text="■ "
-06:037+022 fg=#17202a bg=#f7f9fc mods=bold text="docs-site             "
-06:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
+06:001+025 fg=#17202a bg=#f7f9fc mods=none text=" 190.0K         59.4%    "
+06:026+014 fg=#5f6b7a bg=#f7f9fc mods=none text="  └─ [ ] TURN "
+06:040+019 fg=#17202a bg=#f7f9fc mods=none text="Explain the API bil"
+06:059+001 fg=#5f6b7a bg=#f7f9fc mods=bold text="█"
 07:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
+07:001+025 fg=#17202a bg=#f7f9fc mods=bold text=" 90.0K          28.1%    "
+07:026+004 fg=#5f6b7a bg=#f7f9fc mods=bold text="[+] "
+07:030+005 fg=#006c75 bg=#f7f9fc mods=bold text="PROJ "
+07:035+002 fg=#9b2240 bg=#f7f9fc mods=bold text="■ "
+07:037+022 fg=#17202a bg=#f7f9fc mods=bold text="billing-cli           "
 07:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 08:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 09:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
@@ -99,8 +102,7 @@ styles:
 09:039+021 fg=#7d8998 bg=#f7f9fc mods=none text="────────────────────┐"
 10:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 10:001+002 fg=#9d7625 bg=#f7f9fc mods=none text="■ "
-10:003+013 fg=#17202a bg=#f7f9fc mods=bold text="alpha-service"
-10:016+024 fg=#17202a bg=#f7f9fc mods=none text="                  190.0K"
+10:003+037 fg=#17202a bg=#f7f9fc mods=none text="alpha-service                  190.0K"
 10:040+007 fg=#5f6b7a bg=#f7f9fc mods=none text="  59.4%"
 10:048+007 fg=#9d7625 bg=#f7f9fc mods=bold text="███████"
 10:055+004 fg=#5f6b7a bg=#f7f9fc mods=none text="····"
@@ -123,51 +125,45 @@ styles:
 13:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 14:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 15:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
-15:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Project mix · Tokens · 6h local · 0C/4P/9M · all projects"
+15:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Project mix · Tokens · 1d local · 0C/4P/0M · all projects"
 15:058+002 fg=#7d8998 bg=#f7f9fc mods=none text="─┐"
 16:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-16:001+011 fg=#17202a bg=#f7f9fc mods=bold text="07-12 00:00"
-16:012+003 fg=#17202a bg=#f7f9fc mods=none text=" · "
-16:015+013 fg=#8a5900 bg=#f7f9fc mods=bold text="P lower bound"
-16:028+017 fg=#17202a bg=#f7f9fc mods=none text=" · Total 40.0K · "
-16:045+002 fg=#9d7625 bg=#f7f9fc mods=none text="■ "
-16:047+007 fg=#17202a bg=#f7f9fc mods=bold text="alph… 0"
-16:054+005 fg=#5f6b7a bg=#f7f9fc mods=none text=" · +1"
+16:001+005 fg=#17202a bg=#f7f9fc mods=bold text="07-12"
+16:006+003 fg=#17202a bg=#f7f9fc mods=none text=" · "
+16:009+013 fg=#8a5900 bg=#f7f9fc mods=bold text="P lower bound"
+16:022+017 fg=#17202a bg=#f7f9fc mods=none text=" · Total 40.0K · "
+16:039+002 fg=#21a16b bg=#f7f9fc mods=none text="■ "
+16:041+018 fg=#17202a bg=#f7f9fc mods=none text="docs-site 40.0K   "
 16:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 17:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-17:001+014 fg=#8a5900 bg=#f7f9fc mods=none text="LOWER · C/P/M "
-17:015+001 fg=#5f6b7a bg=#f7f9fc mods=dim text="M"
-17:016+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
-17:017+003 fg=#5f6b7a bg=#f7f9fc mods=dim text="MMM"
-17:020+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
-17:021+003 fg=#5f6b7a bg=#f7f9fc mods=dim text="MMM"
-17:024+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
-17:025+002 fg=#5f6b7a bg=#f7f9fc mods=dim text="MM"
-17:027+001 fg=#8a5900 bg=#f7f9fc mods=none text="P"
+17:001+018 fg=#8a5900 bg=#f7f9fc mods=none text="LOWER · C/P/M PPPP"
 17:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 18:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-18:001+008 fg=#17202a bg=#f7f9fc mods=none text="200.0K  "
-18:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+18:001+006 fg=#17202a bg=#f7f9fc mods=none text="200.0K"
+18:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
 18:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 19:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-19:001+008 fg=#17202a bg=#f7f9fc mods=none text="100.0K  "
-19:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
-19:012+004 fg=#af9050 bg=#af9050 mods=none text="    "
-19:044+004 fg=#ad4d66 bg=#f7f9fc mods=none text="▄▄▄▄"
+19:001+006 fg=#17202a bg=#f7f9fc mods=none text="100.0K"
+19:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+19:008+002 fg=#af9050 bg=#af9050 mods=none text="  "
+19:010+011 fg=#af9050 bg=#f7f9fc mods=none text="▄▄▄▄▄▄▄▄▄▄▄"
+19:036+007 fg=#ad4d66 bg=#f7f9fc mods=none text="▄▄▄▄▄▄▄"
+19:043+001 fg=#4cb388 bg=#f7f9fc mods=none text="▄"
 19:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 20:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-20:001+008 fg=#17202a bg=#f7f9fc mods=none text="0       "
-20:009+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
-20:012+004 fg=#af9050 bg=#af9050 mods=none text="    "
-20:028+004 fg=#af9050 bg=#af9050 mods=none text="    "
-20:044+004 fg=#ad4d66 bg=#ad4d66 mods=none text="    "
-20:056+003 fg=#4cb388 bg=#f7f9fc mods=none text="▄▄▄"
+20:001+006 fg=#17202a bg=#f7f9fc mods=none text="0     "
+20:007+001 fg=#5f6b7a bg=#f7f9fc mods=none text="│"
+20:008+022 fg=#af9050 bg=#af9050 mods=none text="                      "
+20:030+008 fg=#ad4d66 bg=#af9050 mods=none text="▀▀▀▀▀▀▀▀"
+20:038+011 fg=#ad4d66 bg=#ad4d66 mods=none text="           "
+20:049+006 fg=#4cb388 bg=#ad4d66 mods=none text="▀▀▀▀▀▀"
+20:055+004 fg=#4cb388 bg=#f7f9fc mods=none text="▄▄▄▄"
 20:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 21:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-21:009+050 fg=#5f6b7a bg=#f7f9fc mods=none text="└─────────────────────────────────────────────────"
+21:007+052 fg=#5f6b7a bg=#f7f9fc mods=none text="└───────────────────────────────────────────────────"
 21:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 22:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
-22:001+058 fg=#17202a bg=#f7f9fc mods=none text="07-09 00h                    07-10 12h           07-12 00h"
+22:001+058 fg=#17202a bg=#f7f9fc mods=none text="  07-09                       07-11                  07-12"
 22:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 23:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 controls:

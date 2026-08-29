@@ -111,7 +111,7 @@ TUI 中的 Tasks 会话行与 Turns 对话行分别从当前选中的 5 小时�
 
 Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有 `>272K` 的倍率说明，但通用价格表的 Cyber long-context 单元格仍为 `-`，且模型页同时列出 272K maximum input。实现以通用价格目录为准，将这种长调用保持未计价并降低 coverage，不猜测一个无法由公开价目表完整支持的金额。
 
-当前版本只从仍可读取的 rollout 调用计算当前窗口，不把金额写入历史桶。价格会变化，而现有历史聚合没有保存足够的逐请求 short/long 与服务层证据；以后若增加费用趋势，应先扩展价格无关的历史证据结构，再按指定价格目录重放，不能直接重估旧聚合。
+当前版本从仍可读取的 rollout 请求计算 API 等价金额，并把已计算金额及 coverage 按项目/会话轮写入 15 分钟历史桶；每个桶携带价格目录 revision，Summary 不会混合不同 revision 的金额。价格变化后，现有聚合没有保存足够的逐请求 short/long 与服务层证据，因此旧金额只能由仍保留的 rollout 重建，不能直接按新价格重估。
 
 Rollout JSONL 中可利用以下事件重建历史：
 
@@ -125,6 +125,8 @@ Rollout JSONL 中可利用以下事件重建历史：
 近期 rollout 的 `turn_context.effort` 通常可提供 `low/medium/high/xhigh/ultra`；部分旧版本没有该字段，只能显示 unknown。`thread_settings_applied.thread_settings.service_tier` 为 `fast` 或兼容的 `priority` 时，可以为下一次激活的 turn 提供 Fast 标识。TUI 把 `FAST` 放在模型名称后，普通 turn 不显示。Desktop 的 `session_meta.source` 当前仍可能是底层兼容值 `vscode`，具体客户端应优先读取 `originator=Codex Desktop`；子代理角色则优先由结构化 source/thread source 判断。
 
 subagent 的 owning `session_meta` 通常提供直接父 thread：新版位于 `source.subagent.thread_spawn.parent_thread_id`，旧版可回退到顶层 `parent_thread_id` / `forked_from_id`。`forked_from_id` 也可能出现在普通 resume/fork，因此只有 metadata 已确认 subagent 身份时才能建立父子关系；`session_id` 表示根会话，不可代替直接父节点。旧日志缺少父标识、父 rollout 不在扫描范围或父任务被 TUI 过滤时，只能把该 subagent 作为当前视图的根节点。Tree 模式收起父节点时，父行会在渲染层汇总当前过滤树内隐藏后代的 token、所选 reset cycle `TOKEN%`、estimated quota 与 `API EQ.`；展开后恢复逐会话值。该显示层汇总不改变底层 task/turn 归属，也不会影响一次性输出。
+
+Summary 的用户轮次归属采用更严格的事件外键：父 rollout 中 `spawn_agent` 的 `function_call.call_id` 同时携带父 `turn_id`，随后 `sub_agent_activity(kind=started)` 的 `event_id` 与该 `call_id` 相同，并提供真实的 `agent_thread_id`。只有这条等值连接完整且无冲突时，一级 subagent 分支才绑定到创建它的根会话用户轮；嵌套 subagent 沿已确认的直接父链继承该根轮次。Summary 因而显示 `project → session → turn`，turn 数值等于根会话本轮自身调用与该分支全部后代调用的加总，底层每条调用仍只计一次。缺少事件外键的 delegated 用量集中到 `Unassigned delegated usage`，根会话自身缺少 turn id 的用量则单独进入 `Unassigned session usage`；两者都不会用时间邻近、消息文本或 subagent 名称猜测。
 
 工具最多保留每个 turn 首条用户消息的 72 字符摘要。有显式 `turn_id` 时直接归属；没有时只归入当前 active turn，若当前没有 active turn，则不猜测归属。部分 subagent turn 没有明文 `user_message`，摘要显示 `-`，不会从注入上下文反推。
 

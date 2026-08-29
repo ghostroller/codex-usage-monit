@@ -7,7 +7,7 @@ rows:
 00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
 01|[C][7][M] [K][E][A] [B] 1d [I]Inspect [G]All [L] [↵] [X]
 02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐
-03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION         │
+03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  │
 04|│▌190.0K         59.4%    [+] PROJ ■ alpha-service         │
 05|│ 90.0K          28.1%    [+] PROJ ■ billing-cli           │
 06|│ 40.0K          12.5%    [+] PROJ ■ docs-site             │
@@ -68,7 +68,7 @@ styles:
 02:001+057 fg=#f4f6f8 bg=#121417 mods=bold text="Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL"
 02:058+002 fg=#4b525c bg=#121417 mods=none text="─┐"
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION         "
+03:001+058 fg=#3fb9c0 bg=#121417 mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+001 fg=#4b525c bg=#121417 mods=none text="│"
 04:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 04:001+026 fg=#121417 bg=#3fb9c0 mods=bold text="▌190.0K         59.4%    ["
