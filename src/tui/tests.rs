@@ -2822,6 +2822,10 @@ fn saved_ui_state_restores_stable_menu_and_column_preferences_with_theme_overrid
         turns_visible: false,
         models_visible: false,
         api_long_context_multiplier: true,
+        summary_range: UiSummaryRange::ThirtyDays,
+        summary_grain: UiSummaryGrain::Hour,
+        summary_metric: UiSummaryMetric::ApiEquivalent,
+        summary_show_all_projects: true,
         table_columns: UiTableColumns {
             tokens: false,
             token_share: true,
@@ -2841,12 +2845,55 @@ fn saved_ui_state_restores_stable_menu_and_column_preferences_with_theme_overrid
     app.task_search = "temporary query".to_string();
     app.expanded_task_threads
         .insert("task-thread-1".to_string());
+    app.summary_expanded_nodes
+        .insert("project:temporary".to_string());
+    app.summary_selected_id = Some("project:temporary".to_string());
+    app.summary_offset = 7;
+    app.summary_inspected_date = NaiveDate::from_ymd_opt(2026, 8, 29)
+        .unwrap()
+        .and_hms_opt(12, 0, 0);
     assert_eq!(app.ui_state(), saved);
 
     app.apply_ui_state(&saved, Some(Theme::Dark));
     assert_eq!(app.theme, Theme::Dark);
     assert_eq!(app.ui_state().theme, UiTheme::Dark);
     assert_eq!(app.ui_state().table_columns, saved.table_columns);
+}
+
+#[test]
+fn summary_preferences_survive_store_round_trip_while_navigation_resets() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = UiStateStore::new(directory.path().join("tui-state.json"));
+    let mut app = interaction_test_app(3, 1);
+    app.set_view(View::Summary);
+    handle_key_event(&mut app, key_event(KeyCode::Char('M')));
+    handle_key_event(&mut app, key_event(KeyCode::Char('A')));
+    for _ in 0..4 {
+        handle_key_event(&mut app, key_event(KeyCode::Char('B')));
+    }
+    app.summary_show_all_projects = true;
+    app.summary_expanded_nodes
+        .insert("project:temporary".to_string());
+    app.summary_selected_id = Some("project:temporary".to_string());
+    app.summary_offset = 7;
+    app.summary_inspected_date = NaiveDate::from_ymd_opt(2026, 8, 29)
+        .unwrap()
+        .and_hms_opt(12, 0, 0);
+
+    assert!(store.save(&app.ui_state()).unwrap());
+    let loaded = store.load();
+    let mut restarted = interaction_test_app(3, 1);
+    restarted.apply_ui_state(&loaded, None);
+
+    assert_eq!(restarted.view, View::Summary);
+    assert_eq!(restarted.summary_range, SummaryRange::ThirtyDays);
+    assert_eq!(restarted.summary_metric, SummaryMetric::ApiEquivalent);
+    assert_eq!(restarted.summary_grain, SummaryGrain::Hour);
+    assert!(restarted.summary_show_all_projects);
+    assert!(restarted.summary_expanded_nodes.is_empty());
+    assert_eq!(restarted.summary_selected_id, None);
+    assert_eq!(restarted.summary_offset, 0);
+    assert_eq!(restarted.summary_inspected_date, None);
 }
 
 #[test]

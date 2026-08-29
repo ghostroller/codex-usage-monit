@@ -79,8 +79,8 @@ use crate::summary::{
     TurnSummary, UsageSummary, summarize_samples_with_local_time,
 };
 use crate::ui_state::{
-    UiState, UiStateStore, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
-    UiWindowScope,
+    UiState, UiStateStore, UiSummaryGrain, UiSummaryMetric, UiSummaryRange, UiTableColumns,
+    UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
@@ -724,6 +724,26 @@ enum SummaryRange {
     ThirtyDays,
 }
 
+impl From<UiSummaryRange> for SummaryRange {
+    fn from(value: UiSummaryRange) -> Self {
+        match value {
+            UiSummaryRange::Cycle => Self::Cycle,
+            UiSummaryRange::SevenDays => Self::SevenDays,
+            UiSummaryRange::ThirtyDays => Self::ThirtyDays,
+        }
+    }
+}
+
+impl From<SummaryRange> for UiSummaryRange {
+    fn from(value: SummaryRange) -> Self {
+        match value {
+            SummaryRange::Cycle => Self::Cycle,
+            SummaryRange::SevenDays => Self::SevenDays,
+            SummaryRange::ThirtyDays => Self::ThirtyDays,
+        }
+    }
+}
+
 impl SummaryRange {
     const ALL: [Self; 3] = [Self::Cycle, Self::SevenDays, Self::ThirtyDays];
 
@@ -798,6 +818,30 @@ enum SummaryGrain {
     Hour,
 }
 
+impl From<UiSummaryGrain> for SummaryGrain {
+    fn from(value: UiSummaryGrain) -> Self {
+        match value {
+            UiSummaryGrain::Day => Self::Day,
+            UiSummaryGrain::Hours12 => Self::Hours12,
+            UiSummaryGrain::Hours6 => Self::Hours6,
+            UiSummaryGrain::Hours3 => Self::Hours3,
+            UiSummaryGrain::Hour => Self::Hour,
+        }
+    }
+}
+
+impl From<SummaryGrain> for UiSummaryGrain {
+    fn from(value: SummaryGrain) -> Self {
+        match value {
+            SummaryGrain::Day => Self::Day,
+            SummaryGrain::Hours12 => Self::Hours12,
+            SummaryGrain::Hours6 => Self::Hours6,
+            SummaryGrain::Hours3 => Self::Hours3,
+            SummaryGrain::Hour => Self::Hour,
+        }
+    }
+}
+
 impl SummaryGrain {
     const ALL: [Self; 5] = [
         Self::Day,
@@ -868,6 +912,26 @@ enum SummaryMetric {
     Tokens,
     Estimated,
     ApiEquivalent,
+}
+
+impl From<UiSummaryMetric> for SummaryMetric {
+    fn from(value: UiSummaryMetric) -> Self {
+        match value {
+            UiSummaryMetric::Tokens => Self::Tokens,
+            UiSummaryMetric::Estimated => Self::Estimated,
+            UiSummaryMetric::ApiEquivalent => Self::ApiEquivalent,
+        }
+    }
+}
+
+impl From<SummaryMetric> for UiSummaryMetric {
+    fn from(value: SummaryMetric) -> Self {
+        match value {
+            SummaryMetric::Tokens => Self::Tokens,
+            SummaryMetric::Estimated => Self::Estimated,
+            SummaryMetric::ApiEquivalent => Self::ApiEquivalent,
+        }
+    }
 }
 
 impl SummaryMetric {
@@ -2389,6 +2453,15 @@ impl App {
         self.turns_temporarily_visible = false;
         self.models_visible = state.models_visible;
         self.api_long_context_multiplier = state.api_long_context_multiplier;
+        self.summary_range = state.summary_range.into();
+        self.summary_grain = state.summary_grain.into();
+        self.summary_metric = state.summary_metric.into();
+        self.summary_show_all_projects = state.summary_show_all_projects;
+        self.summary_expanded_nodes.clear();
+        self.summary_selected_id = None;
+        self.summary_offset = 0;
+        self.summary_inspected_date = None;
+        self.summary_daily_dragging = false;
         self.table_columns = state.table_columns;
         self.task_list_mode = state.task_list_mode.into();
         self.expanded_task_threads.clear();
@@ -2772,6 +2845,10 @@ impl App {
             turns_visible: self.turns_default_visible,
             models_visible: self.models_visible,
             api_long_context_multiplier: self.api_long_context_multiplier,
+            summary_range: self.summary_range.into(),
+            summary_grain: self.summary_grain.into(),
+            summary_metric: self.summary_metric.into(),
+            summary_show_all_projects: self.summary_show_all_projects,
             table_columns: self.table_columns,
             task_list_mode: self.task_list_mode.into(),
             task_source_filter: self.task_source_filter.into(),
@@ -4033,12 +4110,6 @@ impl App {
             return;
         }
         self.summary_metric = metric;
-        if self.summary_cache.as_ref().is_some_and(|cache| {
-            summary_chart_project_count(&cache.prepared, metric, self.api_long_context_multiplier)
-                <= SUMMARY_STACKED_PROJECT_LIMIT
-        }) {
-            self.summary_show_all_projects = false;
-        }
         self.summary_selected_id = None;
         self.summary_offset = 0;
     }
@@ -7633,14 +7704,6 @@ fn ensure_summary_cache(app: &mut App, query_now: DateTime<Utc>) {
         return;
     }
     let prepared = prepare_summary(app, query_now);
-    if summary_chart_project_count(
-        &prepared,
-        app.summary_metric,
-        app.api_long_context_multiplier,
-    ) <= SUMMARY_STACKED_PROJECT_LIMIT
-    {
-        app.summary_show_all_projects = false;
-    }
     let chart = prepare_summary_chart(&prepared, app.summary_grain);
     app.summary_cache = Some(SummaryCache {
         range: app.summary_range,
@@ -9630,9 +9693,6 @@ fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
         app.summary_metric,
         app.api_long_context_multiplier,
     );
-    if chart_project_count <= SUMMARY_STACKED_PROJECT_LIMIT {
-        app.summary_show_all_projects = false;
-    }
     let mut project_colors = std::mem::take(&mut app.summary_project_colors);
     if project_colors.is_empty() {
         extend_summary_project_colors_from_history(&mut project_colors, &app.history, app.theme);

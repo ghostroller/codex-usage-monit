@@ -847,7 +847,7 @@ fn summary_all_projects_toggle_has_keyboard_mouse_parity_and_stable_hitboxes() {
 }
 
 #[test]
-fn summary_all_projects_resets_when_the_new_range_has_six_or_fewer_projects() {
+fn summary_all_projects_preference_survives_a_range_where_it_is_inapplicable() {
     let mut harness = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
     let now = harness.app.snapshot.as_of;
     let older_groups = (0_u64..7)
@@ -910,8 +910,12 @@ fn summary_all_projects_resets_when_the_new_range_has_six_or_fewer_projects() {
             .len()
             <= SUMMARY_STACKED_PROJECT_LIMIT
     );
-    assert!(!harness.app.summary_show_all_projects);
+    assert!(harness.app.summary_show_all_projects);
     harness.assert_shortcut_inactive(ControlId::SummaryAllProjects);
+
+    harness.key(KeyCode::Char('M'));
+    assert!(harness.app.summary_show_all_projects);
+    assert!(harness.frame().snapshot_text().contains("all projects"));
 }
 
 #[test]
@@ -1282,14 +1286,51 @@ fn summary_all_projects_uses_the_selected_metrics_nonzero_project_count() {
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('A'));
 
-    assert!(!harness.app.summary_show_all_projects);
+    assert!(harness.app.summary_show_all_projects);
     harness.assert_shortcut_inactive(ControlId::SummaryAllProjects);
     let frame = harness.frame().snapshot_text();
     assert!(frame.contains("Project mix · API EQ. · 1d local"));
     assert!(frame.contains("all projects"));
     assert!(!frame.contains("Top 6 + Other"));
     harness.key(KeyCode::Char('G'));
+    assert!(harness.app.summary_show_all_projects);
+
+    harness.key(KeyCode::Char('K'));
+    harness.key(KeyCode::Char('G'));
     assert!(!harness.app.summary_show_all_projects);
+}
+
+#[test]
+fn restored_all_projects_preference_survives_partial_data_until_projects_grow() {
+    let mut harness = summary_many_projects_harness(120, 40, Theme::Dark);
+    let all_groups = harness.app.history.half_hour_buckets[0]
+        .project_groups
+        .clone();
+    harness.app.history.half_hour_buckets[0]
+        .project_groups
+        .truncate(3);
+    harness.app.summary_cache = None;
+    let saved = UiState {
+        view: UiView::Summary,
+        summary_show_all_projects: true,
+        ..harness.app.ui_state()
+    };
+    harness.app.apply_ui_state(&saved, None);
+
+    harness.render();
+    let initial = harness.frame().snapshot_text();
+    assert!(harness.app.summary_show_all_projects);
+    harness.assert_shortcut_inactive(ControlId::SummaryAllProjects);
+    assert!(initial.contains("all projects"));
+
+    harness.app.history.half_hour_buckets[0].project_groups = all_groups;
+    harness.app.summary_cache = None;
+    harness.render();
+    let complete = harness.frame().snapshot_text();
+    assert!(harness.app.summary_show_all_projects);
+    harness.assert_shortcut_distinct(ControlId::SummaryAllProjects);
+    assert!(complete.contains("all projects"));
+    assert!(!complete.contains("Top 6 + Other"));
 }
 
 #[test]

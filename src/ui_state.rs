@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
 
-pub const UI_STATE_VERSION: u32 = 4;
+pub const UI_STATE_VERSION: u32 = 5;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -41,6 +41,35 @@ pub enum UiWindowScope {
     #[default]
     FiveHours,
     Week,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiSummaryRange {
+    #[default]
+    Cycle,
+    SevenDays,
+    ThirtyDays,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiSummaryGrain {
+    #[default]
+    Day,
+    Hours12,
+    Hours6,
+    Hours3,
+    Hour,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiSummaryMetric {
+    #[default]
+    Tokens,
+    Estimated,
+    ApiEquivalent,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +122,10 @@ pub struct UiState {
     /// Applies API long-context multipliers to local quota estimates. This is
     /// opt-in because subscription credit billing does not publish that rule.
     pub api_long_context_multiplier: bool,
+    pub summary_range: UiSummaryRange,
+    pub summary_grain: UiSummaryGrain,
+    pub summary_metric: UiSummaryMetric,
+    pub summary_show_all_projects: bool,
     pub table_columns: UiTableColumns,
     pub task_list_mode: UiTaskListMode,
     pub task_source_filter: UiTaskSourceFilter,
@@ -108,6 +141,10 @@ impl Default for UiState {
             turns_visible: true,
             models_visible: true,
             api_long_context_multiplier: false,
+            summary_range: UiSummaryRange::Cycle,
+            summary_grain: UiSummaryGrain::Day,
+            summary_metric: UiSummaryMetric::Tokens,
+            summary_show_all_projects: false,
             table_columns: UiTableColumns::default(),
             task_list_mode: UiTaskListMode::Flat,
             task_source_filter: UiTaskSourceFilter::All,
@@ -338,6 +375,10 @@ mod tests {
                 turns_visible: true,
                 models_visible: true,
                 api_long_context_multiplier: false,
+                summary_range: UiSummaryRange::Cycle,
+                summary_grain: UiSummaryGrain::Day,
+                summary_metric: UiSummaryMetric::Tokens,
+                summary_show_all_projects: false,
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Flat,
                 task_source_filter: UiTaskSourceFilter::All,
@@ -361,6 +402,10 @@ mod tests {
             turns_visible: false,
             models_visible: false,
             api_long_context_multiplier: true,
+            summary_range: UiSummaryRange::ThirtyDays,
+            summary_grain: UiSummaryGrain::Hour,
+            summary_metric: UiSummaryMetric::ApiEquivalent,
+            summary_show_all_projects: true,
             table_columns: UiTableColumns {
                 tokens: true,
                 token_share: false,
@@ -378,12 +423,17 @@ mod tests {
         assert!(json.contains("\"windowScope\": \"week\""));
         assert!(json.contains("\"taskListMode\": \"tree\""));
         assert!(json.contains("\"apiLongContextMultiplier\": true"));
+        assert!(json.contains("\"summaryRange\": \"thirtyDays\""));
+        assert!(json.contains("\"summaryGrain\": \"hour\""));
+        assert!(json.contains("\"summaryMetric\": \"apiEquivalent\""));
+        assert!(json.contains("\"summaryShowAllProjects\": true"));
         assert!(json.contains("\"tableColumns\""));
         assert!(json.contains("\"tokenShare\": false"));
         assert!(json.contains("\"estimatedQuota\": true"));
         assert!(json.contains("\"apiEquivalent\": false"));
         assert!(!json.contains("window_scope"));
         assert!(!json.contains("table_columns"));
+        assert!(!json.contains("summary_range"));
         assert!(!json.contains("token_share"));
         assert_eq!(
             fs::read_dir(directory.path().join("nested"))
@@ -423,9 +473,52 @@ mod tests {
                 turns_visible: false,
                 models_visible: false,
                 api_long_context_multiplier: false,
+                summary_range: UiSummaryRange::Cycle,
+                summary_grain: UiSummaryGrain::Day,
+                summary_metric: UiSummaryMetric::Tokens,
+                summary_show_all_projects: false,
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Tree,
                 task_source_filter: UiTaskSourceFilter::Cli,
+            }
+        );
+        assert!(store.writes_allowed());
+    }
+
+    #[test]
+    fn version_four_state_uses_defaults_for_new_summary_preferences() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tui-state.json");
+        fs::write(
+            &path,
+            br#"{
+  "version": 4,
+  "view": "summary",
+  "apiLongContextMultiplier": true,
+  "tableColumns": {
+    "tokens": false,
+    "tokenShare": true,
+    "estimatedQuota": false,
+    "apiEquivalent": true
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut store = UiStateStore::new(path);
+        assert_eq!(
+            store.load(),
+            UiState {
+                version: 4,
+                view: UiView::Summary,
+                api_long_context_multiplier: true,
+                table_columns: UiTableColumns {
+                    tokens: false,
+                    token_share: true,
+                    estimated_quota: false,
+                    api_equivalent: true,
+                },
+                ..UiState::default()
             }
         );
         assert!(store.writes_allowed());
