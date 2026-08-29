@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added history-backed `summary` and `trends` one-shot commands that use the same derived reports as the TUI, including Summary range/grain/metric selection, project/session/turn hierarchy and coverage, and Trends quota, weekly, and 15-minute series/readouts.
+- Added a unified `health` command for snapshot, history, recorder, and service diagnostics, plus camelCase JSON output for `service status`. Text, pretty JSON, and compact single-line JSON are available without changing report contents.
+- Added `--long-context` to Summary, Trends, and the existing snapshot/limits/tasks/turns/models/attribution/windows commands so scripts can explicitly select the optional Longx estimate without changing the saved TUI preference.
+
+### Changed
+
+- Shared Summary and Trends query derivation between CLI and TUI, including reset-cycle boundaries, partial/coverage semantics, local-wall-clock Summary buckets, and the namespace-scoped automatic 31-day backfill for incomplete `summary --range 30d` history.
+- Defined one-shot report exit semantics as `0` for complete, `2` for usable partial, and `1` when no requested data is usable; unified health reports use `0` or `2` during normal reporting.
+- Kept exact Summary metrics/values and Trends token readouts lossless in JSON with decimal strings, exposed Summary lower-bound state and recent service heartbeat explicitly, and persisted incomplete backfill cooldown markers after warning-bearing writes.
+- Hardened report-path handling for non-Unicode paths and output aliases, including actual macOS volume case semantics, Unicode-aware comparisons, and Windows 128-bit file identities.
+
 ## [0.3.1] - 2026-08-29
 
 ### Added

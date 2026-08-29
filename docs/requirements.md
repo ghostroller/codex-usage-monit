@@ -126,23 +126,31 @@ codex-usage-monit --theme light
 
 TUI 首次启动使用 dark 主题，之后恢复用户级状态文件中的主题；`--theme light` 显式覆盖保存值，`bright` 是 `light` 的别名，运行中按 `t` 可切换。主题只影响 TUI 渲染，不得改变采集结果或一次性 text/JSON 输出。
 
-TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、默认关闭的 API 长上下文倍率、Turns/Models 显隐、Tasks/Turns/Models 共用的 table columns、Flat/Tree 与 task 来源筛选。搜索、选择、Settings 当前行、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；字段缺失时使用各自安全默认值（Longx 关闭，Turns/Models 与四个指标列开启），状态损坏时回退完整默认状态。一次性输出不得读写此文件并保持基础 EST 口径。
+TUI 必须在用户级状态目录保存稳定菜单偏好，包括主题、顶层视图、5h/Week、默认关闭的 API 长上下文倍率、Turns/Models 显隐、Tasks/Turns/Models 共用的 table columns、Flat/Tree 与 task 来源筛选。搜索、选择、Settings 当前行、滚动位置、临时 Turns 展开和具体 thread 折叠集合不得持久化；字段缺失时使用各自安全默认值（Longx 关闭，Turns/Models 与四个指标列开启），状态损坏时回退完整默认状态。一次性输出不得读写此文件，默认保持基础 EST 口径；显式 `--long-context` 只为本次命令选择可选 Longx 投影，不得改变 TUI 偏好或 recorder 数据。
 
 一次性输出：
 
 ```bash
-codex-usage-monit snapshot [--format text|json] [--section ...]
-codex-usage-monit limits
-codex-usage-monit windows
-codex-usage-monit tasks
-codex-usage-monit turns [--thread <id>]
-codex-usage-monit models
-codex-usage-monit attribution
+codex-usage-monit snapshot [--format text|json] [--compact] [--long-context] [--section ...]
+codex-usage-monit limits [--format text|json] [--compact] [--long-context]
+codex-usage-monit tasks [--format text|json] [--compact] [--long-context]
+codex-usage-monit turns [--thread <id>] [--format text|json] [--compact] [--long-context]
+codex-usage-monit models [--format text|json] [--compact] [--long-context]
+codex-usage-monit attribution [--format text|json] [--compact] [--long-context]
+codex-usage-monit windows [--format text|json] [--compact] [--long-context]
+codex-usage-monit summary [--range cycle|7d|30d] [--grain 1d|12h|6h|3h|1h] [--metric tokens|estimated|api-equivalent] [--long-context] [--format text|json] [--compact] [--history-dir <DIR>]
+codex-usage-monit trends [--day-offset 0..7] [--long-context] [--format text|json] [--compact] [--history-dir <DIR>]
+codex-usage-monit health [--format text|json] [--compact] [--history-dir <DIR>]
+codex-usage-monit service status [--format text|json] [--compact]
 ```
 
-TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `codex` 5h/Week reset cycles；`snapshot --section windows` 输出 `windowAnalyses`。JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。原有 task/turn 顶层 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 以及顶层 `models`、`attribution` 和旧 attribution 汇总字段保持 schema 兼容，始终表示首选 5h 分析，不得因 TUI 选择 Week 而改变语义。schema v2 新增 `apiPricing` 与窗口/实体 `apiEquivalentCost`，并继续序列化现有 `statusConfidence`、各层 `quotaConfidence` 与 attribution `confidence`，字段名和枚举值不变。Turns 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。
+TUI 与 snapshot 系列 CLI 使用同一 `Snapshot`；`summary` 与 `trends` 必须分别使用与 TUI Summary/Trends 相同的共享报告构建逻辑，不能复制一套独立聚合。`windows` 输出当前可分析的普通 `codex` 5h/Week reset cycles；`snapshot --section windows` 输出 `windowAnalyses`。默认 JSON 顶层包含 schemaVersion、asOf、partial、所请求 sections，以及 partial 时的来源和错误原因。原有 task/turn 顶层 5h `windowTokenUsage`、`localTokenSharePercent`、`estimatedQuotaPercent`、`quotaConfidence` 以及顶层 `models`、`attribution` 和旧 attribution 汇总字段保持 schema 兼容，始终表示首选 5h 分析，不得因 TUI 选择 Week 而改变语义；`--long-context` 只切换这套 5h 估算的投影并写入 `estimateProjection`，不得改变原始 token 或 API 等价费用。schema v2 新增 `apiPricing` 与窗口/实体 `apiEquivalentCost`，并继续序列化现有 `statusConfidence`、各层 `quotaConfidence` 与 attribution `confidence`，字段名和枚举值不变。Turns 的 text 输出包含消息摘要，JSON 使用 `messagePreview` 字段。
 
-退出码：`0` 完整、`1` 失败、`2` partial、`64` 参数错误。局部命令只根据与所请求 section 相关的数据源决定 partial。
+`summary` JSON 必须稳定包含查询条件、UTC window、所选指标、可加总 totals、Complete/Partial/Missing coverage、`valueIsLowerBound`、partial reasons、本地墙上时间 chart buckets、逐项目稀疏 buckets，以及 project/session/turn 层级；本地时间转换必须按每个时间戳的真实 offset 处理 DST。Summary 的精确 `u128` 指标/值和 Trends 的精确 token readout 必须使用十进制字符串，不能依赖 JSON number 的 JavaScript 安全整数范围。`trends` JSON 必须包含 5h/Week 剩余额度、周 token/EST、15 分钟 token/EST、准确 readout/interval、所选 24 小时 bounds 和 history diagnostics。`health` 必须统一包含 snapshot、history、recorder、service 及其读取错误；`service status --format json` 必须输出结构化服务状态和 `heartbeatRecent`。pretty/compact 只能改变空白，不能改变字段或过滤数据。
+
+首次请求覆盖不完整的 `summary --range 30d` 时，CLI 必须复用 TUI 的 namespace-scoped 回填策略，在输出前执行一次 local-only、31 天、扩大文件上限的扫描；部分尝试不得每次命令重复，覆盖仍不完整时七天后才重新具备自动尝试资格。无法回填的桶和 totals 必须继续明确标记 partial/lower-bound，不能把缺失当作零。
+
+退出码：`0` 完整、`1` 所请求报告没有可用数据、`2` 有可用数据但 partial、`64` 参数错误。局部命令只根据与所请求 section 相关的数据源决定 partial；Summary coverage 为 Missing 或 Trends 没有任何观察时返回 `1`，统一 `health` 正常报告只返回 `0` 或 `2`。
 
 ## 4. TUI 信息架构
 
@@ -158,7 +166,7 @@ TUI 与 CLI 使用同一 `Snapshot`。`windows` 输出当前可分析的普通 `
 - `V` 与最顶栏中可点击的 `[V]Turns` 切换 Turns 默认显隐；首次启动默认显示，隐藏后仍可临时进入 Turns，顶栏恢复控件始终可达；
 - 非搜索状态的 `Esc` 打开退出确认弹窗，弹窗内 `Enter` 确认、`Esc` 取消；`Ctrl-C` 与 `q` 保持直接退出，搜索输入中的 `Esc` 只取消编辑。
 
-Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要；`[L]EST Longx` 同步切换这些实体 EST 与 Trends 的 Weekly/15m `~EST` 图，但不改变原始 token 图或 API 等价费用。Tasks 与 Turns 的每一行分别显示所选 5h/Week scope 的独立 `API EQ.`，不是 lifetime 金额；窗口缺失时显示 `-`。scope、Longx、面板和列项开关都作为稳定菜单偏好跨 TUI 进程保存；搜索输入焦点必须先消费可打印字符，非 Overview 视图不得误触发 Overview 快捷键。既有 JSON 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 基础分析，CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
+Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因摘要；`[L]EST Longx` 同步切换这些实体 EST 与 Trends 的 Weekly/15m `~EST` 图，但不改变原始 token 图或 API 等价费用。Tasks 与 Turns 的每一行分别显示所选 5h/Week scope 的独立 `API EQ.`，不是 lifetime 金额；窗口缺失时显示 `-`。scope、Longx、面板和列项开关都作为稳定菜单偏好跨 TUI 进程保存；搜索输入焦点必须先消费可打印字符，非 Overview 视图不得误触发 Overview 快捷键。既有 JSON 的顶层 task/turn、`models` 与 `attribution` 字段继续固定表示首选 5h 分析，默认使用基础投影，显式 CLI `--long-context` 可选择 Longx；CLI/JSON attribution 能力不因独立 TUI 面板删除而改变。
 
 ### Settings
 
@@ -179,7 +187,7 @@ Overview 的 scope 切换同步更新 Tasks、Turns、Models 及其中的归因�
 
 宽度小于 100 列时 task/turn 区域改为上下布局。Recent tasks 的 Tree、名称搜索和来源按钮嵌入面板顶边，不额外占用窄终端数据行。Flat/Tree 的显示、点击、滚动和键盘导航均把过滤后的位置映射回 `snapshot.tasks` 绝对索引；切换模式保留所选 thread/turn 并 reveal 新位置，刷新时按 `thread_id` / `turn_id` 保留仍符合筛选的选择。Recent tasks viewport 位于偏移 `0` 时进入跟随顶部模式，新建或更新的 task/subagent 插到排序顶部后必须立即可见；用户向下滚动后则继续按刷新前的首行 task 保留阅读位置，直到再次滚回顶部。
 
-Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Trends、Other、Settings 四个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点，Settings 每个设置行整体可点击。除显式视图 tab、当前视图的真实控件、数据行和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择；Settings 中上下键选择行、`Enter` 切换。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
+Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标记区分状态，Tasks 底部始终提供统一图例，空间足够时同一底边保留选中 task 的状态证据。Overview、Trends、Summary、Other、Settings 五个顶层 tab 均可用鼠标左键切换；Overview scope 切换不得清空 task/turn 搜索、来源筛选、焦点和仍存在于新 scope 的 ID 选择。Overview 中可点击 Tasks/Turns 数据行并切换键盘焦点，Settings 每个设置行整体可点击。除显式视图 tab、当前视图的真实控件、数据行和滚动条外，标题、边框、表头和空白区不得触发选择。`Enter` / `Backspace` 在 Tasks 与 Turns 之间移动焦点，上下键只改变当前焦点面板的选择；Settings 中上下键选择行、`Enter` 切换。参考 btop 的面板路由语义，滚轮只滚动鼠标所在的 Tasks 或 Turns viewport，每格 3 行，不改变选择或键盘焦点；内容超出 viewport 时在右边框显示比例 thumb，点击轨道可跳转、按住左键可拖动，释放后停止拖动，且均不得改变当前数据行选择。dark/light 主题均须保持状态、选中项、额度和 diagnostics 可辨识，按 `t` 即时切换。
 
 ## 5. 非功能需求
 
@@ -220,6 +228,8 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - `serviceTier=fast` / `priority` 的 Fast turn，其 `FAST` 只出现在模型名称后；普通 turn 的模型单元格保持不变；
 - 相同 duration 出现多个额度桶时仍完整显示 gauge，但只有 `codex` 生成归因；Spark 精确模型名大小写不敏感排除，`codex_bengalfox` 保持 gauge-only，缺失模型名进入普通 `codex` 分母；
 - `windows` 与 `snapshot --section windows` 输出多窗口分析，旧 5h 字段保持兼容；
+- `summary` / `trends` 与 TUI 的共享报告在固定 snapshot/history fixture 下逐字段一致，覆盖 Longx、Summary 本地时间桶与 30 天回填、Trends day offset/readout，以及完整/partial/missing 退出码；
+- `health` text/JSON 同时覆盖 snapshot、history、recorder、service 和读取错误，`service status --format json --compact` 输出稳定单行结构；
 - idle 后额度估算仍不声称 exact。
 
 ## 7. 后续增强，不属于 v0.1

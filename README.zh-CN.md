@@ -29,7 +29,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **项目用量汇总** — 按本周期、近 7 天或近 30 天排行项目；展开紧凑的项目/session/用户对话轮树，并通过项目排行柱状图和可从 1 天细化到 1 小时的项目着色堆叠面积图，比较 token、估算 credit 费率或 API 等价用量。能够精确关联的 subagent 子树用量会折叠到创建它的用户对话轮。
 - **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
-- **可脚本化 CLI** — 导出便于阅读的文本或带 schema 版本的 camelCase JSON，选择指定 section，或按 thread 筛选 turn。
+- **可脚本化 CLI** — 以便于阅读的文本或稳定 camelCase JSON 导出与 TUI 相同的 Summary、Trends 和统一健康数据，也可选择 snapshot section 或按 thread 筛选 turn。
 - **适合服务器** — 支持 SSH、tmux 和 Zellij；Linux Release 是静态 musl 构建，不依赖宿主机 glibc。
 - **只读监控** — 读取本地 Codex 数据和账户用量指标，不读取 `auth.json`，也不会消耗重置机会。
 - **低开销刷新** — 使用持久化增量缓存和事件驱动的 TUI 更新，避免反复解析没有变化的 rollout。
@@ -147,11 +147,14 @@ codex-usage-monit --offline snapshot --format json --compact
 | `models` | 输出当前首选重置周期内的模型用量。 |
 | `attribution` | 输出额度归因和数据质量详情。 |
 | `windows` | 输出每个当前重置周期内 task、turn 和模型的用量。 |
+| `summary` | 输出与 TUI 相同、由历史支持的项目/session/turn 汇总。 |
+| `trends` | 输出与 TUI 相同的额度和本地用量走势序列。 |
+| `health` | 统一输出 snapshot、历史、recorder 和后台服务健康状态。 |
 | `record` | 不启动 TUI，持续记录本地和账户历史。 |
 | `service` | 安装、检查或删除可选的用户级后台记录服务。 |
 | `debug-startup` | 分析正常 TUI 冷启动流程，但不进入交互模式。 |
 
-一次性数据命令支持 `--format text|json` 和 `--compact`，后者会把 JSON 写成单行；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。
+一次性数据命令支持 `--format text|json` 和 `--compact`，后者会把 JSON 写成单行；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。snapshot 系列命令（`snapshot`、`limits`、`tasks`、`turns`、`models`、`attribution`、`windows`）以及 `summary`、`trends` 都接受 `--long-context`，只为本次调用选择可选 Longx 估算；默认仍为基础口径，API 等价费用不会随之改变。
 
 ```bash
 # 只输出指定的 snapshot section
@@ -174,7 +177,31 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` 是可选工具，只用于上面的管道示例。
 
-有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。TUI 的顶层 tab 是 **Overview**、**Trends**、**Summary**、**Other** 和 **Settings**；`health` 仍然是一次性 snapshot 的 section 名称。
+### 历史报告与健康报告
+
+`summary` 和 `trends` 与对应 TUI 视图调用同一套报告构建逻辑，因此两个界面的范围边界、重置周期选择、估算、覆盖率和 partial 标记只有一套定义。`health` 把 Other 中的 snapshot 诊断与历史、recorder 和后台服务状态合并输出。
+
+```bash
+# 项目/session/turn 用量；下文列出所有标准参数值
+codex-usage-monit summary \
+  --range 30d \
+  --grain 6h \
+  --metric estimated \
+  --long-context \
+  --format json \
+  --compact
+
+# 当前对齐的 24 小时 Trends 窗口偏移为 0；1 表示前一个窗口
+codex-usage-monit trends --day-offset 1 --long-context --format json
+
+# 适合自动化读取的统一诊断与服务状态
+codex-usage-monit health --format json --compact
+codex-usage-monit service status --format json --compact
+```
+
+`summary --range` 接受 `cycle`、`7d`、`30d`；`--grain` 接受 `1d`、`12h`、`6h`、`3h`、`1h`；`--metric` 接受 `tokens`、`estimated`、`api-equivalent`。`trends --day-offset` 接受 `0` 到 `7`。`summary`、`trends`、`health` 都接受 `--history-dir <DIR>`，用于覆盖平台默认历史目录。Summary 日历桶会按每个时间戳对应的真实本地时区偏移计算，包括夏令时变化；其 JSON `window` 保持 RFC 3339 UTC，而桶的 `startsAt` 是本地墙上时间。Trends 的观测时间和 15 分钟区间边界仍为准确的 RFC 3339 时间戳，TUI 会把它们显示为本地时间。
+
+有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。snapshot 的 `health` section 只包含采集健康状态；如需统一的 snapshot/历史/recorder/服务报告，请使用独立的 `health` 命令。TUI 的顶层 tab 是 **Overview**、**Trends**、**Summary**、**Other** 和 **Settings**。
 
 ### 持续记录历史
 
@@ -280,7 +307,7 @@ codex-usage-monit record --foreground
 
 Overview 提醒采用保守规则：只使用完整且未过期的数据，其中机会状态必须为 `available`，`resetType` 必须为 `codexRateLimits`。程序会判断最早的未来过期时间是否严格早于普通 `codex` 周窗口的重置时间；明细被截断、标记为 partial 或 stale 时不显示提醒。
 
-TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asOf` 时间仍使用 UTC。一次性文本输出使用 UTC，JSON 使用 RFC 3339 时间戳。
+TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asOf` 时间仍使用 UTC。一次性文本输出使用 UTC，但 Summary 中明确标注的图表桶使用本地墙上时间；JSON 的绝对时间使用 RFC 3339 时间戳。
 
 ### Task、turn 和模型字段
 
@@ -300,7 +327,7 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 
 对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
 
-TUI 的 `[L]EST Longx` 开关**默认关闭**。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此该开关只是可选代理假设，不是订阅制计费事实。开关会随其他 TUI 偏好保存；recorder 始终同时保存基础权重与可选附加权重，切换后无需重装后台服务。
+可选 Longx 投影**默认关闭**。在 TUI 中可用 `[L]EST Longx` 持久开启，也可在某次 CLI 查询中传入 `--long-context`。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此 Longx 只是可选代理假设，不是订阅制计费事实。TUI 开关会随其他偏好保存；CLI 参数不会读取或改变该偏好。recorder 始终同时保存基础权重与可选附加权重，因此在任一界面切换都无需重装后台服务。
 
 `API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。程序按每个本地可观察模型请求分别计算普通 input、cached input、cache write 和 output；reasoning token 已包含在 output 中，不会重复相加。单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。对于当前结构化的普通 ThreadSpawn subagent，只有 spawn metadata 明确记录未使用自定义 role，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，parser 才还原其有效 tier；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才表示 API `default`。`codex-auto-review` 是应用明确采用的计价代理：使用 `gpt-5.6-luna` 费率，保留已记录的 Standard/Fast tier，tier 缺失时按 Standard，界面与 model breakdown 仍保留 `codex-auto-review`，并报告 `api_price_codex_auto_review_luna_proxy`。这是应用的路由假设，不是官方 API model alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知 tier、模型未知、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
 
@@ -333,7 +360,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次选择近 30 天且项目历史不完整时，TUI 会在后台执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。`[L]EST Longx` 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和值，而不是从图表坐标反推。对于 Trends 中的 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。Summary 的 Inspect 则显示当前 `1h` 到 `1d` 粒度下所选派生本地聚合桶的起点、区间和值；它不是原始事件时间戳。
 
@@ -353,7 +380,7 @@ Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和�
 
 ## JSON 输出
 
-JSON 输出使用 camelCase，目前报告 `"schemaVersion": 2`。
+JSON 输出使用稳定的 camelCase 字段名。snapshot 系列输出目前报告 `"schemaVersion": 2`。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -371,6 +398,15 @@ JSON 输出使用 camelCase，目前报告 `"schemaVersion": 2`。
 | `stats` | 扫描和解析器统计。 |
 | `warnings`、`errors` | 采集过程中的警告和错误诊断。单个数据源出错不一定会使整个快照不可用。 |
 
+独立报告命令会序列化完整的共享数据对象，而不是抓取文本或 TUI 渲染结果：
+
+- `summary` 输出查询条件、UTC 窗口、所选指标和可加总的精确总量、覆盖状态（`complete`、`partial`、`missing`）、`valueIsLowerBound`、partial reasons、本地墙上时间图表桶、稀疏逐项目桶，以及项目/session/turn 层级；精确的 `u128` 指标/值字段使用十进制字符串。它有独立的报告 `schemaVersion`。
+- `trends` 输出 5 小时与周剩余额度点、周 token/估算点、`fifteenMinuteTokens` / `fifteenMinuteEstimated`、准确读数和区间、所选 24 小时边界，以及历史可用性/警告；精确 token 读数使用十进制字符串。
+- `health` 把带版本的 snapshot、历史、recorder 和可选服务健康状态一起输出，也会报告 recorder/服务读取错误。它不包含 task 记录和专门的 `codexHome` 字段，但保留的诊断文本仍可能带来源路径；该报告有独立的 `schemaVersion`。
+- `service status --format json` 输出 `platform`、`state`、`installed`、`running`、注册路径、最近历史 heartbeat、`heartbeatRecent` 和详情。
+
+pretty 与 compact 模式只在空白格式上不同。`--long-context` 不会切换到另一套 schema，并会按命令在 `estimateProjection`、`apiLongContext` 或 `apiLongContextMultiplier` 中记录所选估算口径，消费者无需从数值反推。
+
 Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`、`outputTokens`、`reasoningOutputTokens` 和 `totalTokens`。不要把这些字段相加：cached input 与 cache write input 都是 input 的子集，reasoning output 是 output 的一部分，而 `totalTokens` 已经是总量。
 
 `apiEquivalentCost` 使用精确十进制字符串输出 `minimumPicoUsd` 和 `maximumPicoUsd`，并附带已观察/已计价的 rollout usage sample 数和 token 数。一个非精确 sample 可能包含多个请求，因此 `observedSamples` 与 `pricedSamples` 不能当作请求数。`modelBreakdown` 包含所有已观察模型，包括额度估算排除且无法计价的模型。顶层值和 task/turn/model 投影固定使用首选当前 5 小时窗口；`windowAnalyses[]` 还提供周周期结果。按 thread 过滤的 Turns 响应会省略覆盖所有 thread 的顶层总额，但保留逐 turn 金额。金额只覆盖已计价模型调用；使用前应同时检查 `partialReasons` 和覆盖率。最小值与最大值相同表示单一价格，不同时表示短/长上下文请求边界尚未确定的区间。
@@ -387,6 +423,8 @@ Token 用量包含 `inputTokens`、`cachedInputTokens`、`cacheWriteInputTokens`
 | `1` | 无法生成有效结果。 |
 | `2` | 结果可用但部分不完整。 |
 | `64` | 命令行用法错误。 |
+
+对数据报告而言，`1` 特指所请求数据没有可用结果，例如 Summary 覆盖完全缺失或 Trends 没有任何观察值；`2` 仍会返回已有数值、覆盖率和诊断。统一 `health` 命令正常只返回 `0` 或 `2`，因为它的用途就是报告降级组件，而不是丢弃这些状态。
 
 ## 隐私和本地数据
 

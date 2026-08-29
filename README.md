@@ -29,7 +29,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **Project usage summary** — Rank projects for the current cycle, last 7 days, or last 30 days; expand a compact project/session/user-turn tree and compare token, estimated credit-rate, or API-equivalent usage with ranked bars and a project-colored stacked-area chart from 1-day down to 1-hour buckets. Usage from an exactly linked subagent subtree is folded into the user turn that spawned it.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
-- **Scriptable CLI** — Export human-readable text or schema-versioned camelCase JSON, select individual sections, and filter turns by thread.
+- **Scriptable CLI** — Export the same Summary, Trends, and unified health data used by the TUI as human-readable text or stable camelCase JSON, select snapshot sections, and filter turns by thread.
 - **Server-friendly** — Works in SSH, tmux, and Zellij sessions; Linux release binaries are static musl builds with no host glibc dependency.
 - **Read-only monitoring** — Reads local Codex data and account gauges without reading `auth.json` or consuming reset credits.
 - **Low-overhead refreshes** — Uses a persistent incremental cache and event-driven TUI updates to avoid repeatedly parsing unchanged rollouts.
@@ -147,11 +147,14 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `models` | Print model usage for the preferred current quota window. |
 | `attribution` | Print quota-attribution and data-quality details. |
 | `windows` | Print task, turn, and model usage for every current reset cycle. |
+| `summary` | Print the TUI's history-backed project/session/turn Summary. |
+| `trends` | Print the TUI's quota and local-usage trend series. |
+| `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, inspect, or remove the optional per-user recorder. |
 | `debug-startup` | Profile the normal TUI cold-start path without entering interactive mode. |
 
-The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render.
+The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render. The snapshot-family commands (`snapshot`, `limits`, `tasks`, `turns`, `models`, `attribution`, and `windows`) plus `summary` and `trends` accept `--long-context` to select the optional Longx estimate for that invocation; the default remains the base estimate, and API-equivalent cost never changes.
 
 ```bash
 # Only selected snapshot sections
@@ -174,7 +177,31 @@ codex-usage-monit --redact-content tasks --format json
 
 `jq` is optional and is only used in the pipeline example above.
 
-The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The TUI's top-level tabs are **Overview**, **Trends**, **Summary**, **Other**, and **Settings**; `health` remains the one-shot snapshot section name.
+### History-backed and health reports
+
+`summary` and `trends` call the same report builders as their TUI views, so range boundaries, reset-cycle selection, estimates, coverage, and partial markers have one definition in both interfaces. `health` combines the snapshot diagnostics shown under Other with history, recorder, and background-service status.
+
+```bash
+# Project/session/turn usage; canonical values are shown below
+codex-usage-monit summary \
+  --range 30d \
+  --grain 6h \
+  --metric estimated \
+  --long-context \
+  --format json \
+  --compact
+
+# The current aligned 24-hour Trends window is offset 0; 1 selects the prior window
+codex-usage-monit trends --day-offset 1 --long-context --format json
+
+# Unified diagnostics, suitable for automation
+codex-usage-monit health --format json --compact
+codex-usage-monit service status --format json --compact
+```
+
+`summary --range` accepts `cycle`, `7d`, or `30d`; `--grain` accepts `1d`, `12h`, `6h`, `3h`, or `1h`; and `--metric` accepts `tokens`, `estimated`, or `api-equivalent`. `trends --day-offset` accepts `0` through `7`. The `summary`, `trends`, and `health` commands each accept `--history-dir <DIR>` to override the platform history location. Summary calendar buckets use the host's real local offset at each timestamp, including DST changes; its JSON `window` stays RFC 3339 UTC while bucket `startsAt` values are local wall-clock times. Trends observations and 15-minute interval bounds remain exact RFC 3339 timestamps and are displayed in local time by the TUI.
+
+The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The snapshot `health` section covers collection health only; use the dedicated `health` command for the unified snapshot/history/recorder/service report. The TUI's top-level tabs are **Overview**, **Trends**, **Summary**, **Other**, and **Settings**.
 
 ### Continuous history recording
 
@@ -280,7 +307,7 @@ The service can return fewer detail rows than the available count. In that case,
 
 The Overview reminder is conservative: it uses only complete, current details whose status is `available` and whose `resetType` is `codexRateLimits`. It compares the earliest future expiry strictly before the ordinary `codex` weekly reset. Truncated, partial, or stale details do not produce a reminder.
 
-Reset and turn timestamps in the TUI are shown in local time; Collection/Snapshot `asOf` timestamps remain UTC. One-shot text output uses UTC, and JSON uses RFC 3339 timestamps.
+Reset and turn timestamps in the TUI are shown in local time; Collection/Snapshot `asOf` timestamps remain UTC. One-shot text output uses UTC except for Summary's explicitly labelled local-wall-clock buckets, and JSON uses RFC 3339 timestamps for absolute times.
 
 ### Task, turn, and model fields
 
@@ -300,7 +327,7 @@ The estimator follows OpenAI's current [token-based Codex rate card](https://lea
 
 For recognized ChatGPT Fast calls the estimator applies the published [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) multiplier: `2.5x` for GPT-5.6/GPT-5.5 and `2x` for GPT-5.4. The compatible `serviceTier=priority` value found in local signed-in rollouts is treated as Fast for this attribution; this is not API Priority billing, which the official Speed page describes separately. Exact `gpt-5.3-codex-spark` calls remain outside this attribution because its credit rate is still a research preview; an unlisted or missing non-Spark model uses the corresponding GPT-5.6 Luna fallback and marks the scope partial.
 
-The TUI's `[L]EST Longx` switch is **off by default**. When enabled, it additionally applies OpenAI's API-published long-context rule to supported models for the Codex quota `~EST` projection. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so the switch is an optional proxy assumption, not subscription billing fact. Its setting is saved with the other TUI preferences; the recorder always stores both base and optional weights, so changing it does not require reinstalling the background service.
+The optional Longx projection is **off by default**. Enable it persistently in the TUI with `[L]EST Longx`, or for one CLI query with `--long-context`. It additionally applies OpenAI's API-published long-context rule to supported models for the Codex quota `~EST` projection. OpenAI's Codex subscription credit card says context affects credits but does not publish this same per-request formula, so Longx is an optional proxy assumption, not subscription billing fact. The TUI setting is saved with its other preferences; the CLI flag does not read or change that preference. The recorder always stores both base and optional weights, so switching either interface does not require reinstalling the background service.
 
 `API EQ.` is a separate calculation based on the current [OpenAI API pricing table](https://developers.openai.com/api/docs/pricing). It prices each locally observed model request using regular input, cached input, cache-write, and output rates; reasoning tokens are already part of output and are not added twice. The calculation applies a published API long-context price when an exact request exceeds 272K input tokens; models with one flat price keep it across their supported context. If a larger cumulative delta has unknown request boundaries, the UI shows a short/long cost range. For current structured plain ThreadSpawn subagents, the parser can recover the effective tier from provenance-gated settings snapshots only when spawn metadata explicitly records no custom role and the child model exactly matches; a newer snapshot always supersedes older state, and only here does an absent or null tier mean API `default`. `codex-auto-review` is an explicit application pricing proxy: it uses `gpt-5.6-luna` rates, honors a recorded Standard/Fast tier, treats a missing tier as Standard, keeps the observed `codex-auto-review` label, and reports `api_price_codex_auto_review_luna_proxy`. This routing assumption is not an official API model alias. Legacy or custom-role spawns, model mismatches, other missing or unknown tiers, unknown models, unavailable Fast/long rows, missing token breakdowns, and cache writes without a published rate reduce the displayed priced coverage instead of using a fallback. Per-call tool and other non-model charges are not included; model input/output tokens surrounding tool execution are still valued at model rates. This is an equivalent value at current API rates, not an API invoice or a Codex subscription charge.
 
@@ -333,7 +360,7 @@ Quota-attribution confidence uses the same enum for schema consistency, but the 
 | `15m Local Tokens` | Local token deltas whose observed completion timestamps fall in UTC-aligned 15-minute buckets. |
 | `15m ~EST Usage` | The same weekly low-confidence allocation split across those 15-minute credit-rate-weight buckets. |
 
-History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. Summary's project breakdown is recorded prospectively and its `1h` through `1d` chart buckets are derived from the same persisted 15-minute observations; switching chart grain does not rescan rollout files or require another recorder mode. The first time the 30-day range is selected with incomplete project history, the TUI performs one local-only background scan with a 31-day lookback and an expanded file limit; the normal recorder remains on its lightweight configured lookback. A namespace-scoped marker prevents a partial scan from repeating on every launch, while incomplete coverage becomes eligible for another automatic attempt after seven days. Buckets that cannot be reconstructed remain `PARTIAL`, totals are labeled as the known lower bound, and unknown time buckets are gaps rather than zero. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With `[L]EST Longx` off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the toggle, or an estimator update changes the selected projection. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
+History is stored in UTC and displayed in local time. Weekly cumulative samples use original call timestamps, so an arbitrary server reset minute is cut exactly. Summary's project breakdown is recorded prospectively and its `1h` through `1d` chart buckets are derived from the same persisted 15-minute observations; switching chart grain does not rescan rollout files or require another recorder mode. The first time an incomplete 30-day range is selected in the TUI or requested with `summary --range 30d`, the shared coverage policy performs one local-only scan with a 31-day lookback and an expanded file limit; the TUI runs it in the background, while the one-shot command completes it before rendering. The normal recorder remains on its lightweight configured lookback. A namespace-scoped marker prevents a partial scan from repeating on every launch or command, while incomplete coverage becomes eligible for another automatic attempt after seven days. Buckets that cannot be reconstructed remain `PARTIAL`, totals are labeled as the known lower bound, and unknown time buckets are gaps rather than zero. EST aggregates carry an estimator revision so incompatible weighting definitions are not silently mixed. The current dual-weight mapping is estimator revision 5: every new local observation stores the base Codex credit proxy and the optional API long-context extra together. With Longx off, an unverifiable large aggregate does not affect completeness; with it on, the aggregate keeps its base rate and reports `long_context_usage_unknown` instead of guessing. Released revision-3 base history is preserved but cannot supply the optional multiplier until rebuilt; the briefly used development-only revision-4 single-weight history is discarded because its base and extra cannot be separated safely. Mixed estimator revisions still cannot be combined. Because the latest weekly gauge and full-cycle denominator are used, previously drawn `~EST` bars may be revised when new local calls, a new server sample, the selected projection, or an estimator update changes. A `15m ~EST` bar that straddles a weekly reset is excluded and marked partial rather than mixed across cycles.
 
 Trends Inspect shows each selected observation's exact stored timestamp and value rather than reconstructing it from chart coordinates. For a 15-minute Trends bar, the readout shows the precise UTC-aligned bucket interval in local time. Summary Inspect instead shows the selected derived local aggregation bucket's start, interval, and value for the active `1h` through `1d` grain; it is not an original event timestamp.
 
@@ -353,7 +380,7 @@ See [Data capabilities and limits](docs/codex-data-capabilities.md) for formulas
 
 ## JSON output
 
-JSON output uses camelCase and currently reports `"schemaVersion": 2`.
+JSON output uses stable camelCase field names. Snapshot-family output currently reports `"schemaVersion": 2`.
 
 | Field | Meaning |
 | --- | --- |
@@ -371,6 +398,15 @@ JSON output uses camelCase and currently reports `"schemaVersion": 2`.
 | `stats` | Scan and parser statistics. |
 | `warnings`, `errors` | Warning and error diagnostics from collection. A source error does not necessarily make the whole snapshot unusable. |
 
+The dedicated reports serialize the complete shared data objects rather than scraping their text or TUI rendering:
+
+- `summary` reports its query, UTC window, selected metric and exact additive totals, coverage state (`complete`, `partial`, or `missing`), `valueIsLowerBound`, partial reasons, local-wall-clock chart buckets, sparse per-project buckets, and the project/session/turn hierarchy. Exact `u128` metric/value fields are decimal strings. It has its own report `schemaVersion`.
+- `trends` reports 5-hour and weekly remaining-quota points, weekly token and estimate points, `fifteenMinuteTokens` / `fifteenMinuteEstimated`, exact readouts and intervals, selected 24-hour bounds, and history availability/warnings. Exact token readout values are decimal strings.
+- `health` reports versioned snapshot, history, recorder, and optional service health together, including recorder/service read errors. It omits task records and the dedicated `codexHome` field; preserved diagnostics can still contain source paths. It has its own report `schemaVersion`.
+- `service status --format json` reports `platform`, `state`, `installed`, `running`, registration path, latest history heartbeat, `heartbeatRecent`, and detail.
+
+Pretty and compact modes differ only in whitespace. `--long-context` does not switch to a different schema; it records the selected estimate projection (`estimateProjection`, `apiLongContext`, or `apiLongContextMultiplier`, depending on the command), so consumers do not have to infer it from values.
+
 Token usage contains `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`, `outputTokens`, `reasoningOutputTokens`, and `totalTokens`. Do not sum them: cached input and cache write input are subsets of input, reasoning output is part of output, and `totalTokens` is already the total.
 
 `apiEquivalentCost` reports `minimumPicoUsd` and `maximumPicoUsd` as exact decimal strings, plus observed/priced rollout usage-sample and token counts. One non-exact sample can represent multiple requests, so `observedSamples` and `pricedSamples` are not request counts. `modelBreakdown` includes every observed model, including unpriced models excluded from the quota estimator. The top-level value and task/turn/model projections use the preferred current 5-hour window; `windowAnalyses[]` also exposes weekly values. A thread-filtered Turns response omits the all-thread top-level total while retaining per-turn costs. The amounts cover only priced model calls; inspect `partialReasons` and coverage before treating the subtotal as complete. Equal minimum and maximum values represent a single price, while differing values represent an unresolved short/long-context request-boundary range.
@@ -387,6 +423,8 @@ The legacy per-entity attribution fields project the preferred 5-hour window for
 | `1` | No valid result could be produced. |
 | `2` | Usable partial result. |
 | `64` | Command-line usage error. |
+
+For data reports, `1` specifically means the requested data has no usable result—for example, missing Summary coverage or no Trends observations. `2` still returns the available values together with coverage and diagnostics. The unified `health` command normally returns only `0` or `2`, because its purpose is to report degraded components rather than discard them.
 
 ## Privacy and local data
 
