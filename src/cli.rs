@@ -759,24 +759,29 @@ fn collect_and_load_report_history(
         },
     );
     let observation = report_history_observation(result, config.offline);
+    let stage_started = Instant::now();
+    store.stage(&observation);
+    let stage_elapsed = stage_started.elapsed();
     let record_started = Instant::now();
-    let write_result = store.record(&observation);
+    let write_result = store.flush_staged();
     let record_elapsed = record_started.elapsed();
     let load_started = Instant::now();
-    let mut history = store.load_since(history_view_since(result.snapshot.as_of));
+    let mut history = store.load_since_with_staged(history_view_since(result.snapshot.as_of));
     let load_elapsed = load_started.elapsed();
 
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, Some(load_elapsed));
+    metrics.stage_us = u64::try_from(stage_elapsed.as_micros()).unwrap_or(u64::MAX);
     metrics.record_performed = true;
     match &write_result {
-        Ok(report) => {
+        Ok(Some(report)) => {
             metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
             metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
             metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
             metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
             metrics.read_only = report.read_only;
         }
+        Ok(None) => {}
         Err(_) => metrics.warnings = 1,
     }
     merge_history_write_result(&mut history, write_result);
@@ -809,13 +814,14 @@ fn report_history_observation(result: &CollectionResult, offline: bool) -> Histo
 
 fn merge_history_write_result(
     history: &mut HistoryData,
-    write_result: io::Result<crate::history::HistoryWriteReport>,
+    write_result: io::Result<Option<crate::history::HistoryWriteReport>>,
 ) {
     match write_result {
-        Ok(report) => {
+        Ok(Some(report)) => {
             history.read_only |= report.read_only;
             history.warnings.extend(report.warnings);
         }
+        Ok(None) => {}
         Err(error) => history
             .warnings
             .push(format!("history persistence failed: {error}")),
@@ -1716,8 +1722,8 @@ mod tests {
         LimitBucket, ModelUsage, Snapshot, TokenUsage, WindowAnalysis, WindowDescriptor,
     };
     use crate::history::{
-        HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, LocalHalfHourBucket,
-        QuotaPoint, WeeklyLocalPoint,
+        HISTORY_ESTIMATOR_REVISION, HISTORY_FORMAT_VERSION, HISTORY_PROJECT_BREAKDOWN_REVISION,
+        LocalHalfHourBucket, LocalProjectUsageGroup, QuotaPoint, WeeklyLocalPoint,
     };
 
     struct BrokenPipeWriter;
@@ -2571,6 +2577,101 @@ mod tests {
         assert_eq!(result.history_observation, expected);
 
         assert_eq!(report_history_observation(&result, true), expected);
+    }
+
+    #[test]
+    fn report_history_keeps_live_observation_when_future_format_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_root = temp.path().join("history");
+        let config = CollectConfig {
+            codex_home: temp.path().join("codex"),
+            ..CollectConfig::default()
+        };
+        let result = report_history_collection_result(Provenance::ServerSnapshot);
+        let probe = HistoryStore::new(history_root.clone(), &config.codex_home);
+        let namespace_dir = probe.namespace_dir().unwrap().to_path_buf();
+        std::fs::create_dir_all(&namespace_dir).unwrap();
+        let shard_path = namespace_dir.join(format!("{}.json", result.snapshot.as_of.date_naive()));
+        let future = serde_json::to_vec(&serde_json::json!({
+            "formatVersion": HISTORY_FORMAT_VERSION + 1,
+            "namespace": probe.namespace(),
+        }))
+        .unwrap();
+        std::fs::write(&shard_path, &future).unwrap();
+
+        let (_, history) = collect_and_load_report_history(&config, &result, Some(history_root));
+
+        assert!(history.read_only);
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("future history format version"))
+        );
+        assert_eq!(
+            history.quota_points,
+            result.history_observation.quota_points
+        );
+        assert_eq!(
+            history.half_hour_buckets,
+            result.history_observation.half_hour_buckets
+        );
+        assert_eq!(
+            history.weekly_local_points,
+            result.history_observation.weekly_local_points
+        );
+        assert_eq!(std::fs::read(shard_path).unwrap(), future);
+    }
+
+    #[test]
+    fn report_history_keeps_redacted_live_observation_after_persistence_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_root = temp.path().join("history-file");
+        let original = b"not a directory\n";
+        std::fs::write(&history_root, original).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().join("codex"),
+            redact_content: true,
+            ..CollectConfig::default()
+        };
+        let mut result = report_history_collection_result(Provenance::ServerSnapshot);
+        result.history_observation.half_hour_buckets[0]
+            .project_groups
+            .push(LocalProjectUsageGroup {
+                thread_id: "root".to_string(),
+                title: Some("secret title".to_string()),
+                message_preview: Some("secret message".to_string()),
+                ..LocalProjectUsageGroup::default()
+            });
+
+        let (_, history) =
+            collect_and_load_report_history(&config, &result, Some(history_root.clone()));
+
+        assert!(!history.read_only);
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("history persistence failed:"))
+        );
+        assert_eq!(
+            history.quota_points,
+            result.history_observation.quota_points
+        );
+        assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 42);
+        assert_eq!(history.half_hour_buckets[0].estimated_cost_units, 7);
+        assert_eq!(
+            history.half_hour_buckets[0].api_long_context_extra_cost_units,
+            Some(3)
+        );
+        let group = &history.half_hour_buckets[0].project_groups[0];
+        assert_eq!(group.title.as_deref(), Some("[redacted]"));
+        assert_eq!(group.message_preview.as_deref(), Some("[redacted]"));
+        assert_eq!(
+            history.weekly_local_points,
+            result.history_observation.weekly_local_points
+        );
+        assert_eq!(std::fs::read(history_root).unwrap(), original);
     }
 
     #[test]

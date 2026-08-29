@@ -361,35 +361,50 @@ impl PreparedSummary {
 
     pub fn api_chart_is_lower_bound(&self) -> bool {
         let amount = self.usage.totals.api_equivalent_cost;
-        !amount.range_is_exact()
+        self.known_usage_is_lower_bound()
+            || !amount.range_is_exact()
             || amount.priced_samples < amount.observed_samples
             || amount.priced_tokens < amount.observed_tokens
-            || self.represented_tokens < self.available_tokens
+    }
+
+    /// Whether the selected total omits known non-negative contributions.
+    ///
+    /// This is deliberately narrower than [`Self::partial`]. Operational
+    /// warnings, fallback windows, uncertain attribution, and chart-edge
+    /// clipping can make a report partial without making its total a
+    /// mathematical lower bound.
+    pub fn value_is_lower_bound(&self, metric: SummaryMetric, api_long_context: bool) -> bool {
+        if self.known_usage_is_lower_bound() {
+            return true;
+        }
+        match metric {
+            SummaryMetric::Tokens => false,
+            SummaryMetric::Estimated => {
+                self.estimated_covered_tokens < self.available_tokens
+                    || (api_long_context && !self.long_context_breakdown_complete)
+            }
+            SummaryMetric::ApiEquivalent => self.api_chart_is_lower_bound(),
+        }
+    }
+
+    fn known_usage_is_lower_bound(&self) -> bool {
+        self.represented_tokens < self.available_tokens
             || self.covered_buckets < self.expected_buckets
-            || self.partial_reasons.iter().any(|reason| {
-                reason.starts_with("rollout_")
-                    || matches!(
-                        reason.as_str(),
-                        "local_scan_disabled" | "range_starts_within_15m_bucket"
-                    )
-            })
+            || self
+                .partial_reasons
+                .iter()
+                .any(|reason| partial_reason_implies_omitted_usage(reason))
     }
 
     /// Whether the selected chart total is only a known lower bound. This is
     /// the shared rule used by the TUI annotation and one-shot report.
     pub fn chart_value_is_lower_bound(
         &self,
-        chart: &SummaryChartData,
+        _chart: &SummaryChartData,
         metric: SummaryMetric,
         api_long_context: bool,
     ) -> bool {
-        summary_chart_value_is_lower_bound_with_local_time(
-            self,
-            chart,
-            metric,
-            api_long_context,
-            &default_local_time,
-        )
+        self.value_is_lower_bound(metric, api_long_context)
     }
 
     /// Metric-aware state using the host's true local offset at each edge.
@@ -493,23 +508,16 @@ pub struct SummaryChartData {
     pub project_values: HashMap<String, BTreeMap<NaiveDateTime, SummaryMetrics>>,
 }
 
-fn summary_chart_value_is_lower_bound_with_local_time(
-    prepared: &PreparedSummary,
-    chart: &SummaryChartData,
-    metric: SummaryMetric,
-    api_long_context: bool,
-    local_time: &impl Fn(DateTime<Utc>) -> NaiveDateTime,
-) -> bool {
-    chart.buckets.iter().any(|bucket| {
-        prepared.chart_bucket_state_with_local_time(
-            bucket,
-            chart.grain,
-            metric,
-            api_long_context,
-            local_time,
-        ) != SummaryCoverageState::Complete
-    }) || prepared.partial(metric, api_long_context)
-        || (metric == SummaryMetric::ApiEquivalent && prepared.api_chart_is_lower_bound())
+fn partial_reason_implies_omitted_usage(reason: &str) -> bool {
+    matches!(
+        reason,
+        "rollout_scan_incomplete"
+            | "rollout_lookback_incomplete"
+            | "rollout_local_coverage_unverified"
+            | "coverage_starts_within_local_bucket"
+            | "local_scan_disabled"
+            | "range_starts_within_15m_bucket"
+    )
 }
 
 /// Earliest timestamp loaded by the shared history view. The timestamp is
@@ -1145,13 +1153,7 @@ pub fn summary_report_from_prepared_with_local_time(
             )
         })
         .collect();
-    let value_is_lower_bound = summary_chart_value_is_lower_bound_with_local_time(
-        prepared,
-        chart,
-        query.metric,
-        query.api_long_context,
-        &local_time,
-    );
+    let value_is_lower_bound = prepared.value_is_lower_bound(query.metric, query.api_long_context);
 
     SummaryReport {
         schema_version: SUMMARY_REPORT_SCHEMA_VERSION,
@@ -1598,6 +1600,64 @@ mod tests {
         }
     }
 
+    fn fully_covered_prepared_summary() -> (PreparedSummary, SummaryChartData) {
+        let starts_at = at(30, 8, 0);
+        let window = SummaryWindow::new(starts_at, starts_at + Duration::hours(1)).unwrap();
+        let totals = SummaryMetrics {
+            token_usage: token_usage(100),
+            estimated_cost_units: 500,
+            api_long_context_extra_cost_units: 50,
+            api_equivalent_cost: ApiCostAmount {
+                minimum_pico_usd: PicoUsd::new(1_000),
+                maximum_pico_usd: PicoUsd::new(1_000),
+                observed_samples: 1,
+                priced_samples: 1,
+                observed_tokens: 100,
+                priced_tokens: 100,
+            },
+            call_count: 1,
+        };
+        let coverage = SummaryDailyCoverage {
+            expected_buckets: 4,
+            covered_buckets: 4,
+            available_tokens: 100,
+            represented_tokens: 100,
+            estimated_covered_tokens: 100,
+            long_context_breakdown_complete: true,
+            source_partial: false,
+        };
+        let local_start = starts_at.naive_utc();
+        let prepared = PreparedSummary {
+            usage: UsageSummary {
+                window,
+                totals,
+                days: Vec::new(),
+                hours: Vec::new(),
+                projects: Vec::new(),
+            },
+            range_note: None,
+            represented_tokens: 100,
+            available_tokens: 100,
+            covered_buckets: 4,
+            expected_buckets: 4,
+            estimated_covered_tokens: 100,
+            long_context_breakdown_complete: true,
+            daily_coverage: BTreeMap::from([(local_start.date(), coverage.clone())]),
+            hourly_coverage: BTreeMap::from([(local_start, coverage.clone())]),
+            partial_reasons: Vec::new(),
+        };
+        let chart = SummaryChartData {
+            grain: SummaryGrain::Hour,
+            buckets: vec![SummaryChartBucket {
+                starts_at: local_start,
+                totals,
+                coverage,
+            }],
+            project_values: HashMap::new(),
+        };
+        (prepared, chart)
+    }
+
     #[test]
     fn cycle_uses_active_week_window_and_falls_back_when_stale() {
         let now = at(30, 10, 7);
@@ -1636,6 +1696,102 @@ mod tests {
         let (window, note) = SummaryRange::Cycle.window(&snapshot, now);
         assert_eq!(window.starts_at, now - Duration::days(7));
         assert_eq!(note, Some("7d fallback"));
+    }
+
+    #[test]
+    fn fully_covered_partial_reasons_do_not_imply_a_lower_bound() {
+        for reason in [
+            "cycle_window_unavailable",
+            "history_read_only",
+            "subagent_turn_attribution_unavailable",
+            "unpriced_model_rate_fallback",
+            "token_breakdown_missing",
+            "api_pricing_catalog_outdated",
+            "estimator_revision_changed",
+            "history_bucket_open",
+        ] {
+            let (mut prepared, mut chart) = fully_covered_prepared_summary();
+            prepared.partial_reasons = vec![reason.to_string()];
+            if matches!(
+                reason,
+                "subagent_turn_attribution_unavailable"
+                    | "unpriced_model_rate_fallback"
+                    | "token_breakdown_missing"
+                    | "history_bucket_open"
+            ) {
+                chart.buckets[0].coverage.source_partial = true;
+            }
+
+            assert!(prepared.partial(SummaryMetric::Tokens, false), "{reason}");
+            for metric in SummaryMetric::ALL {
+                assert!(
+                    !prepared.chart_value_is_lower_bound(&chart, metric, false),
+                    "{reason} incorrectly lowered {metric:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_bound_is_metric_specific() {
+        let (mut prepared, chart) = fully_covered_prepared_summary();
+        assert!(
+            SummaryMetric::ALL
+                .into_iter()
+                .all(|metric| { !prepared.chart_value_is_lower_bound(&chart, metric, false) })
+        );
+
+        prepared.estimated_covered_tokens = 99;
+        assert!(!prepared.value_is_lower_bound(SummaryMetric::Tokens, false));
+        assert!(prepared.value_is_lower_bound(SummaryMetric::Estimated, false));
+        assert!(!prepared.value_is_lower_bound(SummaryMetric::ApiEquivalent, false));
+
+        let (mut prepared, _) = fully_covered_prepared_summary();
+        prepared.long_context_breakdown_complete = false;
+        assert!(!prepared.value_is_lower_bound(SummaryMetric::Estimated, false));
+        assert!(prepared.value_is_lower_bound(SummaryMetric::Estimated, true));
+
+        let (mut prepared, _) = fully_covered_prepared_summary();
+        prepared.usage.totals.api_equivalent_cost.priced_samples = 0;
+        assert!(!prepared.value_is_lower_bound(SummaryMetric::Tokens, false));
+        assert!(!prepared.value_is_lower_bound(SummaryMetric::Estimated, false));
+        assert!(prepared.value_is_lower_bound(SummaryMetric::ApiEquivalent, false));
+
+        let (mut prepared, _) = fully_covered_prepared_summary();
+        prepared.represented_tokens = 99;
+        assert!(
+            SummaryMetric::ALL
+                .into_iter()
+                .all(|metric| { prepared.value_is_lower_bound(metric, false) })
+        );
+
+        let (mut prepared, _) = fully_covered_prepared_summary();
+        prepared.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        assert!(
+            SummaryMetric::ALL
+                .into_iter()
+                .all(|metric| { prepared.value_is_lower_bound(metric, false) })
+        );
+    }
+
+    #[test]
+    fn clipped_calendar_bucket_does_not_lower_bound_exact_range_total() {
+        let (mut prepared, mut chart) = fully_covered_prepared_summary();
+        prepared.usage.window = SummaryWindow::new(at(30, 8, 15), at(30, 9, 15)).unwrap();
+        chart.grain = SummaryGrain::Day;
+        chart.buckets[0].starts_at = at(30, 0, 0).naive_utc();
+
+        assert_eq!(
+            prepared.chart_bucket_state_with_local_time(
+                &chart.buckets[0],
+                SummaryGrain::Day,
+                SummaryMetric::Tokens,
+                false,
+                |timestamp| timestamp.naive_utc(),
+            ),
+            SummaryCoverageState::Partial
+        );
+        assert!(!prepared.chart_value_is_lower_bound(&chart, SummaryMetric::Tokens, false));
     }
 
     #[test]

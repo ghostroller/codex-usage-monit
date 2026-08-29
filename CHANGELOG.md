@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file.
 - Shared Summary and Trends query derivation between CLI and TUI, including reset-cycle boundaries, partial/coverage semantics, local-wall-clock Summary buckets, and the namespace-scoped automatic 31-day backfill for incomplete `summary --range 30d` history.
 - Defined one-shot report exit semantics as `0` for complete, `2` for usable partial, and `1` when no requested data is usable; unified health reports use `0` or `2` during normal reporting.
 - Kept exact Summary metrics/values and Trends token readouts lossless in JSON with decimal strings, exposed Summary lower-bound state and recent service heartbeat explicitly, and persisted incomplete backfill cooldown markers after warning-bearing writes.
+- Preserved the current Summary/Trends observation in memory when history persistence is unavailable, and limited `valueIsLowerBound` to selected values with omitted non-negative contributions instead of treating every partial diagnostic or clipped chart edge as a lower bound.
 - Hardened report-path handling for non-Unicode paths and output aliases, including actual macOS volume case semantics, Unicode-aware comparisons, and Windows 128-bit file identities.
 
 ## [0.3.1] - 2026-08-29
