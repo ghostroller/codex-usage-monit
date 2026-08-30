@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::api_cost::pricing_metadata;
-use crate::app_server::fetch_account_snapshot;
+use crate::app_server::fetch_account_snapshot_as_of;
 use crate::attribution::{analyze_windows, project_five_hour_analysis};
 use crate::config::CollectConfig;
 use crate::domain::{
@@ -47,6 +47,25 @@ fn sources_run_in_parallel(scan_local: bool, refresh_account: bool, offline: boo
     scan_local && refresh_account && !offline
 }
 
+fn next_account_evidence_boundary(
+    account: Option<&AccountSnapshot>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let account = account?;
+    account
+        .limits
+        .iter()
+        .map(|bucket| bucket.as_of)
+        .chain(
+            account
+                .rate_limit_reset_credits
+                .iter()
+                .map(|reset_credits| reset_credits.as_of),
+        )
+        .filter(|timestamp| *timestamp > now)
+        .min()
+}
+
 fn rollout_dataset_complete(dataset: &RolloutDataset) -> bool {
     dataset.stats.truncated_files == 0
         && dataset.stats.unreadable_files == 0
@@ -76,6 +95,7 @@ fn collect_local_source(
     scan_local: bool,
     rollout_cache: Option<&mut RolloutCache>,
     only_if_changed: bool,
+    next_external_boundary: Option<DateTime<Utc>>,
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
     let collection = if scan_local {
@@ -83,9 +103,15 @@ fn collect_local_source(
             match rollout_cache {
                 Some(cache) => {
                     let result = if only_if_changed {
-                        cache.scan_if_changed(config, now)
+                        cache.scan_if_changed_with_external_boundary(
+                            config,
+                            now,
+                            next_external_boundary,
+                        )
                     } else {
-                        cache.scan(config, now).map(Some)
+                        cache
+                            .scan_with_external_boundary(config, now, next_external_boundary)
+                            .map(Some)
                     };
                     let local_coverage_starts_at = match &result {
                         Ok(Some(dataset)) => {
@@ -194,10 +220,10 @@ fn collect_local_source(
     collection
 }
 
-fn fetch_account_source(config: &CollectConfig) -> AccountCollection {
+fn fetch_account_source(config: &CollectConfig, as_of: DateTime<Utc>) -> AccountCollection {
     let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let span = config.startup_trace.span("snapshot.account_fetch");
-    let result = fetch_account_snapshot(config);
+    let result = fetch_account_snapshot_as_of(config, as_of);
     span.finish_with(|| match &result {
         Ok(account) => format!(
             "status={} refresh=true parallel=true buckets={} reset_credits={} usage={}",
@@ -285,13 +311,14 @@ fn collect_snapshot_with_local(
     cached_account: Option<AccountSnapshot>,
     refresh_account: bool,
     scan_local: bool,
-    rollout_cache: Option<&mut RolloutCache>,
+    mut rollout_cache: Option<&mut RolloutCache>,
     only_if_changed: bool,
 ) -> Option<CollectionResult> {
     debug_assert!(!only_if_changed || !refresh_account);
     let total_started = config.startup_trace.is_active().then(Instant::now);
     let perf_started = config.perf_log.is_enabled().then(Instant::now);
     let now = Utc::now();
+    let next_external_boundary = next_account_evidence_boundary(cached_account.as_ref(), now);
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
@@ -299,14 +326,30 @@ fn collect_snapshot_with_local(
     let parallel_sources = sources_run_in_parallel(scan_local, refresh_account, config.offline);
     let (local, prefetched_account, parallel_account_us) = if parallel_sources {
         let (local, account) = run_sources_in_parallel(
-            || collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
-            || fetch_account_source(config),
+            || {
+                collect_local_source(
+                    config,
+                    now,
+                    scan_local,
+                    rollout_cache.as_deref_mut(),
+                    only_if_changed,
+                    next_external_boundary,
+                )
+            },
+            || fetch_account_source(config, now),
         );
         let account = flatten_account_thread(account);
         (local, Some(account.result), account.elapsed_us)
     } else {
         (
-            collect_local_source(config, now, scan_local, rollout_cache, only_if_changed),
+            collect_local_source(
+                config,
+                now,
+                scan_local,
+                rollout_cache.as_deref_mut(),
+                only_if_changed,
+                next_external_boundary,
+            ),
             None,
             0,
         )
@@ -354,7 +397,8 @@ fn collect_snapshot_with_local(
             message: Some("disabled by --offline".to_string()),
         });
     } else if refresh_account {
-        let refresh_result = prefetched_account.unwrap_or_else(|| fetch_account_snapshot(config));
+        let refresh_result =
+            prefetched_account.unwrap_or_else(|| fetch_account_snapshot_as_of(config, now));
         match refresh_result {
             Ok(mut fresh) => {
                 account_status = if fresh.errors.is_empty() && fresh.warnings.is_empty() {
@@ -397,9 +441,12 @@ fn collect_snapshot_with_local(
         }
     } else {
         account_status = "cached";
+        let has_cached_account_data = !account.limits.is_empty()
+            || account.rate_limit_reset_credits.is_some()
+            || account.usage.is_some();
         sources.push(SourceStatus {
             source: "app_server".to_string(),
-            status: if account.limits.is_empty() {
+            status: if !has_cached_account_data {
                 "stale".to_string()
             } else if account.errors.is_empty() && account.warnings.is_empty() {
                 "cached".to_string()
@@ -407,7 +454,7 @@ fn collect_snapshot_with_local(
                 "partial".to_string()
             },
             as_of: now,
-            message: if account.limits.is_empty() {
+            message: if !has_cached_account_data {
                 Some("no cached account snapshot".to_string())
             } else {
                 None
@@ -435,12 +482,64 @@ fn collect_snapshot_with_local(
     warnings.extend(account.warnings.clone());
     errors.extend(account.errors.clone());
 
-    let limits = if account.limits.is_empty() && scan_local {
+    // Account snapshots are cached across refreshes. If the wall clock moves
+    // backwards, a perfectly valid cached sample can temporarily belong to a
+    // future as-of. Keep it in `account` so it becomes usable again when the
+    // clock catches up, but never let it describe the current snapshot.
+    let future_account_limits = account
+        .limits
+        .iter()
+        .filter(|bucket| bucket.as_of > now)
+        .count();
+    if future_account_limits > 0 {
+        warnings.push(format!(
+            "ignored {future_account_limits} cached account quota bucket(s) dated after the snapshot as-of; the cache was retained for clock recovery"
+        ));
+    }
+    let current_account_limits = account
+        .limits
+        .iter()
+        .filter(|bucket| bucket.as_of <= now)
+        .cloned()
+        .collect::<Vec<_>>();
+    let future_reset_credits = account
+        .rate_limit_reset_credits
+        .as_ref()
+        .is_some_and(|reset_credits| reset_credits.as_of > now);
+    if future_reset_credits {
+        warnings.push(
+            "ignored cached reset-credit data dated after the snapshot as-of; the cache was retained for clock recovery"
+                .to_string(),
+        );
+    }
+    let current_reset_credits = account
+        .rate_limit_reset_credits
+        .as_ref()
+        .filter(|reset_credits| reset_credits.as_of <= now)
+        .cloned();
+
+    if let Some(source) = sources
+        .iter_mut()
+        .find(|source| source.source == "app_server")
+    {
+        source.as_of = now;
+        let has_current_account_data = !current_account_limits.is_empty()
+            || current_reset_credits.is_some()
+            || account.usage.is_some();
+        let ignored_future_data = future_account_limits > 0 || future_reset_credits;
+        adjust_account_source_for_as_of(
+            source,
+            account_status,
+            has_current_account_data,
+            ignored_future_data,
+        );
+    }
+    let limits = if current_account_limits.is_empty() && scan_local {
         fallback_limits(&dataset, now)
     } else {
-        account.limits.clone()
+        current_account_limits
     };
-    if quota_sources_disagree(&dataset.rate_observations, &limits) {
+    if quota_sources_disagree(&dataset.rate_observations, &limits, now) {
         warnings.push(
             "rollout quota snapshots disagree with the selected quota snapshot; estimates use the selected current codex gauge"
                 .to_string(),
@@ -502,6 +601,8 @@ fn collect_snapshot_with_local(
 
     let partial = !errors.is_empty()
         || limits.is_empty()
+        || future_account_limits > 0
+        || future_reset_credits
         || limits
             .iter()
             .any(|bucket| matches!(bucket.provenance, Provenance::Stale | Provenance::Unknown))
@@ -557,8 +658,9 @@ fn collect_snapshot_with_local(
             codex_home: config.codex_home.clone(),
             sources,
             limits,
-            rate_limit_reset_credits: account.rate_limit_reset_credits.clone(),
-            rate_limit_reset_credits_partial: account.rate_limit_reset_credits_partial,
+            rate_limit_reset_credits: current_reset_credits,
+            rate_limit_reset_credits_partial: account.rate_limit_reset_credits_partial
+                || future_reset_credits,
             account_usage: account.usage.clone(),
             tasks,
             turns,
@@ -572,6 +674,12 @@ fn collect_snapshot_with_local(
         account,
         history_observation,
     };
+    if let Some(cache) = rollout_cache {
+        cache.set_external_boundary(
+            now,
+            next_account_evidence_boundary(Some(&result.account), now),
+        );
+    }
     derive_span.finish_with(|| {
         format!(
             "partial={} limits={} windows={} warnings={} errors={}",
@@ -613,6 +721,46 @@ fn collect_snapshot_with_local(
             });
     }
     Some(result)
+}
+
+fn adjust_account_source_for_as_of(
+    source: &mut SourceStatus,
+    account_status: &str,
+    has_current_account_data: bool,
+    ignored_future_data: bool,
+) {
+    match account_status {
+        "cached" if !has_current_account_data => {
+            source.status = "stale".to_string();
+            source.message = Some(
+                "cached account data is dated after the snapshot as-of or unavailable".to_string(),
+            );
+        }
+        "cached" if ignored_future_data => {
+            source.status = "partial".to_string();
+            source.message =
+                Some("some cached account data is dated after the snapshot as-of".to_string());
+        }
+        "error" if !has_current_account_data => {
+            source.status = "error".to_string();
+        }
+        "error" => {
+            source.status = "stale".to_string();
+        }
+        "ok" | "partial" if !has_current_account_data => {
+            source.status = "error".to_string();
+            source.message = Some(
+                "app-server refresh produced no account data usable at the snapshot as-of"
+                    .to_string(),
+            );
+        }
+        "ok" | "partial" if ignored_future_data => {
+            source.status = "partial".to_string();
+            source.message =
+                Some("some account data is dated after the snapshot as-of".to_string());
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,15 +895,24 @@ fn preserve_omitted_reset_credits(
     let Some(cached_reset_credits) = &cached.rate_limit_reset_credits else {
         return;
     };
-    let Some(unexpired) = unexpired_cached_reset_credit_details(cached_reset_credits, as_of) else {
-        return;
-    };
+    fresh.rate_limit_reset_credits = reset_credits_for_failed_refresh(cached_reset_credits, as_of);
+    fresh.rate_limit_reset_credits_partial = true;
+}
 
-    let mut preserved = cached_reset_credits.clone();
+fn reset_credits_for_failed_refresh(
+    cached: &RateLimitResetCreditsSnapshot,
+    as_of: DateTime<Utc>,
+) -> Option<RateLimitResetCreditsSnapshot> {
+    if cached.as_of > as_of {
+        let mut preserved = cached.clone();
+        preserved.provenance = Provenance::Stale;
+        return Some(preserved);
+    }
+    let unexpired = unexpired_cached_reset_credit_details(cached, as_of)?;
+    let mut preserved = cached.clone();
     preserved.credits = Some(unexpired);
     preserved.provenance = Provenance::Stale;
-    fresh.rate_limit_reset_credits = Some(preserved);
-    fresh.rate_limit_reset_credits_partial = true;
+    Some(preserved)
 }
 
 fn unexpired_cached_reset_credit_details(
@@ -797,24 +954,23 @@ fn mark_account_data_stale(account: &mut AccountSnapshot, now: DateTime<Utc>) {
     let reset_credits = account
         .rate_limit_reset_credits
         .as_ref()
-        .and_then(|cached| {
-            let unexpired = unexpired_cached_reset_credit_details(cached, now)?;
-            let mut preserved = cached.clone();
-            preserved.credits = Some(unexpired);
-            preserved.provenance = Provenance::Stale;
-            Some(preserved)
-        });
+        .and_then(|cached| reset_credits_for_failed_refresh(cached, now));
     account.rate_limit_reset_credits = reset_credits;
     account.rate_limit_reset_credits_partial = true;
 }
 
-fn quota_sources_disagree(observations: &[RateObservation], limits: &[LimitBucket]) -> bool {
+fn quota_sources_disagree(
+    observations: &[RateObservation],
+    limits: &[LimitBucket],
+    now: DateTime<Utc>,
+) -> bool {
     limits
         .iter()
         .filter(|bucket| bucket.provenance == Provenance::ServerSnapshot)
         .any(|bucket| {
             let matching = observations
                 .iter()
+                .filter(|observation| observation.timestamp <= now)
                 .filter(|observation| observation.limit_id == bucket.limit_id)
                 .filter(|observation| observation.provenance != Provenance::ServerSnapshot);
             [
@@ -881,7 +1037,11 @@ fn merge_account_observations(
 
 fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBucket> {
     let mut latest_by_bucket: BTreeMap<String, &RateObservation> = BTreeMap::new();
-    for observation in &dataset.rate_observations {
+    for observation in dataset
+        .rate_observations
+        .iter()
+        .filter(|observation| observation.timestamp <= now)
+    {
         let key = observation.limit_id.trim().to_ascii_lowercase();
         let replace = latest_by_bucket
             .get(&key)
@@ -902,7 +1062,7 @@ fn fallback_limits(dataset: &RolloutDataset, now: DateTime<Utc>) -> Vec<LimitBuc
             credits: None,
             rate_limit_reached_type: None,
             provenance: Provenance::Stale,
-            as_of: observation.timestamp.min(now),
+            as_of: observation.timestamp,
         })
         .collect()
 }
@@ -1413,6 +1573,48 @@ mod tests {
     }
 
     #[test]
+    fn future_reset_credits_survive_failed_refresh_for_clock_recovery() {
+        let now = Utc::now();
+        let observed_at = now + Duration::hours(1);
+        let cached_credit = reset_credit(observed_at, Some(observed_at + Duration::days(1)));
+        let cached = AccountSnapshot {
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 1,
+                credits: Some(vec![cached_credit.clone()]),
+                provenance: Provenance::ServerSnapshot,
+                as_of: observed_at,
+            }),
+            ..AccountSnapshot::default()
+        };
+        let mut failed_refresh = AccountSnapshot {
+            errors: vec!["rate limit unavailable".to_string()],
+            ..AccountSnapshot::default()
+        };
+
+        preserve_cached_account_data(&mut failed_refresh, &cached, now);
+
+        let preserved = failed_refresh.rate_limit_reset_credits.as_ref().unwrap();
+        assert_eq!(preserved.as_of, observed_at);
+        assert_eq!(
+            preserved.credits.as_deref(),
+            Some([cached_credit].as_slice())
+        );
+        assert_eq!(preserved.provenance, Provenance::Stale);
+        assert!(failed_refresh.rate_limit_reset_credits_partial);
+
+        let mut stale = cached;
+        mark_account_data_stale(&mut stale, now);
+        assert_eq!(
+            stale.rate_limit_reset_credits.as_ref().unwrap().as_of,
+            observed_at
+        );
+        assert_eq!(
+            stale.rate_limit_reset_credits.as_ref().unwrap().provenance,
+            Provenance::Stale
+        );
+    }
+
+    #[test]
     fn failed_limits_refresh_does_not_preserve_expired_reset_details() {
         let now = Utc::now();
         let cached = AccountSnapshot {
@@ -1470,6 +1672,32 @@ mod tests {
     }
 
     #[test]
+    fn cached_reset_credits_without_limits_are_still_a_cached_account_source() {
+        let now = Utc::now();
+        let cached = AccountSnapshot {
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 1,
+                credits: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: now,
+            }),
+            ..AccountSnapshot::default()
+        };
+
+        let result = collect_limits_snapshot(&CollectConfig::default(), Some(cached), false);
+
+        let source = result
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "app_server")
+            .unwrap();
+        assert_eq!(source.status, "cached");
+        assert!(source.message.is_none());
+        assert!(result.snapshot.rate_limit_reset_credits.is_some());
+    }
+
+    #[test]
     fn rollout_fallback_keeps_the_latest_observation_for_each_bucket() {
         let now = Utc::now();
         let observation = |limit_id: &str, minutes_ago: i64, used_percent: f64| RateObservation {
@@ -1512,6 +1740,223 @@ mod tests {
                 .iter()
                 .all(|bucket| bucket.provenance == Provenance::Stale)
         );
+    }
+
+    #[test]
+    fn rollout_fallback_ignores_observations_after_as_of() {
+        let now = Utc::now();
+        let observation =
+            |limit_id: &str, timestamp: DateTime<Utc>, used_percent: f64| RateObservation {
+                timestamp,
+                thread_id: "thread".to_string(),
+                turn_id: None,
+                limit_id: limit_id.to_string(),
+                primary: Some(LimitWindow::new(
+                    used_percent,
+                    Some(300),
+                    Some(now + Duration::hours(2)),
+                )),
+                secondary: None,
+                provenance: Provenance::LocalExact,
+            };
+        let dataset = RolloutDataset {
+            rate_observations: vec![
+                observation("codex", now - Duration::minutes(1), 20.0),
+                observation("codex", now + Duration::hours(1), 90.0),
+                observation("future-only", now + Duration::hours(1), 75.0),
+            ],
+            ..RolloutDataset::default()
+        };
+
+        let limits = fallback_limits(&dataset, now);
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].limit_id, "codex");
+        assert_eq!(limits[0].as_of, now - Duration::minutes(1));
+        assert_eq!(limits[0].primary.as_ref().unwrap().used_percent, 20.0);
+    }
+
+    #[test]
+    fn cached_account_limits_after_as_of_stay_cached_but_not_visible() {
+        let observed_at = Utc::now();
+        let current = weekly_limit(
+            observed_at - Duration::minutes(1),
+            observed_at + Duration::days(2),
+            "codex",
+            20.0,
+        );
+        let future = weekly_limit(
+            observed_at + Duration::days(1),
+            observed_at + Duration::days(3),
+            "future-only",
+            90.0,
+        );
+        let cached = AccountSnapshot {
+            limits: vec![current, future],
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 1,
+                credits: Some(Vec::new()),
+                provenance: Provenance::ServerSnapshot,
+                as_of: observed_at + Duration::days(1),
+            }),
+            ..AccountSnapshot::default()
+        };
+        let config = CollectConfig::default();
+
+        let result = collect_limits_snapshot(&config, Some(cached), false);
+
+        assert_eq!(result.snapshot.limits.len(), 1);
+        assert_eq!(result.snapshot.limits[0].limit_id, "codex");
+        assert!(
+            result
+                .snapshot
+                .limits
+                .iter()
+                .all(|bucket| bucket.as_of <= result.snapshot.as_of)
+        );
+        assert_eq!(result.account.limits.len(), 2);
+        assert!(result.snapshot.rate_limit_reset_credits.is_none());
+        assert!(result.snapshot.rate_limit_reset_credits_partial);
+        assert!(result.account.rate_limit_reset_credits.is_some());
+        let source = result
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "app_server")
+            .unwrap();
+        assert_eq!(source.status, "partial");
+        assert!(result.snapshot.warnings.iter().any(|warning| {
+            warning.contains("cached account quota bucket")
+                && warning.contains("retained for clock recovery")
+        }));
+        assert!(
+            result
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cached reset-credit data"))
+        );
+
+        let future_only = AccountSnapshot {
+            limits: result
+                .account
+                .limits
+                .into_iter()
+                .filter(|bucket| bucket.limit_id == "future-only")
+                .collect(),
+            rate_limit_reset_credits: result.account.rate_limit_reset_credits,
+            ..AccountSnapshot::default()
+        };
+        let future_only = collect_limits_snapshot(&config, Some(future_only), false);
+        assert!(future_only.snapshot.limits.is_empty());
+        assert!(future_only.snapshot.rate_limit_reset_credits.is_none());
+        let source = future_only
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "app_server")
+            .unwrap();
+        assert_eq!(source.status, "stale");
+    }
+
+    #[test]
+    fn account_evidence_boundary_tracks_the_earliest_future_sample() {
+        let now = Utc::now();
+        let reset_boundary = now + Duration::minutes(1);
+        let limit_boundary = now + Duration::minutes(2);
+        let account = AccountSnapshot {
+            limits: vec![
+                weekly_limit(now, now + Duration::days(1), "current", 20.0),
+                weekly_limit(
+                    limit_boundary,
+                    limit_boundary + Duration::days(1),
+                    "future",
+                    40.0,
+                ),
+            ],
+            rate_limit_reset_credits: Some(RateLimitResetCreditsSnapshot {
+                available_count: 1,
+                credits: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: reset_boundary,
+            }),
+            ..AccountSnapshot::default()
+        };
+
+        assert_eq!(
+            next_account_evidence_boundary(Some(&account), now),
+            Some(reset_boundary)
+        );
+        assert_eq!(
+            next_account_evidence_boundary(Some(&account), reset_boundary),
+            Some(limit_boundary)
+        );
+        assert_eq!(
+            next_account_evidence_boundary(Some(&account), limit_boundary),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_refresh_with_only_future_data_is_reported_as_error() {
+        for account_status in ["ok", "partial"] {
+            let mut source = SourceStatus {
+                source: "app_server".to_string(),
+                status: account_status.to_string(),
+                as_of: Utc::now(),
+                message: None,
+            };
+
+            adjust_account_source_for_as_of(&mut source, account_status, false, true);
+
+            assert_eq!(source.status, "error");
+            assert!(
+                source
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("no account data usable"))
+            );
+        }
+    }
+
+    #[test]
+    fn quota_disagreement_ignores_future_observations_at_clock_rollback_boundary() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(2);
+        let limits = vec![LimitBucket {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            plan_type: None,
+            primary: Some(LimitWindow::new(20.0, Some(300), Some(reset))),
+            secondary: None,
+            credits: None,
+            rate_limit_reached_type: None,
+            provenance: Provenance::ServerSnapshot,
+            as_of: now,
+        }];
+        let observation = |timestamp: DateTime<Utc>, used_percent: f64| RateObservation {
+            timestamp,
+            thread_id: "thread".to_string(),
+            turn_id: None,
+            limit_id: "codex".to_string(),
+            primary: Some(LimitWindow::new(used_percent, Some(300), Some(reset))),
+            secondary: None,
+            provenance: Provenance::LocalExact,
+        };
+
+        assert!(!quota_sources_disagree(
+            &[
+                observation(now - Duration::seconds(1), 20.0),
+                observation(now + Duration::seconds(1), 90.0),
+            ],
+            &limits,
+            now,
+        ));
+        assert!(quota_sources_disagree(
+            &[observation(now, 90.0)],
+            &limits,
+            now,
+        ));
     }
 
     #[test]

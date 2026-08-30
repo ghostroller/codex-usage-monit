@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,6 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Utc};
 #[cfg(test)]
 use chrono::{FixedOffset, Timelike};
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -44,9 +46,12 @@ mod text;
 
 use geometry::{reveal_offset, scale_rounded, scroll_offset, scrollbar_geometry};
 use stacked_area::{StackedArea, StackedAreaSeries, StackedAreaState, date_index_at_column};
+#[cfg(test)]
+use text::byte_index_at_grapheme;
 use text::{
-    byte_index_at_char, compact_search_text, search_cursor_window, short_thread_id,
-    truncate_display_text, truncate_middle_display_text,
+    backspace_grapheme, compact_search_text, delete_grapheme, grapheme_count,
+    insert_at_grapheme_cursor, search_cursor_window, short_thread_id, truncate_display_text,
+    truncate_middle_display_text,
 };
 
 #[cfg(test)]
@@ -1601,7 +1606,10 @@ impl RefreshWorker {
 
 impl Drop for RefreshWorker {
     fn drop(&mut self) {
-        self.join();
+        // Error and unwind paths must not delay TerminalGuard restoration on
+        // an in-flight refresh. Completed workers are joined explicitly when
+        // their completion is received; dropping only detaches unfinished work.
+        self.detach();
     }
 }
 
@@ -1644,7 +1652,8 @@ struct RecorderHealth {
     error: Option<String>,
 }
 
-struct RunLoopChannels<'a> {
+struct RunLoopContext<'a> {
+    termination: &'a TerminationSignal,
     refresh_sender: &'a mpsc::Sender<RefreshCompletion>,
     refresh_receiver: &'a Receiver<RefreshCompletion>,
     resume_sender: &'a mpsc::Sender<ResumeLaunchCompletion>,
@@ -2841,7 +2850,7 @@ impl App {
         if self.focus != Focus::TaskSearch {
             self.transition_to_tasks();
             self.task_search_before_edit.clone_from(&self.task_search);
-            self.task_search_cursor = self.task_search.chars().count();
+            self.task_search_cursor = grapheme_count(&self.task_search);
             self.task_search_restore_thread_id = self.selected_thread_id().map(str::to_string);
             self.task_search_restore_turn_id =
                 self.selected_turn_record().map(|turn| turn.turn_id.clone());
@@ -2867,7 +2876,7 @@ impl App {
             let restore_task_offset = self.task_search_restore_task_offset;
             let restore_turn_offset = self.task_search_restore_turn_offset;
             self.task_search.clone_from(&self.task_search_before_edit);
-            self.task_search_cursor = self.task_search.chars().count();
+            self.task_search_cursor = grapheme_count(&self.task_search);
             self.focus = Focus::Tasks;
             let visible_tasks = self.filtered_task_indices();
             let restored_task = restore_thread_id.as_deref().and_then(|thread_id| {
@@ -2910,31 +2919,26 @@ impl App {
 
     fn insert_task_search(&mut self, character: char) {
         if !character.is_control() {
-            let byte_index = byte_index_at_char(&self.task_search, self.task_search_cursor);
-            self.task_search.insert(byte_index, character);
-            self.task_search_cursor += 1;
+            insert_at_grapheme_cursor(
+                &mut self.task_search,
+                &mut self.task_search_cursor,
+                character,
+            );
             self.reconcile_task_filter(true);
         }
     }
 
     fn backspace_task_search(&mut self) {
-        if self.task_search_cursor == 0 {
+        if !backspace_grapheme(&mut self.task_search, &mut self.task_search_cursor) {
             return;
         }
-        let start = byte_index_at_char(&self.task_search, self.task_search_cursor - 1);
-        let end = byte_index_at_char(&self.task_search, self.task_search_cursor);
-        self.task_search.replace_range(start..end, "");
-        self.task_search_cursor -= 1;
         self.reconcile_task_filter(true);
     }
 
     fn delete_task_search(&mut self) {
-        if self.task_search_cursor >= self.task_search.chars().count() {
+        if !delete_grapheme(&mut self.task_search, &mut self.task_search_cursor) {
             return;
         }
-        let start = byte_index_at_char(&self.task_search, self.task_search_cursor);
-        let end = byte_index_at_char(&self.task_search, self.task_search_cursor + 1);
-        self.task_search.replace_range(start..end, "");
         self.reconcile_task_filter(true);
     }
 
@@ -2973,7 +2977,7 @@ impl App {
     fn begin_turn_search(&mut self) {
         if self.focus != Focus::TurnSearch && self.turns_visible() {
             self.turn_search_before_edit.clone_from(&self.turn_search);
-            self.turn_search_cursor = self.turn_search.chars().count();
+            self.turn_search_cursor = grapheme_count(&self.turn_search);
             self.turn_search_restore_turn_id =
                 self.selected_turn_record().map(|turn| turn.turn_id.clone());
             self.turn_search_restore_offset = self.turn_offset;
@@ -2995,7 +2999,7 @@ impl App {
         let restore_turn_id = self.turn_search_restore_turn_id.take();
         let restore_offset = self.turn_search_restore_offset;
         self.turn_search.clone_from(&self.turn_search_before_edit);
-        self.turn_search_cursor = self.turn_search.chars().count();
+        self.turn_search_cursor = grapheme_count(&self.turn_search);
         self.focus = Focus::Turns;
         self.reconcile_turn_filter(false, restore_turn_id.as_deref());
         let turn_count = self.selected_task_turn_count();
@@ -3012,32 +3016,28 @@ impl App {
             return;
         }
         let selected = self.selected_turn_record().map(|turn| turn.turn_id.clone());
-        let byte_index = byte_index_at_char(&self.turn_search, self.turn_search_cursor);
-        self.turn_search.insert(byte_index, character);
-        self.turn_search_cursor += 1;
+        insert_at_grapheme_cursor(
+            &mut self.turn_search,
+            &mut self.turn_search_cursor,
+            character,
+        );
         self.reconcile_turn_filter(true, selected.as_deref());
     }
 
     fn backspace_turn_search(&mut self) {
-        if self.turn_search_cursor == 0 {
+        let selected = self.selected_turn_record().map(|turn| turn.turn_id.clone());
+        if !backspace_grapheme(&mut self.turn_search, &mut self.turn_search_cursor) {
             return;
         }
-        let selected = self.selected_turn_record().map(|turn| turn.turn_id.clone());
-        let start = byte_index_at_char(&self.turn_search, self.turn_search_cursor - 1);
-        let end = byte_index_at_char(&self.turn_search, self.turn_search_cursor);
-        self.turn_search.replace_range(start..end, "");
-        self.turn_search_cursor -= 1;
         self.reconcile_turn_filter(true, selected.as_deref());
     }
 
     fn delete_turn_search(&mut self) {
-        if self.turn_search_cursor >= self.turn_search.chars().count() {
+        if self.turn_search_cursor >= grapheme_count(&self.turn_search) {
             return;
         }
         let selected = self.selected_turn_record().map(|turn| turn.turn_id.clone());
-        let start = byte_index_at_char(&self.turn_search, self.turn_search_cursor);
-        let end = byte_index_at_char(&self.turn_search, self.turn_search_cursor + 1);
-        self.turn_search.replace_range(start..end, "");
+        let _ = delete_grapheme(&mut self.turn_search, &mut self.turn_search_cursor);
         self.reconcile_turn_filter(true, selected.as_deref());
     }
 
@@ -4674,12 +4674,15 @@ fn view_tabs_hitbox(area: Rect) -> ViewTabsHitbox {
         } else {
             view.label()
         };
-        let width = UnicodeWidthStr::width(TAB_PADDING)
-            + 2
-            + UnicodeWidthStr::width(label)
-            + UnicodeWidthStr::width(TAB_PADDING);
+        let label_width = UnicodeWidthChar::width(view.shortcut()).unwrap_or(0)
+            + UnicodeWidthStr::width(" ")
+            + UnicodeWidthStr::width(label);
+        let width =
+            UnicodeWidthStr::width(TAB_PADDING) + label_width + UnicodeWidthStr::width(TAB_PADDING);
         let width = u16::try_from(width).unwrap_or(u16::MAX);
-        tabs[view.index()] = fully_visible_horizontal_hitbox(area, x, width);
+        let label_offset = u16::try_from(UnicodeWidthStr::width(TAB_PADDING)).unwrap_or(u16::MAX);
+        let label_width = u16::try_from(label_width).unwrap_or(u16::MAX);
+        tabs[view.index()] = tab_label_hitbox(area, x, width, label_offset, label_width);
         x = x.saturating_add(width);
         if position + 1 < View::ALL.len() {
             x = x.saturating_add(
@@ -4698,7 +4701,8 @@ fn view_tabs_compact(width: u16) -> bool {
         .into_iter()
         .map(|view| {
             UnicodeWidthStr::width(TAB_PADDING)
-                + 2
+                + UnicodeWidthChar::width(view.shortcut()).unwrap_or(0)
+                + UnicodeWidthStr::width(" ")
                 + UnicodeWidthStr::width(view.label())
                 + UnicodeWidthStr::width(TAB_PADDING)
         })
@@ -4719,14 +4723,23 @@ fn clipped_horizontal_hitbox(area: Rect, x: u16, width: u16) -> Rect {
     )
 }
 
-fn fully_visible_horizontal_hitbox(area: Rect, x: u16, width: u16) -> Rect {
-    let Some(end) = x.checked_add(width) else {
+fn tab_label_hitbox(
+    area: Rect,
+    x: u16,
+    rendered_width: u16,
+    label_offset: u16,
+    label_width: u16,
+) -> Rect {
+    let Some(label_end) = x
+        .checked_add(label_offset)
+        .and_then(|start| start.checked_add(label_width))
+    else {
         return Rect::default();
     };
-    if area.height == 0 || x < area.x || end > area.right() {
+    if area.height == 0 || x < area.x || label_end > area.right() {
         Rect::default()
     } else {
-        Rect::new(x, area.y, width, 1)
+        clipped_horizontal_hitbox(area, x, rendered_width)
     }
 }
 
@@ -4779,10 +4792,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Right => {
                 app.task_search_cursor =
-                    (app.task_search_cursor + 1).min(app.task_search.chars().count());
+                    (app.task_search_cursor + 1).min(grapheme_count(&app.task_search));
             }
             KeyCode::Home => app.task_search_cursor = 0,
-            KeyCode::End => app.task_search_cursor = app.task_search.chars().count(),
+            KeyCode::End => app.task_search_cursor = grapheme_count(&app.task_search),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -4806,10 +4819,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Right => {
                 app.turn_search_cursor =
-                    (app.turn_search_cursor + 1).min(app.turn_search.chars().count());
+                    (app.turn_search_cursor + 1).min(grapheme_count(&app.turn_search));
             }
             KeyCode::Home => app.turn_search_cursor = 0,
-            KeyCode::End => app.turn_search_cursor = app.turn_search.chars().count(),
+            KeyCode::End => app.turn_search_cursor = grapheme_count(&app.turn_search),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -5134,8 +5147,9 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
 fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>) -> Result<()> {
     let (ui_state_store, rollout_cache, history_store, mut app) =
         prepare_initial_tui(&config, theme_override);
+    let termination = TerminationSignal::install()?;
     let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     terminal_enter_span.finish("backend=crossterm");
     let terminal_setup_span = config.startup_trace.span("tui.terminal_setup");
     let backend = CrosstermBackend::new(io::stdout());
@@ -5145,7 +5159,8 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
 
     let (sender, receiver) = mpsc::channel::<RefreshCompletion>();
     let (resume_sender, resume_receiver) = mpsc::channel::<ResumeLaunchCompletion>();
-    let channels = RunLoopChannels {
+    let context = RunLoopContext {
+        termination: &termination,
         refresh_sender: &sender,
         refresh_receiver: &receiver,
         resume_sender: &resume_sender,
@@ -5155,15 +5170,18 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
         &mut terminal,
         &mut app,
         &config,
-        &channels,
+        &context,
         rollout_cache,
         Arc::clone(&history_store),
         &ui_state_store,
     );
+    let cursor_result = terminal.show_cursor();
+    drop(guard);
+    termination.mark_terminal_restored();
     flush_staged_history_on_exit(&history_store, &config.perf_log);
     let _ = ui_state_store.save(&app.ui_state());
     config.perf_log.finish();
-    terminal.show_cursor()?;
+    cursor_result?;
     result
 }
 
@@ -5513,7 +5531,7 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     config: &CollectConfig,
-    channels: &RunLoopChannels<'_>,
+    context: &RunLoopContext<'_>,
     rollout_cache: Arc<Mutex<RolloutCache>>,
     history_store: Arc<Mutex<HistoryStore>>,
     ui_state_store: &UiStateStore,
@@ -5522,7 +5540,11 @@ fn run_loop(
     let mut redraw_reasons = RedrawReasons::default();
     let mut refresh_worker = RefreshWorker::default();
     loop {
-        while let Ok(completion) = channels.refresh_receiver.try_recv() {
+        if context.termination.is_requested() {
+            refresh_worker.detach();
+            return Ok(());
+        }
+        while let Ok(completion) = context.refresh_receiver.try_recv() {
             let mut refresh_changed = false;
             if completion.summary_backfill {
                 app.summary_backfill_running = false;
@@ -5546,7 +5568,7 @@ fn run_loop(
             }
             refresh_worker.join();
         }
-        while let Ok(completion) = channels.resume_receiver.try_recv() {
+        while let Ok(completion) = context.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
             redraw_reasons.insert(RedrawReasons::RESUME);
         }
@@ -5578,7 +5600,7 @@ fn run_loop(
         if start_refresh_if_due(
             app,
             config,
-            channels,
+            context,
             &rollout_cache,
             &history_store,
             &mut refresh_worker,
@@ -5586,11 +5608,11 @@ fn run_loop(
             redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
 
-        if event::poll(next_run_loop_poll_timeout(
+        if event::poll(context.termination.poll_timeout(next_run_loop_poll_timeout(
             app,
             Instant::now(),
             !config.offline,
-        ))? {
+        )))? {
             config.perf_log.record_event_wakeup();
             let previous_ui_state = app.ui_state();
             let mut should_quit = false;
@@ -5625,7 +5647,7 @@ fn run_loop(
         }
 
         if let Some(request) = app.pending_resume.take() {
-            let worker_sender = channels.resume_sender.clone();
+            let worker_sender = context.resume_sender.clone();
             thread::spawn(move || {
                 let _ = worker_sender.send(execute_resume_request(request));
             });
@@ -5642,7 +5664,7 @@ fn run_loop(
 fn start_refresh_if_due(
     app: &mut App,
     config: &CollectConfig,
-    channels: &RunLoopChannels<'_>,
+    context: &RunLoopContext<'_>,
     rollout_cache: &Arc<Mutex<RolloutCache>>,
     history_store: &Arc<Mutex<HistoryStore>>,
     refresh_worker: &mut RefreshWorker,
@@ -5668,7 +5690,7 @@ fn start_refresh_if_due(
 
     if summary_backfill_due {
         let worker_config = summary_backfill_config(config);
-        let worker_sender = channels.refresh_sender.clone();
+        let worker_sender = context.refresh_sender.clone();
         let worker_history = Arc::clone(history_store);
         app.worker_running = true;
         app.summary_backfill_pending = false;
@@ -5704,9 +5726,9 @@ fn start_refresh_if_due(
                 let coverage_complete = summary_history_coverage_complete(&history, observed_at);
                 let requested_complete = scan_complete && coverage_complete;
                 match history_store.mark_summary_backfill_attempt(observed_at, requested_complete) {
-                    Ok(complete) => {
-                        history.summary_backfill_attempted_at = Some(observed_at);
-                        history.summary_backfill_attempt_complete = Some(complete);
+                    Ok(marker) => {
+                        history.summary_backfill_attempted_at = Some(marker.completed_at);
+                        history.summary_backfill_attempt_complete = Some(marker.complete);
                     }
                     Err(error) => {
                         // Keep an in-memory cooldown even when the durable
@@ -5737,7 +5759,7 @@ fn start_refresh_if_due(
 
     let worker_config = config.clone();
     let cached_account = app.account.clone();
-    let worker_sender = channels.refresh_sender.clone();
+    let worker_sender = context.refresh_sender.clone();
     let worker_cache = Arc::clone(rollout_cache);
     let worker_history = Arc::clone(history_store);
     app.worker_running = true;
@@ -13139,6 +13161,190 @@ fn provenance_label(provenance: Provenance) -> &'static str {
     }
 }
 
+struct TerminationSignal {
+    #[cfg(unix)]
+    requested: Arc<AtomicBool>,
+    #[cfg(unix)]
+    registrations: Vec<signal_hook::SigId>,
+    #[cfg(windows)]
+    installed: bool,
+}
+
+impl TerminationSignal {
+    fn install() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+
+            let requested = Arc::new(AtomicBool::new(false));
+            let mut registrations = Vec::with_capacity(3);
+            for signal in [SIGHUP, SIGINT, SIGTERM] {
+                match signal_hook::flag::register(signal, Arc::clone(&requested)) {
+                    Ok(registration) => registrations.push(registration),
+                    Err(error) => {
+                        for registration in registrations {
+                            signal_hook::low_level::unregister(registration);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(Self {
+                requested,
+                registrations,
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            WINDOWS_TERMINATION_REQUESTED.store(false, Ordering::SeqCst);
+            WINDOWS_TERMINAL_RESTORED.store(false, Ordering::SeqCst);
+            // SAFETY: the callback has the ABI and process lifetime required
+            // by the console API and performs only atomic coordination.
+            let installed = unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(windows_console_ctrl_handler),
+                    1,
+                )
+            };
+            if installed == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(Self { installed: true })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                requested: Arc::new(AtomicBool::new(false)),
+                registrations: Vec::new(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            WINDOWS_TERMINATION_REQUESTED.store(false, Ordering::SeqCst);
+            WINDOWS_TERMINAL_RESTORED.store(false, Ordering::SeqCst);
+            Self { installed: false }
+        }
+    }
+
+    #[cfg(test)]
+    fn request_for_test(&self) {
+        #[cfg(unix)]
+        self.requested.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        WINDOWS_TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.requested.load(Ordering::SeqCst)
+        }
+        #[cfg(windows)]
+        {
+            WINDOWS_TERMINATION_REQUESTED.load(Ordering::SeqCst)
+        }
+    }
+
+    fn poll_timeout(&self, timeout: Duration) -> Duration {
+        timeout.min(BACKGROUND_CHANNEL_POLL)
+    }
+
+    fn mark_terminal_restored(&self) {
+        #[cfg(windows)]
+        mark_windows_terminal_restored();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminationSignal {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+#[cfg(windows)]
+static WINDOWS_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static WINDOWS_TERMINAL_RESTORED: AtomicBool = AtomicBool::new(true);
+
+#[cfg(windows)]
+fn mark_windows_terminal_restored() {
+    WINDOWS_TERMINAL_RESTORED.store(true, Ordering::SeqCst);
+    // SAFETY: the address is a process-lifetime static and is used only as
+    // the matching one-byte WaitOnAddress key in the console callback.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll(
+            WINDOWS_TERMINAL_RESTORED.as_ptr().cast(),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_terminal_restore() {
+    while !WINDOWS_TERMINAL_RESTORED.load(Ordering::SeqCst) {
+        let pending = false;
+        // Close/logoff/shutdown handlers return on a system-owned thread.
+        // Keep that thread alive until the main loop has dropped
+        // TerminalGuard; otherwise Windows may terminate the process as soon
+        // as this callback returns. This wait performs no terminal or file IO.
+        // SAFETY: both pointers refer to valid one-byte bool storage for the
+        // duration of the wait. Spurious wakes are handled by the loop.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                WINDOWS_TERMINAL_RESTORED.as_ptr().cast(),
+                (&raw const pending).cast(),
+                std::mem::size_of::<bool>(),
+                u32::MAX,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_ctrl_handler(control: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    match control {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+            WINDOWS_TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+            1
+        }
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+            WINDOWS_TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+            wait_for_windows_terminal_restore();
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TerminationSignal {
+    fn drop(&mut self) {
+        mark_windows_terminal_restored();
+        if !self.installed {
+            return;
+        }
+        // SAFETY: this removes the exact static callback installed above.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(windows_console_ctrl_handler),
+                0,
+            );
+        }
+    }
+}
+
 struct TerminalGuard;
 
 #[cfg(not(windows))]
@@ -13189,6 +13395,9 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         let _ = disable_button_mouse_capture(&mut stdout);
         let _ = execute!(stdout, LeaveAlternateScreen);
+        // Ratatui can hide the cursor during drawing. Keep cursor restoration
+        // in the guard so panic/unwind paths are as safe as normal returns.
+        let _ = execute!(stdout, Show);
         let _ = disable_raw_mode();
     }
 }

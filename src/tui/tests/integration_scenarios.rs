@@ -1991,7 +1991,11 @@ fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
     let prepared = &cache.prepared;
     assert_eq!(prepared.covered_buckets, prepared.expected_buckets);
     assert_eq!(prepared.represented_tokens, prepared.available_tokens);
-    assert!(!prepared.partial(SummaryMetric::ApiEquivalent, false));
+    assert!(prepared.partial(SummaryMetric::ApiEquivalent, false));
+    assert_eq!(
+        prepared.coverage_state(SummaryMetric::ApiEquivalent, false),
+        SummaryDailyState::Partial
+    );
     assert!(prepared.api_chart_is_lower_bound());
     assert!(summary_daily_is_lower_bound(
         prepared,

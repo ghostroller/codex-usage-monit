@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use crate::bounded_io::{BoundedLine, read_bounded_line};
 use crate::cache::write_private_atomically;
 use crate::config::CollectConfig;
 use crate::domain::{
@@ -23,7 +24,7 @@ use crate::session_index::load_thread_titles;
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 9;
+const ROLLOUT_PARSER_REVISION: u32 = 13;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -40,6 +41,11 @@ const OWNER_PROBE_MAX_BYTES: u64 = 64 * 1024;
 const OWNER_PROBE_MAX_LINES: usize = 32;
 const OWNER_PROBE_MAX_FILES_PER_SCAN: usize = 64;
 const LOCAL_COVERAGE_BUCKET_SECONDS: i64 = 15 * 60;
+// Tool results can legitimately make rollout records large. This ceiling is
+// intentionally much larger than ordinary records while still bounding serde.
+const ROLLOUT_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+const ROLLOUT_MAX_WARNINGS_PER_FILE: usize = 64;
+const ROLLOUT_MAX_WARNINGS: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -117,12 +123,17 @@ enum ParsedEvent {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
     },
-    ForeignCounterBaseline(TokenUsage),
+    ForeignCounterBaseline {
+        timestamp: DateTime<Utc>,
+        total_usage: TokenUsage,
+    },
     ForeignThreadSettingsBaseline {
+        timestamp: DateTime<Utc>,
         model: Option<String>,
         service_tier: Option<String>,
     },
     UserMessage {
+        timestamp: DateTime<Utc>,
         preview: String,
         turn_id: Option<String>,
         source: UserMessageSource,
@@ -134,13 +145,18 @@ enum ParsedEvent {
         kind: AgentInteractionKind,
     },
     AgentActivity {
+        recorded_at: Option<DateTime<Utc>>,
         occurred_at: Option<DateTime<Utc>>,
         call_id: String,
         child_thread_id: String,
         kind: AgentInteractionKind,
     },
     ThreadSettingsApplied {
+        timestamp: DateTime<Utc>,
         service_tier: Option<String>,
+    },
+    Activity {
+        timestamp: DateTime<Utc>,
     },
     TurnContext {
         timestamp: DateTime<Utc>,
@@ -208,6 +224,8 @@ struct ParsedFile {
     skipped_lines: usize,
     unreadable_files: usize,
     warnings: Vec<String>,
+    #[serde(default)]
+    suppressed_warnings: usize,
     complete: bool,
     #[serde(default)]
     source_lines: usize,
@@ -258,6 +276,8 @@ struct ReducedRollouts {
     replay_order_warnings: HashMap<PathBuf, Vec<String>>,
     ambiguous_replay_orders: HashMap<PathBuf, usize>,
     incomplete_counter_threads: HashSet<String>,
+    suppressed_warnings: usize,
+    replay_order_suppressed_warnings: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +298,14 @@ struct ReplayPlan {
     incomplete_counter_threads: HashSet<String>,
     replay_order_warnings: HashMap<PathBuf, Vec<String>>,
     ambiguous_replay_orders: HashMap<PathBuf, usize>,
+    suppressed_warnings: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayRange {
+    started_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    timestamps_complete: bool,
 }
 
 /// Diagnostics for the most recent cached scan.
@@ -354,6 +382,7 @@ pub struct RolloutCacheMetrics {
 struct DiscoveryState {
     stats: CollectionStats,
     warnings: Vec<String>,
+    suppressed_warnings: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,6 +400,7 @@ struct DiscoveryCache {
     directories: HashMap<PathBuf, FileFingerprint>,
     roots: Vec<(PathBuf, Option<FileFingerprint>)>,
     warnings: Vec<String>,
+    suppressed_warnings: usize,
     unreadable_files: usize,
     complete: bool,
     full_scan_at: Instant,
@@ -409,6 +439,13 @@ pub struct RolloutCache {
     metrics: RolloutCacheMetrics,
     last_materialized_at: Option<DateTime<Utc>>,
     last_materialized_active_grace: Option<Duration>,
+    next_freshness_deadline: Option<DateTime<Utc>>,
+    next_as_of_evidence_boundary: Option<DateTime<Utc>>,
+    as_of_reduced: Option<ReducedRollouts>,
+    #[cfg(test)]
+    as_of_reduce_count: usize,
+    last_external_materialized_at: Option<DateTime<Utc>>,
+    next_external_evidence_boundary: Option<DateTime<Utc>>,
     last_discovery: Option<DiscoveryState>,
     discovery_cache: Option<DiscoveryCache>,
     omitted_owner_probes: HashMap<PathBuf, CachedOwnerProbe>,
@@ -602,6 +639,8 @@ impl PersistentCacheUsage {
 struct SessionTitleCache {
     state: SessionTitleState,
     titles: HashMap<String, String>,
+    materialized_at: Option<DateTime<Utc>>,
+    next_update_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -633,6 +672,7 @@ struct ThreadBuilder {
     source: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    session_metadata_updated_at: Option<DateTime<Utc>>,
     service_tier: Option<String>,
     service_tier_observed: bool,
     inherited_thread_settings: Option<(String, String)>,
@@ -740,6 +780,7 @@ impl RolloutCache {
         config: &CollectConfig,
         now: DateTime<Utc>,
         dataset: &mut RolloutDataset,
+        suppressed_warnings: &mut usize,
         refresh: &mut RolloutCacheRefresh,
     ) -> Vec<RolloutFile> {
         let key = DiscoveryKey {
@@ -793,7 +834,7 @@ impl RolloutCache {
             .discovery_cache
             .as_ref()
             .expect("discovery always initializes its inventory");
-        let files = select_rollout_files(cache, config, now, dataset);
+        let files = select_rollout_files(cache, config, now, dataset, suppressed_warnings);
         let selected_paths = files
             .iter()
             .map(|file| file.path.clone())
@@ -812,7 +853,18 @@ impl RolloutCache {
     /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
         Ok(self
-            .scan_inner(config, now, true)?
+            .scan_inner(config, now, true, None)?
+            .expect("a forced rollout scan always materializes a dataset"))
+    }
+
+    pub(crate) fn scan_with_external_boundary(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+        next_external_boundary: Option<DateTime<Utc>>,
+    ) -> Result<RolloutDataset> {
+        Ok(self
+            .scan_inner(config, now, true, next_external_boundary)?
             .expect("a forced rollout scan always materializes a dataset"))
     }
 
@@ -823,7 +875,25 @@ impl RolloutCache {
         config: &CollectConfig,
         now: DateTime<Utc>,
     ) -> Result<Option<RolloutDataset>> {
-        self.scan_inner(config, now, false)
+        self.scan_inner(config, now, false, None)
+    }
+
+    pub(crate) fn scan_if_changed_with_external_boundary(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+        next_external_boundary: Option<DateTime<Utc>>,
+    ) -> Result<Option<RolloutDataset>> {
+        self.scan_inner(config, now, false, next_external_boundary)
+    }
+
+    pub(crate) fn set_external_boundary(
+        &mut self,
+        now: DateTime<Utc>,
+        next_external_boundary: Option<DateTime<Utc>>,
+    ) {
+        self.last_external_materialized_at = Some(now);
+        self.next_external_evidence_boundary = next_external_boundary;
     }
 
     fn scan_inner(
@@ -831,6 +901,7 @@ impl RolloutCache {
         config: &CollectConfig,
         now: DateTime<Utc>,
         force_materialize: bool,
+        next_external_boundary: Option<DateTime<Utc>>,
     ) -> Result<Option<RolloutDataset>> {
         let trace_active = config.startup_trace.is_active();
         let perf_active = config.perf_log.is_enabled();
@@ -854,6 +925,15 @@ impl RolloutCache {
             self.metrics = RolloutCacheMetrics::default();
             self.last_materialized_at = None;
             self.last_materialized_active_grace = None;
+            self.next_freshness_deadline = None;
+            self.next_as_of_evidence_boundary = None;
+            self.as_of_reduced = None;
+            #[cfg(test)]
+            {
+                self.as_of_reduce_count = 0;
+            }
+            self.last_external_materialized_at = None;
+            self.next_external_evidence_boundary = None;
             self.last_discovery = None;
             self.discovery_cache = None;
             self.omitted_owner_probes.clear();
@@ -861,11 +941,29 @@ impl RolloutCache {
             self.local_coverage_last_complete_at = None;
             self.key = Some(key.clone());
         }
+        let external_boundary_changed = self
+            .last_external_materialized_at
+            .is_some_and(|last| last > now)
+            || self
+                .next_external_evidence_boundary
+                .is_some_and(|boundary| {
+                    self.last_external_materialized_at
+                        .is_some_and(|last| last < boundary && boundary <= now)
+                });
+        self.last_external_materialized_at = Some(now);
+        self.next_external_evidence_boundary = next_external_boundary;
 
         let mut discovery = RolloutDataset::default();
+        let mut discovery_suppressed_warnings = 0_usize;
         let discovery_started = perf_active.then(Instant::now);
         let discovery_span = config.startup_trace.span("rollout.discover");
-        let mut files = self.discover_rollout_files(config, now, &mut discovery, &mut refresh);
+        let mut files = self.discover_rollout_files(
+            config,
+            now,
+            &mut discovery,
+            &mut discovery_suppressed_warnings,
+            &mut refresh,
+        );
         let (selected_bytes, largest_file_bytes) = files
             .iter()
             .map(|file| file.fingerprint.len)
@@ -892,7 +990,13 @@ impl RolloutCache {
         sort_span.finish_with(|| format!("files={}", files.len()));
 
         let title_span = config.startup_trace.span("rollout.session_titles");
-        self.refresh_session_titles(config, &mut discovery, &mut refresh);
+        self.refresh_session_titles(
+            config,
+            now,
+            &mut discovery,
+            &mut discovery_suppressed_warnings,
+            &mut refresh,
+        );
         title_span.finish_with(|| {
             format!(
                 "reads={} reused={} titles={} redacted={}",
@@ -958,6 +1062,7 @@ impl RolloutCache {
         let mut slowest_parse_us = 0_u128;
         let mut slowest_file_bytes = 0_u64;
         let mut changed_thread_ids = HashSet::new();
+        let mut changed_paths = HashSet::new();
         for file in &files {
             let reusable = self.files.get(&file.path).is_some_and(|cached| {
                 cached.fingerprint == file.fingerprint && cached.parsed.complete
@@ -967,6 +1072,7 @@ impl RolloutCache {
                 continue;
             }
 
+            changed_paths.insert(file.path.clone());
             let previous = self.files.remove(&file.path);
             if let Some(thread_id) = previous
                 .as_ref()
@@ -1052,6 +1158,7 @@ impl RolloutCache {
             self.discovery_cache.as_ref(),
             &mut self.omitted_owner_probes,
             config,
+            None,
         );
 
         let cache_save_started = perf_active.then(Instant::now);
@@ -1105,24 +1212,30 @@ impl RolloutCache {
                 if current_by_path
                     .get(previous.path.as_path())
                     .is_none_or(|fingerprint| **fingerprint != previous.fingerprint)
-                    && let Some(thread_id) = self
+                {
+                    changed_paths.insert(previous.path.clone());
+                    if let Some(thread_id) = self
                         .files
                         .get(&previous.path)
                         .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
-                {
-                    changed_thread_ids.insert(thread_id.clone());
+                    {
+                        changed_thread_ids.insert(thread_id.clone());
+                    }
                 }
             }
             for current in &selected {
                 if previous_by_path
                     .get(current.path.as_path())
                     .is_none_or(|fingerprint| **fingerprint != current.fingerprint)
-                    && let Some(thread_id) = self
+                {
+                    changed_paths.insert(current.path.clone());
+                    if let Some(thread_id) = self
                         .files
                         .get(&current.path)
                         .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
-                {
-                    changed_thread_ids.insert(thread_id.clone());
+                    {
+                        changed_thread_ids.insert(thread_id.clone());
+                    }
                 }
             }
         }
@@ -1136,6 +1249,7 @@ impl RolloutCache {
             reduced.incomplete_counter_threads != replay_plan.incomplete_counter_threads
                 || reduced.replay_order_warnings != replay_plan.replay_order_warnings
                 || reduced.ambiguous_replay_orders != replay_plan.ambiguous_replay_orders
+                || reduced.replay_order_suppressed_warnings != replay_plan.suppressed_warnings
         });
         if let Some(reduced) = self.reduced.as_ref()
             && replay_plan_changed
@@ -1166,16 +1280,19 @@ impl RolloutCache {
         let reduce_started = perf_active.then(Instant::now);
         let reduce_span = config.startup_trace.span("rollout.reduce");
         if must_rebuild {
+            let mut replay_warnings_truncated = false;
             if let Some(reduced) = self.reduced.as_mut() {
                 incrementally_reduce_cached_files(
                     reduced,
                     &changed_thread_ids,
+                    &changed_paths,
                     &files,
                     &self.files,
                     config,
                     &replay_plan,
                 );
                 refresh.incrementally_reduced_threads = changed_thread_ids.len();
+                replay_warnings_truncated = replay_warnings_are_truncated(reduced);
             } else {
                 self.reduced = Some(reduce_cached_files(
                     &files,
@@ -1183,6 +1300,16 @@ impl RolloutCache {
                     config,
                     &replay_plan,
                 ));
+                refresh.full_rebuild = true;
+            }
+            if replay_warnings_truncated {
+                self.reduced = Some(reduce_cached_files(
+                    &files,
+                    &self.files,
+                    config,
+                    &replay_plan,
+                ));
+                refresh.incrementally_reduced_threads = 0;
                 refresh.full_rebuild = true;
             }
             refresh.rebuilt = true;
@@ -1225,6 +1352,7 @@ impl RolloutCache {
         let discovery_state = DiscoveryState {
             stats: discovery.stats.clone(),
             warnings: discovery.warnings.clone(),
+            suppressed_warnings: discovery_suppressed_warnings,
         };
         let discovery_changed = self.last_discovery.as_ref() != Some(&discovery_state);
         let title_changed = !config.redact_content && !refresh.session_index_reused;
@@ -1234,21 +1362,19 @@ impl RolloutCache {
                 && self
                     .last_materialized_at
                     .is_some_and(|last| crossed_local_coverage_bucket(last, now)))
-            || self.last_materialized_at.is_some_and(|last| {
-                crossed_freshness_deadline(
-                    self.reduced
-                        .as_ref()
-                        .expect("a scan always initializes reduced rollout state"),
-                    last,
-                    now,
-                    config.active_grace,
-                )
+            || self
+                .next_freshness_deadline
+                .is_some_and(|deadline| deadline < now)
+            || self.next_as_of_evidence_boundary.is_some_and(|boundary| {
+                self.last_materialized_at
+                    .is_some_and(|last| last < boundary && boundary <= now)
             });
         let should_materialize = force_materialize
             || self.last_materialized_at.is_none()
             || refresh.rebuilt
             || discovery_changed
             || title_changed
+            || external_boundary_changed
             || freshness_changed;
         self.last_discovery = Some(discovery_state);
         if !should_materialize {
@@ -1258,11 +1384,55 @@ impl RolloutCache {
 
         let materialize_started = perf_active.then(Instant::now);
         let materialize_span = config.startup_trace.span("rollout.materialize");
-        let dataset = materialize_dataset(
+        let reuse_as_of_reduced = !refresh.rebuilt
+            && self.as_of_reduced.is_some()
+            && self
+                .last_materialized_at
+                .is_some_and(|materialized_at| materialized_at <= now)
+            && self
+                .next_as_of_evidence_boundary
+                .is_some_and(|boundary| now < boundary);
+        let next_as_of_evidence_boundary = if reuse_as_of_reduced {
+            self.next_as_of_evidence_boundary
+        } else {
+            next_as_of_evidence_boundary(&files, &self.files, now)
+        };
+        if next_as_of_evidence_boundary.is_some() && !reuse_as_of_reduced {
+            let mut as_of_files = files.clone();
+            sort_rollout_files_for_replay_as_of(&mut as_of_files, &self.files, Some(now));
+            let as_of_replay_plan = build_replay_plan(
+                &as_of_files,
+                &self.files,
+                self.discovery_cache.as_ref(),
+                &mut self.omitted_owner_probes,
+                config,
+                Some(now),
+            );
+            self.as_of_reduced = Some(reduce_cached_files_as_of(
+                &as_of_files,
+                &self.files,
+                config,
+                &as_of_replay_plan,
+                now,
+            ));
+            #[cfg(test)]
+            {
+                self.as_of_reduce_count = self.as_of_reduce_count.saturating_add(1);
+            }
+        } else if next_as_of_evidence_boundary.is_none() {
+            self.as_of_reduced = None;
+        }
+        let materialized_reduced = self.as_of_reduced.as_ref().unwrap_or_else(|| {
             self.reduced
                 .as_ref()
-                .expect("a scan always initializes reduced rollout state"),
+                .expect("a scan always initializes reduced rollout state")
+        });
+        let next_freshness_deadline =
+            next_freshness_deadline(materialized_reduced, now, config.active_grace);
+        let dataset = materialize_dataset(
+            materialized_reduced,
             discovery,
+            discovery_suppressed_warnings,
             config,
             now,
             &self.session_titles.titles,
@@ -1271,6 +1441,8 @@ impl RolloutCache {
         self.last_refresh = refresh;
         self.last_materialized_at = Some(now);
         self.last_materialized_active_grace = Some(config.active_grace);
+        self.next_freshness_deadline = next_freshness_deadline;
+        self.next_as_of_evidence_boundary = next_as_of_evidence_boundary;
         materialize_span.finish_with(|| {
             format!(
                 "tasks={} turns={} calls={} observations={}",
@@ -1452,7 +1624,9 @@ impl RolloutCache {
     fn refresh_session_titles(
         &mut self,
         config: &CollectConfig,
+        now: DateTime<Utc>,
         discovery: &mut RolloutDataset,
+        suppressed_warnings: &mut usize,
         refresh: &mut RolloutCacheRefresh,
     ) {
         if config.redact_content {
@@ -1469,15 +1643,21 @@ impl RolloutCache {
                 } else {
                     self.session_titles.state = SessionTitleState::Missing;
                     self.session_titles.titles.clear();
+                    self.session_titles.next_update_at = None;
                 }
+                self.session_titles.materialized_at = Some(now);
                 return;
             }
             Err(error) => {
                 self.session_titles = SessionTitleCache::default();
-                discovery.warnings.push(format!(
-                    "session title index unavailable: could not inspect {}: {error}",
-                    path.display()
-                ));
+                push_bounded_rollout_warning(
+                    &mut discovery.warnings,
+                    suppressed_warnings,
+                    format!(
+                        "session title index unavailable: could not inspect {}: {error}",
+                        path.display()
+                    ),
+                );
                 return;
             }
         };
@@ -1485,32 +1665,51 @@ impl RolloutCache {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.session_titles = SessionTitleCache::default();
-                discovery.warnings.push(format!(
-                    "session title index unavailable: could not fingerprint {}: {error}",
-                    path.display()
-                ));
+                push_bounded_rollout_warning(
+                    &mut discovery.warnings,
+                    suppressed_warnings,
+                    format!(
+                        "session title index unavailable: could not fingerprint {}: {error}",
+                        path.display()
+                    ),
+                );
                 return;
             }
         };
-        if matches!(
-            &self.session_titles.state,
-            SessionTitleState::Loaded(cached) if cached == &fingerprint
-        ) {
+        let timeline_changed = self
+            .session_titles
+            .materialized_at
+            .is_none_or(|materialized_at| materialized_at > now)
+            || self.session_titles.next_update_at.is_some_and(|boundary| {
+                self.session_titles
+                    .materialized_at
+                    .is_some_and(|materialized_at| materialized_at < boundary && boundary <= now)
+            });
+        if !timeline_changed
+            && matches!(
+                &self.session_titles.state,
+                SessionTitleState::Loaded(cached) if cached == &fingerprint
+            )
+        {
             refresh.session_index_reused = true;
             return;
         }
 
         refresh.session_index_reads += 1;
-        match load_thread_titles(&config.codex_home) {
-            Ok(titles) => {
+        match load_thread_titles(&config.codex_home, now) {
+            Ok(loaded) => {
                 self.session_titles.state = SessionTitleState::Loaded(fingerprint);
-                self.session_titles.titles = titles;
+                self.session_titles.titles = loaded.titles;
+                self.session_titles.materialized_at = Some(now);
+                self.session_titles.next_update_at = loaded.next_update_at;
             }
             Err(error) => {
                 self.session_titles = SessionTitleCache::default();
-                discovery
-                    .warnings
-                    .push(format!("session title index unavailable: {error:#}"));
+                push_bounded_rollout_warning(
+                    &mut discovery.warnings,
+                    suppressed_warnings,
+                    format!("session title index unavailable: {error:#}"),
+                );
             }
         }
     }
@@ -1767,13 +1966,35 @@ fn stable_hash(parts: &[&[u8]]) -> u64 {
 }
 
 fn sort_rollout_files_for_replay(files: &mut [RolloutFile], cache: &HashMap<PathBuf, CachedFile>) {
+    sort_rollout_files_for_replay_as_of(files, cache, None);
+}
+
+fn sort_rollout_files_for_replay_as_of(
+    files: &mut [RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    as_of: Option<DateTime<Utc>>,
+) {
+    let visible_starts = as_of.map(|as_of| {
+        files
+            .iter()
+            .map(|file| {
+                let started_at = cache
+                    .get(&file.path)
+                    .and_then(|cached| replay_range(&cached.parsed, Some(as_of)))
+                    .and_then(|range| range.started_at);
+                (file.path.clone(), started_at)
+            })
+            .collect::<HashMap<_, _>>()
+    });
     files.sort_by(|left, right| {
-        let left_started_at = cache
-            .get(&left.path)
-            .and_then(|cached| cached.parsed.replay_started_at);
-        let right_started_at = cache
-            .get(&right.path)
-            .and_then(|cached| cached.parsed.replay_started_at);
+        let started_at = |file: &RolloutFile| match visible_starts.as_ref() {
+            Some(starts) => starts.get(&file.path).copied().flatten(),
+            None => cache
+                .get(&file.path)
+                .and_then(|cached| cached.parsed.replay_started_at),
+        };
+        let left_started_at = started_at(left);
+        let right_started_at = started_at(right);
         match (left_started_at, right_started_at) {
             (Some(left_started_at), Some(right_started_at)) => left_started_at
                 .cmp(&right_started_at)
@@ -1791,23 +2012,27 @@ fn build_replay_plan(
     discovery: Option<&DiscoveryCache>,
     owner_probes: &mut HashMap<PathBuf, CachedOwnerProbe>,
     config: &CollectConfig,
+    as_of: Option<DateTime<Utc>>,
 ) -> ReplayPlan {
     let mut plan = ReplayPlan::default();
-    let mut files_by_thread = HashMap::<String, Vec<&RolloutFile>>::new();
+    let mut files_by_thread = HashMap::<String, Vec<(&RolloutFile, ReplayRange)>>::new();
     let mut selected_owner_uncertain = false;
     for file in files {
         let Some(parsed) = cache.get(&file.path).map(|cached| &cached.parsed) else {
             selected_owner_uncertain = true;
             continue;
         };
-        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
+        if archived_rollout_is_subsumed_by_active_as_of(file, parsed, files, cache, config, as_of) {
             continue;
         }
         if let Some(thread_id) = parsed.owner_thread_id.as_ref() {
+            let Some(replay_range) = replay_range(parsed, as_of) else {
+                continue;
+            };
             files_by_thread
                 .entry(thread_id.clone())
                 .or_default()
-                .push(file);
+                .push((file, replay_range));
             if !parsed.complete || parsed.skipped_lines > 0 || parsed.unreadable_files > 0 {
                 plan.incomplete_counter_threads.insert(thread_id.clone());
             }
@@ -1822,20 +2047,16 @@ fn build_replay_plan(
         }
         let mut previous_end = None;
         let mut ambiguous = false;
-        for file in thread_files {
-            let parsed = &cache
-                .get(&file.path)
-                .expect("replay plan only groups cached files")
-                .parsed;
-            if !parsed.replay_timestamps_complete {
+        for (_, replay_range) in thread_files {
+            if !replay_range.timestamps_complete {
                 ambiguous = true;
                 break;
             }
-            let Some(started_at) = parsed.replay_started_at else {
+            let Some(started_at) = replay_range.started_at else {
                 ambiguous = true;
                 break;
             };
-            let Some(updated_at) = parsed.replay_updated_at else {
+            let Some(updated_at) = replay_range.updated_at else {
                 ambiguous = true;
                 break;
             };
@@ -1846,14 +2067,18 @@ fn build_replay_plan(
             previous_end = Some(updated_at);
         }
         if ambiguous {
-            let path = thread_files[0].path.clone();
+            let path = thread_files[0].0.path.clone();
             plan.incomplete_counter_threads.insert(thread_id.clone());
-            plan.replay_order_warnings.insert(
-                path.clone(),
-                vec![format!(
-                    "could not establish a non-overlapping content timestamp order for thread {thread_id}; replayed its rollout files in a stable fallback order"
-                )],
-            );
+            if plan.replay_order_warnings.len() < ROLLOUT_MAX_WARNINGS.saturating_sub(1) {
+                plan.replay_order_warnings.insert(
+                    path.clone(),
+                    vec![format!(
+                        "could not establish a non-overlapping content timestamp order for thread {thread_id}; replayed its rollout files in a stable fallback order"
+                    )],
+                );
+            } else {
+                plan.suppressed_warnings = plan.suppressed_warnings.saturating_add(1);
+            }
             plan.ambiguous_replay_orders.insert(path, 1);
         }
     }
@@ -1873,9 +2098,9 @@ fn build_replay_plan(
     let selected_filenames_are_trustworthy = !selected_threads.is_empty()
         && selected_threads.iter().all(|thread_id| {
             files_by_thread.get(thread_id).is_some_and(|thread_files| {
-                thread_files
-                    .iter()
-                    .any(|file| rollout_filename_thread_id(&file.path) == Some(thread_id.as_str()))
+                thread_files.iter().any(|(file, _)| {
+                    rollout_filename_thread_id(&file.path) == Some(thread_id.as_str())
+                })
             })
         });
     let mut owner_uncertain = false;
@@ -1965,6 +2190,45 @@ fn build_replay_plan(
     plan
 }
 
+fn replay_range(parsed: &ParsedFile, as_of: Option<DateTime<Utc>>) -> Option<ReplayRange> {
+    let Some(as_of) = as_of else {
+        return Some(ReplayRange {
+            started_at: parsed.replay_started_at,
+            updated_at: parsed.replay_updated_at,
+            timestamps_complete: parsed.replay_timestamps_complete,
+        });
+    };
+
+    let mut range = ReplayRange {
+        started_at: None,
+        updated_at: None,
+        timestamps_complete: parsed.replay_timestamps_complete,
+    };
+    let mut visible = false;
+    for event in &parsed.events {
+        if matches!(
+            event,
+            ParsedEvent::ForeignCounterBaseline { .. }
+                | ParsedEvent::ForeignThreadSettingsBaseline { .. }
+        ) {
+            continue;
+        }
+        match parsed_event_available_at(event) {
+            Some(timestamp) if timestamp <= as_of => {
+                visible = true;
+                set_min_timestamp(&mut range.started_at, timestamp);
+                set_max_timestamp(&mut range.updated_at, timestamp);
+            }
+            Some(_) => {}
+            None => {
+                visible = true;
+                range.timestamps_complete = false;
+            }
+        }
+    }
+    visible.then_some(range)
+}
+
 fn rollout_filename_thread_id(path: &Path) -> Option<&str> {
     let stem = path.file_stem()?.to_str()?;
     let start = stem.len().checked_sub(36)?;
@@ -2030,10 +2294,31 @@ fn reduce_cached_files(
     config: &CollectConfig,
     replay_plan: &ReplayPlan,
 ) -> ReducedRollouts {
+    reduce_cached_files_inner(files, cache, config, replay_plan, None)
+}
+
+fn reduce_cached_files_as_of(
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    config: &CollectConfig,
+    replay_plan: &ReplayPlan,
+    as_of: DateTime<Utc>,
+) -> ReducedRollouts {
+    reduce_cached_files_inner(files, cache, config, replay_plan, Some(as_of))
+}
+
+fn reduce_cached_files_inner(
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    config: &CollectConfig,
+    replay_plan: &ReplayPlan,
+    as_of: Option<DateTime<Utc>>,
+) -> ReducedRollouts {
     let mut reduced = ReducedRollouts {
         incomplete_counter_threads: replay_plan.incomplete_counter_threads.clone(),
         replay_order_warnings: replay_plan.replay_order_warnings.clone(),
         ambiguous_replay_orders: replay_plan.ambiguous_replay_orders.clone(),
+        replay_order_suppressed_warnings: replay_plan.suppressed_warnings,
         ..ReducedRollouts::default()
     };
     for file in files {
@@ -2041,13 +2326,27 @@ fn reduce_cached_files(
             continue;
         };
         let parsed = &cached.parsed;
-        if archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config) {
+        if archived_rollout_is_subsumed_by_active_as_of(file, parsed, files, cache, config, as_of) {
             continue;
         }
-        replay_file_into_reduced(&mut reduced, file, parsed, config);
+        replay_file_into_reduced(&mut reduced, file, parsed, config, as_of);
     }
     rebuild_reduced_metadata(&mut reduced, files, cache);
     reduced
+}
+
+fn replay_warnings_are_truncated(reduced: &ReducedRollouts) -> bool {
+    let total_replay_warnings = reduced
+        .ambiguous_token_resets
+        .values()
+        .copied()
+        .fold(0_usize, usize::saturating_add);
+    let retained_replay_warnings = reduced
+        .replay_warnings
+        .values()
+        .map(Vec::len)
+        .fold(0_usize, usize::saturating_add);
+    total_replay_warnings > retained_replay_warnings
 }
 
 fn mark_threads_with_changed_file_order(
@@ -2085,6 +2384,7 @@ fn mark_threads_with_changed_file_order(
 fn incrementally_reduce_cached_files(
     reduced: &mut ReducedRollouts,
     changed_thread_ids: &HashSet<String>,
+    changed_paths: &HashSet<PathBuf>,
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
@@ -2107,14 +2407,16 @@ fn incrementally_reduce_cached_files(
         .map(|file| file.path.as_path())
         .collect::<HashSet<_>>();
     reduced.replay_warnings.retain(|path, _| {
-        selected_paths.contains(path.as_path())
+        !changed_paths.contains(path)
+            && selected_paths.contains(path.as_path())
             && cache
                 .get(path)
                 .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
                 .is_none_or(|thread_id| !changed_thread_ids.contains(thread_id))
     });
     reduced.ambiguous_token_resets.retain(|path, _| {
-        selected_paths.contains(path.as_path())
+        !changed_paths.contains(path)
+            && selected_paths.contains(path.as_path())
             && cache
                 .get(path)
                 .and_then(|cached| cached.parsed.owner_thread_id.as_ref())
@@ -2123,21 +2425,23 @@ fn incrementally_reduce_cached_files(
     reduced.incomplete_counter_threads = replay_plan.incomplete_counter_threads.clone();
     reduced.replay_order_warnings = replay_plan.replay_order_warnings.clone();
     reduced.ambiguous_replay_orders = replay_plan.ambiguous_replay_orders.clone();
+    reduced.replay_order_suppressed_warnings = replay_plan.suppressed_warnings;
 
     for file in files {
         let Some(cached) = cache.get(&file.path) else {
             continue;
         };
         let parsed = &cached.parsed;
-        if !parsed
+        let owner_changed = parsed
             .owner_thread_id
             .as_ref()
-            .is_some_and(|thread_id| changed_thread_ids.contains(thread_id))
+            .is_some_and(|thread_id| changed_thread_ids.contains(thread_id));
+        if (!changed_paths.contains(&file.path) && !owner_changed)
             || archived_rollout_is_subsumed_by_active(file, parsed, files, cache, config)
         {
             continue;
         }
-        replay_file_into_reduced(reduced, file, parsed, config);
+        replay_file_into_reduced(reduced, file, parsed, config, None);
     }
     rebuild_reduced_metadata(reduced, files, cache);
 }
@@ -2147,19 +2451,12 @@ fn replay_file_into_reduced(
     file: &RolloutFile,
     parsed: &ParsedFile,
     config: &CollectConfig,
+    as_of: Option<DateTime<Utc>>,
 ) {
-    if let Some(thread_id) = parsed.owner_thread_id.as_ref()
-        && !reduced.threads.contains_key(thread_id)
-    {
-        reduced.threads.insert(
-            thread_id.clone(),
-            ThreadBuilder {
-                thread_id: thread_id.clone(),
-                incomplete_counter_boundary: reduced.incomplete_counter_threads.contains(thread_id),
-                ..ThreadBuilder::default()
-            },
-        );
-    }
+    let incomplete_counter_boundary = parsed
+        .owner_thread_id
+        .as_ref()
+        .is_some_and(|thread_id| reduced.incomplete_counter_threads.contains(thread_id));
     let mut replay = RolloutDataset::default();
     replay_rollout_file(
         &file.path,
@@ -2167,12 +2464,24 @@ fn replay_file_into_reduced(
         config,
         &mut reduced.threads,
         &mut replay,
+        as_of,
+        incomplete_counter_boundary,
     );
     reduced.dataset.calls.extend(replay.calls);
     reduced
         .dataset
         .rate_observations
         .extend(replay.rate_observations);
+    let retained_replay_warnings = reduced
+        .replay_warnings
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
+    replay.warnings.truncate(
+        ROLLOUT_MAX_WARNINGS
+            .saturating_sub(1)
+            .saturating_sub(retained_replay_warnings),
+    );
     if !replay.warnings.is_empty() {
         reduced
             .replay_warnings
@@ -2192,6 +2501,19 @@ fn rebuild_reduced_metadata(
 ) {
     reduced.dataset.stats = Default::default();
     reduced.dataset.warnings.clear();
+    let total_replay_warnings = reduced
+        .ambiguous_token_resets
+        .values()
+        .copied()
+        .fold(0_usize, usize::saturating_add);
+    let retained_replay_warnings = reduced
+        .replay_warnings
+        .values()
+        .map(Vec::len)
+        .fold(0_usize, usize::saturating_add);
+    reduced.suppressed_warnings = reduced
+        .replay_order_suppressed_warnings
+        .saturating_add(total_replay_warnings.saturating_sub(retained_replay_warnings));
     for file in files {
         reduced.dataset.stats.scanned_files += 1;
         let Some(cached) = cache.get(&file.path) else {
@@ -2201,12 +2523,27 @@ fn rebuild_reduced_metadata(
         reduced.dataset.stats.parsed_lines += parsed.parsed_lines;
         reduced.dataset.stats.skipped_lines += parsed.skipped_lines;
         reduced.dataset.stats.unreadable_files += parsed.unreadable_files;
-        reduced.dataset.warnings.extend(parsed.warnings.clone());
+        reduced.suppressed_warnings = reduced
+            .suppressed_warnings
+            .saturating_add(parsed.suppressed_warnings);
+        append_bounded_rollout_warnings(
+            &mut reduced.dataset.warnings,
+            &mut reduced.suppressed_warnings,
+            parsed.warnings.iter().cloned(),
+        );
         if let Some(warnings) = reduced.replay_warnings.get(&file.path) {
-            reduced.dataset.warnings.extend(warnings.clone());
+            append_bounded_rollout_warnings(
+                &mut reduced.dataset.warnings,
+                &mut reduced.suppressed_warnings,
+                warnings.iter().cloned(),
+            );
         }
         if let Some(warnings) = reduced.replay_order_warnings.get(&file.path) {
-            reduced.dataset.warnings.extend(warnings.clone());
+            append_bounded_rollout_warnings(
+                &mut reduced.dataset.warnings,
+                &mut reduced.suppressed_warnings,
+                warnings.iter().cloned(),
+            );
         }
         reduced.dataset.stats.ambiguous_token_resets += reduced
             .ambiguous_token_resets
@@ -2221,12 +2558,46 @@ fn rebuild_reduced_metadata(
     }
 }
 
+fn append_bounded_rollout_warnings(
+    destination: &mut Vec<String>,
+    suppressed: &mut usize,
+    warnings: impl IntoIterator<Item = String>,
+) {
+    for warning in warnings {
+        push_bounded_rollout_warning(destination, suppressed, warning);
+    }
+}
+
+fn push_bounded_rollout_warning(
+    destination: &mut Vec<String>,
+    suppressed: &mut usize,
+    warning: String,
+) {
+    let retained_limit = ROLLOUT_MAX_WARNINGS.saturating_sub(1);
+    if destination.len() < retained_limit {
+        destination.push(warning);
+    } else {
+        *suppressed = suppressed.saturating_add(1);
+    }
+}
+
 fn archived_rollout_is_subsumed_by_active(
     file: &RolloutFile,
     parsed: &ParsedFile,
     files: &[RolloutFile],
     cache: &HashMap<PathBuf, CachedFile>,
     config: &CollectConfig,
+) -> bool {
+    archived_rollout_is_subsumed_by_active_as_of(file, parsed, files, cache, config, None)
+}
+
+fn archived_rollout_is_subsumed_by_active_as_of(
+    file: &RolloutFile,
+    parsed: &ParsedFile,
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    config: &CollectConfig,
+    as_of: Option<DateTime<Utc>>,
 ) -> bool {
     if !parsed.complete
         || !file
@@ -2245,6 +2616,7 @@ fn archived_rollout_is_subsumed_by_active(
             && cache.get(&candidate.path).is_some_and(|candidate| {
                 candidate.parsed.complete
                     && candidate.parsed.owner_thread_id.as_deref() == Some(owner_thread_id)
+                    && replay_range(&candidate.parsed, as_of).is_some()
                     && candidate.parsed.events.starts_with(&parsed.events)
             })
     })
@@ -2253,6 +2625,7 @@ fn archived_rollout_is_subsumed_by_active(
 fn materialize_dataset(
     reduced: &ReducedRollouts,
     mut discovery: RolloutDataset,
+    discovery_suppressed_warnings: usize,
     config: &CollectConfig,
     now: DateTime<Utc>,
     thread_titles: &HashMap<String, String>,
@@ -2262,30 +2635,73 @@ fn materialize_dataset(
     discovery.stats.skipped_lines = reduced.dataset.stats.skipped_lines;
     discovery.stats.ambiguous_token_resets = reduced.dataset.stats.ambiguous_token_resets;
     discovery.stats.unreadable_files += reduced.dataset.stats.unreadable_files;
-    discovery.warnings.extend(reduced.dataset.warnings.clone());
+    let mut bounded_warnings = Vec::new();
+    let mut suppressed_warnings = reduced
+        .suppressed_warnings
+        .saturating_add(discovery_suppressed_warnings);
+    append_bounded_rollout_warnings(
+        &mut bounded_warnings,
+        &mut suppressed_warnings,
+        std::mem::take(&mut discovery.warnings),
+    );
+    append_bounded_rollout_warnings(
+        &mut bounded_warnings,
+        &mut suppressed_warnings,
+        reduced.dataset.warnings.iter().cloned(),
+    );
+    if suppressed_warnings > 0 {
+        bounded_warnings.push(format!(
+            "suppressed {suppressed_warnings} additional rollout warnings"
+        ));
+    }
+    discovery.warnings = bounded_warnings;
     discovery.calls = reduced.dataset.calls.clone();
     discovery.rate_observations = reduced.dataset.rate_observations.clone();
     finish_dataset(config, now, &reduced.threads, thread_titles, &mut discovery);
     discovery
 }
 
-fn crossed_freshness_deadline(
+fn next_freshness_deadline(
     reduced: &ReducedRollouts,
-    last_materialized_at: DateTime<Utc>,
     now: DateTime<Utc>,
     active_grace: Duration,
-) -> bool {
+) -> Option<DateTime<Utc>> {
     let Ok(active_grace) = ChronoDuration::from_std(active_grace) else {
-        return false;
+        return None;
     };
-    reduced.threads.values().any(|thread| {
-        !thread.active_turn_ids.is_empty()
-            && thread.updated_at.is_some_and(|updated_at| {
-                updated_at
-                    .checked_add_signed(active_grace)
-                    .is_some_and(|deadline| deadline >= last_materialized_at && deadline < now)
-            })
-    })
+    reduced
+        .threads
+        .values()
+        .filter(|thread| !thread.active_turn_ids.is_empty())
+        .filter_map(|thread| thread.updated_at?.checked_add_signed(active_grace))
+        .filter(|deadline| *deadline >= now)
+        .min()
+}
+
+fn next_as_of_evidence_boundary(
+    files: &[RolloutFile],
+    cache: &HashMap<PathBuf, CachedFile>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut next = None;
+    let mut consider = |timestamp: DateTime<Utc>| {
+        if timestamp > now && next.is_none_or(|current| timestamp < current) {
+            next = Some(timestamp);
+        }
+    };
+
+    for parsed in files
+        .iter()
+        .filter_map(|file| cache.get(&file.path).map(|cached| &cached.parsed))
+    {
+        if let Some(timestamp) = parsed.activity_updated_at {
+            consider(timestamp);
+        }
+        for timestamp in parsed.events.iter().filter_map(parsed_event_available_at) {
+            consider(timestamp);
+        }
+    }
+    next
 }
 
 fn crossed_local_coverage_bucket(last_materialized_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -2309,6 +2725,7 @@ fn discover_rollout_inventory(
     let mut directories = HashMap::new();
     let mut root_fingerprints = Vec::with_capacity(roots.len());
     let mut warnings = Vec::new();
+    let mut suppressed_warnings = 0_usize;
     let mut unreadable_files = 0_usize;
     let mut complete = true;
     let mut found_root = false;
@@ -2323,10 +2740,14 @@ fn discover_rollout_inventory(
             Err(error) => {
                 complete = false;
                 unreadable_files += 1;
-                warnings.push(format!(
-                    "could not inspect rollout directory {}: {error}",
-                    root.display()
-                ));
+                push_bounded_rollout_warning(
+                    &mut warnings,
+                    &mut suppressed_warnings,
+                    format!(
+                        "could not inspect rollout directory {}: {error}",
+                        root.display()
+                    ),
+                );
                 root_fingerprints.push((root.clone(), None));
             }
         }
@@ -2334,10 +2755,14 @@ fn discover_rollout_inventory(
 
     if !found_root {
         unreadable_files += 1;
-        warnings.push(format!(
-            "no Codex rollout directories found under {}",
-            config.codex_home.display()
-        ));
+        push_bounded_rollout_warning(
+            &mut warnings,
+            &mut suppressed_warnings,
+            format!(
+                "no Codex rollout directories found under {}",
+                config.codex_home.display()
+            ),
+        );
     }
 
     for (root, fingerprint) in &root_fingerprints {
@@ -2351,10 +2776,14 @@ fn discover_rollout_inventory(
                 Err(error) => {
                     complete = false;
                     unreadable_files += 1;
-                    warnings.push(format!(
-                        "could not inspect rollout path under {}: {error}",
-                        root.display()
-                    ));
+                    push_bounded_rollout_warning(
+                        &mut warnings,
+                        &mut suppressed_warnings,
+                        format!(
+                            "could not inspect rollout path under {}: {error}",
+                            root.display()
+                        ),
+                    );
                     continue;
                 }
             };
@@ -2369,19 +2798,27 @@ fn discover_rollout_inventory(
                         Err(error) => {
                             complete = false;
                             unreadable_files += 1;
-                            warnings.push(format!(
-                                "could not fingerprint rollout directory {}: {error}",
-                                entry.path().display()
-                            ));
+                            push_bounded_rollout_warning(
+                                &mut warnings,
+                                &mut suppressed_warnings,
+                                format!(
+                                    "could not fingerprint rollout directory {}: {error}",
+                                    entry.path().display()
+                                ),
+                            );
                         }
                     },
                     Err(error) => {
                         complete = false;
                         unreadable_files += 1;
-                        warnings.push(format!(
-                            "could not fingerprint rollout directory {}: {error}",
-                            entry.path().display()
-                        ));
+                        push_bounded_rollout_warning(
+                            &mut warnings,
+                            &mut suppressed_warnings,
+                            format!(
+                                "could not fingerprint rollout directory {}: {error}",
+                                entry.path().display()
+                            ),
+                        );
                     }
                 }
                 continue;
@@ -2400,10 +2837,11 @@ fn discover_rollout_inventory(
                 Err(error) => {
                     complete = false;
                     unreadable_files += 1;
-                    warnings.push(format!(
-                        "could not fingerprint {}: {error}",
-                        entry.path().display()
-                    ));
+                    push_bounded_rollout_warning(
+                        &mut warnings,
+                        &mut suppressed_warnings,
+                        format!("could not fingerprint {}: {error}", entry.path().display()),
+                    );
                 }
             }
         }
@@ -2428,6 +2866,7 @@ fn discover_rollout_inventory(
         directories,
         roots: root_fingerprints,
         warnings,
+        suppressed_warnings,
         unreadable_files,
         complete,
         full_scan_at: Instant::now(),
@@ -2550,6 +2989,7 @@ fn select_rollout_files(
     config: &CollectConfig,
     now: DateTime<Utc>,
     dataset: &mut RolloutDataset,
+    suppressed_warnings: &mut usize,
 ) -> Vec<RolloutFile> {
     let lookback_days = config.lookback_days.max(0);
     let cutoff = ChronoDuration::try_days(lookback_days)
@@ -2557,6 +2997,7 @@ fn select_rollout_files(
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
     dataset.stats.unreadable_files = cache.unreadable_files;
     dataset.warnings = cache.warnings.clone();
+    *suppressed_warnings = cache.suppressed_warnings;
     let mut files = cache
         .inventory
         .values()
@@ -2605,10 +3046,13 @@ fn refresh_stable_rollout_file(
             Err(error) => {
                 parsed.complete = false;
                 parsed.unreadable_files += 1;
-                parsed.warnings.push(format!(
-                    "could not inspect {} after reading: {error}",
-                    candidate.path.display()
-                ));
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "could not inspect {} after reading: {error}",
+                        candidate.path.display()
+                    ),
+                );
                 return StableParse {
                     cached: CachedFile {
                         fingerprint: candidate.fingerprint,
@@ -2628,10 +3072,13 @@ fn refresh_stable_rollout_file(
             {
                 parsed.complete = false;
                 parsed.unreadable_files += 1;
-                parsed.warnings.push(format!(
-                    "could not fingerprint parsed tail for {}: {error}",
-                    candidate.path.display()
-                ));
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "could not fingerprint parsed tail for {}: {error}",
+                        candidate.path.display()
+                    ),
+                );
             }
             let final_fingerprint = inspect_rollout_file(&candidate.path)
                 .map(|final_file| final_file.fingerprint)
@@ -2663,10 +3110,13 @@ fn refresh_stable_rollout_file(
 
         parsed.complete = false;
         parsed.unreadable_files += 1;
-        parsed.warnings.push(format!(
-            "{} changed repeatedly while being read; the snapshot contains a stable parsed prefix",
-            candidate.path.display()
-        ));
+        push_parsed_warning(
+            &mut parsed,
+            format!(
+                "{} changed repeatedly while being read; the snapshot contains a stable parsed prefix",
+                candidate.path.display()
+            ),
+        );
         return StableParse {
             cached: CachedFile {
                 fingerprint: after.fingerprint,
@@ -2817,45 +3267,81 @@ fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile 
 fn parse_rollout_reader<R: BufRead>(
     file: &RolloutFile,
     config: &CollectConfig,
-    mut parsed: ParsedFile,
+    parsed: ParsedFile,
     reader: R,
+) -> ParsedFile {
+    parse_rollout_reader_with_limit(file, config, parsed, reader, ROLLOUT_MAX_LINE_BYTES)
+}
+
+fn parse_rollout_reader_with_limit<R: BufRead>(
+    file: &RolloutFile,
+    config: &CollectConfig,
+    mut parsed: ParsedFile,
+    mut reader: R,
+    max_line_bytes: usize,
 ) -> ParsedFile {
     let mut owning_thread_id = parsed.owner_thread_id.clone();
     let mut owning_created_at = parsed.owning_created_at;
     let mut replaying_foreign_history = parsed.replaying_foreign_history;
     let mut inherit_foreign_thread_settings = parsed.inherit_foreign_thread_settings;
+    let mut line = Vec::new();
+    let mut read_failed = false;
 
-    for line in reader.lines() {
-        parsed.source_lines = parsed.source_lines.saturating_add(1);
-        let line_number = parsed.source_lines;
-        let line = match line {
-            Ok(line) => line,
+    loop {
+        let status = match read_bounded_line(&mut reader, &mut line, max_line_bytes) {
+            Ok(BoundedLine::Eof) => break,
+            Ok(status) => status,
             Err(error) => {
-                parsed.skipped_lines += 1;
-                parsed.warnings.push(format!(
-                    "could not read {} line {line_number}: {error}",
-                    file.path.display()
-                ));
-                continue;
+                let line_number = parsed.source_lines.saturating_add(1);
+                parsed.skipped_lines = parsed.skipped_lines.saturating_add(1);
+                parsed.unreadable_files = parsed.unreadable_files.saturating_add(1);
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "could not read {} line {line_number}: {error}",
+                        file.path.display()
+                    ),
+                );
+                read_failed = true;
+                break;
             }
         };
+        parsed.source_lines = parsed.source_lines.saturating_add(1);
+        let line_number = parsed.source_lines;
+        if status == BoundedLine::TooLong {
+            parsed.skipped_lines = parsed.skipped_lines.saturating_add(1);
+            push_parsed_warning(
+                &mut parsed,
+                format!(
+                    "ignored oversized JSON at {} line {line_number}; the {max_line_bytes}-byte line limit was exceeded",
+                    file.path.display()
+                ),
+            );
+            continue;
+        }
 
-        let record: Value = match serde_json::from_str(&line) {
+        let record: Value = match serde_json::from_slice(&line) {
             Ok(Value::Object(record)) => Value::Object(record),
             Ok(_) => {
-                parsed.skipped_lines += 1;
-                parsed.warnings.push(format!(
-                    "ignored non-object JSON at {} line {line_number}",
-                    file.path.display()
-                ));
+                parsed.skipped_lines = parsed.skipped_lines.saturating_add(1);
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "ignored non-object JSON at {} line {line_number}",
+                        file.path.display()
+                    ),
+                );
                 continue;
             }
             Err(error) => {
-                parsed.skipped_lines += 1;
-                parsed.warnings.push(format!(
-                    "ignored malformed JSON at {} line {line_number}: {error}",
-                    file.path.display()
-                ));
+                parsed.skipped_lines = parsed.skipped_lines.saturating_add(1);
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "ignored malformed JSON at {} line {line_number}: {error}",
+                        file.path.display()
+                    ),
+                );
                 continue;
             }
         };
@@ -2870,11 +3356,20 @@ fn parse_rollout_reader<R: BufRead>(
                 continue;
             };
             let Some(thread_id) = string_field_in(payload, &["id"]).map(str::to_owned) else {
-                parsed.warnings.push(format!(
-                    "session metadata without an id at {} line {line_number}",
-                    file.path.display()
-                ));
+                push_parsed_warning(
+                    &mut parsed,
+                    format!(
+                        "session metadata without an id at {} line {line_number}",
+                        file.path.display()
+                    ),
+                );
                 continue;
+            };
+            let payload_timestamp = payload.get("timestamp").and_then(parse_timestamp);
+            let session_timestamp = match (explicit_timestamp, payload_timestamp) {
+                (Some(recorded_at), Some(effective_at)) => recorded_at.max(effective_at),
+                (Some(timestamp), None) | (None, Some(timestamp)) => timestamp,
+                (None, None) => file.modified_at,
             };
 
             match owning_thread_id.as_deref() {
@@ -2897,7 +3392,7 @@ fn parse_rollout_reader<R: BufRead>(
                         parsed.replay_timestamps_complete = false;
                     }
                     parsed.events.push(ParsedEvent::SessionMeta {
-                        timestamp,
+                        timestamp: session_timestamp,
                         payload: projected_payload(
                             payload,
                             &[
@@ -2926,7 +3421,7 @@ fn parse_rollout_reader<R: BufRead>(
                         parsed.replay_timestamps_complete = false;
                     }
                     parsed.events.push(ParsedEvent::SessionMeta {
-                        timestamp,
+                        timestamp: session_timestamp,
                         payload: projected_payload(
                             payload,
                             &[
@@ -2978,7 +3473,11 @@ fn parse_rollout_reader<R: BufRead>(
                 {
                     if string_field_in(payload, &["type"]) == Some("token_count")
                         && let Some(total_usage) = total_token_usage(payload)
-                        && retain_latest_foreign_baseline(&mut parsed.events, total_usage)
+                        && retain_latest_foreign_baseline(
+                            &mut parsed.events,
+                            timestamp,
+                            total_usage,
+                        )
                     {
                         parsed.foreign_baseline_events += 1;
                     } else if inherit_foreign_thread_settings
@@ -2987,6 +3486,7 @@ fn parse_rollout_reader<R: BufRead>(
                         let (model, service_tier) = inherited_thread_settings_snapshot(payload);
                         retain_latest_foreign_thread_settings(
                             &mut parsed.events,
+                            timestamp,
                             model,
                             service_tier,
                         );
@@ -3005,6 +3505,7 @@ fn parse_rollout_reader<R: BufRead>(
             parsed.replay_timestamps_complete = false;
         }
         set_max_timestamp(&mut parsed.activity_updated_at, timestamp);
+        let event_count_before = parsed.events.len();
 
         match record_type {
             Some("turn_context") => {
@@ -3036,6 +3537,7 @@ fn parse_rollout_reader<R: BufRead>(
                                 .and_then(title_preview)
                         {
                             parsed.events.push(ParsedEvent::UserMessage {
+                                timestamp,
                                 preview: title,
                                 turn_id: string_field_in(payload, &["turn_id", "turnId"])
                                     .map(str::to_owned),
@@ -3051,9 +3553,10 @@ fn parse_rollout_reader<R: BufRead>(
                             .and_then(|settings| {
                                 normalized_service_tier(settings, inherit_foreign_thread_settings)
                             });
-                        parsed
-                            .events
-                            .push(ParsedEvent::ThreadSettingsApplied { service_tier });
+                        parsed.events.push(ParsedEvent::ThreadSettingsApplied {
+                            timestamp,
+                            service_tier,
+                        });
                     } else if let Some((call_id, child_thread_id, kind)) =
                         subagent_activity(payload)
                     {
@@ -3063,6 +3566,7 @@ fn parse_rollout_reader<R: BufRead>(
                             .and_then(parse_timestamp)
                             .or(explicit_timestamp);
                         parsed.events.push(ParsedEvent::AgentActivity {
+                            recorded_at: explicit_timestamp,
                             occurred_at,
                             call_id,
                             child_thread_id,
@@ -3088,6 +3592,7 @@ fn parse_rollout_reader<R: BufRead>(
                         && let Some((preview, turn_id)) = response_item_user_message(payload)
                     {
                         parsed.events.push(ParsedEvent::UserMessage {
+                            timestamp,
                             preview,
                             turn_id,
                             source: UserMessageSource::ResponseItem,
@@ -3097,18 +3602,37 @@ fn parse_rollout_reader<R: BufRead>(
             }
             _ => {}
         }
+        if parsed.events.len() == event_count_before {
+            parsed.events.push(ParsedEvent::Activity { timestamp });
+        }
     }
     parsed.owning_created_at = owning_created_at;
     parsed.replaying_foreign_history = replaying_foreign_history;
     parsed.inherit_foreign_thread_settings = inherit_foreign_thread_settings;
-    parsed.complete = true;
+    parsed.complete = !read_failed;
     parsed
 }
 
-fn retain_latest_foreign_baseline(events: &mut Vec<ParsedEvent>, total_usage: TokenUsage) -> bool {
+fn push_parsed_warning(parsed: &mut ParsedFile, warning: String) {
+    if parsed.warnings.len() < ROLLOUT_MAX_WARNINGS_PER_FILE {
+        parsed.warnings.push(warning);
+    } else {
+        parsed.suppressed_warnings = parsed.suppressed_warnings.saturating_add(1);
+    }
+}
+
+fn retain_latest_foreign_baseline(
+    events: &mut Vec<ParsedEvent>,
+    timestamp: DateTime<Utc>,
+    total_usage: TokenUsage,
+) -> bool {
     for event in events.iter_mut().rev() {
         match event {
-            ParsedEvent::ForeignCounterBaseline(previous) => {
+            ParsedEvent::ForeignCounterBaseline {
+                timestamp: previous_timestamp,
+                total_usage: previous,
+            } => {
+                *previous_timestamp = timestamp;
                 *previous = total_usage;
                 return false;
             }
@@ -3117,30 +3641,21 @@ fn retain_latest_foreign_baseline(events: &mut Vec<ParsedEvent>, total_usage: To
             _ => break,
         }
     }
-    events.push(ParsedEvent::ForeignCounterBaseline(total_usage));
+    events.push(ParsedEvent::ForeignCounterBaseline {
+        timestamp,
+        total_usage,
+    });
     true
 }
 
 fn retain_latest_foreign_thread_settings(
     events: &mut Vec<ParsedEvent>,
+    timestamp: DateTime<Utc>,
     model: Option<String>,
     service_tier: Option<String>,
 ) {
-    for event in events.iter_mut().rev() {
-        match event {
-            ParsedEvent::ForeignThreadSettingsBaseline {
-                model: previous_model,
-                service_tier: previous_service_tier,
-            } => {
-                *previous_model = model;
-                *previous_service_tier = service_tier;
-                return;
-            }
-            ParsedEvent::ForeignCounterBaseline(_) | ParsedEvent::SessionMeta { .. } => {}
-            _ => break,
-        }
-    }
     events.push(ParsedEvent::ForeignThreadSettingsBaseline {
+        timestamp,
         model,
         service_tier,
     });
@@ -3488,34 +4003,77 @@ fn replay_rollout_file(
     config: &CollectConfig,
     threads: &mut HashMap<String, ThreadBuilder>,
     dataset: &mut RolloutDataset,
+    as_of: Option<DateTime<Utc>>,
+    incomplete_counter_boundary: bool,
 ) {
     let Some(thread_id) = parsed.owner_thread_id.as_deref() else {
         return;
     };
+    let event_is_visible = |event: &ParsedEvent| {
+        as_of.is_none_or(|as_of| {
+            parsed_event_available_at(event).is_none_or(|available_at| available_at <= as_of)
+        })
+    };
+    if !parsed.events.iter().any(event_is_visible) {
+        return;
+    }
+    let archived_file = path.starts_with(config.codex_home.join("archived_sessions"));
     let thread = threads
         .entry(thread_id.to_owned())
         .or_insert_with(|| ThreadBuilder {
             thread_id: thread_id.to_owned(),
+            incomplete_counter_boundary,
             ..ThreadBuilder::default()
         });
-    if path.starts_with(config.codex_home.join("archived_sessions")) {
-        thread.seen_archived_file = true;
-    } else {
-        thread.seen_active_file = true;
+    let visible_session_metadata = parsed
+        .events
+        .iter()
+        .any(|event| matches!(event, ParsedEvent::SessionMeta { .. }) && event_is_visible(event));
+    if as_of.is_none() || visible_session_metadata {
+        if archived_file {
+            thread.seen_archived_file = true;
+        } else {
+            thread.seen_active_file = true;
+        }
     }
 
     for event in &parsed.events {
+        if !event_is_visible(event) {
+            if matches!(event, ParsedEvent::ForeignCounterBaseline { .. })
+                || matches!(
+                    event,
+                    ParsedEvent::TokenCount {
+                        total_usage: Some(_),
+                        ..
+                    }
+                )
+            {
+                // A later wall-clock timestamp can appear earlier in append
+                // order when the system clock is corrected. Do not use that
+                // hidden sample as a cumulative baseline, but also do not
+                // bridge a visible delta across the unknown counter segment.
+                thread.previous_cumulative = None;
+                thread.incomplete_counter_boundary = true;
+            }
+            continue;
+        }
+        if as_of.is_some()
+            && let Some(activity_at) = parsed_event_available_at(event)
+        {
+            set_max_timestamp(&mut thread.updated_at, activity_at);
+        }
         match event {
             ParsedEvent::SessionMeta { timestamp, payload } => {
                 apply_session_meta(thread, payload, *timestamp);
             }
-            ParsedEvent::ForeignCounterBaseline(total_usage) => {
+            ParsedEvent::ForeignCounterBaseline { total_usage, .. } => {
                 thread.previous_cumulative = Some(*total_usage);
                 thread.incomplete_counter_boundary = false;
             }
             ParsedEvent::ForeignThreadSettingsBaseline {
                 model,
                 service_tier,
+                ..
             } => {
                 thread.inherited_thread_settings = model
                     .as_ref()
@@ -3526,6 +4084,7 @@ fn replay_rollout_file(
                 preview,
                 turn_id,
                 source,
+                ..
             } => {
                 apply_user_message(thread, preview, turn_id.as_deref(), *source);
             }
@@ -3545,15 +4104,17 @@ fn replay_rollout_file(
                 call_id,
                 child_thread_id,
                 kind,
+                ..
             } => thread.agent_activities.push(AgentActivityEvidence {
                 occurred_at: *occurred_at,
                 call_id: call_id.clone(),
                 child_thread_id: child_thread_id.clone(),
                 kind: *kind,
             }),
-            ParsedEvent::ThreadSettingsApplied { service_tier } => {
+            ParsedEvent::ThreadSettingsApplied { service_tier, .. } => {
                 apply_thread_settings(thread, service_tier.clone());
             }
+            ParsedEvent::Activity { .. } => {}
             ParsedEvent::TurnContext { timestamp, payload } => {
                 apply_turn_context(thread, payload, *timestamp);
             }
@@ -3611,8 +4172,48 @@ fn replay_rollout_file(
             ),
         }
     }
-    if let Some(updated_at) = parsed.activity_updated_at {
+    if as_of.is_none()
+        && let Some(updated_at) = parsed.activity_updated_at
+    {
         set_max_timestamp(&mut thread.updated_at, updated_at);
+    }
+}
+
+fn parsed_event_available_at(event: &ParsedEvent) -> Option<DateTime<Utc>> {
+    match event {
+        ParsedEvent::SessionMeta { timestamp, .. }
+        | ParsedEvent::ForeignCounterBaseline { timestamp, .. }
+        | ParsedEvent::ForeignThreadSettingsBaseline { timestamp, .. }
+        | ParsedEvent::UserMessage { timestamp, .. }
+        | ParsedEvent::ThreadSettingsApplied { timestamp, .. }
+        | ParsedEvent::Activity { timestamp }
+        | ParsedEvent::TurnContext { timestamp, .. }
+        | ParsedEvent::TokenCount { timestamp, .. } => Some(*timestamp),
+        ParsedEvent::AgentCall { requested_at, .. } => *requested_at,
+        ParsedEvent::AgentActivity {
+            recorded_at,
+            occurred_at,
+            ..
+        } => match (*recorded_at, *occurred_at) {
+            (Some(recorded_at), Some(occurred_at)) => Some(recorded_at.max(occurred_at)),
+            (Some(timestamp), None) | (None, Some(timestamp)) => Some(timestamp),
+            (None, None) => None,
+        },
+        ParsedEvent::TaskStarted {
+            timestamp,
+            started_at,
+            ..
+        } => Some(started_at.map_or(*timestamp, |started_at| (*timestamp).max(started_at))),
+        ParsedEvent::TaskComplete {
+            timestamp,
+            completed_at,
+            ..
+        }
+        | ParsedEvent::TurnAborted {
+            timestamp,
+            completed_at,
+            ..
+        } => Some(completed_at.map_or(*timestamp, |completed_at| (*timestamp).max(completed_at))),
     }
 }
 
@@ -3621,6 +4222,7 @@ fn apply_session_meta(
     payload: &Map<String, Value>,
     timestamp: DateTime<Utc>,
 ) {
+    set_max_timestamp(&mut thread.session_metadata_updated_at, timestamp);
     if let Some((parent_thread_id, rank)) =
         session_parent_thread_id(payload, Some(&thread.thread_id))
     {
@@ -3826,11 +4428,14 @@ fn apply_token_count(
             if usage.last == Some(total_usage) {
                 total_usage
             } else {
-                dataset.warnings.push(format!(
-                    "token counter baseline for thread {} is outside the selected rollout boundary at {} line {line_number}; counted only the explicitly reported last request, when valid, and did not attribute the unknown cumulative gap",
-                    thread.thread_id,
-                    path.display()
-                ));
+                push_replay_warning(
+                    dataset,
+                    format!(
+                        "token counter baseline for thread {} is outside the selected rollout boundary at {} line {line_number}; counted only the explicitly reported last request, when valid, and did not attribute the unknown cumulative gap",
+                        thread.thread_id,
+                        path.display()
+                    ),
+                );
                 dataset.stats.ambiguous_token_resets += 1;
                 let Some(last_usage) = usage
                     .last
@@ -3847,11 +4452,14 @@ fn apply_token_count(
         Some(previous) => match total_usage.delta_from(previous) {
             Some(delta) => delta,
             None => {
-                dataset.warnings.push(format!(
-                    "token counter reset for thread {} at {} line {line_number}; re-established the cumulative baseline without counting the ambiguous reset sample",
-                    thread.thread_id,
-                    path.display()
-                ));
+                push_replay_warning(
+                    dataset,
+                    format!(
+                        "token counter reset for thread {} at {} line {line_number}; re-established the cumulative baseline without counting the ambiguous reset sample",
+                        thread.thread_id,
+                        path.display()
+                    ),
+                );
                 dataset.stats.ambiguous_token_resets += 1;
                 thread.previous_cumulative = Some(total_usage);
                 return;
@@ -3891,6 +4499,12 @@ fn apply_token_count(
         tokens: delta,
         request_usage_exact,
     });
+}
+
+fn push_replay_warning(dataset: &mut RolloutDataset, warning: String) {
+    if dataset.warnings.len() < ROLLOUT_MAX_WARNINGS_PER_FILE {
+        dataset.warnings.push(warning);
+    }
 }
 
 fn total_token_usage(payload: &Map<String, Value>) -> Option<TokenUsage> {
@@ -4066,7 +4680,77 @@ fn finish_dataset(
     thread_titles: &HashMap<String, String>,
     dataset: &mut RolloutDataset,
 ) {
-    for thread in threads.values() {
+    // The reduced cache intentionally keeps every parsed event. That lets a
+    // sample become visible without reparsing after the clock catches up, and
+    // lets a clock rollback hide it again. Materialization is the as-of
+    // boundary: future evidence must not leak into the current snapshot or its
+    // token/quota calculations.
+    dataset.calls.retain(|call| call.timestamp <= now);
+    dataset
+        .rate_observations
+        .retain(|observation| observation.timestamp <= now);
+
+    let mut usage_by_thread = HashMap::<String, TokenUsage>::new();
+    let mut usage_by_turn = HashMap::<(String, String), TokenUsage>::new();
+    let mut latest_call_by_thread = HashMap::<String, DateTime<Utc>>::new();
+    for call in &dataset.calls {
+        usage_by_thread
+            .entry(call.thread_id.clone())
+            .or_default()
+            .add_assign(call.tokens);
+        if let Some(turn_id) = &call.turn_id {
+            usage_by_turn
+                .entry((call.thread_id.clone(), turn_id.clone()))
+                .or_default()
+                .add_assign(call.tokens);
+        }
+        latest_call_by_thread
+            .entry(call.thread_id.clone())
+            .and_modify(|timestamp| *timestamp = (*timestamp).max(call.timestamp))
+            .or_insert(call.timestamp);
+    }
+
+    let visible_threads = threads
+        .iter()
+        .filter_map(|(thread_id, thread)| {
+            materialize_thread_as_of(
+                thread,
+                now,
+                usage_by_thread.get(thread_id).copied().unwrap_or_default(),
+                &usage_by_turn,
+                latest_call_by_thread.get(thread_id).copied(),
+            )
+            .map(|thread| (thread_id.clone(), thread))
+        })
+        .collect::<HashMap<_, _>>();
+
+    // A timestamped usage/quota sample can be current even when a corrupted or
+    // rolled-back turn start is still in the future. Preserve the sample, but
+    // do not expose or calculate with metadata borrowed from that future turn.
+    for call in &mut dataset.calls {
+        let turn_is_visible = call.turn_id.as_ref().is_none_or(|turn_id| {
+            visible_threads
+                .get(&call.thread_id)
+                .is_some_and(|thread| thread.turns.contains_key(turn_id))
+        });
+        if !turn_is_visible {
+            call.turn_id = None;
+            call.model = None;
+            call.service_tier = None;
+        }
+    }
+    for observation in &mut dataset.rate_observations {
+        let turn_is_visible = observation.turn_id.as_ref().is_none_or(|turn_id| {
+            visible_threads
+                .get(&observation.thread_id)
+                .is_some_and(|thread| thread.turns.contains_key(turn_id))
+        });
+        if !turn_is_visible {
+            observation.turn_id = None;
+        }
+    }
+
+    for thread in visible_threads.values() {
         let active_is_fresh = !thread.active_turn_ids.is_empty()
             && timestamp_is_fresh(thread.updated_at, now, config.active_grace);
 
@@ -4118,6 +4802,11 @@ fn finish_dataset(
 
         let title = if config.redact_content {
             "[redacted]".to_owned()
+        } else if thread
+            .session_metadata_updated_at
+            .is_some_and(|timestamp| timestamp > now)
+        {
+            "Untitled task".to_owned()
         } else {
             thread_titles
                 .get(&thread.thread_id)
@@ -4147,7 +4836,19 @@ fn finish_dataset(
         });
     }
 
-    append_exact_agent_interactions(threads, dataset);
+    append_exact_agent_interactions(&visible_threads, dataset);
+    // Untimestamped interaction halves retain their historical compatibility:
+    // without a timestamp there is no evidence that they are in the future.
+    // Any known future half, however, makes the joined record unavailable at
+    // this as-of boundary.
+    dataset.agent_interactions.retain(|interaction| {
+        interaction
+            .requested_at
+            .is_none_or(|timestamp| timestamp <= now)
+            && interaction
+                .occurred_at
+                .is_none_or(|timestamp| timestamp <= now)
+    });
 
     dataset.tasks.sort_by(|left, right| {
         right
@@ -4182,6 +4883,121 @@ fn finish_dataset(
             .then_with(|| left.child_thread_id.cmp(&right.child_thread_id))
             .then_with(|| left.call_id.cmp(&right.call_id))
     });
+}
+
+fn materialize_thread_as_of(
+    thread: &ThreadBuilder,
+    now: DateTime<Utc>,
+    token_usage: TokenUsage,
+    usage_by_turn: &HashMap<(String, String), TokenUsage>,
+    latest_call: Option<DateTime<Utc>>,
+) -> Option<ThreadBuilder> {
+    let mut visible = thread.clone();
+    let session_metadata_is_future = thread
+        .session_metadata_updated_at
+        .is_some_and(|timestamp| timestamp > now);
+    if session_metadata_is_future {
+        visible.parent_thread_id = None;
+        visible.parent_thread_rank = None;
+        visible.seen_active_file = false;
+        visible.seen_archived_file = false;
+        visible.title = None;
+        visible.title_source = None;
+        visible.title_turn_id = None;
+        visible.cwd = None;
+        visible.source = None;
+        visible.service_tier = None;
+        visible.service_tier_observed = false;
+        visible.inherited_thread_settings = None;
+    }
+    visible.created_at = thread.created_at.filter(|timestamp| *timestamp <= now);
+    visible.updated_at = thread.updated_at.filter(|timestamp| *timestamp <= now);
+    visible.token_usage = token_usage;
+    visible
+        .agent_calls
+        .retain(|call| call.requested_at.is_none_or(|timestamp| timestamp <= now));
+    visible.agent_activities.retain(|activity| {
+        activity
+            .occurred_at
+            .is_none_or(|timestamp| timestamp <= now)
+    });
+
+    let original_active_turn_ids = thread
+        .active_turn_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    visible.active_turn_ids.clear();
+    visible.turns.retain(|_, turn| {
+        turn.started_at.is_none_or(|started_at| started_at <= now)
+            && !(turn.started_at.is_none()
+                && turn
+                    .completed_at
+                    .is_some_and(|completed_at| completed_at > now)
+                && usage_by_turn
+                    .get(&(thread.thread_id.clone(), turn.turn_id.clone()))
+                    .is_none())
+    });
+    for turn in visible.turns.values_mut() {
+        let completed_in_future = turn
+            .completed_at
+            .is_some_and(|completed_at| completed_at > now);
+        if completed_in_future {
+            turn.completed_at = None;
+            turn.duration_ms = None;
+            turn.status = TurnStatus::InProgress;
+        }
+        turn.token_usage = usage_by_turn
+            .get(&(thread.thread_id.clone(), turn.turn_id.clone()))
+            .copied()
+            .unwrap_or_default();
+        if original_active_turn_ids.contains(turn.turn_id.as_str()) || completed_in_future {
+            visible.active_turn_ids.push(turn.turn_id.clone());
+        }
+    }
+    visible.last_turn_id = visible
+        .turns
+        .values()
+        .filter(|turn| turn.completed_at.is_some())
+        .max_by_key(|turn| turn.completed_at)
+        .map(|turn| turn.turn_id.clone());
+
+    if let Some(created_at) = visible.created_at {
+        set_max_timestamp(&mut visible.updated_at, created_at);
+    }
+    if let Some(latest_call) = latest_call {
+        set_max_timestamp(&mut visible.updated_at, latest_call);
+    }
+    for turn in visible.turns.values() {
+        if let Some(started_at) = turn.started_at {
+            set_max_timestamp(&mut visible.updated_at, started_at);
+        }
+        if let Some(completed_at) = turn.completed_at {
+            set_max_timestamp(&mut visible.updated_at, completed_at);
+        }
+    }
+    for call in &visible.agent_calls {
+        if let Some(requested_at) = call.requested_at {
+            set_max_timestamp(&mut visible.updated_at, requested_at);
+        }
+    }
+    for activity in &visible.agent_activities {
+        if let Some(occurred_at) = activity.occurred_at {
+            set_max_timestamp(&mut visible.updated_at, occurred_at);
+        }
+    }
+
+    // A thread whose only dated evidence is in the future does not exist in
+    // this view. Fully untimestamped legacy metadata remains visible because
+    // there is no sound basis for classifying it as future.
+    let has_visible_evidence = visible.created_at.is_some()
+        || visible.updated_at.is_some()
+        || !visible.turns.is_empty()
+        || !token_usage.is_zero()
+        || !visible.agent_calls.is_empty()
+        || !visible.agent_activities.is_empty();
+    let legacy_untimestamped = thread.created_at.is_none() && thread.updated_at.is_none();
+    (has_visible_evidence || legacy_untimestamped).then_some(visible)
 }
 
 fn append_exact_agent_interactions(
@@ -4344,8 +5160,8 @@ fn timestamp_is_fresh(
     let Some(timestamp) = timestamp else {
         return false;
     };
-    if timestamp >= now {
-        return true;
+    if timestamp > now {
+        return false;
     }
     now.signed_duration_since(timestamp)
         .to_std()

@@ -181,6 +181,54 @@ impl PtySession {
         }
     }
 
+    fn signal_and_wait_for_exit(&mut self, signal: libc::c_int) -> Vec<u8> {
+        let process_id = self
+            .child
+            .process_id()
+            .expect("PTY child should have a pid");
+        // SAFETY: this targets the live child process created by this session.
+        let result = unsafe { libc::kill(process_id as libc::pid_t, signal) };
+        assert_eq!(result, 0, "failed to signal PTY child");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        loop {
+            while let Ok(bytes) = self.output.try_recv() {
+                output.extend_from_slice(&bytes);
+                self.parser.process(&bytes);
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "signal-aware TUI exited with {status:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not exit after signal {signal}"
+            );
+            match self.output.recv_timeout(Duration::from_millis(20)) {
+                Ok(bytes) => {
+                    output.extend_from_slice(&bytes);
+                    self.parser.process(&bytes);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        let drain_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.output.recv_timeout(Duration::from_millis(50)) {
+                Ok(bytes) => {
+                    output.extend_from_slice(&bytes);
+                    self.parser.process(&bytes);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < drain_deadline => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+            }
+        }
+        output
+    }
+
     fn top_row(&self) -> String {
         top_row(self.parser.screen())
     }
@@ -303,4 +351,29 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
 
     session.send(b"q");
     session.wait_for_exit();
+}
+
+#[test]
+fn termination_signals_restore_terminal_modes_before_exiting() {
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let mut session = PtySession::spawn();
+        session.wait_for("initial fixture session", |screen| {
+            screen.contents().contains("codex-usage-monit | desktop")
+        });
+
+        let output = session.signal_and_wait_for_exit(signal);
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("\u{1b}[?1006l"),
+            "mouse capture stayed enabled after signal {signal}"
+        );
+        assert!(
+            output.contains("\u{1b}[?1049l"),
+            "alternate screen stayed enabled after signal {signal}"
+        );
+        assert!(
+            output.contains("\u{1b}[?25h"),
+            "cursor stayed hidden after signal {signal}"
+        );
+    }
 }

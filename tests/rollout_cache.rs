@@ -78,6 +78,84 @@ fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
 }
 
 #[test]
+fn cached_refresh_rebuilds_truncated_replay_warnings_in_file_order() {
+    let temp = TempDir::new().unwrap();
+    let sessions = temp.path().join("sessions");
+    let now = Utc::now();
+    let base = now - chrono::Duration::hours(1);
+    let write_resets = |path: &Path, thread_id: &str, at: DateTime<Utc>, reset_count: usize| {
+        let mut records = vec![
+            json!({
+                "timestamp": timestamp(at),
+                "type": "session_meta",
+                "payload": {"id": thread_id, "timestamp": timestamp(at)}
+            }),
+            json!({
+                "timestamp": timestamp(at),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(1_000)}
+                }
+            }),
+        ];
+        for reset in 0..reset_count {
+            let at = at + chrono::Duration::milliseconds((reset + 1) as i64);
+            records.push(json!({
+                "timestamp": timestamp(at),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(999 - reset as u64)}
+                }
+            }));
+        }
+        write_jsonl(path, &records);
+    };
+
+    let mut first_path = None;
+    for index in 0..127 {
+        let path = sessions.join(format!("rollout-{index:03}.jsonl"));
+        if index == 0 {
+            first_path = Some(path.clone());
+        }
+        write_resets(
+            &path,
+            &format!("thread-{index:03}"),
+            base + chrono::Duration::seconds(index),
+            if index == 0 { 2 } else { 1 },
+        );
+    }
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let overflowed = cache.scan(&scan_config, now).unwrap();
+    assert_eq!(overflowed.stats.ambiguous_token_resets, 128);
+    assert!(
+        overflowed
+            .warnings
+            .last()
+            .is_some_and(|warning| warning.starts_with("suppressed 1 additional"))
+    );
+
+    write_resets(first_path.as_ref().unwrap(), "thread-000", base, 0);
+    let cached = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
+
+    assert!(cache.last_refresh().full_rebuild);
+    assert_eq!(cached.stats.ambiguous_token_resets, 126);
+    assert!(
+        cached
+            .warnings
+            .iter()
+            .all(|warning| !warning.starts_with("suppressed "))
+    );
+    assert_dataset_eq(&cached, &fresh);
+}
+
+#[test]
 fn cached_snapshot_skips_derive_until_rollout_changes() {
     let temp = TempDir::new().unwrap();
     let now = Utc::now();
@@ -106,7 +184,7 @@ fn cached_snapshot_skips_derive_until_rollout_changes() {
     append_jsonl(
         &path,
         &[json!({
-            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "timestamp": timestamp(Utc::now()),
             "type": "event_msg",
             "payload": {"type": "task_started", "turn_id": "snapshot-fast-path-turn"}
         })],
@@ -378,7 +456,9 @@ fn warm_owner_probe_cache_cannot_bypass_the_omitted_candidate_cap() {
     scan_config.lookback_days = 1;
     let mut cache = RolloutCache::new();
 
-    let first = cache.scan(&scan_config, now).unwrap();
+    let first = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
     assert_eq!(first.calls.len(), 1);
     assert_eq!(first.stats.ambiguous_token_resets, 0);
 
@@ -1200,6 +1280,131 @@ fn cache_preserves_foreign_parent_counter_baseline() {
             .iter()
             .all(|warning| !warning.contains("counter reset"))
     );
+}
+
+#[test]
+fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner() {
+    let temp = TempDir::new().unwrap();
+    let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+    let path = temp.path().join("sessions/rollout-ownerless-rewrite.jsonl");
+    let retained_path = temp
+        .path()
+        .join("sessions/rollout-ownerless-rewrite-control.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {
+                    "id": "owner-before-rewrite",
+                    "timestamp": timestamp(now)
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(100)}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now + chrono::Duration::milliseconds(1)),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(50)}
+                }
+            }),
+        ],
+    );
+    write_jsonl(
+        &retained_path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {
+                    "id": "unchanged-owner",
+                    "timestamp": timestamp(now)
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(80)}
+                }
+            }),
+            json!({
+                "timestamp": timestamp(now + chrono::Duration::milliseconds(1)),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage(40)}
+                }
+            }),
+        ],
+    );
+
+    let scan_config = config(temp.path());
+    let mut cache = RolloutCache::new();
+    let owned = cache
+        .scan(&scan_config, now + chrono::Duration::milliseconds(2))
+        .unwrap();
+    assert_eq!(owned.stats.ambiguous_token_resets, 2);
+    assert!(
+        owned
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("token counter reset"))
+    );
+
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": "ignored-ownerless-turn",
+                "padding": "this rewrite intentionally has no session metadata owner"
+            }
+        })],
+    );
+
+    let ownerless = cache
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+    assert_eq!(cache.last_refresh().reused_files, 1);
+    // The selected ownerless file makes the unchanged owner's first counter
+    // boundary conservative, so that control file now contributes two
+    // ambiguities. Neither diagnostic may come from the rewritten path.
+    assert_eq!(
+        ownerless.stats.ambiguous_token_resets, 2,
+        "{:?}",
+        ownerless.warnings
+    );
+    assert!(
+        ownerless
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("token counter reset"))
+            .all(|warning| !warning.contains(&path.display().to_string()))
+    );
+    assert!(ownerless.warnings.iter().any(|warning| {
+        warning.contains("token counter reset")
+            && warning.contains(&retained_path.display().to_string())
+    }));
+    assert_eq!(ownerless.tasks.len(), 1);
+    assert_eq!(ownerless.tasks[0].thread_id, "unchanged-owner");
+    assert!(ownerless.turns.is_empty());
+
+    let fresh = scan_rollouts(&scan_config, now + chrono::Duration::seconds(2)).unwrap();
+    assert_dataset_eq(&ownerless, &fresh);
 }
 
 #[test]

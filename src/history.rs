@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Days, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -31,6 +31,8 @@ const APP_DIRECTORY: &str = "codex-usage-monit";
 const HISTORY_DIRECTORY: &str = "history-v1";
 const STATE_DIRECTORY_ENV: &str = "CODEX_USAGE_MONIT_STATE_DIR";
 const LOCK_FILE: &str = "history.lock";
+const RETENTION_CLOCK_FILE: &str = "retention-clock.json";
+const RETENTION_CLOCK_VERSION: u32 = 1;
 const SUMMARY_BACKFILL_MARKER_FILE: &str = "summary-backfill.json";
 const SUMMARY_BACKFILL_MARKER_VERSION: u32 = 1;
 const LEGACY_HISTORY_FORMAT_VERSION: u32 = 1;
@@ -43,9 +45,44 @@ const RESET_DRIFT_SECS: i64 = 120;
 const FULL_HISTORY_MERGE_SECS: i64 = 30 * 60;
 const RECENT_BUCKET_OVERLAP_SECS: i64 = 60 * 60;
 const HISTORY_READ_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
+/// A single wall-clock step larger than the entire retention window is never
+/// allowed to move the destructive-pruning clock. Ordinary continuous use and
+/// gaps within the window retain their existing cleanup behavior.
+const MAX_RETENTION_CLOCK_STEP_DAYS: i64 = HISTORY_RETENTION_DAYS;
+const RETENTION_CLOCK_CONFIRMATION_HOURS: i64 = 48;
+const RETENTION_CLOCK_MIN_CONFIRMATIONS: u32 = 3;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 const PROJECT_TITLE_MAX_CHARS: usize = 160;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn datetime_saturating_add(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    timestamp.checked_add_signed(duration).unwrap_or_else(|| {
+        if duration < Duration::zero() {
+            DateTime::<Utc>::MIN_UTC
+        } else {
+            DateTime::<Utc>::MAX_UTC
+        }
+    })
+}
+
+fn datetime_saturating_sub(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    timestamp.checked_sub_signed(duration).unwrap_or_else(|| {
+        if duration < Duration::zero() {
+            DateTime::<Utc>::MAX_UTC
+        } else {
+            DateTime::<Utc>::MIN_UTC
+        }
+    })
+}
+
+fn timestamps_within(
+    timestamp: DateTime<Utc>,
+    reference: DateTime<Utc>,
+    tolerance: Duration,
+) -> bool {
+    timestamp >= datetime_saturating_sub(reference, tolerance)
+        && timestamp <= datetime_saturating_add(reference, tolerance)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,9 +321,17 @@ pub struct HistoryData {
 
 impl HistoryData {
     pub fn remaining_series(&self, duration_mins: i64) -> Vec<QuotaPoint> {
+        self.remaining_series_as_of(duration_mins, DateTime::<Utc>::MAX_UTC)
+    }
+
+    pub fn remaining_series_as_of(
+        &self,
+        duration_mins: i64,
+        as_of: DateTime<Utc>,
+    ) -> Vec<QuotaPoint> {
         self.quota_points
             .iter()
-            .filter(|point| point.duration_mins == duration_mins)
+            .filter(|point| point.duration_mins == duration_mins && point.observed_at <= as_of)
             .cloned()
             .collect()
     }
@@ -296,13 +341,18 @@ impl HistoryData {
     }
 
     pub fn latest_weekly_reset(&self) -> Option<DateTime<Utc>> {
+        self.latest_weekly_reset_as_of(DateTime::<Utc>::MAX_UTC)
+    }
+
+    pub fn latest_weekly_reset_as_of(&self, as_of: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.quota_points
             .iter()
-            .filter(|point| point.duration_mins == WEEK_MINS)
+            .filter(|point| point.duration_mins == WEEK_MINS && point.observed_at <= as_of)
             .map(|point| (point.observed_at, point.resets_at))
             .chain(
                 self.weekly_local_points
                     .iter()
+                    .filter(|point| point.observed_at <= as_of)
                     .map(|point| (point.observed_at, point.resets_at)),
             )
             .max_by_key(|(observed_at, _)| *observed_at)
@@ -313,7 +363,15 @@ impl HistoryData {
         &self,
         weekly_resets_at: DateTime<Utc>,
     ) -> Vec<HalfHourSeriesPoint> {
-        self.estimated_half_hour_series_with_api_long_context(weekly_resets_at, false)
+        self.estimated_half_hour_series_as_of(weekly_resets_at, DateTime::<Utc>::MAX_UTC)
+    }
+
+    pub fn estimated_half_hour_series_as_of(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+    ) -> Vec<HalfHourSeriesPoint> {
+        self.estimated_half_hour_series_with_api_long_context_as_of(weekly_resets_at, as_of, false)
     }
 
     pub fn estimated_half_hour_series_with_api_long_context(
@@ -321,11 +379,25 @@ impl HistoryData {
         weekly_resets_at: DateTime<Utc>,
         api_long_context: bool,
     ) -> Vec<HalfHourSeriesPoint> {
-        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        self.estimated_half_hour_series_with_api_long_context_as_of(
+            weekly_resets_at,
+            DateTime::<Utc>::MAX_UTC,
+            api_long_context,
+        )
+    }
+
+    pub fn estimated_half_hour_series_with_api_long_context_as_of(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+        api_long_context: bool,
+    ) -> Vec<HalfHourSeriesPoint> {
+        let cycle_starts_at =
+            datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
         let boundary_crosses_bucket =
             cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
-        let cycle = self.weekly_cycle_buckets(weekly_resets_at);
-        let estimate = self.estimate_context(weekly_resets_at, &cycle, api_long_context);
+        let cycle = self.weekly_cycle_buckets(weekly_resets_at, as_of);
+        let estimate = self.estimate_context(weekly_resets_at, as_of, &cycle, api_long_context);
         cycle
             .into_iter()
             .map(|bucket| {
@@ -373,7 +445,15 @@ impl HistoryData {
         &self,
         weekly_resets_at: DateTime<Utc>,
     ) -> Vec<WeeklyCumulativePoint> {
-        self.weekly_cumulative_series_with_api_long_context(weekly_resets_at, false)
+        self.weekly_cumulative_series_as_of(weekly_resets_at, DateTime::<Utc>::MAX_UTC)
+    }
+
+    pub fn weekly_cumulative_series_as_of(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+    ) -> Vec<WeeklyCumulativePoint> {
+        self.weekly_cumulative_series_with_api_long_context_as_of(weekly_resets_at, as_of, false)
     }
 
     pub fn weekly_cumulative_series_with_api_long_context(
@@ -381,27 +461,46 @@ impl HistoryData {
         weekly_resets_at: DateTime<Utc>,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
+        self.weekly_cumulative_series_with_api_long_context_as_of(
+            weekly_resets_at,
+            DateTime::<Utc>::MAX_UTC,
+            api_long_context,
+        )
+    }
+
+    pub fn weekly_cumulative_series_with_api_long_context_as_of(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+        api_long_context: bool,
+    ) -> Vec<WeeklyCumulativePoint> {
         if let Some(points) =
-            self.recorded_weekly_cumulative_series(weekly_resets_at, api_long_context)
+            self.recorded_weekly_cumulative_series(weekly_resets_at, as_of, api_long_context)
         {
             return points;
         }
-        self.derived_weekly_cumulative_series(weekly_resets_at, api_long_context)
+        self.derived_weekly_cumulative_series(weekly_resets_at, as_of, api_long_context)
     }
 
     fn recorded_weekly_cumulative_series(
         &self,
         weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
         api_long_context: bool,
     ) -> Option<Vec<WeeklyCumulativePoint>> {
-        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+        let cycle_starts_at =
+            datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
         let mut recorded = self
             .weekly_local_points
             .iter()
             .filter(|point| {
-                (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
-                    && point.observed_at >= cycle_starts_at
+                timestamps_within(
+                    point.resets_at,
+                    weekly_resets_at,
+                    Duration::seconds(RESET_DRIFT_SECS),
+                ) && point.observed_at >= cycle_starts_at
                     && point.observed_at < weekly_resets_at
+                    && point.observed_at <= as_of
             })
             .collect::<Vec<_>>();
         recorded.sort_by_key(|point| point.observed_at);
@@ -419,7 +518,7 @@ impl HistoryData {
             .max_by_key(|point| point.observed_at)
             .copied()
             .expect("recorded weekly points are non-empty");
-        let used_percent = self.latest_weekly_used_percent(weekly_resets_at);
+        let used_percent = self.latest_weekly_used_percent(weekly_resets_at, as_of);
         let latest_cost_units = selected_cost_units(
             latest.estimated_cost_units,
             latest.api_long_context_extra_cost_units,
@@ -493,7 +592,7 @@ impl HistoryData {
             .into_iter()
             .map(|point| (point.at, point))
             .collect::<BTreeMap<_, _>>();
-        let mut buckets = self.weekly_cycle_buckets(weekly_resets_at);
+        let mut buckets = self.weekly_cycle_buckets(weekly_resets_at, as_of);
         buckets.sort_by_key(|bucket| bucket.starts_at);
         for bucket in buckets {
             if !confirmed_zero_bucket(bucket) || projected.contains_key(&bucket.ends_at) {
@@ -524,11 +623,13 @@ impl HistoryData {
     fn derived_weekly_cumulative_series(
         &self,
         weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
         api_long_context: bool,
     ) -> Vec<WeeklyCumulativePoint> {
-        let cycle_starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
-        let buckets = self.weekly_cycle_buckets(weekly_resets_at);
-        let estimate = self.estimate_context(weekly_resets_at, &buckets, api_long_context);
+        let cycle_starts_at =
+            datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
+        let buckets = self.weekly_cycle_buckets(weekly_resets_at, as_of);
+        let estimate = self.estimate_context(weekly_resets_at, as_of, &buckets, api_long_context);
         let boundary_crosses_bucket =
             cycle_starts_at.timestamp().rem_euclid(LOCAL_BUCKET_SECS) != 0;
         let mut token_usage = TokenUsage::default();
@@ -583,19 +684,32 @@ impl HistoryData {
         points
     }
 
-    fn latest_weekly_used_percent(&self, weekly_resets_at: DateTime<Utc>) -> Option<f64> {
+    fn latest_weekly_used_percent(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+    ) -> Option<f64> {
         self.quota_points
             .iter()
             .filter(|point| {
                 point.duration_mins == WEEK_MINS
-                    && (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+                    && timestamps_within(
+                        point.resets_at,
+                        weekly_resets_at,
+                        Duration::seconds(RESET_DRIFT_SECS),
+                    )
+                    && point.observed_at <= as_of
             })
             .max_by_key(|point| point.observed_at)
             .map(|point| point.used_percent)
     }
 
-    fn weekly_cycle_buckets(&self, weekly_resets_at: DateTime<Utc>) -> Vec<&LocalHalfHourBucket> {
-        let starts_at = weekly_resets_at - Duration::minutes(WEEK_MINS);
+    fn weekly_cycle_buckets(
+        &self,
+        weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
+    ) -> Vec<&LocalHalfHourBucket> {
+        let starts_at = datetime_saturating_sub(weekly_resets_at, Duration::minutes(WEEK_MINS));
         self.half_hour_buckets
             .iter()
             // A local aggregate cannot be split accurately after the fact. Keep
@@ -605,6 +719,7 @@ impl HistoryData {
                 is_current_local_bucket(bucket)
                     && bucket.starts_at >= starts_at
                     && bucket.ends_at <= weekly_resets_at
+                    && bucket.sampled_at <= as_of
             })
             .collect()
     }
@@ -612,6 +727,7 @@ impl HistoryData {
     fn estimate_context(
         &self,
         weekly_resets_at: DateTime<Utc>,
+        as_of: DateTime<Utc>,
         buckets: &[&LocalHalfHourBucket],
         api_long_context: bool,
     ) -> EstimateContext {
@@ -640,7 +756,11 @@ impl HistoryData {
             .weekly_local_points
             .iter()
             .filter(|point| {
-                (point.resets_at - weekly_resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+                timestamps_within(
+                    point.resets_at,
+                    weekly_resets_at,
+                    Duration::seconds(RESET_DRIFT_SECS),
+                ) && point.observed_at <= as_of
             })
             .max_by_key(|point| point.observed_at);
         let weekly_cost_units = weekly_point.and_then(|point| {
@@ -659,7 +779,7 @@ impl HistoryData {
         let estimator_revision = weekly_point
             .map(|point| point.estimator_revision)
             .unwrap_or(estimator_revision);
-        let used_percent = self.latest_weekly_used_percent(weekly_resets_at);
+        let used_percent = self.latest_weekly_used_percent(weekly_resets_at, as_of);
         EstimateContext {
             used_percent,
             total_cost_units,
@@ -736,8 +856,19 @@ pub struct HistoryWriteReport {
     pub shards_written: usize,
     pub shards_skipped: usize,
     pub shards_pruned: usize,
+    /// Retention was based on the latest persisted observation instead of the
+    /// incoming wall clock because the requested cutoff would have jumped
+    /// past every existing observation. A later full merge can confirm normal
+    /// clock progress and resume pruning.
+    pub retention_prune_deferred: bool,
     pub warnings: Vec<String>,
     pub read_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SummaryBackfillAttempt {
+    pub completed_at: DateTime<Utc>,
+    pub complete: bool,
 }
 
 #[derive(Debug)]
@@ -745,6 +876,8 @@ pub struct HistoryStore {
     history_root: Option<PathBuf>,
     namespace: String,
     namespace_dir: Option<PathBuf>,
+    #[cfg(windows)]
+    windows_namespace_mode: WindowsNamespaceMode,
     redact_content: bool,
     read_only: bool,
     namespace_checked: bool,
@@ -783,12 +916,18 @@ impl HistoryStore {
         codex_home: &Path,
         redact_content: bool,
     ) -> Self {
+        #[cfg(windows)]
+        let (namespace, windows_namespace_mode) =
+            windows_resolved_history_identity(history_root.as_deref(), codex_home, redact_content);
+        #[cfg(not(windows))]
         let namespace = history_namespace_with_redaction(codex_home, redact_content);
         let namespace_dir = history_root.as_ref().map(|root| root.join(&namespace));
         Self {
             history_root,
             namespace,
             namespace_dir,
+            #[cfg(windows)]
+            windows_namespace_mode,
             redact_content,
             read_only: false,
             namespace_checked: false,
@@ -823,13 +962,20 @@ impl HistoryStore {
             .redact_content
             .then(|| redacted_history_observation(observation));
         let observation = redacted_observation.as_ref().unwrap_or(observation);
+        #[cfg(windows)]
+        let normalized_observation =
+            observation_for_windows_namespace(observation, self.windows_namespace_mode);
+        #[cfg(windows)]
+        let observation = &normalized_observation;
         let full_merge = self.full_merge_due(observation.observed_at);
         self.record_with_merge_mode(observation, full_merge, full_merge)
     }
 
     fn full_merge_due(&self, observed_at: DateTime<Utc>) -> bool {
         self.last_full_merge_at.is_none_or(|last| {
-            observed_at < last || observed_at - last >= Duration::seconds(FULL_HISTORY_MERGE_SECS)
+            observed_at < last
+                || observed_at
+                    >= datetime_saturating_add(last, Duration::seconds(FULL_HISTORY_MERGE_SECS))
         })
     }
 
@@ -867,7 +1013,46 @@ impl HistoryStore {
             self.namespace_checked = true;
         }
 
-        let cutoff = observation.observed_at - Duration::days(HISTORY_RETENTION_DAYS);
+        let cutoff = if full_merge {
+            let current_clock = read_current_retention_clock(directory);
+            // A fresh store has no independent clock yet, but a full
+            // observation can already contain older rollout-backed samples.
+            // Include that evidence in the initial anchor so a bad first wall
+            // clock cannot discard the backfill before it is ever persisted.
+            let conservative_anchor = current_clock
+                .is_none()
+                .then(|| {
+                    [
+                        earliest_persisted_observation_at(directory, &self.namespace),
+                        include_all_observation_points
+                            .then(|| earliest_observation_timestamp(observation))
+                            .flatten(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                })
+                .flatten();
+            let (clock, deferred) =
+                next_retention_clock(current_clock, conservative_anchor, observation.observed_at);
+            report.retention_prune_deferred = deferred;
+            if deferred {
+                report.warnings.push(format!(
+                    "history retention pruning was limited because the wall clock advanced too far beyond the trusted history clock (trusted through {})",
+                    clock.trusted_at.to_rfc3339()
+                ));
+            }
+            // Commit the independent trusted clock before samples from an
+            // untrusted future timestamp can become persisted candidates.
+            write_retention_clock(directory, &clock)?;
+            let retention_as_of = clock.trusted_at.min(observation.observed_at);
+            datetime_saturating_sub(retention_as_of, Duration::days(HISTORY_RETENTION_DAYS))
+        } else {
+            datetime_saturating_sub(
+                observation.observed_at,
+                Duration::days(HISTORY_RETENTION_DAYS),
+            )
+        };
         let additions = additions_by_day(observation, cutoff, include_all_observation_points);
         for (day, additions) in additions {
             let path = shard_path(directory, day);
@@ -947,10 +1132,27 @@ impl HistoryStore {
             .redact_content
             .then(|| redacted_history_observation(observation));
         let observation = redacted_observation.as_ref().unwrap_or(observation);
+        #[cfg(windows)]
+        let normalized_observation =
+            observation_for_windows_namespace(observation, self.windows_namespace_mode);
+        #[cfg(windows)]
+        let observation = &normalized_observation;
         let pending_clock_rollback = self
             .staged_observation
             .as_ref()
             .is_some_and(|staged| observation.observed_at < staged.observed_at);
+        let large_clock_rollback = self.staged_observation.as_ref().is_some_and(|staged| {
+            observation.observed_at
+                < datetime_saturating_sub(
+                    staged.observed_at,
+                    Duration::days(MAX_RETENTION_CLOCK_STEP_DAYS),
+                )
+        });
+        if large_clock_rollback {
+            // A staged sample from far ahead must not pin all subsequent
+            // writes to the bad timestamp after the wall clock is corrected.
+            self.staged_observation = None;
+        }
         self.staged_force_full_merge |=
             self.full_merge_due(observation.observed_at) || pending_clock_rollback;
         let full_merge = self.staged_force_full_merge;
@@ -975,7 +1177,21 @@ impl HistoryStore {
             .redact_content
             .then(|| redacted_history_observation(observation));
         let observation = redacted_observation.as_ref().unwrap_or(observation);
+        #[cfg(windows)]
+        let normalized_observation =
+            observation_for_windows_namespace(observation, self.windows_namespace_mode);
+        #[cfg(windows)]
+        let observation = &normalized_observation;
         self.staged_force_full_merge = true;
+        if self.staged_observation.as_ref().is_some_and(|staged| {
+            observation.observed_at
+                < datetime_saturating_sub(
+                    staged.observed_at,
+                    Duration::days(MAX_RETENTION_CLOCK_STEP_DAYS),
+                )
+        }) {
+            self.staged_observation = None;
+        }
         match self.staged_observation.as_mut() {
             Some(staged) => merge_history_observation(staged, observation, true),
             None => {
@@ -997,7 +1213,7 @@ impl HistoryStore {
         &mut self,
         completed_at: DateTime<Utc>,
         complete: bool,
-    ) -> io::Result<bool> {
+    ) -> io::Result<SummaryBackfillAttempt> {
         let Some(directory) = self.namespace_dir.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1014,16 +1230,29 @@ impl HistoryStore {
         // observation staged. Persist the cooldown marker anyway, but never
         // claim that such an attempt completed successfully.
         let complete = complete && self.staged_observation.is_none();
-        let marker = SummaryBackfillMarker::current(completed_at, complete);
+        create_private_directory(directory)?;
+        let lock = open_lock_file(directory)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+
+        let requested = SummaryBackfillMarker::current(completed_at, complete);
+        let marker = read_current_summary_backfill_marker(directory)
+            .filter(|current| {
+                (current.completed_at, current.complete)
+                    >= (requested.completed_at, requested.complete)
+            })
+            .unwrap_or(requested);
         let mut contents = serde_json::to_vec_pretty(&marker)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         contents.push(b'\n');
         write_private_atomically(&directory.join(SUMMARY_BACKFILL_MARKER_FILE), &contents)?;
         if let Some(data) = self.cached_data.as_mut() {
-            data.summary_backfill_attempted_at = Some(completed_at);
-            data.summary_backfill_attempt_complete = Some(complete);
+            data.summary_backfill_attempted_at = Some(marker.completed_at);
+            data.summary_backfill_attempt_complete = Some(marker.complete);
         }
-        Ok(complete)
+        Ok(SummaryBackfillAttempt {
+            completed_at: marker.completed_at,
+            complete: marker.complete,
+        })
     }
 
     /// Flush a staged observation regardless of the normal batching interval.
@@ -1145,8 +1374,12 @@ impl HistoryStore {
                 return data;
             }
         };
+        let earliest_relevant_day = since
+            .date_naive()
+            .checked_sub_days(Days::new(1))
+            .unwrap_or(NaiveDate::MIN);
         for (day, path) in entries {
-            if day < since.date_naive() - Duration::days(1) {
+            if day < earliest_relevant_day {
                 continue;
             }
             match read_shard(&path, &self.namespace, day) {
@@ -1225,7 +1458,10 @@ impl HistoryStore {
                 let _ = upsert_quota_point(&mut data.quota_points, point.clone());
             }
         }
-        let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+        let recent_cutoff = datetime_saturating_sub(
+            observation.observed_at,
+            Duration::seconds(RECENT_BUCKET_OVERLAP_SECS),
+        );
         for bucket in &observation.half_hour_buckets {
             if bucket.ends_at > since
                 && (include_all_observation_points || bucket.ends_at > recent_cutoff)
@@ -1255,11 +1491,15 @@ fn merge_history_observation(
     incoming: &HistoryObservation,
     full_merge: bool,
 ) {
+    let staged_high_water = latest_observation_timestamp(staged);
     staged.observed_at = staged.observed_at.max(incoming.observed_at);
     for point in &incoming.quota_points {
         let _ = upsert_quota_point(&mut staged.quota_points, point.clone());
     }
-    let recent_cutoff = incoming.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+    let recent_cutoff = datetime_saturating_sub(
+        incoming.observed_at,
+        Duration::seconds(RECENT_BUCKET_OVERLAP_SECS),
+    );
     for bucket in &incoming.half_hour_buckets {
         if full_merge || bucket.ends_at > recent_cutoff {
             let _ = upsert_half_hour_bucket(&mut staged.half_hour_buckets, bucket.clone());
@@ -1271,16 +1511,28 @@ fn merge_history_observation(
         }
     }
 
-    let cutoff = staged.observed_at - Duration::days(HISTORY_RETENTION_DAYS);
-    staged
-        .quota_points
-        .retain(|point| point.observed_at >= cutoff);
-    staged
-        .half_hour_buckets
-        .retain(|bucket| bucket.ends_at > cutoff);
-    staged
-        .weekly_local_points
-        .retain(|point| point.observed_at >= cutoff);
+    // A full observation may be the first place an untrusted future wall
+    // clock is seen. Defer destructive retention until `record_with_merge_mode`
+    // has compared that timestamp with the persisted retention clock. Regular
+    // lightweight staging remains bounded to the retention window.
+    if !full_merge {
+        let requested_cutoff =
+            datetime_saturating_sub(staged.observed_at, Duration::days(HISTORY_RETENTION_DAYS));
+        let cutoff = staged_high_water
+            .filter(|high_water| requested_cutoff > *high_water)
+            .map_or(requested_cutoff, |high_water| {
+                datetime_saturating_sub(high_water, Duration::days(HISTORY_RETENTION_DAYS))
+            });
+        staged
+            .quota_points
+            .retain(|point| point.observed_at >= cutoff);
+        staged
+            .half_hour_buckets
+            .retain(|bucket| bucket.ends_at > cutoff);
+        staged
+            .weekly_local_points
+            .retain(|point| point.observed_at >= cutoff);
+    }
     staged.quota_points.sort_by(|left, right| {
         left.observed_at
             .cmp(&right.observed_at)
@@ -1299,6 +1551,22 @@ fn redacted_history_observation(observation: &HistoryObservation) -> HistoryObse
     let mut observation = observation.clone();
     for bucket in &mut observation.half_hour_buckets {
         redact_project_group_titles(&mut bucket.project_groups);
+    }
+    observation
+}
+
+#[cfg(windows)]
+fn observation_for_windows_namespace(
+    observation: &HistoryObservation,
+    mode: WindowsNamespaceMode,
+) -> HistoryObservation {
+    let mut observation = observation.clone();
+    for bucket in &mut observation.half_hour_buckets {
+        for group in &mut bucket.project_groups {
+            if let Some(project_id) = group.project_id.as_mut() {
+                *project_id = windows_project_id_for_namespace(project_id, mode);
+            }
+        }
     }
     observation
 }
@@ -1355,6 +1623,48 @@ struct DayAdditions {
     weekly_local_points: Vec<WeeklyLocalPoint>,
 }
 
+fn latest_observation_timestamp(observation: &HistoryObservation) -> Option<DateTime<Utc>> {
+    latest_history_timestamp(
+        &observation.quota_points,
+        &observation.half_hour_buckets,
+        &observation.weekly_local_points,
+    )
+}
+
+fn earliest_observation_timestamp(observation: &HistoryObservation) -> Option<DateTime<Utc>> {
+    earliest_history_timestamp(
+        &observation.quota_points,
+        &observation.half_hour_buckets,
+        &observation.weekly_local_points,
+    )
+}
+
+fn latest_history_timestamp(
+    quota_points: &[QuotaPoint],
+    half_hour_buckets: &[LocalHalfHourBucket],
+    weekly_local_points: &[WeeklyLocalPoint],
+) -> Option<DateTime<Utc>> {
+    quota_points
+        .iter()
+        .map(|point| point.observed_at)
+        .chain(half_hour_buckets.iter().map(|bucket| bucket.sampled_at))
+        .chain(weekly_local_points.iter().map(|point| point.observed_at))
+        .max()
+}
+
+fn earliest_history_timestamp(
+    quota_points: &[QuotaPoint],
+    half_hour_buckets: &[LocalHalfHourBucket],
+    weekly_local_points: &[WeeklyLocalPoint],
+) -> Option<DateTime<Utc>> {
+    quota_points
+        .iter()
+        .map(|point| point.observed_at)
+        .chain(half_hour_buckets.iter().map(|bucket| bucket.sampled_at))
+        .chain(weekly_local_points.iter().map(|point| point.observed_at))
+        .min()
+}
+
 fn additions_by_day(
     observation: &HistoryObservation,
     cutoff: DateTime<Utc>,
@@ -1370,7 +1680,10 @@ fn additions_by_day(
                 .push(point.clone());
         }
     }
-    let recent_cutoff = observation.observed_at - Duration::seconds(RECENT_BUCKET_OVERLAP_SECS);
+    let recent_cutoff = datetime_saturating_sub(
+        observation.observed_at,
+        Duration::seconds(RECENT_BUCKET_OVERLAP_SECS),
+    );
     for bucket in &observation.half_hour_buckets {
         if bucket.ends_at > cutoff
             && (include_all_observation_points || bucket.ends_at > recent_cutoff)
@@ -1420,8 +1733,9 @@ fn quota_points_from_limits(limits: &[LimitBucket]) -> Vec<QuotaPoint> {
             let Some(resets_at) = window.resets_at else {
                 continue;
             };
-            let starts_at = resets_at - Duration::minutes(duration_mins);
-            if bucket.as_of < starts_at - Duration::seconds(RESET_DRIFT_SECS)
+            let starts_at = datetime_saturating_sub(resets_at, Duration::minutes(duration_mins));
+            if bucket.as_of
+                < datetime_saturating_sub(starts_at, Duration::seconds(RESET_DRIFT_SECS))
                 || bucket.as_of >= resets_at
             {
                 continue;
@@ -1473,8 +1787,8 @@ fn weekly_local_points_from_sources(
             let Some(resets_at) = window.resets_at else {
                 continue;
             };
-            let starts_at = resets_at - Duration::minutes(WEEK_MINS);
-            if observed_at < starts_at - Duration::seconds(RESET_DRIFT_SECS)
+            let starts_at = datetime_saturating_sub(resets_at, Duration::minutes(WEEK_MINS));
+            if observed_at < datetime_saturating_sub(starts_at, Duration::seconds(RESET_DRIFT_SECS))
                 || observed_at >= resets_at
             {
                 continue;
@@ -1492,7 +1806,7 @@ fn weekly_local_points_from_sources(
     let Some((_, resets_at, provenance)) = selected else {
         return Vec::new();
     };
-    let starts_at = resets_at - Duration::minutes(WEEK_MINS);
+    let starts_at = datetime_saturating_sub(resets_at, Duration::minutes(WEEK_MINS));
     let mut buckets = BTreeMap::<DateTime<Utc>, WeeklyAccumulator>::new();
     let mut first_call_bucket = None;
     for call in calls {
@@ -1556,7 +1870,12 @@ fn weekly_local_points_from_sources(
                     .partial_reasons
                     .insert("coverage_starts_within_local_bucket".to_string());
             }
-            bucket_starts_at += Duration::seconds(WEEKLY_SAMPLE_SECS);
+            let Some(next_bucket) =
+                bucket_starts_at.checked_add_signed(Duration::seconds(WEEKLY_SAMPLE_SECS))
+            else {
+                break;
+            };
+            bucket_starts_at = next_bucket;
         }
     } else {
         buckets.entry(last_bucket).or_default();
@@ -1590,8 +1909,11 @@ fn weekly_local_points_from_sources(
             call_count = call_count.saturating_add(bucket.call_count);
             reasons.extend(bucket.partial_reasons);
             WeeklyLocalPoint {
-                observed_at: (bucket_starts_at + Duration::seconds(WEEKLY_SAMPLE_SECS))
-                    .min(observed_at),
+                observed_at: datetime_saturating_add(
+                    bucket_starts_at,
+                    Duration::seconds(WEEKLY_SAMPLE_SECS),
+                )
+                .min(observed_at),
                 resets_at,
                 token_usage,
                 estimated_cost_units,
@@ -1816,14 +2138,19 @@ fn local_buckets_from_calls(
                     .partial_reasons
                     .insert("coverage_starts_within_local_bucket".to_string());
             }
-            starts_at += Duration::seconds(LOCAL_BUCKET_SECS);
+            let Some(next_bucket) =
+                starts_at.checked_add_signed(Duration::seconds(LOCAL_BUCKET_SECS))
+            else {
+                break;
+            };
+            starts_at = next_bucket;
         }
     }
 
     buckets
         .into_iter()
         .map(|(starts_at, bucket)| {
-            let ends_at = starts_at + Duration::seconds(LOCAL_BUCKET_SECS);
+            let ends_at = datetime_saturating_add(starts_at, Duration::seconds(LOCAL_BUCKET_SECS));
             let active_project_threads = bucket
                 .project_groups
                 .values()
@@ -2153,7 +2480,7 @@ fn build_project_group_template(
     let project_descriptor = project_path.as_ref().map(|path| {
         project_descriptors
             .entry(path.clone())
-            .or_insert_with(|| (project_id(path), project_label(path)))
+            .or_insert_with(|| (project_identity(path), project_label(path)))
             .clone()
     });
     LocalProjectUsageGroup {
@@ -2183,12 +2510,58 @@ fn bounded_chars(value: &str, maximum: usize) -> String {
     bounded
 }
 
-fn project_id(path: &Path) -> String {
+fn project_identity(path: &Path) -> String {
     let normalized = normalized_path(path);
-    format!(
-        "project-{:016x}",
-        stable_hash(&history_namespace_bytes(&normalized))
+    #[cfg(windows)]
+    {
+        // Keep both hashes until the observation reaches its HistoryStore.
+        // The store's persisted namespace mode is the stable authority: a
+        // legacy namespace can losslessly downgrade this identity, while a
+        // case-preserving namespace must not let a transient filesystem probe
+        // split one project across IDs.
+        windows_project_ids_from_bytes(
+            &windows_history_namespace_bytes(&normalized, true),
+            &windows_history_namespace_bytes(&normalized, false),
+        )
+        .0
+    }
+
+    #[cfg(not(windows))]
+    let bytes = history_namespace_bytes(&normalized);
+    #[cfg(not(windows))]
+    format!("project-{:016x}", stable_hash(&bytes))
+}
+
+#[cfg(any(windows, test))]
+fn windows_project_ids_from_bytes(
+    case_preserving_bytes: &[u8],
+    legacy_bytes: &[u8],
+) -> (String, String) {
+    let case_preserving_hash = stable_hash(case_preserving_bytes);
+    let legacy_hash = stable_hash(legacy_bytes);
+    (
+        format!("project-win2-{case_preserving_hash:016x}-{legacy_hash:016x}"),
+        format!("project-{legacy_hash:016x}"),
     )
+}
+
+#[cfg(any(windows, test))]
+fn windows_legacy_project_id(identity: &str) -> Option<String> {
+    let (case_hash, legacy_hash) = identity.strip_prefix("project-win2-")?.split_once('-')?;
+    (case_hash.len() == 16
+        && case_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && legacy_hash.len() == 16
+        && legacy_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| format!("project-{legacy_hash}"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_project_id_for_namespace(identity: &str, mode: WindowsNamespaceMode) -> String {
+    if mode == WindowsNamespaceMode::Legacy {
+        windows_legacy_project_id(identity).unwrap_or_else(|| identity.to_string())
+    } else {
+        identity.to_string()
+    }
 }
 
 fn project_label(path: &Path) -> String {
@@ -2212,12 +2585,12 @@ fn is_zero_u32(value: &u32) -> bool {
 
 fn floor_local_bucket(timestamp: DateTime<Utc>) -> DateTime<Utc> {
     let seconds = timestamp.timestamp().div_euclid(LOCAL_BUCKET_SECS) * LOCAL_BUCKET_SECS;
-    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid local-bucket floor")
+    DateTime::from_timestamp(seconds, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 fn floor_weekly_sample(timestamp: DateTime<Utc>) -> DateTime<Utc> {
     let seconds = timestamp.timestamp().div_euclid(WEEKLY_SAMPLE_SECS) * WEEKLY_SAMPLE_SECS;
-    DateTime::from_timestamp(seconds, 0).expect("a valid DateTime has a valid weekly-sample floor")
+    DateTime::from_timestamp(seconds, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 fn is_exact_weekly_sample_boundary(timestamp: DateTime<Utc>) -> bool {
@@ -2238,6 +2611,52 @@ struct HistoryShard {
     half_hour_buckets: Vec<LocalHalfHourBucket>,
     #[serde(default)]
     weekly_local_points: Vec<WeeklyLocalPoint>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetentionClock {
+    schema_version: u32,
+    trusted_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_last_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pending_confirmations: u32,
+}
+
+impl RetentionClock {
+    fn current(trusted_at: DateTime<Utc>) -> Self {
+        Self {
+            schema_version: RETENTION_CLOCK_VERSION,
+            trusted_at,
+            pending_started_at: None,
+            pending_last_at: None,
+            pending_confirmations: 0,
+        }
+    }
+
+    fn pending(trusted_at: DateTime<Utc>, observed_at: DateTime<Utc>) -> Self {
+        Self {
+            schema_version: RETENTION_CLOCK_VERSION,
+            trusted_at,
+            pending_started_at: Some(observed_at),
+            pending_last_at: Some(observed_at),
+            pending_confirmations: 1,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.schema_version == RETENTION_CLOCK_VERSION
+            && match (self.pending_started_at, self.pending_last_at) {
+                (None, None) => self.pending_confirmations == 0,
+                (Some(started_at), Some(last_at)) => {
+                    self.pending_confirmations > 0 && started_at <= last_at
+                }
+                (None, Some(_)) | (Some(_), None) => false,
+            }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2283,6 +2702,67 @@ fn read_current_summary_backfill_marker(directory: &Path) -> Option<SummaryBackf
         .ok()
         .and_then(|contents| serde_json::from_slice::<SummaryBackfillMarker>(&contents).ok())
         .filter(SummaryBackfillMarker::revisions_are_current)
+}
+
+fn read_current_retention_clock(directory: &Path) -> Option<RetentionClock> {
+    fs::read(directory.join(RETENTION_CLOCK_FILE))
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<RetentionClock>(&contents).ok())
+        .filter(RetentionClock::is_valid)
+}
+
+fn next_retention_clock(
+    current: Option<RetentionClock>,
+    initial_anchor: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+) -> (RetentionClock, bool) {
+    let Some(mut clock) = current.or_else(|| initial_anchor.map(RetentionClock::current)) else {
+        return (RetentionClock::current(observed_at), false);
+    };
+    let trusted_at = clock.trusted_at;
+    if observed_at <= trusted_at {
+        return (RetentionClock::current(trusted_at), false);
+    }
+    let maximum =
+        datetime_saturating_add(trusted_at, Duration::days(MAX_RETENTION_CLOCK_STEP_DAYS));
+    if observed_at <= maximum {
+        return (RetentionClock::current(observed_at), false);
+    }
+
+    // Sparse legitimate invocations must still be able to establish a stable
+    // new timeline. Confirmation count plus elapsed wall-clock time protects
+    // against a one-off jump; imposing an adjacency limit would make every
+    // schedule slower than that limit restart forever.
+    let continues_pending_timeline = clock
+        .pending_last_at
+        .zip(clock.pending_started_at)
+        .is_some_and(|(last, _)| observed_at >= last);
+    if !continues_pending_timeline {
+        return (RetentionClock::pending(trusted_at, observed_at), true);
+    }
+
+    clock.pending_last_at = Some(observed_at);
+    clock.pending_confirmations = clock.pending_confirmations.saturating_add(1);
+    let stable_since = datetime_saturating_add(
+        clock
+            .pending_started_at
+            .expect("a continuing pending timeline has a start"),
+        Duration::hours(RETENTION_CLOCK_CONFIRMATION_HOURS),
+    );
+    if observed_at >= stable_since
+        && clock.pending_confirmations >= RETENTION_CLOCK_MIN_CONFIRMATIONS
+    {
+        (RetentionClock::current(observed_at), false)
+    } else {
+        (clock, true)
+    }
+}
+
+fn write_retention_clock(directory: &Path, clock: &RetentionClock) -> io::Result<()> {
+    let mut contents = serde_json::to_vec_pretty(clock)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    contents.push(b'\n');
+    write_private_atomically(&directory.join(RETENTION_CLOCK_FILE), &contents)
 }
 
 impl HistoryShard {
@@ -2474,7 +2954,8 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
 }
 
 fn is_current_local_bucket(bucket: &LocalHalfHourBucket) -> bool {
-    bucket.ends_at - bucket.starts_at == Duration::seconds(LOCAL_BUCKET_SECS)
+    datetime_saturating_add(bucket.starts_at, Duration::seconds(LOCAL_BUCKET_SECS))
+        == bucket.ends_at
         && floor_local_bucket(bucket.starts_at) == bucket.starts_at
         && bucket.sampled_at >= bucket.starts_at
         && bucket.sampled_at <= bucket.ends_at
@@ -2520,7 +3001,11 @@ fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> boo
         point.duration_mins == incoming.duration_mins
             && point.limit_id.eq_ignore_ascii_case(&incoming.limit_id)
             && point.observed_at.timestamp().div_euclid(QUOTA_SAMPLE_SECS) == slot
-            && (point.resets_at - incoming.resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+            && timestamps_within(
+                point.resets_at,
+                incoming.resets_at,
+                Duration::seconds(RESET_DRIFT_SECS),
+            )
     });
     if let Some(index) = existing {
         if quota_point_payload_eq(&incoming, &points[index]) {
@@ -2805,7 +3290,11 @@ fn upsert_weekly_local_point(
         .timestamp()
         .div_euclid(QUOTA_SAMPLE_SECS);
     let same_cycle = |point: &&WeeklyLocalPoint| {
-        (point.resets_at - incoming.resets_at).num_seconds().abs() <= RESET_DRIFT_SECS
+        timestamps_within(
+            point.resets_at,
+            incoming.resets_at,
+            Duration::seconds(RESET_DRIFT_SECS),
+        )
     };
     if let Some(index) = points.iter().position(|point| {
         same_cycle(&point)
@@ -3242,6 +3731,27 @@ fn shard_entries(directory: &Path) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
     Ok(entries)
 }
 
+/// Returns the most conservative persisted wall-clock anchor while the caller
+/// holds the namespace lock. A missing/corrupt marker must never promote an
+/// isolated future shard into authority over destructive retention.
+fn earliest_persisted_observation_at(directory: &Path, namespace: &str) -> Option<DateTime<Utc>> {
+    shard_entries(directory)
+        .ok()?
+        .into_iter()
+        .filter_map(|(day, path)| match read_shard(&path, namespace, day) {
+            ShardRead::Current { shard, .. } => earliest_history_timestamp(
+                &shard.quota_points,
+                &shard.half_hour_buckets,
+                &shard.weekly_local_points,
+            ),
+            ShardRead::Missing
+            | ShardRead::FutureFormat(_)
+            | ShardRead::FutureMetric(_)
+            | ShardRead::Corrupt(_) => None,
+        })
+        .min()
+}
+
 fn shard_day_from_path(path: &Path) -> Option<NaiveDate> {
     if path.extension().and_then(OsStr::to_str) != Some("json") {
         return None;
@@ -3425,13 +3935,32 @@ fn resolve_history_root(
 }
 
 pub fn history_namespace(codex_home: &Path) -> String {
+    #[cfg(windows)]
+    return windows_resolved_history_namespace(
+        default_history_root().as_deref(),
+        codex_home,
+        false,
+    );
+
+    #[cfg(not(windows))]
     let normalized = normalized_path(codex_home);
+    #[cfg(not(windows))]
     let bytes = history_namespace_bytes(&normalized);
+    #[cfg(not(windows))]
     format!("{:016x}", stable_hash(&bytes))
 }
 
 pub fn history_namespace_with_redaction(codex_home: &Path, redact_content: bool) -> String {
+    #[cfg(windows)]
+    return windows_resolved_history_namespace(
+        default_history_root().as_deref(),
+        codex_home,
+        redact_content,
+    );
+
+    #[cfg(not(windows))]
     let namespace = history_namespace(codex_home);
+    #[cfg(not(windows))]
     if redact_content {
         format!("{namespace}-redacted")
     } else {
@@ -3447,27 +3976,202 @@ fn history_namespace_bytes(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(windows)]
-fn history_namespace_bytes(path: &Path) -> Vec<u8> {
+fn windows_resolved_history_namespace(
+    history_root: Option<&Path>,
+    codex_home: &Path,
+    redact_content: bool,
+) -> String {
+    windows_resolved_history_identity(history_root, codex_home, redact_content).0
+}
+
+#[cfg(windows)]
+fn windows_resolved_history_identity(
+    history_root: Option<&Path>,
+    codex_home: &Path,
+    redact_content: bool,
+) -> (String, WindowsNamespaceMode) {
+    let normalized = normalized_path(codex_home);
+    let legacy = format!(
+        "{:016x}",
+        stable_hash(&windows_history_namespace_bytes(&normalized, false))
+    );
+    let case_preserving = format!(
+        "{:016x}",
+        stable_hash(&windows_history_namespace_bytes(&normalized, true))
+    );
+    let selected = windows_select_namespace_mode(
+        history_root,
+        &legacy,
+        &case_preserving,
+        windows_parent_case_sensitivity(&normalized),
+    );
+    let namespace = match selected {
+        WindowsNamespaceMode::Legacy => legacy,
+        WindowsNamespaceMode::CasePreserving => case_preserving,
+    };
+    let namespace = if redact_content {
+        format!("{namespace}-redacted")
+    } else {
+        namespace
+    };
+    (namespace, selected)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsNamespaceMode {
+    Legacy,
+    CasePreserving,
+}
+
+#[cfg(windows)]
+fn windows_select_namespace_mode(
+    history_root: Option<&Path>,
+    legacy: &str,
+    case_preserving: &str,
+    detected_case_sensitivity: Option<bool>,
+) -> WindowsNamespaceMode {
+    if let Some(root) = history_root {
+        // Either redaction variant is evidence of an already-persisted path
+        // identity policy. A legacy namespace wins when both exist: it may
+        // contain the long-lived history, while old shards do not carry enough
+        // path identity to split a possible lowercase collision safely. A
+        // lone case-preserving directory keeps its choice across later probe
+        // failures.
+        let legacy_exists =
+            root.join(legacy).is_dir() || root.join(format!("{legacy}-redacted")).is_dir();
+        let case_preserving_exists = root.join(case_preserving).is_dir()
+            || root.join(format!("{case_preserving}-redacted")).is_dir();
+        return windows_namespace_mode_from_evidence(
+            legacy_exists,
+            case_preserving_exists,
+            detected_case_sensitivity,
+        );
+    }
+    windows_namespace_mode_from_evidence(false, false, detected_case_sensitivity)
+}
+
+#[cfg(any(windows, test))]
+fn windows_namespace_mode_from_evidence(
+    legacy_exists: bool,
+    case_preserving_exists: bool,
+    detected_case_sensitivity: Option<bool>,
+) -> WindowsNamespaceMode {
+    if legacy_exists {
+        return WindowsNamespaceMode::Legacy;
+    }
+    if case_preserving_exists {
+        return WindowsNamespaceMode::CasePreserving;
+    }
+    match detected_case_sensitivity {
+        Some(false) => WindowsNamespaceMode::Legacy,
+        // With no persisted compatibility evidence, an unknown probe cannot
+        // prove that lowercasing is safe. Choose the collision-safe identity;
+        // once materialized, the directory evidence above keeps it stable
+        // across later successful or failed probes.
+        Some(true) | None => WindowsNamespaceMode::CasePreserving,
+    }
+}
+
+#[cfg(windows)]
+fn windows_history_namespace_bytes(path: &Path, preserve_case: bool) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
 
     if let Some(path) = path.to_str() {
-        // Preserve existing history namespaces for ordinary Windows paths.
-        return path.replace('\\', "/").to_ascii_lowercase().into_bytes();
+        let normalized = path.replace('\\', "/");
+        if !preserve_case {
+            // Preserve existing namespace and project IDs on ordinary
+            // case-insensitive Windows directories.
+            return normalized.to_ascii_lowercase().into_bytes();
+        }
+        // Keep the new case-sensitive representation disjoint from every
+        // legacy UTF-8 input, including paths that begin with marker text.
+        let mut bytes = vec![0xff, b'c', b'a', b's', b'e', 0];
+        bytes.extend_from_slice(normalized.as_bytes());
+        return bytes;
     }
 
     // WTF-16 can contain unpaired surrogates, so encode code units explicitly.
-    // The invalid UTF-8 prefix keeps this representation disjoint from every
-    // legacy namespace input while remaining stable across Rust versions.
-    let mut bytes = vec![0xff, b'w', b't', b'f', b'1', b'6', 0];
+    // Separate prefixes keep both representations stable and disjoint from
+    // legacy UTF-8 namespace inputs.
+    let mut bytes = if preserve_case {
+        vec![
+            0xff, b'c', b'a', b's', b'e', b'w', b't', b'f', b'1', b'6', 0,
+        ]
+    } else {
+        vec![0xff, b'w', b't', b'f', b'1', b'6', 0]
+    };
     for mut unit in path.as_os_str().encode_wide() {
         if unit == u16::from(b'\\') {
             unit = u16::from(b'/');
-        } else if unit <= 0x7f {
+        } else if !preserve_case && unit <= 0x7f {
             unit = u16::from((unit as u8).to_ascii_lowercase());
         }
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     bytes
+}
+
+#[cfg(windows)]
+fn windows_parent_case_sensitivity(path: &Path) -> Option<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileCaseSensitiveInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 1;
+
+    windows_parent_case_sensitivity_from_states(path.ancestors().skip(1).map(|directory| {
+        let directory = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .ok()?;
+        let mut information = FILE_CASE_SENSITIVE_INFO::default();
+        // SAFETY: `directory` owns a valid directory handle for the call
+        // and `information` is writable storage of the requested type.
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                FileCaseSensitiveInfo,
+                (&mut information as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+                u32::try_from(std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>()).unwrap_or(u32::MAX),
+            )
+        } != 0;
+        if succeeded {
+            Some(information.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+        } else {
+            let error = io::Error::last_os_error();
+            windows_unsupported_case_query_is_insensitive(error.raw_os_error()).then_some(false)
+        }
+    }))
+}
+
+#[cfg(any(windows, test))]
+fn windows_parent_case_sensitivity_from_states(
+    states: impl IntoIterator<Item = Option<bool>>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for state in states {
+        match state {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
+}
+
+#[cfg(windows)]
+fn windows_unsupported_case_query_is_insensitive(error: Option<i32>) -> bool {
+    // Filesystems/Windows versions that do not implement
+    // FileCaseSensitiveInfo cannot opt directories into that mode.
+    matches!(error, Some(50 | 87)) // ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3703,13 +4407,12 @@ mod tests {
         let first = root.path().join("first/../first");
         let equivalent = root.path().join("first");
         let other = root.path().join("other");
-        let mut legacy_bytes = normalized_path(&first).to_string_lossy().into_owned();
-        if cfg!(windows) {
-            legacy_bytes = legacy_bytes.replace('\\', "/").to_ascii_lowercase();
-        }
+        #[cfg(not(windows))]
+        let legacy_bytes = normalized_path(&first).to_string_lossy().into_owned();
         assert_eq!(history_namespace(&first), history_namespace(&equivalent));
         assert_ne!(history_namespace(&first), history_namespace(&other));
         assert_eq!(history_namespace(&first).len(), 16);
+        #[cfg(not(windows))]
         assert_eq!(
             history_namespace(&first),
             format!("{:016x}", stable_hash(legacy_bytes.as_bytes()))
@@ -3722,6 +4425,138 @@ mod tests {
             history_namespace_with_redaction(&first, true),
             format!("{}-redacted", history_namespace(&first))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_namespace_keeps_legacy_ids_unless_parent_is_case_sensitive() {
+        let upper = Path::new(r"C:\Users\Example\ProjectA");
+        let lower = Path::new(r"c:\users\example\projecta");
+
+        assert_eq!(
+            windows_history_namespace_bytes(upper, false),
+            windows_history_namespace_bytes(lower, false)
+        );
+        assert_ne!(
+            windows_history_namespace_bytes(upper, true),
+            windows_history_namespace_bytes(lower, true)
+        );
+        assert_eq!(
+            windows_history_namespace_bytes(upper, false),
+            b"c:/users/example/projecta"
+        );
+        assert!(windows_history_namespace_bytes(upper, true).starts_with(&[0xff]));
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([Some(false), Some(false)]),
+            Some(false)
+        );
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([Some(false), Some(true), Some(false),]),
+            Some(true)
+        );
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([Some(false), None, Some(false)]),
+            None
+        );
+        assert!(windows_unsupported_case_query_is_insensitive(Some(50)));
+        assert!(windows_unsupported_case_query_is_insensitive(Some(87)));
+        assert!(!windows_unsupported_case_query_is_insensitive(Some(5)));
+    }
+
+    #[test]
+    fn windows_identity_mode_is_legacy_compatible_and_persistently_selected() {
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([Some(false), Some(false)]),
+            Some(false)
+        );
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([Some(false), None]),
+            None
+        );
+        assert_eq!(
+            windows_parent_case_sensitivity_from_states([None, Some(true)]),
+            Some(true)
+        );
+        let matrix = [
+            (false, false, Some(false), WindowsNamespaceMode::Legacy),
+            (
+                false,
+                false,
+                Some(true),
+                WindowsNamespaceMode::CasePreserving,
+            ),
+            (false, false, None, WindowsNamespaceMode::CasePreserving),
+            (true, false, Some(false), WindowsNamespaceMode::Legacy),
+            (true, false, Some(true), WindowsNamespaceMode::Legacy),
+            (true, false, None, WindowsNamespaceMode::Legacy),
+            (
+                false,
+                true,
+                Some(false),
+                WindowsNamespaceMode::CasePreserving,
+            ),
+            (
+                false,
+                true,
+                Some(true),
+                WindowsNamespaceMode::CasePreserving,
+            ),
+            (false, true, None, WindowsNamespaceMode::CasePreserving),
+            (true, true, Some(false), WindowsNamespaceMode::Legacy),
+            (true, true, Some(true), WindowsNamespaceMode::Legacy),
+            (true, true, None, WindowsNamespaceMode::Legacy),
+        ];
+        for (legacy_exists, case_preserving_exists, detected, expected) in matrix {
+            assert_eq!(
+                windows_namespace_mode_from_evidence(
+                    legacy_exists,
+                    case_preserving_exists,
+                    detected,
+                ),
+                expected,
+                "legacy={legacy_exists} case_preserving={case_preserving_exists} detected={detected:?}",
+            );
+        }
+
+        let upper_case = b"case:C:/Users/Example/ProjectA";
+        let lower_case = b"case:c:/users/example/projecta";
+        let legacy = b"c:/users/example/projecta";
+        let (upper, ordinary) = windows_project_ids_from_bytes(upper_case, legacy);
+        let (lower, lower_ordinary) = windows_project_ids_from_bytes(lower_case, legacy);
+        assert_ne!(upper, lower);
+        assert_eq!(ordinary, lower_ordinary);
+        assert_eq!(
+            windows_legacy_project_id(&upper),
+            windows_legacy_project_id(&lower)
+        );
+        assert_eq!(
+            windows_legacy_project_id(&upper).as_deref(),
+            Some(ordinary.as_str())
+        );
+        for (identity, mode, expected) in [
+            (
+                upper.as_str(),
+                WindowsNamespaceMode::Legacy,
+                ordinary.as_str(),
+            ),
+            (
+                lower.as_str(),
+                WindowsNamespaceMode::Legacy,
+                lower_ordinary.as_str(),
+            ),
+            (
+                upper.as_str(),
+                WindowsNamespaceMode::CasePreserving,
+                upper.as_str(),
+            ),
+            (
+                lower.as_str(),
+                WindowsNamespaceMode::CasePreserving,
+                lower.as_str(),
+            ),
+        ] {
+            assert_eq!(windows_project_id_for_namespace(identity, mode), expected);
+        }
     }
 
     #[cfg(unix)]
@@ -4679,6 +5514,13 @@ mod tests {
         store.record(&old).unwrap();
 
         let now = at(2026, 7, 28, 12, 5, 0);
+        // Model the trusted clock produced by ordinary periodic observations;
+        // retention remains immediate once that independent clock is current.
+        write_retention_clock(
+            store.namespace_dir().unwrap(),
+            &RetentionClock::current(now),
+        )
+        .unwrap();
         let first = HistoryObservation {
             observed_at: now,
             quota_points: vec![quota_point(now, now + Duration::days(3), 40.0)],
@@ -4716,6 +5558,196 @@ mod tests {
         assert_eq!(data.weekly_local_points[0].token_usage.total_tokens, 20);
         assert!(!shard_path(store.namespace_dir().unwrap(), old_at.date_naive()).exists());
         assert!(data.warnings.is_empty());
+    }
+
+    #[test]
+    fn consecutive_forward_clock_jumps_never_drive_destructive_retention() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let real_at = now - Duration::days(1);
+        let observation = |observed_at: DateTime<Utc>, used_percent: f64| HistoryObservation {
+            observed_at,
+            quota_points: vec![quota_point(
+                observed_at,
+                observed_at + Duration::days(3),
+                used_percent,
+            )],
+            ..HistoryObservation::default()
+        };
+
+        store.record(&observation(real_at, 10.0)).unwrap();
+        let real_shard = shard_path(store.namespace_dir().unwrap(), real_at.date_naive());
+        assert!(real_shard.exists());
+
+        let first_jump = now + Duration::days(180);
+        let first = store.record(&observation(first_jump, 80.0)).unwrap();
+        assert!(first.retention_prune_deferred);
+        assert_eq!(first.shards_pruned, 0);
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("wall clock advanced too far"))
+        );
+        assert!(real_shard.exists());
+
+        let second_jump = now + Duration::days(181);
+        let second = store.record(&observation(second_jump, 90.0)).unwrap();
+        assert!(second.retention_prune_deferred);
+        assert_eq!(second.shards_pruned, 0);
+        assert!(real_shard.exists());
+
+        let restored_at = now + Duration::minutes(1);
+        let restored = store.record(&observation(restored_at, 20.0)).unwrap();
+        assert!(!restored.retention_prune_deferred);
+        assert!(real_shard.exists());
+
+        let persisted =
+            HistoryStore::new(history_root, &codex_home).load_since(real_at - Duration::minutes(1));
+        assert!(persisted.quota_points.iter().any(|point| {
+            point.observed_at == real_at && (point.used_percent - 10.0).abs() < f64::EPSILON
+        }));
+        let clock = read_current_retention_clock(store.namespace_dir().unwrap()).unwrap();
+        assert_eq!(clock.trusted_at, restored_at);
+        assert_eq!(clock.pending_started_at, None);
+    }
+
+    #[test]
+    fn missing_retention_clock_does_not_promote_future_shards() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let real_at = now - Duration::days(1);
+        let observation = |observed_at: DateTime<Utc>| HistoryObservation {
+            observed_at,
+            quota_points: vec![quota_point(
+                observed_at,
+                observed_at + Duration::days(3),
+                10.0,
+            )],
+            ..HistoryObservation::default()
+        };
+
+        store.record(&observation(real_at)).unwrap();
+        store
+            .record(&observation(now + Duration::days(180)))
+            .unwrap();
+        store
+            .record(&observation(now + Duration::days(181)))
+            .unwrap();
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        let real_shard = shard_path(&namespace_dir, real_at.date_naive());
+        fs::remove_file(namespace_dir.join(RETENTION_CLOCK_FILE)).unwrap();
+
+        let mut restored = HistoryStore::new(history_root, &codex_home);
+        let report = restored
+            .record(&observation(now + Duration::minutes(1)))
+            .unwrap();
+
+        assert!(!report.retention_prune_deferred);
+        assert_eq!(report.shards_pruned, 0);
+        assert!(real_shard.exists());
+        let clock = read_current_retention_clock(&namespace_dir).unwrap();
+        assert_eq!(clock.trusted_at, now + Duration::minutes(1));
+    }
+
+    #[test]
+    fn retention_clock_advances_normally_and_confirms_a_stable_large_step() {
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let current = RetentionClock::current(now - Duration::hours(1));
+        let (normal, deferred) = next_retention_clock(Some(current), None, now);
+        assert_eq!(normal.trusted_at, now);
+        assert!(!deferred);
+
+        let (capped, deferred) =
+            next_retention_clock(Some(normal), None, now + Duration::days(180));
+        assert_eq!(capped.trusted_at, now);
+        assert_eq!(capped.pending_started_at, Some(now + Duration::days(180)));
+        assert!(deferred);
+
+        let (still_pending, deferred) =
+            next_retention_clock(Some(capped), None, now + Duration::days(181));
+        assert_eq!(still_pending.trusted_at, now);
+        assert_eq!(still_pending.pending_confirmations, 2);
+        assert!(deferred);
+
+        let (confirmed, deferred) =
+            next_retention_clock(Some(still_pending), None, now + Duration::days(182));
+        assert_eq!(confirmed.trusted_at, now + Duration::days(182));
+        assert_eq!(confirmed.pending_started_at, None);
+        assert!(!deferred);
+    }
+
+    #[test]
+    fn retention_clock_accepts_a_stable_low_frequency_timeline() {
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let (pending, deferred) = next_retention_clock(
+            Some(RetentionClock::current(now)),
+            None,
+            now + Duration::days(180),
+        );
+        assert!(deferred);
+
+        // Weekly invocations are intentionally farther apart than the former
+        // 24-hour adjacency limit and must not restart confirmation forever.
+        let (pending, deferred) =
+            next_retention_clock(Some(pending), None, now + Duration::days(187));
+        assert!(deferred);
+        assert_eq!(pending.pending_confirmations, 2);
+        let (confirmed, deferred) =
+            next_retention_clock(Some(pending), None, now + Duration::days(194));
+        assert!(!deferred);
+        assert_eq!(confirmed.trusted_at, now + Duration::days(194));
+        assert_eq!(confirmed.pending_started_at, None);
+    }
+
+    #[test]
+    fn restored_clock_uses_observation_time_for_the_retention_boundary() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let now = at(2026, 7, 28, 12, 0, 0);
+        let boundary_at = now - Duration::days(HISTORY_RETENTION_DAYS) + Duration::minutes(2);
+        let observation = |observed_at: DateTime<Utc>| HistoryObservation {
+            observed_at,
+            quota_points: vec![quota_point(
+                observed_at,
+                observed_at + Duration::days(3),
+                10.0,
+            )],
+            ..HistoryObservation::default()
+        };
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        store.record(&observation(now)).unwrap();
+        store.record(&observation(boundary_at)).unwrap();
+        let boundary_shard = shard_path(store.namespace_dir().unwrap(), boundary_at.date_naive());
+        assert!(boundary_shard.exists());
+
+        store
+            .record(&observation(now + Duration::days(180)))
+            .unwrap();
+        store
+            .record(&observation(now + Duration::days(181)))
+            .unwrap();
+        assert!(boundary_shard.exists());
+
+        let mut restored = HistoryStore::new(history_root, &codex_home);
+        restored
+            .record(&observation(now + Duration::minutes(1)))
+            .unwrap();
+        assert!(boundary_shard.exists());
+        let history = restored.load_since(boundary_at - Duration::minutes(1));
+        assert!(
+            history
+                .quota_points
+                .iter()
+                .any(|point| point.observed_at == boundary_at)
+        );
     }
 
     #[test]
@@ -5084,6 +6116,95 @@ mod tests {
     }
 
     #[test]
+    fn first_full_stage_defers_future_clock_retention_until_flush() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let real_now = at(2026, 7, 28, 12, 0, 0);
+        let old_start = real_now - Duration::days(30);
+        let future = real_now + Duration::days(180);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+
+        store.stage_full_observation(&HistoryObservation {
+            observed_at: future,
+            half_hour_buckets: vec![local_bucket(
+                old_start,
+                old_start + Duration::minutes(LOCAL_BUCKET_MINUTES),
+                20,
+                200,
+            )],
+            ..HistoryObservation::default()
+        });
+        assert_eq!(
+            store
+                .staged_observation
+                .as_ref()
+                .unwrap()
+                .half_hour_buckets
+                .len(),
+            1
+        );
+
+        let report = store.flush_staged().unwrap().unwrap();
+        assert!(report.retention_prune_deferred);
+        let clock = read_current_retention_clock(store.namespace_dir().unwrap()).unwrap();
+        assert_eq!(
+            clock.trusted_at,
+            old_start + Duration::minutes(LOCAL_BUCKET_MINUTES)
+        );
+        assert_eq!(clock.pending_started_at, Some(future));
+        let mut reloaded = HistoryStore::new(history_root, &codex_home);
+        assert_eq!(
+            reloaded
+                .load_since(old_start)
+                .half_hour_buckets
+                .iter()
+                .filter(|bucket| bucket.starts_at == old_start)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn datetime_extremes_are_safe_for_history_windows_and_storage() {
+        let history = HistoryData::default();
+        assert!(
+            history
+                .estimated_half_hour_series_as_of(
+                    DateTime::<Utc>::MIN_UTC,
+                    DateTime::<Utc>::MIN_UTC,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            history
+                .weekly_cumulative_series_as_of(DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC,)
+                .len(),
+            1
+        );
+
+        let directory = tempdir().unwrap();
+        let mut store = HistoryStore::new(
+            directory.path().join("state"),
+            &directory.path().join("codex"),
+        );
+        store
+            .record(&HistoryObservation {
+                observed_at: DateTime::<Utc>::MIN_UTC,
+                ..HistoryObservation::default()
+            })
+            .unwrap();
+        store
+            .record(&HistoryObservation {
+                observed_at: DateTime::<Utc>::MAX_UTC,
+                ..HistoryObservation::default()
+            })
+            .unwrap();
+        let loaded = store.load_since(DateTime::<Utc>::MIN_UTC);
+        assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
     fn summary_backfill_marker_is_namespace_scoped_and_revision_checked() {
         let directory = tempdir().unwrap();
         let history_root = directory.path().join("state");
@@ -5146,6 +6267,62 @@ mod tests {
     }
 
     #[test]
+    fn summary_backfill_marker_merges_monotonically_under_concurrent_writers() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let completed_at = at(2026, 7, 28, 12, 5, 0);
+        let barrier = Arc::new(Barrier::new(4));
+        let attempts = [
+            (completed_at + Duration::minutes(1), true),
+            (completed_at + Duration::minutes(2), false),
+            (completed_at + Duration::minutes(2), true),
+            (completed_at, false),
+        ];
+        let handles = attempts.map(|(attempted_at, complete)| {
+            let history_root = history_root.clone();
+            let codex_home = codex_home.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = HistoryStore::new(history_root, &codex_home);
+                barrier.wait();
+                store
+                    .mark_summary_backfill_attempt(attempted_at, complete)
+                    .unwrap();
+            })
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let since = completed_at - Duration::days(31);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        let history = store.load_since(since);
+        assert_eq!(
+            history.summary_backfill_attempted_at,
+            Some(completed_at + Duration::minutes(2))
+        );
+        assert_eq!(history.summary_backfill_attempt_complete, Some(true));
+
+        // An older partial attempt must neither regress disk nor the already
+        // populated in-process cache.
+        let final_marker = store
+            .mark_summary_backfill_attempt(completed_at, false)
+            .unwrap();
+        assert_eq!(
+            final_marker.completed_at,
+            completed_at + Duration::minutes(2)
+        );
+        assert!(final_marker.complete);
+        let cached = store.load_since(since);
+        assert_eq!(
+            cached.summary_backfill_attempted_at,
+            Some(completed_at + Duration::minutes(2))
+        );
+        assert_eq!(cached.summary_backfill_attempt_complete, Some(true));
+    }
+
+    #[test]
     fn partial_summary_backfill_marker_is_not_a_global_history_warning() {
         let directory = tempdir().unwrap();
         let history_root = directory.path().join("state");
@@ -5184,6 +6361,7 @@ mod tests {
             !store
                 .mark_summary_backfill_attempt(completed_at, true)
                 .unwrap()
+                .complete
         );
 
         let history = HistoryStore::new(history_root, &codex_home)

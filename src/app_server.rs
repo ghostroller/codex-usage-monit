@@ -2,18 +2,41 @@ use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::env;
 use std::ffi::OsStr;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
+use crate::bounded_io::{BoundedLine, read_bounded_line};
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, AccountTokenUsage, CreditsSnapshot, DailyTokenBucket, LimitBucket,
@@ -27,6 +50,13 @@ const ACCOUNT_USAGE_ID: u64 = 3;
 const STDERR_LIMIT: usize = 32 * 1024;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 2 * 1024;
 const RPC_ERROR_MESSAGE_LIMIT: usize = 512;
+// Account quota payloads are normally tiny; leave generous headroom for
+// future usage detail without allowing an unbounded JSON value or queue.
+const APP_SERVER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const APP_SERVER_READER_QUEUE: usize = 2;
+const APP_SERVER_MAX_PROTOCOL_WARNINGS: usize = 32;
+const APP_SERVER_MAX_RESET_CREDIT_DETAILS: usize = 4_096;
+const APP_SERVER_READER_JOIN_GRACE: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const DESKTOP_CLI_RESOURCE_DIAGNOSTIC: &str = "Codex Desktop packaged resource";
 #[cfg(windows)]
@@ -38,20 +68,64 @@ enum ReaderEvent {
     Eof,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderTask {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Default)]
+struct ProtocolWarnings {
+    retained: Vec<String>,
+    suppressed: usize,
+}
+
+impl ProtocolWarnings {
+    fn push(&mut self, warning: String) {
+        if self.retained.len() < APP_SERVER_MAX_PROTOCOL_WARNINGS {
+            self.retained.push(warning);
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.retained.len()
+            + usize::from(
+                self.suppressed > 0 && self.retained.len() < APP_SERVER_MAX_PROTOCOL_WARNINGS,
+            )
+    }
+
+    fn into_messages(mut self) -> Vec<String> {
+        if self.suppressed > 0 {
+            if self.retained.len() == APP_SERVER_MAX_PROTOCOL_WARNINGS {
+                self.retained.pop();
+                self.suppressed = self.suppressed.saturating_add(1);
+            }
+            self.retained.push(format!(
+                "suppressed {} additional codex app-server protocol warnings",
+                self.suppressed
+            ));
+        }
+        self.retained
+    }
+}
+
 struct ChildGuard {
     child: Child,
+    process_tree: ProcessTree,
     startup_trace: StartupTrace,
+    reaped: bool,
 }
 
 impl ChildGuard {
     fn terminate_and_reap(&mut self) {
-        match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
-                let _ = self.child.kill();
-            }
+        if self.reaped {
+            return;
         }
+        self.process_tree.terminate(&mut self.child);
         let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
@@ -63,11 +137,182 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(unix)]
+struct ProcessTree {
+    process_group: libc::pid_t,
+}
+
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn attach_process_tree(child: &mut Child) -> io::Result<ProcessTree> {
+    Ok(ProcessTree {
+        process_group: child.id() as libc::pid_t,
+    })
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn terminate(&mut self, child: &mut Child) {
+        // Every ordinary wrapper and descendant inherits this group. Killing
+        // it also closes stdout/stderr copies held outside the direct child.
+        let killed_group = unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == 0;
+        if !killed_group {
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: HANDLE,
+}
+
+#[cfg(windows)]
+fn configure_process_tree(command: &mut Command) {
+    command.creation_flags(CREATE_SUSPENDED);
+}
+
+#[cfg(windows)]
+fn attach_process_tree(child: &mut Child) -> io::Result<ProcessTree> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error);
+    }
+
+    let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) };
+    if assigned == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error);
+    }
+    let process_tree = ProcessTree { job };
+    resume_suspended_child(child)?;
+    Ok(process_tree)
+}
+
+#[cfg(windows)]
+fn resume_suspended_child(child: &Child) -> io::Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        let mut resumed_threads = 0_usize;
+        while has_entry {
+            if entry.th32OwnerProcessID == child.id() {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let resume_result = unsafe { ResumeThread(thread) };
+                unsafe {
+                    CloseHandle(thread);
+                }
+                if resume_result == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                resumed_threads = resumed_threads.saturating_add(1);
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        }
+        if resumed_threads == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not find the suspended app-server primary thread",
+            ))
+        } else {
+            Ok(())
+        }
+    })();
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    result
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn terminate(&mut self, child: &mut Child) {
+        if !self.job.is_null() {
+            unsafe {
+                // Close is a kill-on-close fallback if explicit termination
+                // races with process shutdown.
+                TerminateJobObject(self.job, 1);
+                CloseHandle(self.job);
+            }
+            self.job = std::ptr::null_mut();
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe {
+                CloseHandle(self.job);
+            }
+        }
+    }
+}
+
 /// Fetches the read-only account quota and token-activity snapshot from Codex.
 ///
 /// Authentication remains owned by `codex app-server`; this adapter does not read
 /// `auth.json` and does not call any write or control methods.
 pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot> {
+    fetch_account_snapshot_inner(config, None)
+}
+
+/// Collects account data while assigning the caller's logical snapshot time.
+///
+/// Snapshot orchestration starts local and remote collection from one boundary;
+/// keeping that boundary avoids manufacturing local zero-coverage while a slow
+/// App Server request is still in flight. Standalone callers use the public
+/// function above and retain response-completion timestamps.
+pub(crate) fn fetch_account_snapshot_as_of(
+    config: &CollectConfig,
+    as_of: DateTime<Utc>,
+) -> Result<AccountSnapshot> {
+    fetch_account_snapshot_inner(config, Some(as_of))
+}
+
+fn fetch_account_snapshot_inner(
+    config: &CollectConfig,
+    snapshot_as_of: Option<DateTime<Utc>>,
+) -> Result<AccountSnapshot> {
     let total_span = config.startup_trace.span("app_server.total");
     if config.offline {
         total_span.finish("status=offline");
@@ -82,8 +327,9 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     if let Some(path) = config.app_server_path.as_deref() {
         command.env("PATH", path);
     }
+    configure_process_tree(&mut command);
     let program = command.get_program().to_owned();
-    let child = command
+    let mut spawned_child = command
         .arg("app-server")
         .env("CODEX_HOME", &config.codex_home)
         .stdin(Stdio::piped())
@@ -92,12 +338,20 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         .spawn()
         .map_err(|error| app_server_spawn_error(&program, error))
         .context("failed to spawn `codex app-server`")?;
+    let process_tree = attach_process_tree(&mut spawned_child)
+        .inspect_err(|_| {
+            let _ = spawned_child.kill();
+            let _ = spawned_child.wait();
+        })
+        .context("failed to contain the codex app-server process tree")?;
     spawn_span.finish("command=codex_app_server");
 
     let io_span = config.startup_trace.span("app_server.io_setup");
     let mut child = ChildGuard {
-        child,
+        child: spawned_child,
+        process_tree,
         startup_trace: config.startup_trace.clone(),
+        reaped: false,
     };
     let stdin = child
         .child
@@ -115,18 +369,26 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         .take()
         .context("codex app-server did not expose stderr")?;
 
-    let (reader_tx, reader_rx) = mpsc::channel();
-    thread::spawn(move || read_stdout(stdout, reader_tx));
-
-    let stderr_output = Arc::new(Mutex::new(String::new()));
-    let stderr_writer = Arc::clone(&stderr_output);
-    thread::spawn(move || capture_stderr(stderr, stderr_writer));
-
     let deadline = Instant::now()
         .checked_add(config.app_server_timeout)
         .context("app-server timeout exceeds the platform's supported range")?;
+
+    let (reader_tx, reader_rx) = mpsc::sync_channel(APP_SERVER_READER_QUEUE);
+    let (reader_done_tx, reader_done_rx) = mpsc::channel();
+    let stdout_done_tx = reader_done_tx.clone();
+    let stdout_reader = thread::spawn(move || {
+        read_stdout(stdout, reader_tx);
+        let _ = stdout_done_tx.send(ReaderTask::Stdout);
+    });
+
+    let stderr_output = Arc::new(Mutex::new(String::new()));
+    let stderr_writer = Arc::clone(&stderr_output);
+    let stderr_reader = thread::spawn(move || {
+        capture_stderr(stderr, stderr_writer);
+        let _ = reader_done_tx.send(ReaderTask::Stderr);
+    });
     let mut stdin = stdin;
-    let mut protocol_warnings = Vec::new();
+    let mut protocol_warnings = ProtocolWarnings::default();
     io_span.finish_with(|| format!("timeout_ms={}", config.app_server_timeout.as_millis()));
 
     let result = (|| {
@@ -184,9 +446,12 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
             let event = match recv_event(deadline, &reader_rx, "account snapshot", &stderr_output) {
                 Ok(event) => event,
                 Err(error) if rate_limits.is_some() => {
-                    protocol_warnings.push(format!(
-                        "account/usage/read did not complete after rate limits were received: {error:#}"
-                    ));
+                    push_protocol_warning(
+                        &mut protocol_warnings,
+                        format!(
+                            "account/usage/read did not complete after rate limits were received: {error:#}"
+                        ),
+                    );
                     break;
                 }
                 Err(error) => {
@@ -204,13 +469,18 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                         account_usage = Some(response_payload(&message));
                     }
                 }
-                ReaderEvent::Malformed(message) => protocol_warnings.push(message),
+                ReaderEvent::Malformed(message) => {
+                    push_protocol_warning(&mut protocol_warnings, message);
+                }
                 ReaderEvent::Eof => {
                     if rate_limits.is_some() {
-                        protocol_warnings.push(format!(
-                            "codex app-server closed stdout before returning account/usage/read{}",
-                            stderr_suffix(&stderr_output)
-                        ));
+                        push_protocol_warning(
+                            &mut protocol_warnings,
+                            format!(
+                                "codex app-server closed stdout before returning account/usage/read{}",
+                                stderr_suffix(&stderr_output)
+                            ),
+                        );
                         break;
                     }
                     account_span.finish("status=error kind=eof");
@@ -236,36 +506,33 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
         });
 
         let parse_span = config.startup_trace.span("app_server.parse_responses");
-        let mut snapshot = AccountSnapshot {
-            warnings: protocol_warnings,
-            ..AccountSnapshot::default()
-        };
+        let mut snapshot = AccountSnapshot::default();
         match rate_limits.expect("rate-limit response must be present") {
             Ok(result) => {
-                let as_of = Utc::now();
+                let as_of = snapshot_as_of.unwrap_or_else(Utc::now);
                 match parse_rate_limits_result(&result, as_of) {
                     Ok(limits) => snapshot.limits = limits,
                     Err(error) => snapshot.errors.push(format!(
                         "account/rateLimits/read returned invalid data: {error:#}"
                     )),
                 }
-                match parse_rate_limit_reset_credits_result_lossy(&result, as_of) {
-                    Ok((reset_credits, detail_errors)) => {
+                match parse_rate_limit_reset_credits_result_lossy(
+                    &result,
+                    as_of,
+                    &mut protocol_warnings,
+                ) {
+                    Ok((reset_credits, partial)) => {
                         snapshot.rate_limit_reset_credits = reset_credits;
-                        if !detail_errors.is_empty() {
-                            snapshot.rate_limit_reset_credits_partial = true;
-                            snapshot.warnings.extend(detail_errors.into_iter().map(|error| {
-                                format!(
-                                    "account/rateLimits/read ignored invalid reset credit detail: {error}"
-                                )
-                            }));
-                        }
+                        snapshot.rate_limit_reset_credits_partial = partial;
                     }
                     Err(error) => {
                         snapshot.rate_limit_reset_credits_partial = true;
-                        snapshot.warnings.push(format!(
-                            "account/rateLimits/read returned invalid reset credits: {error:#}"
-                        ));
+                        push_protocol_warning(
+                            &mut protocol_warnings,
+                            format!(
+                                "account/rateLimits/read returned invalid reset credits: {error:#}"
+                            ),
+                        );
                     }
                 }
             }
@@ -277,14 +544,16 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
             match account_usage {
                 Ok(result) => match parse_account_usage_result(&result) {
                     Ok(usage) => snapshot.usage = Some(usage),
-                    Err(error) => snapshot.warnings.push(format!(
-                        "account/usage/read returned invalid data: {error:#}"
-                    )),
+                    Err(error) => push_protocol_warning(
+                        &mut protocol_warnings,
+                        format!("account/usage/read returned invalid data: {error:#}"),
+                    ),
                 },
                 Err(message) if optional_usage_rpc_unavailable(&message) => {}
-                Err(message) => snapshot
-                    .warnings
-                    .push(format!("account/usage/read failed: {message}")),
+                Err(message) => push_protocol_warning(
+                    &mut protocol_warnings,
+                    format!("account/usage/read failed: {message}"),
+                ),
             }
         }
 
@@ -294,18 +563,55 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
                 snapshot.limits.len(),
                 snapshot.rate_limit_reset_credits.is_some(),
                 snapshot.usage.is_some(),
-                snapshot.warnings.len(),
+                protocol_warnings.len(),
                 snapshot.errors.len()
             )
         });
+        snapshot.warnings = protocol_warnings.into_messages();
 
         Ok(snapshot)
     })();
 
     drop(stdin);
+    child.terminate_and_reap();
+    drop(reader_rx);
+    finish_reader_threads(stdout_reader, stderr_reader, reader_done_rx);
     drop(child);
     total_span.finish_with(|| format!("status={}", if result.is_ok() { "ok" } else { "error" }));
     result
+}
+
+fn finish_reader_threads(
+    stdout_reader: thread::JoinHandle<()>,
+    stderr_reader: thread::JoinHandle<()>,
+    reader_done_rx: mpsc::Receiver<ReaderTask>,
+) {
+    let deadline = Instant::now()
+        .checked_add(APP_SERVER_READER_JOIN_GRACE)
+        .unwrap_or_else(Instant::now);
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    while !stdout_done || !stderr_done {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match reader_done_rx.recv_timeout(remaining) {
+            Ok(ReaderTask::Stdout) => stdout_done = true,
+            Ok(ReaderTask::Stderr) => stderr_done = true,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Joining only threads that announced completion keeps ordinary shutdown
+    // deterministic. A custom wrapper can deliberately move a pipe-owning
+    // descendant outside our process group; detaching that blocked reader is
+    // safer than allowing an external process to defeat the RPC timeout.
+    if stdout_done {
+        let _ = stdout_reader.join();
+    }
+    if stderr_done {
+        let _ = stderr_reader.join();
+    }
 }
 
 fn codex_command(config: &CollectConfig) -> Result<Command> {
@@ -510,9 +816,10 @@ pub fn parse_rate_limit_reset_credits_result(
 fn parse_rate_limit_reset_credits_result_lossy(
     result: &Value,
     as_of: DateTime<Utc>,
-) -> Result<(Option<RateLimitResetCreditsSnapshot>, Vec<String>)> {
+    warnings: &mut ProtocolWarnings,
+) -> Result<(Option<RateLimitResetCreditsSnapshot>, bool)> {
     let Some(reset_credits) = rate_limit_reset_credits_object(result)? else {
-        return Ok((None, Vec::new()));
+        return Ok((None, false));
     };
     let available_count = required_u64(reset_credits, "availableCount")
         .context("rateLimitResetCredits.availableCount is invalid")?;
@@ -520,21 +827,44 @@ fn parse_rate_limit_reset_credits_result_lossy(
         bail!("rateLimitResetCredits.availableCount exceeds the protocol int64 range");
     }
 
-    let mut detail_errors = Vec::new();
+    let mut partial = false;
     let credits = match optional_reset_credit_values(reset_credits) {
         Ok(None) => None,
         Ok(Some(values)) => {
-            let mut credits = Vec::with_capacity(values.len());
-            for (index, value) in values.iter().enumerate() {
+            let retained = values.len().min(APP_SERVER_MAX_RESET_CREDIT_DETAILS);
+            let mut credits = Vec::with_capacity(retained);
+            for (index, value) in values.iter().take(retained).enumerate() {
                 match parse_reset_credit(value, index) {
                     Ok(credit) => credits.push(credit),
-                    Err(error) => detail_errors.push(format!("{error:#}")),
+                    Err(error) => {
+                        partial = true;
+                        push_protocol_warning(
+                            warnings,
+                            format!(
+                                "account/rateLimits/read ignored invalid reset credit detail: {error:#}"
+                            ),
+                        );
+                    }
                 }
+            }
+            if values.len() > retained {
+                partial = true;
+                push_protocol_warning(
+                    warnings,
+                    format!(
+                        "account/rateLimits/read ignored {} reset credit details exceeding the {APP_SERVER_MAX_RESET_CREDIT_DETAILS}-detail limit",
+                        values.len() - retained
+                    ),
+                );
             }
             Some(credits)
         }
         Err(error) => {
-            detail_errors.push(format!("{error:#}"));
+            partial = true;
+            push_protocol_warning(
+                warnings,
+                format!("account/rateLimits/read ignored invalid reset credit detail: {error:#}"),
+            );
             None
         }
     };
@@ -546,7 +876,7 @@ fn parse_rate_limit_reset_credits_result_lossy(
             provenance: Provenance::ServerSnapshot,
             as_of,
         }),
-        detail_errors,
+        partial,
     ))
 }
 
@@ -680,6 +1010,12 @@ fn optional_reset_credits(
     let Some(credits) = optional_reset_credit_values(object)? else {
         return Ok(None);
     };
+    if credits.len() > APP_SERVER_MAX_RESET_CREDIT_DETAILS {
+        bail!(
+            "rateLimitResetCredits.credits contains {} entries, exceeding the {APP_SERVER_MAX_RESET_CREDIT_DETAILS}-detail limit",
+            credits.len()
+        );
+    }
     credits
         .iter()
         .enumerate()
@@ -810,7 +1146,7 @@ fn wait_for_response(
     operation: &str,
     deadline: Instant,
     receiver: &mpsc::Receiver<ReaderEvent>,
-    warnings: &mut Vec<String>,
+    warnings: &mut ProtocolWarnings,
     stderr: &Arc<Mutex<String>>,
 ) -> Result<std::result::Result<Value, String>> {
     loop {
@@ -819,7 +1155,7 @@ fn wait_for_response(
                 return Ok(response_payload(&message));
             }
             ReaderEvent::Message(_) => {}
-            ReaderEvent::Malformed(message) => warnings.push(message),
+            ReaderEvent::Malformed(message) => push_protocol_warning(warnings, message),
             ReaderEvent::Eof => {
                 bail!(
                     "codex app-server closed stdout while waiting for {operation}{}",
@@ -858,22 +1194,42 @@ fn recv_event(
         })
 }
 
-fn read_stdout(stdout: impl Read, sender: mpsc::Sender<ReaderEvent>) {
+fn push_protocol_warning(warnings: &mut ProtocolWarnings, warning: String) {
+    warnings.push(warning);
+}
+
+fn read_stdout(stdout: impl Read, sender: mpsc::SyncSender<ReaderEvent>) {
+    read_stdout_with_limit(stdout, sender, APP_SERVER_MAX_FRAME_BYTES);
+}
+
+fn read_stdout_with_limit(
+    stdout: impl Read,
+    sender: mpsc::SyncSender<ReaderEvent>,
+    max_frame_bytes: usize,
+) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        match read_bounded_line(&mut reader, &mut line, max_frame_bytes) {
+            Ok(BoundedLine::Eof) => {
                 let _ = sender.send(ReaderEvent::Eof);
                 break;
             }
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+            Ok(BoundedLine::TooLong) => {
+                if sender
+                    .send(ReaderEvent::Malformed(format!(
+                        "ignored oversized codex app-server output frame exceeding the {max_frame_bytes}-byte limit"
+                    )))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(BoundedLine::Line) => {
+                if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let event = match serde_json::from_str(trimmed) {
+                let event = match serde_json::from_slice(&line) {
                     Ok(value) => ReaderEvent::Message(value),
                     Err(error) => ReaderEvent::Malformed(format!(
                         "ignored malformed codex app-server output: {error}"
@@ -1093,13 +1449,18 @@ fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
 
 #[cfg(test)]
 mod diagnostic_tests {
+    use std::io::Cursor;
     use std::path::PathBuf;
+    use std::sync::mpsc;
 
+    use chrono::Utc;
     use serde_json::json;
 
     use super::{
-        RPC_ERROR_MESSAGE_LIMIT, codex_command, compact_diagnostic_text, format_rpc_error,
-        optional_usage_rpc_unavailable,
+        APP_SERVER_MAX_PROTOCOL_WARNINGS, APP_SERVER_MAX_RESET_CREDIT_DETAILS, ProtocolWarnings,
+        RPC_ERROR_MESSAGE_LIMIT, ReaderEvent, codex_command, compact_diagnostic_text,
+        format_rpc_error, optional_usage_rpc_unavailable, parse_rate_limit_reset_credits_result,
+        parse_rate_limit_reset_credits_result_lossy, read_stdout_with_limit,
     };
     use crate::config::CollectConfig;
 
@@ -1146,16 +1507,227 @@ mod diagnostic_tests {
         assert!(error.ends_with("... (code -32600)"));
         assert!(error.chars().count() <= RPC_ERROR_MESSAGE_LIMIT + 16);
     }
+
+    #[test]
+    fn stdout_reader_drains_an_oversized_frame_and_recovers() {
+        let input = format!("{}\n{{\"id\":7}}\n", "x".repeat(64));
+        let (sender, receiver) = mpsc::sync_channel(4);
+
+        read_stdout_with_limit(Cursor::new(input), sender, 16);
+
+        match receiver.recv().unwrap() {
+            ReaderEvent::Malformed(message) => assert!(message.contains("oversized")),
+            _ => panic!("expected oversized-frame diagnostic"),
+        }
+        match receiver.recv().unwrap() {
+            ReaderEvent::Message(message) => assert_eq!(message["id"], 7),
+            _ => panic!("expected recovered JSON-RPC frame"),
+        }
+        assert!(matches!(receiver.recv().unwrap(), ReaderEvent::Eof));
+    }
+
+    #[test]
+    fn protocol_warning_limit_reports_every_suppressed_diagnostic() {
+        let mut warnings = ProtocolWarnings::default();
+        for index in 0..APP_SERVER_MAX_PROTOCOL_WARNINGS + 5 {
+            warnings.push(format!("warning {index}"));
+        }
+
+        let warnings = warnings.into_messages();
+
+        assert_eq!(warnings.len(), APP_SERVER_MAX_PROTOCOL_WARNINGS);
+        assert_eq!(
+            warnings.last().map(String::as_str),
+            Some("suppressed 6 additional codex app-server protocol warnings")
+        );
+    }
+
+    #[test]
+    fn lossy_reset_credit_parsing_bounds_details_and_diagnostics_during_parsing() {
+        let mut warnings = ProtocolWarnings::default();
+        let result = json!({
+            "rateLimitResetCredits": {
+                "availableCount": APP_SERVER_MAX_RESET_CREDIT_DETAILS + 100,
+                "credits": vec![json!(0); APP_SERVER_MAX_RESET_CREDIT_DETAILS + 100]
+            }
+        });
+
+        let (snapshot, partial) =
+            parse_rate_limit_reset_credits_result_lossy(&result, Utc::now(), &mut warnings)
+                .unwrap();
+        let snapshot = snapshot.unwrap();
+        let messages = warnings.into_messages();
+
+        assert!(partial);
+        assert_eq!(snapshot.credits.as_ref().map(Vec::len), Some(0));
+        assert_eq!(messages.len(), APP_SERVER_MAX_PROTOCOL_WARNINGS);
+        assert_eq!(
+            messages.last().map(String::as_str),
+            Some("suppressed 4066 additional codex app-server protocol warnings")
+        );
+        assert!(
+            parse_rate_limit_reset_credits_result(&result, Utc::now())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeding the 4096-detail limit")
+        );
+    }
+
+    #[test]
+    fn disconnecting_a_full_reader_queue_unblocks_the_reader_thread() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let input = "{\"id\":1}\n".repeat(64);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || read_stdout_with_limit(Cursor::new(input), sender, 64));
+        assert!(matches!(receiver.recv().unwrap(), ReaderEvent::Message(_)));
+        thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        drop(receiver);
+        reader.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_cleanup_closes_pipes_inherited_by_descendants() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        use crate::startup::StartupTrace;
+
+        use super::{ChildGuard, attach_process_tree, configure_process_tree};
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 5 & echo ready; wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let process_tree = attach_process_tree(&mut child).unwrap();
+        let mut child = ChildGuard {
+            child,
+            process_tree,
+            startup_trace: StartupTrace::default(),
+            reaped: false,
+        };
+        let mut reader = BufReader::new(stdout);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+
+        let started = Instant::now();
+        child.terminate_and_reap();
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(remainder.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_cleanup_is_bounded_when_a_process_outside_the_group_keeps_the_pipe_open() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use crate::startup::StartupTrace;
+
+        use super::{
+            ChildGuard, ReaderTask, attach_process_tree, configure_process_tree,
+            finish_reader_threads,
+        };
+
+        let (read_pipe, write_pipe) = UnixStream::pair().unwrap();
+        let primary_stdout: OwnedFd = write_pipe.try_clone().unwrap().into();
+        let escaped_stdout: OwnedFd = write_pipe.try_clone().unwrap().into();
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo ready; sleep 5"])
+            .stdout(Stdio::from(primary_stdout))
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut primary = command.spawn().unwrap();
+        let process_tree = attach_process_tree(&mut primary).unwrap();
+        let mut primary = ChildGuard {
+            child: primary,
+            process_tree,
+            startup_trace: StartupTrace::default(),
+            reaped: false,
+        };
+
+        // This sibling models a custom wrapper that moved a descendant to a
+        // different process group while leaving the app-server pipe inherited.
+        let mut escaped = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::from(escaped_stdout))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(write_pipe);
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let stdout_done_tx = done_tx.clone();
+        let stdout_reader = thread::spawn(move || {
+            let mut reader = BufReader::new(read_pipe);
+            let mut ready = String::new();
+            reader.read_line(&mut ready).unwrap();
+            let _ = ready_tx.send(ready);
+            let mut remainder = Vec::new();
+            let _ = reader.read_to_end(&mut remainder);
+            let _ = stdout_done_tx.send(ReaderTask::Stdout);
+        });
+        let stderr_reader = thread::spawn(move || {
+            let _ = done_tx.send(ReaderTask::Stderr);
+        });
+        assert_eq!(
+            ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .trim(),
+            "ready"
+        );
+
+        let started = Instant::now();
+        primary.terminate_and_reap();
+        finish_reader_threads(stdout_reader, stderr_reader, done_rx);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = escaped.kill();
+        let _ = escaped.wait();
+    }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use std::env;
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::{app_server_spawn_error, resolve_automatic_windows_codex_cli_with_installed};
+    use crate::startup::StartupTrace;
+
+    use super::{
+        ChildGuard, app_server_spawn_error, attach_process_tree, configure_process_tree,
+        resolve_automatic_windows_codex_cli_with_installed,
+    };
+
+    const WINDOWS_JOB_HELPER_MARKER: &str = "CODEX_USAGE_MONIT_WINDOWS_JOB_HELPER_MARKER";
 
     fn desktop_resource_path() -> PathBuf {
         PathBuf::from(
@@ -1175,6 +1747,62 @@ mod tests {
         assert!(rendered.contains(&path.display().to_string()));
         assert!(rendered.contains("--codex-bin"));
         assert!(rendered.contains("--offline"));
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // The helper must stay alive so the parent can prove the Job kills its grandchild.
+    fn windows_job_resumes_child_and_terminates_inherited_grandchild() {
+        if let Some(marker) = env::var_os(WINDOWS_JOB_HELPER_MARKER) {
+            let _grandchild = Command::new("cmd.exe")
+                .args(["/D", "/S", "/C", "ping -n 31 127.0.0.1"])
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            fs::write(marker, b"resumed").unwrap();
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("resumed.marker");
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args([
+                "windows_job_resumes_child_and_terminates_inherited_grandchild",
+                "--nocapture",
+            ])
+            .env(WINDOWS_JOB_HELPER_MARKER, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let process_tree = attach_process_tree(&mut child).unwrap();
+        let mut child = ChildGuard {
+            child,
+            process_tree,
+            startup_trace: StartupTrace::default(),
+            reaped: false,
+        };
+
+        let resume_deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < resume_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            child.terminate_and_reap();
+            panic!("suspended child did not resume and create its marker");
+        }
+
+        let started = Instant::now();
+        child.terminate_and_reap();
+        let mut reader = io::BufReader::new(stdout);
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

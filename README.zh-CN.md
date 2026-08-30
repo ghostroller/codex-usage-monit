@@ -263,7 +263,7 @@ codex-usage-monit record --foreground
 | Summary 中的 `b` | 在 `1d`、`12h`、`6h`、`3h`、`1h` 图表桶之间循环。 |
 | Summary 中的 `g` | 在 Top 6 + Other 与全部项目的堆叠图之间切换。 |
 | Summary 中的 `i` | 在序列未压缩时切换精确时间桶检查；启用后可用 `Left` / `Right`、`[` / `]`、`Home` 或 `End` 导航。 |
-| Summary 中的 `Enter` / `Space`、`x`、`l` | 展开/收起选中树节点、收起整棵树，或切换可选 Longx 估算。 |
+| Summary 中的 `Enter` / `Space`、`+` / `-`、`x`、`l` | 切换、展开/收起选中树节点、收起整棵树，或切换可选 Longx 估算。 |
 | 紧凑 Trends 中的 `r`、`w`、`h` | 显示 Remaining、Weekly 或 15-minute 图表。 |
 | Trends 中的 `[`、`]`、`n` | 把 24 小时图表窗口向前/向后移动，或回到 Now。 |
 | Trends 中的 `i` | 切换 Inspect 模式。 |

@@ -335,11 +335,8 @@ impl PreparedSummary {
         !self.partial_reasons.is_empty()
             || self.represented_tokens < self.available_tokens
             || self.covered_buckets < self.expected_buckets
-            || (metric == SummaryMetric::ApiEquivalent && {
-                let amount = self.usage.totals.api_equivalent_cost;
-                amount.priced_samples < amount.observed_samples
-                    || amount.priced_tokens < amount.observed_tokens
-            })
+            || (metric == SummaryMetric::ApiEquivalent
+                && api_cost_coverage_is_partial(self.usage.totals.api_equivalent_cost))
             || (metric == SummaryMetric::Estimated
                 && api_long_context
                 && !self.long_context_breakdown_complete)
@@ -1384,17 +1381,18 @@ fn coverage_is_partial(
             coverage.estimated_covered_tokens < coverage.available_tokens
                 || (api_long_context && !coverage.long_context_breakdown_complete)
         }
-        SummaryMetric::ApiEquivalent => {
-            let amount = totals.api_equivalent_cost;
-            amount.priced_samples < amount.observed_samples
-                || amount.priced_tokens < amount.observed_tokens
-                || !amount.range_is_exact()
-        }
+        SummaryMetric::ApiEquivalent => api_cost_coverage_is_partial(totals.api_equivalent_cost),
     };
     coverage.covered_buckets < coverage.expected_buckets
         || coverage.represented_tokens < coverage.available_tokens
         || coverage.source_partial
         || metric_partial
+}
+
+fn api_cost_coverage_is_partial(amount: ApiCostAmount) -> bool {
+    amount.priced_samples < amount.observed_samples
+        || amount.priced_tokens < amount.observed_tokens
+        || !amount.range_is_exact()
 }
 
 fn summary_day_is_partial_window_edge(
@@ -1771,6 +1769,29 @@ mod tests {
             SummaryMetric::ALL
                 .into_iter()
                 .all(|metric| { prepared.value_is_lower_bound(metric, false) })
+        );
+    }
+
+    #[test]
+    fn inexact_api_range_is_partial_at_report_and_bucket_levels() {
+        let (mut prepared, mut chart) = fully_covered_prepared_summary();
+        prepared.usage.totals.api_equivalent_cost.maximum_pico_usd = PicoUsd::new(2_000);
+        chart.buckets[0].totals.api_equivalent_cost.maximum_pico_usd = PicoUsd::new(2_000);
+
+        assert_eq!(
+            prepared.coverage_state(SummaryMetric::ApiEquivalent, false),
+            SummaryCoverageState::Partial
+        );
+        assert!(prepared.value_is_lower_bound(SummaryMetric::ApiEquivalent, false));
+        assert_eq!(
+            prepared.chart_bucket_state_with_local_time(
+                &chart.buckets[0],
+                SummaryGrain::Hour,
+                SummaryMetric::ApiEquivalent,
+                false,
+                |timestamp| timestamp.naive_utc(),
+            ),
+            SummaryCoverageState::Partial
         );
     }
 

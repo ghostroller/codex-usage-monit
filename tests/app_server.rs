@@ -18,6 +18,10 @@ use codex_usage_monit::app_server::{
 };
 use codex_usage_monit::config::CollectConfig;
 use codex_usage_monit::domain::{Provenance, RateLimitResetCreditsSnapshot};
+#[cfg(unix)]
+use codex_usage_monit::rollout::RolloutCache;
+#[cfg(unix)]
+use codex_usage_monit::snapshot::collect_snapshot_cached;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -653,6 +657,66 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"use
         ] {
             assert!(stages.iter().any(|stage| stage == expected));
         }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_boundary_includes_fresh_app_server_timestamps() {
+    let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 41
+IFS= read -r initialize || exit 42
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 43
+IFS= read -r limits || exit 44
+IFS= read -r usage || exit 45
+sleep 0.02
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":0,"credits":[]}}}'
+"#;
+
+    with_mock_codex(script, |directory| {
+        let codex_home = directory.join("home");
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home,
+            app_server_timeout: Duration::from_secs(2),
+            ..CollectConfig::default()
+        };
+        let mut cache = RolloutCache::new();
+
+        let result = collect_snapshot_cached(&config, None, true, &mut cache);
+        let collection_completed_at = Utc::now();
+
+        assert_eq!(result.snapshot.limits.len(), 1);
+        assert_eq!(result.snapshot.limits[0].limit_id, "codex");
+        assert_eq!(result.snapshot.limits[0].as_of, result.snapshot.as_of);
+        let reset_credits = result.snapshot.rate_limit_reset_credits.as_ref().unwrap();
+        assert_eq!(reset_credits.available_count, 0);
+        assert_eq!(reset_credits.as_of, result.snapshot.as_of);
+        assert!(result.snapshot.as_of < collection_completed_at);
+        assert!(
+            result
+                .history_observation
+                .half_hour_buckets
+                .iter()
+                .all(|bucket| bucket.sampled_at <= result.snapshot.as_of)
+        );
+        assert!(
+            result
+                .snapshot
+                .sources
+                .iter()
+                .find(|source| source.source == "app_server")
+                .is_some_and(|source| matches!(source.status.as_str(), "ok" | "partial"))
+        );
+        assert!(
+            !result
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("dated after the snapshot as-of"))
+        );
     });
 }
 

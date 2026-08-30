@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
-use crate::history::history_namespace_with_redaction;
+use crate::history::HistoryStore;
 
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
@@ -337,7 +337,13 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
 }
 
 fn expected_history_namespace(options: &ServiceOptions) -> String {
-    history_namespace_with_redaction(&options.codex_home, options.redact_content)
+    HistoryStore::new_with_redaction(
+        options.history_dir.clone(),
+        &options.codex_home,
+        options.redact_content,
+    )
+    .namespace()
+    .to_string()
 }
 
 pub fn uninstall(options: &ServiceOptions) -> Result<ServiceStatus> {

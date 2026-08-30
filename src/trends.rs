@@ -15,6 +15,30 @@ pub const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 pub const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
 pub const TRENDS_REPORT_SCHEMA_VERSION: u32 = 1;
 
+fn datetime_saturating_add(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    timestamp.checked_add_signed(duration).unwrap_or_else(|| {
+        if duration < Duration::zero() {
+            DateTime::<Utc>::MIN_UTC
+        } else {
+            DateTime::<Utc>::MAX_UTC
+        }
+    })
+}
+
+fn datetime_saturating_sub(timestamp: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    timestamp.checked_sub_signed(duration).unwrap_or_else(|| {
+        if duration < Duration::zero() {
+            DateTime::<Utc>::MAX_UTC
+        } else {
+            DateTime::<Utc>::MIN_UTC
+        }
+    })
+}
+
+fn interval_midpoint(starts_at: DateTime<Utc>, ends_at: DateTime<Utc>) -> DateTime<Utc> {
+    datetime_saturating_add(starts_at, ends_at.signed_duration_since(starts_at) / 2)
+}
+
 /// A half-open interval represented by a trend sample: `[starts_at, ends_at)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,21 +153,24 @@ pub fn build_trends_report(
     day_offset: u16,
     api_long_context_multiplier: bool,
 ) -> TrendsReport {
-    let five_hour_remaining = remaining_trend(history, FIVE_HOUR_WINDOW_MINUTES);
-    let weekly_remaining = remaining_trend(history, WEEKLY_WINDOW_MINUTES);
+    let five_hour_remaining = remaining_trend_as_of(history, FIVE_HOUR_WINDOW_MINUTES, now);
+    let weekly_remaining = remaining_trend_as_of(history, WEEKLY_WINDOW_MINUTES, now);
     let five_hour_remaining_readout =
         remaining_trend_readout(history, FIVE_HOUR_WINDOW_MINUTES, now);
     let weekly_remaining_readout = remaining_trend_readout(history, WEEKLY_WINDOW_MINUTES, now);
     let half_hour_bounds = trend_day_bounds(now, day_offset);
-    let weekly_reset = history.latest_weekly_reset();
+    let weekly_reset = history.latest_weekly_reset_as_of(now);
 
     let weekly_cumulative = weekly_reset
-        .map(|reset| history.weekly_cumulative_series(reset))
+        .map(|reset| history.weekly_cumulative_series_as_of(reset, now))
         .unwrap_or_default();
     let weekly_estimated_cumulative = weekly_reset
         .map(|reset| {
-            history
-                .weekly_cumulative_series_with_api_long_context(reset, api_long_context_multiplier)
+            history.weekly_cumulative_series_with_api_long_context_as_of(
+                reset,
+                now,
+                api_long_context_multiplier,
+            )
         })
         .unwrap_or_default();
     let weekly_history_present = weekly_cumulative
@@ -177,7 +204,7 @@ pub fn build_trends_report(
         .collect();
 
     let current_weekly_cycle = weekly_reset.filter(|reset| {
-        let starts_at = *reset - Duration::minutes(WEEKLY_WINDOW_MINUTES);
+        let starts_at = datetime_saturating_sub(*reset, Duration::minutes(WEEKLY_WINDOW_MINUTES));
         starts_at <= now && now < *reset
     });
     let weekly_tokens_readout = current_weekly_cycle
@@ -203,7 +230,9 @@ pub fn build_trends_report(
         .half_hour_series()
         .iter()
         .filter(|bucket| {
-            bucket.starts_at >= half_hour_bounds[0] && bucket.starts_at < half_hour_bounds[1]
+            bucket.starts_at >= half_hour_bounds[0]
+                && bucket.starts_at < half_hour_bounds[1]
+                && bucket.sampled_at <= now
         })
         .collect::<Vec<_>>();
     let half_hour_history_present = !half_hour_buckets.is_empty();
@@ -215,7 +244,7 @@ pub fn build_trends_report(
                 ends_at: bucket.ends_at,
             };
             trend_point(
-                interval.starts_at + (interval.ends_at - interval.starts_at) / 2,
+                interval_midpoint(interval.starts_at, interval.ends_at),
                 TrendReadoutValue::Tokens(bucket.token_usage.total_tokens),
                 Some(bucket.sampled_at),
                 Some(interval),
@@ -224,7 +253,7 @@ pub fn build_trends_report(
         })
         .collect();
     let half_hour_estimated =
-        half_hour_estimated_trend(history, half_hour_bounds, api_long_context_multiplier);
+        half_hour_estimated_trend(history, half_hour_bounds, now, api_long_context_multiplier);
 
     TrendsReport {
         schema_version: TRENDS_REPORT_SCHEMA_VERSION,
@@ -252,7 +281,7 @@ pub fn build_trends_report(
 
 /// Returns the aligned, half-open 24-hour interval selected by the Trends UI.
 pub fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>; 2] {
-    let shifted = as_of - Duration::days(i64::from(day_offset));
+    let shifted = datetime_saturating_sub(as_of, Duration::days(i64::from(day_offset)));
     let bucket_seconds = LOCAL_BUCKET_MINUTES * 60;
     let end_seconds = shifted
         .timestamp()
@@ -260,7 +289,7 @@ pub fn trend_day_bounds(as_of: DateTime<Utc>, day_offset: u16) -> [DateTime<Utc>
         .div_euclid(bucket_seconds)
         .saturating_mul(bucket_seconds);
     let end = DateTime::from_timestamp(end_seconds, 0).unwrap_or(shifted);
-    [end - Duration::hours(24), end]
+    [datetime_saturating_sub(end, Duration::hours(24)), end]
 }
 
 fn trend_point(
@@ -332,15 +361,20 @@ fn remaining_trend_readout(
 fn half_hour_estimated_trend(
     history: &HistoryData,
     bounds: [DateTime<Utc>; 2],
+    as_of: DateTime<Utc>,
     api_long_context: bool,
 ) -> Vec<TrendPoint> {
-    let resets = weekly_resets_overlapping(history, bounds);
+    let resets = weekly_resets_overlapping_as_of(history, bounds, as_of);
     let estimates_by_reset = resets
         .iter()
         .copied()
         .map(|reset| {
             let points = history
-                .estimated_half_hour_series_with_api_long_context(reset, api_long_context)
+                .estimated_half_hour_series_with_api_long_context_as_of(
+                    reset,
+                    as_of,
+                    api_long_context,
+                )
                 .into_iter()
                 .filter(|point| point.starts_at >= bounds[0] && point.starts_at < bounds[1])
                 .map(|point| (point.starts_at, point))
@@ -349,13 +383,12 @@ fn half_hour_estimated_trend(
         })
         .collect::<BTreeMap<_, _>>();
     let mut points = BTreeMap::new();
-    for bucket in history
-        .half_hour_series()
-        .iter()
-        .filter(|bucket| bucket.starts_at >= bounds[0] && bucket.starts_at < bounds[1])
-    {
+    for bucket in history.half_hour_series().iter().filter(|bucket| {
+        bucket.starts_at >= bounds[0] && bucket.starts_at < bounds[1] && bucket.sampled_at <= as_of
+    }) {
         let crosses_reset = resets.iter().any(|reset| {
-            let cycle_starts_at = *reset - Duration::minutes(WEEKLY_WINDOW_MINUTES);
+            let cycle_starts_at =
+                datetime_saturating_sub(*reset, Duration::minutes(WEEKLY_WINDOW_MINUTES));
             bucket.starts_at < cycle_starts_at && cycle_starts_at < bucket.ends_at
         });
         if crosses_reset {
@@ -365,7 +398,8 @@ fn half_hour_estimated_trend(
             .iter()
             .copied()
             .filter(|reset| {
-                let cycle_starts_at = *reset - Duration::minutes(WEEKLY_WINDOW_MINUTES);
+                let cycle_starts_at =
+                    datetime_saturating_sub(*reset, Duration::minutes(WEEKLY_WINDOW_MINUTES));
                 bucket.starts_at >= cycle_starts_at && bucket.ends_at <= *reset
             })
             .max()
@@ -385,7 +419,7 @@ fn half_hour_estimated_trend(
             starts_at: point.starts_at,
             ends_at: point.ends_at,
         };
-        let at = interval.starts_at + (interval.ends_at - interval.starts_at) / 2;
+        let at = interval_midpoint(interval.starts_at, interval.ends_at);
         points.insert(
             at,
             trend_point(
@@ -404,21 +438,31 @@ fn half_hour_estimated_trend(
 ///
 /// Kept crate-visible so UI contract tests can lock reset-drift behavior to
 /// the same implementation used by [`build_trends_report`].
+#[cfg(test)]
 pub(crate) fn weekly_resets_overlapping(
     history: &HistoryData,
     bounds: [DateTime<Utc>; 2],
+) -> Vec<DateTime<Utc>> {
+    weekly_resets_overlapping_as_of(history, bounds, DateTime::<Utc>::MAX_UTC)
+}
+
+pub(crate) fn weekly_resets_overlapping_as_of(
+    history: &HistoryData,
+    bounds: [DateTime<Utc>; 2],
+    as_of: DateTime<Utc>,
 ) -> Vec<DateTime<Utc>> {
     const RESET_DRIFT_SECONDS: i64 = 120;
 
     let mut candidates = history
         .quota_points
         .iter()
-        .filter(|point| point.duration_mins == WEEKLY_WINDOW_MINUTES)
+        .filter(|point| point.duration_mins == WEEKLY_WINDOW_MINUTES && point.observed_at <= as_of)
         .map(|point| (point.resets_at, point.observed_at))
         .chain(
             history
                 .weekly_local_points
                 .iter()
+                .filter(|point| point.observed_at <= as_of)
                 .map(|point| (point.resets_at, point.observed_at)),
         )
         .collect::<Vec<_>>();
@@ -428,8 +472,9 @@ pub(crate) fn weekly_resets_overlapping(
     let mut cluster_end = None;
     let mut representative = None::<(DateTime<Utc>, DateTime<Utc>)>;
     for (reset, observed_at) in candidates {
-        let joins_cluster =
-            cluster_end.is_some_and(|end| reset - end <= Duration::seconds(RESET_DRIFT_SECONDS));
+        let joins_cluster = cluster_end.is_some_and(|end| {
+            reset <= datetime_saturating_add(end, Duration::seconds(RESET_DRIFT_SECONDS))
+        });
         if !joins_cluster && let Some(previous) = representative.take() {
             resets.push(previous);
         }
@@ -447,7 +492,8 @@ pub(crate) fn weekly_resets_overlapping(
         .into_iter()
         .map(|(reset, _)| reset)
         .filter(|reset| {
-            let starts_at = *reset - Duration::minutes(WEEKLY_WINDOW_MINUTES);
+            let starts_at =
+                datetime_saturating_sub(*reset, Duration::minutes(WEEKLY_WINDOW_MINUTES));
             starts_at < bounds[1] && *reset > bounds[0]
         })
         .collect()
@@ -456,8 +502,17 @@ pub(crate) fn weekly_resets_overlapping(
 /// Builds an ordered remaining-quota series across every loaded reset cycle.
 ///
 /// Kept crate-visible so UI contract tests do not duplicate transition logic.
+#[cfg(test)]
 pub(crate) fn remaining_trend(history: &HistoryData, duration_mins: i64) -> Vec<TrendPoint> {
-    let mut points = history.remaining_series(duration_mins);
+    remaining_trend_as_of(history, duration_mins, DateTime::<Utc>::MAX_UTC)
+}
+
+pub(crate) fn remaining_trend_as_of(
+    history: &HistoryData,
+    duration_mins: i64,
+    as_of: DateTime<Utc>,
+) -> Vec<TrendPoint> {
+    let mut points = history.remaining_series_as_of(duration_mins, as_of);
     // Keep real observations from every loaded cycle. A reset credit can start
     // a new cycle before the previous resets_at, so observed timestamps are
     // the honest transition boundary; rendering can still split recorder gaps.
@@ -490,7 +545,7 @@ mod tests {
     use crate::domain::{Provenance, TokenUsage};
     use crate::history::{
         HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, LocalHalfHourBucket,
-        QuotaPoint,
+        QuotaPoint, WeeklyLocalPoint,
     };
 
     fn at(value: &str) -> DateTime<Utc> {
@@ -855,5 +910,113 @@ mod tests {
         assert_eq!(report.weekly_tokens.len(), 1);
         assert_eq!(report.weekly_tokens_readout, None);
         assert_eq!(report.weekly_estimated_readout, None);
+    }
+
+    #[test]
+    fn report_excludes_every_observation_after_as_of() {
+        let now = at("2026-07-29T12:00:00Z");
+        let reset = now + Duration::days(3);
+        let future_reset = now + Duration::days(8);
+        let mut future_bucket = bucket(now - Duration::minutes(15), 9_000, 900, Some(0), &[]);
+        future_bucket.sampled_at = now + Duration::hours(1);
+        let history = HistoryData {
+            quota_points: vec![
+                quota_point(
+                    now - Duration::minutes(1),
+                    300,
+                    now + Duration::hours(4),
+                    20.0,
+                ),
+                quota_point(
+                    now + Duration::hours(1),
+                    300,
+                    now + Duration::hours(4),
+                    90.0,
+                ),
+                quota_point(
+                    now - Duration::minutes(1),
+                    WEEKLY_WINDOW_MINUTES,
+                    reset,
+                    25.0,
+                ),
+                quota_point(now + Duration::hours(1), WEEKLY_WINDOW_MINUTES, reset, 90.0),
+                quota_point(
+                    now + Duration::hours(2),
+                    WEEKLY_WINDOW_MINUTES,
+                    future_reset,
+                    95.0,
+                ),
+            ],
+            half_hour_buckets: vec![
+                bucket(now - Duration::minutes(30), 1_000, 100, Some(0), &[]),
+                future_bucket,
+            ],
+            weekly_local_points: vec![WeeklyLocalPoint {
+                observed_at: now + Duration::hours(2),
+                resets_at: future_reset,
+                token_usage: TokenUsage {
+                    total_tokens: 50_000,
+                    ..TokenUsage::default()
+                },
+                estimated_cost_units: 5_000,
+                api_long_context_extra_cost_units: Some(0),
+                long_context_usage_unknown: false,
+                estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                call_count: 1,
+                partial_reasons: Vec::new(),
+            }],
+            ..HistoryData::default()
+        };
+
+        let report = build_trends_report(&history, now, 0, false);
+
+        assert_eq!(report.five_hour_remaining.len(), 1);
+        assert_eq!(report.weekly_remaining.len(), 1);
+        assert_eq!(
+            report.five_hour_remaining_readout.unwrap().value,
+            TrendReadoutValue::Percent(80.0)
+        );
+        assert_eq!(
+            report.weekly_remaining_readout.unwrap().value,
+            TrendReadoutValue::Percent(75.0)
+        );
+        assert_eq!(report.half_hour_tokens.len(), 1);
+        assert_eq!(
+            report.half_hour_tokens[0].readout_value,
+            TrendReadoutValue::Tokens(1_000)
+        );
+        assert!(
+            report
+                .weekly_tokens
+                .iter()
+                .filter_map(|point| point.sampled_at)
+                .all(|sampled_at| sampled_at <= now)
+        );
+        assert_eq!(
+            report.weekly_estimated_readout.unwrap().value,
+            TrendReadoutValue::Percent(25.0)
+        );
+    }
+
+    #[test]
+    fn datetime_extremes_are_safe_for_trend_windows() {
+        let minimum = DateTime::<Utc>::MIN_UTC;
+        let maximum = DateTime::<Utc>::MAX_UTC;
+
+        let minimum_bounds = trend_day_bounds(minimum, u16::MAX);
+        assert_eq!(minimum_bounds[0], minimum);
+        assert!(minimum_bounds[0] <= minimum_bounds[1]);
+        let maximum_bounds = trend_day_bounds(maximum, 0);
+        assert!(maximum_bounds[0] <= maximum_bounds[1]);
+        assert!(maximum_bounds[1] <= maximum);
+
+        let history = HistoryData::default();
+        let minimum_report = build_trends_report(&history, minimum, u16::MAX, false);
+        let maximum_report = build_trends_report(&history, maximum, 0, false);
+        assert_eq!(minimum_report.as_of, minimum);
+        assert_eq!(maximum_report.as_of, maximum);
+
+        let midpoint = interval_midpoint(minimum, maximum);
+        assert!(midpoint >= minimum && midpoint <= maximum);
     }
 }

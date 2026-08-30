@@ -857,17 +857,20 @@ fn backfill_summary_history(
     }
     let requested_complete =
         scan_complete && summary_history_coverage_complete(&history, observed_at);
-    let complete = match store.mark_summary_backfill_attempt(observed_at, requested_complete) {
-        Ok(complete) => complete,
+    let marker = match store.mark_summary_backfill_attempt(observed_at, requested_complete) {
+        Ok(marker) => marker,
         Err(error) => {
             history
                 .warnings
                 .push(format!("summary backfill marker failed: {error}"));
-            requested_complete
+            crate::history::SummaryBackfillAttempt {
+                completed_at: observed_at,
+                complete: requested_complete,
+            }
         }
     };
-    history.summary_backfill_attempted_at = Some(observed_at);
-    history.summary_backfill_attempt_complete = Some(complete);
+    history.summary_backfill_attempted_at = Some(marker.completed_at);
+    history.summary_backfill_attempt_complete = Some(marker.complete);
     normalize_history_warnings(&mut history);
     (history, observed_at)
 }

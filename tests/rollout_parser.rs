@@ -157,12 +157,12 @@ fn latest_session_index_title_overrides_the_first_message_without_bypassing_reda
         true,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(2)).unwrap();
     assert_eq!(dataset.tasks[0].title, "Current Desktop title");
 
     let mut redacted = config(temp.path());
     redacted.redact_content = true;
-    let dataset = scan_rollouts(&redacted, now).unwrap();
+    let dataset = scan_rollouts(&redacted, now + chrono::Duration::seconds(2)).unwrap();
     assert_eq!(dataset.tasks[0].title, "[redacted]");
 }
 
@@ -622,7 +622,7 @@ fn omitted_owner_probe_budget_degrades_unknown_boundary_without_unbounded_reads(
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
@@ -672,7 +672,7 @@ fn unrelated_canonical_uuid_inventory_does_not_consume_owner_probe_budget() {
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
 
     assert_eq!(dataset.calls.len(), 1);
     assert_eq!(dataset.calls[0].tokens.total_tokens, 10);
@@ -719,7 +719,7 @@ fn exhausted_owner_probe_byte_budget_is_uncertain_not_a_proven_absence() {
 
     let mut scan_config = config(temp.path());
     scan_config.lookback_days = 1;
-    let dataset = scan_rollouts(&scan_config, now).unwrap();
+    let dataset = scan_rollouts(&scan_config, now + chrono::Duration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.stats.ambiguous_token_resets, 1);
@@ -811,7 +811,7 @@ fn overlapping_same_thread_file_times_mark_replay_order_ambiguous() {
         false,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(15)).unwrap();
 
     assert_eq!(dataset.stats.ambiguous_token_resets, 2);
     assert_eq!(dataset.calls.len(), 1);
@@ -843,7 +843,7 @@ fn missing_same_thread_content_times_mark_replay_order_ambiguous() {
         );
     }
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(4)).unwrap();
 
     assert_eq!(dataset.stats.ambiguous_token_resets, 2);
     assert_eq!(dataset.calls.len(), 1);
@@ -915,7 +915,7 @@ fn selected_file_without_an_owner_makes_first_cumulative_total_partial() {
         false,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(1)).unwrap();
 
     assert!(dataset.calls.is_empty());
     assert_eq!(dataset.tasks[0].token_usage.total_tokens, 0);
@@ -937,7 +937,7 @@ fn skipped_selected_line_makes_first_cumulative_total_partial() {
         true,
     );
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(1)).unwrap();
 
     assert_eq!(dataset.stats.skipped_lines, 1);
     assert!(dataset.calls.is_empty());
@@ -3046,7 +3046,7 @@ fn active_rollout_copy_wins_over_an_archived_copy_for_resume_eligibility() {
         );
     }
 
-    let dataset = scan_rollouts(&config(temp.path()), now).unwrap();
+    let dataset = scan_rollouts(&config(temp.path()), now + chrono::Duration::seconds(4)).unwrap();
 
     assert_eq!(dataset.tasks.len(), 1);
     assert_eq!(dataset.tasks[0].thread_id, "shared-thread");

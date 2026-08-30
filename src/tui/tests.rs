@@ -14,6 +14,9 @@ mod testkit;
 
 const RESUMABLE_THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
 
+#[cfg(windows)]
+static WINDOWS_TERMINATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn summary_estimate_formats_credit_rate_equivalents_instead_of_raw_units() {
     assert_eq!(format_estimated_credits(8_000_000, true), "~1.00 cr");
@@ -700,6 +703,43 @@ fn run_loop_poll_timeout_sleeps_until_work_and_checks_workers_promptly() {
         next_run_loop_poll_timeout(&app, now, false),
         Duration::from_millis(100)
     );
+}
+
+#[test]
+fn termination_request_wakes_the_run_loop_without_terminal_io() {
+    #[cfg(windows)]
+    let _signal_test_guard = WINDOWS_TERMINATION_TEST_LOCK.lock().unwrap();
+    let termination = TerminationSignal::for_test();
+    assert!(!termination.is_requested());
+    assert_eq!(
+        termination.poll_timeout(Duration::from_secs(30)),
+        BACKGROUND_CHANNEL_POLL
+    );
+
+    termination.request_for_test();
+    assert!(termination.is_requested());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_close_handler_waits_until_terminal_restoration() {
+    use windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT;
+
+    let _signal_test_guard = WINDOWS_TERMINATION_TEST_LOCK.lock().unwrap();
+    let termination = TerminationSignal::for_test();
+    let handler = thread::spawn(|| unsafe { windows_console_ctrl_handler(CTRL_CLOSE_EVENT) });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !WINDOWS_TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "console handler did not start");
+        thread::yield_now();
+    }
+    assert!(
+        !handler.is_finished(),
+        "close handler returned before terminal restoration"
+    );
+
+    termination.mark_terminal_restored();
+    assert_eq!(handler.join().unwrap(), 1);
 }
 
 #[test]
@@ -3299,16 +3339,24 @@ fn viewport_offsets_scroll_and_reveal_with_clamped_bounds() {
 #[test]
 fn unicode_text_helpers_preserve_cursor_and_display_width_contracts() {
     let value = "a测b";
-    assert_eq!(byte_index_at_char(value, 0), 0);
-    assert_eq!(byte_index_at_char(value, 1), 1);
-    assert_eq!(byte_index_at_char(value, 2), 4);
-    assert_eq!(byte_index_at_char(value, usize::MAX), value.len());
+    assert_eq!(byte_index_at_grapheme(value, 0), 0);
+    assert_eq!(byte_index_at_grapheme(value, 1), 1);
+    assert_eq!(byte_index_at_grapheme(value, 2), 4);
+    assert_eq!(byte_index_at_grapheme(value, usize::MAX), value.len());
+    assert_eq!(grapheme_count("e\u{301}👩\u{200d}💻"), 2);
+    assert_eq!(byte_index_at_grapheme("e\u{301}x", 1), "e\u{301}".len());
 
     assert_eq!(compact_search_text("abcdef测试", 5), "<测试");
     assert_eq!(compact_search_text("测试", 4), "测试");
+    assert_eq!(
+        compact_search_text("prefix👩\u{200d}💻", 3),
+        "<👩\u{200d}💻"
+    );
+    assert_eq!(compact_search_text("prefixe\u{301}", 2), "<e\u{301}");
     assert_eq!(compact_search_text("测试", 0), "");
 
     assert_eq!(truncate_display_text("ab测试", 5), "ab测…");
+    assert_eq!(truncate_display_text("👩\u{200d}💻ab", 3), "👩\u{200d}💻…");
     assert_eq!(truncate_display_text("unchanged", 32), "unchanged");
     assert_eq!(truncate_display_text("anything", 1), "…");
     assert_eq!(truncate_display_text("anything", 0), "");
@@ -3316,6 +3364,10 @@ fn unicode_text_helpers_preserve_cursor_and_display_width_contracts() {
     let middle = truncate_middle_display_text("/workspace/项目/src/main.rs", 12);
     assert_eq!(middle, "/wo…/main.rs");
     assert_eq!(UnicodeWidthStr::width(middle.as_str()), 12);
+    assert_eq!(
+        truncate_middle_display_text("abc👩\u{200d}💻z", 5),
+        "a…👩\u{200d}💻z"
+    );
     assert_eq!(truncate_middle_display_text("anything", 1), "…");
     assert_eq!(truncate_middle_display_text("anything", 0), "");
 
@@ -3331,6 +3383,11 @@ fn unicode_text_helpers_preserve_cursor_and_display_width_contracts() {
     assert_eq!(format!("{before}{after}"), "试cd");
     assert!(UnicodeWidthStr::width(before.as_str()) <= 4);
     assert!(UnicodeWidthStr::width(after.as_str()) <= 4);
+
+    let (before, after, visible) = search_cursor_window("a👩\u{200d}💻b", 2, 4);
+    assert!(visible);
+    assert_eq!(before, "👩\u{200d}💻");
+    assert_eq!(after, "b");
 }
 
 #[test]
@@ -5499,7 +5556,7 @@ fn window_task_controls_compact_before_filter_hitboxes_are_clipped() {
             app.window_scope = scope;
             app.task_search = query.to_string();
             app.task_search_before_edit = app.task_search.clone();
-            app.task_search_cursor = app.task_search.chars().count();
+            app.task_search_cursor = grapheme_count(&app.task_search);
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -6537,6 +6594,56 @@ fn long_unicode_search_keeps_the_cursor_visible_in_narrow_panels() {
 }
 
 #[test]
+fn task_and_turn_search_edit_complete_grapheme_clusters() {
+    let mut app = interaction_test_app(2, 2);
+    app.begin_task_search();
+    for character in ['a', 'b'] {
+        handle_key_event(&mut app, key_event(KeyCode::Char(character)));
+    }
+    handle_key_event(&mut app, key_event(KeyCode::Left));
+    handle_key_event(&mut app, key_event(KeyCode::Char('\u{301}')));
+    assert_eq!(app.task_search, "a\u{301}b");
+    assert_eq!(app.task_search_cursor, 1);
+
+    handle_key_event(&mut app, key_event(KeyCode::End));
+    assert_eq!(app.task_search_cursor, 2);
+    handle_key_event(&mut app, key_event(KeyCode::Home));
+    handle_key_event(&mut app, key_event(KeyCode::Right));
+    handle_key_event(&mut app, key_event(KeyCode::Backspace));
+    assert_eq!(app.task_search, "b");
+    assert_eq!(app.task_search_cursor, 0);
+    handle_key_event(&mut app, key_event(KeyCode::Delete));
+    assert!(app.task_search.is_empty());
+
+    handle_key_event(&mut app, key_event(KeyCode::Enter));
+    app.focus_turns();
+    app.begin_turn_search();
+    for character in ['👩', '\u{200d}', '💻', 'x'] {
+        handle_key_event(&mut app, key_event(KeyCode::Char(character)));
+    }
+    assert_eq!(app.turn_search, "👩\u{200d}💻x");
+    assert_eq!(app.turn_search_cursor, 2);
+
+    handle_key_event(&mut app, key_event(KeyCode::Left));
+    handle_key_event(&mut app, key_event(KeyCode::Delete));
+    assert_eq!(app.turn_search, "👩\u{200d}💻");
+    assert_eq!(app.turn_search_cursor, 1);
+    handle_key_event(&mut app, key_event(KeyCode::Backspace));
+    assert!(app.turn_search.is_empty());
+    assert_eq!(app.turn_search_cursor, 0);
+
+    app.turn_search = "👩💻".to_string();
+    app.turn_search_cursor = grapheme_count(&app.turn_search);
+    handle_key_event(&mut app, key_event(KeyCode::Left));
+    handle_key_event(&mut app, key_event(KeyCode::Char('\u{200d}')));
+    assert_eq!(app.turn_search, "👩\u{200d}💻");
+    assert_eq!(app.turn_search_cursor, 1);
+    handle_key_event(&mut app, key_event(KeyCode::Char('x')));
+    assert_eq!(app.turn_search, "👩\u{200d}💻x");
+    assert_eq!(app.turn_search_cursor, 2);
+}
+
+#[test]
 fn keyboard_focus_moves_between_tasks_and_turns_and_reveals_selection() {
     let mut app = interaction_test_app(2, 30);
     assert_eq!(app.focus, Focus::Tasks);
@@ -7004,6 +7111,40 @@ fn view_tabs_use_rendered_padding_and_support_mouse_switching() {
         mouse_event(MouseEventKind::Down(MouseButton::Left), 19, 0),
     ));
     assert_eq!(narrow.view, View::Overview);
+
+    for theme in [Theme::Dark, Theme::Light] {
+        for width in 21..=25 {
+            let mut app = interaction_test_app(3, 2);
+            app.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let summary = app.view_tabs_hitbox.unwrap().tabs[View::Summary.index()];
+            if width < 25 {
+                assert!(summary.is_empty(), "theme={theme:?} width={width}");
+            } else {
+                assert_eq!(summary, Rect::new(19, 0, 6, 1));
+                let rendered = (summary.x..summary.right())
+                    .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                    .collect::<String>();
+                assert_eq!(rendered, " U Sum");
+                assert_eq!(
+                    terminal.backend().buffer()[(20, 0)].fg,
+                    theme.palette().accent
+                );
+            }
+        }
+    }
+
+    for column in 20..25 {
+        let mut app = interaction_test_app(3, 2);
+        let mut terminal = Terminal::new(TestBackend::new(25, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, 0),
+        ));
+        assert_eq!(app.view, View::Summary, "column={column}");
+    }
 }
 
 #[test]

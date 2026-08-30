@@ -2,6 +2,7 @@ pub mod api_cost;
 pub mod app_server;
 mod atomic_file;
 pub mod attribution;
+mod bounded_io;
 pub mod cache;
 pub mod cli;
 pub mod config;
