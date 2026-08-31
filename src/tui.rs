@@ -1423,7 +1423,8 @@ fn api_cost_window_state(analysis: Option<&WindowAnalysis>) -> ApiCostWindowStat
         .partial_reasons
         .iter()
         .any(|reason| reason.starts_with("rollout_"));
-    if !rollout_incomplete {
+    let cost_incomplete = analysis.api_equivalent_cost.is_partial();
+    if !rollout_incomplete && !cost_incomplete {
         return ApiCostWindowState::Complete;
     }
     let amount = analysis.api_equivalent_cost.amount;
@@ -1826,6 +1827,17 @@ struct TaskListRow {
     has_children: bool,
     collapsed: bool,
     hidden_descendants: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverviewRefreshAnchor {
+    selected_thread_id: Option<String>,
+    selected_turn_id: Option<String>,
+    task_viewport_thread_id: Option<String>,
+    turn_viewport_id: Option<String>,
+    task_viewport_was_at_top: bool,
+    selected_task_was_visible: bool,
+    selected_turn_was_visible: bool,
 }
 
 impl TaskSourceFilter {
@@ -5347,6 +5359,123 @@ impl App {
         changed
     }
 
+    fn overview_refresh_anchor(&self) -> OverviewRefreshAnchor {
+        let filtered = self.filtered_task_indices();
+        let selected_position = filtered
+            .iter()
+            .position(|index| *index == self.selected_task);
+        OverviewRefreshAnchor {
+            selected_thread_id: self.raw_selected_thread_id().map(str::to_owned),
+            selected_turn_id: self.selected_turn_record().map(|turn| turn.turn_id.clone()),
+            task_viewport_thread_id: filtered
+                .get(self.task_table_offset)
+                .and_then(|index| self.snapshot.tasks.get(*index))
+                .map(|task| task.thread_id.clone()),
+            turn_viewport_id: self
+                .filtered_turn_indices()
+                .get(self.turn_offset)
+                .and_then(|index| self.snapshot.turns.get(*index))
+                .map(|turn| turn.turn_id.clone()),
+            task_viewport_was_at_top: self.task_table_offset == 0,
+            selected_task_was_visible: self.task_table_hitbox.is_some_and(|hitbox| {
+                selected_position.is_some_and(|position| {
+                    position >= hitbox.offset
+                        && position < hitbox.offset.saturating_add(hitbox.capacity)
+                })
+            }),
+            selected_turn_was_visible: self.turn_table_hitbox.is_some_and(|hitbox| {
+                self.selected_turn >= hitbox.offset
+                    && self.selected_turn < hitbox.offset.saturating_add(hitbox.capacity)
+            }),
+        }
+    }
+
+    fn restore_overview_refresh_anchor(&mut self, anchor: OverviewRefreshAnchor) {
+        let restored_task = anchor.selected_thread_id.as_deref().and_then(|thread_id| {
+            self.snapshot
+                .tasks
+                .iter()
+                .position(|task| task.thread_id == thread_id)
+        });
+        let task_was_restored = restored_task.is_some();
+        self.selected_task = restored_task
+            .unwrap_or(0)
+            .min(self.snapshot.tasks.len().saturating_sub(1));
+        if !task_was_restored {
+            self.task_table_offset = 0;
+            self.task_reveal_pending = false;
+        }
+
+        let filtered_turns = self.filtered_turn_indices();
+        let turn_count = filtered_turns.len();
+        let restored_turn = task_was_restored
+            .then_some(anchor.selected_turn_id.as_deref())
+            .flatten()
+            .and_then(|turn_id| {
+                filtered_turns
+                    .iter()
+                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
+            });
+        let turn_was_restored = restored_turn.is_some();
+        self.selected_turn = restored_turn.unwrap_or(0).min(turn_count.saturating_sub(1));
+        self.turn_offset = if turn_was_restored {
+            self.turn_offset.min(turn_count.saturating_sub(1))
+        } else {
+            0
+        };
+        self.reconcile_task_filter(false);
+
+        if task_was_restored && !self.task_reveal_pending {
+            // Keep offset zero as the live-list anchor. Once scrolled, anchor
+            // the viewport to its previous first thread across a recency sort.
+            if anchor.task_viewport_was_at_top {
+                self.task_table_offset = 0;
+            } else {
+                let restored_viewport =
+                    anchor
+                        .task_viewport_thread_id
+                        .as_deref()
+                        .and_then(|thread_id| {
+                            let task_index = self
+                                .snapshot
+                                .tasks
+                                .iter()
+                                .position(|task| task.thread_id == thread_id)?;
+                            self.filtered_task_indices()
+                                .iter()
+                                .position(|index| *index == task_index)
+                        });
+                if let Some(position) = restored_viewport {
+                    self.task_table_offset = position;
+                }
+                if anchor.selected_task_was_visible {
+                    self.task_reveal_pending = true;
+                }
+            }
+        }
+
+        let selected_thread_was_restored =
+            self.selected_thread_id() == anchor.selected_thread_id.as_deref();
+        if turn_was_restored && selected_thread_was_restored && !self.turn_reveal_pending {
+            let restored_viewport = anchor.turn_viewport_id.as_deref().and_then(|turn_id| {
+                self.filtered_turn_indices()
+                    .iter()
+                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
+            });
+            if let Some(position) = restored_viewport {
+                self.turn_offset = position;
+            }
+            if anchor.selected_turn_was_visible {
+                self.turn_reveal_pending = true;
+            }
+        }
+        if matches!(self.focus, Focus::Turns | Focus::TurnSearch)
+            && self.selected_task_raw_turn_count() == 0
+        {
+            self.close_temporary_turns();
+        }
+    }
+
     fn replace(&mut self, mut result: CollectionResult, refreshed_account: bool) {
         self.local_snapshot_partial = result.snapshot.partial;
         self.local_snapshot = result.snapshot.clone();
@@ -5368,32 +5497,7 @@ impl App {
                 next_snapshot_as_of.max(self.snapshot.as_of),
             )
         });
-        let filtered = self.filtered_task_indices();
-        let task_viewport_was_at_top = self.task_table_offset == 0;
-        let selected_position = filtered
-            .iter()
-            .position(|index| *index == self.selected_task);
-        let selected_task_was_visible = self.task_table_hitbox.is_some_and(|hitbox| {
-            selected_position.is_some_and(|position| {
-                position >= hitbox.offset
-                    && position < hitbox.offset.saturating_add(hitbox.capacity)
-            })
-        });
-        let task_viewport_thread_id = filtered
-            .get(self.task_table_offset)
-            .and_then(|index| self.snapshot.tasks.get(*index))
-            .map(|task| task.thread_id.clone());
-        let selected = self.raw_selected_thread_id().map(str::to_string);
-        let selected_turn_id = self.selected_turn_record().map(|turn| turn.turn_id.clone());
-        let selected_turn_was_visible = self.turn_table_hitbox.is_some_and(|hitbox| {
-            self.selected_turn >= hitbox.offset
-                && self.selected_turn < hitbox.offset.saturating_add(hitbox.capacity)
-        });
-        let turn_viewport_id = self
-            .filtered_turn_indices()
-            .get(self.turn_offset)
-            .and_then(|index| self.snapshot.turns.get(*index))
-            .map(|turn| turn.turn_id.clone());
+        let anchor = self.overview_refresh_anchor();
         self.snapshot = result.snapshot;
         self.account = result.account;
         if summary_inputs_unchanged {
@@ -5435,82 +5539,7 @@ impl App {
         self.turn_scrollbar_hitbox = None;
         self.scroll_drag = None;
         self.resume_confirmation_hitbox = None;
-        let restored_task = selected.as_deref().and_then(|thread_id| {
-            self.snapshot
-                .tasks
-                .iter()
-                .position(|task| task.thread_id == thread_id)
-        });
-        let task_was_restored = restored_task.is_some();
-        self.selected_task = restored_task
-            .unwrap_or(0)
-            .min(self.snapshot.tasks.len().saturating_sub(1));
-        if !task_was_restored {
-            self.task_table_offset = 0;
-            self.task_reveal_pending = false;
-        }
-        let filtered_turns = self.filtered_turn_indices();
-        let turn_count = filtered_turns.len();
-        let restored_turn = task_was_restored
-            .then_some(selected_turn_id.as_deref())
-            .flatten()
-            .and_then(|turn_id| {
-                filtered_turns
-                    .iter()
-                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
-            });
-        let turn_was_restored = restored_turn.is_some();
-        self.selected_turn = restored_turn.unwrap_or(0).min(turn_count.saturating_sub(1));
-        self.turn_offset = if turn_was_restored {
-            self.turn_offset.min(turn_count.saturating_sub(1))
-        } else {
-            0
-        };
-        self.reconcile_task_filter(false);
-
-        if task_was_restored && !self.task_reveal_pending {
-            // Offset zero is a live anchor; restoring the old first row would hide new tasks.
-            if task_viewport_was_at_top {
-                self.task_table_offset = 0;
-            } else {
-                let restored_viewport = task_viewport_thread_id.as_deref().and_then(|thread_id| {
-                    let task_index = self
-                        .snapshot
-                        .tasks
-                        .iter()
-                        .position(|task| task.thread_id == thread_id)?;
-                    self.filtered_task_indices()
-                        .iter()
-                        .position(|index| *index == task_index)
-                });
-                if let Some(position) = restored_viewport {
-                    self.task_table_offset = position;
-                }
-                if selected_task_was_visible {
-                    self.task_reveal_pending = true;
-                }
-            }
-        }
-
-        let selected_thread_was_restored = self.selected_thread_id() == selected.as_deref();
-        if turn_was_restored && selected_thread_was_restored && !self.turn_reveal_pending {
-            let restored_viewport = turn_viewport_id.as_deref().and_then(|turn_id| {
-                self.filtered_turn_indices()
-                    .iter()
-                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
-            });
-            if let Some(position) = restored_viewport {
-                self.turn_offset = position;
-            }
-            if selected_turn_was_visible {
-                self.turn_reveal_pending = true;
-            }
-        }
-        if matches!(self.focus, Focus::Turns | Focus::TurnSearch)
-            && self.selected_task_raw_turn_count() == 0
-        {
-            self.close_temporary_turns();
-        }
+        self.restore_overview_refresh_anchor(anchor);
         self.worker_running = false;
         self.last_local_refresh = Instant::now();
     }
@@ -5530,8 +5559,7 @@ impl App {
         {
             return false;
         }
-        let selected = self.raw_selected_thread_id().map(str::to_owned);
-        let selected_turn = self.selected_turn_record().map(|turn| turn.turn_id.clone());
+        let anchor = self.overview_refresh_anchor();
         self.remote_live_states = states;
         self.snapshot = self.local_snapshot.clone();
         self.snapshot.partial = self.local_snapshot_partial;
@@ -5548,27 +5576,7 @@ impl App {
                 .iter()
                 .any(|task| &task.thread_id == thread_id)
         });
-        self.selected_task = selected
-            .as_deref()
-            .and_then(|thread_id| {
-                self.snapshot
-                    .tasks
-                    .iter()
-                    .position(|task| task.thread_id == thread_id)
-            })
-            .unwrap_or(0)
-            .min(self.snapshot.tasks.len().saturating_sub(1));
-        let turns = self.filtered_turn_indices();
-        self.selected_turn = selected_turn
-            .as_deref()
-            .and_then(|turn_id| {
-                turns
-                    .iter()
-                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
-            })
-            .unwrap_or(0)
-            .min(turns.len().saturating_sub(1));
-        self.reconcile_task_filter(false);
+        self.restore_overview_refresh_anchor(anchor);
         self.task_table_hitbox = None;
         self.turn_table_hitbox = None;
         true
@@ -5584,6 +5592,7 @@ impl App {
         {
             return false;
         }
+        let anchor = self.overview_refresh_anchor();
         self.remote_overview_history = history;
         self.snapshot = self.local_snapshot.clone();
         self.snapshot.partial = self.local_snapshot_partial;
@@ -5594,7 +5603,13 @@ impl App {
             Utc::now(),
         );
         self.summary_cache = None;
-        self.reconcile_task_filter(false);
+        self.expanded_task_threads.retain(|thread_id| {
+            self.snapshot
+                .tasks
+                .iter()
+                .any(|task| &task.thread_id == thread_id)
+        });
+        self.restore_overview_refresh_anchor(anchor);
         self.task_table_hitbox = None;
         self.turn_table_hitbox = None;
         true
@@ -17940,6 +17955,20 @@ fn model_api_cost_for_analysis(
         .unwrap_or(model.api_equivalent_cost)
 }
 
+fn model_api_cost_state(
+    window_state: ApiCostWindowState,
+    cost: ApiCostAmount,
+) -> ApiCostWindowState {
+    if window_state != ApiCostWindowState::Complete {
+        return window_state;
+    }
+    if cost.priced_samples < cost.observed_samples || cost.priced_tokens < cost.observed_tokens {
+        ApiCostWindowState::Incomplete
+    } else {
+        ApiCostWindowState::Complete
+    }
+}
+
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
@@ -18006,10 +18035,8 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .iter()
             .take(visible_capacity)
             .map(|model| {
-                format_scoped_api_cost_amount(
-                    api_cost_state,
-                    model_api_cost_for_analysis(api_cost_analysis, model),
-                )
+                let cost = model_api_cost_for_analysis(api_cost_analysis, model);
+                format_scoped_api_cost_amount(model_api_cost_state(api_cost_state, cost), cost)
             })
             .collect::<Vec<_>>()
     } else {
@@ -18381,7 +18408,6 @@ fn merge_remote_live_into_snapshot_at(
     snapshot
         .turns
         .retain(|turn| !turn.thread_id.starts_with("remote:"));
-    let local_task_count = snapshot.tasks.len();
     let local_turn_count = snapshot.turns.len();
     snapshot
         .sources
@@ -18551,7 +18577,7 @@ fn merge_remote_live_into_snapshot_at(
                     }
                     existing.source = Some(source_name.clone());
                     existing.created_at = existing.created_at.or(task.created_at);
-                    existing.updated_at = Some(task.updated_at);
+                    existing.updated_at = existing.updated_at.max(Some(task.updated_at));
                     existing.status = status;
                     existing.status_provenance = if stale {
                         Provenance::Stale
@@ -18672,12 +18698,14 @@ fn merge_remote_live_into_snapshot_at(
     }
     ensure_remote_task_ancestor_closure(&mut snapshot.tasks, &trusted_parent_edges);
     apply_preferred_remote_window_usage(snapshot);
-    snapshot.tasks[local_task_count..].sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.thread_id.cmp(&right.thread_id))
-    });
+    // The collector already sorts the local slice by recency, but remote
+    // projection/live rows are appended afterwards. Sort the complete merged
+    // list so a recently updated remote task is not pinned below every local
+    // task. This is stable on equal timestamps, preserving the deterministic
+    // order established by each source.
+    snapshot
+        .tasks
+        .sort_by_key(|task| std::cmp::Reverse(task.updated_at));
     snapshot.turns[local_turn_count..].sort_by(|left, right| {
         right
             .started_at
@@ -18697,6 +18725,14 @@ fn apply_remote_window_projection(
     analysis: &mut WindowAnalysis,
     remote: &crate::remote_overview::RemoteOverviewWindow,
 ) {
+    apply_remote_window_projection_mode(analysis, remote, false);
+}
+
+fn apply_remote_window_projection_mode(
+    analysis: &mut WindowAnalysis,
+    remote: &crate::remote_overview::RemoteOverviewWindow,
+    api_long_context: bool,
+) {
     analysis.threads.retain(|usage| {
         !usage.thread_id.starts_with("remote:")
             && !remote.replaced_local_threads.contains(&usage.thread_id)
@@ -18707,11 +18743,27 @@ fn apply_remote_window_projection(
     });
     analysis.threads.extend(remote.threads.iter().cloned());
     analysis.turns.extend(remote.turns.iter().cloned());
-    let total_tokens = analysis
+    let task_tokens = analysis
         .threads
         .iter()
         .map(|usage| usage.usage.token_usage.total_tokens)
         .fold(0_u64, u64::saturating_add);
+    let mut combined = TokenUsage::default();
+    for usage in &analysis.threads {
+        combined.add_assign(usage.usage.token_usage);
+    }
+    let live_tail_residual = combined
+        .delta_from(remote.model_token_usage)
+        .filter(|residual| !residual.is_zero());
+    let (window_tokens, model_thread_inconsistent) =
+        if remote.model_token_usage.delta_from(combined).is_some() {
+            (remote.model_token_usage, false)
+        } else if combined.delta_from(remote.model_token_usage).is_some() {
+            (combined, false)
+        } else {
+            (combined, true)
+        };
+    let total_tokens = window_tokens.total_tokens;
     for usage in &mut analysis.threads {
         usage.usage.local_token_share_percent = if total_tokens == 0 {
             0.0
@@ -18726,31 +18778,190 @@ fn apply_remote_window_projection(
             usage.usage.token_usage.total_tokens as f64 / total_tokens as f64 * 100.0
         };
     }
-    let mut combined = TokenUsage::default();
-    for usage in &analysis.threads {
-        combined.add_assign(usage.usage.token_usage);
+    analysis.attribution.local_token_usage = window_tokens;
+    if let Some(models) = remote.models.as_ref() {
+        let mut model_reasons = BTreeSet::new();
+        if model_thread_inconsistent {
+            model_reasons.insert("remote_model_thread_totals_inconsistent".to_owned());
+        } else if task_tokens < total_tokens {
+            model_reasons.insert("remote_project_breakdown_partial".to_owned());
+        }
+        analysis.models = project_remote_window_models(
+            models,
+            window_tokens,
+            remote.estimated_cost_units,
+            remote.api_long_context_extra_cost_units,
+            analysis
+                .attribution
+                .window
+                .as_ref()
+                .map_or(0.0, |window| window.used_percent),
+            api_long_context,
+            &mut model_reasons,
+        );
+        if let Some(api_equivalent_cost) = remote.api_equivalent_cost.as_ref() {
+            analysis.api_equivalent_cost = api_equivalent_cost.clone();
+            if let Some(residual) = live_tail_residual {
+                analysis.api_equivalent_cost.amount.observed_tokens = analysis
+                    .api_equivalent_cost
+                    .amount
+                    .observed_tokens
+                    .saturating_add(residual.total_tokens);
+                analysis
+                    .api_equivalent_cost
+                    .partial_reasons
+                    .push("remote_live_tail_api_cost_partial".to_owned());
+            }
+            if model_thread_inconsistent {
+                analysis
+                    .api_equivalent_cost
+                    .partial_reasons
+                    .push("remote_model_thread_totals_inconsistent".to_owned());
+            }
+            analysis.api_equivalent_cost.partial_reasons.sort();
+            analysis.api_equivalent_cost.partial_reasons.dedup();
+        }
+        analysis.partial_reasons.extend(model_reasons);
     }
-    analysis.attribution.local_token_usage = combined;
-    if !remote.threads.is_empty() {
-        // Unified project groups are replica-safe, but the snapshot does not
-        // retain a compatible all-source quota denominator or per-thread model
-        // split. Do not synthesize either breakdown or silently change the
-        // analysis-level API total.
-        analysis.partial = true;
-        analysis.partial_reasons.extend([
-            "remote_quota_estimate_not_projected".to_owned(),
-            "remote_models_not_projected".to_owned(),
-            "remote_api_total_not_projected".to_owned(),
-        ]);
-    }
-    analysis
-        .partial_reasons
-        .extend(remote.partial_reasons.iter().cloned());
+    analysis.partial_reasons.extend(
+        remote
+            .partial_reasons
+            .iter()
+            .filter(|reason| api_long_context || reason.as_str() != "long_context_usage_unknown")
+            .cloned(),
+    );
     analysis.partial_reasons.sort();
     analysis.partial_reasons.dedup();
+    analysis.partial |= !analysis.partial_reasons.is_empty();
     if let Some(long_context) = analysis.api_long_context.as_mut() {
-        apply_remote_window_projection(long_context, remote);
+        apply_remote_window_projection_mode(long_context, remote, true);
     }
+}
+
+fn project_remote_window_models(
+    models: &[crate::remote_overview::RemoteOverviewModelUsage],
+    expected_tokens: TokenUsage,
+    total_estimated_cost_units: u128,
+    total_long_context_extra_cost_units: Option<u128>,
+    used_percent: f64,
+    api_long_context: bool,
+    partial_reasons: &mut BTreeSet<String>,
+) -> Vec<ModelUsage> {
+    let mut models = models.to_vec();
+    let mut quota_projection_complete = true;
+
+    let mut represented = TokenUsage::default();
+    for model in &models {
+        represented.add_assign(model.token_usage);
+    }
+    match expected_tokens.delta_from(represented) {
+        Some(residual) if !residual.is_zero() => {
+            quota_projection_complete = false;
+            if let Some(unknown) = models.iter_mut().find(|model| model.model == "unknown") {
+                unknown.token_usage.add_assign(residual);
+                unknown.api_equivalent_cost.observed_tokens = unknown
+                    .api_equivalent_cost
+                    .observed_tokens
+                    .saturating_add(residual.total_tokens);
+                unknown.api_equivalent_cost_complete = false;
+                unknown.api_equivalent_cost_incomplete_tokens = unknown
+                    .api_equivalent_cost_incomplete_tokens
+                    .saturating_add(residual.total_tokens);
+            } else {
+                models.push(crate::remote_overview::RemoteOverviewModelUsage {
+                    model: "unknown".to_owned(),
+                    token_usage: residual,
+                    api_equivalent_cost: ApiCostAmount {
+                        observed_tokens: residual.total_tokens,
+                        ..ApiCostAmount::default()
+                    },
+                    api_equivalent_cost_incomplete_tokens: residual.total_tokens,
+                    ..crate::remote_overview::RemoteOverviewModelUsage::default()
+                });
+            }
+            partial_reasons.insert("remote_model_breakdown_partial".to_owned());
+            partial_reasons.insert("remote_model_api_cost_partial".to_owned());
+        }
+        Some(_) => {}
+        None => {
+            quota_projection_complete = false;
+            models.clear();
+            models.push(crate::remote_overview::RemoteOverviewModelUsage {
+                model: "unknown".to_owned(),
+                token_usage: expected_tokens,
+                estimated_cost_units: total_estimated_cost_units,
+                api_long_context_extra_cost_units: total_long_context_extra_cost_units,
+                api_equivalent_cost: ApiCostAmount {
+                    observed_tokens: expected_tokens.total_tokens,
+                    ..ApiCostAmount::default()
+                },
+                api_equivalent_cost_incomplete_tokens: expected_tokens.total_tokens,
+                ..crate::remote_overview::RemoteOverviewModelUsage::default()
+            });
+            partial_reasons.insert("remote_model_breakdown_inconsistent".to_owned());
+            partial_reasons.insert("remote_model_api_cost_partial".to_owned());
+        }
+    }
+
+    let total_cost_units = if api_long_context {
+        total_long_context_extra_cost_units
+            .map(|extra| total_estimated_cost_units.saturating_add(extra))
+    } else {
+        Some(total_estimated_cost_units)
+    };
+    models
+        .into_iter()
+        .map(|model| {
+            let model_cost_units = if api_long_context {
+                model
+                    .api_long_context_extra_cost_units
+                    .map(|extra| model.estimated_cost_units.saturating_add(extra))
+            } else {
+                Some(model.estimated_cost_units)
+            };
+            let estimated_quota_percent = match (
+                quota_projection_complete
+                    .then_some(model_cost_units)
+                    .flatten(),
+                quota_projection_complete
+                    .then_some(total_cost_units)
+                    .flatten(),
+            ) {
+                (Some(model_units), Some(total_units)) if total_units > 0 => {
+                    used_percent.clamp(0.0, 100.0) * model_units as f64 / total_units as f64
+                }
+                _ => {
+                    if !model.token_usage.is_zero() {
+                        partial_reasons.insert("remote_quota_estimate_partial".to_owned());
+                    }
+                    0.0
+                }
+            };
+            let quota_confidence = if !quota_projection_complete
+                || model.token_usage.is_zero()
+                || total_cost_units == Some(0)
+            {
+                Confidence::Unknown
+            } else if model_cost_units.is_some() && total_cost_units.is_some() {
+                Confidence::Low
+            } else {
+                Confidence::Unknown
+            };
+            ModelUsage {
+                model: model.model,
+                token_usage: model.token_usage,
+                local_token_share_percent: if expected_tokens.total_tokens == 0 {
+                    0.0
+                } else {
+                    model.token_usage.total_tokens as f64 / expected_tokens.total_tokens as f64
+                        * 100.0
+                },
+                estimated_quota_percent,
+                quota_confidence,
+                api_equivalent_cost: model.api_equivalent_cost,
+            }
+        })
+        .collect()
 }
 
 fn ensure_remote_task_ancestor_closure(

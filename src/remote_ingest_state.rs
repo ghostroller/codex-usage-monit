@@ -2985,10 +2985,14 @@ fn local_bucket(
     }
     let mut groups = Vec::with_capacity(bucket.model_groups.len());
     for group in &bucket.model_groups {
+        let token_usage = local_token_usage(group.token_usage);
+        let api_equivalent_cost = local_api_cost(group.api_equivalent_cost);
+        let api_equivalent_cost_complete = api_equivalent_cost.observed_samples == group.call_count
+            && api_equivalent_cost.observed_tokens == token_usage.total_tokens;
         groups.push(LocalUsageGroup {
             model: group.model.clone(),
             service_tier: group.service_tier.clone(),
-            token_usage: local_token_usage(group.token_usage),
+            token_usage,
             estimated_cost_units: group.estimated_cost_units.value(),
             api_long_context_extra_cost_units: group
                 .api_long_context_extra_cost_units
@@ -2998,6 +3002,8 @@ fn local_bucket(
             used_token_breakdown_fallback: group.used_token_breakdown_fallback,
             used_long_context_pricing: group.used_long_context_pricing,
             used_long_context_detection_fallback: group.used_long_context_detection_fallback,
+            api_equivalent_cost,
+            api_equivalent_cost_complete,
         });
     }
 

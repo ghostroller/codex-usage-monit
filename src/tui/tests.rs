@@ -537,6 +537,159 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
 }
 
 #[test]
+fn remote_models_keep_historical_api_lower_bound_and_make_live_tail_quota_unknown() {
+    let remote_cost = ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(40),
+        maximum_pico_usd: PicoUsd::new(40),
+        observed_samples: 2,
+        priced_samples: 1,
+        observed_tokens: 100,
+        priced_tokens: 40,
+    };
+    let remote = crate::remote_overview::RemoteOverviewModelUsage {
+        model: "gpt-5.6-sol".to_owned(),
+        token_usage: TokenUsage {
+            input_tokens: 100,
+            total_tokens: 100,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 100,
+        api_long_context_extra_cost_units: Some(0),
+        api_equivalent_cost: remote_cost,
+        api_equivalent_cost_complete: false,
+        api_equivalent_cost_incomplete_tokens: 60,
+        api_equivalent_cost_incomplete_samples: 1,
+        call_count: 2,
+    };
+    let mut reasons = BTreeSet::new();
+    let models = project_remote_window_models(
+        &[remote],
+        TokenUsage {
+            input_tokens: 120,
+            total_tokens: 120,
+            ..TokenUsage::default()
+        },
+        100,
+        Some(0),
+        31.0,
+        false,
+        &mut reasons,
+    );
+
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.token_usage.total_tokens)
+            .sum::<u64>(),
+        120
+    );
+    let sol = models
+        .iter()
+        .find(|model| model.model == "gpt-5.6-sol")
+        .unwrap();
+    assert_eq!(sol.api_equivalent_cost.minimum_pico_usd.value(), 40);
+    assert_eq!(sol.api_equivalent_cost.priced_tokens, 40);
+    assert_eq!(sol.estimated_quota_percent, 0.0);
+    assert_eq!(sol.quota_confidence, Confidence::Unknown);
+    assert!(models.iter().any(|model| model.model == "unknown"));
+    assert!(reasons.contains("remote_quota_estimate_partial"));
+}
+
+#[test]
+fn remote_model_projection_marks_unpersisted_live_tail_api_as_a_lower_bound() {
+    let as_of = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+    let history_cost = ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(100),
+        maximum_pico_usd: PicoUsd::new(100),
+        observed_samples: 1,
+        priced_samples: 1,
+        observed_tokens: 100,
+        priced_tokens: 100,
+    };
+    let mut analysis = WindowAnalysis {
+        duration_mins: 300,
+        attribution: AttributionSummary {
+            window: Some(WindowDescriptor {
+                limit_id: "codex".to_owned(),
+                label: "5h".to_owned(),
+                starts_at: as_of - ChronoDuration::hours(5),
+                ends_at: as_of,
+                used_percent: 31.0,
+            }),
+            ..AttributionSummary::default()
+        },
+        threads: vec![ThreadWindowUsage {
+            thread_id: "local-live".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 120,
+                    total_tokens: 120,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        }],
+        partial: false,
+        partial_reasons: Vec::new(),
+        turns: Vec::new(),
+        models: Vec::new(),
+        api_equivalent_cost: ApiEquivalentCost::default(),
+        api_pricing: Default::default(),
+        api_long_context: None,
+    };
+    let remote = crate::remote_overview::RemoteOverviewWindow {
+        duration_mins: 300,
+        models: Some(vec![crate::remote_overview::RemoteOverviewModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            token_usage: TokenUsage {
+                input_tokens: 100,
+                total_tokens: 100,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: 100,
+            api_long_context_extra_cost_units: Some(0),
+            api_equivalent_cost: history_cost,
+            api_equivalent_cost_complete: true,
+            call_count: 1,
+            ..crate::remote_overview::RemoteOverviewModelUsage::default()
+        }]),
+        model_token_usage: TokenUsage {
+            input_tokens: 100,
+            total_tokens: 100,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 100,
+        api_long_context_extra_cost_units: Some(0),
+        api_equivalent_cost: Some(ApiEquivalentCost {
+            amount: history_cost,
+            ..ApiEquivalentCost::default()
+        }),
+        ..crate::remote_overview::RemoteOverviewWindow::default()
+    };
+
+    apply_remote_window_projection(&mut analysis, &remote);
+
+    assert_eq!(analysis.attribution.local_token_usage.total_tokens, 120);
+    assert_eq!(
+        analysis
+            .models
+            .iter()
+            .map(|model| model.token_usage.total_tokens)
+            .sum::<u64>(),
+        120
+    );
+    assert_eq!(analysis.api_equivalent_cost.amount.observed_tokens, 120);
+    assert_eq!(analysis.api_equivalent_cost.amount.priced_tokens, 100);
+    assert!(
+        analysis
+            .api_equivalent_cost
+            .partial_reasons
+            .contains(&"remote_live_tail_api_cost_partial".to_owned())
+    );
+    assert!(analysis.api_equivalent_cost.is_partial());
+}
+
+#[test]
 fn summary_backfill_scan_completeness_rejects_ambiguous_or_partial_sources() {
     let mut snapshot = mouse_test_app(0).snapshot;
     snapshot.stats = CollectionStats {
@@ -1192,6 +1345,110 @@ fn remote_live_fixture(
 }
 
 #[test]
+fn merged_overview_tasks_sort_globally_while_tree_rows_keep_recent_subtrees_together() {
+    let mut app = interaction_test_app(2, 0);
+    let as_of = app.snapshot.as_of;
+    app.snapshot.tasks[0].updated_at = Some(as_of);
+    app.snapshot.tasks[1].updated_at = Some(as_of - ChronoDuration::minutes(2));
+    app.local_snapshot = app.snapshot.clone();
+
+    let mut state = remote_live_fixture(as_of + ChronoDuration::minutes(5), true);
+    let node = state.source.source_id().as_str().to_owned();
+    let remote_parent = remote_live_thread_id(&node, "remote-thread");
+    state.snapshot.tasks[0].updated_at = as_of - ChronoDuration::minutes(2);
+    let mut child = state.snapshot.tasks[0].clone();
+    child.thread_id = "remote-child".parse().unwrap();
+    child.parent_thread_id = Some("remote-thread".parse().unwrap());
+    child.updated_at = as_of - ChronoDuration::minutes(1);
+    state.snapshot.tasks.push(child);
+    let remote_child = remote_live_thread_id(&node, "remote-child");
+
+    let mut snapshot = app.local_snapshot.clone();
+    let trusted_edges = merge_remote_live_into_snapshot_at(
+        &mut snapshot,
+        &[state],
+        &RemoteOverviewHistory::default(),
+        as_of + ChronoDuration::minutes(6),
+    );
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .map(|task| task.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "task-thread-0",
+            remote_child.as_str(),
+            "task-thread-1",
+            remote_parent.as_str(),
+        ],
+        "local and remote tasks must share one stable updated-at ordering",
+    );
+
+    app.snapshot = snapshot;
+    app.trusted_remote_parent_edges = trusted_edges;
+    app.task_list_mode = TaskListMode::Tree;
+    app.expanded_task_threads.insert(remote_parent.clone());
+    let expanded = app.filtered_task_rows();
+    assert_eq!(
+        expanded
+            .iter()
+            .map(|row| app.snapshot.tasks[row.index].thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "task-thread-0",
+            remote_parent.as_str(),
+            remote_child.as_str(),
+            "task-thread-1",
+        ],
+        "the child's recency ranks its whole branch without splitting the subtree",
+    );
+
+    app.expanded_task_threads.remove(&remote_parent);
+    let collapsed = app.filtered_task_rows();
+    assert_eq!(
+        collapsed
+            .iter()
+            .map(|row| app.snapshot.tasks[row.index].thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["task-thread-0", remote_parent.as_str(), "task-thread-1"],
+    );
+    assert_eq!(
+        collapsed[1]
+            .hidden_descendants
+            .iter()
+            .map(|index| app.snapshot.tasks[*index].thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![remote_child.as_str()],
+    );
+}
+
+#[test]
+fn remote_live_rebuild_preserves_selected_thread_and_scrolled_task_viewport() {
+    let mut app = interaction_test_app(8, 1);
+    app.selected_task = 5;
+    app.selected_turn = 0;
+    app.task_table_offset = 3;
+    let selected_thread = app.raw_selected_thread_id().unwrap().to_owned();
+    let viewport_thread = app.snapshot.tasks[app.filtered_task_indices()[3]]
+        .thread_id
+        .clone();
+    let received_at = app.snapshot.as_of + ChronoDuration::minutes(2);
+
+    assert!(app.replace_remote_live_states_at(
+        vec![remote_live_fixture(received_at, true)],
+        received_at + ChronoDuration::minutes(1),
+    ));
+
+    assert_eq!(app.raw_selected_thread_id(), Some(selected_thread.as_str()));
+    assert_eq!(
+        app.snapshot.tasks[app.filtered_task_indices()[app.task_table_offset]].thread_id,
+        viewport_thread,
+    );
+    assert!(app.snapshot.tasks[0].thread_id.starts_with("remote:"));
+}
+
+#[test]
 fn unchanged_remote_live_state_crosses_stale_boundary_once_including_error_refreshes() {
     let mut app = interaction_test_app(0, 0);
     let local_as_of = app.snapshot.as_of;
@@ -1421,6 +1678,35 @@ fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistor
 }
 
 #[test]
+fn remote_history_rebuild_preserves_selected_thread_and_scrolled_task_viewport() {
+    let mut app = interaction_test_app(8, 1);
+    let old_updated_at = app.snapshot.as_of - ChronoDuration::hours(1);
+    for task in &mut app.snapshot.tasks {
+        task.updated_at = Some(old_updated_at);
+    }
+    add_window_analysis(&mut app, WindowScope::Week, 10, 100.0);
+    app.local_snapshot = app.snapshot.clone();
+    app.selected_task = 5;
+    app.selected_turn = 0;
+    app.task_table_offset = 3;
+    let selected_thread = app.raw_selected_thread_id().unwrap().to_owned();
+    let viewport_thread = app.snapshot.tasks[app.filtered_task_indices()[3]]
+        .thread_id
+        .clone();
+
+    assert!(
+        app.replace_remote_overview_history(remote_overview_history_fixture(app.snapshot.as_of,))
+    );
+
+    assert_eq!(app.raw_selected_thread_id(), Some(selected_thread.as_str()));
+    assert_eq!(
+        app.snapshot.tasks[app.filtered_task_indices()[app.task_table_offset]].thread_id,
+        viewport_thread,
+    );
+    assert_eq!(app.snapshot.tasks[0].title, "Remote history task");
+}
+
+#[test]
 fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
@@ -1428,7 +1714,8 @@ fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
     app.local_snapshot = app.snapshot.clone();
     let history = remote_overview_history_fixture(app.snapshot.as_of);
     let received_at = app.snapshot.as_of + ChronoDuration::minutes(1);
-    let live = remote_live_fixture(received_at, true);
+    let mut live = remote_live_fixture(received_at, true);
+    live.snapshot.tasks[0].updated_at = app.snapshot.as_of - ChronoDuration::minutes(5);
 
     let mut snapshot = app.local_snapshot.clone();
     merge_remote_live_into_snapshot_at(
@@ -1451,6 +1738,15 @@ fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
             .filter(|task| task.thread_id == remote_id)
             .count(),
         1
+    );
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .find(|task| task.thread_id == remote_id)
+            .and_then(|task| task.updated_at),
+        Some(app.snapshot.as_of),
+        "an older cached live sample must not move a history task backwards in the recency order",
     );
     assert_eq!(
         snapshot

@@ -115,6 +115,16 @@ pub struct LocalUsageGroup {
     pub used_long_context_pricing: bool,
     #[serde(default)]
     pub used_long_context_detection_fallback: bool,
+    /// API-equivalent cost retained for this exact model/service-tier group.
+    ///
+    /// Older local history did not persist the wire-level model amount.  The
+    /// amount therefore defaults to a known lower bound while the separate
+    /// completeness bit prevents readers from interpreting that default as
+    /// an exact zero.
+    #[serde(default)]
+    pub api_equivalent_cost: ApiCostAmount,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub api_equivalent_cost_complete: bool,
 }
 
 /// One emitting thread/turn's own usage within a fixed-width local bucket,
@@ -2197,6 +2207,7 @@ struct BucketAccumulator {
     long_context_usage_unknown: bool,
     call_count: u64,
     groups: BTreeMap<(Option<String>, Option<String>), LocalUsageGroup>,
+    api_cost_by_model: BTreeMap<(Option<String>, Option<String>), ApiCostAccumulator>,
     project_groups: BTreeMap<ProjectGroupKey, LocalProjectUsageGroup>,
     api_cost_by_group: BTreeMap<ProjectGroupKey, ApiCostAccumulator>,
     partial_reasons: BTreeSet<String>,
@@ -2331,6 +2342,11 @@ fn local_buckets_from_calls(
             normalized_optional(&call.model),
             normalized_optional(&call.service_tier),
         );
+        bucket
+            .api_cost_by_model
+            .entry(key.clone())
+            .or_default()
+            .add_call(call);
         let group = bucket
             .groups
             .entry(key.clone())
@@ -2424,6 +2440,19 @@ fn local_buckets_from_calls(
                     group
                 })
                 .collect();
+            let groups = bucket
+                .groups
+                .into_iter()
+                .map(|(key, mut group)| {
+                    group.api_equivalent_cost = bucket
+                        .api_cost_by_model
+                        .get(&key)
+                        .map(ApiCostAccumulator::amount)
+                        .unwrap_or_default();
+                    group.api_equivalent_cost_complete = true;
+                    group
+                })
+                .collect();
             LocalHalfHourBucket {
                 starts_at,
                 ends_at,
@@ -2438,7 +2467,7 @@ fn local_buckets_from_calls(
                 project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
                 api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
                 call_count: bucket.call_count,
-                groups: bucket.groups.into_values().collect(),
+                groups,
                 project_groups,
                 partial_reasons: bucket.partial_reasons.into_iter().collect(),
             }
@@ -3318,6 +3347,41 @@ pub(crate) fn upsert_half_hour_bucket(
             merge_coverage_issues(&mut existing.partial_reasons, &incoming.partial_reasons);
             return true;
         }
+        let model_api_cost_repriced =
+            model_group_api_cost_can_reprice_without_replacing(&incoming, &buckets[index]);
+        let model_api_cost_upgraded = model_api_cost_repriced
+            || model_group_api_cost_can_upgrade_without_replacing(&incoming, &buckets[index]);
+        if model_api_cost_upgraded {
+            buckets[index].groups = incoming.groups.clone();
+        } else if (buckets[index].api_pricing_catalog_revision
+            > incoming.api_pricing_catalog_revision
+            && closed_bucket_model_group_non_api_evidence_eq(&buckets[index], &incoming))
+            || model_group_api_cost_can_upgrade_without_replacing(&buckets[index], &incoming)
+        {
+            // A fresher writer may still advance unrelated bucket metadata,
+            // but it must not erase API amounts already enriched into this
+            // closed bucket by a more complete history reader.
+            incoming.groups = buckets[index].groups.clone();
+        } else if closed_bucket_model_group_non_api_evidence_eq(&incoming, &buckets[index])
+            && !model_group_api_cost_facts_eq(&incoming, &buckets[index])
+        {
+            // The two API observations conflict or are otherwise
+            // incomparable. Preserve the already accepted facts even when
+            // the incoming bucket has better collection metadata that would
+            // normally win the generic replacement ordering.
+            incoming.groups = buckets[index].groups.clone();
+        }
+        if incoming.api_pricing_catalog_revision > buckets[index].api_pricing_catalog_revision
+            && closed_bucket_model_group_non_api_evidence_eq(&incoming, &buckets[index])
+            && !model_api_cost_repriced
+        {
+            // One revision covers both model and project API amounts. Do not
+            // advance it when the model evidence for that catalog regresses,
+            // or the retained old amounts would be mislabeled as newly
+            // priced.
+            incoming.api_pricing_catalog_revision = buckets[index].api_pricing_catalog_revision;
+            incoming.project_groups = buckets[index].project_groups.clone();
+        }
         if project_breakdown_can_upgrade_without_replacing(&incoming, &buckets[index]) {
             let existing = &mut buckets[index];
             existing.sampled_at = existing.sampled_at.max(incoming.sampled_at);
@@ -3353,12 +3417,228 @@ pub(crate) fn upsert_half_hour_bucket(
             buckets[index] = incoming;
             true
         } else {
-            false
+            model_api_cost_upgraded
         }
     } else {
         buckets.push(incoming);
         true
     }
+}
+
+/// Allows a closed model breakdown to gain API-equivalent cost evidence
+/// without reopening or otherwise replacing the bucket. All model-call
+/// evidence must be identical; only the API amount and its completeness bit
+/// may advance.
+fn model_group_api_cost_can_upgrade_without_replacing(
+    candidate: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    if candidate.api_pricing_catalog_revision != existing.api_pricing_catalog_revision
+        || !closed_bucket_model_group_non_api_evidence_eq(candidate, existing)
+    {
+        return false;
+    }
+
+    let candidate_by_model = model_groups_by_identity(&candidate.groups);
+    let Some(candidate_by_model) = candidate_by_model else {
+        return false;
+    };
+
+    let mut strictly_richer = false;
+    for existing_group in &existing.groups {
+        let Some(candidate_group) = candidate_by_model.get(&(
+            existing_group.model.as_deref(),
+            existing_group.service_tier.as_deref(),
+        )) else {
+            return false;
+        };
+        let Some(group_is_richer) =
+            model_group_api_cost_information_dominates(candidate_group, existing_group)
+        else {
+            return false;
+        };
+        strictly_richer |= group_is_richer;
+    }
+    strictly_richer
+}
+
+/// A newer pricing catalog may legitimately change the amount for identical
+/// model-call evidence in either direction. Coverage and the explicit
+/// completeness bit must still retain every fact known by the older catalog.
+fn model_group_api_cost_can_reprice_without_replacing(
+    candidate: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    if candidate.api_pricing_catalog_revision <= existing.api_pricing_catalog_revision
+        || !closed_bucket_model_group_non_api_evidence_eq(candidate, existing)
+    {
+        return false;
+    }
+
+    let Some(candidate_by_model) = model_groups_by_identity(&candidate.groups) else {
+        return false;
+    };
+    existing.groups.iter().all(|existing_group| {
+        candidate_by_model
+            .get(&(
+                existing_group.model.as_deref(),
+                existing_group.service_tier.as_deref(),
+            ))
+            .is_some_and(|candidate_group| {
+                model_group_api_coverage_and_completeness_retained(candidate_group, existing_group)
+            })
+    })
+}
+
+fn model_group_api_coverage_and_completeness_retained(
+    candidate: &LocalUsageGroup,
+    existing: &LocalUsageGroup,
+) -> bool {
+    if existing.api_equivalent_cost_complete && !candidate.api_equivalent_cost_complete {
+        return false;
+    }
+    let candidate = candidate.api_equivalent_cost;
+    let existing = existing.api_equivalent_cost;
+    candidate.observed_samples >= existing.observed_samples
+        && candidate.priced_samples >= existing.priced_samples
+        && candidate.observed_tokens >= existing.observed_tokens
+        && candidate.priced_tokens >= existing.priced_tokens
+}
+
+fn closed_bucket_model_group_non_api_evidence_eq(
+    candidate: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    if candidate.sampled_at != candidate.ends_at
+        || existing.sampled_at != existing.ends_at
+        || candidate.estimator_revision != existing.estimator_revision
+        || candidate.token_usage != existing.token_usage
+        || candidate.estimated_cost_units != existing.estimated_cost_units
+        || candidate.api_long_context_extra_cost_units != existing.api_long_context_extra_cost_units
+        || candidate.long_context_usage_unknown != existing.long_context_usage_unknown
+        || candidate.call_count != existing.call_count
+        || candidate.groups.len() != existing.groups.len()
+    {
+        return false;
+    }
+
+    let Some(candidate_by_model) = model_groups_by_identity(&candidate.groups) else {
+        return false;
+    };
+
+    for existing_group in &existing.groups {
+        let Some(candidate_group) = candidate_by_model.get(&(
+            existing_group.model.as_deref(),
+            existing_group.service_tier.as_deref(),
+        )) else {
+            return false;
+        };
+        if !model_group_non_api_evidence_eq(candidate_group, existing_group) {
+            return false;
+        }
+    }
+    true
+}
+
+type LocalUsageGroupIdentity<'a> = (Option<&'a str>, Option<&'a str>);
+type LocalUsageGroupsByIdentity<'a> = HashMap<LocalUsageGroupIdentity<'a>, &'a LocalUsageGroup>;
+
+fn model_groups_by_identity(groups: &[LocalUsageGroup]) -> Option<LocalUsageGroupsByIdentity<'_>> {
+    let by_model = groups
+        .iter()
+        .map(|group| {
+            (
+                (group.model.as_deref(), group.service_tier.as_deref()),
+                group,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    (by_model.len() == groups.len()).then_some(by_model)
+}
+
+fn model_group_api_cost_facts_eq(
+    candidate: &LocalHalfHourBucket,
+    existing: &LocalHalfHourBucket,
+) -> bool {
+    let Some(candidate_by_model) = model_groups_by_identity(&candidate.groups) else {
+        return false;
+    };
+    existing.groups.iter().all(|existing_group| {
+        candidate_by_model
+            .get(&(
+                existing_group.model.as_deref(),
+                existing_group.service_tier.as_deref(),
+            ))
+            .is_some_and(|candidate_group| {
+                candidate_group.api_equivalent_cost == existing_group.api_equivalent_cost
+                    && candidate_group.api_equivalent_cost_complete
+                        == existing_group.api_equivalent_cost_complete
+            })
+    })
+}
+
+fn model_group_non_api_evidence_eq(
+    candidate: &LocalUsageGroup,
+    existing: &LocalUsageGroup,
+) -> bool {
+    candidate.model == existing.model
+        && candidate.service_tier == existing.service_tier
+        && candidate.token_usage == existing.token_usage
+        && candidate.estimated_cost_units == existing.estimated_cost_units
+        && candidate.api_long_context_extra_cost_units == existing.api_long_context_extra_cost_units
+        && candidate.call_count == existing.call_count
+        && candidate.used_model_fallback == existing.used_model_fallback
+        && candidate.used_token_breakdown_fallback == existing.used_token_breakdown_fallback
+        && candidate.used_long_context_pricing == existing.used_long_context_pricing
+        && candidate.used_long_context_detection_fallback
+            == existing.used_long_context_detection_fallback
+}
+
+/// `Some(strict)` means every previously known API-cost fact is retained.
+/// Equal coverage with a conflicting amount is rejected unless the candidate
+/// also upgrades the explicit completeness bit.
+fn model_group_api_cost_information_dominates(
+    candidate: &LocalUsageGroup,
+    existing: &LocalUsageGroup,
+) -> Option<bool> {
+    if existing.api_equivalent_cost_complete && !candidate.api_equivalent_cost_complete {
+        return None;
+    }
+
+    let candidate_api = candidate.api_equivalent_cost;
+    let existing_api = existing.api_equivalent_cost;
+    if candidate_api.minimum_pico_usd < existing_api.minimum_pico_usd
+        || candidate_api.maximum_pico_usd < existing_api.maximum_pico_usd
+    {
+        return None;
+    }
+    for (candidate_value, existing_value) in [
+        (
+            candidate_api.observed_samples,
+            existing_api.observed_samples,
+        ),
+        (candidate_api.priced_samples, existing_api.priced_samples),
+        (candidate_api.observed_tokens, existing_api.observed_tokens),
+        (candidate_api.priced_tokens, existing_api.priced_tokens),
+    ] {
+        if candidate_value < existing_value {
+            return None;
+        }
+    }
+
+    let coverage_is_richer = candidate_api.observed_samples > existing_api.observed_samples
+        || candidate_api.priced_samples > existing_api.priced_samples
+        || candidate_api.observed_tokens > existing_api.observed_tokens
+        || candidate_api.priced_tokens > existing_api.priced_tokens;
+    let amount_is_richer = candidate_api.minimum_pico_usd > existing_api.minimum_pico_usd
+        || candidate_api.maximum_pico_usd > existing_api.maximum_pico_usd;
+    let completeness_is_richer =
+        candidate.api_equivalent_cost_complete && !existing.api_equivalent_cost_complete;
+    if amount_is_richer && !coverage_is_richer && !completeness_is_richer {
+        return None;
+    }
+
+    Some(coverage_is_richer || completeness_is_richer)
 }
 
 fn project_breakdown_can_upgrade_without_replacing(
@@ -7050,6 +7330,133 @@ mod tests {
         assert!(upsert_half_hour_bucket(&mut buckets, closed.clone()));
         assert_eq!(buckets, vec![closed.clone()]);
         assert!(!upsert_half_hour_bucket(&mut buckets, closed));
+    }
+
+    #[test]
+    fn closed_bucket_grafts_complete_model_api_cost_without_sparse_regression() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let mut sparse = local_bucket(starts_at, sampled_at, 300, 3_000);
+        sparse.call_count = 2;
+        sparse.groups = vec![LocalUsageGroup {
+            model: Some("gpt-5.6-sol".to_string()),
+            service_tier: Some("priority".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(200),
+            call_count: 2,
+            used_long_context_pricing: true,
+            ..LocalUsageGroup::default()
+        }];
+
+        let mut enriched = sparse.clone();
+        enriched.groups[0].api_equivalent_cost = ApiCostAmount {
+            minimum_pico_usd: crate::domain::PicoUsd::new(250),
+            maximum_pico_usd: crate::domain::PicoUsd::new(300),
+            observed_samples: 2,
+            priced_samples: 2,
+            observed_tokens: 300,
+            priced_tokens: 300,
+        };
+        enriched.groups[0].api_equivalent_cost_complete = true;
+
+        let mut buckets = vec![sparse.clone()];
+        assert!(upsert_half_hour_bucket(&mut buckets, enriched.clone()));
+        assert_eq!(buckets[0].groups, enriched.groups);
+
+        assert!(!upsert_half_hour_bucket(&mut buckets, sparse.clone()));
+        assert_eq!(buckets[0].groups, enriched.groups);
+
+        let mut more_coverage_but_less_cost = enriched.clone();
+        more_coverage_but_less_cost.groups[0]
+            .api_equivalent_cost
+            .observed_samples = 3;
+        more_coverage_but_less_cost.groups[0]
+            .api_equivalent_cost
+            .priced_samples = 3;
+        more_coverage_but_less_cost.groups[0]
+            .api_equivalent_cost
+            .minimum_pico_usd = crate::domain::PicoUsd::new(200);
+        more_coverage_but_less_cost.groups[0]
+            .api_equivalent_cost
+            .maximum_pico_usd = crate::domain::PicoUsd::new(250);
+        assert!(!upsert_half_hour_bucket(
+            &mut buckets,
+            more_coverage_but_less_cost
+        ));
+        assert_eq!(buckets[0].groups, enriched.groups);
+
+        buckets[0].partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut conflicting = enriched.clone();
+        conflicting.groups[0].api_equivalent_cost.minimum_pico_usd =
+            crate::domain::PicoUsd::new(275);
+        assert!(upsert_half_hour_bucket(&mut buckets, conflicting));
+        assert_eq!(buckets[0].groups, enriched.groups);
+        assert!(buckets[0].partial_reasons.is_empty());
+
+        let mut different_non_api_evidence = enriched.clone();
+        different_non_api_evidence.groups[0].call_count = 3;
+        assert!(!upsert_half_hour_bucket(
+            &mut buckets,
+            different_non_api_evidence
+        ));
+        assert_eq!(buckets[0].groups, enriched.groups);
+    }
+
+    #[test]
+    fn closed_bucket_reprices_model_api_cost_for_newer_catalog_only() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let mut old_catalog = local_bucket(starts_at, sampled_at, 300, 3_000);
+        old_catalog.call_count = 2;
+        old_catalog.groups = vec![LocalUsageGroup {
+            model: Some("gpt-5.6-sol".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(0),
+            call_count: 2,
+            api_equivalent_cost: ApiCostAmount {
+                minimum_pico_usd: crate::domain::PicoUsd::new(300),
+                maximum_pico_usd: crate::domain::PicoUsd::new(350),
+                observed_samples: 2,
+                priced_samples: 2,
+                observed_tokens: 300,
+                priced_tokens: 300,
+            },
+            api_equivalent_cost_complete: true,
+            ..LocalUsageGroup::default()
+        }];
+
+        let mut new_catalog = old_catalog.clone();
+        new_catalog.api_pricing_catalog_revision =
+            old_catalog.api_pricing_catalog_revision.saturating_add(1);
+        new_catalog.groups[0].api_equivalent_cost.minimum_pico_usd =
+            crate::domain::PicoUsd::new(200);
+        new_catalog.groups[0].api_equivalent_cost.maximum_pico_usd =
+            crate::domain::PicoUsd::new(250);
+
+        let mut buckets = vec![old_catalog.clone()];
+        assert!(upsert_half_hour_bucket(&mut buckets, new_catalog.clone()));
+        assert_eq!(
+            buckets[0].api_pricing_catalog_revision,
+            new_catalog.api_pricing_catalog_revision
+        );
+        assert_eq!(buckets[0].groups, new_catalog.groups);
+
+        assert!(!upsert_half_hour_bucket(&mut buckets, old_catalog));
+        assert_eq!(buckets[0].groups, new_catalog.groups);
+
+        let mut incomplete_newer_catalog = new_catalog.clone();
+        incomplete_newer_catalog.api_pricing_catalog_revision =
+            new_catalog.api_pricing_catalog_revision.saturating_add(1);
+        incomplete_newer_catalog.groups[0]
+            .api_equivalent_cost
+            .priced_samples = 1;
+        assert!(!upsert_half_hour_bucket(
+            &mut buckets,
+            incomplete_newer_catalog
+        ));
+        assert_eq!(buckets[0].groups, new_catalog.groups);
     }
 
     #[test]

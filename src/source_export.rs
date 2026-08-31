@@ -1139,7 +1139,7 @@ fn materialize_model_group(
     let key = (group.model.clone(), group.service_tier.clone());
     let api_cost = api_costs
         .and_then(|costs| costs.by_model.get(&key))
-        .map_or_else(ApiCostAmount::default, ApiCostAccumulator::amount);
+        .map_or(group.api_equivalent_cost, ApiCostAccumulator::amount);
     Ok(RemoteModelUsageGroup {
         model: group.model.clone(),
         service_tier: group.service_tier.clone(),

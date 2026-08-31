@@ -2092,6 +2092,10 @@ fn merge_usage_groups(target: &mut Vec<LocalUsageGroup>, incoming: Vec<LocalUsag
                 existing.used_long_context_pricing |= group.used_long_context_pricing;
                 existing.used_long_context_detection_fallback |=
                     group.used_long_context_detection_fallback;
+                existing
+                    .api_equivalent_cost
+                    .add_assign(group.api_equivalent_cost);
+                existing.api_equivalent_cost_complete &= group.api_equivalent_cost_complete;
             }
         }
     }

@@ -1449,6 +1449,13 @@ impl RemoteModelUsageGroup {
         )?;
         self.token_usage.validate()?;
         self.api_equivalent_cost.validate(self.token_usage)?;
+        if self.api_equivalent_cost.observed_samples > self.call_count
+            || self.api_equivalent_cost.observed_tokens > self.token_usage.total_tokens
+        {
+            return Err(invalid_message(
+                "remote model API-equivalent coverage exceeds model usage",
+            ));
+        }
         validate_usage_count(self.call_count, self.token_usage, "model group")
     }
 
@@ -3512,6 +3519,43 @@ mod tests {
         };
 
         api_cost.validate(RemoteTokenUsage::default()).unwrap();
+    }
+
+    #[test]
+    fn model_group_api_coverage_cannot_exceed_its_own_call_or_token_population() {
+        let mut group = RemoteModelUsageGroup {
+            model: Some("gpt-5.6-sol".to_owned()),
+            service_tier: Some("standard".to_owned()),
+            token_usage: remote_tokens(),
+            estimated_cost_units: RemoteU128::new(75),
+            api_long_context_extra_cost_units: Some(RemoteU128::new(25)),
+            api_equivalent_cost: remote_api_cost(),
+            call_count: 1,
+            used_model_fallback: false,
+            used_token_breakdown_fallback: false,
+            used_long_context_pricing: true,
+            used_long_context_detection_fallback: false,
+        };
+        group.validate().unwrap();
+
+        group.api_equivalent_cost.observed_samples = 2;
+        let error = group.validate().unwrap_err();
+        assert_eq!(error.kind(), RemoteProtocolErrorKind::InvalidMessage);
+        assert!(
+            error
+                .to_string()
+                .contains("API-equivalent coverage exceeds model usage")
+        );
+
+        group.api_equivalent_cost.observed_samples = group.call_count;
+        group.api_equivalent_cost.observed_tokens = group.token_usage.total_tokens + 1;
+        let error = group.validate().unwrap_err();
+        assert_eq!(error.kind(), RemoteProtocolErrorKind::InvalidMessage);
+        assert!(
+            error
+                .to_string()
+                .contains("API-equivalent coverage exceeds model usage")
+        );
     }
 
     fn delta_request(include_live: bool) -> RemoteExportRequest {
