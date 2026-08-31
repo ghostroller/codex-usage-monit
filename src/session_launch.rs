@@ -47,6 +47,7 @@ impl ResumeTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EligibilityError {
     InvalidThreadId,
+    Remote,
     Subagent,
     Active(TaskStatus),
     Archived,
@@ -61,6 +62,7 @@ impl fmt::Display for EligibilityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidThreadId => write!(formatter, "Task has no resumable thread id"),
+            Self::Remote => write!(formatter, "Resume this task on its remote source"),
             Self::Subagent => write!(formatter, "Resume the parent task, then use /agent"),
             Self::Active(status) => write!(
                 formatter,
@@ -115,6 +117,13 @@ pub(crate) fn check_eligibility(target: &ResumeTarget) -> Result<&Path, Eligibil
 pub(crate) fn check_eligibility_without_cwd_probe(
     target: &ResumeTarget,
 ) -> Result<&Path, EligibilityError> {
+    if target
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("remote:"))
+    {
+        return Err(EligibilityError::Remote);
+    }
     if !is_canonical_thread_uuid(&target.thread_id) {
         return Err(EligibilityError::InvalidThreadId);
     }

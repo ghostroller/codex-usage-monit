@@ -266,13 +266,14 @@ mod tests {
                 "recorder": {
                     "state": "error",
                     "status": {
-                        "schemaVersion": 2,
+                        "schemaVersion": 3,
                         "historyNamespace": "history-namespace",
                         "pid": recorder.pid,
                         "startedAt": "2026-08-30T12:00:00Z",
                         "lastAttemptAt": "2026-08-30T12:00:00Z",
                         "lastHistoryHeartbeat": "2026-08-30T12:00:00Z",
-                        "lastError": "recorder error"
+                        "lastError": "recorder error",
+                        "historyBackend": "legacy_v1"
                     },
                     "error": "status read error"
                 },

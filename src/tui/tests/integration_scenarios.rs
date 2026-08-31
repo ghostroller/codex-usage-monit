@@ -1344,6 +1344,7 @@ fn summary_cache_survives_refreshes_that_do_not_change_summary_inputs() {
             snapshot,
             account: harness.app.account.clone(),
             history_observation: HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -1374,6 +1375,7 @@ fn summary_cache_is_invalidated_by_live_metadata_or_bucket_usage_changes() {
             snapshot,
             account: metadata.app.account.clone(),
             history_observation: HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -2519,6 +2521,21 @@ fn compact_settings_scrolls_to_keep_keyboard_selection_visible() {
     settings.key(KeyCode::End);
     assert_eq!(
         settings.app.selected_setting,
+        SettingItem::ALL.len(),
+        "an empty Remote panel owns the last synthetic focus position"
+    );
+    let remote_controls = settings
+        .app
+        .settings_controls_hitbox
+        .as_ref()
+        .expect("settings controls should render");
+    assert!(!remote_controls.remote_global.is_empty());
+    assert!(settings.frame().snapshot_text().contains("Remote sources"));
+    assert!(settings.control_rect(ControlId::SettingTheme).is_empty());
+
+    settings.key(KeyCode::Up);
+    assert_eq!(
+        settings.app.selected_setting,
         SettingItem::ApiEquivalent.index()
     );
     assert!(
@@ -2527,7 +2544,6 @@ fn compact_settings_scrolls_to_keep_keyboard_selection_visible() {
             .is_empty()
     );
     assert!(settings.frame().snapshot_text().contains("API equivalent"));
-    assert!(settings.control_rect(ControlId::SettingTheme).is_empty());
 
     let before = settings.app.table_columns.api_equivalent;
     settings.key(KeyCode::Enter);

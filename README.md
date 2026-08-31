@@ -27,6 +27,7 @@ _Deterministically rendered from the integration-test fixture. The synchronizati
 - **API-equivalent model cost** — Value locally observed model tokens at current API rates with exact fixed-point math, long-context ranges, and explicit priced coverage; non-model tool charges are excluded.
 - **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 15-minute token/estimate buckets in local state.
 - **Project usage summary** — Rank projects for the current cycle, last 7 days, or last 30 days; expand a compact project/session/user-turn tree and compare token, estimated credit-rate, or API-equivalent usage with ranked bars and a project-colored stacked-area chart from 1-day down to 1-hour buckets. Usage from an exactly linked subagent subtree is folded into the user turn that spawned it.
+- **Opt-in multi-machine history** — The v0.4 work in progress lets one central machine pull normalized usage deltas from individually allowlisted SSH hosts, retain source identity, and merge only explicitly mapped projects and evidence-backed session replicas.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export the same Summary, Trends, and unified health data used by the TUI as human-readable text or stable camelCase JSON, select snapshot sections, and filter turns by thread.
@@ -152,6 +153,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, inspect, or remove the optional per-user recorder. |
+| `remote` | Configure, test, and synchronize explicitly allowlisted SSH machines. This is under development for v0.4. |
 | `debug-startup` | Profile the normal TUI cold-start path without entering interactive mode. |
 
 The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render. The snapshot-family commands (`snapshot`, `limits`, `tasks`, `turns`, `models`, `attribution`, and `windows`) plus `summary` and `trends` accept `--long-context` to select the optional Longx estimate for that invocation; the default remains the base estimate, and API-equivalent cost never changes.
@@ -203,6 +205,37 @@ codex-usage-monit service status --format json --compact
 
 The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The snapshot `health` section covers collection health only; use the dedicated `health` command for the unified snapshot/history/recorder/service report. The TUI's top-level tabs are **Overview**, **Trends**, **Summary**, **Other**, and **Settings**.
 
+### Remote machine usage sync (v0.4, in development)
+
+The v0.4 branch can use a central machine to pull normalized aggregate history, bounded session facts, and a compact Overview snapshot from another machine over the system OpenSSH client. The remote runs the same executable as a short-lived exporter; it does not need a listening port, database, or resident remote service, and raw rollout JSONL is not copied to the center. Account quota gauges and reset credits still come only from the central machine.
+
+Remote sync is fail-closed and opt-in at two levels. The application never enumerates or connects every host in SSH config. `add` only creates one disabled, unpaired allowlist entry and does not connect; `pair`, `test`, and manual `sync` contact exactly the ID named by the user. Automatic sync starts only after that host is paired, its per-host switch is enabled, and the global switch is enabled:
+
+```bash
+# Both machines need a compatible codex-usage-monit on PATH.
+# dev-server is an existing system OpenSSH config alias.
+codex-usage-monit remote add buildbox --ssh-host dev-server
+codex-usage-monit remote pair buildbox
+codex-usage-monit remote test buildbox
+
+# A one-off pull does not change automatic-sync settings.
+codex-usage-monit remote sync buildbox
+
+# These two explicit switches opt this one host into recorder scheduling.
+codex-usage-monit remote enable buildbox
+codex-usage-monit remote config --auto-sync true
+```
+
+If the recorder uses a non-default history location, pass that same source-aware directory to stateful remote commands, for example `codex-usage-monit remote --history-dir /srv/codex-state/history-v1 sync buildbox`. Pairing, unpairing/removal, retained-source management, and manual sync then share the recorder's exact persistence domain instead of silently using the platform default.
+
+The same per-host controls and explicit project mappings are available under **Settings**. Git evidence remains a suggestion that must be accepted; unmapped instances are listed separately and can be multi-selected for an explicit manual merge, while Split reverses logical membership. Overview uses two local layers after a sync: source-aware unified history supplies replica-deduplicated task/turn rows and 5-hour/weekly window usage, independently of the Summary/Trends source selector, while a bounded live snapshot supplies recent status and metadata. The live layer contains active/uncertain tasks plus terminal rows from the latest 24 hours; a semantic revision handshake sends at most 128 tasks, 512 turns, and 64 KiB of live content only when it changed. Unchanged polls carry the revision alone, and a missing local baseline forces a full replacement. Remote rows are read-only and become `STALE` after 15 minutes without a successful refresh. A live cumulative task/turn counter is never substituted for missing 5-hour or weekly history; incomplete historical coverage remains an explicit lower bound instead.
+
+The rolling bandwidth budget is per configured source: automatic bulk transfer pauses at 150 MiB per 24 hours and ordinary automatic transfer pauses at 250 MiB. The scheduler uses one worker and connects to at most one host at a time, but explicitly enabling several hosts still makes the total allowance scale linearly. Enable only the hosts you want polled. Excluding a retained source removes it from **All** and replica authority calculations without deleting it; selecting that exact source in Summary or Trends still opens its inspect-only data and labels it `EXCLUDED`.
+
+If the application cannot prove that an SSH process tree and its inherited pipes were fully reclaimed, **Other** reports a `process-pause` and automatic sync for that exact host remains stopped across restarts. Editing that host or completing an explicit manual test/sync successfully clears the pause. On Unix, a user-defined `ProxyCommand` that deliberately escapes its process group may be impossible to kill from the parent; the monitor still bounds its own readers and does not keep retrying it automatically.
+
+Removing an SSH connection does not delete retained history; `remote source list/include/exclude/purge` manages detached source data separately. SSH authentication, host-key policy, `IdentityFile`, ports, and `ProxyJump` remain system OpenSSH responsibilities. Remote sync is not part of the v0.3 release binaries yet; see the [v0.4 design and implementation status](docs/v0.4-remote-usage-sync-design.md).
+
 ### Continuous history recording
 
 The TUI records history while it is open. Local token buckets can usually be reconstructed from rollout files after a restart, but server quota gauges cannot be recovered retroactively. To keep the remaining-quota line continuous while the TUI is closed, install the optional user-level recorder:
@@ -212,13 +245,13 @@ codex-usage-monit service install
 codex-usage-monit service status
 ```
 
-The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and a least-privilege current-user Task Scheduler task on Windows. For online recording it registers absolute paths for both the running monitor and the Codex executable, preserves the install-time collection options and `PATH`, and starts `record --foreground`. The application does not daemonize itself. Use `--codex-bin <FILE>` before `service install` to override automatic Codex discovery; an offline recorder does not require Codex. The Windows task is isolated by user SID, has no 72-hour execution limit, may run on battery power, and restarts after failures. Registration is always explicit and can be removed without deleting history:
+The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and a least-privilege current-user Task Scheduler task on Windows. For online recording it registers absolute paths for both the running monitor and the Codex executable, preserves the install-time collection options, `PATH`, and the exact remote-sync configuration file selected at installation, and starts `record --foreground`. This also preserves a `CODEX_USAGE_MONIT_CONFIG_DIR` override after the installing shell exits. The application does not daemonize itself. Use `--codex-bin <FILE>` before `service install` to override automatic Codex discovery; an offline recorder does not require Codex. The Windows task is isolated by user SID, has no 72-hour execution limit, may run on battery power, and restarts after failures. Registration is always explicit and can be removed without deleting history:
 
 ```bash
 codex-usage-monit service uninstall
 ```
 
-Run `service install` again after moving or replacing either executable, changing `--codex-home`, or changing collection options. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
+Run `service install` again after moving or replacing either executable, changing `--codex-home`, or changing collection options. Because each platform exposes one recorder registration per user, service changes and a pending v1-to-v2 history cutover share one current-user-global gate even when custom history directories differ. Before touching the manager, the installer writes a durable cutover blocker, removes any stale trust marker, disables and stops the previous managed recorder, and verifies that no separate foreground recorder owns the target history. Every new definition contains both the source-aware protocol and a deterministic identity derived from the executable, complete recorder arguments, and install-time environment. The installer binds the exact on-disk definition to the manager's loaded identity, verifies it again immediately before clearing the blocker, and only then permits the recorder to start. Linux units and Windows tasks remain inactive during this check; launchd must load a job before exposing its loaded arguments, so the installer keeps the target history's recorder lock until trust is complete and any eager launch attempt fails before it can write history. This also makes an old binary at the same path reject the new service command instead of becoming a legacy writer. A failed replacement never restores an older auto-start definition; trust, blocker-clear, and registration failures all enter verified cleanup, and an unproven cleanup leaves the blocker in place without a timeout. A dormant or changed registration without the matching trust record blocks first-time migration and crash recovery, while an already-active v2 history does not query the service manager again. Concurrent mutation by a pre-v0.4 installer or an administrator is outside the supported cutover protocol; the final recheck narrows that unavoidable cross-version window and fails closed when it observes a change. If no managed registration exists but a recent foreground-recorder status remains, installation and uninstallation also fail closed until that process is stopped. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
 
 On systems without a supported service manager, run the recorder under tmux, Zellij, or another supervisor:
 
@@ -366,10 +399,10 @@ Trends Inspect shows each selected observation's exact stored timestamp and valu
 
 ## Accuracy and limitations
 
-- **Tokens are local observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within the scanned local data when the relevant logs are complete and counters have not reset ambiguously.
+- **Tokens are rollout observations.** Task/turn/model counts are derived from monotonic counter deltas. They are exact within each scanned local or explicitly synchronized source when the relevant logs are complete and counters have not reset ambiguously.
 - **Account gauges are server data.** Current quota-window percentages and reset times come from the Codex App Server, or from a stale local fallback in offline/degraded mode.
-- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto local model/service-tier Codex credit-rate weights. The optional API long-context multiplier is disabled by default; either projection can still be distorted by activity from other machines or clients.
-- **API equivalent is token-only and local.** It values locally observed model calls at the bundled current API prices. It excludes per-call tool fees, container, storage, search-call, tax, regional, and negotiated-contract charges, and does not yet include usage from other machines.
+- **Entity quota is always estimated.** Codex does not provide an official per-task or per-turn quota bill. `EST.Q*` projects the current ordinary `codex` gauge onto observed model/service-tier Codex credit-rate weights. The optional API long-context multiplier is disabled by default; either projection can still be distorted by machines or clients that have not been synchronized.
+- **API equivalent is token-only and observation-backed.** It values model calls observed locally or imported from explicitly included remote sources at the bundled current API prices. It excludes per-call tool fees, container, storage, search-call, tax, regional, and negotiated-contract charges; an unsynchronized source remains absent rather than being estimated.
 - **Workspace rate-card migration matters.** The token-based card applies to most plans, but OpenAI says a small subset of Enterprise workspaces remains on the legacy per-message card. The monitor cannot infer that workspace migration state from local rollouts, so those users should treat `~EST` as not representative of their applicable billing card.
 - **Partial is still usable, not complete.** A short lookback, `--max-files`, unreadable/bad lines, counter resets, stale sources, or a missing cycle boundary can mark a snapshot/window `partial`. An estimate may still be displayed.
 - **Attribution is bucket-specific.** All quota buckets are displayed, but task/turn/model attribution currently uses the ordinary `codex` bucket. Exact `gpt-5.3-codex-spark` usage is excluded from the local attribution denominator.

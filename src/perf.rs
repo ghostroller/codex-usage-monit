@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const PERF_LOG_SCHEMA_VERSION: u32 = 4;
+const PERF_LOG_SCHEMA_VERSION: u32 = 6;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Per-stage timings for one refresh. Sibling stages may overlap when account
@@ -40,6 +40,7 @@ pub struct RefreshMetrics {
     pub changed: bool,
     pub reduced_rebuilt: bool,
     pub discovery_full_scan: bool,
+    pub discovery_complete: bool,
     pub discovery_cache_hit: bool,
     pub discovery_invalidated: bool,
     pub discovery_probed_files: u64,
@@ -52,8 +53,22 @@ pub struct RefreshMetrics {
     pub reparsed_files: u64,
     pub tail_parsed_files: u64,
     pub tail_parsed_bytes: u64,
+    pub tail_guard_validation_bytes: u64,
     pub full_parsed_files: u64,
+    pub full_parsed_bytes: u64,
     pub reused_files: u64,
+    /// Unchanged entries hydrated from persistent cache without JSON parsing.
+    pub disk_exact_reused_files: u64,
+    /// Persisted prefixes reused to tail-parse growing rollout files after a
+    /// process restart. This distinguishes durable tail reuse from the normal
+    /// in-process cache path.
+    pub disk_tail_reused_files: u64,
+    pub disk_large_exact_reused_files: u64,
+    pub disk_large_tail_reused_files: u64,
+    /// Source bytes read solely for bounded persistent cache hash validation.
+    pub persistent_hash_bytes: u64,
+    /// Subset of `persistent_hash_bytes` spent on large-file sampled guards.
+    pub persistent_large_guard_bytes: u64,
     pub incrementally_reduced_threads: u64,
     pub full_rebuild: bool,
     pub tasks: u64,
@@ -740,8 +755,17 @@ mod tests {
         refresh.discovery_cache_hit = true;
         refresh.discovery_probed_files = 7;
         refresh.discovery_probed_dirs = 3;
+        refresh.discovery_complete = true;
         refresh.cached_events = 42;
         refresh.foreign_baseline_events = 3;
+        refresh.tail_guard_validation_bytes = 512;
+        refresh.full_parsed_bytes = 8192;
+        refresh.disk_exact_reused_files = 4;
+        refresh.disk_tail_reused_files = 2;
+        refresh.disk_large_exact_reused_files = 3;
+        refresh.disk_large_tail_reused_files = 1;
+        refresh.persistent_hash_bytes = 4096;
+        refresh.persistent_large_guard_bytes = 3072;
         log.record_refresh(refresh);
         let mut history = HistoryMetrics::with_durations(
             Duration::from_millis(3),
@@ -774,8 +798,17 @@ mod tests {
         assert_eq!(values[1]["metrics"]["discoveryCacheHit"], true);
         assert_eq!(values[1]["metrics"]["discoveryProbedFiles"], 7);
         assert_eq!(values[1]["metrics"]["discoveryProbedDirs"], 3);
+        assert_eq!(values[1]["metrics"]["discoveryComplete"], true);
         assert_eq!(values[1]["metrics"]["cachedEvents"], 42);
         assert_eq!(values[1]["metrics"]["foreignBaselineEvents"], 3);
+        assert_eq!(values[1]["metrics"]["tailGuardValidationBytes"], 512);
+        assert_eq!(values[1]["metrics"]["fullParsedBytes"], 8192);
+        assert_eq!(values[1]["metrics"]["diskExactReusedFiles"], 4);
+        assert_eq!(values[1]["metrics"]["diskTailReusedFiles"], 2);
+        assert_eq!(values[1]["metrics"]["diskLargeExactReusedFiles"], 3);
+        assert_eq!(values[1]["metrics"]["diskLargeTailReusedFiles"], 1);
+        assert_eq!(values[1]["metrics"]["persistentHashBytes"], 4096);
+        assert_eq!(values[1]["metrics"]["persistentLargeGuardBytes"], 3072);
         assert_eq!(values[2]["event"], "history");
         assert_eq!(values[2]["metrics"]["stageUs"], 250);
         assert_eq!(values[2]["metrics"]["recordUs"], 2_000);

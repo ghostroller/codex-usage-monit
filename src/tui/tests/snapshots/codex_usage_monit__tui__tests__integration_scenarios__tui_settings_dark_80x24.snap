@@ -5,28 +5,28 @@ expression: settings.frame().snapshot_text()
 size=80x24
 rows:
 00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
-01|┌ Display──────────────────────────────────────────────────────────────────────┐
-02|│▌ [T]Theme                                                            Dark    │
-03|│  [V]Turns panel                                                      On      │
-04|│  [M]Models panel                                                     On      │
-05|│  [L]EST Longx                                                        Off     │
-06|└──────────────────────────────────────────────────────────────────────────────┘
-07|┌ Table columns────────────────────────────────────────────────────────────────┐
-08|│  [K]Tokens                                                           On      │
-09|│  [P]Token share                                                      On      │
-10|│  [E]Estimated quota                                                  On      │
-11|│  [A]API equivalent                                                   On      │
-12|└ [↑↓]Select [↵]Toggle ────────────────────────────────────────────────────────┘
-13|┌ Behavior─────────────────────────────────────────────────────────────────────┐
-14|│Column choices apply to Tasks, Turns, and Models.                             │
-15|│API EQ. uses the selected 5h/week scope and is independent of EST Longx.      │
-16|│Narrow panes keep API EQ. visible first and may omit lower-priority columns.  │
+01|┌ Display──────────────────────────────┐┌ Table columns────────────────────────┐
+02|│▌ [T]Theme                    Dark    ││  [K]Tokens                   On      │
+03|│  [V]Turns panel              On      ││  [P]Token share              On      │
+04|│  [M]Models panel             On      ││  [E]Estimated quota          On      │
+05|│  [L]EST Longx                Off     ││  [A]API equivalent           On      │
+06|└──────────────────────────────────────┘└ [↑↓]Select [↵]Toggle ────────────────┘
+07|┌ Remote sources───────────────────────────────────────────────────────────────┐
+08|│[G]Automatic sync: Off                                                        │
+09|│No configured or retained remote sources                                      │
+10|│                                                                              │
+11|│                                                                              │
+12|│[N]New  [E]Edit  [P]Pair  [D]Remove                                           │
+13|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data                         │
+14|└──────────────────────────────────────────────────────────────────────────────┘
+15|┌ Project mappings · explicit only─────────────────────────────────────────────┐
+16|│No project instances or explicit logical mappings                             │
 17|│                                                                              │
 18|│                                                                              │
 19|│                                                                              │
 20|│                                                                              │
 21|│                                                                              │
-22|│                                                                              │
+22|│[J]Accept merge  [T]Select  [M]Merge selected  [X]Split mapping               │
 23|└──────────────────────────────────────────────────────────────────────────────┘
 styles:
 00:001+001 fg=#3fb9c0 bg=#121417 mods=bold text="1"
@@ -41,69 +41,77 @@ styles:
 00:044+003 fg=#f4f6f8 bg=#121417 mods=bold text="Set"
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+008 fg=#f4f6f8 bg=#121417 mods=bold text=" Display"
-01:009+071 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────────────────────────────────────────────┐"
+01:009+032 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────┐┌"
+01:041+014 fg=#f4f6f8 bg=#121417 mods=bold text=" Table columns"
+01:055+025 fg=#4b525c bg=#121417 mods=none text="────────────────────────┐"
 02:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 02:001+003 fg=#121417 bg=#3fb9c0 mods=bold text="▌ ["
 02:004+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="T"
-02:005+074 fg=#121417 bg=#3fb9c0 mods=bold text="]Theme                                                            Dark    "
+02:005+034 fg=#121417 bg=#3fb9c0 mods=bold text="]Theme                    Dark    "
+02:039+002 fg=#4b525c bg=#121417 mods=none text="││"
+02:041+003 fg=#dadee4 bg=#121417 mods=none text="  ["
+02:044+001 fg=#3fb9c0 bg=#121417 mods=bold text="K"
+02:045+034 fg=#dadee4 bg=#121417 mods=none text="]Tokens                   On      "
 02:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 03:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
 03:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="V"
-03:005+074 fg=#dadee4 bg=#121417 mods=none text="]Turns panel                                                      On      "
+03:005+034 fg=#dadee4 bg=#121417 mods=none text="]Turns panel              On      "
+03:039+002 fg=#4b525c bg=#121417 mods=none text="││"
+03:041+003 fg=#dadee4 bg=#121417 mods=none text="  ["
+03:044+001 fg=#3fb9c0 bg=#121417 mods=bold text="P"
+03:045+034 fg=#dadee4 bg=#121417 mods=none text="]Token share              On      "
 03:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 04:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 04:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
 04:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="M"
-04:005+074 fg=#dadee4 bg=#121417 mods=none text="]Models panel                                                     On      "
+04:005+034 fg=#dadee4 bg=#121417 mods=none text="]Models panel             On      "
+04:039+002 fg=#4b525c bg=#121417 mods=none text="││"
+04:041+003 fg=#dadee4 bg=#121417 mods=none text="  ["
+04:044+001 fg=#3fb9c0 bg=#121417 mods=bold text="E"
+04:045+034 fg=#dadee4 bg=#121417 mods=none text="]Estimated quota          On      "
 04:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 05:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 05:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
 05:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
-05:005+074 fg=#dadee4 bg=#121417 mods=none text="]EST Longx                                                        Off     "
+05:005+034 fg=#dadee4 bg=#121417 mods=none text="]EST Longx                Off     "
+05:039+002 fg=#4b525c bg=#121417 mods=none text="││"
+05:041+003 fg=#dadee4 bg=#121417 mods=none text="  ["
+05:044+001 fg=#3fb9c0 bg=#121417 mods=bold text="A"
+05:045+034 fg=#dadee4 bg=#121417 mods=none text="]API equivalent           On      "
 05:079+001 fg=#4b525c bg=#121417 mods=none text="│"
-06:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+06:000+041 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────┘└"
+06:041+002 fg=#7e8691 bg=#121417 mods=none text=" ["
+06:043+002 fg=#3fb9c0 bg=#121417 mods=bold text="↑↓"
+06:045+009 fg=#7e8691 bg=#121417 mods=none text="]Select ["
+06:054+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
+06:055+008 fg=#7e8691 bg=#121417 mods=none text="]Toggle "
+06:063+017 fg=#4b525c bg=#121417 mods=none text="────────────────┘"
 07:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
-07:001+014 fg=#f4f6f8 bg=#121417 mods=bold text=" Table columns"
-07:015+065 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────────────────┐"
+07:001+015 fg=#f4f6f8 bg=#121417 mods=bold text=" Remote sources"
+07:016+064 fg=#4b525c bg=#121417 mods=none text="───────────────────────────────────────────────────────────────┐"
 08:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-08:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
-08:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="K"
-08:005+074 fg=#dadee4 bg=#121417 mods=none text="]Tokens                                                           On      "
+08:001+022 fg=#7e8691 bg=#121417 mods=none text="[G]Automatic sync: Off"
 08:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 09:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-09:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
-09:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="P"
-09:005+074 fg=#dadee4 bg=#121417 mods=none text="]Token share                                                      On      "
+09:001+078 fg=#7e8691 bg=#121417 mods=none text="No configured or retained remote sources                                      "
 09:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 10:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-10:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
-10:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="E"
-10:005+074 fg=#dadee4 bg=#121417 mods=none text="]Estimated quota                                                  On      "
 10:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 11:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-11:001+003 fg=#dadee4 bg=#121417 mods=none text="  ["
-11:004+001 fg=#3fb9c0 bg=#121417 mods=bold text="A"
-11:005+074 fg=#dadee4 bg=#121417 mods=none text="]API equivalent                                                   On      "
 11:079+001 fg=#4b525c bg=#121417 mods=none text="│"
-12:000+001 fg=#4b525c bg=#121417 mods=none text="└"
-12:001+002 fg=#7e8691 bg=#121417 mods=none text=" ["
-12:003+002 fg=#3fb9c0 bg=#121417 mods=bold text="↑↓"
-12:005+009 fg=#7e8691 bg=#121417 mods=none text="]Select ["
-12:014+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
-12:015+008 fg=#7e8691 bg=#121417 mods=none text="]Toggle "
-12:023+057 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────────┘"
-13:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
-13:001+009 fg=#f4f6f8 bg=#121417 mods=bold text=" Behavior"
-13:010+070 fg=#4b525c bg=#121417 mods=none text="─────────────────────────────────────────────────────────────────────┐"
-14:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-14:001+078 fg=#7e8691 bg=#121417 mods=none text="Column choices apply to Tasks, Turns, and Models.                             "
-14:079+001 fg=#4b525c bg=#121417 mods=none text="│"
-15:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-15:001+078 fg=#7e8691 bg=#121417 mods=none text="API EQ. uses the selected 5h/week scope and is independent of EST Longx.      "
-15:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+12:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+12:001+035 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove"
+12:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+13:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+13:001+053 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data"
+13:079+001 fg=#4b525c bg=#121417 mods=none text="│"
+14:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
+15:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
+15:001+033 fg=#f4f6f8 bg=#121417 mods=bold text=" Project mappings · explicit only"
+15:034+046 fg=#4b525c bg=#121417 mods=none text="─────────────────────────────────────────────┐"
 16:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-16:001+078 fg=#7e8691 bg=#121417 mods=none text="Narrow panes keep API EQ. visible first and may omit lower-priority columns.  "
+16:001+078 fg=#7e8691 bg=#121417 mods=none text="No project instances or explicit logical mappings                             "
 16:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 17:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 17:079+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -116,6 +124,7 @@ styles:
 21:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 22:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+22:001+063 fg=#7e8691 bg=#121417 mods=none text="[J]Accept merge  [T]Select  [M]Merge selected  [X]Split mapping"
 22:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 23:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
 controls:
@@ -124,11 +133,11 @@ ViewTrends binding=2 rect=10,0,6,1
 ViewSummary binding=U rect=19,0,7,1
 ViewOther binding=3 rect=29,0,9,1
 ViewSettings binding=4 rect=41,0,7,1
-SettingTheme binding=T rect=1,2,78,1
-SettingTurns binding=V rect=1,3,78,1
-SettingModels binding=M rect=1,4,78,1
-SettingLongContext binding=L rect=1,5,78,1
-SettingTokens binding=K rect=1,8,78,1
-SettingTokenShare binding=P rect=1,9,78,1
-SettingEstimatedQuota binding=E rect=1,10,78,1
-SettingApiEquivalent binding=A rect=1,11,78,1
+SettingTheme binding=T rect=1,2,38,1
+SettingTurns binding=V rect=1,3,38,1
+SettingModels binding=M rect=1,4,38,1
+SettingLongContext binding=L rect=1,5,38,1
+SettingTokens binding=K rect=41,2,38,1
+SettingTokenShare binding=P rect=41,3,38,1
+SettingEstimatedQuota binding=E rect=41,4,38,1
+SettingApiEquivalent binding=A rect=41,5,38,1

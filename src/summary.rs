@@ -1471,6 +1471,8 @@ mod tests {
             timestamp,
             thread_id: "thread".to_string(),
             turn_id: Some("turn".to_string()),
+            usage_event_id: None,
+            usage_event_identity_exact: false,
             model: Some("gpt-5.6-luna".to_string()),
             service_tier: Some("standard".to_string()),
             tokens: TokenUsage {

@@ -27,6 +27,7 @@ _此图由集成测试夹具确定性生成；CI 同步校验会防止预览图�
 - **API 等价模型费用** — 使用精确定点计算按当前 API 费率换算本地模型 token，并显示长上下文区间与已计价覆盖率；不包含非模型工具费用。
 - **用量走势** — 在本地记录服务端剩余额度、本地周 token、低置信度周估算，以及 15 分钟 token/估算桶。
 - **项目用量汇总** — 按本周期、近 7 天或近 30 天排行项目；展开紧凑的项目/session/用户对话轮树，并通过项目排行柱状图和可从 1 天细化到 1 小时的项目着色堆叠面积图，比较 token、估算 credit 费率或 API 等价用量。能够精确关联的 subagent 子树用量会折叠到创建它的用户对话轮。
+- **显式启用的多机器历史** — 正在开发的 v0.4 可由一台中心机器从逐台加入 allowlist 的 SSH 主机拉取归一化用量增量，保留机器来源，并且只合并用户明确映射的项目和有证据支持的会话副本。
 - **可选后台记录** — TUI 关闭后可由 launchd、systemd 用户服务或 Windows 任务计划程序继续采集，无需管理员权限。
 - **交互式终端 UI** — 不离开终端即可筛选、搜索、切换用量范围、展开任务树、查看 turn/模型和恢复任务。
 - **可脚本化 CLI** — 以便于阅读的文本或稳定 camelCase JSON 导出与 TUI 相同的 Summary、Trends 和统一健康数据，也可选择 snapshot section 或按 thread 筛选 turn。
@@ -152,6 +153,7 @@ codex-usage-monit --offline snapshot --format json --compact
 | `health` | 统一输出 snapshot、历史、recorder 和后台服务健康状态。 |
 | `record` | 不启动 TUI，持续记录本地和账户历史。 |
 | `service` | 安装、检查或删除可选的用户级后台记录服务。 |
+| `remote` | 配置、测试和同步显式加入 allowlist 的 SSH 机器；该功能正在为 v0.4 开发。 |
 | `debug-startup` | 分析正常 TUI 冷启动流程，但不进入交互模式。 |
 
 一次性数据命令支持 `--format text|json` 和 `--compact`，后者会把 JSON 写成单行；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。snapshot 系列命令（`snapshot`、`limits`、`tasks`、`turns`、`models`、`attribution`、`windows`）以及 `summary`、`trends` 都接受 `--long-context`，只为本次调用选择可选 Longx 估算；默认仍为基础口径，API 等价费用不会随之改变。
@@ -203,6 +205,37 @@ codex-usage-monit service status --format json --compact
 
 有效的 `snapshot --section` 值包括 `limits`、`tasks`、`turns`、`models`、`attribution`、`windows` 和 `health`。snapshot 的 `health` section 只包含采集健康状态；如需统一的 snapshot/历史/recorder/服务报告，请使用独立的 `health` 命令。TUI 的顶层 tab 是 **Overview**、**Trends**、**Summary**、**Other** 和 **Settings**。
 
+### 远程机器用量同步（v0.4，开发中）
+
+v0.4 分支可由中心机器通过系统 OpenSSH 客户端，从另一台机器拉取归一化的聚合历史、有边界限制的 session facts 和紧凑的 Overview 快照。远端只需安装相同程序，并在同步时运行短生命周期 exporter；不需要监听端口、数据库或远端常驻服务，也不会把原始 rollout JSONL 复制到中心。账户额度 gauge 和重置机会仍只由中心机器采集一次。
+
+远程同步采用 fail-closed 的双层显式 opt-in。程序不会枚举或连接 SSH config 中的全部主机。`add` 只创建一条 disabled、unpaired 的 allowlist 配置，不会连接；`pair`、`test` 和手工 `sync` 只会联系用户点名的一个 ID。只有主机已经配对、逐主机开关已开启且全局开关也已开启时，自动同步才会启动：
+
+```bash
+# 两台机器的 PATH 中都需要有兼容版本的 codex-usage-monit。
+# dev-server 是系统 OpenSSH config 中已有的 alias。
+codex-usage-monit remote add buildbox --ssh-host dev-server
+codex-usage-monit remote pair buildbox
+codex-usage-monit remote test buildbox
+
+# 单次拉取不会修改自动同步设置。
+codex-usage-monit remote sync buildbox
+
+# 下面两个显式开关才会让 recorder 调度这一台主机。
+codex-usage-monit remote enable buildbox
+codex-usage-monit remote config --auto-sync true
+```
+
+如果 recorder 使用非默认历史目录，所有会读写远程状态的命令都要指定同一个 source-aware 目录，例如 `codex-usage-monit remote --history-dir /srv/codex-state/history-v1 sync buildbox`。这样配对、解绑/移除、保留来源管理与手工同步会进入 recorder 的同一个持久化域，不会静默落到平台默认目录。
+
+**Settings** 中也提供相同的逐主机控制和显式项目映射。Git 证据仍只是需要接受的建议；未映射 instance 会单独列出，可多选后明确执行手工 Merge，Split 则撤销 logical membership。同步完成后，Overview 使用两层本地数据：source-aware 统一历史独立于 Summary/Trends 的来源选择器，负责提供经过 replica 去重的 task/turn 行以及 5 小时/周窗口用量；有边界的 live 快照只负责近期状态和元数据。live 层包含活动/不确定任务以及最近 24 小时的终态记录，语义 revision 握手只在内容变化时发送完整快照，硬上限为 128 个 task、512 个 turn 和 64 KiB；没有变化时只发送 revision，本地 baseline 丢失时则强制补发完整 replacement。远端行只读，连续 15 分钟没有成功刷新后会变为 `STALE`。live 中的 task/turn 累计计数绝不会在历史缺失时冒充 5 小时或周窗口数据；历史覆盖不完整时会继续明确显示为下界。
+
+滚动带宽预算按每个已配置 source 独立计算：自动 bulk 在 rolling 24 小时达到 150 MiB 时暂停，普通自动传输在 250 MiB 时暂停。调度器只有一个 worker，同一时刻最多连接一台主机；但如果显式启用多台主机，总预算仍会线性叠加，因此只应启用确实需要轮询的主机。Exclude 只会让保留 source 不再参与 **All** 和 replica authority 计算，不会删除数据；在 Summary 或 Trends 精确选中该 source 时仍可查看 inspect-only 数据，并明确标为 `EXCLUDED`。
+
+如果程序无法证明某次 SSH 进程树及其继承管道已经完整回收，**Other** 会显示 `process-pause`，并跨重启持续停止这一台主机的自动同步；编辑该主机配置，或显式手工 test/sync 成功后才会解除。Unix 上用户自定义的 `ProxyCommand` 若主动逃出进程组，父进程可能无法保证杀死它；本程序仍会在固定时限内关闭自己的 reader，并停止自动重试。
+
+删除 SSH 连接不会删除已经保留的历史；`remote source list/include/exclude/purge` 独立管理 detached source 数据。SSH 认证、host-key 策略、`IdentityFile`、端口和 `ProxyJump` 仍由系统 OpenSSH 负责。远程同步尚未包含在 v0.3 release 程序中；详细边界和当前进度见 [v0.4 设计与实现状态](docs/v0.4-remote-usage-sync-design.md)。
+
 ### 持续记录历史
 
 TUI 打开时会记录历史。本地 token 桶通常可以在重启后从 rollout 文件回算，但服务端额度 gauge 无法事后恢复。如果希望 TUI 关闭后剩余额度曲线仍然连续，可以显式安装用户级记录服务：
@@ -212,13 +245,13 @@ codex-usage-monit service install
 codex-usage-monit service status
 ```
 
-macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低权限的当前用户任务计划。在线记录时，注册项会固化当前监控程序和 Codex 可执行文件的绝对路径，保留安装时的采集选项和 `PATH`，并运行 `record --foreground`。程序自身不会 daemonize。可以在 `service install` 前传入 `--codex-bin <FILE>` 覆盖自动发现的 Codex；离线 recorder 不要求安装 Codex。Windows 任务按用户 SID 隔离，不受默认 72 小时运行上限影响，允许电池供电，并会在失败后重启。删除服务不会删除历史：
+macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低权限的当前用户任务计划。在线记录时，注册项会固化当前监控程序和 Codex 可执行文件的绝对路径，保留安装时的采集选项、`PATH`，以及安装时实际选中的远程同步配置文件，并运行 `record --foreground`；因此安装 shell 退出后，`CODEX_USAGE_MONIT_CONFIG_DIR` 覆盖也不会丢失。程序自身不会 daemonize。可以在 `service install` 前传入 `--codex-bin <FILE>` 覆盖自动发现的 Codex；离线 recorder 不要求安装 Codex。Windows 任务按用户 SID 隔离，不受默认 72 小时运行上限影响，允许电池供电，并会在失败后重启。删除服务不会删除历史：
 
 ```bash
 codex-usage-monit service uninstall
 ```
 
-移动或替换任一可执行文件、修改 `--codex-home`，或者改变采集选项后，请重新运行 `service install`。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
+移动或替换任一可执行文件、修改 `--codex-home`，或者改变采集选项后，请重新运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 v1→v2 history cutover 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次迁移和迁移恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
 
 没有受支持服务管理器的环境，可以在 tmux、Zellij 或其他 supervisor 中运行：
 
@@ -366,10 +399,10 @@ Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和�
 
 ## 精度和限制
 
-- **Token 是本地观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在已扫描的本地数据范围内是准确值。
+- **Token 是 rollout 观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在每个已扫描的本机或显式同步来源内是准确值。
 - **账户用量指标是服务端数据。** 当前额度窗口百分比和重置时间来自 Codex App Server；离线或降级时则来自已过期（`stale`）的本地后备数据。
-- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到本地模型/服务层 Codex credit 费率权重上。可选 API 长上下文倍率默认关闭；无论选择哪种口径，来自其他机器或客户端的活动都可能使结果失真。
-- **API 等价费用只覆盖本地模型 token。** 它按内置的当前 API 价格换算本地可观察模型调用，不包含按次工具费、容器、存储、搜索调用、税费、区域加价或协商合同价格，目前也不包含其他机器的用量。
+- **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到已观察模型/服务层 Codex credit 费率权重上。可选 API 长上下文倍率默认关闭；无论选择哪种口径，尚未同步的机器或客户端活动都可能使结果失真。
+- **API 等价费用只覆盖有观察证据的模型 token。** 它按内置的当前 API 价格换算本机观察到、或从显式 included 远程来源导入的模型调用，不包含按次工具费、容器、存储、搜索调用、税费、区域加价或协商合同价格；未同步来源会保持缺失，不会被估算补齐。
 - **需考虑 workspace 的费率卡迁移状态。** token-based 卡适用于绝大多数方案，但 OpenAI 说明仍有少量 Enterprise workspace 使用旧的按消息计费卡。监控器无法从本地 rollout 判断 workspace 是否已迁移，因此这些用户不应把 `~EST` 视为其适用计费卡的代表值。
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。

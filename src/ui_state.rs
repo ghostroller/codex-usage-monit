@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::replace_file;
+use crate::source_identity::NodeId;
 
-pub const UI_STATE_VERSION: u32 = 5;
+pub const UI_STATE_VERSION: u32 = 6;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -72,6 +73,26 @@ pub enum UiSummaryMetric {
     ApiEquivalent,
 }
 
+/// Exact physical history source shared by the Summary and Trends views.
+///
+/// Node IDs, rather than mutable display labels, are persisted deliberately:
+/// an unavailable saved source must remain selected until the user explicitly
+/// chooses another scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UiHistorySourceSelection {
+    #[default]
+    All,
+    Local {
+        #[serde(rename = "nodeId")]
+        node_id: NodeId,
+    },
+    Remote {
+        #[serde(rename = "nodeId")]
+        node_id: NodeId,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UiTaskListMode {
@@ -126,6 +147,7 @@ pub struct UiState {
     pub summary_grain: UiSummaryGrain,
     pub summary_metric: UiSummaryMetric,
     pub summary_show_all_projects: bool,
+    pub history_source_selection: UiHistorySourceSelection,
     pub table_columns: UiTableColumns,
     pub task_list_mode: UiTaskListMode,
     pub task_source_filter: UiTaskSourceFilter,
@@ -145,6 +167,7 @@ impl Default for UiState {
             summary_grain: UiSummaryGrain::Day,
             summary_metric: UiSummaryMetric::Tokens,
             summary_show_all_projects: false,
+            history_source_selection: UiHistorySourceSelection::All,
             table_columns: UiTableColumns::default(),
             task_list_mode: UiTaskListMode::Flat,
             task_source_filter: UiTaskSourceFilter::All,
@@ -379,6 +402,7 @@ mod tests {
                 summary_grain: UiSummaryGrain::Day,
                 summary_metric: UiSummaryMetric::Tokens,
                 summary_show_all_projects: false,
+                history_source_selection: UiHistorySourceSelection::All,
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Flat,
                 task_source_filter: UiTaskSourceFilter::All,
@@ -406,6 +430,9 @@ mod tests {
             summary_grain: UiSummaryGrain::Hour,
             summary_metric: UiSummaryMetric::ApiEquivalent,
             summary_show_all_projects: true,
+            history_source_selection: UiHistorySourceSelection::Remote {
+                node_id: "node-11111111111111111111111111111111".parse().unwrap(),
+            },
             table_columns: UiTableColumns {
                 tokens: true,
                 token_share: false,
@@ -427,6 +454,9 @@ mod tests {
         assert!(json.contains("\"summaryGrain\": \"hour\""));
         assert!(json.contains("\"summaryMetric\": \"apiEquivalent\""));
         assert!(json.contains("\"summaryShowAllProjects\": true"));
+        assert!(json.contains("\"historySourceSelection\""));
+        assert!(json.contains("\"kind\": \"remote\""));
+        assert!(json.contains("\"nodeId\": \"node-11111111111111111111111111111111\""));
         assert!(json.contains("\"tableColumns\""));
         assert!(json.contains("\"tokenShare\": false"));
         assert!(json.contains("\"estimatedQuota\": true"));
@@ -477,6 +507,7 @@ mod tests {
                 summary_grain: UiSummaryGrain::Day,
                 summary_metric: UiSummaryMetric::Tokens,
                 summary_show_all_projects: false,
+                history_source_selection: UiHistorySourceSelection::All,
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Tree,
                 task_source_filter: UiTaskSourceFilter::Cli,

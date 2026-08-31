@@ -23,6 +23,7 @@ pub(super) enum ControlId {
     ToggleModels,
     ScopeFiveHours,
     ScopeWeek,
+    HistorySource,
     SummaryRangeCycle,
     SummaryRangeSevenDays,
     SummaryRangeThirtyDays,
@@ -75,6 +76,7 @@ impl ControlId {
             Self::ToggleModels => "M",
             Self::ScopeFiveHours => "5",
             Self::ScopeWeek => "W",
+            Self::HistorySource => "S",
             Self::SummaryRangeCycle => "C",
             Self::SummaryRangeSevenDays => "7",
             Self::SummaryRangeThirtyDays => "M",
@@ -300,6 +302,7 @@ impl SemanticFrame {
 pub(super) struct TuiHarness {
     pub(super) app: App,
     terminal: Terminal<TestBackend>,
+    _mapping_directory: tempfile::TempDir,
 }
 
 impl TuiHarness {
@@ -316,17 +319,29 @@ impl TuiHarness {
     }
 
     pub(super) fn from_snapshot(snapshot: Snapshot, width: u16, height: u16, theme: Theme) -> Self {
-        let app = App::new(
+        let mut app = App::new(
             CollectionResult {
                 snapshot,
                 account: AccountSnapshot::default(),
                 history_observation: crate::history::HistoryObservation::default(),
+                local_session_digests: Default::default(),
             },
             theme,
         );
+        let mapping_directory =
+            tempfile::tempdir().expect("test mapping directory must initialize");
+        app.project_mapping_store = ProjectMappingStore::new(
+            mapping_directory
+                .path()
+                .join("config/project-mappings.json"),
+        );
         let terminal =
             Terminal::new(TestBackend::new(width, height)).expect("test terminal must initialize");
-        let mut harness = Self { app, terminal };
+        let mut harness = Self {
+            app,
+            terminal,
+            _mapping_directory: mapping_directory,
+        };
         harness.render();
         harness
     }
@@ -463,6 +478,7 @@ impl TuiHarness {
                 .window_controls_hitbox
                 .map(|hitbox| hitbox.scopes[WindowScope::Week.index()])
                 .unwrap_or_default(),
+            ControlId::HistorySource => self.app.history_source_control_hitbox,
             ControlId::SummaryRangeCycle => self.summary_range_rect(SummaryRange::Cycle),
             ControlId::SummaryRangeSevenDays => self.summary_range_rect(SummaryRange::SevenDays),
             ControlId::SummaryRangeThirtyDays => self.summary_range_rect(SummaryRange::ThirtyDays),
@@ -646,6 +662,7 @@ impl TuiHarness {
     fn setting_rect(&self, item: SettingItem) -> Rect {
         self.app
             .settings_controls_hitbox
+            .as_ref()
             .map(|hitbox| hitbox.rows[item.index()])
             .unwrap_or_default()
     }
@@ -661,6 +678,7 @@ impl TuiHarness {
             ControlId::ToggleModels,
             ControlId::ScopeFiveHours,
             ControlId::ScopeWeek,
+            ControlId::HistorySource,
             ControlId::SummaryRangeCycle,
             ControlId::SummaryRangeSevenDays,
             ControlId::SummaryRangeThirtyDays,

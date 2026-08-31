@@ -109,6 +109,8 @@ fn call_with_usage(
         timestamp,
         thread_id: thread_id.to_string(),
         turn_id: Some(turn_id.to_string()),
+        usage_event_id: None,
+        usage_event_identity_exact: false,
         model: model.map(str::to_string),
         service_tier: service_tier.map(str::to_string),
         tokens,

@@ -19,6 +19,7 @@ pub fn default_rollout_cache_dir() -> Option<PathBuf> {
         nonempty_env("XDG_CACHE_HOME").as_deref(),
         nonempty_env("HOME").as_deref(),
         nonempty_env("LOCALAPPDATA").as_deref(),
+        nonempty_env("USERPROFILE").as_deref(),
         current_platform(),
     )
 }
@@ -37,6 +38,7 @@ pub(crate) fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Resu
         file.flush()?;
         drop(file);
         replace_file(&temporary, path)?;
+        validate_private_cache_path(path)?;
         Ok(())
     })();
 
@@ -44,6 +46,60 @@ pub(crate) fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Resu
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Proves that the private cache directory can create, flush, and remove a
+/// file without retaining probe state. This is used only by an explicit
+/// remote-agent health probe; normal startup never calls it.
+pub(crate) fn probe_private_directory_writable(directory: &Path) -> io::Result<()> {
+    create_private_directory(directory)?;
+    let (temporary, mut file) = create_temporary_file(directory, OsStr::new("writable-probe"))?;
+    let result = (|| {
+        file.write_all(b"probe")?;
+        file.sync_all()?;
+        drop(file);
+        fs::remove_file(&temporary)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Validates a cache directory before existing persistent entries are read or
+/// removed. The final directory must be private, and user-controlled symbolic
+/// link components are rejected instead of being followed.
+pub(crate) fn validate_private_cache_directory(path: &Path) -> io::Result<()> {
+    reject_untrusted_link_components(path, "rollout cache directory")?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(invalid_cache(
+            "rollout cache directory must not be a symbolic link or reparse point",
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(invalid_cache("rollout cache path must be a directory"));
+    }
+    ensure_private_directory(path, &metadata, "rollout cache directory")
+}
+
+/// Validates an already-open persistent cache entry against its current path.
+pub(crate) fn validate_private_cache_file(path: &Path, file: &File) -> io::Result<()> {
+    reject_untrusted_link_components(path, "rollout cache entry")?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link_or_reparse(&path_metadata) || !path_metadata.file_type().is_file() {
+        return Err(invalid_cache(
+            "rollout cache entry must be a regular file, not a link or reparse point",
+        ));
+    }
+    let opened_metadata = file.metadata()?;
+    if metadata_is_link_or_reparse(&opened_metadata) || !opened_metadata.file_type().is_file() {
+        return Err(invalid_cache(
+            "opened rollout cache entry is not a regular file",
+        ));
+    }
+    ensure_opened_file_matches_path(&path_metadata, &opened_metadata)?;
+    ensure_private_file(path, file, &opened_metadata, "rollout cache entry")
 }
 
 fn nonempty_env(name: &str) -> Option<PathBuf> {
@@ -74,6 +130,7 @@ fn resolve_rollout_cache_dir(
     xdg_cache_home: Option<&Path>,
     home: Option<&Path>,
     local_app_data: Option<&Path>,
+    user_profile: Option<&Path>,
     platform: Platform,
 ) -> Option<PathBuf> {
     if let Some(directory) = nonempty_path(override_directory) {
@@ -87,6 +144,10 @@ fn resolve_rollout_cache_dir(
         Platform::MacOs => nonempty_path(home)
             .map(|directory| directory.join("Library/Caches").join(APP_DIRECTORY)),
         Platform::Windows => nonempty_path(local_app_data)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                nonempty_path(user_profile).map(|directory| directory.join("AppData").join("Local"))
+            })
             .map(|directory| directory.join(APP_DIRECTORY).join("cache")),
         Platform::Unix => {
             nonempty_path(home).map(|directory| directory.join(".cache").join(APP_DIRECTORY))
@@ -112,11 +173,27 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
 
         match options.open(&temporary) {
-            Ok(file) => return Ok((temporary, file)),
+            Ok(file) => match validate_private_cache_file(&temporary, &file) {
+                Ok(()) => return Ok((temporary, file)),
+                Err(error) => {
+                    drop(file);
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            },
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -129,20 +206,218 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
+    match validate_private_cache_directory(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
 
         let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(path)
+        builder.recursive(true).mode(0o700).create(path)?;
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path)
+        fs::create_dir_all(path)?;
     }
+    validate_private_cache_directory(path)
+}
+
+fn validate_private_cache_path(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    validate_private_cache_file(path, &file)
+}
+
+fn invalid_cache(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(unix)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn reject_untrusted_link_components(path: &Path, subject: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for component in path.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() && metadata.uid() != 0 => {
+                return Err(invalid_cache(format!(
+                    "{subject} path must not traverse a user-controlled symbolic link ({})",
+                    component.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reject_untrusted_link_components(path: &Path, subject: &str) -> io::Result<()> {
+    // The shared Windows validator checks every path component for reparse
+    // points and validates the final directory DACL using a live handle.
+    if path.is_dir() {
+        crate::source_identity::validate_windows_private_directory(path, subject)
+    } else if let Some(parent) = path.parent() {
+        crate::source_identity::validate_windows_private_directory(parent, subject)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn reject_untrusted_link_components(path: &Path, subject: &str) -> io::Result<()> {
+    for component in path.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+        if fs::symlink_metadata(component).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(invalid_cache(format!(
+                "{subject} path must not traverse a symbolic link ({})",
+                component.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(
+    _path: &Path,
+    metadata: &fs::Metadata,
+    subject: &str,
+) -> io::Result<()> {
+    ensure_private_unix_metadata(metadata, subject)
+}
+
+#[cfg(unix)]
+fn ensure_private_file(
+    _path: &Path,
+    _file: &File,
+    metadata: &fs::Metadata,
+    subject: &str,
+) -> io::Result<()> {
+    ensure_private_unix_metadata(metadata, subject)
+}
+
+#[cfg(unix)]
+fn ensure_private_unix_metadata(metadata: &fs::Metadata, subject: &str) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{subject} must be owned by the current user"),
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{subject} must not be accessible by group or other users"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_private_directory(
+    path: &Path,
+    _metadata: &fs::Metadata,
+    subject: &str,
+) -> io::Result<()> {
+    crate::source_identity::validate_windows_private_directory(path, subject)
+}
+
+#[cfg(windows)]
+fn ensure_private_file(
+    path: &Path,
+    file: &File,
+    _metadata: &fs::Metadata,
+    subject: &str,
+) -> io::Result<()> {
+    crate::source_identity::validate_windows_private_file(path, file, subject)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_private_directory(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+    _subject: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private rollout cache directories are unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_private_file(
+    _path: &Path,
+    _file: &File,
+    _metadata: &fs::Metadata,
+    _subject: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private rollout cache files are unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn ensure_opened_file_matches_path(
+    path_metadata: &fs::Metadata,
+    opened_metadata: &fs::Metadata,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
+    {
+        Ok(())
+    } else {
+        Err(invalid_cache(
+            "rollout cache entry changed while it was being opened",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_opened_file_matches_path(
+    _path_metadata: &fs::Metadata,
+    _opened_metadata: &fs::Metadata,
+) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,29 +438,59 @@ mod tests {
                 Some(xdg),
                 Some(home),
                 Some(local),
+                None,
                 Platform::Windows,
             ),
             Some(override_directory.to_path_buf())
         );
         assert_eq!(
-            resolve_rollout_cache_dir(None, Some(xdg), Some(home), Some(local), Platform::MacOs,),
+            resolve_rollout_cache_dir(
+                None,
+                Some(xdg),
+                Some(home),
+                Some(local),
+                None,
+                Platform::MacOs,
+            ),
             Some(xdg.join(APP_DIRECTORY))
         );
         assert_eq!(
-            resolve_rollout_cache_dir(None, None, Some(home), None, Platform::MacOs),
+            resolve_rollout_cache_dir(None, None, Some(home), None, None, Platform::MacOs),
             Some(home.join("Library/Caches").join(APP_DIRECTORY))
         );
         assert_eq!(
-            resolve_rollout_cache_dir(None, None, Some(home), None, Platform::Unix),
+            resolve_rollout_cache_dir(None, None, Some(home), None, None, Platform::Unix),
             Some(home.join(".cache").join(APP_DIRECTORY))
         );
         assert_eq!(
-            resolve_rollout_cache_dir(None, None, None, Some(local), Platform::Windows),
+            resolve_rollout_cache_dir(None, None, None, Some(local), None, Platform::Windows,),
             Some(local.join(APP_DIRECTORY).join("cache"))
         );
         assert_eq!(
-            resolve_rollout_cache_dir(None, None, None, None, Platform::Unix),
+            resolve_rollout_cache_dir(None, None, None, None, None, Platform::Unix),
             None
+        );
+    }
+
+    #[test]
+    fn windows_resolver_falls_back_to_user_profile_local_app_data() {
+        let user_profile = Path::new("C:/Users/developer");
+        assert_eq!(
+            resolve_rollout_cache_dir(
+                None,
+                None,
+                None,
+                None,
+                Some(user_profile),
+                Platform::Windows,
+            ),
+            Some(
+                user_profile
+                    .join("AppData")
+                    .join("Local")
+                    .join(APP_DIRECTORY)
+                    .join("cache")
+            )
         );
     }
 
@@ -199,6 +504,7 @@ mod tests {
                 Some(empty),
                 Some(empty),
                 Some(home),
+                Some(empty),
                 Some(empty),
                 Platform::Unix,
             ),
@@ -230,6 +536,14 @@ mod tests {
         assert_eq!(fs::read_dir(cache_directory).unwrap().count(), 1);
     }
 
+    #[test]
+    fn writable_probe_leaves_no_file_behind() {
+        let directory = tempdir().unwrap();
+        let cache_directory = directory.path().join("private/cache");
+        probe_private_directory_writable(&cache_directory).unwrap();
+        assert_eq!(fs::read_dir(cache_directory).unwrap().count(), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn newly_created_cache_paths_are_private() {
@@ -248,5 +562,60 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_public_cache_directory_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let cache_directory = directory.path().join("public-cache");
+        fs::create_dir(&cache_directory).unwrap();
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = probe_private_directory_writable(&cache_directory).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(cache_directory).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_and_ancestor_symlinks_are_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let final_link = directory.path().join("final-link");
+        symlink(&outside, &final_link).unwrap();
+        assert!(probe_private_directory_writable(&final_link).is_err());
+
+        let nested = outside.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        let ancestor_link = directory.path().join("ancestor-link");
+        symlink(&outside, &ancestor_link).unwrap();
+        assert!(probe_private_directory_writable(&ancestor_link.join("nested")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_public_cache_entry_is_rejected_on_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let cache_directory = directory.path().join("private-cache");
+        fs::create_dir(&cache_directory).unwrap();
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = cache_directory.join("entry.json");
+        fs::write(&path, b"cache").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let error = validate_private_cache_file(&path, &file).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }

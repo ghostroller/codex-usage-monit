@@ -19,6 +19,7 @@ use crate::domain::{
     AgentInteraction, AgentInteractionKind, ApiCostAmount, LimitBucket, Provenance, TaskRecord,
     TokenUsage, TurnRecord, UsageCall,
 };
+use crate::history_ownership::HistoryWriteAuthority;
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
 pub const HISTORY_METRIC_REVISION: u32 = 4;
@@ -866,9 +867,42 @@ pub struct HistoryWriteReport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SummaryBackfillAttempt {
+pub struct SummaryBackfillAttempt {
     pub completed_at: DateTime<Utc>,
     pub complete: bool,
+}
+
+impl SummaryBackfillAttempt {
+    pub fn completed_at(&self) -> DateTime<Utc> {
+        self.completed_at
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+/// Immutable snapshot of the currently staged in-memory observation.
+///
+/// External backends use this to preserve the TUI's batching and live-overlay
+/// semantics without publishing another legacy v1 shard. Completion is
+/// revision-checked so a newer observation can never be cleared by an older
+/// persistence result.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedHistoryFlush {
+    observation: HistoryObservation,
+    force_full_merge: bool,
+    revision: u64,
+}
+
+impl StagedHistoryFlush {
+    pub(crate) fn observation(&self) -> &HistoryObservation {
+        &self.observation
+    }
+
+    pub(crate) fn force_full_merge(&self) -> bool {
+        self.force_full_merge
+    }
 }
 
 #[derive(Debug)]
@@ -888,6 +922,53 @@ pub struct HistoryStore {
     staged_observation: Option<HistoryObservation>,
     staged_force_full_merge: bool,
     last_staged_flush_attempt: Option<Instant>,
+    staged_revision: u64,
+}
+
+/// A short-lived, ownership-fenced write surface for legacy v1 history.
+///
+/// The authority retains the cross-process ownership writer lease, while the
+/// store continues to use its namespace-local lock for shard consistency.
+/// Every persistence operation validates the exact v1 root, profile,
+/// redaction mode, and ownership epoch after taking that namespace lock.
+pub struct HistoryV1Writer<'store, 'authority, 'lease> {
+    store: &'store mut HistoryStore,
+    authority: &'authority HistoryWriteAuthority<'lease>,
+}
+
+impl HistoryV1Writer<'_, '_, '_> {
+    pub fn validate(&self) -> io::Result<()> {
+        self.store.validate_v1_authority(self.authority)
+    }
+
+    pub fn record(&mut self, observation: &HistoryObservation) -> io::Result<HistoryWriteReport> {
+        self.store.record_fenced(observation, Some(self.authority))
+    }
+
+    pub fn flush_staged(&mut self) -> io::Result<Option<HistoryWriteReport>> {
+        self.store
+            .flush_staged_at(Instant::now(), Some(self.authority))
+    }
+
+    pub fn flush_staged_if_due(
+        &mut self,
+        interval: StdDuration,
+    ) -> io::Result<Option<HistoryWriteReport>> {
+        self.store
+            .flush_staged_if_due_at(interval, Instant::now(), Some(self.authority))
+    }
+
+    pub fn mark_summary_backfill_attempt(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        complete: bool,
+    ) -> io::Result<SummaryBackfillAttempt> {
+        self.store.mark_summary_backfill_attempt_fenced(
+            completed_at,
+            complete,
+            Some(self.authority),
+        )
+    }
 }
 
 impl HistoryStore {
@@ -938,6 +1019,7 @@ impl HistoryStore {
             staged_observation: None,
             staged_force_full_merge: false,
             last_staged_flush_attempt: None,
+            staged_revision: 0,
         }
     }
 
@@ -957,7 +1039,58 @@ impl HistoryStore {
         self.read_only
     }
 
+    pub(crate) fn redact_content_enabled(&self) -> bool {
+        self.redact_content
+    }
+
+    /// Creates a v1 writer bound to the exact ownership root, namespace,
+    /// redaction mode, and durable epoch represented by `authority`.
+    /// Construction only validates; it does not create history files.
+    pub fn writer<'store, 'authority, 'lease>(
+        &'store mut self,
+        authority: &'authority HistoryWriteAuthority<'lease>,
+    ) -> io::Result<HistoryV1Writer<'store, 'authority, 'lease>> {
+        let writer = HistoryV1Writer {
+            store: self,
+            authority,
+        };
+        writer.validate()?;
+        Ok(writer)
+    }
+
+    fn validate_v1_authority(&self, authority: &HistoryWriteAuthority<'_>) -> io::Result<()> {
+        let history_root = self.history_root.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "history state directory is unavailable",
+            )
+        })?;
+        authority.validate_v1_namespace(history_root, &self.namespace, self.redact_content)
+    }
+
+    fn validate_v1_authority_if_present(
+        &self,
+        authority: Option<&HistoryWriteAuthority<'_>>,
+    ) -> io::Result<()> {
+        if let Some(authority) = authority {
+            self.validate_v1_authority(authority)?;
+        }
+        Ok(())
+    }
+
     pub fn record(&mut self, observation: &HistoryObservation) -> io::Result<HistoryWriteReport> {
+        self.record_fenced(observation, None)
+    }
+
+    fn record_fenced(
+        &mut self,
+        observation: &HistoryObservation,
+        authority: Option<&HistoryWriteAuthority<'_>>,
+    ) -> io::Result<HistoryWriteReport> {
+        // Reject a stale or incorrectly-bound authority before even creating
+        // the namespace directory or lock file. The same fence is checked
+        // again while holding the namespace lock in record_with_merge_mode.
+        self.validate_v1_authority_if_present(authority)?;
         let redacted_observation = self
             .redact_content
             .then(|| redacted_history_observation(observation));
@@ -968,7 +1101,7 @@ impl HistoryStore {
         #[cfg(windows)]
         let observation = &normalized_observation;
         let full_merge = self.full_merge_due(observation.observed_at);
-        self.record_with_merge_mode(observation, full_merge, full_merge)
+        self.record_with_merge_mode(observation, full_merge, full_merge, authority)
     }
 
     fn full_merge_due(&self, observed_at: DateTime<Utc>) -> bool {
@@ -984,6 +1117,7 @@ impl HistoryStore {
         observation: &HistoryObservation,
         full_merge: bool,
         include_all_observation_points: bool,
+        authority: Option<&HistoryWriteAuthority<'_>>,
     ) -> io::Result<HistoryWriteReport> {
         let mut report = HistoryWriteReport::default();
         let Some(directory) = self.namespace_dir.as_deref() else {
@@ -1000,6 +1134,7 @@ impl HistoryStore {
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        self.validate_v1_authority_if_present(authority)?;
 
         if !self.namespace_checked {
             let preflight = inspect_namespace(directory, &self.namespace);
@@ -1008,6 +1143,7 @@ impl HistoryStore {
                 self.read_only = true;
                 self.cached_data = None;
                 report.read_only = true;
+                self.validate_v1_authority_if_present(authority)?;
                 return Ok(report);
             }
             self.namespace_checked = true;
@@ -1044,7 +1180,9 @@ impl HistoryStore {
             }
             // Commit the independent trusted clock before samples from an
             // untrusted future timestamp can become persisted candidates.
+            self.validate_v1_authority_if_present(authority)?;
             write_retention_clock(directory, &clock)?;
+            self.validate_v1_authority_if_present(authority)?;
             let retention_as_of = clock.trusted_at.min(observation.observed_at);
             datetime_saturating_sub(retention_as_of, Duration::days(HISTORY_RETENTION_DAYS))
         } else {
@@ -1067,6 +1205,7 @@ impl HistoryStore {
                         "{} uses future history format version {version}; writes are disabled",
                         path.display()
                     ));
+                    self.validate_v1_authority_if_present(authority)?;
                     return Ok(report);
                 }
                 ShardRead::FutureMetric(revision) => {
@@ -1077,6 +1216,7 @@ impl HistoryStore {
                         "{} uses future history metric revision {revision}; writes are disabled",
                         path.display()
                     ));
+                    self.validate_v1_authority_if_present(authority)?;
                     return Ok(report);
                 }
                 ShardRead::Corrupt(message) => {
@@ -1100,16 +1240,21 @@ impl HistoryStore {
                 continue;
             }
             shard.sort();
+            self.validate_v1_authority_if_present(authority)?;
             if let Err(error) = write_shard_atomically(&path, &shard) {
                 self.cached_data = None;
+                self.validate_v1_authority_if_present(authority)?;
                 return Err(error);
             }
+            self.validate_v1_authority_if_present(authority)?;
             report.shards_written += 1;
         }
 
         if full_merge {
+            self.validate_v1_authority_if_present(authority)?;
             report.shards_pruned =
                 prune_old_shards(directory, cutoff.date_naive(), &mut report.warnings);
+            self.validate_v1_authority_if_present(authority)?;
             self.last_full_merge_at = Some(observation.observed_at);
         }
         report.read_only = self.read_only;
@@ -1118,6 +1263,7 @@ impl HistoryStore {
         } else {
             self.cached_data = None;
         }
+        self.validate_v1_authority_if_present(authority)?;
         Ok(report)
     }
 
@@ -1128,6 +1274,7 @@ impl HistoryStore {
     /// reset transitions, closed local buckets, and stronger external evidence
     /// retain their normal semantics.
     pub(crate) fn stage(&mut self, observation: &HistoryObservation) {
+        self.staged_revision = self.staged_revision.wrapping_add(1);
         let redacted_observation = self
             .redact_content
             .then(|| redacted_history_observation(observation));
@@ -1173,6 +1320,7 @@ impl HistoryStore {
     /// normal recent-writer overlap. This is reserved for explicit history
     /// reconstruction such as Summary's one-time 30-day backfill.
     pub(crate) fn stage_full_observation(&mut self, observation: &HistoryObservation) {
+        self.staged_revision = self.staged_revision.wrapping_add(1);
         let redacted_observation = self
             .redact_content
             .then(|| redacted_history_observation(observation));
@@ -1214,6 +1362,16 @@ impl HistoryStore {
         completed_at: DateTime<Utc>,
         complete: bool,
     ) -> io::Result<SummaryBackfillAttempt> {
+        self.mark_summary_backfill_attempt_fenced(completed_at, complete, None)
+    }
+
+    fn mark_summary_backfill_attempt_fenced(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        complete: bool,
+        authority: Option<&HistoryWriteAuthority<'_>>,
+    ) -> io::Result<SummaryBackfillAttempt> {
+        self.validate_v1_authority_if_present(authority)?;
         let Some(directory) = self.namespace_dir.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1233,6 +1391,7 @@ impl HistoryStore {
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        self.validate_v1_authority_if_present(authority)?;
 
         let requested = SummaryBackfillMarker::current(completed_at, complete);
         let marker = read_current_summary_backfill_marker(directory)
@@ -1244,7 +1403,9 @@ impl HistoryStore {
         let mut contents = serde_json::to_vec_pretty(&marker)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         contents.push(b'\n');
+        self.validate_v1_authority_if_present(authority)?;
         write_private_atomically(&directory.join(SUMMARY_BACKFILL_MARKER_FILE), &contents)?;
+        self.validate_v1_authority_if_present(authority)?;
         if let Some(data) = self.cached_data.as_mut() {
             data.summary_backfill_attempted_at = Some(marker.completed_at);
             data.summary_backfill_attempt_complete = Some(marker.complete);
@@ -1260,58 +1421,117 @@ impl HistoryStore {
     /// A failed, read-only, or warning-bearing write keeps the staged data so
     /// the live view does not regress and a later attempt can recover it.
     pub(crate) fn flush_staged(&mut self) -> io::Result<Option<HistoryWriteReport>> {
-        self.flush_staged_at(Instant::now())
+        self.flush_staged_at(Instant::now(), None)
     }
 
-    /// Flush staged data once the monotonic batching interval has elapsed.
-    pub(crate) fn flush_staged_if_due(
+    /// Captures staged data for a non-v1 backend while preserving the same
+    /// monotonic batching clock used by the legacy writer.
+    pub(crate) fn prepare_staged_flush(&mut self) -> Option<StagedHistoryFlush> {
+        self.prepare_staged_flush_at(Instant::now())
+    }
+
+    pub(crate) fn prepare_staged_flush_if_due(
         &mut self,
         interval: StdDuration,
-    ) -> io::Result<Option<HistoryWriteReport>> {
-        self.flush_staged_if_due_at(interval, Instant::now())
+    ) -> Option<StagedHistoryFlush> {
+        self.prepare_staged_flush_if_due_at(interval, Instant::now())
+    }
+
+    /// Clears a successfully persisted snapshot only when no newer
+    /// observation was staged after it was captured.
+    pub(crate) fn complete_staged_flush(&mut self, flush: &StagedHistoryFlush) -> bool {
+        if self.staged_revision != flush.revision || self.staged_observation.is_none() {
+            return false;
+        }
+        self.staged_observation = None;
+        self.staged_force_full_merge = false;
+        true
     }
 
     fn flush_staged_if_due_at(
         &mut self,
         interval: StdDuration,
         now: Instant,
+        authority: Option<&HistoryWriteAuthority<'_>>,
     ) -> io::Result<Option<HistoryWriteReport>> {
+        self.validate_v1_authority_if_present(authority)?;
+        let Some(flush) = self.prepare_staged_flush_if_due_at(interval, now) else {
+            return Ok(None);
+        };
+        self.persist_prepared_staged_flush(flush, authority)
+    }
+
+    fn flush_staged_at(
+        &mut self,
+        attempted_at: Instant,
+        authority: Option<&HistoryWriteAuthority<'_>>,
+    ) -> io::Result<Option<HistoryWriteReport>> {
+        self.validate_v1_authority_if_present(authority)?;
+        let Some(flush) = self.prepare_staged_flush_at(attempted_at) else {
+            return Ok(None);
+        };
+        self.persist_prepared_staged_flush(flush, authority)
+    }
+
+    fn persist_prepared_staged_flush(
+        &mut self,
+        flush: StagedHistoryFlush,
+        authority: Option<&HistoryWriteAuthority<'_>>,
+    ) -> io::Result<Option<HistoryWriteReport>> {
+        // The staged observation has already been reduced to the desired
+        // recent/full delta. Persist every staged point so a bucket cannot age
+        // past the overlap boundary while waiting for the batch deadline.
+        let result = self.record_with_merge_mode(
+            flush.observation(),
+            flush.force_full_merge(),
+            true,
+            authority,
+        );
+        if let Ok(report) = &result
+            && !report.read_only
+            && report.warnings.is_empty()
+        {
+            self.complete_staged_flush(&flush);
+        }
+        result.map(Some)
+    }
+
+    fn prepare_staged_flush_if_due_at(
+        &mut self,
+        interval: StdDuration,
+        now: Instant,
+    ) -> Option<StagedHistoryFlush> {
         if self.staged_observation.is_none()
             || self
                 .last_staged_flush_attempt
                 .is_some_and(|last| now.saturating_duration_since(last) < interval)
         {
-            return Ok(None);
+            return None;
         }
-        self.flush_staged_at(now)
+        self.prepare_staged_flush_at(now)
     }
 
-    fn flush_staged_at(&mut self, attempted_at: Instant) -> io::Result<Option<HistoryWriteReport>> {
-        let Some(observation) = self.staged_observation.clone() else {
-            return Ok(None);
-        };
+    fn prepare_staged_flush_at(&mut self, attempted_at: Instant) -> Option<StagedHistoryFlush> {
+        let observation = self.staged_observation.clone()?;
         self.last_staged_flush_attempt = Some(attempted_at);
-        // The staged observation has already been reduced to the desired
-        // recent/full delta. Persist every staged point so a bucket cannot age
-        // past the overlap boundary while waiting for the batch deadline.
-        let result = self.record_with_merge_mode(&observation, self.staged_force_full_merge, true);
-        if let Ok(report) = &result
-            && !report.read_only
-            && report.warnings.is_empty()
-        {
-            self.staged_observation = None;
-            self.staged_force_full_merge = false;
-        }
-        result.map(Some)
+        Some(StagedHistoryFlush {
+            observation,
+            force_full_merge: self.staged_force_full_merge,
+            revision: self.staged_revision,
+        })
     }
 
     /// Load persisted history and overlay any not-yet-flushed TUI observation.
     pub(crate) fn load_since_with_staged(&mut self, since: DateTime<Utc>) -> HistoryData {
         let mut data = self.load_since(since);
-        if let Some(observation) = self.staged_observation.as_ref() {
-            merge_observation_into_history(&mut data, observation, since);
-        }
+        self.overlay_staged_since(&mut data, since);
         data
+    }
+
+    pub(crate) fn overlay_staged_since(&self, data: &mut HistoryData, since: DateTime<Utc>) {
+        if let Some(observation) = self.staged_observation.as_ref() {
+            merge_observation_into_history(data, observation, since);
+        }
     }
 
     /// Reload external writer changes when stale, then restore the staged view.
@@ -1320,9 +1540,7 @@ impl HistoryStore {
         since: DateTime<Utc>,
     ) -> Option<HistoryData> {
         let mut data = self.reload_since_if_stale(since)?;
-        if let Some(observation) = self.staged_observation.as_ref() {
-            merge_observation_into_history(&mut data, observation, since);
-        }
+        self.overlay_staged_since(&mut data, since);
         Some(data)
     }
 
@@ -1337,18 +1555,19 @@ impl HistoryStore {
             data.read_only = self.read_only;
             return data;
         }
-        let mut data = HistoryData::default();
-        let Some(directory) = self.namespace_dir.as_deref() else {
+        let Some(directory) = self.namespace_dir.clone() else {
+            let mut data = HistoryData::default();
             data.warnings
                 .push("history state directory is unavailable".to_string());
             return data;
         };
         if !directory.is_dir() {
-            return data;
+            return HistoryData::default();
         }
-        let lock = match open_lock_file(directory) {
+        let lock = match open_lock_file(&directory) {
             Ok(lock) => lock,
             Err(error) => {
+                let mut data = HistoryData::default();
                 data.warnings.push(format!(
                     "could not open history lock in {}: {error}",
                     directory.display()
@@ -1357,12 +1576,48 @@ impl HistoryStore {
             }
         };
         if let Err(error) = fs2::FileExt::lock_shared(&lock) {
+            let mut data = HistoryData::default();
             data.warnings.push(format!(
                 "could not lock history in {}: {error}",
                 directory.display()
             ));
             return data;
         }
+
+        let data = self.load_since_locked(&directory, since);
+        self.cached_since = Some(since);
+        self.cached_data = Some(data.clone());
+        self.cache_loaded_at = Some(Instant::now());
+        data
+    }
+
+    /// Provides one persisted v1 snapshot while excluding concurrent v1
+    /// writers for the complete consumer operation. This is intentionally
+    /// crate-private and reserved for the one-time source-history cutover; it
+    /// does not overlay staged observations or wire migration into runtime.
+    pub(crate) fn with_exclusive_persisted_snapshot_since<R, F>(
+        &mut self,
+        since: DateTime<Utc>,
+        consume: F,
+    ) -> io::Result<R>
+    where
+        F: FnOnce(&HistoryData) -> io::Result<R>,
+    {
+        let directory = self.namespace_dir.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "history state directory is unavailable",
+            )
+        })?;
+        create_private_directory(&directory)?;
+        let lock = open_lock_file(&directory)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let data = self.load_since_locked(&directory, since);
+        consume(&data)
+    }
+
+    fn load_since_locked(&mut self, directory: &Path, since: DateTime<Utc>) -> HistoryData {
+        let mut data = HistoryData::default();
 
         let entries = match shard_entries(directory) {
             Ok(entries) => entries,
@@ -1430,9 +1685,6 @@ impl HistoryStore {
             data.summary_backfill_attempted_at = Some(marker.completed_at);
             data.summary_backfill_attempt_complete = Some(marker.complete);
         }
-        self.cached_since = Some(since);
-        self.cached_data = Some(data.clone());
-        self.cache_loaded_at = Some(Instant::now());
         data
     }
 
@@ -1547,7 +1799,7 @@ fn merge_history_observation(
         .sort_by_key(|point| point.observed_at);
 }
 
-fn redacted_history_observation(observation: &HistoryObservation) -> HistoryObservation {
+pub(crate) fn redacted_history_observation(observation: &HistoryObservation) -> HistoryObservation {
     let mut observation = observation.clone();
     for bucket in &mut observation.half_hour_buckets {
         redact_project_group_titles(&mut bucket.project_groups);
@@ -2953,7 +3205,7 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
     ShardRead::Current { shard, migrated }
 }
 
-fn is_current_local_bucket(bucket: &LocalHalfHourBucket) -> bool {
+pub(crate) fn is_current_local_bucket(bucket: &LocalHalfHourBucket) -> bool {
     datetime_saturating_add(bucket.starts_at, Duration::seconds(LOCAL_BUCKET_SECS))
         == bucket.ends_at
         && floor_local_bucket(bucket.starts_at) == bucket.starts_at
@@ -2992,7 +3244,7 @@ fn can_promote_closed_empty_project_bucket(bucket: &LocalHalfHourBucket) -> bool
         && bucket.partial_reasons.is_empty()
 }
 
-fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
+pub(crate) fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> bool {
     let slot = incoming
         .observed_at
         .timestamp()
@@ -3027,7 +3279,7 @@ fn upsert_quota_point(points: &mut Vec<QuotaPoint>, incoming: QuotaPoint) -> boo
     }
 }
 
-fn upsert_half_hour_bucket(
+pub(crate) fn upsert_half_hour_bucket(
     buckets: &mut Vec<LocalHalfHourBucket>,
     mut incoming: LocalHalfHourBucket,
 ) -> bool {
@@ -4228,6 +4480,11 @@ mod tests {
         AgentInteraction, AgentInteractionKind, Confidence, LimitWindow, TaskStatus, TurnRecord,
         TurnStatus, UsageCall,
     };
+    use crate::history_ownership::{
+        HistoryOwnershipManifest, HistoryOwnershipState, HistoryOwnershipStore, HistoryWriterLease,
+        InitializeV1Outcome, OwnershipCasOutcome,
+    };
+    use crate::source_history::RedactionProfile;
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
@@ -4243,6 +4500,36 @@ mod tests {
         }
     }
 
+    fn v1_ownership_for_store(state_root: &Path, store: &HistoryStore) -> HistoryOwnershipStore {
+        let profile = if store.redact_content {
+            store
+                .namespace()
+                .strip_suffix("-redacted")
+                .expect("redacted v1 namespaces carry the redaction suffix")
+        } else {
+            store.namespace()
+        };
+        HistoryOwnershipStore::new(
+            state_root.to_path_buf(),
+            profile.parse().unwrap(),
+            if store.redact_content {
+                RedactionProfile::Redacted
+            } else {
+                RedactionProfile::PreviewEnabled
+            },
+        )
+    }
+
+    fn initialize_v1(
+        ownership: &HistoryOwnershipStore,
+        lease: &HistoryWriterLease,
+    ) -> HistoryOwnershipManifest {
+        match ownership.initialize_v1_active(lease).unwrap() {
+            InitializeV1Outcome::Initialized(manifest)
+            | InitializeV1Outcome::Existing(manifest) => manifest,
+        }
+    }
+
     fn call(
         timestamp: DateTime<Utc>,
         model: &str,
@@ -4253,6 +4540,8 @@ mod tests {
             timestamp,
             thread_id: "thread".to_string(),
             turn_id: Some("turn".to_string()),
+            usage_event_id: None,
+            usage_event_identity_exact: false,
             model: Some(model.to_string()),
             service_tier: service_tier.map(str::to_string),
             tokens: usage(total),
@@ -5966,7 +6255,7 @@ mod tests {
         });
         assert!(
             store
-                .flush_staged_if_due_at(interval, first_attempt)
+                .flush_staged_if_due_at(interval, first_attempt, None)
                 .unwrap()
                 .is_some()
         );
@@ -5985,7 +6274,7 @@ mod tests {
         });
         assert!(
             store
-                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(29),)
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(29), None,)
                 .unwrap()
                 .is_none()
         );
@@ -6005,7 +6294,7 @@ mod tests {
 
         assert!(
             store
-                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(30),)
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(30), None,)
                 .unwrap()
                 .is_some()
         );
@@ -6017,6 +6306,75 @@ mod tests {
                 .total_tokens,
             20
         );
+    }
+
+    #[test]
+    fn externally_completed_staged_flush_does_not_clear_a_newer_observation() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let since = starts_at - Duration::minutes(1);
+        let mut store = HistoryStore::new(history_root, &codex_home);
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(5),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(5),
+                10,
+                100,
+            )],
+            ..HistoryObservation::default()
+        });
+        let prepared = store.prepare_staged_flush().unwrap();
+        assert_eq!(prepared.observation().half_hour_buckets.len(), 1);
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(6),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(6),
+                20,
+                200,
+            )],
+            ..HistoryObservation::default()
+        });
+
+        assert!(!store.complete_staged_flush(&prepared));
+        assert_eq!(
+            store.load_since_with_staged(since).half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert!(store.staged_observation.is_some());
+    }
+
+    #[test]
+    fn externally_completed_staged_flush_clears_the_exact_snapshot() {
+        let directory = tempdir().unwrap();
+        let history_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut store = HistoryStore::new(history_root, &codex_home);
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(5),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(5),
+                10,
+                100,
+            )],
+            ..HistoryObservation::default()
+        });
+        let prepared = store.prepare_staged_flush().unwrap();
+
+        assert!(store.complete_staged_flush(&prepared));
+        assert!(store.staged_observation.is_none());
+        assert!(!store.staged_force_full_merge);
+        assert!(!store.complete_staged_flush(&prepared));
     }
 
     #[test]
@@ -6457,13 +6815,13 @@ mod tests {
 
         assert!(
             store
-                .flush_staged_if_due_at(interval, first_attempt)
+                .flush_staged_if_due_at(interval, first_attempt, None)
                 .is_err()
         );
         assert!(store.staged_observation.is_some());
         assert!(
             store
-                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(1),)
+                .flush_staged_if_due_at(interval, first_attempt + StdDuration::from_secs(1), None,)
                 .unwrap()
                 .is_none()
         );
@@ -7890,6 +8248,254 @@ mod tests {
             Some(40.0)
         );
         assert!(cumulative.last().unwrap().partial_reasons.is_empty());
+    }
+
+    #[test]
+    fn v1_writer_authorizes_record_staged_flush_and_summary_marker() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let history_root = state_root.join(HISTORY_DIRECTORY);
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut store = HistoryStore::new(history_root.clone(), &codex_home);
+        let ownership = v1_ownership_for_store(&state_root, &store);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let manifest = initialize_v1(&ownership, &lease);
+        let authority = ownership.authorize_v1_write(&lease, &manifest).unwrap();
+
+        {
+            let mut writer = store.writer(&authority).unwrap();
+            let report = writer
+                .record(&HistoryObservation {
+                    observed_at: starts_at + Duration::minutes(5),
+                    half_hour_buckets: vec![local_bucket(
+                        starts_at,
+                        starts_at + Duration::minutes(5),
+                        10,
+                        100,
+                    )],
+                    ..HistoryObservation::default()
+                })
+                .unwrap();
+            assert_eq!(report.shards_written, 1);
+        }
+
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(6),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(6),
+                20,
+                200,
+            )],
+            ..HistoryObservation::default()
+        });
+        {
+            let mut writer = store.writer(&authority).unwrap();
+            assert!(writer.flush_staged().unwrap().is_some());
+            let marker = writer
+                .mark_summary_backfill_attempt(starts_at + Duration::minutes(7), true)
+                .unwrap();
+            assert_eq!(marker.completed_at(), starts_at + Duration::minutes(7));
+            assert!(marker.is_complete());
+        }
+
+        let data = HistoryStore::new(history_root, &codex_home)
+            .load_since(starts_at - Duration::minutes(1));
+        assert_eq!(data.half_hour_buckets.len(), 1);
+        assert_eq!(data.half_hour_buckets[0].token_usage.total_tokens, 20);
+        assert_eq!(
+            data.summary_backfill_attempted_at,
+            Some(starts_at + Duration::minutes(7))
+        );
+        assert_eq!(data.summary_backfill_attempt_complete, Some(true));
+    }
+
+    #[test]
+    fn v1_writer_rejects_wrong_root_namespace_and_redaction_without_writing() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let history_root = state_root.join(HISTORY_DIRECTORY);
+        let codex_home = directory.path().join("codex");
+        let mut exact = HistoryStore::new(history_root, &codex_home);
+        let ownership = v1_ownership_for_store(&state_root, &exact);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let manifest = initialize_v1(&ownership, &lease);
+        let authority = ownership.authorize_v1_write(&lease, &manifest).unwrap();
+        exact.writer(&authority).unwrap().validate().unwrap();
+
+        let wrong_root = directory.path().join("other-state").join(HISTORY_DIRECTORY);
+        let mut wrong_root_store = HistoryStore::new(wrong_root.clone(), &codex_home);
+        let error = match wrong_root_store.writer(&authority) {
+            Ok(_) => panic!("a foreign state root must not accept the authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!wrong_root.exists());
+
+        let mut wrong_namespace = HistoryStore::new(
+            state_root.join(HISTORY_DIRECTORY),
+            &directory.path().join("other-codex"),
+        );
+        let wrong_namespace_dir = wrong_namespace.namespace_dir().unwrap().to_path_buf();
+        let error = match wrong_namespace.writer(&authority) {
+            Ok(_) => panic!("a foreign profile must not accept the authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!wrong_namespace_dir.exists());
+
+        let mut wrong_redaction =
+            HistoryStore::new_with_redaction(state_root.join(HISTORY_DIRECTORY), &codex_home, true);
+        let wrong_redaction_dir = wrong_redaction.namespace_dir().unwrap().to_path_buf();
+        let error = match wrong_redaction.writer(&authority) {
+            Ok(_) => panic!("a foreign redaction mode must not accept the authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!wrong_redaction_dir.exists());
+    }
+
+    #[test]
+    fn v1_writer_revalidates_stale_authority_before_every_persistence_api() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let history_root = state_root.join(HISTORY_DIRECTORY);
+        let codex_home = directory.path().join("codex");
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let mut store = HistoryStore::new(history_root, &codex_home);
+        store.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(5),
+            half_hour_buckets: vec![local_bucket(
+                starts_at,
+                starts_at + Duration::minutes(5),
+                10,
+                100,
+            )],
+            ..HistoryObservation::default()
+        });
+        let namespace_dir = store.namespace_dir().unwrap().to_path_buf();
+        let ownership = v1_ownership_for_store(&state_root, &store);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let manifest = initialize_v1(&ownership, &lease);
+        let authority = ownership.authorize_v1_write(&lease, &manifest).unwrap();
+        {
+            let mut writer = store.writer(&authority).unwrap();
+
+            let migrating = match ownership.begin_migration(&lease, &manifest).unwrap() {
+                OwnershipCasOutcome::Applied(manifest) => manifest,
+                OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+            };
+            assert_eq!(migrating.state(), HistoryOwnershipState::Migrating);
+
+            let observation = HistoryObservation {
+                observed_at: starts_at + Duration::minutes(6),
+                ..HistoryObservation::default()
+            };
+            assert_eq!(
+                writer.record(&observation).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                writer.flush_staged().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                writer
+                    .flush_staged_if_due(StdDuration::ZERO)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                writer
+                    .mark_summary_backfill_attempt(starts_at + Duration::minutes(7), true)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+
+        assert!(store.staged_observation.is_some());
+        assert!(!namespace_dir.exists());
+    }
+
+    #[test]
+    fn competing_v1_writers_share_one_ownership_and_namespace_lock_domain() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let history_root = state_root.join(HISTORY_DIRECTORY);
+        let codex_home = directory.path().join("codex");
+        let probe = HistoryStore::new(history_root.clone(), &codex_home);
+        let profile: String = probe.namespace().to_owned();
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for index in 0..4 {
+            let state_root = state_root.clone();
+            let history_root = history_root.clone();
+            let codex_home = codex_home.clone();
+            let profile = profile.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let mut store = HistoryStore::new(history_root, &codex_home);
+                let ownership = HistoryOwnershipStore::new(
+                    state_root,
+                    profile.parse().unwrap(),
+                    RedactionProfile::PreviewEnabled,
+                );
+                barrier.wait();
+                let lease = ownership.acquire_writer_lease().unwrap();
+                let manifest = initialize_v1(&ownership, &lease);
+                let authority = ownership.authorize_v1_write(&lease, &manifest).unwrap();
+                let starts_at = at(2026, 7, 28, 10 + index, 0, 0);
+                store
+                    .writer(&authority)
+                    .unwrap()
+                    .record(&HistoryObservation {
+                        observed_at: at(2026, 7, 28, 14, 0, 0),
+                        half_hour_buckets: vec![local_bucket(
+                            starts_at,
+                            starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES),
+                            index as u64 + 1,
+                            index as u128 + 1,
+                        )],
+                        ..HistoryObservation::default()
+                    })
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut store = HistoryStore::new(history_root, &codex_home);
+        let data = store.load_since(at(2026, 7, 28, 0, 0, 0));
+        assert_eq!(data.half_hour_buckets.len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v1_writer_rejects_case_aliases_to_the_windows_history_root() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let codex_home = directory.path().join("CodexHome");
+        let mut exact = HistoryStore::new(state_root.join(HISTORY_DIRECTORY), &codex_home);
+        let ownership = v1_ownership_for_store(&state_root, &exact);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let manifest = initialize_v1(&ownership, &lease);
+        let authority = ownership.authorize_v1_write(&lease, &manifest).unwrap();
+        exact.writer(&authority).unwrap();
+
+        // Windows normally resolves this to the same directory, but accepting
+        // a lexical alias would make the history lock and ownership lease use
+        // different coordination identities on case-sensitive directories.
+        let mut alias = HistoryStore::new(state_root.join("HISTORY-V1"), &codex_home);
+        let error = match alias.writer(&authority) {
+            Ok(_) => panic!("a case alias must not accept the exact-root authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

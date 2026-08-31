@@ -9,10 +9,13 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::bounded_io::{BoundedLine, read_bounded_line};
-use crate::cache::write_private_atomically;
+use crate::cache::{
+    validate_private_cache_directory, validate_private_cache_file, write_private_atomically,
+};
 use crate::config::CollectConfig;
 use crate::domain::{
     AgentInteraction, AgentInteractionKind, CollectionStats, Confidence, LimitWindow, Provenance,
@@ -22,11 +25,14 @@ use crate::domain::{
 use crate::session_index::load_thread_titles;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
-const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 1;
+const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 3;
 // Bump when the projected event schema or replay semantics change.
 const ROLLOUT_PARSER_REVISION: u32 = 13;
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PERSISTENT_PREFIX_HASH_BYTES: u64 = 8 * 1024 * 1024;
+const LARGE_PREFIX_GUARD_WINDOWS: usize = 3;
+const LARGE_PREFIX_GUARD_WINDOW_BYTES: usize = 1024;
 const MAX_PERSISTENT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PERSISTENT_CACHE_ENTRIES: usize = 2_000;
 const PERSISTENT_WRITE_DEBOUNCE: Duration = Duration::from_secs(30);
@@ -46,6 +52,8 @@ const LOCAL_COVERAGE_BUCKET_SECONDS: i64 = 15 * 60;
 const ROLLOUT_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 const ROLLOUT_MAX_WARNINGS_PER_FILE: usize = 64;
 const ROLLOUT_MAX_WARNINGS: usize = 128;
+const USAGE_EVENT_ID_DOMAIN: &[u8] = b"codex-usage-monit/usage-event/fallback/v1\0";
+const USAGE_EVENT_ID_PREFIX: &str = "usage-sha256-v1-";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -54,7 +62,7 @@ struct RolloutFile {
     fingerprint: FileFingerprint,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct FileFingerprint {
     len: u64,
     modified: SystemTime,
@@ -67,18 +75,24 @@ struct FileFingerprint {
     #[cfg(unix)]
     ctime_nsec: i64,
     #[cfg(windows)]
+    volume_serial: Option<u64>,
+    #[cfg(windows)]
+    file_id: Option<[u8; 16]>,
+    #[cfg(windows)]
     creation_time: u64,
     #[cfg(windows)]
     last_write_time: u64,
 }
 
 impl FileFingerprint {
-    fn from_metadata(metadata: &Metadata) -> std::io::Result<Self> {
+    fn from_path_and_metadata(_path: &Path, metadata: &Metadata) -> std::io::Result<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         #[cfg(windows)]
         use std::os::windows::fs::MetadataExt;
 
+        #[cfg(windows)]
+        let stable_identity = windows_stable_file_identity(_path).ok();
         Ok(Self {
             len: metadata.len(),
             modified: metadata.modified()?,
@@ -90,6 +104,10 @@ impl FileFingerprint {
             ctime: metadata.ctime(),
             #[cfg(unix)]
             ctime_nsec: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            volume_serial: stable_identity.map(|identity| identity.0),
+            #[cfg(windows)]
+            file_id: stable_identity.map(|identity| identity.1),
             #[cfg(windows)]
             creation_time: metadata.creation_time(),
             #[cfg(windows)]
@@ -104,10 +122,123 @@ impl FileFingerprint {
         }
         #[cfg(windows)]
         {
-            return self.creation_time == other.creation_time;
+            return windows_stable_identity_matches(
+                self.volume_serial,
+                self.file_id,
+                other.volume_serial,
+                other.file_id,
+            );
         }
         #[allow(unreachable_code)]
         false
+    }
+}
+
+impl PartialEq for FileFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len || self.modified != other.modified {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            return self.dev == other.dev
+                && self.ino == other.ino
+                && self.ctime == other.ctime
+                && self.ctime_nsec == other.ctime_nsec;
+        }
+        #[cfg(windows)]
+        {
+            return windows_snapshot_identity_matches(
+                self.creation_time,
+                self.last_write_time,
+                self.volume_serial,
+                self.file_id,
+                other.creation_time,
+                other.last_write_time,
+                other.volume_serial,
+                other.file_id,
+            );
+        }
+        #[allow(unreachable_code)]
+        true
+    }
+}
+
+impl Eq for FileFingerprint {}
+
+#[cfg(windows)]
+fn windows_stable_file_identity(path: &Path) -> std::io::Result<(u64, [u8; 16])> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let file = options.open(path)?;
+    let mut info: FILE_ID_INFO = unsafe { zeroed() };
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+#[cfg(any(windows, test))]
+fn windows_stable_identity_matches(
+    left_volume: Option<u64>,
+    left_id: Option<[u8; 16]>,
+    right_volume: Option<u64>,
+    right_id: Option<[u8; 16]>,
+) -> bool {
+    matches!(
+        (left_volume, left_id, right_volume, right_id),
+        (Some(left_volume), Some(left_id), Some(right_volume), Some(right_id))
+            if left_volume == right_volume && left_id == right_id
+    )
+}
+
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+fn windows_snapshot_identity_matches(
+    left_creation_time: u64,
+    left_last_write_time: u64,
+    left_volume: Option<u64>,
+    left_id: Option<[u8; 16]>,
+    right_creation_time: u64,
+    right_last_write_time: u64,
+    right_volume: Option<u64>,
+    right_id: Option<[u8; 16]>,
+) -> bool {
+    if left_creation_time != right_creation_time || left_last_write_time != right_last_write_time {
+        return false;
+    }
+    match (left_volume, left_id, right_volume, right_id) {
+        (Some(left_volume), Some(left_id), Some(right_volume), Some(right_id)) => {
+            left_volume == right_volume && left_id == right_id
+        }
+        // Some filesystems and network shares do not support FileIdInfo. A
+        // stable metadata fallback keeps pre/post-read and directory checks
+        // usable, while `same_source_identity` above still refuses tail reuse
+        // unless both sides have a complete stable identity.
+        (None, None, None, None) => true,
+        // A one-sided identity query failure cannot prove that the path still
+        // names the same object. A later stable probe can recover naturally.
+        _ => false,
     }
 }
 
@@ -313,6 +444,9 @@ struct ReplayRange {
 pub struct RolloutCacheRefresh {
     /// Whether this refresh walked the complete rollout directory tree.
     pub discovery_full_scan: bool,
+    /// Whether the inventory used by this refresh was complete. Defaults to
+    /// false until discovery has produced an inventory for the current scan.
+    pub discovery_complete: bool,
     /// Whether the in-memory discovery inventory was reused.
     pub discovery_cache_hit: bool,
     /// Whether a cached inventory was discarded after a metadata/config check.
@@ -327,10 +461,31 @@ pub struct RolloutCacheRefresh {
     pub tail_parsed_files: usize,
     /// New bytes consumed by successful append-only tail parsing.
     pub tail_parsed_bytes: u64,
+    /// Source bytes read to validate cached byte-boundary tail guards. A
+    /// restart tail hit validates once during hydration and once before seek.
+    pub tail_guard_validation_bytes: u64,
     /// Files parsed from byte zero, including new/replaced/truncated files.
     pub full_parsed_files: usize,
+    /// Source bytes consumed when the stable result required a parse from byte
+    /// zero. Earlier failed/tail retries are included because they are real I/O.
+    pub full_parsed_bytes: u64,
     /// Files hydrated from the user-level parsed rollout cache.
     pub disk_reused_files: usize,
+    /// Unchanged files hydrated from disk without parsing rollout JSON.
+    pub disk_exact_reused_files: usize,
+    /// Growing files whose validated persisted prefix was hydrated so parsing
+    /// could resume at the previous byte boundary in a fresh process.
+    pub disk_tail_reused_files: usize,
+    /// Unchanged large files validated with bounded guards and hydrated from
+    /// disk without parsing rollout JSON.
+    pub disk_large_exact_reused_files: usize,
+    /// Growing large files validated with bounded guards and resumed from a
+    /// persisted byte boundary in a fresh process.
+    pub disk_large_tail_reused_files: usize,
+    /// Source bytes read solely to validate or create persistent cache hashes.
+    pub persistent_hash_bytes: u64,
+    /// Subset of `persistent_hash_bytes` read for bounded large-prefix guards.
+    pub persistent_large_guard_bytes: u64,
     /// Persistent entries that were absent or stale for the current fingerprint.
     pub disk_misses: usize,
     /// Persistent entries that could not be decoded or validated.
@@ -341,7 +496,8 @@ pub struct RolloutCacheRefresh {
     pub disk_write_failures: usize,
     /// Dirty entries deferred while a previous write failure is backing off.
     pub disk_deferred_files: usize,
-    /// Entries that exceeded the per-file cache safety limit and were not written.
+    /// Entries whose bounded serialized form exceeded a cache safety limit and
+    /// were not written.
     pub disk_oversized_files: usize,
     /// Milliseconds until deferred persistent writes are eligible to retry.
     pub disk_write_retry_ms: u64,
@@ -453,6 +609,32 @@ pub struct RolloutCache {
     local_coverage_last_complete_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistentPrefixGuard {
+    offset: u64,
+    len: u16,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum PersistentSourceValidation {
+    FullPrefixSha256 {
+        sha256: [u8; 32],
+    },
+    BoundedPrefixGuards {
+        prefix_len: u64,
+        guards: [PersistentPrefixGuard; LARGE_PREFIX_GUARD_WINDOWS],
+    },
+}
+
+impl PersistentSourceValidation {
+    fn uses_bounded_guards(&self) -> bool {
+        matches!(self, Self::BoundedPrefixGuards { .. })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistentFileEntry {
@@ -460,6 +642,8 @@ struct PersistentFileEntry {
     parser_revision: u32,
     key: CacheKey,
     source_path: PathBuf,
+    #[serde(default)]
+    source_validation: Option<PersistentSourceValidation>,
     cached: CachedFile,
 }
 
@@ -470,15 +654,24 @@ struct PersistentFileEntryRef<'a> {
     parser_revision: u32,
     key: &'a CacheKey,
     source_path: &'a Path,
+    source_validation: &'a PersistentSourceValidation,
     cached: &'a CachedFile,
 }
 
 enum PersistentLoad {
-    Hit(Box<CachedFile>),
+    Exact {
+        cached: Box<CachedFile>,
+        bounded_guards: bool,
+    },
+    AppendPrefix {
+        cached: Box<CachedFile>,
+        bounded_guards: bool,
+    },
     Miss,
     Corrupt,
 }
 
+#[derive(Debug)]
 enum PersistentWriteError {
     Oversized,
     Other,
@@ -494,6 +687,8 @@ struct PersistentWriteSummary {
     pruned_entries: usize,
     pruned_temps: usize,
     maintenance_ran: bool,
+    hash_bytes: u64,
+    large_guard_bytes: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -834,6 +1029,7 @@ impl RolloutCache {
             .discovery_cache
             .as_ref()
             .expect("discovery always initializes its inventory");
+        refresh.discovery_complete = cache.complete;
         let files = select_rollout_files(cache, config, now, dataset, suppressed_warnings);
         let selected_paths = files
             .iter()
@@ -1031,15 +1227,37 @@ impl RolloutCache {
 
         let cache_load_started = perf_active.then(Instant::now);
         let cache_load_span = config.startup_trace.span("rollout.cache_load");
+        let mut disk_tail_candidates = HashMap::new();
         if let Some(cache_root) = config.rollout_cache_dir.as_deref() {
             for file in &files {
                 if self.files.contains_key(&file.path) {
                     continue;
                 }
-                match load_persistent_file(cache_root, &key, file) {
-                    PersistentLoad::Hit(cached) => {
+                match load_persistent_file(
+                    cache_root,
+                    &key,
+                    file,
+                    &mut refresh.persistent_hash_bytes,
+                    &mut refresh.persistent_large_guard_bytes,
+                    &mut refresh.tail_guard_validation_bytes,
+                ) {
+                    PersistentLoad::Exact {
+                        cached,
+                        bounded_guards,
+                    } => {
                         self.files.insert(file.path.clone(), *cached);
                         refresh.disk_reused_files += 1;
+                        refresh.disk_exact_reused_files += 1;
+                        if bounded_guards {
+                            refresh.disk_large_exact_reused_files += 1;
+                        }
+                    }
+                    PersistentLoad::AppendPrefix {
+                        cached,
+                        bounded_guards,
+                    } => {
+                        self.files.insert(file.path.clone(), *cached);
+                        disk_tail_candidates.insert(file.path.clone(), bounded_guards);
                     }
                     PersistentLoad::Miss => refresh.disk_misses += 1,
                     PersistentLoad::Corrupt => refresh.disk_corrupt_files += 1,
@@ -1049,11 +1267,16 @@ impl RolloutCache {
         refresh.cache_load_us = elapsed_micros(cache_load_started);
         cache_load_span.finish_with(|| {
             format!(
-                "enabled={} loaded={} misses={} corrupt={}",
+                "enabled={} loaded={} exact={} large_exact={} tail_candidates={} misses={} corrupt={} hash_bytes={} large_guard_bytes={}",
                 config.rollout_cache_dir.is_some(),
                 refresh.disk_reused_files,
+                refresh.disk_exact_reused_files,
+                refresh.disk_large_exact_reused_files,
+                disk_tail_candidates.len(),
                 refresh.disk_misses,
-                refresh.disk_corrupt_files
+                refresh.disk_corrupt_files,
+                refresh.persistent_hash_bytes,
+                refresh.persistent_large_guard_bytes
             )
         });
 
@@ -1082,6 +1305,9 @@ impl RolloutCache {
             }
             let file_started = trace_active.then(Instant::now);
             let parsed = refresh_stable_rollout_file(file, config, previous);
+            refresh.tail_guard_validation_bytes = refresh
+                .tail_guard_validation_bytes
+                .saturating_add(parsed.tail_guard_validation_bytes);
             let cached = parsed.cached;
             if let Some(file_started) = file_started {
                 let parse_us = file_started.elapsed().as_micros();
@@ -1098,8 +1324,19 @@ impl RolloutCache {
                 refresh.tail_parsed_bytes = refresh
                     .tail_parsed_bytes
                     .saturating_add(parsed.parsed_bytes);
+                if let Some(bounded_guards) = disk_tail_candidates.remove(&file.path) {
+                    refresh.disk_reused_files += 1;
+                    refresh.disk_tail_reused_files += 1;
+                    if bounded_guards {
+                        refresh.disk_large_tail_reused_files += 1;
+                    }
+                }
             } else {
+                disk_tail_candidates.remove(&file.path);
                 refresh.full_parsed_files += 1;
+                refresh.full_parsed_bytes = refresh
+                    .full_parsed_bytes
+                    .saturating_add(parsed.parsed_bytes);
             }
             let cacheable = cached.parsed.complete;
             let fingerprint_len = cached.fingerprint.len;
@@ -1140,14 +1377,20 @@ impl RolloutCache {
             foreign_baseline_events,
         };
         parse_span.finish_with(|| format!(
-            "files={} reparsed={} tail_parsed={} tail_bytes={} full_parsed={} reused={} disk_reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
+            "files={} reparsed={} tail_parsed={} tail_bytes={} tail_guard_bytes={} full_parsed={} full_bytes={} reused={} disk_reused={} disk_exact_reused={} disk_tail_reused={} disk_large_exact_reused={} disk_large_tail_reused={} retries={} bytes={selected_bytes} lines={parsed_lines} slowest_us={slowest_parse_us} slowest_bytes={slowest_file_bytes}",
             files.len(),
             refresh.reparsed_files,
             refresh.tail_parsed_files,
             refresh.tail_parsed_bytes,
+            refresh.tail_guard_validation_bytes,
             refresh.full_parsed_files,
+            refresh.full_parsed_bytes,
             refresh.reused_files,
             refresh.disk_reused_files,
+            refresh.disk_exact_reused_files,
+            refresh.disk_tail_reused_files,
+            refresh.disk_large_exact_reused_files,
+            refresh.disk_large_tail_reused_files,
             refresh.stability_retries
         ));
 
@@ -1171,13 +1414,19 @@ impl RolloutCache {
         refresh.disk_write_retry_ms = write.retry_ms;
         refresh.disk_pruned_files += write.pruned_entries;
         refresh.disk_pruned_temp_files += write.pruned_temps;
+        refresh.persistent_hash_bytes = refresh
+            .persistent_hash_bytes
+            .saturating_add(write.hash_bytes);
+        refresh.persistent_large_guard_bytes = refresh
+            .persistent_large_guard_bytes
+            .saturating_add(write.large_guard_bytes);
         if write.maintenance_ran {
             self.last_disk_prune = Some(Instant::now());
         }
         refresh.cache_save_us = elapsed_micros(cache_save_started);
         cache_save_span.finish_with(|| {
             format!(
-                "enabled={} written={} failures={} deferred={} oversized={} retry_ms={} pruned={} temp_pruned={}",
+                "enabled={} written={} failures={} deferred={} oversized={} retry_ms={} pruned={} temp_pruned={} hash_bytes={} large_guard_bytes={}",
                 config.rollout_cache_dir.is_some(),
                 refresh.disk_written_files,
                 refresh.disk_write_failures,
@@ -1185,7 +1434,9 @@ impl RolloutCache {
                 refresh.disk_oversized_files,
                 refresh.disk_write_retry_ms,
                 refresh.disk_pruned_files,
-                refresh.disk_pruned_temp_files
+                refresh.disk_pruned_temp_files,
+                write.hash_bytes,
+                write.large_guard_bytes
             )
         });
 
@@ -1457,12 +1708,20 @@ impl RolloutCache {
                 .startup_trace
                 .record_with("rollout.total", scan_started, || {
                 format!(
-                "files={} lines={} bytes={selected_bytes} reparsed={} reused={} disk_reused={} disk_written={} disk_failures={} disk_deferred={} disk_oversized={} disk_retry_ms={} disk_pruned={} disk_temp_pruned={} retries={} rebuilt={}",
+                "files={} lines={} bytes={selected_bytes} reparsed={} full_bytes={} tail_guard_bytes={} reused={} disk_reused={} disk_exact_reused={} disk_tail_reused={} disk_large_exact_reused={} disk_large_tail_reused={} persistent_hash_bytes={} persistent_large_guard_bytes={} disk_written={} disk_failures={} disk_deferred={} disk_oversized={} disk_retry_ms={} disk_pruned={} disk_temp_pruned={} retries={} rebuilt={}",
                 dataset.stats.scanned_files,
                 dataset.stats.parsed_lines,
                 refresh.reparsed_files,
+                refresh.full_parsed_bytes,
+                refresh.tail_guard_validation_bytes,
                 refresh.reused_files,
                 refresh.disk_reused_files,
+                refresh.disk_exact_reused_files,
+                refresh.disk_tail_reused_files,
+                refresh.disk_large_exact_reused_files,
+                refresh.disk_large_tail_reused_files,
+                refresh.persistent_hash_bytes,
+                refresh.persistent_large_guard_bytes,
                 refresh.disk_written_files,
                 refresh.disk_write_failures,
                 refresh.disk_deferred_files,
@@ -1562,7 +1821,14 @@ impl RolloutCache {
                 continue;
             }
             self.unpersistable_files.remove(&path);
-            let contents = match serialize_persistent_entry(key, &path, cached, max_entry_bytes) {
+            let contents = match serialize_persistent_entry(
+                key,
+                &path,
+                cached,
+                max_entry_bytes,
+                &mut summary.hash_bytes,
+                &mut summary.large_guard_bytes,
+            ) {
                 Ok(contents) => contents,
                 Err(PersistentWriteError::Oversized) => {
                     summary.oversized += 1;
@@ -1661,7 +1927,7 @@ impl RolloutCache {
                 return;
             }
         };
-        let fingerprint = match FileFingerprint::from_metadata(&metadata) {
+        let fingerprint = match FileFingerprint::from_path_and_metadata(&path, &metadata) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.session_titles = SessionTitleCache::default();
@@ -1715,18 +1981,18 @@ impl RolloutCache {
     }
 }
 
-fn load_persistent_file(cache_root: &Path, key: &CacheKey, file: &RolloutFile) -> PersistentLoad {
+fn load_persistent_file(
+    cache_root: &Path,
+    key: &CacheKey,
+    file: &RolloutFile,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
+    tail_guard_bytes: &mut u64,
+) -> PersistentLoad {
     let entry_path = persistent_entry_path(cache_root, key, &file.path);
-    let metadata = match entry_path.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return PersistentLoad::Miss,
-        Err(_) => return PersistentLoad::Corrupt,
-    };
-    if !metadata.is_file() || metadata.len() > MAX_PERSISTENT_ENTRY_BYTES {
-        return PersistentLoad::Corrupt;
-    }
-    let contents = match fs::read(&entry_path) {
+    let contents = match read_persistent_entry_bounded(&entry_path) {
         Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return PersistentLoad::Miss,
         Err(_) => return PersistentLoad::Corrupt,
     };
     let entry: PersistentFileEntry = match serde_json::from_slice(&contents) {
@@ -1737,7 +2003,6 @@ fn load_persistent_file(cache_root: &Path, key: &CacheKey, file: &RolloutFile) -
         || entry.parser_revision != ROLLOUT_PARSER_REVISION
         || entry.key != *key
         || entry.source_path != file.path
-        || entry.cached.fingerprint != file.fingerprint
         || !entry.cached.parsed.complete
     {
         return PersistentLoad::Miss;
@@ -1748,7 +2013,67 @@ fn load_persistent_file(cache_root: &Path, key: &CacheKey, file: &RolloutFile) -
     {
         return PersistentLoad::Miss;
     }
-    PersistentLoad::Hit(Box::new(entry.cached))
+    let Some(source_validation) = entry.source_validation.as_ref() else {
+        return PersistentLoad::Miss;
+    };
+    let exact = entry.cached.fingerprint == file.fingerprint;
+    let append_prefix = can_tail_parse(&entry.cached, file);
+    if !source_validation_shape_is_valid(
+        entry.cached.fingerprint.len,
+        file.fingerprint.len,
+        source_validation,
+    ) {
+        return PersistentLoad::Miss;
+    }
+    let bounded_guards = source_validation.uses_bounded_guards();
+    if exact {
+        return if inspect_rollout_file(&file.path)
+            .is_ok_and(|current| current.fingerprint == file.fingerprint)
+        {
+            PersistentLoad::Exact {
+                cached: Box::new(entry.cached),
+                bounded_guards,
+            }
+        } else {
+            PersistentLoad::Miss
+        };
+    }
+    if !append_prefix
+        || !source_validation_matches(
+            &file.path,
+            entry.cached.fingerprint.len,
+            &file.fingerprint,
+            source_validation,
+            hash_bytes,
+            large_guard_bytes,
+        )
+        || !inspect_rollout_file(&file.path)
+            .is_ok_and(|current| current.fingerprint == file.fingerprint)
+    {
+        return PersistentLoad::Miss;
+    }
+
+    // A short-lived exporter normally starts with an empty in-memory cache.
+    // Reuse a persisted complete prefix when the same rollout file only grew,
+    // but prove that the old boundary still names the same bytes before
+    // hydrating it. `refresh_stable_rollout_file` repeats the tail guard and
+    // post-read fingerprint checks, so a concurrent append or rewrite still
+    // falls back safely instead of trusting a stale prefix.
+    if open_rollout_source_for_validation(&file.path).is_ok_and(|mut handle| {
+        tail_guard_matches_counted(
+            &mut handle,
+            entry.cached.fingerprint.len,
+            entry.cached.parsed.tail_guard,
+            tail_guard_bytes,
+        )
+    }) {
+        PersistentLoad::AppendPrefix {
+            cached: Box::new(entry.cached),
+            bounded_guards,
+        }
+    } else {
+        PersistentLoad::Miss
+    }
 }
 
 #[cfg(test)]
@@ -1759,7 +2084,16 @@ fn persist_file_entry(
     cached: &CachedFile,
     max_entry_bytes: u64,
 ) -> std::result::Result<(), PersistentWriteError> {
-    let contents = serialize_persistent_entry(key, source_path, cached, max_entry_bytes)?;
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+    let contents = serialize_persistent_entry(
+        key,
+        source_path,
+        cached,
+        max_entry_bytes,
+        &mut hash_bytes,
+        &mut large_guard_bytes,
+    )?;
     write_private_atomically(
         &persistent_entry_path(cache_root, key, source_path),
         &contents,
@@ -1772,12 +2106,34 @@ fn serialize_persistent_entry(
     source_path: &Path,
     cached: &CachedFile,
     max_entry_bytes: u64,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
 ) -> std::result::Result<Vec<u8>, PersistentWriteError> {
+    if inspect_rollout_file(source_path)
+        .map(|file| file.fingerprint != cached.fingerprint)
+        .unwrap_or(true)
+    {
+        return Err(PersistentWriteError::Other);
+    }
+    let source_validation = build_source_validation(
+        source_path,
+        &cached.fingerprint,
+        hash_bytes,
+        large_guard_bytes,
+    )
+    .map_err(|_| PersistentWriteError::Other)?;
+    if inspect_rollout_file(source_path)
+        .map(|file| file.fingerprint != cached.fingerprint)
+        .unwrap_or(true)
+    {
+        return Err(PersistentWriteError::Other);
+    }
     let entry = PersistentFileEntryRef {
         format_version: ROLLOUT_CACHE_FORMAT_VERSION,
         parser_revision: ROLLOUT_PARSER_REVISION,
         key,
         source_path,
+        source_validation: &source_validation,
         cached,
     };
     let mut contents = LimitedBuffer::new(max_entry_bytes);
@@ -1789,6 +2145,281 @@ fn serialize_persistent_entry(
         });
     }
     Ok(contents.bytes)
+}
+
+fn read_persistent_entry_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    validate_private_cache_directory(parent)?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "persistent rollout cache entry is not a regular file",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_private_cache_file(path, &file)?;
+    if !metadata.is_file() || metadata.len() > MAX_PERSISTENT_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "persistent rollout cache entry exceeds its limit",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "persistent rollout cache entry is a reparse point",
+            ));
+        }
+    }
+    let mut contents = Vec::with_capacity((metadata.len() as usize).min(64 * 1024));
+    Read::by_ref(&mut file)
+        .take(MAX_PERSISTENT_ENTRY_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > MAX_PERSISTENT_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "persistent rollout cache entry exceeds its limit",
+        ));
+    }
+    Ok(contents)
+}
+
+fn build_source_validation(
+    path: &Path,
+    fingerprint: &FileFingerprint,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
+) -> std::io::Result<PersistentSourceValidation> {
+    if fingerprint.len <= MAX_PERSISTENT_PREFIX_HASH_BYTES {
+        return sha256_file_prefix(path, fingerprint.len, hash_bytes)
+            .map(|sha256| PersistentSourceValidation::FullPrefixSha256 { sha256 });
+    }
+    let guards = hash_large_prefix_guards(path, fingerprint.len, hash_bytes, large_guard_bytes)?;
+    Ok(PersistentSourceValidation::BoundedPrefixGuards {
+        prefix_len: fingerprint.len,
+        guards,
+    })
+}
+
+fn source_validation_matches(
+    path: &Path,
+    prefix_len: u64,
+    current_fingerprint: &FileFingerprint,
+    validation: &PersistentSourceValidation,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
+) -> bool {
+    if !source_validation_shape_is_valid(prefix_len, current_fingerprint.len, validation) {
+        return false;
+    }
+    match validation {
+        PersistentSourceValidation::FullPrefixSha256 { sha256 } => {
+            prefix_sha256_matches(path, prefix_len, *sha256, hash_bytes)
+        }
+        PersistentSourceValidation::BoundedPrefixGuards { guards, .. } => {
+            hash_large_prefix_guards(path, prefix_len, hash_bytes, large_guard_bytes)
+                .is_ok_and(|actual| actual == *guards)
+        }
+    }
+}
+
+fn source_validation_shape_is_valid(
+    prefix_len: u64,
+    current_len: u64,
+    validation: &PersistentSourceValidation,
+) -> bool {
+    match validation {
+        PersistentSourceValidation::FullPrefixSha256 { sha256 } => {
+            prefix_len <= MAX_PERSISTENT_PREFIX_HASH_BYTES && *sha256 != [0; 32]
+        }
+        PersistentSourceValidation::BoundedPrefixGuards {
+            prefix_len: guarded_len,
+            guards,
+        } => {
+            if prefix_len <= MAX_PERSISTENT_PREFIX_HASH_BYTES
+                || *guarded_len != prefix_len
+                || prefix_len > current_len
+            {
+                return false;
+            }
+            guards
+                .iter()
+                .zip(large_prefix_guard_specs(prefix_len))
+                .all(|(guard, (offset, len))| guard.offset == offset && guard.len == len)
+        }
+    }
+}
+
+fn large_prefix_guard_specs(prefix_len: u64) -> [(u64, u16); LARGE_PREFIX_GUARD_WINDOWS] {
+    debug_assert!(prefix_len > MAX_PERSISTENT_PREFIX_HASH_BYTES);
+    let guard_len = LARGE_PREFIX_GUARD_WINDOW_BYTES as u64;
+    let last_offset = prefix_len - guard_len;
+    [
+        (0, guard_len as u16),
+        (last_offset / 2, guard_len as u16),
+        (last_offset, guard_len as u16),
+    ]
+}
+
+fn hash_large_prefix_guards(
+    path: &Path,
+    prefix_len: u64,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
+) -> std::io::Result<[PersistentPrefixGuard; LARGE_PREFIX_GUARD_WINDOWS]> {
+    if prefix_len <= MAX_PERSISTENT_PREFIX_HASH_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "bounded prefix guards are reserved for large rollout prefixes",
+        ));
+    }
+    let mut file = open_rollout_source_for_validation(path)?;
+    let mut guards = Vec::with_capacity(LARGE_PREFIX_GUARD_WINDOWS);
+    for (offset, len) in large_prefix_guard_specs(prefix_len) {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; usize::from(len)];
+        file.read_exact(&mut bytes)?;
+        *hash_bytes = (*hash_bytes).saturating_add(u64::from(len));
+        *large_guard_bytes = (*large_guard_bytes).saturating_add(u64::from(len));
+        guards.push(PersistentPrefixGuard {
+            offset,
+            len,
+            sha256: Sha256::digest(&bytes).into(),
+        });
+    }
+    guards.try_into().map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "large rollout guard count is not canonical",
+        )
+    })
+}
+
+fn prefix_sha256_matches(
+    path: &Path,
+    prefix_len: u64,
+    expected: [u8; 32],
+    hash_bytes: &mut u64,
+) -> bool {
+    sha256_file_prefix(path, prefix_len, hash_bytes).is_ok_and(|actual| actual == expected)
+}
+
+fn sha256_file_prefix(
+    path: &Path,
+    prefix_len: u64,
+    hash_bytes: &mut u64,
+) -> std::io::Result<[u8; 32]> {
+    if prefix_len > MAX_PERSISTENT_PREFIX_HASH_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "rollout prefix exceeds the persistent hash I/O limit",
+        ));
+    }
+    let mut file = open_rollout_source_for_validation(path)?;
+    let mut remaining = prefix_len;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "rollout prefix ended before its cached boundary",
+            ));
+        }
+        *hash_bytes = (*hash_bytes).saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn open_rollout_source_for_validation(path: &Path) -> std::io::Result<File> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "rollout source validation requires a regular non-link file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "rollout source validation refuses a reparse point",
+            ));
+        }
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "opened rollout source is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != opened.dev() || path_metadata.ino() != opened.ino() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "rollout source changed while it was being opened",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "opened rollout source is a reparse point",
+            ));
+        }
+    }
+    Ok(file)
 }
 
 fn next_write_backoff(current: Duration) -> Duration {
@@ -1841,6 +2472,9 @@ fn prune_cache_directory(
     max_bytes: u64,
     stale_temp_before: SystemTime,
 ) -> PersistentPruneSummary {
+    if validate_private_cache_directory(directory).is_err() {
+        return PersistentPruneSummary::default();
+    }
     let Ok(entries) = fs::read_dir(directory) else {
         return PersistentPruneSummary::default();
     };
@@ -2790,24 +3424,26 @@ fn discover_rollout_inventory(
 
             if entry.file_type().is_dir() {
                 match entry.metadata() {
-                    Ok(metadata) => match FileFingerprint::from_metadata(&metadata) {
-                        Ok(fingerprint) => {
-                            refresh.discovery_probed_dirs += 1;
-                            directories.insert(entry.path().to_owned(), fingerprint);
+                    Ok(metadata) => {
+                        match FileFingerprint::from_path_and_metadata(entry.path(), &metadata) {
+                            Ok(fingerprint) => {
+                                refresh.discovery_probed_dirs += 1;
+                                directories.insert(entry.path().to_owned(), fingerprint);
+                            }
+                            Err(error) => {
+                                complete = false;
+                                unreadable_files += 1;
+                                push_bounded_rollout_warning(
+                                    &mut warnings,
+                                    &mut suppressed_warnings,
+                                    format!(
+                                        "could not fingerprint rollout directory {}: {error}",
+                                        entry.path().display()
+                                    ),
+                                );
+                            }
                         }
-                        Err(error) => {
-                            complete = false;
-                            unreadable_files += 1;
-                            push_bounded_rollout_warning(
-                                &mut warnings,
-                                &mut suppressed_warnings,
-                                format!(
-                                    "could not fingerprint rollout directory {}: {error}",
-                                    entry.path().display()
-                                ),
-                            );
-                        }
-                    },
+                    }
                     Err(error) => {
                         complete = false;
                         unreadable_files += 1;
@@ -2981,7 +3617,7 @@ fn inspect_rollout_directory(path: &Path) -> std::io::Result<Option<FileFingerpr
     if !metadata.is_dir() {
         return Ok(None);
     }
-    FileFingerprint::from_metadata(&metadata).map(Some)
+    FileFingerprint::from_path_and_metadata(path, &metadata).map(Some)
 }
 
 fn select_rollout_files(
@@ -3021,6 +3657,7 @@ struct StableParse {
     stability_retries: usize,
     tail_parsed: bool,
     parsed_bytes: u64,
+    tail_guard_validation_bytes: u64,
 }
 
 #[cfg(test)]
@@ -3037,10 +3674,12 @@ fn refresh_stable_rollout_file(
     let mut candidate = file.clone();
     let mut previous = previous;
     let mut parsed_bytes = 0_u64;
+    let mut tail_guard_validation_bytes = 0_u64;
     for attempt in 0..2 {
-        let (mut parsed, tail_parsed, bytes_read) =
+        let (mut parsed, tail_parsed, bytes_read, guard_bytes) =
             parse_rollout_candidate(&candidate, config, previous.take());
         parsed_bytes = parsed_bytes.saturating_add(bytes_read);
+        tail_guard_validation_bytes = tail_guard_validation_bytes.saturating_add(guard_bytes);
         let after = match inspect_rollout_file(&candidate.path) {
             Ok(after) => after,
             Err(error) => {
@@ -3061,6 +3700,7 @@ fn refresh_stable_rollout_file(
                     stability_retries: attempt,
                     tail_parsed: false,
                     parsed_bytes,
+                    tail_guard_validation_bytes,
                 };
             }
         };
@@ -3092,6 +3732,7 @@ fn refresh_stable_rollout_file(
                     stability_retries: attempt,
                     tail_parsed,
                     parsed_bytes,
+                    tail_guard_validation_bytes,
                 };
             }
             if attempt == 0 {
@@ -3125,6 +3766,7 @@ fn refresh_stable_rollout_file(
             stability_retries: attempt,
             tail_parsed: false,
             parsed_bytes,
+            tail_guard_validation_bytes,
         };
     }
     unreachable!("stable rollout parsing attempts are bounded")
@@ -3134,16 +3776,24 @@ fn parse_rollout_candidate(
     file: &RolloutFile,
     config: &CollectConfig,
     previous: Option<CachedFile>,
-) -> (ParsedFile, bool, u64) {
+) -> (ParsedFile, bool, u64, u64) {
     if let Some(previous) = previous {
         let previous_len = previous.fingerprint.len;
-        if can_tail_parse(&previous, file)
-            && let Some(parsed) = parse_rollout_tail(file, config, previous)
-        {
+        if can_tail_parse(&previous, file) {
+            let (parsed, guard_bytes) = parse_rollout_tail(file, config, previous);
+            if let Some(parsed) = parsed {
+                return (
+                    parsed,
+                    true,
+                    file.fingerprint.len.saturating_sub(previous_len),
+                    guard_bytes,
+                );
+            }
             return (
-                parsed,
-                true,
-                file.fingerprint.len.saturating_sub(previous_len),
+                parse_rollout_file(file, config),
+                false,
+                file.fingerprint.len,
+                guard_bytes,
             );
         }
     }
@@ -3151,6 +3801,7 @@ fn parse_rollout_candidate(
         parse_rollout_file(file, config),
         false,
         file.fingerprint.len,
+        0,
     )
 }
 
@@ -3166,34 +3817,44 @@ fn parse_rollout_tail(
     file: &RolloutFile,
     config: &CollectConfig,
     mut previous: CachedFile,
-) -> Option<ParsedFile> {
-    let mut handle = match File::open(&file.path) {
+) -> (Option<ParsedFile>, u64) {
+    let mut guard_bytes = 0_u64;
+    let mut handle = match open_rollout_source_for_validation(&file.path) {
         Ok(handle) => handle,
-        Err(_) => return None,
+        Err(_) => return (None, guard_bytes),
     };
-    if !tail_guard_matches(
+    if !tail_guard_matches_counted(
         &mut handle,
         previous.fingerprint.len,
         previous.parsed.tail_guard,
+        &mut guard_bytes,
     ) {
-        return None;
+        return (None, guard_bytes);
     }
     if handle
         .seek(SeekFrom::Start(previous.fingerprint.len))
         .is_err()
     {
-        return None;
+        return (None, guard_bytes);
     }
     previous.parsed.complete = false;
-    Some(parse_rollout_reader(
-        file,
-        config,
-        previous.parsed,
-        BufReader::new(handle),
-    ))
+    (
+        Some(parse_rollout_reader(
+            file,
+            config,
+            previous.parsed,
+            BufReader::new(handle),
+        )),
+        guard_bytes,
+    )
 }
 
-fn tail_guard_matches(handle: &mut File, prefix_len: u64, expected: TailGuard) -> bool {
+fn tail_guard_matches_counted(
+    handle: &mut File,
+    prefix_len: u64,
+    expected: TailGuard,
+    bytes_read: &mut u64,
+) -> bool {
     let guard_len = usize::from(expected.len);
     if prefix_len == 0 {
         return guard_len == 0;
@@ -3208,7 +3869,11 @@ fn tail_guard_matches(handle: &mut File, prefix_len: u64, expected: TailGuard) -
         return false;
     }
     let mut bytes = vec![0_u8; guard_len];
-    handle.read_exact(&mut bytes).is_ok() && stable_hash(&[&bytes]) == expected.hash
+    if handle.read_exact(&mut bytes).is_err() {
+        return false;
+    }
+    *bytes_read = (*bytes_read).saturating_add(guard_len as u64);
+    stable_hash(&[&bytes]) == expected.hash
 }
 
 fn update_tail_guard(path: &Path, parsed: &mut ParsedFile, file_len: u64) -> std::io::Result<()> {
@@ -3218,7 +3883,7 @@ fn update_tail_guard(path: &Path, parsed: &mut ParsedFile, file_len: u64) -> std
         return Ok(());
     }
     let guard_len = usize::try_from(file_len.min(TAIL_GUARD_BYTES as u64)).unwrap_or(0);
-    let mut handle = File::open(path)?;
+    let mut handle = open_rollout_source_for_validation(path)?;
     handle.seek(SeekFrom::Start(file_len - guard_len as u64))?;
     let mut bytes = vec![0_u8; guard_len];
     handle.read_exact(&mut bytes)?;
@@ -3232,7 +3897,7 @@ fn update_tail_guard(path: &Path, parsed: &mut ParsedFile, file_len: u64) -> std
 
 fn inspect_rollout_file(path: &Path) -> std::io::Result<RolloutFile> {
     let metadata = path.metadata()?;
-    let fingerprint = FileFingerprint::from_metadata(&metadata)?;
+    let fingerprint = FileFingerprint::from_path_and_metadata(path, &metadata)?;
     Ok(RolloutFile {
         path: path.to_owned(),
         modified_at: DateTime::<Utc>::from(fingerprint.modified),
@@ -3241,7 +3906,7 @@ fn inspect_rollout_file(path: &Path) -> std::io::Result<RolloutFile> {
 }
 
 fn parse_rollout_file(file: &RolloutFile, config: &CollectConfig) -> ParsedFile {
-    let handle = match File::open(&file.path) {
+    let handle = match open_rollout_source_for_validation(&file.path) {
         Ok(handle) => handle,
         Err(error) => {
             let mut parsed = ParsedFile::default();
@@ -4494,11 +5159,68 @@ fn apply_token_count(
         timestamp,
         thread_id: thread.thread_id.clone(),
         turn_id,
+        usage_event_id: Some(fallback_usage_event_id(
+            &thread.thread_id,
+            timestamp,
+            total_usage,
+            usage.last,
+        )),
+        // The normalized identity binds the physical thread, source event
+        // timestamp, cumulative counter, and optional last-request counter.
+        // It is path-independent for copied rollouts; any same-ID semantic
+        // disagreement is still detected and downgraded by the digest/fact
+        // materializers before replica union is allowed.
+        usage_event_identity_exact: true,
         model,
         service_tier,
         tokens: delta,
         request_usage_exact,
     });
+}
+
+fn fallback_usage_event_id(
+    thread_id: &str,
+    timestamp: DateTime<Utc>,
+    cumulative: TokenUsage,
+    last: Option<TokenUsage>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(USAGE_EVENT_ID_DOMAIN);
+    hash_length_prefixed(&mut hasher, thread_id.as_bytes());
+    hasher.update(timestamp.timestamp().to_be_bytes());
+    hasher.update(timestamp.timestamp_subsec_nanos().to_be_bytes());
+    hash_token_usage(&mut hasher, cumulative);
+    hasher.update([u8::from(last.is_some())]);
+    if let Some(last) = last {
+        hash_token_usage(&mut hasher, last);
+    }
+    let digest = hasher.finalize();
+    let mut identity = String::with_capacity(USAGE_EVENT_ID_PREFIX.len() + digest.len() * 2);
+    identity.push_str(USAGE_EVENT_ID_PREFIX);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        identity.push(HEX[usize::from(byte >> 4)] as char);
+        identity.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    identity
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_token_usage(hasher: &mut Sha256, usage: TokenUsage) {
+    for value in [
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.total_tokens,
+    ] {
+        hasher.update(value.to_be_bytes());
+    }
 }
 
 fn push_replay_warning(dataset: &mut RolloutDataset, warning: String) {

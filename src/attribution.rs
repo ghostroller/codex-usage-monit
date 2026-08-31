@@ -687,6 +687,8 @@ mod tests {
             timestamp: Utc::now(),
             thread_id: "thread".to_string(),
             turn_id: Some("turn".to_string()),
+            usage_event_id: None,
+            usage_event_identity_exact: false,
             model: Some(model.to_string()),
             service_tier: fast.then(|| "priority".to_string()),
             tokens,

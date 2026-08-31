@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,6 +11,8 @@ use codex_usage_monit::snapshot::{collect_snapshot_cached, collect_snapshot_cach
 use codex_usage_monit::startup::StartupTrace;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+const LARGE_TEST_PADDING_BYTES: usize = 8 * 1024 * 1024 + 4096;
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -39,6 +41,33 @@ fn append_jsonl(path: &std::path::Path, records: &[Value]) {
     for record in records {
         writeln!(file, "{}", serde_json::to_string(record).unwrap()).unwrap();
     }
+    file.flush().unwrap();
+}
+
+fn write_large_rollout(path: &Path, now: DateTime<Utc>, thread_id: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = File::create(path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": thread_id, "timestamp": timestamp(now)}
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    file.write_all(b"{\"type\":\"ignored_padding\",\"payload\":{\"blob\":\"")
+        .unwrap();
+    let block = [b'x'; 64 * 1024];
+    let mut remaining = LARGE_TEST_PADDING_BYTES;
+    while remaining > 0 {
+        let chunk = remaining.min(block.len());
+        file.write_all(&block[..chunk]).unwrap();
+        remaining -= chunk;
+    }
+    file.write_all(b"\"}}\n").unwrap();
     file.flush().unwrap();
 }
 
@@ -311,7 +340,133 @@ fn persistent_cache_is_reused_by_a_new_instance_and_recomputes_freshness() {
     assert_eq!(reopened.last_refresh().disk_reused_files, 1);
     assert_eq!(reopened.last_refresh().reused_files, 1);
     assert_eq!(reopened.last_refresh().reparsed_files, 0);
+    assert_eq!(reopened.last_refresh().disk_exact_reused_files, 1);
+    assert_eq!(reopened.last_refresh().persistent_hash_bytes, 0);
     assert!(reopened.last_refresh().rebuilt);
+}
+
+#[test]
+fn large_persistent_cache_exact_hit_reads_no_source_content() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-large-exact.jsonl");
+    write_large_rollout(&path, now, "large-exact-thread");
+    let scan_config = persistent_config(temp.path(), &cache_root);
+
+    let mut first_cache = RolloutCache::new();
+    let first = first_cache.scan(&scan_config, now).unwrap();
+    assert_eq!(first.tasks[0].thread_id, "large-exact-thread");
+    assert_eq!(first_cache.last_refresh().disk_written_files, 1);
+    assert_eq!(first_cache.last_refresh().disk_oversized_files, 0);
+    assert!(first_cache.metrics().selected_bytes > 8 * 1024 * 1024);
+    assert_eq!(
+        first_cache.last_refresh().persistent_large_guard_bytes,
+        3 * 1024
+    );
+
+    let mut reopened = RolloutCache::new();
+    let cached = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(cached.tasks[0].thread_id, first.tasks[0].thread_id);
+    assert_eq!(reopened.last_refresh().disk_exact_reused_files, 1);
+    assert_eq!(reopened.last_refresh().disk_large_exact_reused_files, 1);
+    assert_eq!(reopened.last_refresh().reparsed_files, 0);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 0);
+    assert_eq!(reopened.last_refresh().full_parsed_bytes, 0);
+    assert_eq!(reopened.last_refresh().tail_guard_validation_bytes, 0);
+    assert_eq!(reopened.last_refresh().persistent_hash_bytes, 0);
+    assert_eq!(reopened.last_refresh().persistent_large_guard_bytes, 0);
+}
+
+#[test]
+fn large_persistent_cache_restart_parses_only_the_appended_tail() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp.path().join("sessions/rollout-large-tail.jsonl");
+    write_large_rollout(&path, now, "large-tail-thread");
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&scan_config, now).unwrap();
+
+    let prefix_len = fs::metadata(&path).unwrap().len();
+    append_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "large-tail-turn"}
+        })],
+    );
+    let appended_bytes = fs::metadata(&path).unwrap().len() - prefix_len;
+    let mut reopened = RolloutCache::new();
+    let cached = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+
+    assert_eq!(cached.turns[0].turn_id, "large-tail-turn");
+    assert_eq!(reopened.last_refresh().disk_tail_reused_files, 1);
+    assert_eq!(reopened.last_refresh().disk_large_tail_reused_files, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_files, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_bytes, appended_bytes);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 0);
+    assert_eq!(reopened.last_refresh().full_parsed_bytes, 0);
+    assert_eq!(reopened.last_refresh().tail_guard_validation_bytes, 512);
+    assert!(reopened.last_refresh().persistent_large_guard_bytes <= 6 * 1024);
+
+    let mut uncached = scan_config.clone();
+    uncached.rollout_cache_dir = None;
+    let fresh = scan_rollouts(&uncached, now + chrono::Duration::seconds(2)).unwrap();
+    assert_dataset_eq(&cached, &fresh);
+}
+
+#[test]
+fn large_persistent_cache_rejects_a_rewritten_cached_boundary() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-large-boundary-rewrite.jsonl");
+    write_large_rollout(&path, now, "large-boundary-thread");
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&scan_config, now).unwrap();
+
+    let prefix_len = fs::metadata(&path).unwrap().len();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.seek(SeekFrom::Start(prefix_len - 100)).unwrap();
+    file.write_all(b"y").unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({
+            "timestamp": timestamp(now + chrono::Duration::seconds(1)),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "boundary-rewrite-turn"}
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    file.flush().unwrap();
+
+    let mut reopened = RolloutCache::new();
+    let reparsed = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(2))
+        .unwrap();
+    assert_eq!(reparsed.turns[0].turn_id, "boundary-rewrite-turn");
+    assert_eq!(reopened.last_refresh().disk_large_tail_reused_files, 0);
+    assert_eq!(reopened.last_refresh().disk_misses, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_files, 0);
+    assert_eq!(reopened.last_refresh().tail_guard_validation_bytes, 0);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 1);
+    assert!(reopened.last_refresh().full_parsed_bytes > 8 * 1024 * 1024);
 }
 
 #[test]
@@ -341,6 +496,7 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
     let scan_config = persistent_config(temp.path(), &cache_root);
     RolloutCache::new().scan(&scan_config, now).unwrap();
 
+    let previous_len = fs::metadata(&changed_path).unwrap().len();
     append_jsonl(
         &changed_path,
         &[json!({
@@ -349,13 +505,21 @@ fn reopened_cache_reparses_only_a_changed_file_and_matches_a_fresh_scan() {
             "payload": {"type": "token_count", "info": {"total_token_usage": usage(20)}}
         })],
     );
+    let appended_bytes = fs::metadata(&changed_path)
+        .unwrap()
+        .len()
+        .saturating_sub(previous_len);
     let mut reopened = RolloutCache::new();
     let cached = reopened
         .scan(&scan_config, now + chrono::Duration::seconds(2))
         .unwrap();
-    assert_eq!(reopened.last_refresh().disk_reused_files, 1);
+    assert_eq!(reopened.last_refresh().disk_reused_files, 2);
+    assert_eq!(reopened.last_refresh().disk_tail_reused_files, 1);
     assert_eq!(reopened.last_refresh().reused_files, 1);
     assert_eq!(reopened.last_refresh().reparsed_files, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_files, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_bytes, appended_bytes);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 0);
     assert_eq!(reopened.last_refresh().disk_written_files, 1);
 
     let mut uncached_config = scan_config.clone();
@@ -818,6 +982,101 @@ fn tail_parse_falls_back_when_the_cached_prefix_was_rewritten() {
     assert_eq!(cache.last_refresh().tail_parsed_files, 0);
     assert_eq!(cache.last_refresh().full_parsed_files, 1);
     assert_eq!(rewritten.tasks[0].thread_id, "after-rewrite-with-longer-id");
+}
+
+#[test]
+fn reopened_persistent_cache_rejects_a_rewritten_prefix() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-persistent-rewritten.jsonl");
+    let padding = "x".repeat(1024);
+    write_jsonl(
+        &path,
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "thread-aaaaaaaaaaaaaaaa"}
+            }),
+            json!({"type": "ignored_padding", "payload": {"blob": padding}}),
+        ],
+    );
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    RolloutCache::new().scan(&scan_config, now).unwrap();
+    let cached_prefix_len = fs::metadata(&path).unwrap().len();
+    assert!(cached_prefix_len > 256);
+
+    write_jsonl(
+        &path,
+        &[
+            json!({"timestamp": timestamp(now), "type": "session_meta", "payload": {"id": "thread-bbbbbbbbbbbbbbbb"}}),
+            json!({"type": "ignored_padding", "payload": {"blob": "x".repeat(1024)}}),
+            json!({"timestamp": timestamp(now), "type": "event_msg", "payload": {"type": "task_started", "turn_id": "persistent-rewritten-turn"}}),
+        ],
+    );
+    assert!(fs::metadata(&path).unwrap().len() > cached_prefix_len);
+    let mut reopened = RolloutCache::new();
+    let rewritten = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(reopened.last_refresh().disk_tail_reused_files, 0);
+    assert_eq!(reopened.last_refresh().disk_misses, 1);
+    assert_eq!(reopened.last_refresh().tail_parsed_files, 0);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 1);
+    assert_eq!(rewritten.tasks[0].thread_id, "thread-bbbbbbbbbbbbbbbb");
+}
+
+#[test]
+fn reopened_persistent_cache_rejects_an_equal_length_rewrite_with_restored_mtime() {
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-persistent-equal-rewrite.jsonl");
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "equal-thread-aaaa"}
+        })],
+    );
+    let original_len = fs::metadata(&path).unwrap().len();
+    let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    let original = RolloutCache::new().scan(&scan_config, now).unwrap();
+    assert_eq!(original.tasks[0].thread_id, "equal-thread-aaaa");
+
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "equal-thread-bbbb"}
+        })],
+    );
+    assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(original_modified)
+        .unwrap();
+
+    let mut reopened = RolloutCache::new();
+    let rewritten = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(reopened.last_refresh().disk_reused_files, 0);
+    assert_eq!(reopened.last_refresh().disk_misses, 1);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 1);
+    assert_eq!(rewritten.tasks[0].thread_id, "equal-thread-bbbb");
 }
 
 #[test]

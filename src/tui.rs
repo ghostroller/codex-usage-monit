@@ -1,14 +1,34 @@
 use std::borrow::Cow;
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
 use anyhow::{Result, ensure};
 use base64::Engine;
@@ -46,12 +66,10 @@ mod text;
 
 use geometry::{reveal_offset, scale_rounded, scroll_offset, scrollbar_geometry};
 use stacked_area::{StackedArea, StackedAreaSeries, StackedAreaState, date_index_at_column};
-#[cfg(test)]
-use text::byte_index_at_grapheme;
 use text::{
-    backspace_grapheme, compact_search_text, delete_grapheme, grapheme_count,
-    insert_at_grapheme_cursor, search_cursor_window, short_thread_id, truncate_display_text,
-    truncate_middle_display_text,
+    backspace_grapheme, byte_index_at_grapheme, compact_search_text, delete_grapheme,
+    grapheme_count, insert_at_grapheme_cursor, search_cursor_window, short_thread_id,
+    truncate_display_text, truncate_middle_display_text,
 };
 
 #[cfg(test)]
@@ -61,16 +79,45 @@ use crate::attribution::ESTIMATED_COST_UNITS_PER_CREDIT;
 use crate::config::CollectConfig;
 use crate::domain::{
     AccountSnapshot, ApiCostAmount, AttributionSummary, Confidence, ModelUsage, Provenance,
-    Snapshot, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus, WindowAnalysis,
-    WindowUsage, terminal_safe_text,
+    Snapshot, SourceStatus, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus,
+    WindowAnalysis, WindowUsage, terminal_safe_text,
 };
 #[cfg(test)]
 use crate::history::{HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION};
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
+use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
+use crate::history_profile_lease::{
+    HistoryProfileLeaseGuard, TryHistoryProfileLease, try_acquire_history_profile_lease,
+};
+use crate::history_query::{
+    HistorySourceSelection, HistorySourceSelectionStatus, HistorySourceUnavailableReason,
+};
+use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
 use crate::open_config::{OpenConfig, OpenConfigStore};
 use crate::perf::{HistoryMetrics, PerfLog};
+use crate::project_mapping::{
+    ProjectMappingProjection, ProjectMappingStore, ProjectMappings, ProjectMergeSuggestion,
+    ProjectMergeSuggestionReason, manual_merge_display_label,
+};
+use crate::remote_bandwidth_budget::{
+    REMOTE_BANDWIDTH_HARD_LIMIT_BYTES, REMOTE_BANDWIDTH_SOFT_LIMIT_BYTES,
+    RemoteBandwidthBudgetLevel, RemoteBandwidthBudgetStore, RemoteBandwidthTransferKind,
+};
+use crate::remote_overview::{RemoteOverviewHistory, project_remote_overview_history};
+use crate::remote_protocol::RemoteTokenUsage;
+use crate::remote_sync_health::{
+    RemoteSyncAttemptResult, RemoteSyncErrorCategory, RemoteSyncHealthCompletion,
+    RemoteSyncHealthStore, RemoteSyncHostHealth,
+};
+use crate::remote_transport::TuiProcessTreeInheritanceContract;
+use crate::remotes_config::{
+    DEFAULT_REMOTE_AGENT_EXECUTABLE, RemotesConfig, RemotesConfigMutation, RemotesConfigStore,
+};
 use crate::rollout::RolloutCache;
-use crate::service::{RecorderStatusFile, default_status_file, read_recorder_status};
+use crate::service::{
+    RecorderStatusFile, TryRecorderInstanceLock, default_status_file,
+    incompatible_recorder_for_cutover, read_recorder_status, try_acquire_recorder_instance_lock,
+};
 use crate::session_launch::{
     FocusResult, LaunchContext, LaunchResult, PaneId, ResumeTarget, ZellijOptions,
     check_eligibility, check_eligibility_without_cwd_probe, execute_zellij_launch,
@@ -80,6 +127,13 @@ use crate::session_launch::{
 use crate::snapshot::{
     CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
 };
+use crate::source_export::LocalSessionDigestEvidence;
+use crate::source_history::{
+    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
+    SourceRemoteLiveSnapshot,
+};
+use crate::source_identity::NodeId;
+use crate::source_model::{LogicalProjectId, ProjectDisplayLabel, ProjectInstanceId};
 #[cfg(test)]
 use crate::summary::SummaryWindow;
 use crate::summary::{
@@ -105,11 +159,13 @@ use crate::trends::{
 #[cfg(test)]
 use crate::trends::{remaining_trend, trend_day_bounds, weekly_resets_overlapping};
 use crate::ui_state::{
-    UiState, UiStateStore, UiSummaryGrain, UiSummaryMetric, UiSummaryRange, UiTableColumns,
-    UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView, UiWindowScope,
+    UiHistorySourceSelection, UiState, UiStateStore, UiSummaryGrain, UiSummaryMetric,
+    UiSummaryRange, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
+    UiWindowScope,
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
+const REMOTE_LIVE_STALE_AFTER: ChronoDuration = ChronoDuration::minutes(15);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
 const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(5), Duration::from_secs(10)];
@@ -128,6 +184,495 @@ const FILTER_CLEAR_GAP_WIDTH: u16 = 1;
 const FILTER_MIN_QUERY_WIDTH: u16 = 1;
 const RESUME_CONFIRM_MIN_INNER_WIDTH: u16 = 44;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
+const TUI_HISTORY_PROFILE_BUSY_WARNING: &str =
+    "history persistence is read-only because another redaction profile is active";
+const REMOTE_EDITOR_MAX_HOST_ID_BYTES: usize = 64;
+const REMOTE_EDITOR_MAX_SSH_HOST_BYTES: usize = 255;
+const REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES: usize = 512;
+const REMOTE_SOURCE_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+enum TuiHistoryBackend {
+    Runtime(Box<HistoryRuntime>),
+    LegacyFallback(Box<HistoryStore>),
+}
+
+enum TuiHistoryRuntimePreparation {
+    Ready(Vec<String>),
+    LegacyFallback(Vec<String>),
+}
+
+#[derive(Debug, Default)]
+struct TuiRemoteOverviewCache {
+    revisions: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
+    history: RemoteOverviewHistory,
+    loaded_at: Option<Instant>,
+    initialized: bool,
+}
+
+/// History state used by the interactive UI.
+///
+/// The canonical user-level store is ownership-aware and source-aware. The
+/// legacy variant exists only so a corrupt or non-canonical state directory
+/// or a concurrently starting recorder cannot prevent the TUI from rendering
+/// durable V1 plus the current live observation. Fallback persistence is
+/// deliberately disabled because its owner may activate V2 at any moment.
+struct TuiHistoryStore {
+    backend: TuiHistoryBackend,
+    profile_lease: Option<HistoryProfileLeaseGuard>,
+    setup_warnings: Vec<String>,
+    last_runtime_load_at: Option<Instant>,
+    remote_overview_cache: TuiRemoteOverviewCache,
+}
+
+#[derive(Clone, Debug)]
+struct TuiHistoryProjection {
+    history: HistoryData,
+    selection: HistorySourceSelection,
+    status: Option<HistorySourceSelectionStatus>,
+    query_error: Option<String>,
+}
+
+impl TuiHistoryStore {
+    fn runtime(
+        runtime: HistoryRuntime,
+        profile_lease: Option<HistoryProfileLeaseGuard>,
+        setup_warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            backend: TuiHistoryBackend::Runtime(Box::new(runtime)),
+            profile_lease,
+            setup_warnings,
+            last_runtime_load_at: None,
+            remote_overview_cache: TuiRemoteOverviewCache::default(),
+        }
+    }
+
+    fn legacy_fallback(store: HistoryStore, setup_warnings: Vec<String>) -> Self {
+        Self {
+            backend: TuiHistoryBackend::LegacyFallback(Box::new(store)),
+            profile_lease: None,
+            setup_warnings,
+            last_runtime_load_at: None,
+            remote_overview_cache: TuiRemoteOverviewCache::default(),
+        }
+    }
+
+    fn legacy_history(&self) -> &HistoryStore {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.legacy_history(),
+            TuiHistoryBackend::LegacyFallback(store) => store,
+        }
+    }
+
+    fn local_source_id(&self) -> Option<NodeId> {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => {
+                Some(runtime.source_identity().node_id().clone())
+            }
+            TuiHistoryBackend::LegacyFallback(_) => None,
+        }
+    }
+
+    fn source_history_store(&self) -> Option<SourceHistoryStore> {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => Some(runtime.source_history().clone()),
+            TuiHistoryBackend::LegacyFallback(_) => None,
+        }
+    }
+
+    fn load_remote_live_states(&self) -> Result<Vec<SourceRemoteLiveSnapshot>, String> {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime
+                .source_history()
+                .load_included_remote_live_states()
+                .map_err(|error| format!("remote live state is unavailable: {error}")),
+            TuiHistoryBackend::LegacyFallback(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn load_remote_overview_history(
+        &mut self,
+        unified_seed: Option<&HistoryData>,
+        now: DateTime<Utc>,
+    ) -> Result<RemoteOverviewHistory, String> {
+        let TuiHistoryBackend::Runtime(runtime) = &mut self.backend else {
+            return Ok(RemoteOverviewHistory::default());
+        };
+        let store = runtime.source_history().clone();
+        let mut metadata = store
+            .list_source_metadata()
+            .map_err(|error| format!("remote Overview source list is unavailable: {error}"))?
+            .into_iter()
+            .filter(|source| source.kind() == SourceKind::Ssh && source.include_in_aggregates())
+            .collect::<Vec<_>>();
+        metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
+        let revisions = metadata
+            .iter()
+            .map(|source| {
+                store
+                    .active_remote_history_ref(
+                        source.source_id(),
+                        source.aggregate_redaction_profile(),
+                    )
+                    .map(|active| (source.clone(), active))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|error| format!("remote Overview revision is unavailable: {error}"))?;
+        let remote_sources = metadata.iter().map(|source| {
+            (
+                source.source_id().clone(),
+                source.display_label().to_owned(),
+            )
+        });
+        if let Some(history) = unified_seed {
+            self.remote_overview_cache.revisions = revisions;
+            self.remote_overview_cache.history =
+                RemoteOverviewHistory::from_unified(history, remote_sources, now);
+            self.remote_overview_cache.loaded_at = Some(Instant::now());
+            self.remote_overview_cache.initialized = true;
+            return Ok(self.remote_overview_cache.history.clone());
+        }
+        if self.remote_overview_cache.initialized
+            && self.remote_overview_cache.revisions == revisions
+            && self
+                .remote_overview_cache
+                .loaded_at
+                .is_some_and(|loaded| loaded.elapsed() < HISTORY_FLUSH_INTERVAL)
+        {
+            return Ok(self.remote_overview_cache.history.clone());
+        }
+        let snapshot = runtime
+            .load_unified_history_since_with_staged_selected(
+                &HistorySourceSelection::AllIncluded,
+                history_view_since(now),
+            )
+            .map_err(|error| format!("remote Overview history query failed: {error}"))?;
+        self.remote_overview_cache.revisions = revisions;
+        self.remote_overview_cache.history =
+            RemoteOverviewHistory::from_unified(&snapshot.history, remote_sources, now);
+        self.remote_overview_cache.loaded_at = Some(Instant::now());
+        self.remote_overview_cache.initialized = true;
+        Ok(self.remote_overview_cache.history.clone())
+    }
+
+    fn remote_history_sources(&mut self) -> Vec<(NodeId, String)> {
+        let TuiHistoryBackend::Runtime(runtime) = &self.backend else {
+            return Vec::new();
+        };
+        match runtime.source_history().list_source_metadata() {
+            Ok(metadata) => metadata
+                .into_iter()
+                .filter(|source| source.kind() == SourceKind::Ssh)
+                .map(|source| {
+                    (
+                        source.source_id().clone(),
+                        source.display_label().to_owned(),
+                    )
+                })
+                .collect(),
+            Err(error) => {
+                self.setup_warnings
+                    .push(format!("history source list is unavailable: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    fn merge_setup_warnings(&self, history: &mut HistoryData) {
+        history.warnings.extend(self.setup_warnings.iter().cloned());
+    }
+
+    fn write_permitted(&self) -> bool {
+        matches!(&self.backend, TuiHistoryBackend::Runtime(_)) && self.profile_lease.is_some()
+    }
+
+    /// Revalidates the process-lifetime profile selection immediately before
+    /// every runtime write. A replaced lock/marker must fail closed even when
+    /// the TUI acquired a valid lease at startup.
+    fn validate_runtime_write_authority(&mut self) -> io::Result<bool> {
+        if !matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
+            return Ok(true);
+        }
+        let Some(profile_lease) = self.profile_lease.as_ref() else {
+            return Ok(false);
+        };
+        if let Err(error) = profile_lease.validate() {
+            self.profile_lease = None;
+            self.setup_warnings.push(format!(
+                "history persistence became read-only because its profile lease could not be revalidated: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn stage(&mut self, observation: &HistoryObservation) {
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.stage(observation),
+            TuiHistoryBackend::LegacyFallback(store) => store.stage(observation),
+        }
+    }
+
+    fn stage_collection(
+        &mut self,
+        observation: &HistoryObservation,
+        tasks: &[TaskRecord],
+        evidence: &LocalSessionDigestEvidence,
+    ) {
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => {
+                if let Err(error) = runtime.stage_local_collection(observation, tasks, evidence) {
+                    let normalized =
+                        runtime.prepare_local_collection_observation(observation, tasks);
+                    runtime.stage(&normalized);
+                    self.setup_warnings.push(format!(
+                        "local session digest evidence could not be staged: {error}"
+                    ));
+                }
+            }
+            TuiHistoryBackend::LegacyFallback(store) => store.stage(observation),
+        }
+    }
+
+    #[cfg(test)]
+    fn stage_full_observation(&mut self, observation: &HistoryObservation) {
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.stage_full_observation(observation),
+            TuiHistoryBackend::LegacyFallback(store) => {
+                store.stage_full_observation(observation);
+            }
+        }
+    }
+
+    fn stage_full_collection(
+        &mut self,
+        observation: &HistoryObservation,
+        tasks: &[TaskRecord],
+        evidence: &LocalSessionDigestEvidence,
+    ) {
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => {
+                if let Err(error) =
+                    runtime.stage_full_local_collection(observation, tasks, evidence)
+                {
+                    let normalized =
+                        runtime.prepare_local_collection_observation(observation, tasks);
+                    runtime.stage_full_observation(&normalized);
+                    self.setup_warnings.push(format!(
+                        "local session digest evidence could not be staged for reconciliation: {error}"
+                    ));
+                }
+            }
+            TuiHistoryBackend::LegacyFallback(store) => {
+                store.stage_full_observation(observation);
+            }
+        }
+    }
+
+    fn flush_staged(&mut self) -> io::Result<Option<HistoryRuntimeWriteReport>> {
+        if !self.validate_runtime_write_authority()? {
+            return Ok(None);
+        }
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged(),
+            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+        }
+    }
+
+    fn flush_staged_if_due(
+        &mut self,
+        interval: Duration,
+    ) -> io::Result<Option<HistoryRuntimeWriteReport>> {
+        if !self.validate_runtime_write_authority()? {
+            return Ok(None);
+        }
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged_if_due(interval),
+            // A fallback may have been selected while a recorder held the
+            // cutover lock. It must never write V1 after that recorder
+            // activates V2. Keep staged data visible, but leave persistence
+            // disabled until the TUI is restarted into a verified runtime.
+            TuiHistoryBackend::LegacyFallback(_) => Ok(None),
+        }
+    }
+
+    fn flush_staged_reconcile(
+        &mut self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> io::Result<Option<HistoryRuntimeWriteReport>> {
+        if !self.validate_runtime_write_authority()? {
+            return Ok(None);
+        }
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged_reconcile(from, to),
+            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+        }
+    }
+
+    #[cfg(test)]
+    fn load_since_with_staged(&mut self, since: DateTime<Utc>) -> HistoryData {
+        self.load_since_with_staged_selected(&HistorySourceSelection::AllIncluded, since)
+            .history
+    }
+
+    /// Performs an ownership-consistent disk query for the exact requested
+    /// projection. This deliberately bypasses the TUI's 30-second reload gate;
+    /// source switches must filter before aggregation and must never reuse an
+    /// all-source cache entry.
+    fn load_since_with_staged_selected(
+        &mut self,
+        selection: &HistorySourceSelection,
+        since: DateTime<Utc>,
+    ) -> TuiHistoryProjection {
+        let runtime_backend = matches!(&self.backend, TuiHistoryBackend::Runtime(_));
+        let (mut history, status, query_error) = match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => {
+                match runtime.load_unified_history_since_with_staged_selected(selection, since) {
+                    Ok(snapshot) => (
+                        snapshot.history,
+                        Some(snapshot.source_selection_status),
+                        None,
+                    ),
+                    Err(error) => {
+                        let mut history = HistoryData::default();
+                        // Only an all-source failure may expose the legacy
+                        // staged local slice. Exact source failures remain
+                        // empty rather than silently falling back to All.
+                        if matches!(selection, HistorySourceSelection::AllIncluded) {
+                            runtime
+                                .legacy_history()
+                                .overlay_staged_since(&mut history, since);
+                        }
+                        history
+                            .warnings
+                            .push(format!("history query failed: {error}"));
+                        (history, None, Some(error.to_string()))
+                    }
+                }
+            }
+            TuiHistoryBackend::LegacyFallback(store) => match selection {
+                HistorySourceSelection::AllIncluded => (
+                    store.load_since_with_staged(since),
+                    Some(HistorySourceSelectionStatus::Applied),
+                    None,
+                ),
+                HistorySourceSelection::Local(_) | HistorySourceSelection::Remote(_) => {
+                    // Quota is account-global, so preserve it (plus legacy
+                    // diagnostics/read-only state) while failing closed for
+                    // source-scoped local usage.
+                    let mut history = store.load_since_with_staged(since);
+                    history.half_hour_buckets.clear();
+                    history.weekly_local_points.clear();
+                    history.summary_backfill_attempted_at = None;
+                    history.summary_backfill_attempt_complete = None;
+                    history.warnings.push(
+                        "source selection is unavailable while using legacy history".to_owned(),
+                    );
+                    (
+                        history,
+                        Some(HistorySourceSelectionStatus::Unavailable(
+                            HistorySourceUnavailableReason::UnsupportedByLegacy,
+                        )),
+                        None,
+                    )
+                }
+            },
+        };
+        if runtime_backend {
+            self.last_runtime_load_at = Some(Instant::now());
+        }
+        if !self.write_permitted() {
+            history.read_only = true;
+        }
+        self.merge_setup_warnings(&mut history);
+        normalize_history_warnings(&mut history);
+        TuiHistoryProjection {
+            history,
+            selection: selection.clone(),
+            status,
+            query_error,
+        }
+    }
+
+    fn reload_since_if_stale_with_staged_selected(
+        &mut self,
+        selection: &HistorySourceSelection,
+        since: DateTime<Utc>,
+    ) -> Option<TuiHistoryProjection> {
+        if matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
+            // Source-aware history can change when another process completes
+            // a remote sync, so it cannot use the legacy store's local-only
+            // shard stamp as its staleness oracle. Mirror the legacy 30-second
+            // read cache instead of rescanning all source shards on every
+            // two-second local rollout poll.
+            if self
+                .last_runtime_load_at
+                .is_some_and(|loaded| loaded.elapsed() < HISTORY_FLUSH_INTERVAL)
+            {
+                return None;
+            }
+            return Some(self.load_since_with_staged_selected(selection, since));
+        }
+
+        if !matches!(selection, HistorySourceSelection::AllIncluded) {
+            return Some(self.load_since_with_staged_selected(selection, since));
+        }
+        let TuiHistoryBackend::LegacyFallback(store) = &mut self.backend else {
+            unreachable!("the runtime backend returned above")
+        };
+        let mut history = store.reload_since_if_stale_with_staged(since)?;
+        self.merge_setup_warnings(&mut history);
+        normalize_history_warnings(&mut history);
+        Some(TuiHistoryProjection {
+            history,
+            selection: selection.clone(),
+            status: Some(HistorySourceSelectionStatus::Applied),
+            query_error: None,
+        })
+    }
+
+    fn mark_summary_backfill_attempt(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        complete: bool,
+    ) -> io::Result<crate::history::SummaryBackfillAttempt> {
+        if !self.validate_runtime_write_authority()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                TUI_HISTORY_PROFILE_BUSY_WARNING,
+            ));
+        }
+        match &mut self.backend {
+            TuiHistoryBackend::Runtime(runtime) => {
+                runtime.mark_summary_backfill_attempt(completed_at, complete)
+            }
+            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+        }
+    }
+}
+
+fn legacy_fallback_write_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "history persistence is disabled while the source-aware runtime is unavailable",
+    )
+}
+
+fn normalize_history_warnings(history: &mut HistoryData) {
+    history.warnings.sort();
+    history.warnings.dedup();
+}
+
+fn compact_node_id(node_id: &NodeId) -> &str {
+    let value = node_id.as_str();
+    value
+        .strip_prefix("node-")
+        .unwrap_or(value)
+        .get(..8)
+        .unwrap_or(value)
+}
 const TASK_TOKENS_WIDTH: u16 = 10;
 const TASK_TOKEN_SHARE_WIDTH: u16 = 8;
 const TASK_QUOTA_WIDTH: u16 = 8;
@@ -323,6 +868,30 @@ impl From<View> for UiView {
             View::Summary => Self::Summary,
             View::Health => Self::Health,
             View::Settings => Self::Settings,
+        }
+    }
+}
+
+impl From<&UiHistorySourceSelection> for HistorySourceSelection {
+    fn from(value: &UiHistorySourceSelection) -> Self {
+        match value {
+            UiHistorySourceSelection::All => Self::AllIncluded,
+            UiHistorySourceSelection::Local { node_id } => Self::Local(node_id.clone()),
+            UiHistorySourceSelection::Remote { node_id } => Self::Remote(node_id.clone()),
+        }
+    }
+}
+
+impl From<&HistorySourceSelection> for UiHistorySourceSelection {
+    fn from(value: &HistorySourceSelection) -> Self {
+        match value {
+            HistorySourceSelection::AllIncluded => Self::All,
+            HistorySourceSelection::Local(node_id) => Self::Local {
+                node_id: node_id.clone(),
+            },
+            HistorySourceSelection::Remote(node_id) => Self::Remote {
+                node_id: node_id.clone(),
+            },
         }
     }
 }
@@ -1011,12 +1580,17 @@ fn task_usage_for_scope_with_api_long_context(
 ) -> WindowUsage {
     if let Some(analysis) = window_analysis_with_api_long_context(snapshot, scope, api_long_context)
     {
-        return analysis
+        let usage = analysis
             .threads
             .iter()
             .find(|usage| usage.thread_id == task.thread_id)
-            .map(|usage| usage.usage)
-            .unwrap_or_default();
+            .map(|usage| usage.usage);
+        if let Some(usage) = usage {
+            return usage;
+        }
+        // A remote live counter is cumulative over the exported task/turn,
+        // not scoped to this quota window. An analysis miss must stay zero.
+        return WindowUsage::default();
     }
 
     if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
@@ -1040,12 +1614,15 @@ fn turn_usage_for_scope_with_api_long_context(
 ) -> WindowUsage {
     if let Some(analysis) = window_analysis_with_api_long_context(snapshot, scope, api_long_context)
     {
-        return analysis
+        let usage = analysis
             .turns
             .iter()
             .find(|usage| usage.thread_id == turn.thread_id && usage.turn_id == turn.turn_id)
-            .map(|usage| usage.usage)
-            .unwrap_or_default();
+            .map(|usage| usage.usage);
+        if let Some(usage) = usage {
+            return usage;
+        }
+        return WindowUsage::default();
     }
 
     if scope == WindowScope::FiveHours && has_legacy_codex_window(snapshot) {
@@ -1103,33 +1680,34 @@ fn aggregate_task_row_usage_with_api_long_context(
     };
     if window_only
         && !row.hidden_descendants.is_empty()
-        && let Some(analysis) =
-            window_analysis_with_api_long_context(snapshot, scope, api_long_context)
+        && window_analysis_with_api_long_context(snapshot, scope, api_long_context).is_some()
     {
-        let thread_ids = std::iter::once(row.index)
-            .chain(row.hidden_descendants.iter().copied())
-            .filter_map(|index| snapshot.tasks.get(index))
-            .map(|task| task.thread_id.as_str())
-            .collect::<HashSet<_>>();
         let mut aggregate = WindowUsage::default();
         let mut quota_confidence = None;
-        for thread in analysis
-            .threads
-            .iter()
-            .filter(|thread| thread_ids.contains(thread.thread_id.as_str()))
-        {
-            aggregate.token_usage.add_assign(thread.usage.token_usage);
-            aggregate.local_token_share_percent += thread.usage.local_token_share_percent;
-            aggregate.estimated_quota_percent += thread.usage.estimated_quota_percent;
+        let mut counted_threads = HashSet::new();
+        for index in std::iter::once(row.index).chain(row.hidden_descendants.iter().copied()) {
+            let Some(task) = snapshot.tasks.get(index) else {
+                continue;
+            };
+            if !counted_threads.insert(task.thread_id.as_str()) {
+                continue;
+            }
+            // Resolve each row independently: persisted window analysis is
+            // authoritative when present, while remote live rows that have
+            // not yet been projected into it retain their cumulative-token
+            // fallback. A thread contributes through exactly one path.
+            let usage =
+                task_usage_for_scope_with_api_long_context(snapshot, scope, task, api_long_context);
+            aggregate.token_usage.add_assign(usage.token_usage);
+            aggregate.local_token_share_percent += usage.local_token_share_percent;
+            aggregate.estimated_quota_percent += usage.estimated_quota_percent;
             aggregate
                 .api_equivalent_cost
-                .add_assign(thread.usage.api_equivalent_cost);
-            if quota_estimate_participates(&thread.usage) {
+                .add_assign(usage.api_equivalent_cost);
+            if quota_estimate_participates(&usage) {
                 quota_confidence = Some(match quota_confidence {
-                    None => thread.usage.quota_confidence,
-                    Some(current) => {
-                        weakest_quota_confidence(current, thread.usage.quota_confidence)
-                    }
+                    None => usage.quota_confidence,
+                    Some(current) => weakest_quota_confidence(current, usage.quota_confidence),
                 });
             }
         }
@@ -1423,10 +2001,59 @@ struct SummaryControlsHitbox {
     collapse_all: Rect,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SettingsControlsHitbox {
     rows: [Rect; 8],
+    remote_global: Rect,
+    remote_hosts: Vec<Rect>,
+    remote_new: Rect,
+    remote_edit: Rect,
+    remote_pair: Rect,
+    remote_purge: Rect,
+    remote_remove: Rect,
+    remote_enable: Rect,
+    remote_test: Rect,
+    remote_sync: Rect,
+    remote_include: Rect,
+    remote_global_enabled: bool,
+    remote_new_enabled: bool,
+    remote_edit_enabled: bool,
+    remote_pair_enabled: bool,
+    remote_purge_enabled: bool,
+    remote_remove_enabled: bool,
+    remote_enable_enabled: bool,
+    remote_test_enabled: bool,
+    remote_sync_enabled: bool,
+    remote_include_enabled: bool,
+    project_rows: Vec<Rect>,
+    project_accept: Rect,
+    project_toggle: Rect,
+    project_merge: Rect,
+    project_split: Rect,
+    project_accept_enabled: bool,
+    project_toggle_enabled: bool,
+    project_merge_enabled: bool,
+    project_split_enabled: bool,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteEditorHitbox {
+    host_id: Rect,
+    ssh_host: Rect,
+    agent_executable: Rect,
+    content: Rect,
+    next: Rect,
+    save: Rect,
+    cancel: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteRemoveConfirmationHitbox {
+    confirm: Rect,
+    cancel: Rect,
+}
+
+type RemotePurgeConfirmationHitbox = RemoteRemoveConfirmationHitbox;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowControlsHitbox {
@@ -1543,6 +2170,7 @@ enum ResumeLaunchRequest {
 struct TrendPanelSpec<'a> {
     panel: TrendPanelId,
     title: &'a str,
+    source_scope: Option<&'a str>,
     graph_kind: TrendGraphKind,
     value_kind: TrendValueKind,
     fixed_y_bounds: Option<[f64; 2]>,
@@ -1576,10 +2204,18 @@ struct ResumeLaunchCompletion {
 
 struct RefreshCompletion {
     result: Option<CollectionResult>,
-    history: Option<HistoryData>,
+    remote_live: Option<Result<Vec<SourceRemoteLiveSnapshot>, String>>,
+    remote_overview_history: Option<Result<RemoteOverviewHistory, String>>,
+    history: Option<HistoryRefreshCompletion>,
     recorder_health: Option<RecorderHealth>,
     refreshed_account: bool,
     summary_backfill: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryRefreshCompletion {
+    generation: u64,
+    projection: TuiHistoryProjection,
 }
 
 #[derive(Default)]
@@ -1652,12 +2288,314 @@ struct RecorderHealth {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RemoteSourcesState {
+    config: Option<RemotesConfig>,
+    history_sources: Vec<SourceMetadata>,
+    health: Vec<RemoteSyncHostHealth>,
+    bandwidth: Vec<RemoteBandwidthHostStatus>,
+    config_error: Option<String>,
+    history_error: Option<String>,
+    health_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProjectMappingsSettingsState {
+    mappings: Option<ProjectMappings>,
+    rows: Vec<ProjectMappingSettingsRow>,
+    selected_instances: BTreeSet<ProjectInstanceId>,
+    error: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectMappingSettingsRow {
+    Suggestion {
+        key: String,
+        instance_ids: Vec<ProjectInstanceId>,
+        proposed_label: ProjectDisplayLabel,
+        evidence: String,
+    },
+    LogicalProject {
+        logical_project_id: LogicalProjectId,
+        display_label: ProjectDisplayLabel,
+        instance_ids: Vec<ProjectInstanceId>,
+    },
+    MappedInstance {
+        logical_project_id: LogicalProjectId,
+        logical_label: ProjectDisplayLabel,
+        instance_id: ProjectInstanceId,
+        instance_label: String,
+    },
+    UnmappedInstance {
+        instance_id: ProjectInstanceId,
+        instance_label: String,
+        source_label: String,
+    },
+}
+
+impl ProjectMappingSettingsRow {
+    fn selection_key(&self) -> String {
+        match self {
+            Self::Suggestion { key, .. } => format!("suggestion:{key}"),
+            Self::LogicalProject {
+                logical_project_id, ..
+            } => format!("logical:{}", logical_project_id.as_str()),
+            Self::MappedInstance { instance_id, .. } => {
+                format!("instance:{}", instance_id.as_str())
+            }
+            Self::UnmappedInstance { instance_id, .. } => {
+                format!("unmapped:{}", instance_id.as_str())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteBandwidthThresholdStatus {
+    Ok,
+    Paused,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteBandwidthHostStatus {
+    host_id: String,
+    rolling_bytes: Option<u64>,
+    soft: RemoteBandwidthThresholdStatus,
+    hard: RemoteBandwidthThresholdStatus,
+    resume_at: Option<DateTime<Utc>>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteUiActionKind {
+    Add {
+        ssh_host: String,
+        agent_executable: String,
+        redact_content: bool,
+    },
+    Edit {
+        ssh_host: String,
+        agent_executable: String,
+        redact_content: bool,
+    },
+    Pair,
+    Remove,
+    Test,
+    Sync,
+    Include,
+    Exclude,
+    Purge,
+}
+
+impl RemoteUiActionKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Edit { .. } => "edit",
+            Self::Pair => "pair",
+            Self::Remove => "remove",
+            Self::Test => "test",
+            Self::Sync => "sync",
+            Self::Include => "include",
+            Self::Exclude => "exclude",
+            Self::Purge => "purge",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteUiActionRequest {
+    kind: RemoteUiActionKind,
+    host_id: String,
+    config_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteUiActionOutcome {
+    Complete,
+    NeedsAttention,
+}
+
+#[derive(Debug)]
+struct RemoteUiActionCompletion {
+    request: RemoteUiActionRequest,
+    result: Result<RemoteUiActionOutcome, String>,
+}
+
+#[derive(Clone, Default)]
+struct RemoteActionCancellation {
+    state: Arc<Mutex<RemoteActionCancellationState>>,
+}
+
+#[derive(Default)]
+struct RemoteActionCancellationState {
+    cancelled: bool,
+    target: Option<RemoteActionProcessTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteActionProcessTarget {
+    #[cfg(unix)]
+    ProcessGroup(libc::pid_t),
+    #[cfg(windows)]
+    Job(usize),
+}
+
+impl RemoteActionProcessTarget {
+    fn terminate(self) -> io::Result<()> {
+        #[cfg(unix)]
+        let Self::ProcessGroup(process_group) = self;
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+
+        #[cfg(windows)]
+        let Self::Job(job) = self;
+        #[cfg(windows)]
+        {
+            let job = job as HANDLE;
+            if unsafe { TerminateJobObject(job, 1) } != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = self;
+            Ok(())
+        }
+    }
+}
+
+impl RemoteActionCancellation {
+    fn register(&self, target: RemoteActionProcessTarget) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.cancelled {
+            let _ = target.terminate();
+            false
+        } else {
+            state.target = Some(target);
+            true
+        }
+    }
+
+    fn clear(&self, target: RemoteActionProcessTarget) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.target == Some(target) {
+            state.target = None;
+        }
+    }
+
+    fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.cancelled = true;
+        if let Some(target) = state.target {
+            let _ = target.terminate();
+        }
+    }
+}
+
+struct RemoteActionWorkerGuard {
+    cancellation: RemoteActionCancellation,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl RemoteActionWorkerGuard {
+    fn finish(mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for RemoteActionWorkerGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteEditorMode {
+    Add,
+    Edit,
+}
+
+impl RemoteEditorMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Add => "Add remote host",
+            Self::Edit => "Edit remote host",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteEditorField {
+    HostId,
+    SshHost,
+    AgentExecutable,
+    Content,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteEditorState {
+    mode: RemoteEditorMode,
+    host_id: String,
+    ssh_host: String,
+    agent_executable: String,
+    redact_content: bool,
+    field: RemoteEditorField,
+    host_id_cursor: usize,
+    ssh_host_cursor: usize,
+    agent_executable_cursor: usize,
+    config_revision: u64,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteRemoveConfirmation {
+    host_id: String,
+    config_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemotePurgeConfirmation {
+    source_id: NodeId,
+}
+
 struct RunLoopContext<'a> {
     termination: &'a TerminationSignal,
     refresh_sender: &'a mpsc::Sender<RefreshCompletion>,
     refresh_receiver: &'a Receiver<RefreshCompletion>,
     resume_sender: &'a mpsc::Sender<ResumeLaunchCompletion>,
     resume_receiver: &'a Receiver<ResumeLaunchCompletion>,
+    remote_sender: &'a mpsc::Sender<RemoteUiActionCompletion>,
+    remote_receiver: &'a Receiver<RemoteUiActionCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1809,8 +2747,23 @@ impl View {
 
 struct App {
     snapshot: Snapshot,
+    /// Collector-only baseline. Remote history/live overlays always rebuild
+    /// from this copy so replica replacement and source removal are idempotent.
+    local_snapshot: Snapshot,
     account: AccountSnapshot,
     history: HistoryData,
+    /// Desired source selection shared by Summary and Trends. The separately
+    /// tracked applied selection prevents an in-flight old result from being
+    /// presented under a newly selected label.
+    history_source_selection: HistorySourceSelection,
+    history_source_applied_selection: HistorySourceSelection,
+    history_source_status: Option<HistorySourceSelectionStatus>,
+    history_source_query_error: Option<String>,
+    history_source_loading: bool,
+    history_source_query_pending: bool,
+    history_source_generation: u64,
+    history_local_source_id: Option<NodeId>,
+    history_remote_sources: Vec<(NodeId, String)>,
     recorder_health: RecorderHealth,
     theme: Theme,
     view: View,
@@ -1840,6 +2793,31 @@ struct App {
     api_long_context_multiplier: bool,
     table_columns: UiTableColumns,
     selected_setting: usize,
+    remote_sources: RemoteSourcesState,
+    remote_config_store: RemotesConfigStore,
+    project_mappings: ProjectMappingsSettingsState,
+    project_mapping_store: ProjectMappingStore,
+    remote_source_history_store: Option<SourceHistoryStore>,
+    remote_live_states: Vec<SourceRemoteLiveSnapshot>,
+    remote_overview_history: RemoteOverviewHistory,
+    trusted_remote_parent_edges: HashSet<(String, String)>,
+    // Remote freshness/load quality is an overlay. Keep the collector's own
+    // partial bit so removing or refreshing an SSH source cannot permanently
+    // contaminate unrelated local/account quality.
+    local_snapshot_partial: bool,
+    last_remote_source_metadata_reload: Option<Instant>,
+    remote_health_store: Option<RemoteSyncHealthStore>,
+    remote_bandwidth_store: Option<RemoteBandwidthBudgetStore>,
+    pending_remote_action: Option<RemoteUiActionRequest>,
+    remote_action_running: Option<RemoteUiActionRequest>,
+    remote_action_status: Option<String>,
+    remote_editor: Option<RemoteEditorState>,
+    remote_editor_hitbox: Option<RemoteEditorHitbox>,
+    remote_remove_confirmation: Option<RemoteRemoveConfirmation>,
+    remote_remove_confirmation_hitbox: Option<RemoteRemoveConfirmationHitbox>,
+    remote_purge_confirmation: Option<RemotePurgeConfirmation>,
+    remote_purge_confirmation_hitbox: Option<RemotePurgeConfirmationHitbox>,
+    local_redact_content: bool,
     open_config: OpenConfig,
     open_config_error: Option<String>,
     zellij_environment: bool,
@@ -1863,6 +2841,7 @@ struct App {
     window_controls_hitbox: Option<WindowControlsHitbox>,
     settings_controls_hitbox: Option<SettingsControlsHitbox>,
     trend_controls_hitbox: Option<TrendControlsHitbox>,
+    history_source_control_hitbox: Rect,
     trend_chart_hitboxes: Vec<TrendChartHitbox>,
     trend_inspect_mode: bool,
     trend_inspection: Option<TrendInspection>,
@@ -1904,10 +2883,22 @@ struct App {
 
 impl App {
     fn new(result: CollectionResult, theme: Theme) -> Self {
+        let local_snapshot_partial = result.snapshot.partial;
+        let local_snapshot = result.snapshot.clone();
         Self {
             snapshot: result.snapshot,
+            local_snapshot,
             account: result.account,
             history: HistoryData::default(),
+            history_source_selection: HistorySourceSelection::AllIncluded,
+            history_source_applied_selection: HistorySourceSelection::AllIncluded,
+            history_source_status: Some(HistorySourceSelectionStatus::Applied),
+            history_source_query_error: None,
+            history_source_loading: false,
+            history_source_query_pending: false,
+            history_source_generation: 0,
+            history_local_source_id: None,
+            history_remote_sources: Vec::new(),
             recorder_health: RecorderHealth::default(),
             theme,
             view: View::Overview,
@@ -1936,6 +2927,28 @@ impl App {
             api_long_context_multiplier: false,
             table_columns: UiTableColumns::default(),
             selected_setting: 0,
+            remote_sources: RemoteSourcesState::default(),
+            remote_config_store: RemotesConfigStore::discover(),
+            project_mappings: ProjectMappingsSettingsState::default(),
+            project_mapping_store: ProjectMappingStore::discover(),
+            remote_source_history_store: None,
+            remote_live_states: Vec::new(),
+            remote_overview_history: RemoteOverviewHistory::default(),
+            trusted_remote_parent_edges: HashSet::new(),
+            local_snapshot_partial,
+            last_remote_source_metadata_reload: None,
+            remote_health_store: discover_remote_sync_health_store(),
+            remote_bandwidth_store: discover_remote_bandwidth_budget_store(),
+            pending_remote_action: None,
+            remote_action_running: None,
+            remote_action_status: None,
+            remote_editor: None,
+            remote_editor_hitbox: None,
+            remote_remove_confirmation: None,
+            remote_remove_confirmation_hitbox: None,
+            remote_purge_confirmation: None,
+            remote_purge_confirmation_hitbox: None,
+            local_redact_content: false,
             open_config: OpenConfig::default(),
             open_config_error: None,
             zellij_environment: std::env::var_os("ZELLIJ").is_some(),
@@ -1959,6 +2972,7 @@ impl App {
             window_controls_hitbox: None,
             settings_controls_hitbox: None,
             trend_controls_hitbox: None,
+            history_source_control_hitbox: Rect::default(),
             trend_chart_hitboxes: Vec::new(),
             trend_inspect_mode: false,
             trend_inspection: None,
@@ -2060,6 +3074,7 @@ impl App {
         self.summary_grain = state.summary_grain.into();
         self.summary_metric = state.summary_metric.into();
         self.summary_show_all_projects = state.summary_show_all_projects;
+        self.history_source_selection = (&state.history_source_selection).into();
         self.summary_expanded_nodes.clear();
         self.summary_selected_id = None;
         self.summary_offset = 0;
@@ -2091,6 +3106,35 @@ impl App {
         if !summary_inputs_unchanged {
             self.summary_cache = None;
         }
+    }
+
+    fn apply_history_projection(
+        &mut self,
+        generation: u64,
+        projection: TuiHistoryProjection,
+    ) -> bool {
+        if generation != self.history_source_generation
+            || projection.selection != self.history_source_selection
+        {
+            return false;
+        }
+        let scope_changed = self.history_source_loading
+            || self.history_source_applied_selection != projection.selection
+            || self.history_source_status != projection.status;
+        self.history_source_applied_selection = projection.selection;
+        self.history_source_status = projection.status;
+        self.history_source_query_error = projection.query_error;
+        self.history_source_loading = false;
+        self.history_source_query_pending = false;
+        self.replace_history(projection.history);
+        if scope_changed {
+            self.summary_selected_id = None;
+            self.summary_offset = 0;
+            self.summary_inspected_date = None;
+            self.summary_daily_dragging = false;
+            self.clear_trend_inspection();
+        }
+        true
     }
 
     fn replace_recorder_health(&mut self, recorder_health: RecorderHealth) {
@@ -2452,6 +3496,7 @@ impl App {
             summary_grain: self.summary_grain.into(),
             summary_metric: self.summary_metric.into(),
             summary_show_all_projects: self.summary_show_all_projects,
+            history_source_selection: (&self.history_source_selection).into(),
             table_columns: self.table_columns,
             task_list_mode: self.task_list_mode.into(),
             task_source_filter: self.task_source_filter.into(),
@@ -2520,13 +3565,6 @@ impl App {
             let Some(child) = self.snapshot.tasks.get(child_index) else {
                 continue;
             };
-            if !child
-                .source
-                .as_deref()
-                .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
-            {
-                continue;
-            }
             let Some(parent_index) = child
                 .parent_thread_id
                 .as_deref()
@@ -2535,6 +3573,12 @@ impl App {
             else {
                 continue;
             };
+            let Some(parent) = self.snapshot.tasks.get(parent_index) else {
+                continue;
+            };
+            if !self.trusts_task_parent_edge(child, parent) {
+                continue;
+            }
             if parent_index == child_index
                 || task_parent_edge_would_cycle(child_index, parent_index, &parent_by_index)
             {
@@ -2620,18 +3664,15 @@ impl App {
         let mut seen = HashSet::from([index]);
         loop {
             let task = self.snapshot.tasks.get(cursor)?;
-            if !task
-                .source
-                .as_deref()
-                .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
-            {
-                return None;
-            }
             let parent = task
                 .parent_thread_id
                 .as_deref()
                 .and_then(|thread_id| by_thread.get(thread_id))
                 .copied()?;
+            let parent_task = self.snapshot.tasks.get(parent)?;
+            if !self.trusts_task_parent_edge(task, parent_task) {
+                return None;
+            }
             if visible.contains(&parent) {
                 return Some(parent);
             }
@@ -2709,6 +3750,76 @@ impl App {
         !self.focus.is_search()
             && !self.quit_confirmation_visible
             && self.resume_confirmation.is_none()
+            && self.remote_editor.is_none()
+            && self.remote_remove_confirmation.is_none()
+            && self.remote_purge_confirmation.is_none()
+    }
+
+    fn setting_control_visible(&self, item: SettingItem) -> bool {
+        self.settings_controls_hitbox
+            .as_ref()
+            .is_some_and(|hitbox| !hitbox.rows[item.index()].is_empty())
+    }
+
+    fn main_settings_focused(&self) -> bool {
+        self.selected_setting_item().is_some()
+    }
+
+    fn remote_settings_focused(&self) -> bool {
+        let Some(index) = self.selected_setting.checked_sub(SettingItem::ALL.len()) else {
+            return false;
+        };
+        index < self.remote_settings_selection_count()
+    }
+
+    fn project_settings_focused(&self) -> bool {
+        self.selected_project_mapping_row().is_some()
+    }
+
+    fn remote_control_active(
+        &self,
+        control: impl FnOnce(&SettingsControlsHitbox) -> (Rect, bool),
+    ) -> bool {
+        self.remote_settings_focused()
+            && self
+                .settings_controls_hitbox
+                .as_ref()
+                .is_some_and(|hitbox| {
+                    let (area, enabled) = control(hitbox);
+                    enabled && !area.is_empty()
+                })
+    }
+
+    fn project_control_active(
+        &self,
+        control: impl FnOnce(&SettingsControlsHitbox) -> (Rect, bool),
+    ) -> bool {
+        self.project_settings_focused()
+            && self
+                .settings_controls_hitbox
+                .as_ref()
+                .is_some_and(|hitbox| {
+                    let (area, enabled) = control(hitbox);
+                    enabled && !area.is_empty()
+                })
+    }
+
+    fn remote_action_idle(&self) -> bool {
+        self.remote_action_running.is_none()
+            && self.pending_remote_action.is_none()
+            && self.remote_editor.is_none()
+            && self.remote_remove_confirmation.is_none()
+            && self.remote_purge_confirmation.is_none()
+    }
+
+    fn reject_remote_config_mutation_while_busy(&mut self) -> bool {
+        if self.remote_action_idle() {
+            false
+        } else {
+            self.remote_action_status =
+                Some("Another remote operation is still running".to_owned());
+            true
+        }
     }
 
     fn close_temporary_turns(&mut self) {
@@ -2743,8 +3854,229 @@ impl App {
         self.clear_trend_inspection();
     }
 
-    fn selected_setting_item(&self) -> SettingItem {
-        SettingItem::ALL[self.selected_setting.min(SettingItem::ALL.len() - 1)]
+    fn history_source_choices(&self) -> Vec<HistorySourceSelection> {
+        let mut choices = vec![HistorySourceSelection::AllIncluded];
+        if let Some(local_source_id) = self.history_local_source_id.as_ref() {
+            choices.push(HistorySourceSelection::Local(local_source_id.clone()));
+        }
+        for (source_id, _) in &self.history_remote_sources {
+            let selection = HistorySourceSelection::Remote(source_id.clone());
+            if !choices.contains(&selection) {
+                choices.push(selection);
+            }
+        }
+        if let Some(config) = self.remote_sources.config.as_ref() {
+            for source_id in config
+                .hosts()
+                .iter()
+                .filter_map(|host| host.expected_source())
+                .map(|source| source.node_id.clone())
+            {
+                let selection = HistorySourceSelection::Remote(source_id);
+                if !choices.contains(&selection) {
+                    choices.push(selection);
+                }
+            }
+        }
+        // A persisted exact selection remains an explicit desired scope even
+        // after its SSH host or metadata was removed. Keeping it in the cycle
+        // makes the UNAVAILABLE state reversible without silently choosing All.
+        if matches!(
+            self.history_source_selection,
+            HistorySourceSelection::Remote(_)
+        ) && !choices.contains(&self.history_source_selection)
+        {
+            choices.push(self.history_source_selection.clone());
+        }
+        choices
+    }
+
+    fn cycle_history_source(&mut self) {
+        let choices = self.history_source_choices();
+        let next = choices
+            .iter()
+            .position(|choice| choice == &self.history_source_selection)
+            .map_or(0, |index| (index + 1) % choices.len());
+        self.request_history_source(choices[next].clone());
+    }
+
+    fn request_history_source(&mut self, selection: HistorySourceSelection) {
+        if selection == self.history_source_selection && !self.history_source_loading {
+            return;
+        }
+        self.history_source_selection = selection;
+        self.history_source_generation = self.history_source_generation.wrapping_add(1);
+        self.history_source_loading = true;
+        self.history_source_query_pending = true;
+        self.history_source_query_error = None;
+        self.summary_cache = None;
+        self.summary_selected_id = None;
+        self.summary_offset = 0;
+        self.summary_inspected_date = None;
+        self.summary_daily_dragging = false;
+        self.clear_trend_inspection();
+    }
+
+    fn history_source_label(&self, selection: &HistorySourceSelection) -> String {
+        match selection {
+            HistorySourceSelection::AllIncluded => "All".to_owned(),
+            HistorySourceSelection::Local(_) => "Local".to_owned(),
+            HistorySourceSelection::Remote(source_id) => {
+                let host_label = self.remote_sources.config.as_ref().and_then(|config| {
+                    config.hosts().iter().find_map(|host| {
+                        (host
+                            .expected_source()
+                            .is_some_and(|source| &source.node_id == source_id))
+                        .then(|| host.id().to_owned())
+                    })
+                });
+                let history_label = self
+                    .history_remote_sources
+                    .iter()
+                    .find_map(|(candidate, label)| (candidate == source_id).then_some(label))
+                    .filter(|label| !label.is_empty());
+                host_label.or_else(|| history_label.cloned()).map_or_else(
+                    || format!("SSH {}", compact_node_id(source_id)),
+                    |host| format!("SSH {host}"),
+                )
+            }
+        }
+    }
+
+    fn history_source_scope_label(&self) -> String {
+        if self.history_source_loading {
+            return format!(
+                "source {} → {} LOADING",
+                self.history_source_label(&self.history_source_applied_selection),
+                self.history_source_label(&self.history_source_selection)
+            );
+        }
+        let label = self.history_source_label(&self.history_source_applied_selection);
+        match self.history_source_status {
+            Some(HistorySourceSelectionStatus::Applied) => format!("source {label}"),
+            Some(HistorySourceSelectionStatus::AppliedExcludedFromAggregates) => {
+                format!("source {label} EXCLUDED (inspect only)")
+            }
+            Some(HistorySourceSelectionStatus::Unavailable(reason)) => {
+                format!("source {label} UNAVAILABLE ({})", reason.as_str())
+            }
+            None => self.history_source_query_error.as_deref().map_or_else(
+                || format!("source {label} ERROR"),
+                |error| {
+                    format!(
+                        "source {label} ERROR ({})",
+                        truncate_display_text(terminal_safe_text(error).as_ref(), 48)
+                    )
+                },
+            ),
+        }
+    }
+
+    fn history_source_compact_scope_label(&self) -> String {
+        if self.history_source_loading {
+            return format!(
+                "{}>{} LOAD",
+                self.history_source_label(&self.history_source_applied_selection),
+                self.history_source_label(&self.history_source_selection)
+            );
+        }
+        let label = self.history_source_label(&self.history_source_applied_selection);
+        match self.history_source_status {
+            Some(HistorySourceSelectionStatus::Applied) => label,
+            Some(HistorySourceSelectionStatus::AppliedExcludedFromAggregates) => {
+                format!("{label} EXCL")
+            }
+            Some(HistorySourceSelectionStatus::Unavailable(_)) => format!("{label} UNAVAIL"),
+            None => format!("{label} ERR"),
+        }
+    }
+
+    fn history_source_control_visible(&self) -> bool {
+        matches!(self.view, View::Summary | View::Trends)
+            && !self.history_source_control_hitbox.is_empty()
+    }
+
+    fn selected_setting_item(&self) -> Option<SettingItem> {
+        SettingItem::ALL.get(self.selected_setting).copied()
+    }
+
+    fn settings_selection_count(&self) -> usize {
+        self.project_mapping_selection_base()
+            .saturating_add(self.project_mappings.rows.len())
+    }
+
+    fn remote_settings_entry_count(&self) -> usize {
+        self.remote_sources
+            .config
+            .as_ref()
+            .map_or(0, |config| config.hosts().len())
+            .saturating_add(
+                self.remote_sources
+                    .history_sources
+                    .iter()
+                    .filter(|source| source.detached())
+                    .count(),
+            )
+    }
+
+    /// The empty Remote sources panel still owns one keyboard-focus position.
+    /// Once it has rows, those rows remain the selectable positions exactly as
+    /// before; the synthetic position exists only so `[G]` and `[N]` are
+    /// reachable on a fresh installation without requiring a mouse.
+    fn remote_settings_selection_count(&self) -> usize {
+        self.remote_settings_entry_count().max(1)
+    }
+
+    fn project_mapping_selection_base(&self) -> usize {
+        SettingItem::ALL
+            .len()
+            .saturating_add(self.remote_settings_selection_count())
+    }
+
+    fn selected_project_mapping_row(&self) -> Option<&ProjectMappingSettingsRow> {
+        let index = self
+            .selected_setting
+            .checked_sub(self.project_mapping_selection_base())?;
+        self.project_mappings.rows.get(index)
+    }
+
+    fn selected_remote_host(&self) -> Option<&crate::remotes_config::RemoteHostConfig> {
+        let index = self.selected_setting.checked_sub(SettingItem::ALL.len())?;
+        self.remote_sources.config.as_ref()?.hosts().get(index)
+    }
+
+    fn selected_remote_host_id(&self) -> Option<String> {
+        self.selected_remote_host().map(|host| host.id().to_owned())
+    }
+
+    fn selected_detached_remote_source(&self) -> Option<&SourceMetadata> {
+        let entry_index = self.selected_setting.checked_sub(SettingItem::ALL.len())?;
+        let host_count = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map_or(0, |config| config.hosts().len());
+        let source_index = entry_index.checked_sub(host_count)?;
+        self.remote_sources
+            .history_sources
+            .iter()
+            .filter(|source| source.detached())
+            .nth(source_index)
+    }
+
+    fn selected_remote_source_metadata(&self) -> Option<&SourceMetadata> {
+        if let Some(source) = self.selected_detached_remote_source() {
+            return Some(source);
+        }
+        let source_id = self
+            .selected_remote_host()?
+            .expected_source()?
+            .node_id
+            .clone();
+        self.remote_sources
+            .history_sources
+            .iter()
+            .find(|source| source.source_id() == &source_id)
     }
 
     fn select_setting(&mut self, item: SettingItem) {
@@ -2752,11 +4084,866 @@ impl App {
     }
 
     fn move_setting_selection(&mut self, forward: bool) {
+        let last = self.settings_selection_count().saturating_sub(1);
         self.selected_setting = if forward {
-            (self.selected_setting + 1).min(SettingItem::ALL.len() - 1)
+            (self.selected_setting + 1).min(last)
         } else {
             self.selected_setting.saturating_sub(1)
         };
+    }
+
+    fn reload_project_mappings(&mut self) -> bool {
+        let selected_key = self
+            .selected_project_mapping_row()
+            .map(ProjectMappingSettingsRow::selection_key);
+        let previous = self.project_mappings.clone();
+        let status = self.project_mappings.status.take();
+        let selected_instances = self.project_mappings.selected_instances.clone();
+        self.project_mappings = load_project_mappings_settings_state(&self.project_mapping_store);
+        self.project_mappings.status = status;
+        let unmapped = self
+            .project_mappings
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                ProjectMappingSettingsRow::UnmappedInstance { instance_id, .. } => {
+                    Some(instance_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.project_mappings.selected_instances = selected_instances
+            .intersection(&unmapped)
+            .cloned()
+            .collect();
+        if let Some(selected_key) = selected_key
+            && let Some(index) = self
+                .project_mappings
+                .rows
+                .iter()
+                .position(|row| row.selection_key() == selected_key)
+        {
+            self.selected_setting = self.project_mapping_selection_base() + index;
+        } else {
+            self.selected_setting = self
+                .selected_setting
+                .min(self.settings_selection_count().saturating_sub(1));
+        }
+        self.project_mappings != previous
+    }
+
+    fn accept_selected_project_merge(&mut self) {
+        let Some(mappings) = self.project_mappings.mappings.as_ref() else {
+            self.project_mappings.status = Some("Project mappings are unavailable".to_owned());
+            return;
+        };
+        let revision = mappings.revision();
+        let Some(ProjectMappingSettingsRow::Suggestion {
+            instance_ids,
+            proposed_label,
+            ..
+        }) = self.selected_project_mapping_row().cloned()
+        else {
+            return;
+        };
+        self.project_mappings.status = match self.project_mapping_store.merge_instances(
+            revision,
+            None,
+            Some(proposed_label.clone()),
+            &instance_ids,
+        ) {
+            Ok(_) => Some(format!(
+                "Merged {} instances as {}",
+                instance_ids.len(),
+                proposed_label.as_str()
+            )),
+            Err(error) => Some(format!(
+                "Project merge failed ({})",
+                io_error_category(&error)
+            )),
+        };
+        self.reload_project_mappings();
+    }
+
+    fn toggle_selected_project_instance(&mut self) {
+        let Some(ProjectMappingSettingsRow::UnmappedInstance { instance_id, .. }) =
+            self.selected_project_mapping_row().cloned()
+        else {
+            return;
+        };
+        if !self
+            .project_mappings
+            .selected_instances
+            .remove(&instance_id)
+        {
+            self.project_mappings.selected_instances.insert(instance_id);
+        }
+        self.project_mappings.status = Some(format!(
+            "{} instance(s) selected for manual merge",
+            self.project_mappings.selected_instances.len()
+        ));
+    }
+
+    fn merge_selected_project_instances(&mut self) {
+        let Some(mappings) = self.project_mappings.mappings.as_ref() else {
+            self.project_mappings.status = Some("Project mappings are unavailable".to_owned());
+            return;
+        };
+        let revision = mappings.revision();
+        let instance_ids = self
+            .project_mappings
+            .selected_instances
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let label = match manual_merge_display_label(mappings, &instance_ids) {
+            Ok(label) => label,
+            Err(error) => {
+                self.project_mappings.status = Some(format!(
+                    "Manual merge unavailable ({})",
+                    io_error_category(&error)
+                ));
+                return;
+            }
+        };
+        let member_count = instance_ids.len();
+        self.project_mappings.status = match self.project_mapping_store.merge_instances(
+            revision,
+            None,
+            Some(label.clone()),
+            &instance_ids,
+        ) {
+            Ok(_) => {
+                self.project_mappings.selected_instances.clear();
+                Some(format!(
+                    "Merged {member_count} selected instances as {}",
+                    label.as_str()
+                ))
+            }
+            Err(error) => Some(format!(
+                "Manual project merge failed ({})",
+                io_error_category(&error)
+            )),
+        };
+        self.reload_project_mappings();
+    }
+
+    fn split_selected_project_mapping(&mut self) {
+        let Some(mappings) = self.project_mappings.mappings.as_ref() else {
+            self.project_mappings.status = Some("Project mappings are unavailable".to_owned());
+            return;
+        };
+        let revision = mappings.revision();
+        let Some(row) = self.selected_project_mapping_row().cloned() else {
+            return;
+        };
+        let instance_ids = match row {
+            ProjectMappingSettingsRow::LogicalProject { instance_ids, .. } => instance_ids,
+            ProjectMappingSettingsRow::MappedInstance { instance_id, .. } => vec![instance_id],
+            ProjectMappingSettingsRow::Suggestion { .. }
+            | ProjectMappingSettingsRow::UnmappedInstance { .. } => return,
+        };
+        self.project_mappings.status = match self
+            .project_mapping_store
+            .split_instances(revision, &instance_ids)
+        {
+            Ok(_) => Some(format!("Split {} mapped instance(s)", instance_ids.len())),
+            Err(error) => Some(format!(
+                "Project split failed ({})",
+                io_error_category(&error)
+            )),
+        };
+        self.reload_project_mappings();
+    }
+
+    fn reload_remote_sources(&mut self) -> bool {
+        self.reload_remote_sources_with_history(false)
+    }
+
+    fn reload_remote_sources_with_history(&mut self, force_history: bool) -> bool {
+        let selected_host = self.selected_remote_host_id();
+        let selected_source = self
+            .selected_detached_remote_source()
+            .map(|source| source.source_id().clone());
+        let selected_project_mapping = self
+            .selected_project_mapping_row()
+            .map(ProjectMappingSettingsRow::selection_key);
+        let now = Instant::now();
+        let refresh_history = force_history
+            || self.last_remote_source_metadata_reload.is_none_or(|last| {
+                now.saturating_duration_since(last) >= REMOTE_SOURCE_METADATA_REFRESH_INTERVAL
+            });
+        let mut reloaded = load_remote_sources_state(
+            &self.remote_config_store,
+            self.remote_health_store.as_ref(),
+            self.remote_bandwidth_store.as_ref(),
+            Utc::now(),
+        );
+        if refresh_history {
+            (reloaded.history_sources, reloaded.history_error) =
+                load_remote_history_sources(self.remote_source_history_store.as_ref());
+            self.last_remote_source_metadata_reload = Some(now);
+        } else {
+            reloaded.history_sources = self.remote_sources.history_sources.clone();
+            reloaded.history_error = self.remote_sources.history_error.clone();
+        }
+        let changed = reloaded != self.remote_sources;
+        self.remote_sources = reloaded;
+        if let Some(selected_host) = selected_host
+            && let Some(index) = self.remote_sources.config.as_ref().and_then(|config| {
+                config
+                    .hosts()
+                    .iter()
+                    .position(|host| host.id() == selected_host)
+            })
+        {
+            self.selected_setting = SettingItem::ALL.len() + index;
+        } else if let Some(selected_source) = selected_source
+            && let Some(index) = self
+                .remote_sources
+                .history_sources
+                .iter()
+                .filter(|source| source.detached())
+                .position(|source| source.source_id() == &selected_source)
+        {
+            let host_count = self
+                .remote_sources
+                .config
+                .as_ref()
+                .map_or(0, |config| config.hosts().len());
+            self.selected_setting = SettingItem::ALL.len() + host_count + index;
+        } else if let Some(selected_project_mapping) = selected_project_mapping
+            && let Some(index) = self
+                .project_mappings
+                .rows
+                .iter()
+                .position(|row| row.selection_key() == selected_project_mapping)
+        {
+            self.selected_setting = self.project_mapping_selection_base() + index;
+        } else {
+            self.selected_setting = self
+                .selected_setting
+                .min(self.settings_selection_count().saturating_sub(1));
+        }
+        changed
+    }
+
+    fn update_remote_config(&mut self, mutation: RemotesConfigMutation, label: &str) {
+        let Some(config) = self.remote_sources.config.as_ref() else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        match self
+            .remote_config_store
+            .update(config.config_revision(), mutation)
+        {
+            Ok(updated) => {
+                self.remote_sources.config = Some(updated);
+                self.remote_sources.config_error = None;
+                self.remote_action_status = Some(label.to_owned());
+            }
+            Err(error) => {
+                self.remote_action_status = Some(format!(
+                    "Remote config update failed ({})",
+                    io_error_category(&error)
+                ));
+                self.reload_remote_sources();
+            }
+        }
+        self.selected_setting = self
+            .selected_setting
+            .min(self.settings_selection_count().saturating_sub(1));
+    }
+
+    fn begin_remote_add(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(config) = self.remote_sources.config.as_ref() else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        self.remote_editor = Some(RemoteEditorState {
+            mode: RemoteEditorMode::Add,
+            host_id: String::new(),
+            ssh_host: String::new(),
+            agent_executable: DEFAULT_REMOTE_AGENT_EXECUTABLE.to_owned(),
+            redact_content: self.local_redact_content,
+            field: RemoteEditorField::HostId,
+            host_id_cursor: 0,
+            ssh_host_cursor: 0,
+            agent_executable_cursor: grapheme_count(DEFAULT_REMOTE_AGENT_EXECUTABLE),
+            config_revision: config.config_revision(),
+            validation_error: None,
+        });
+    }
+
+    fn begin_selected_remote_edit(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(host) = self.selected_remote_host().cloned() else {
+            self.remote_action_status = Some("Select one remote host first".to_owned());
+            return;
+        };
+        let Some(config_revision) = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map(RemotesConfig::config_revision)
+        else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        let ssh_host = host.ssh_host().to_owned();
+        let agent_executable = host.agent_executable().to_owned();
+        self.remote_editor = Some(RemoteEditorState {
+            mode: RemoteEditorMode::Edit,
+            host_id: host.id().to_owned(),
+            ssh_host_cursor: grapheme_count(&ssh_host),
+            ssh_host,
+            agent_executable_cursor: grapheme_count(&agent_executable),
+            agent_executable,
+            redact_content: host.redact_content(),
+            field: RemoteEditorField::SshHost,
+            host_id_cursor: grapheme_count(host.id()),
+            config_revision,
+            validation_error: None,
+        });
+    }
+
+    fn cancel_remote_editor(&mut self) {
+        self.remote_editor = None;
+        self.remote_editor_hitbox = None;
+    }
+
+    fn cycle_remote_editor_field(&mut self, forward: bool) {
+        let Some(editor) = self.remote_editor.as_mut() else {
+            return;
+        };
+        editor.validation_error = None;
+        editor.field = match (editor.mode, editor.field, forward) {
+            (RemoteEditorMode::Add, RemoteEditorField::HostId, true) => RemoteEditorField::SshHost,
+            (RemoteEditorMode::Add, RemoteEditorField::SshHost, true)
+            | (RemoteEditorMode::Edit, RemoteEditorField::SshHost, true) => {
+                RemoteEditorField::AgentExecutable
+            }
+            (RemoteEditorMode::Add, RemoteEditorField::AgentExecutable, true)
+            | (RemoteEditorMode::Edit, RemoteEditorField::AgentExecutable, true) => {
+                RemoteEditorField::Content
+            }
+            (RemoteEditorMode::Add, RemoteEditorField::Content, true) => RemoteEditorField::HostId,
+            (RemoteEditorMode::Edit, RemoteEditorField::Content, true) => {
+                RemoteEditorField::SshHost
+            }
+            (RemoteEditorMode::Add, RemoteEditorField::HostId, false) => RemoteEditorField::Content,
+            (RemoteEditorMode::Add, RemoteEditorField::SshHost, false) => RemoteEditorField::HostId,
+            (RemoteEditorMode::Add, RemoteEditorField::AgentExecutable, false)
+            | (RemoteEditorMode::Edit, RemoteEditorField::AgentExecutable, false) => {
+                RemoteEditorField::SshHost
+            }
+            (RemoteEditorMode::Add, RemoteEditorField::Content, false)
+            | (RemoteEditorMode::Edit, RemoteEditorField::Content, false) => {
+                RemoteEditorField::AgentExecutable
+            }
+            (RemoteEditorMode::Edit, RemoteEditorField::SshHost, false) => {
+                RemoteEditorField::Content
+            }
+            (RemoteEditorMode::Edit, RemoteEditorField::HostId, _) => RemoteEditorField::SshHost,
+        };
+    }
+
+    fn select_remote_editor_field(&mut self, field: RemoteEditorField) {
+        if let Some(editor) = self.remote_editor.as_mut()
+            && !(editor.mode == RemoteEditorMode::Edit && field == RemoteEditorField::HostId)
+        {
+            editor.field = field;
+            editor.validation_error = None;
+        }
+    }
+
+    fn insert_remote_editor_character(&mut self, character: char) {
+        let Some(editor) = self.remote_editor.as_mut() else {
+            return;
+        };
+        if character.is_control() {
+            return;
+        }
+        editor.validation_error = None;
+        match editor.field {
+            RemoteEditorField::HostId if editor.mode == RemoteEditorMode::Add => {
+                insert_at_grapheme_cursor(
+                    &mut editor.host_id,
+                    &mut editor.host_id_cursor,
+                    character,
+                );
+            }
+            RemoteEditorField::SshHost => insert_at_grapheme_cursor(
+                &mut editor.ssh_host,
+                &mut editor.ssh_host_cursor,
+                character,
+            ),
+            RemoteEditorField::AgentExecutable => insert_at_grapheme_cursor(
+                &mut editor.agent_executable,
+                &mut editor.agent_executable_cursor,
+                character,
+            ),
+            RemoteEditorField::HostId | RemoteEditorField::Content => {}
+        }
+    }
+
+    fn backspace_remote_editor(&mut self) {
+        let Some(editor) = self.remote_editor.as_mut() else {
+            return;
+        };
+        editor.validation_error = None;
+        match editor.field {
+            RemoteEditorField::HostId if editor.mode == RemoteEditorMode::Add => {
+                backspace_grapheme(&mut editor.host_id, &mut editor.host_id_cursor);
+            }
+            RemoteEditorField::SshHost => {
+                backspace_grapheme(&mut editor.ssh_host, &mut editor.ssh_host_cursor);
+            }
+            RemoteEditorField::AgentExecutable => {
+                backspace_grapheme(
+                    &mut editor.agent_executable,
+                    &mut editor.agent_executable_cursor,
+                );
+            }
+            RemoteEditorField::HostId | RemoteEditorField::Content => {}
+        }
+    }
+
+    fn delete_remote_editor(&mut self) {
+        let Some(editor) = self.remote_editor.as_mut() else {
+            return;
+        };
+        editor.validation_error = None;
+        match editor.field {
+            RemoteEditorField::HostId if editor.mode == RemoteEditorMode::Add => {
+                delete_grapheme(&mut editor.host_id, &mut editor.host_id_cursor);
+            }
+            RemoteEditorField::SshHost => {
+                delete_grapheme(&mut editor.ssh_host, &mut editor.ssh_host_cursor);
+            }
+            RemoteEditorField::AgentExecutable => {
+                delete_grapheme(
+                    &mut editor.agent_executable,
+                    &mut editor.agent_executable_cursor,
+                );
+            }
+            RemoteEditorField::HostId | RemoteEditorField::Content => {}
+        }
+    }
+
+    fn move_remote_editor_cursor(&mut self, forward: bool, edge: Option<bool>) {
+        let Some(editor) = self.remote_editor.as_mut() else {
+            return;
+        };
+        let move_cursor = |cursor: &mut usize, value: &str| {
+            *cursor = match edge {
+                Some(false) => 0,
+                Some(true) => grapheme_count(value),
+                None if forward => cursor.saturating_add(1).min(grapheme_count(value)),
+                None => cursor.saturating_sub(1),
+            };
+        };
+        match editor.field {
+            RemoteEditorField::HostId if editor.mode == RemoteEditorMode::Add => {
+                move_cursor(&mut editor.host_id_cursor, &editor.host_id);
+            }
+            RemoteEditorField::SshHost => {
+                move_cursor(&mut editor.ssh_host_cursor, &editor.ssh_host);
+            }
+            RemoteEditorField::AgentExecutable => move_cursor(
+                &mut editor.agent_executable_cursor,
+                &editor.agent_executable,
+            ),
+            RemoteEditorField::HostId | RemoteEditorField::Content => {}
+        }
+    }
+
+    fn toggle_remote_editor_content(&mut self) {
+        if let Some(editor) = self.remote_editor.as_mut()
+            && editor.field == RemoteEditorField::Content
+        {
+            editor.redact_content = !editor.redact_content;
+            editor.validation_error = None;
+        }
+    }
+
+    fn validate_remote_editor(&self, editor: &RemoteEditorState) -> Result<(), String> {
+        if editor.host_id.is_empty() || editor.host_id.len() > REMOTE_EDITOR_MAX_HOST_ID_BYTES {
+            return Err(format!(
+                "Host ID must contain 1-{REMOTE_EDITOR_MAX_HOST_ID_BYTES} bytes"
+            ));
+        }
+        let bytes = editor.host_id.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric()
+            || bytes
+                .iter()
+                .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
+        {
+            return Err("Host ID must use ASCII letters, digits, '-' or '_'".to_owned());
+        }
+        if editor.ssh_host.is_empty() || editor.ssh_host.len() > REMOTE_EDITOR_MAX_SSH_HOST_BYTES {
+            return Err(format!(
+                "SSH alias must contain 1-{REMOTE_EDITOR_MAX_SSH_HOST_BYTES} bytes"
+            ));
+        }
+        if editor.ssh_host.starts_with('-')
+            || editor.ssh_host.chars().any(char::is_control)
+            || editor.ssh_host.chars().any(char::is_whitespace)
+        {
+            return Err("SSH alias must not start with '-' or contain whitespace".to_owned());
+        }
+        if editor.agent_executable.is_empty()
+            || editor.agent_executable.len() > REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES
+        {
+            return Err(format!(
+                "Agent executable must contain 1-{REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES} bytes"
+            ));
+        }
+        if editor.agent_executable.bytes().any(|byte| {
+            !byte.is_ascii_alphanumeric()
+                && !matches!(byte, b'/' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
+        }) {
+            return Err(
+                "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
+                    .to_owned(),
+            );
+        }
+        let current = self.remote_config_store.load().map_err(|error| {
+            format!("Remote config unavailable ({})", io_error_category(&error))
+        })?;
+        if current.config_revision() != editor.config_revision {
+            return Err("Remote config changed; cancel and reopen this editor".to_owned());
+        }
+        match editor.mode {
+            RemoteEditorMode::Add if current.host(&editor.host_id).is_some() => {
+                Err("That host ID is already configured".to_owned())
+            }
+            RemoteEditorMode::Edit if current.host(&editor.host_id).is_none() => {
+                Err("This host was removed; cancel and reopen the editor".to_owned())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn submit_remote_editor(&mut self) {
+        let Some(editor) = self.remote_editor.clone() else {
+            return;
+        };
+        if let Err(error) = self.validate_remote_editor(&editor) {
+            if let Some(current) = self.remote_editor.as_mut() {
+                current.validation_error = Some(error);
+            }
+            return;
+        }
+        let kind = match editor.mode {
+            RemoteEditorMode::Add => RemoteUiActionKind::Add {
+                ssh_host: editor.ssh_host,
+                agent_executable: editor.agent_executable,
+                redact_content: editor.redact_content,
+            },
+            RemoteEditorMode::Edit => RemoteUiActionKind::Edit {
+                ssh_host: editor.ssh_host,
+                agent_executable: editor.agent_executable,
+                redact_content: editor.redact_content,
+            },
+        };
+        self.cancel_remote_editor();
+        self.queue_remote_action(kind, editor.host_id, editor.config_revision);
+    }
+
+    fn begin_remote_remove_confirmation(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(host_id) = self.selected_remote_host_id() else {
+            self.remote_action_status = Some("Select one remote host first".to_owned());
+            return;
+        };
+        let Some(config_revision) = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map(RemotesConfig::config_revision)
+        else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        self.remote_remove_confirmation = Some(RemoteRemoveConfirmation {
+            host_id,
+            config_revision,
+        });
+    }
+
+    fn cancel_remote_remove_confirmation(&mut self) {
+        self.remote_remove_confirmation = None;
+        self.remote_remove_confirmation_hitbox = None;
+    }
+
+    fn confirm_remote_remove(&mut self) {
+        let Some(confirmation) = self.remote_remove_confirmation.clone() else {
+            return;
+        };
+        let current = match self.remote_config_store.load() {
+            Ok(current) => current,
+            Err(error) => {
+                self.remote_action_status = Some(format!(
+                    "Remote config unavailable ({})",
+                    io_error_category(&error)
+                ));
+                self.cancel_remote_remove_confirmation();
+                return;
+            }
+        };
+        if current.config_revision() != confirmation.config_revision
+            || current.host(&confirmation.host_id).is_none()
+        {
+            self.remote_action_status =
+                Some("Remote config changed; remove was not started".to_owned());
+            self.cancel_remote_remove_confirmation();
+            self.reload_remote_sources();
+            return;
+        }
+        self.cancel_remote_remove_confirmation();
+        self.queue_remote_action(
+            RemoteUiActionKind::Remove,
+            confirmation.host_id,
+            confirmation.config_revision,
+        );
+    }
+
+    fn begin_remote_purge_confirmation(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(source_id) = self
+            .selected_detached_remote_source()
+            .map(|source| source.source_id().clone())
+        else {
+            self.remote_action_status = Some("Select one detached remote source first".to_owned());
+            return;
+        };
+        self.remote_purge_confirmation = Some(RemotePurgeConfirmation { source_id });
+    }
+
+    fn cancel_remote_purge_confirmation(&mut self) {
+        self.remote_purge_confirmation = None;
+        self.remote_purge_confirmation_hitbox = None;
+    }
+
+    fn confirm_remote_purge(&mut self) {
+        let Some(confirmation) = self.remote_purge_confirmation.clone() else {
+            return;
+        };
+        self.reload_remote_sources_with_history(true);
+        let still_detached = self
+            .remote_sources
+            .history_sources
+            .iter()
+            .any(|source| source.source_id() == &confirmation.source_id && source.detached());
+        if !still_detached {
+            self.remote_action_status = Some("Source changed; purge was not started".to_owned());
+            self.cancel_remote_purge_confirmation();
+            return;
+        }
+        let config_revision = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map_or(0, RemotesConfig::config_revision);
+        self.cancel_remote_purge_confirmation();
+        self.queue_remote_action(
+            RemoteUiActionKind::Purge,
+            confirmation.source_id.to_string(),
+            config_revision,
+        );
+    }
+
+    fn queue_remote_action(
+        &mut self,
+        kind: RemoteUiActionKind,
+        host_id: String,
+        config_revision: u64,
+    ) {
+        if self.remote_action_running.is_some() || self.pending_remote_action.is_some() {
+            self.remote_action_status =
+                Some("Another remote operation is still running".to_owned());
+            return;
+        }
+        let label = kind.label();
+        let request = RemoteUiActionRequest {
+            kind,
+            host_id,
+            config_revision,
+        };
+        self.pending_remote_action = Some(request.clone());
+        self.remote_action_running = Some(request);
+        self.remote_action_status = Some(format!("Remote {label} started…"));
+    }
+
+    fn toggle_remote_global(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(enabled) = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map(RemotesConfig::auto_sync_enabled)
+        else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        self.update_remote_config(
+            RemotesConfigMutation::set_auto_sync_enabled(!enabled),
+            if enabled {
+                "Automatic remote sync disabled"
+            } else {
+                "Automatic remote sync enabled"
+            },
+        );
+    }
+
+    fn toggle_selected_remote_host(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(host) = self.selected_remote_host().cloned() else {
+            self.remote_action_status = Some("Select one remote host first".to_owned());
+            return;
+        };
+        if !host.is_paired() {
+            self.remote_action_status = Some(format!(
+                "{} is unpaired; run `codex-usage-monit remote pair {}`",
+                host.id(),
+                host.id()
+            ));
+            return;
+        }
+        let enabled = host.sync_enabled();
+        let mutation = if enabled {
+            RemotesConfigMutation::disable_host(host.id().to_owned())
+        } else {
+            RemotesConfigMutation::enable_host(host.id().to_owned())
+        };
+        self.update_remote_config(
+            mutation,
+            &format!(
+                "Automatic sync {} for {}",
+                if enabled { "disabled" } else { "enabled" },
+                host.id()
+            ),
+        );
+    }
+
+    fn toggle_selected_remote_source_in_aggregates(&mut self) {
+        if !self.remote_action_idle() {
+            self.remote_action_status =
+                Some("Another remote operation is still running".to_owned());
+            return;
+        }
+        let Some(source) = self.selected_remote_source_metadata().cloned() else {
+            self.remote_action_status =
+                Some("The selected host has no synchronized history yet".to_owned());
+            return;
+        };
+        let kind = if source.include_in_aggregates() {
+            RemoteUiActionKind::Exclude
+        } else {
+            RemoteUiActionKind::Include
+        };
+        let config_revision = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map_or(0, RemotesConfig::config_revision);
+        self.queue_remote_action(kind, source.source_id().to_string(), config_revision);
+    }
+
+    fn request_remote_action(&mut self, kind: RemoteUiActionKind) {
+        let Some(host) = self.selected_remote_host().cloned() else {
+            self.remote_action_status = Some("Select one remote host first".to_owned());
+            return;
+        };
+        if !self.remote_action_idle() {
+            self.remote_action_status =
+                Some("Another remote operation is still running".to_owned());
+            return;
+        }
+        if matches!(&kind, RemoteUiActionKind::Pair) && host.is_paired() {
+            self.remote_action_status = Some(format!(
+                "{} is already paired; edit or remove it before pairing another target",
+                host.id()
+            ));
+            return;
+        }
+        if matches!(&kind, RemoteUiActionKind::Sync) && !host.is_paired() {
+            self.remote_action_status =
+                Some(format!("{} is unpaired; pair it before syncing", host.id()));
+            return;
+        }
+        if matches!(&kind, RemoteUiActionKind::Sync)
+            && host.redact_content() != self.local_redact_content
+        {
+            self.remote_action_status = Some(format!(
+                "{} uses a different redaction profile; edit it before syncing",
+                host.id()
+            ));
+            return;
+        }
+        let Some(config_revision) = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map(RemotesConfig::config_revision)
+        else {
+            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            return;
+        };
+        self.queue_remote_action(kind, host.id().to_owned(), config_revision);
+    }
+
+    fn apply_remote_action_completion(&mut self, completion: RemoteUiActionCompletion) {
+        if self.remote_action_running.as_ref() != Some(&completion.request) {
+            return;
+        }
+        if self.pending_remote_action.as_ref() == Some(&completion.request) {
+            self.pending_remote_action = None;
+        }
+        self.remote_action_running = None;
+        self.reload_remote_sources_with_history(true);
+        if completion.result.is_ok()
+            && matches!(&completion.request.kind, RemoteUiActionKind::Add { .. })
+            && let Some(index) = self.remote_sources.config.as_ref().and_then(|config| {
+                config
+                    .hosts()
+                    .iter()
+                    .position(|host| host.id() == completion.request.host_id)
+            })
+        {
+            self.selected_setting = SettingItem::ALL.len() + index;
+        }
+        self.remote_action_status = Some(match completion.result {
+            Ok(RemoteUiActionOutcome::Complete) => format!(
+                "Remote {} completed for {}",
+                completion.request.kind.label(),
+                completion.request.host_id
+            ),
+            Ok(RemoteUiActionOutcome::NeedsAttention) => format!(
+                "Remote {} for {} needs attention; run the same CLI command for details",
+                completion.request.kind.label(),
+                completion.request.host_id
+            ),
+            Err(category) => format!(
+                "Remote {} failed for {} ({category})",
+                completion.request.kind.label(),
+                completion.request.host_id
+            ),
+        });
     }
 
     fn toggle_setting(&mut self, item: SettingItem) {
@@ -3160,7 +5347,14 @@ impl App {
         changed
     }
 
-    fn replace(&mut self, result: CollectionResult, refreshed_account: bool) {
+    fn replace(&mut self, mut result: CollectionResult, refreshed_account: bool) {
+        self.local_snapshot_partial = result.snapshot.partial;
+        self.local_snapshot = result.snapshot.clone();
+        self.trusted_remote_parent_edges = merge_remote_live_into_snapshot(
+            &mut result.snapshot,
+            &self.remote_live_states,
+            &self.remote_overview_history,
+        );
         if refreshed_account {
             self.schedule_next_account_refresh(&result, Instant::now());
         }
@@ -3319,6 +5513,142 @@ impl App {
         }
         self.worker_running = false;
         self.last_local_refresh = Instant::now();
+    }
+
+    fn replace_remote_live_states(&mut self, states: Vec<SourceRemoteLiveSnapshot>) -> bool {
+        self.replace_remote_live_states_at(states, Utc::now())
+    }
+
+    fn replace_remote_live_states_at(
+        &mut self,
+        states: Vec<SourceRemoteLiveSnapshot>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.remote_live_states == states
+            && !remote_live_quality_requires_remerge(&self.snapshot, &states, now)
+            && !has_remote_live_load_error(&self.snapshot)
+        {
+            return false;
+        }
+        let selected = self.raw_selected_thread_id().map(str::to_owned);
+        let selected_turn = self.selected_turn_record().map(|turn| turn.turn_id.clone());
+        self.remote_live_states = states;
+        self.snapshot = self.local_snapshot.clone();
+        self.snapshot.partial = self.local_snapshot_partial;
+        self.trusted_remote_parent_edges = merge_remote_live_into_snapshot_at(
+            &mut self.snapshot,
+            &self.remote_live_states,
+            &self.remote_overview_history,
+            now,
+        );
+        self.summary_cache = None;
+        self.expanded_task_threads.retain(|thread_id| {
+            self.snapshot
+                .tasks
+                .iter()
+                .any(|task| &task.thread_id == thread_id)
+        });
+        self.selected_task = selected
+            .as_deref()
+            .and_then(|thread_id| {
+                self.snapshot
+                    .tasks
+                    .iter()
+                    .position(|task| task.thread_id == thread_id)
+            })
+            .unwrap_or(0)
+            .min(self.snapshot.tasks.len().saturating_sub(1));
+        let turns = self.filtered_turn_indices();
+        self.selected_turn = selected_turn
+            .as_deref()
+            .and_then(|turn_id| {
+                turns
+                    .iter()
+                    .position(|index| self.snapshot.turns[*index].turn_id == turn_id)
+            })
+            .unwrap_or(0)
+            .min(turns.len().saturating_sub(1));
+        self.reconcile_task_filter(false);
+        self.task_table_hitbox = None;
+        self.turn_table_hitbox = None;
+        true
+    }
+
+    fn replace_remote_overview_history(&mut self, history: RemoteOverviewHistory) -> bool {
+        if self.remote_overview_history == history
+            && !self
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("remote history load failed:"))
+        {
+            return false;
+        }
+        self.remote_overview_history = history;
+        self.snapshot = self.local_snapshot.clone();
+        self.snapshot.partial = self.local_snapshot_partial;
+        self.trusted_remote_parent_edges = merge_remote_live_into_snapshot_at(
+            &mut self.snapshot,
+            &self.remote_live_states,
+            &self.remote_overview_history,
+            Utc::now(),
+        );
+        self.summary_cache = None;
+        self.reconcile_task_filter(false);
+        self.task_table_hitbox = None;
+        self.turn_table_hitbox = None;
+        true
+    }
+
+    fn record_remote_overview_history_load_error(&mut self, message: String) -> bool {
+        let message = terminal_safe_text(&format!("remote history load failed: {message}"));
+        if self
+            .snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning == &message)
+        {
+            return false;
+        }
+        self.snapshot.partial = true;
+        self.snapshot.warnings.push(message);
+        self.snapshot.warnings.sort();
+        self.snapshot.warnings.dedup();
+        true
+    }
+
+    fn record_remote_live_load_error(&mut self, message: String) -> bool {
+        self.record_remote_live_load_error_at(message, Utc::now())
+    }
+
+    fn record_remote_live_load_error_at(&mut self, message: String, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+        if remote_live_quality_requires_remerge(&self.snapshot, &self.remote_live_states, now) {
+            self.snapshot = self.local_snapshot.clone();
+            self.snapshot.partial = self.local_snapshot_partial;
+            self.trusted_remote_parent_edges = merge_remote_live_into_snapshot_at(
+                &mut self.snapshot,
+                &self.remote_live_states,
+                &self.remote_overview_history,
+                now,
+            );
+            self.summary_cache = None;
+            changed = true;
+        }
+        let message = terminal_safe_text(&format!("remote live load failed: {message}"));
+        if self
+            .snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning == &message)
+        {
+            return changed;
+        }
+        self.snapshot.partial = true;
+        self.snapshot.warnings.push(message);
+        self.snapshot.warnings.sort();
+        self.snapshot.warnings.dedup();
+        true
     }
 
     fn finish_unchanged_refresh(&mut self) {
@@ -3653,17 +5983,89 @@ impl App {
         if self.view != View::Settings {
             return false;
         }
-        let Some(hitbox) = self.settings_controls_hitbox else {
+        let Some(hitbox) = self.settings_controls_hitbox.as_ref() else {
             return false;
         };
-        let Some(item) = SettingItem::ALL
+        let item = SettingItem::ALL
             .into_iter()
-            .find(|item| rect_contains(hitbox.rows[item.index()], column, row))
-        else {
-            return false;
-        };
-        self.toggle_setting(item);
-        true
+            .find(|item| rect_contains(hitbox.rows[item.index()], column, row));
+        if let Some(item) = item {
+            self.toggle_setting(item);
+            return true;
+        }
+        if hitbox.remote_global_enabled && rect_contains(hitbox.remote_global, column, row) {
+            self.toggle_remote_global();
+            return true;
+        }
+        if hitbox.remote_new_enabled && rect_contains(hitbox.remote_new, column, row) {
+            self.begin_remote_add();
+            return true;
+        }
+        if let Some(index) = hitbox
+            .remote_hosts
+            .iter()
+            .position(|area| rect_contains(*area, column, row))
+        {
+            self.selected_setting = SettingItem::ALL.len() + index;
+            return true;
+        }
+        if hitbox.remote_edit_enabled && rect_contains(hitbox.remote_edit, column, row) {
+            self.begin_selected_remote_edit();
+            return true;
+        }
+        if hitbox.remote_pair_enabled && rect_contains(hitbox.remote_pair, column, row) {
+            self.request_remote_action(RemoteUiActionKind::Pair);
+            return true;
+        }
+        if hitbox.remote_purge_enabled && rect_contains(hitbox.remote_purge, column, row) {
+            self.begin_remote_purge_confirmation();
+            return true;
+        }
+        if hitbox.remote_remove_enabled && rect_contains(hitbox.remote_remove, column, row) {
+            self.begin_remote_remove_confirmation();
+            return true;
+        }
+        if hitbox.remote_enable_enabled && rect_contains(hitbox.remote_enable, column, row) {
+            self.toggle_selected_remote_host();
+            return true;
+        }
+        if hitbox.remote_test_enabled && rect_contains(hitbox.remote_test, column, row) {
+            self.request_remote_action(RemoteUiActionKind::Test);
+            return true;
+        }
+        if hitbox.remote_sync_enabled && rect_contains(hitbox.remote_sync, column, row) {
+            self.request_remote_action(RemoteUiActionKind::Sync);
+            return true;
+        }
+        if hitbox.remote_include_enabled && rect_contains(hitbox.remote_include, column, row) {
+            self.toggle_selected_remote_source_in_aggregates();
+            return true;
+        }
+        if let Some(index) = hitbox
+            .project_rows
+            .iter()
+            .position(|area| rect_contains(*area, column, row))
+        {
+            self.selected_setting = self.project_mapping_selection_base() + index;
+            return true;
+        }
+        if hitbox.project_accept_enabled && rect_contains(hitbox.project_accept, column, row) {
+            self.accept_selected_project_merge();
+            return true;
+        }
+        if hitbox.project_toggle_enabled && rect_contains(hitbox.project_toggle, column, row) {
+            self.toggle_selected_project_instance();
+            return true;
+        }
+        if hitbox.project_merge_enabled && rect_contains(hitbox.project_merge, column, row) {
+            self.merge_selected_project_instances();
+            return true;
+        }
+        if hitbox.project_split_enabled && rect_contains(hitbox.project_split, column, row) {
+            self.split_selected_project_mapping();
+            return true;
+        }
+        false
     }
 
     fn set_view(&mut self, view: View) {
@@ -3679,6 +6081,9 @@ impl App {
             self.transition_to_tasks();
         }
         self.view = view;
+        if view == View::Settings {
+            self.reload_project_mappings();
+        }
     }
 
     fn set_summary_range(&mut self, range: SummaryRange) {
@@ -3927,6 +6332,10 @@ impl App {
     fn activate_summary_control_at(&mut self, column: u16, row: u16) -> bool {
         if self.view != View::Summary {
             return false;
+        }
+        if rect_contains(self.history_source_control_hitbox, column, row) {
+            self.cycle_history_source();
+            return true;
         }
         let Some(hitbox) = self.summary_controls_hitbox else {
             return false;
@@ -4305,6 +6714,10 @@ impl App {
         if self.view != View::Trends {
             return false;
         }
+        if rect_contains(self.history_source_control_hitbox, column, row) {
+            self.cycle_history_source();
+            return true;
+        }
         let Some(hitbox) = self.trend_controls_hitbox else {
             return false;
         };
@@ -4437,6 +6850,38 @@ impl App {
         }
         true
     }
+
+    fn trusts_task_parent_edge(&self, child: &TaskRecord, parent: &TaskRecord) -> bool {
+        task_parent_edge_is_trusted(child, parent)
+            || self
+                .trusted_remote_parent_edges
+                .contains(&(child.thread_id.clone(), parent.thread_id.clone()))
+    }
+}
+
+fn task_parent_edge_is_trusted(child: &TaskRecord, parent: &TaskRecord) -> bool {
+    if child
+        .source
+        .as_deref()
+        .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+    {
+        return true;
+    }
+
+    let Some(child_node) = remote_task_node_namespace(&child.thread_id) else {
+        return false;
+    };
+    let Some(parent_node) = remote_task_node_namespace(&parent.thread_id) else {
+        return false;
+    };
+    child_node == parent_node
+}
+
+fn remote_task_node_namespace(thread_id: &str) -> Option<&str> {
+    let namespaced = thread_id.strip_prefix("remote:")?;
+    let (node, remote_thread_id) = namespaced.split_once(':')?;
+    (!node.is_empty() && !remote_thread_id.is_empty() && node.parse::<NodeId>().is_ok())
+        .then_some(node)
 }
 
 fn task_parent_edge_would_cycle(
@@ -4527,6 +6972,56 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.remote_editor.is_some() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(hitbox) = app.remote_editor_hitbox
+        {
+            if rect_contains(hitbox.host_id, event.column, event.row) {
+                app.select_remote_editor_field(RemoteEditorField::HostId);
+            } else if rect_contains(hitbox.ssh_host, event.column, event.row) {
+                app.select_remote_editor_field(RemoteEditorField::SshHost);
+            } else if rect_contains(hitbox.agent_executable, event.column, event.row) {
+                app.select_remote_editor_field(RemoteEditorField::AgentExecutable);
+            } else if rect_contains(hitbox.content, event.column, event.row) {
+                app.select_remote_editor_field(RemoteEditorField::Content);
+                app.toggle_remote_editor_content();
+            } else if rect_contains(hitbox.next, event.column, event.row) {
+                app.cycle_remote_editor_field(true);
+            } else if rect_contains(hitbox.save, event.column, event.row) {
+                app.submit_remote_editor();
+            } else if rect_contains(hitbox.cancel, event.column, event.row) {
+                app.cancel_remote_editor();
+            }
+        }
+        return true;
+    }
+
+    if app.remote_remove_confirmation.is_some() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(hitbox) = app.remote_remove_confirmation_hitbox
+        {
+            if rect_contains(hitbox.confirm, event.column, event.row) {
+                app.confirm_remote_remove();
+            } else if rect_contains(hitbox.cancel, event.column, event.row) {
+                app.cancel_remote_remove_confirmation();
+            }
+        }
+        return true;
+    }
+
+    if app.remote_purge_confirmation.is_some() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(hitbox) = app.remote_purge_confirmation_hitbox
+        {
+            if rect_contains(hitbox.confirm, event.column, event.row) {
+                app.confirm_remote_purge();
+            } else if rect_contains(hitbox.cancel, event.column, event.row) {
+                app.cancel_remote_purge_confirmation();
+            }
+        }
+        return true;
+    }
+
     if app.resume_confirmation.is_some() {
         if event.kind == MouseEventKind::Down(MouseButton::Left) {
             if app
@@ -4762,6 +7257,56 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    if app.remote_editor.is_some() {
+        match key.code {
+            KeyCode::Esc => app.cancel_remote_editor(),
+            KeyCode::Tab => app.cycle_remote_editor_field(true),
+            KeyCode::BackTab => app.cycle_remote_editor_field(false),
+            KeyCode::Enter => app.submit_remote_editor(),
+            KeyCode::Backspace => app.backspace_remote_editor(),
+            KeyCode::Delete => app.delete_remote_editor(),
+            KeyCode::Left => app.move_remote_editor_cursor(false, None),
+            KeyCode::Right => app.move_remote_editor_cursor(true, None),
+            KeyCode::Home => app.move_remote_editor_cursor(false, Some(false)),
+            KeyCode::End => app.move_remote_editor_cursor(false, Some(true)),
+            KeyCode::Char(' ')
+                if app
+                    .remote_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.field == RemoteEditorField::Content) =>
+            {
+                app.toggle_remote_editor_content();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.insert_remote_editor_character(character);
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    if app.remote_remove_confirmation.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_remote_remove(),
+            KeyCode::Esc => app.cancel_remote_remove_confirmation(),
+            _ => {}
+        }
+        return false;
+    }
+
+    if app.remote_purge_confirmation.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_remote_purge(),
+            KeyCode::Esc => app.cancel_remote_purge_confirmation(),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.resume_confirmation.is_some() {
         match key.code {
             KeyCode::Enter => app.confirm_resume(),
@@ -4904,6 +7449,12 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('u' | 'U') => app.set_view(View::Summary),
         KeyCode::Char('3') => app.set_view(View::Health),
         KeyCode::Char('4') => app.set_view(View::Settings),
+        KeyCode::Char('s' | 'S')
+            if matches!(app.view, View::Summary | View::Trends)
+                && app.history_source_control_visible() =>
+        {
+            app.cycle_history_source();
+        }
         KeyCode::Char('c' | 'C') if app.view == View::Summary => {
             app.set_summary_range(SummaryRange::Cycle);
         }
@@ -4960,11 +7511,130 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::PageUp if app.view == View::Summary => {
             app.scroll_summary(false, PAGE_SCROLL_LINES);
         }
-        KeyCode::Enter | KeyCode::Char(' ') if app.view == View::Settings => {
-            app.toggle_setting(app.selected_setting_item());
+        KeyCode::Enter | KeyCode::Char(' ')
+            if app.view == View::Settings && app.main_settings_focused() =>
+        {
+            if let Some(item) = app.selected_setting_item() {
+                app.toggle_setting(item);
+            }
+        }
+        KeyCode::Char('g' | 'G')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_global, hitbox.remote_global_enabled)
+                }) =>
+        {
+            app.toggle_remote_global();
+        }
+        KeyCode::Char('n' | 'N')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_new, hitbox.remote_new_enabled)
+                }) =>
+        {
+            app.begin_remote_add();
+        }
+        KeyCode::Char('e' | 'E')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_edit, hitbox.remote_edit_enabled)
+                }) =>
+        {
+            app.begin_selected_remote_edit();
+        }
+        KeyCode::Char('p' | 'P')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_pair, hitbox.remote_pair_enabled)
+                }) =>
+        {
+            app.request_remote_action(RemoteUiActionKind::Pair);
+        }
+        KeyCode::Char('p' | 'P')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_purge, hitbox.remote_purge_enabled)
+                }) =>
+        {
+            app.begin_remote_purge_confirmation();
+        }
+        KeyCode::Char('d' | 'D')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_remove, hitbox.remote_remove_enabled)
+                }) =>
+        {
+            app.begin_remote_remove_confirmation();
+        }
+        KeyCode::Char('h' | 'H')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_enable, hitbox.remote_enable_enabled)
+                }) =>
+        {
+            app.toggle_selected_remote_host();
+        }
+        KeyCode::Char('c' | 'C')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_test, hitbox.remote_test_enabled)
+                }) =>
+        {
+            app.request_remote_action(RemoteUiActionKind::Test);
+        }
+        KeyCode::Char('s' | 'S')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_sync, hitbox.remote_sync_enabled)
+                }) =>
+        {
+            app.request_remote_action(RemoteUiActionKind::Sync);
+        }
+        KeyCode::Char('i' | 'I')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_include, hitbox.remote_include_enabled)
+                }) =>
+        {
+            app.toggle_selected_remote_source_in_aggregates();
+        }
+        KeyCode::Char('j' | 'J')
+            if app.view == View::Settings
+                && app.project_control_active(|hitbox| {
+                    (hitbox.project_accept, hitbox.project_accept_enabled)
+                }) =>
+        {
+            app.accept_selected_project_merge();
+        }
+        KeyCode::Char('t' | 'T')
+            if app.view == View::Settings
+                && app.project_control_active(|hitbox| {
+                    (hitbox.project_toggle, hitbox.project_toggle_enabled)
+                }) =>
+        {
+            app.toggle_selected_project_instance();
+        }
+        KeyCode::Char('m' | 'M')
+            if app.view == View::Settings
+                && app.project_control_active(|hitbox| {
+                    (hitbox.project_merge, hitbox.project_merge_enabled)
+                }) =>
+        {
+            app.merge_selected_project_instances();
+        }
+        KeyCode::Char('x' | 'X')
+            if app.view == View::Settings
+                && app.project_control_active(|hitbox| {
+                    (hitbox.project_split, hitbox.project_split_enabled)
+                }) =>
+        {
+            app.split_selected_project_mapping();
         }
         KeyCode::Char(character) if app.view == View::Settings => {
-            if let Some(item) = SettingItem::from_shortcut(character) {
+            if app.main_settings_focused()
+                && let Some(item) = SettingItem::from_shortcut(character)
+                && app.setting_control_visible(item)
+            {
                 app.toggle_setting(item);
             }
         }
@@ -4972,7 +7642,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Up if app.view == View::Settings => app.move_setting_selection(false),
         KeyCode::Home if app.view == View::Settings => app.selected_setting = 0,
         KeyCode::End if app.view == View::Settings => {
-            app.selected_setting = SettingItem::ALL.len() - 1;
+            app.selected_setting = app.settings_selection_count().saturating_sub(1);
         }
         KeyCode::Char('5') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::FiveHours);
@@ -5159,12 +7829,15 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
 
     let (sender, receiver) = mpsc::channel::<RefreshCompletion>();
     let (resume_sender, resume_receiver) = mpsc::channel::<ResumeLaunchCompletion>();
+    let (remote_sender, remote_receiver) = mpsc::channel::<RemoteUiActionCompletion>();
     let context = RunLoopContext {
         termination: &termination,
         refresh_sender: &sender,
         refresh_receiver: &receiver,
         resume_sender: &resume_sender,
         resume_receiver: &resume_receiver,
+        remote_sender: &remote_sender,
+        remote_receiver: &remote_receiver,
     };
     let result = run_loop(
         &mut terminal,
@@ -5191,7 +7864,7 @@ fn prepare_initial_tui(
 ) -> (
     UiStateStore,
     Arc<Mutex<RolloutCache>>,
-    Arc<Mutex<HistoryStore>>,
+    Arc<Mutex<TuiHistoryStore>>,
     App,
 ) {
     let bootstrap_span = config.startup_trace.span("tui.bootstrap");
@@ -5246,31 +7919,75 @@ fn prepare_initial_tui(
         )
     });
     let history_span = config.startup_trace.span("tui.history_load");
-    let mut history_store =
-        HistoryStore::discover_with_redaction(&config.codex_home, config.redact_content);
+    let mut history_store = prepare_tui_history_store(config);
+    let local_source_id = history_store.local_source_id();
+    let remote_history_sources = history_store.remote_history_sources();
+    let remote_source_history_store = history_store.source_history_store();
+    let initial_selection: HistorySourceSelection = (&ui_state.history_source_selection).into();
     let initial_history_observation = collection_history_observation(&initial, config.offline);
-    let (history, recorder_health) = stage_and_load_history(
+    let (all_history, recorder_health) = stage_and_load_history(
         &mut history_store,
         initial_history_observation.as_ref(),
+        &initial.snapshot.tasks,
+        &initial.local_session_digests,
         initial.snapshot.as_of,
         &config.perf_log,
         true,
     );
+    let initial_remote_overview_history =
+        history_store.load_remote_overview_history(Some(&all_history), initial.snapshot.as_of);
+    let initial_projection = if matches!(&initial_selection, HistorySourceSelection::AllIncluded) {
+        TuiHistoryProjection {
+            history: all_history,
+            selection: initial_selection.clone(),
+            status: Some(HistorySourceSelectionStatus::Applied),
+            query_error: None,
+        }
+    } else {
+        history_store.load_since_with_staged_selected(
+            &initial_selection,
+            history_view_since(initial.snapshot.as_of),
+        )
+    };
     history_span.finish_with(|| {
         format!(
             "quota_points={} local_buckets={} warnings={} read_only={}",
-            history.quota_points.len(),
-            history.half_hour_buckets.len(),
-            history.warnings.len(),
-            history.read_only
+            initial_projection.history.quota_points.len(),
+            initial_projection.history.half_hour_buckets.len(),
+            initial_projection.history.warnings.len(),
+            initial_projection.history.read_only
         )
     });
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial, initial_theme);
-    app.replace_history(history);
+    app.history_local_source_id = local_source_id;
+    app.history_remote_sources = remote_history_sources;
+    app.remote_source_history_store = remote_source_history_store;
+    app.local_redact_content = config.redact_content;
+    app.reload_remote_sources();
+    match history_store.load_remote_live_states() {
+        Ok(states) => {
+            app.replace_remote_live_states(states);
+        }
+        Err(error) => {
+            app.record_remote_live_load_error(error);
+        }
+    }
+    match initial_remote_overview_history {
+        Ok(history) => {
+            app.replace_remote_overview_history(history);
+        }
+        Err(error) => {
+            app.record_remote_overview_history_load_error(error);
+        }
+    }
     app.replace_recorder_health(recorder_health);
     app.apply_ui_state(&ui_state, theme_override);
+    if app.view == View::Settings {
+        app.reload_project_mappings();
+    }
+    app.apply_history_projection(0, initial_projection);
     app.apply_open_config(open_config, open_config_error);
     app_span.finish_with(|| {
         format!(
@@ -5293,50 +8010,343 @@ fn prepare_initial_tui(
     )
 }
 
+fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
+    match HistoryRuntime::discover(&config.codex_home, config.redact_content) {
+        Ok(mut runtime) => match acquire_tui_history_profile_lease(&runtime) {
+            Ok(profile_lease) => {
+                match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+                    TuiHistoryRuntimePreparation::Ready(warnings) => {
+                        TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings)
+                    }
+                    TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+                        TuiHistoryStore::legacy_fallback(
+                            HistoryStore::discover_with_redaction(
+                                &config.codex_home,
+                                config.redact_content,
+                            ),
+                            warnings,
+                        )
+                    }
+                }
+            }
+            Err(error) => TuiHistoryStore::runtime(
+                runtime,
+                None,
+                vec![format!(
+                    "history persistence is read-only because the requested profile cannot be selected: {error}"
+                )],
+            ),
+        },
+        Err(error) => TuiHistoryStore::legacy_fallback(
+            HistoryStore::discover_with_redaction(&config.codex_home, config.redact_content),
+            vec![format!(
+                "source-aware history runtime unavailable; using legacy history only: {error}"
+            )],
+        ),
+    }
+}
+
+fn acquire_tui_history_profile_lease(
+    runtime: &HistoryRuntime,
+) -> io::Result<HistoryProfileLeaseGuard> {
+    match try_acquire_history_profile_lease(
+        runtime.state_root(),
+        runtime.profile_id().clone(),
+        runtime.redaction_profile(),
+    )? {
+        TryHistoryProfileLease::Acquired(guard) => Ok(guard),
+        TryHistoryProfileLease::Busy { active_profile } => {
+            let detail = active_profile.map_or_else(
+                || "a profile transition is in progress".to_owned(),
+                |active| {
+                    format!(
+                        "the active history selection uses {:?}",
+                        active.redaction_profile()
+                    )
+                },
+            );
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{detail}; retry after the other process exits"),
+            ))
+        }
+    }
+}
+
+fn prepare_tui_history_runtime(
+    runtime: &mut HistoryRuntime,
+    profile_lease: &HistoryProfileLeaseGuard,
+    now: DateTime<Utc>,
+) -> TuiHistoryRuntimePreparation {
+    let mut warnings = Vec::new();
+    if profile_lease.state_root() != runtime.state_root()
+        || profile_lease.profile_id() != runtime.profile_id()
+        || profile_lease.redaction_profile() != runtime.redaction_profile()
+    {
+        warnings.push(
+            "source-aware history profile lease does not match the TUI runtime; using legacy history only"
+                .to_owned(),
+        );
+        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+    }
+    if let Err(error) = profile_lease.validate() {
+        warnings.push(format!(
+            "source-aware history profile lease could not be verified; using legacy history only: {error}"
+        ));
+        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+    }
+    match runtime.ownership().load_manifest() {
+        Ok(OwnershipManifestStatus::Initialized(manifest))
+            if manifest.state() == HistoryOwnershipState::V2Active =>
+        {
+            return TuiHistoryRuntimePreparation::Ready(warnings);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warnings.push(format!(
+                "source-aware history ownership could not be verified; using legacy history only: {error}"
+            ));
+            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        }
+    }
+
+    let history_root = runtime
+        .legacy_history()
+        .history_root()
+        .expect("a bound runtime always has a legacy root");
+    // The recorder singleton is only a cutover fence. The process-lifetime
+    // profile lease remains held after this short guard is dropped, while
+    // ordinary V2 writes use their own short writer lease.
+    let _cutover_guard = match try_acquire_recorder_instance_lock(history_root) {
+        Ok(TryRecorderInstanceLock::Acquired(guard)) => guard,
+        Ok(TryRecorderInstanceLock::Busy) => {
+            if matches!(
+                runtime.ownership().load_manifest(),
+                Ok(OwnershipManifestStatus::Initialized(manifest))
+                    if manifest.state() == HistoryOwnershipState::V2Active
+            ) {
+                return TuiHistoryRuntimePreparation::Ready(warnings);
+            }
+            warnings.push(
+                "source-aware history cutover deferred while the recorder is active; using read-only legacy history until the TUI restarts"
+                    .to_string(),
+            );
+            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "source-aware history cutover lock could not be verified; using legacy history only: {error}"
+            ));
+            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        }
+    };
+
+    // The lifetime lock proves that a cooperating recorder cannot start or
+    // continue during this check. Re-read legacy status only after acquiring
+    // it because pre-v0.4 recorders do not participate in the lock protocol.
+    let status_path = default_status_file(
+        runtime
+            .legacy_history()
+            .history_root()
+            .expect("a bound runtime always has a legacy root"),
+    );
+    match incompatible_recorder_for_cutover(&status_path, runtime.legacy_history().namespace(), now)
+    {
+        Ok(Some(status)) => {
+            if let Err(error) = runtime.ensure_ownership_initialized() {
+                warnings.push(format!("history ownership initialization failed: {error}"));
+            }
+            warnings.push(format!(
+                "source-aware history cutover deferred while legacy recorder pid {} may still be active",
+                status.pid
+            ));
+        }
+        Ok(None) => {
+            if let Err(error) = runtime.ensure_v2_active() {
+                warnings.push(format!("source-aware history cutover failed: {error}"));
+            }
+        }
+        Err(error) => {
+            if let Err(initialization_error) = runtime.ensure_ownership_initialized() {
+                warnings.push(format!(
+                    "history ownership initialization failed: {initialization_error}"
+                ));
+            }
+            warnings.push(format!(
+                "source-aware history cutover deferred because recorder status could not be verified at {}: {error}",
+                status_path.display()
+            ));
+        }
+    }
+    if let Err(error) = profile_lease.validate() {
+        warnings.push(format!(
+            "source-aware history profile lease changed during cutover: {error}"
+        ));
+        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+    }
+    TuiHistoryRuntimePreparation::Ready(warnings)
+}
+
+fn apply_tui_history_write_metrics(
+    metrics: &mut HistoryMetrics,
+    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
+) {
+    match write_result {
+        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
+            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
+            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
+            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
+            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
+            metrics.read_only = report.read_only;
+        }
+        Ok(Some(HistoryRuntimeWriteReport::V2(report))) => {
+            metrics.shards_written = u64::try_from(
+                report
+                    .account
+                    .shards_written
+                    .saturating_add(report.buckets.shards_written)
+                    .saturating_add(report.weekly.shards_written)
+                    .saturating_add(report.session_digests.shards_written),
+            )
+            .unwrap_or(u64::MAX);
+            metrics.shards_skipped = u64::try_from(
+                report
+                    .account
+                    .shards_skipped
+                    .saturating_add(report.buckets.shards_skipped)
+                    .saturating_add(report.weekly.shards_skipped)
+                    .saturating_add(report.session_digests.shards_skipped),
+            )
+            .unwrap_or(u64::MAX);
+        }
+        Ok(None) => {}
+        Err(_) => metrics.warnings = 1,
+    }
+}
+
+fn merge_tui_history_write_result(
+    history: &mut HistoryData,
+    write_result: io::Result<Option<HistoryRuntimeWriteReport>>,
+    operation: &str,
+) {
+    match write_result {
+        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
+            history.read_only |= report.read_only;
+            history.warnings.extend(report.warnings);
+        }
+        Ok(Some(HistoryRuntimeWriteReport::V2(_))) | Ok(None) => {}
+        Err(error) => history
+            .warnings
+            .push(format!("{operation} failed: {error}")),
+    }
+}
+
 fn stage_and_load_history(
-    store: &mut HistoryStore,
+    store: &mut TuiHistoryStore,
     observation: &HistoryObservation,
+    tasks: &[TaskRecord],
+    evidence: &LocalSessionDigestEvidence,
     now: DateTime<Utc>,
     perf_log: &PerfLog,
     force_flush: bool,
 ) -> (HistoryData, RecorderHealth) {
-    stage_and_load_history_with_mode(store, observation, now, perf_log, force_flush, false)
+    let (projection, health) = stage_and_load_history_selected_with_mode(
+        store,
+        observation,
+        tasks,
+        evidence,
+        now,
+        perf_log,
+        TuiHistoryStageMode::Incremental { force_flush },
+        &HistorySourceSelection::AllIncluded,
+    );
+    (projection.history, health)
 }
 
-fn stage_full_and_load_history(
-    store: &mut HistoryStore,
+#[allow(clippy::too_many_arguments)]
+fn stage_and_load_history_selected(
+    store: &mut TuiHistoryStore,
     observation: &HistoryObservation,
-    now: DateTime<Utc>,
-    perf_log: &PerfLog,
-) -> (HistoryData, RecorderHealth) {
-    stage_and_load_history_with_mode(store, observation, now, perf_log, true, true)
-}
-
-fn stage_and_load_history_with_mode(
-    store: &mut HistoryStore,
-    observation: &HistoryObservation,
+    tasks: &[TaskRecord],
+    evidence: &LocalSessionDigestEvidence,
     now: DateTime<Utc>,
     perf_log: &PerfLog,
     force_flush: bool,
-    full_observation: bool,
-) -> (HistoryData, RecorderHealth) {
+    selection: &HistorySourceSelection,
+) -> (TuiHistoryProjection, RecorderHealth) {
+    stage_and_load_history_selected_with_mode(
+        store,
+        observation,
+        tasks,
+        evidence,
+        now,
+        perf_log,
+        TuiHistoryStageMode::Incremental { force_flush },
+        selection,
+    )
+}
+
+fn stage_full_and_load_history_selected(
+    store: &mut TuiHistoryStore,
+    observation: &HistoryObservation,
+    tasks: &[TaskRecord],
+    evidence: &LocalSessionDigestEvidence,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+    selection: &HistorySourceSelection,
+) -> (TuiHistoryProjection, RecorderHealth) {
+    stage_and_load_history_selected_with_mode(
+        store,
+        observation,
+        tasks,
+        evidence,
+        now,
+        perf_log,
+        TuiHistoryStageMode::Full,
+        selection,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TuiHistoryStageMode {
+    Incremental { force_flush: bool },
+    Full,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_and_load_history_selected_with_mode(
+    store: &mut TuiHistoryStore,
+    observation: &HistoryObservation,
+    tasks: &[TaskRecord],
+    evidence: &LocalSessionDigestEvidence,
+    now: DateTime<Utc>,
+    perf_log: &PerfLog,
+    mode: TuiHistoryStageMode,
+    selection: &HistorySourceSelection,
+) -> (TuiHistoryProjection, RecorderHealth) {
     let total_started = Instant::now();
     let stage_started = Instant::now();
-    if full_observation {
-        store.stage_full_observation(observation);
-    } else {
-        store.stage(observation);
+    match mode {
+        TuiHistoryStageMode::Incremental { .. } => {
+            store.stage_collection(observation, tasks, evidence);
+        }
+        TuiHistoryStageMode::Full => {
+            store.stage_full_collection(observation, tasks, evidence);
+        }
     }
     let stage_elapsed = stage_started.elapsed();
     let record_started = Instant::now();
-    let write_result = if force_flush {
-        store.flush_staged()
-    } else {
-        store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL)
+    let since = history_view_since(now);
+    let write_result = match mode {
+        TuiHistoryStageMode::Full => store.flush_staged_reconcile(since, now),
+        TuiHistoryStageMode::Incremental { force_flush: true } => store.flush_staged(),
+        TuiHistoryStageMode::Incremental { force_flush: false } => {
+            store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL)
+        }
     };
     let record_elapsed = record_started.elapsed();
     let load_started = Instant::now();
-    let mut history = store.load_since_with_staged(history_view_since(now));
+    let mut projection = store.load_since_with_staged_selected(selection, since);
     let load_elapsed = load_started.elapsed();
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, Some(load_elapsed));
@@ -5345,45 +8355,29 @@ fn stage_and_load_history_with_mode(
         Ok(report) => report.is_some(),
         Err(_) => true,
     };
-    if let Ok(Some(report)) = &write_result {
-        metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-        metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-        metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-        metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-        metrics.read_only = report.read_only;
-    } else {
-        metrics.warnings = 1;
-    }
-    metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
-    metrics.local_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    apply_tui_history_write_metrics(&mut metrics, &write_result);
+    metrics.quota_points = u64::try_from(projection.history.quota_points.len()).unwrap_or(u64::MAX);
+    metrics.local_buckets =
+        u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
-        u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    match write_result {
-        Ok(Some(report)) => {
-            history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings);
-        }
-        Ok(None) => {}
-        Err(error) => history
-            .warnings
-            .push(format!("history persistence failed: {error}")),
-    }
-    history.warnings.sort();
-    history.warnings.dedup();
+        u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
+    merge_tui_history_write_result(&mut projection.history, write_result, "history persistence");
+    normalize_history_warnings(&mut projection.history);
     if metrics.record_performed {
         perf_log.record_history(metrics);
     } else {
         perf_log.record_history_runtime(total_started.elapsed());
     }
     let recorder_health = load_recorder_health(store);
-    (history, recorder_health)
+    (projection, recorder_health)
 }
 
 fn flush_or_reload_history_if_due(
-    store: &mut HistoryStore,
+    store: &mut TuiHistoryStore,
     now: DateTime<Utc>,
     perf_log: &PerfLog,
-) -> Option<(HistoryData, RecorderHealth)> {
+    selection: &HistorySourceSelection,
+) -> Option<(TuiHistoryProjection, RecorderHealth)> {
     let total_started = Instant::now();
     let record_started = Instant::now();
     let write_result = store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL);
@@ -5393,11 +8387,12 @@ fn flush_or_reload_history_if_due(
         Err(_) => true,
     };
     let load_started = Instant::now();
-    let reloaded = store.reload_since_if_stale_with_staged(history_view_since(now));
-    let (mut history, load_elapsed) = match reloaded {
-        Some(history) => (history, Some(load_started.elapsed())),
+    let reloaded =
+        store.reload_since_if_stale_with_staged_selected(selection, history_view_since(now));
+    let (mut projection, load_elapsed) = match reloaded {
+        Some(projection) => (projection, Some(load_started.elapsed())),
         None if record_performed => (
-            store.load_since_with_staged(history_view_since(now)),
+            store.load_since_with_staged_selected(selection, history_view_since(now)),
             Some(load_started.elapsed()),
         ),
         None => {
@@ -5408,41 +8403,24 @@ fn flush_or_reload_history_if_due(
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, load_elapsed);
     metrics.record_performed = record_performed;
-    if let Ok(Some(report)) = &write_result {
-        metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-        metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-        metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-        metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-        metrics.read_only = report.read_only;
-    } else if write_result.is_err() {
-        metrics.warnings = 1;
-    }
-    metrics.quota_points = u64::try_from(history.quota_points.len()).unwrap_or(u64::MAX);
-    metrics.local_buckets = u64::try_from(history.half_hour_buckets.len()).unwrap_or(u64::MAX);
+    apply_tui_history_write_metrics(&mut metrics, &write_result);
+    metrics.quota_points = u64::try_from(projection.history.quota_points.len()).unwrap_or(u64::MAX);
+    metrics.local_buckets =
+        u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
-        u64::try_from(history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    match write_result {
-        Ok(Some(report)) => {
-            history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings);
-        }
-        Ok(None) => {}
-        Err(error) => history
-            .warnings
-            .push(format!("history persistence failed: {error}")),
-    }
-    history.warnings.sort();
-    history.warnings.dedup();
+        u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
+    merge_tui_history_write_result(&mut projection.history, write_result, "history persistence");
+    normalize_history_warnings(&mut projection.history);
     metrics.warnings = metrics
         .warnings
-        .max(u64::try_from(history.warnings.len()).unwrap_or(u64::MAX));
-    metrics.read_only |= history.read_only;
+        .max(u64::try_from(projection.history.warnings.len()).unwrap_or(u64::MAX));
+    metrics.read_only |= projection.history.read_only;
     perf_log.record_history(metrics);
     let recorder_health = load_recorder_health(store);
-    Some((history, recorder_health))
+    Some((projection, recorder_health))
 }
 
-fn flush_staged_history_on_exit(history_store: &Arc<Mutex<HistoryStore>>, perf_log: &PerfLog) {
+fn flush_staged_history_on_exit(history_store: &Arc<Mutex<TuiHistoryStore>>, perf_log: &PerfLog) {
     let total_started = Instant::now();
     let mut store = history_store
         .lock()
@@ -5455,21 +8433,12 @@ fn flush_staged_history_on_exit(history_store: &Arc<Mutex<HistoryStore>>, perf_l
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_started.elapsed(), None);
     metrics.record_performed = true;
-    match write_result {
-        Ok(Some(report)) => {
-            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-            metrics.read_only = report.read_only;
-        }
-        Ok(None) => {}
-        Err(_) => metrics.warnings = 1,
-    }
+    apply_tui_history_write_metrics(&mut metrics, &write_result);
     perf_log.record_history(metrics);
 }
 
-fn load_recorder_health(store: &HistoryStore) -> RecorderHealth {
+fn load_recorder_health(store: &TuiHistoryStore) -> RecorderHealth {
+    let store = store.legacy_history();
     let Some(history_root) = store.history_root() else {
         return RecorderHealth {
             status: None,
@@ -5533,12 +8502,13 @@ fn run_loop(
     config: &CollectConfig,
     context: &RunLoopContext<'_>,
     rollout_cache: Arc<Mutex<RolloutCache>>,
-    history_store: Arc<Mutex<HistoryStore>>,
+    history_store: Arc<Mutex<TuiHistoryStore>>,
     ui_state_store: &UiStateStore,
 ) -> Result<()> {
     let mut first_frame = true;
     let mut redraw_reasons = RedrawReasons::default();
     let mut refresh_worker = RefreshWorker::default();
+    let mut remote_action_worker: Option<RemoteActionWorkerGuard> = None;
     loop {
         if context.termination.is_requested() {
             refresh_worker.detach();
@@ -5555,15 +8525,31 @@ fn run_loop(
             } else {
                 app.finish_unchanged_refresh();
             }
-            if let Some(history) = completion.history {
-                app.replace_history(history);
+            if let Some(history) = completion.history
+                && app.apply_history_projection(history.generation, history.projection)
+            {
                 refresh_changed = true;
             }
             if let Some(recorder_health) = completion.recorder_health {
                 app.replace_recorder_health(recorder_health);
                 refresh_changed = true;
             }
+            if let Some(remote_live) = completion.remote_live {
+                refresh_changed |= match remote_live {
+                    Ok(states) => app.replace_remote_live_states(states),
+                    Err(error) => app.record_remote_live_load_error(error),
+                };
+            }
+            if let Some(remote_history) = completion.remote_overview_history {
+                refresh_changed |= match remote_history {
+                    Ok(history) => app.replace_remote_overview_history(history),
+                    Err(error) => app.record_remote_overview_history_load_error(error),
+                };
+            }
             if refresh_changed {
+                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+            }
+            if app.reload_remote_sources() {
                 redraw_reasons.insert(RedrawReasons::SNAPSHOT);
             }
             refresh_worker.join();
@@ -5571,6 +8557,13 @@ fn run_loop(
         while let Ok(completion) = context.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
             redraw_reasons.insert(RedrawReasons::RESUME);
+        }
+        while let Ok(completion) = context.remote_receiver.try_recv() {
+            if let Some(worker) = remote_action_worker.take() {
+                worker.finish();
+            }
+            app.apply_remote_action_completion(completion);
+            redraw_reasons.insert(RedrawReasons::NOTICE);
         }
         if app.expire_open_notice_at(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::NOTICE);
@@ -5653,6 +8646,24 @@ fn run_loop(
             });
         }
 
+        if let Some(request) = app.pending_remote_action.take() {
+            let worker_sender = context.remote_sender.clone();
+            let worker_config = config.clone();
+            let cancellation = RemoteActionCancellation::default();
+            let worker_cancellation = cancellation.clone();
+            let worker = thread::spawn(move || {
+                let _ = worker_sender.send(execute_remote_ui_action(
+                    request,
+                    &worker_config,
+                    &worker_cancellation,
+                ));
+            });
+            remote_action_worker = Some(RemoteActionWorkerGuard {
+                cancellation,
+                worker: Some(worker),
+            });
+        }
+
         if let Some(request) = app.pending_clipboard.take() {
             let result = write_osc52_clipboard(terminal.backend_mut(), &request.text);
             app.apply_clipboard_result(request, result);
@@ -5666,10 +8677,40 @@ fn start_refresh_if_due(
     config: &CollectConfig,
     context: &RunLoopContext<'_>,
     rollout_cache: &Arc<Mutex<RolloutCache>>,
-    history_store: &Arc<Mutex<HistoryStore>>,
+    history_store: &Arc<Mutex<TuiHistoryStore>>,
     refresh_worker: &mut RefreshWorker,
 ) -> bool {
     let now = Instant::now();
+    if app.worker_running {
+        return false;
+    }
+    if app.history_source_query_pending {
+        let generation = app.history_source_generation;
+        let worker_selection = app.history_source_selection.clone();
+        let worker_sender = context.refresh_sender.clone();
+        let worker_history = Arc::clone(history_store);
+        app.worker_running = true;
+        app.history_source_query_pending = false;
+        refresh_worker.start(thread::spawn(move || {
+            let projection = worker_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .load_since_with_staged_selected(&worker_selection, history_view_since(Utc::now()));
+            let _ = worker_sender.send(RefreshCompletion {
+                result: None,
+                remote_live: None,
+                remote_overview_history: None,
+                history: Some(HistoryRefreshCompletion {
+                    generation,
+                    projection,
+                }),
+                recorder_health: None,
+                refreshed_account: false,
+                summary_backfill: false,
+            });
+        }));
+        return true;
+    }
     let local_refresh_due = now.saturating_duration_since(app.last_local_refresh) >= LOCAL_REFRESH;
     let account_refresh_due = !config.offline && app.account_refresh_due(now);
     if local_refresh_due
@@ -5683,8 +8724,12 @@ fn start_refresh_if_due(
     let summary_backfill_due = app.view == View::Summary
         && app.summary_range == SummaryRange::ThirtyDays
         && app.summary_backfill_pending
+        && !matches!(
+            &app.history_source_selection,
+            HistorySourceSelection::Remote(_)
+        )
         && !account_refresh_due;
-    if app.worker_running || (!summary_backfill_due && !local_refresh_due && !account_refresh_due) {
+    if !summary_backfill_due && !local_refresh_due && !account_refresh_due {
         return false;
     }
 
@@ -5692,6 +8737,8 @@ fn start_refresh_if_due(
         let worker_config = summary_backfill_config(config);
         let worker_sender = context.refresh_sender.clone();
         let worker_history = Arc::clone(history_store);
+        let history_source_generation = app.history_source_generation;
+        let history_source_selection = app.history_source_selection.clone();
         app.worker_running = true;
         app.summary_backfill_pending = false;
         app.summary_backfill_running = true;
@@ -5703,8 +8750,10 @@ fn start_refresh_if_due(
                 snapshot,
                 account,
                 mut history_observation,
+                local_session_digests,
             } = result;
             let observed_at = snapshot.as_of;
+            let tasks = snapshot.tasks.clone();
             // Summary reconstruction is deliberately local-only. Never let
             // offline fallback quota/weekly points replace server history.
             history_observation.quota_points.clear();
@@ -5713,42 +8762,55 @@ fn start_refresh_if_due(
             drop(snapshot);
             drop(account);
             drop(cache);
-            let (mut history, recorder_health) = {
+            let (mut projection, recorder_health) = {
                 let mut history_store = worker_history
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (mut history, recorder_health) = stage_full_and_load_history(
+                let (mut projection, recorder_health) = stage_full_and_load_history_selected(
                     &mut history_store,
                     &history_observation,
+                    &tasks,
+                    &local_session_digests,
                     observed_at,
                     &worker_config.perf_log,
+                    &history_source_selection,
                 );
-                let coverage_complete = summary_history_coverage_complete(&history, observed_at);
+                let coverage_complete =
+                    summary_history_coverage_complete(&projection.history, observed_at);
                 let requested_complete = scan_complete && coverage_complete;
                 match history_store.mark_summary_backfill_attempt(observed_at, requested_complete) {
                     Ok(marker) => {
-                        history.summary_backfill_attempted_at = Some(marker.completed_at);
-                        history.summary_backfill_attempt_complete = Some(marker.complete);
+                        projection.history.summary_backfill_attempted_at =
+                            Some(marker.completed_at);
+                        projection.history.summary_backfill_attempt_complete =
+                            Some(marker.complete);
                     }
                     Err(error) => {
                         // Keep an in-memory cooldown even when the durable
                         // marker cannot be written, otherwise a read-only or
                         // full state directory would trigger an immediate
                         // expensive rescan loop.
-                        history.summary_backfill_attempted_at = Some(observed_at);
-                        history.summary_backfill_attempt_complete = Some(requested_complete);
-                        history
+                        projection.history.summary_backfill_attempted_at = Some(observed_at);
+                        projection.history.summary_backfill_attempt_complete =
+                            Some(requested_complete);
+                        projection
+                            .history
                             .warnings
                             .push(format!("summary backfill marker failed: {error}"));
                     }
                 }
-                (history, recorder_health)
+                (projection, recorder_health)
             };
-            history.warnings.sort();
-            history.warnings.dedup();
+            projection.history.warnings.sort();
+            projection.history.warnings.dedup();
             let _ = worker_sender.send(RefreshCompletion {
                 result: None,
-                history: Some(history),
+                remote_live: None,
+                remote_overview_history: None,
+                history: Some(HistoryRefreshCompletion {
+                    generation: history_source_generation,
+                    projection,
+                }),
                 recorder_health: Some(recorder_health),
                 refreshed_account: false,
                 summary_backfill: true,
@@ -5762,6 +8824,8 @@ fn start_refresh_if_due(
     let worker_sender = context.refresh_sender.clone();
     let worker_cache = Arc::clone(rollout_cache);
     let worker_history = Arc::clone(history_store);
+    let history_source_generation = app.history_source_generation;
+    let history_source_selection = app.history_source_selection.clone();
     app.worker_running = true;
     refresh_worker.start(thread::spawn(move || {
         let result = {
@@ -5779,35 +8843,55 @@ fn start_refresh_if_due(
                 collect_snapshot_cached_if_changed(&worker_config, Some(cached_account), &mut cache)
             }
         };
-        let history_and_recorder = {
+        let (history_and_recorder, remote_live, remote_overview_history) = {
             let mut history_store = worker_history
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match result.as_ref() {
+            let history = match result.as_ref() {
                 Some(result) => {
                     let history_observation =
                         collection_history_observation(result, worker_config.offline);
-                    Some(stage_and_load_history(
+                    Some(stage_and_load_history_selected(
                         &mut history_store,
                         history_observation.as_ref(),
+                        &result.snapshot.tasks,
+                        &result.local_session_digests,
                         result.snapshot.as_of,
                         &worker_config.perf_log,
                         false,
+                        &history_source_selection,
                     ))
                 }
                 None => flush_or_reload_history_if_due(
                     &mut history_store,
                     Utc::now(),
                     &worker_config.perf_log,
+                    &history_source_selection,
                 ),
-            }
+            };
+            let remote_live = history_store.load_remote_live_states();
+            let unified_seed = history.as_ref().and_then(|(projection, _)| {
+                matches!(projection.selection, HistorySourceSelection::AllIncluded)
+                    .then_some(&projection.history)
+            });
+            let remote_overview_history =
+                history_store.load_remote_overview_history(unified_seed, Utc::now());
+            (history, Some(remote_live), Some(remote_overview_history))
         };
-        let (history, recorder_health) = history_and_recorder
-            .map_or((None, None), |(history, recorder_health)| {
-                (Some(history), Some(recorder_health))
+        let (history, recorder_health) =
+            history_and_recorder.map_or((None, None), |(projection, recorder_health)| {
+                (
+                    Some(HistoryRefreshCompletion {
+                        generation: history_source_generation,
+                        projection,
+                    }),
+                    Some(recorder_health),
+                )
             });
         let _ = worker_sender.send(RefreshCompletion {
             result,
+            remote_live,
+            remote_overview_history,
             history,
             recorder_health,
             refreshed_account: account_refresh_due,
@@ -5833,7 +8917,7 @@ fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: 
     if account_refresh_enabled && !app.worker_running {
         timeout = timeout.min(app.next_account_refresh.saturating_duration_since(now));
     }
-    if !app.launching_threads.is_empty() {
+    if !app.launching_threads.is_empty() || app.remote_action_running.is_some() {
         timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
     }
     if let Some(notice) = app.open_notice.as_ref() {
@@ -5904,6 +8988,602 @@ fn execute_resume_request(request: ResumeLaunchRequest) -> ResumeLaunchCompletio
     ResumeLaunchCompletion { thread_id, result }
 }
 
+fn discover_remote_sync_health_store() -> Option<RemoteSyncHealthStore> {
+    let history_root = crate::history::default_history_root()?;
+    let state_root = history_root.parent()?.to_path_buf();
+    Some(RemoteSyncHealthStore::new(state_root))
+}
+
+fn discover_remote_bandwidth_budget_store() -> Option<RemoteBandwidthBudgetStore> {
+    let history_root = crate::history::default_history_root()?;
+    let state_root = history_root.parent()?.to_path_buf();
+    Some(RemoteBandwidthBudgetStore::new(state_root))
+}
+
+fn short_project_instance_id(instance_id: &ProjectInstanceId) -> String {
+    instance_id
+        .as_str()
+        .strip_prefix("project-instance-")
+        .unwrap_or(instance_id.as_str())
+        .chars()
+        .take(8)
+        .collect()
+}
+
+fn short_project_source_id(source_id: &crate::source_identity::NodeId) -> String {
+    source_id
+        .as_str()
+        .strip_prefix("node-")
+        .unwrap_or(source_id.as_str())
+        .chars()
+        .take(8)
+        .collect()
+}
+
+fn project_instance_display_label(
+    mappings: &ProjectMappings,
+    projection: &ProjectMappingProjection,
+    instance_id: &ProjectInstanceId,
+) -> Option<ProjectDisplayLabel> {
+    mappings
+        .instance(instance_id)?
+        .observations()
+        .filter_map(|observation| {
+            projection
+                .resolve(observation.source_id(), observation.observed_project_key())
+                .and_then(|project| project.display_label().cloned())
+        })
+        .min()
+}
+
+fn proposed_project_merge_label(
+    mappings: &ProjectMappings,
+    projection: &ProjectMappingProjection,
+    suggestion: &ProjectMergeSuggestion,
+) -> ProjectDisplayLabel {
+    suggestion
+        .instance_ids()
+        .iter()
+        .filter_map(|instance_id| project_instance_display_label(mappings, projection, instance_id))
+        .min()
+        .unwrap_or_else(|| {
+            let fallback = suggestion
+                .instance_ids()
+                .first()
+                .map(short_project_instance_id)
+                .unwrap_or_else(|| "project".to_owned());
+            fallback
+                .parse()
+                .expect("a short project instance ID is a valid display label")
+        })
+}
+
+fn project_merge_evidence(suggestion: &ProjectMergeSuggestion) -> (String, String) {
+    match suggestion.reason() {
+        ProjectMergeSuggestionReason::MatchingGit {
+            fingerprint,
+            repository_relative_workspace_root,
+        } => {
+            let fingerprint = fingerprint
+                .as_str()
+                .strip_prefix("git-sha256-v1-")
+                .unwrap_or(fingerprint.as_str())
+                .chars()
+                .take(8)
+                .collect::<String>();
+            (
+                format!("git:{fingerprint}:{repository_relative_workspace_root}"),
+                format!("Git {fingerprint} · {repository_relative_workspace_root}"),
+            )
+        }
+    }
+}
+
+fn load_project_mappings_settings_state(
+    store: &ProjectMappingStore,
+) -> ProjectMappingsSettingsState {
+    let mappings = match store.load_or_create() {
+        Ok(mappings) => mappings,
+        Err(error) => {
+            return ProjectMappingsSettingsState {
+                error: Some(format!("local-state/{}", io_error_category(&error))),
+                ..ProjectMappingsSettingsState::default()
+            };
+        }
+    };
+    let projection = mappings.projection();
+    let mut rows = Vec::new();
+    for suggestion in mappings.merge_suggestions() {
+        let (evidence_key, evidence) = project_merge_evidence(&suggestion);
+        let member_key = suggestion
+            .instance_ids()
+            .iter()
+            .map(ProjectInstanceId::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push(ProjectMappingSettingsRow::Suggestion {
+            key: format!("{evidence_key}:{member_key}"),
+            proposed_label: proposed_project_merge_label(&mappings, &projection, &suggestion),
+            instance_ids: suggestion.instance_ids().to_vec(),
+            evidence,
+        });
+    }
+    for logical in mappings.logical_projects() {
+        let instance_ids = mappings
+            .instances()
+            .iter()
+            .filter(|instance| instance.logical_project_id() == Some(logical.logical_project_id()))
+            .map(|instance| instance.instance_id().clone())
+            .collect::<Vec<_>>();
+        rows.push(ProjectMappingSettingsRow::LogicalProject {
+            logical_project_id: logical.logical_project_id().clone(),
+            display_label: logical.display_label().clone(),
+            instance_ids: instance_ids.clone(),
+        });
+        for instance_id in instance_ids {
+            let instance_label =
+                project_instance_display_label(&mappings, &projection, &instance_id)
+                    .map(|label| label.as_str().to_owned())
+                    .unwrap_or_else(|| short_project_instance_id(&instance_id));
+            rows.push(ProjectMappingSettingsRow::MappedInstance {
+                logical_project_id: logical.logical_project_id().clone(),
+                logical_label: logical.display_label().clone(),
+                instance_id,
+                instance_label,
+            });
+        }
+    }
+    for instance in mappings
+        .instances()
+        .iter()
+        .filter(|instance| instance.logical_project_id().is_none())
+    {
+        let instance_id = instance.instance_id().clone();
+        let instance_label = project_instance_display_label(&mappings, &projection, &instance_id)
+            .map(|label| label.as_str().to_owned())
+            .unwrap_or_else(|| short_project_instance_id(&instance_id));
+        let source_label = instance
+            .observations()
+            .next()
+            .map(|observation| short_project_source_id(observation.source_id()))
+            .unwrap_or_else(|| "unknown".to_owned());
+        rows.push(ProjectMappingSettingsRow::UnmappedInstance {
+            instance_id,
+            instance_label,
+            source_label,
+        });
+    }
+    ProjectMappingsSettingsState {
+        mappings: Some(mappings),
+        rows,
+        selected_instances: BTreeSet::new(),
+        error: None,
+        status: None,
+    }
+}
+
+fn load_remote_sources_state(
+    config_store: &RemotesConfigStore,
+    health_store: Option<&RemoteSyncHealthStore>,
+    bandwidth_store: Option<&RemoteBandwidthBudgetStore>,
+    now: DateTime<Utc>,
+) -> RemoteSourcesState {
+    let (config, config_error) = match config_store.load_or_create() {
+        Ok(config) => (Some(config), None),
+        Err(error) => (
+            None,
+            Some(format!("local-state/{}", io_error_category(&error))),
+        ),
+    };
+    let (history_sources, history_error) = (Vec::new(), None);
+    let (health, health_error) = match health_store {
+        Some(store) => match store.list() {
+            Ok(health) => (health, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("local-state/{}", io_error_category(&error))),
+            ),
+        },
+        None => (
+            Vec::new(),
+            Some("remote sync state directory is unavailable".to_owned()),
+        ),
+    };
+    let bandwidth = config.as_ref().map_or_else(Vec::new, |config| {
+        load_remote_bandwidth_statuses(config, bandwidth_store, now)
+    });
+    RemoteSourcesState {
+        config,
+        history_sources,
+        health,
+        bandwidth,
+        config_error,
+        history_error,
+        health_error,
+    }
+}
+
+fn load_remote_history_sources(
+    history_store: Option<&SourceHistoryStore>,
+) -> (Vec<SourceMetadata>, Option<String>) {
+    match history_store {
+        Some(store) => match store.list_source_metadata() {
+            Ok(sources) => (
+                sources
+                    .into_iter()
+                    .filter(|source| source.kind() == SourceKind::Ssh)
+                    .collect(),
+                None,
+            ),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("local-state/{}", io_error_category(&error))),
+            ),
+        },
+        None => (
+            Vec::new(),
+            Some("source-aware history is unavailable".to_owned()),
+        ),
+    }
+}
+
+fn unavailable_remote_bandwidth_host_status(
+    host_id: &str,
+    error: &str,
+) -> RemoteBandwidthHostStatus {
+    RemoteBandwidthHostStatus {
+        host_id: host_id.to_owned(),
+        rolling_bytes: None,
+        soft: RemoteBandwidthThresholdStatus::Unknown,
+        hard: RemoteBandwidthThresholdStatus::Unknown,
+        resume_at: None,
+        error: Some(error.to_owned()),
+    }
+}
+
+fn load_remote_bandwidth_statuses(
+    config: &RemotesConfig,
+    store: Option<&RemoteBandwidthBudgetStore>,
+    now: DateTime<Utc>,
+) -> Vec<RemoteBandwidthHostStatus> {
+    let Some(store) = store else {
+        return config
+            .hosts()
+            .iter()
+            .map(|host| {
+                unavailable_remote_bandwidth_host_status(host.id(), "local-state/unavailable")
+            })
+            .collect();
+    };
+    let sources = config
+        .hosts()
+        .iter()
+        .map(|host| {
+            (
+                host.id(),
+                host.expected_source().map(|source| &source.node_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    let checks =
+        match store.check_many_read_only(&sources, now, RemoteBandwidthTransferKind::AutomaticBulk)
+        {
+            Ok(checks) => checks,
+            Err(error) => {
+                let category = format!("local-state/{}", io_error_category(&error));
+                return config
+                    .hosts()
+                    .iter()
+                    .map(|host| unavailable_remote_bandwidth_host_status(host.id(), &category))
+                    .collect();
+            }
+        };
+    config
+        .hosts()
+        .iter()
+        .zip(checks)
+        .map(|(host, check)| match check {
+            Ok(usage) => RemoteBandwidthHostStatus {
+                host_id: host.id().to_owned(),
+                rolling_bytes: Some(usage.rolling_bytes()),
+                soft: RemoteBandwidthThresholdStatus::Ok,
+                hard: RemoteBandwidthThresholdStatus::Ok,
+                resume_at: None,
+                error: None,
+            },
+            Err(pause) => {
+                let rolling_bytes = pause.usage().rolling_bytes();
+                let hard_paused = pause.level() == RemoteBandwidthBudgetLevel::Hard;
+                let soft = if pause.level() == RemoteBandwidthBudgetLevel::Soft
+                    || rolling_bytes >= REMOTE_BANDWIDTH_SOFT_LIMIT_BYTES
+                {
+                    RemoteBandwidthThresholdStatus::Paused
+                } else if hard_paused {
+                    // Clock/capacity anomalies can pause the hard policy
+                    // without proving anything about the byte soft threshold.
+                    RemoteBandwidthThresholdStatus::Unknown
+                } else {
+                    RemoteBandwidthThresholdStatus::Ok
+                };
+                RemoteBandwidthHostStatus {
+                    host_id: host.id().to_owned(),
+                    rolling_bytes: Some(rolling_bytes),
+                    soft,
+                    hard: if hard_paused {
+                        RemoteBandwidthThresholdStatus::Paused
+                    } else {
+                        RemoteBandwidthThresholdStatus::Ok
+                    },
+                    resume_at: pause.resume_at(),
+                    error: None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn io_error_category(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "not-found",
+        io::ErrorKind::PermissionDenied => "permission-denied",
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => "invalid-data",
+        io::ErrorKind::WouldBlock => "busy",
+        _ => "io-error",
+    }
+}
+
+#[cfg(unix)]
+struct RemoteActionProcessTree {
+    process_group: libc::pid_t,
+}
+
+#[cfg(unix)]
+fn configure_remote_action_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn attach_remote_action_process_tree(child: &mut Child) -> io::Result<RemoteActionProcessTree> {
+    Ok(RemoteActionProcessTree {
+        process_group: child.id() as libc::pid_t,
+    })
+}
+
+#[cfg(unix)]
+impl RemoteActionProcessTree {
+    fn target(&self) -> RemoteActionProcessTarget {
+        RemoteActionProcessTarget::ProcessGroup(self.process_group)
+    }
+}
+
+#[cfg(windows)]
+struct RemoteActionProcessTree {
+    job: HANDLE,
+}
+
+#[cfg(windows)]
+fn configure_remote_action_process_tree(command: &mut Command) {
+    command.creation_flags(CREATE_SUSPENDED);
+}
+
+#[cfg(windows)]
+fn attach_remote_action_process_tree(child: &mut Child) -> io::Result<RemoteActionProcessTree> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        return Err(error);
+    }
+    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        return Err(error);
+    }
+    let tree = RemoteActionProcessTree { job };
+    resume_remote_action_child(child)?;
+    Ok(tree)
+}
+
+#[cfg(windows)]
+fn resume_remote_action_child(child: &Child) -> io::Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        let mut resumed = 0_usize;
+        while has_entry {
+            if entry.th32OwnerProcessID == child.id() {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let resume_result = unsafe { ResumeThread(thread) };
+                unsafe { CloseHandle(thread) };
+                if resume_result == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                resumed = resumed.saturating_add(1);
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        }
+        if resumed == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not find the suspended remote action thread",
+            ))
+        } else {
+            Ok(())
+        }
+    })();
+    unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(windows)]
+impl RemoteActionProcessTree {
+    fn target(&self) -> RemoteActionProcessTarget {
+        RemoteActionProcessTarget::Job(self.job as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RemoteActionProcessTree {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe { CloseHandle(self.job) };
+            self.job = std::ptr::null_mut();
+        }
+    }
+}
+
+fn run_cancellable_remote_action_command(
+    mut command: Command,
+    cancellation: &RemoteActionCancellation,
+) -> io::Result<Output> {
+    configure_remote_action_process_tree(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let process_tree = match attach_remote_action_process_tree(&mut child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let target = process_tree.target();
+    cancellation.register(target);
+    let output = child.wait_with_output();
+    let cleanup = target.terminate();
+    cancellation.clear(target);
+    match (output, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(output), Ok(())) => Ok(output),
+    }
+}
+
+fn execute_remote_ui_action(
+    request: RemoteUiActionRequest,
+    config: &CollectConfig,
+    cancellation: &RemoteActionCancellation,
+) -> RemoteUiActionCompletion {
+    let result = (|| -> Result<RemoteUiActionOutcome, String> {
+        if !matches!(
+            &request.kind,
+            RemoteUiActionKind::Include | RemoteUiActionKind::Exclude | RemoteUiActionKind::Purge
+        ) {
+            let current = RemotesConfigStore::discover()
+                .load_or_create()
+                .map_err(|_| "remote config unavailable".to_owned())?;
+            if current.config_revision() != request.config_revision {
+                return Err("configuration changed".to_owned());
+            }
+        }
+        let executable = std::env::current_exe().map_err(|_| "launcher unavailable".to_owned())?;
+        let command = remote_ui_action_command(&executable, config, &request)
+            .map_err(|_| "launcher unavailable".to_owned())?;
+        // Capturing both streams prevents a child process from corrupting the
+        // alternate-screen TUI. The CLI's remote transport and diagnostics are
+        // already bounded; the UI intentionally exposes only a sanitized
+        // outcome and leaves detailed troubleshooting to the CLI invocation.
+        let output = run_cancellable_remote_action_command(command, cancellation)
+            .map_err(|_| "launcher unavailable".to_owned())?;
+        match output.status.code() {
+            Some(0) => Ok(RemoteUiActionOutcome::Complete),
+            Some(2) => Ok(RemoteUiActionOutcome::NeedsAttention),
+            Some(_) => Err("command failed".to_owned()),
+            None => Err("command terminated".to_owned()),
+        }
+    })();
+    RemoteUiActionCompletion { request, result }
+}
+
+fn remote_ui_action_command(
+    executable: &Path,
+    config: &CollectConfig,
+    request: &RemoteUiActionRequest,
+) -> io::Result<Command> {
+    let mut command = Command::new(executable);
+    let inheritance = TuiProcessTreeInheritanceContract::generate()?;
+    inheritance.apply(&mut command);
+    command.arg("--codex-home").arg(&config.codex_home);
+    if config.redact_content {
+        command.arg("--redact-content");
+    }
+    append_remote_ui_action_args(&mut command, request);
+    Ok(command)
+}
+
+fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionRequest) {
+    command.arg("remote");
+    match &request.kind {
+        RemoteUiActionKind::Include | RemoteUiActionKind::Exclude | RemoteUiActionKind::Purge => {
+            command
+                .arg("source")
+                .arg(request.kind.label())
+                .arg(&request.host_id);
+        }
+        _ => {
+            command
+                .arg(request.kind.label())
+                .arg(&request.host_id)
+                .arg("--expected-revision")
+                .arg(request.config_revision.to_string());
+        }
+    }
+    match &request.kind {
+        RemoteUiActionKind::Add {
+            ssh_host,
+            agent_executable,
+            redact_content,
+        }
+        | RemoteUiActionKind::Edit {
+            ssh_host,
+            agent_executable,
+            redact_content,
+        } => {
+            command
+                .arg("--ssh-host")
+                .arg(ssh_host)
+                .arg("--agent-executable")
+                .arg(agent_executable)
+                .arg("--redact-content")
+                .arg(redact_content.to_string());
+        }
+        RemoteUiActionKind::Pair
+        | RemoteUiActionKind::Remove
+        | RemoteUiActionKind::Test
+        | RemoteUiActionKind::Sync
+        | RemoteUiActionKind::Include
+        | RemoteUiActionKind::Exclude
+        | RemoteUiActionKind::Purge => {}
+    }
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_at(frame, app, Utc::now());
 }
@@ -5917,7 +9597,11 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
     app.settings_controls_hitbox = None;
+    app.remote_editor_hitbox = None;
+    app.remote_remove_confirmation_hitbox = None;
+    app.remote_purge_confirmation_hitbox = None;
     app.trend_controls_hitbox = None;
+    app.history_source_control_hitbox = Rect::default();
     app.trend_chart_hitboxes.clear();
     app.summary_controls_hitbox = None;
     app.summary_table_hitbox = None;
@@ -6000,6 +9684,10 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
         ));
     app.view_tabs_hitbox = Some(view_tabs_hitbox(tab_area));
     frame.render_widget(tabs, tab_area);
+    if matches!(app.view, View::Summary | View::Trends) {
+        app.history_source_control_hitbox =
+            render_history_source_control(frame, tab_area, app, initial_tabs.rendered_right);
+    }
     if app.view == View::Overview {
         app.window_controls_hitbox = Some(if controls_on_second_row {
             let controls_area = Rect::new(root[0].x, root[0].y + 1, root[0].width, 1);
@@ -6029,11 +9717,88 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     {
         app.scroll_drag = None;
     }
-    if app.resume_confirmation.is_some() {
+    if app.remote_editor.is_some() {
+        app.remote_editor_hitbox = Some(render_remote_editor(frame, area, app));
+    } else if app.remote_remove_confirmation.is_some() {
+        app.remote_remove_confirmation_hitbox =
+            Some(render_remote_remove_confirmation(frame, area, app));
+    } else if app.remote_purge_confirmation.is_some() {
+        app.remote_purge_confirmation_hitbox =
+            Some(render_remote_purge_confirmation(frame, area, app));
+    } else if app.resume_confirmation.is_some() {
         app.resume_confirmation_hitbox = Some(render_resume_confirmation(frame, area, app));
     } else if app.quit_confirmation_visible {
         app.quit_confirmation_hitbox = Some(render_quit_confirmation(frame, area, app.theme));
     }
+}
+
+fn render_history_source_control(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    start_x: u16,
+) -> Rect {
+    let palette = app.theme.palette();
+    let remaining = usize::from(area.right().saturating_sub(start_x));
+    let full_label = "[S]Source";
+    let compact_label = "[S]Src";
+    let full_width = UnicodeWidthStr::width(TAB_DIVIDER) + UnicodeWidthStr::width(full_label);
+    let compact = remaining < full_width;
+    let separator = if compact { " " } else { TAB_DIVIDER };
+    let label = if compact { compact_label } else { full_label };
+    let separator_width = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(u16::MAX);
+    let label_width = u16::try_from(UnicodeWidthStr::width(label)).unwrap_or(u16::MAX);
+    if start_x
+        .saturating_add(separator_width)
+        .saturating_add(label_width)
+        > area.right()
+    {
+        return Rect::default();
+    }
+
+    let selected = !matches!(
+        &app.history_source_selection,
+        HistorySourceSelection::AllIncluded
+    );
+    let style = if selected {
+        Style::default()
+            .fg(palette.background)
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let shortcut_style = if !app.shortcuts_active() {
+        style
+    } else if selected {
+        style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    let hitbox = Rect::new(
+        start_x.saturating_add(separator_width),
+        area.y,
+        label_width,
+        1,
+    );
+    let suffix = if compact { "]Src" } else { "]Source" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(separator, Style::default().fg(palette.muted)),
+            Span::styled("[", style),
+            Span::styled("S", shortcut_style),
+            Span::styled(suffix, style),
+        ])),
+        Rect::new(
+            start_x,
+            area.y,
+            separator_width.saturating_add(label_width),
+            1,
+        ),
+    );
+    hitbox
 }
 
 fn render_overview_controls(frame: &mut Frame<'_>, area: Rect, app: &App) -> WindowControlsHitbox {
@@ -6492,6 +10257,460 @@ fn render_resume_confirmation(
     }
 }
 
+fn remote_editor_input_line(
+    label: &str,
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    locked: bool,
+    theme: Theme,
+) -> Line<'static> {
+    let palette = theme.palette();
+    let style = if focused {
+        Style::default()
+            .fg(palette.foreground)
+            .bg(palette.gauge_track)
+    } else {
+        Style::default().fg(palette.foreground)
+    };
+    let label_style = style
+        .fg(if focused {
+            palette.accent
+        } else {
+            palette.muted
+        })
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let byte = byte_index_at_grapheme(value, cursor);
+    let left = terminal_safe_text(&value[..byte]);
+    let right = terminal_safe_text(&value[byte..]);
+    let mut spans = vec![
+        Span::styled(format!("{label:<10}"), label_style),
+        Span::styled(left, style),
+    ];
+    if focused && !locked {
+        spans.push(Span::styled(
+            "│",
+            style
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+        ));
+    }
+    spans.push(Span::styled(right, style));
+    if locked {
+        spans.push(Span::styled("  locked", style.fg(palette.muted)));
+    }
+    Line::from(spans)
+}
+
+fn render_remote_editor(frame: &mut Frame<'_>, area: Rect, app: &App) -> RemoteEditorHitbox {
+    let Some(editor) = app.remote_editor.as_ref() else {
+        return RemoteEditorHitbox::default();
+    };
+    let palette = app.theme.palette();
+    let popup_width = area.width.min(72);
+    let popup_height = area.height.min(12);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent))
+        .style(app.theme.base_style())
+        .title(Span::styled(
+            format!(" {} ", editor.mode.label()),
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return RemoteEditorHitbox::default();
+    }
+
+    let host_id = Rect::new(inner.x, inner.y, inner.width, 1);
+    let ssh_host = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        u16::from(inner.height > 1),
+    );
+    let agent_executable = Rect::new(
+        inner.x,
+        inner.y.saturating_add(2),
+        inner.width,
+        u16::from(inner.height > 2),
+    );
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(3),
+        inner.width,
+        u16::from(inner.height > 3),
+    );
+    frame.render_widget(
+        Paragraph::new(remote_editor_input_line(
+            "Host ID:",
+            &editor.host_id,
+            editor.host_id_cursor,
+            editor.field == RemoteEditorField::HostId,
+            editor.mode == RemoteEditorMode::Edit,
+            app.theme,
+        )),
+        host_id,
+    );
+    if !ssh_host.is_empty() {
+        frame.render_widget(
+            Paragraph::new(remote_editor_input_line(
+                "SSH alias:",
+                &editor.ssh_host,
+                editor.ssh_host_cursor,
+                editor.field == RemoteEditorField::SshHost,
+                false,
+                app.theme,
+            )),
+            ssh_host,
+        );
+    }
+    if !agent_executable.is_empty() {
+        frame.render_widget(
+            Paragraph::new(remote_editor_input_line(
+                "Agent exe:",
+                &editor.agent_executable,
+                editor.agent_executable_cursor,
+                editor.field == RemoteEditorField::AgentExecutable,
+                false,
+                app.theme,
+            )),
+            agent_executable,
+        );
+    }
+    if !content.is_empty() {
+        let focused = editor.field == RemoteEditorField::Content;
+        let style = if focused {
+            Style::default()
+                .fg(palette.foreground)
+                .bg(palette.gauge_track)
+        } else {
+            Style::default().fg(palette.foreground)
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<10}", "Content:"),
+                style.fg(if focused {
+                    palette.accent
+                } else {
+                    palette.muted
+                }),
+            ),
+            Span::styled(
+                if editor.redact_content {
+                    "Redacted"
+                } else {
+                    "Preview"
+                },
+                style.add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if focused {
+            spans.extend([
+                Span::styled("  [", style),
+                Span::styled(
+                    "Space",
+                    style.fg(palette.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("]Toggle", style),
+            ]);
+        } else {
+            spans.push(Span::styled("  Tab to select", style.fg(palette.muted)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), content);
+    }
+
+    if inner.height > 5 {
+        let message = editor.validation_error.as_deref().unwrap_or(
+            "Only this SSH alias and agent executable are used; no SSH hosts are discovered.",
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_display_text(message, usize::from(inner.width))).style(
+                Style::default().fg(if editor.validation_error.is_some() {
+                    palette.error
+                } else {
+                    palette.muted
+                }),
+            ),
+            Rect::new(inner.x, inner.y.saturating_add(5), inner.width, 1),
+        );
+    }
+
+    let full = inner.width >= 40;
+    let next_label = if full { "[Tab]Next" } else { "[Tab]" };
+    let save_label = if full { "[↵]Save" } else { "[↵]" };
+    let cancel_label = if full { "[Esc]Cancel" } else { "[Esc]" };
+    let gap = if full { "   " } else { " " };
+    let next_width = u16::try_from(UnicodeWidthStr::width(next_label)).unwrap_or(u16::MAX);
+    let save_width = u16::try_from(UnicodeWidthStr::width(save_label)).unwrap_or(u16::MAX);
+    let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let controls_width = next_width
+        .saturating_add(save_width)
+        .saturating_add(cancel_width)
+        .saturating_add(gap_width.saturating_mul(2));
+    let mut next = Rect::default();
+    let mut save = Rect::default();
+    let mut cancel = Rect::default();
+    if inner.height > 0 && controls_width <= inner.width {
+        let y = inner.bottom().saturating_sub(1);
+        let x = inner
+            .x
+            .saturating_add(inner.width.saturating_sub(controls_width) / 2);
+        next = Rect::new(x, y, next_width, 1);
+        save = Rect::new(next.right().saturating_add(gap_width), y, save_width, 1);
+        cancel = Rect::new(save.right().saturating_add(gap_width), y, cancel_width, 1);
+        let button = Style::default()
+            .fg(palette.foreground)
+            .bg(palette.gauge_track);
+        let shortcut = button.fg(palette.accent).add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[", button),
+                Span::styled("Tab", shortcut),
+                Span::styled(if full { "]Next" } else { "]" }, button),
+                Span::raw(gap),
+                Span::styled("[", button),
+                Span::styled("↵", shortcut),
+                Span::styled(if full { "]Save" } else { "]" }, button),
+                Span::raw(gap),
+                Span::styled("[", button),
+                Span::styled("Esc", shortcut),
+                Span::styled(if full { "]Cancel" } else { "]" }, button),
+            ])),
+            Rect::new(x, y, controls_width, 1),
+        );
+    }
+
+    RemoteEditorHitbox {
+        host_id,
+        ssh_host,
+        agent_executable,
+        content,
+        next,
+        save,
+        cancel,
+    }
+}
+
+fn render_remote_remove_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+) -> RemoteRemoveConfirmationHitbox {
+    let Some(confirmation) = app.remote_remove_confirmation.as_ref() else {
+        return RemoteRemoveConfirmationHitbox::default();
+    };
+    let palette = app.theme.palette();
+    let popup_width = area.width.min(68);
+    let popup_height = area.height.min(8);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.warning))
+        .style(app.theme.base_style())
+        .title(Span::styled(
+            " Remove remote host? ",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return RemoteRemoveConfirmationHitbox::default();
+    }
+    let lines = [
+        format!(
+            "Remove '{}' from the explicit SSH allowlist?",
+            terminal_safe_text(&confirmation.host_id)
+        ),
+        "Retained source history stays on disk but is detached and excluded by default.".to_owned(),
+        "No SSH connection is opened by this removal.".to_owned(),
+    ];
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .map(|line| Line::from(truncate_display_text(&line, usize::from(inner.width))))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(palette.foreground)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        ),
+    );
+    let full = inner.width >= 28;
+    let confirm_label = if full { "[↵]Remove" } else { "[↵]" };
+    let cancel_label = if full { "[Esc]Cancel" } else { "[Esc]" };
+    let gap = if full { "   " } else { " " };
+    let confirm_width = u16::try_from(UnicodeWidthStr::width(confirm_label)).unwrap_or(u16::MAX);
+    let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let controls_width = confirm_width
+        .saturating_add(gap_width)
+        .saturating_add(cancel_width);
+    if inner.height == 0 || controls_width > inner.width {
+        return RemoteRemoveConfirmationHitbox::default();
+    }
+    let y = inner.bottom().saturating_sub(1);
+    let x = inner
+        .x
+        .saturating_add(inner.width.saturating_sub(controls_width) / 2);
+    let confirm = Rect::new(x, y, confirm_width, 1);
+    let cancel = Rect::new(
+        confirm.right().saturating_add(gap_width),
+        y,
+        cancel_width,
+        1,
+    );
+    let button = Style::default()
+        .fg(palette.foreground)
+        .bg(palette.gauge_track);
+    let shortcut = button.fg(palette.accent).add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("[", button),
+            Span::styled("↵", shortcut),
+            Span::styled(if full { "]Remove" } else { "]" }, button),
+            Span::raw(gap),
+            Span::styled("[", button),
+            Span::styled("Esc", shortcut),
+            Span::styled(if full { "]Cancel" } else { "]" }, button),
+        ])),
+        Rect::new(x, y, controls_width, 1),
+    );
+    RemoteRemoveConfirmationHitbox { confirm, cancel }
+}
+
+fn render_remote_purge_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+) -> RemotePurgeConfirmationHitbox {
+    let Some(confirmation) = app.remote_purge_confirmation.as_ref() else {
+        return RemotePurgeConfirmationHitbox::default();
+    };
+    let palette = app.theme.palette();
+    let popup_width = area.width.min(72);
+    let popup_height = area.height.min(9);
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.error))
+        .style(app.theme.base_style())
+        .title(Span::styled(
+            " Purge retained source history? ",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return RemotePurgeConfirmationHitbox::default();
+    }
+    let lines = [
+        format!(
+            "Permanently delete retained history for '{}'?",
+            terminal_safe_text(confirmation.source_id.as_str())
+        ),
+        "This also removes its cursor, WAL, and project observations.".to_owned(),
+        "This cannot be undone. The source must remain detached.".to_owned(),
+    ];
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .map(|line| Line::from(truncate_display_text(&line, usize::from(inner.width))))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(palette.foreground)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        ),
+    );
+    let full = inner.width >= 27;
+    let confirm_label = if full { "[↵]Purge" } else { "[↵]" };
+    let cancel_label = if full { "[Esc]Cancel" } else { "[Esc]" };
+    let gap = if full { "   " } else { " " };
+    let confirm_width = u16::try_from(UnicodeWidthStr::width(confirm_label)).unwrap_or(u16::MAX);
+    let cancel_width = u16::try_from(UnicodeWidthStr::width(cancel_label)).unwrap_or(u16::MAX);
+    let gap_width = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(u16::MAX);
+    let controls_width = confirm_width
+        .saturating_add(gap_width)
+        .saturating_add(cancel_width);
+    if inner.height == 0 || controls_width > inner.width {
+        return RemotePurgeConfirmationHitbox::default();
+    }
+    let y = inner.bottom().saturating_sub(1);
+    let x = inner
+        .x
+        .saturating_add(inner.width.saturating_sub(controls_width) / 2);
+    let confirm = Rect::new(x, y, confirm_width, 1);
+    let cancel = Rect::new(
+        confirm.right().saturating_add(gap_width),
+        y,
+        cancel_width,
+        1,
+    );
+    let button = Style::default()
+        .fg(palette.foreground)
+        .bg(palette.gauge_track);
+    let shortcut = button.fg(palette.accent).add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("[", button),
+            Span::styled("↵", shortcut),
+            Span::styled(if full { "]Purge" } else { "]" }, button),
+            Span::raw(gap),
+            Span::styled("[", button),
+            Span::styled("Esc", shortcut),
+            Span::styled(if full { "]Cancel" } else { "]" }, button),
+        ])),
+        Rect::new(x, y, controls_width, 1),
+    );
+    RemotePurgeConfirmationHitbox { confirm, cancel }
+}
+
 fn render_quit_confirmation(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -6670,25 +10889,30 @@ fn on_off(value: bool) -> &'static str {
 
 fn settings_hint(app: &App) -> Line<'static> {
     let normal = Style::default().fg(app.theme.palette().muted);
-    let shortcut = if app.shortcuts_active() {
+    let navigation_shortcut = if app.shortcuts_active() {
         Style::default()
             .fg(app.theme.palette().accent)
             .add_modifier(Modifier::BOLD)
     } else {
         normal
     };
+    let toggle_shortcut = if app.shortcuts_active() && app.main_settings_focused() {
+        navigation_shortcut
+    } else {
+        normal
+    };
     Line::from(vec![
         Span::styled(" [", normal),
-        Span::styled("↑↓", shortcut),
+        Span::styled("↑↓", navigation_shortcut),
         Span::styled("]Select [", normal),
-        Span::styled("↵", shortcut),
+        Span::styled("↵", toggle_shortcut),
         Span::styled("]Toggle ", normal),
     ])
 }
 
 fn settings_row(app: &App, item: SettingItem) -> Row<'static> {
     let selected = app.selected_setting == item.index();
-    let shortcuts_active = app.shortcuts_active();
+    let shortcuts_active = app.shortcuts_active() && app.main_settings_focused();
     let palette = app.theme.palette();
     let row_style = if selected {
         Style::default()
@@ -6766,10 +10990,719 @@ fn render_settings_group(
     );
 }
 
+fn push_remote_control(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    area: Rect,
+    shortcut: char,
+    label: &str,
+    active: bool,
+    theme: Theme,
+) -> Rect {
+    let palette = theme.palette();
+    let normal = Style::default().fg(if active {
+        palette.foreground
+    } else {
+        palette.muted
+    });
+    let shortcut_style = if active {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    if !spans.is_empty() {
+        spans.push(Span::styled("  ", normal));
+        *x = x.saturating_add(2);
+    }
+    let text = format!("[{shortcut}]{label}");
+    let width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+    let hitbox = if *x < area.right() && x.saturating_add(width) <= area.right() {
+        Rect::new(*x, area.y, width, u16::from(area.height > 0))
+    } else {
+        Rect::default()
+    };
+    spans.push(Span::styled("[", normal));
+    spans.push(Span::styled(shortcut.to_string(), shortcut_style));
+    spans.push(Span::styled(format!("]{label}"), normal));
+    *x = x.saturating_add(width);
+    hitbox
+}
+
+fn render_remote_sources_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    hitbox: &mut SettingsControlsHitbox,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let palette = app.theme.palette();
+    let block = panel(" Remote sources", app.theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let config = app.remote_sources.config.as_ref();
+    let idle = app.remote_action_idle();
+    let shortcuts_active = app.shortcuts_active() && app.remote_settings_focused();
+    let global_enabled = config.is_some_and(RemotesConfig::auto_sync_enabled);
+    let global_label = format!(
+        "Automatic sync: {}",
+        if global_enabled { "On" } else { "Off" }
+    );
+    let global_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    let mut global_spans = Vec::new();
+    let mut x = inner.x;
+    hitbox.remote_global_enabled = config.is_some() && idle && app.shortcuts_active();
+    hitbox.remote_global = push_remote_control(
+        &mut global_spans,
+        &mut x,
+        global_area,
+        'G',
+        &global_label,
+        hitbox.remote_global_enabled && shortcuts_active,
+        app.theme,
+    );
+    if let Some(config) = config {
+        global_spans.push(Span::styled(
+            format!(
+                "  active {}s · idle {}s",
+                config.active_interval_seconds(),
+                config.idle_interval_seconds()
+            ),
+            Style::default().fg(palette.muted),
+        ));
+    } else if let Some(error) = app.remote_sources.config_error.as_deref() {
+        global_spans.push(Span::styled(
+            format!("  {}", terminal_safe_text(error)),
+            Style::default().fg(palette.error),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(global_spans)), global_area);
+
+    if inner.height <= 1 {
+        return;
+    }
+    let controls_y = inner.bottom().saturating_sub(1);
+    let manage_y = (inner.height >= 5).then_some(controls_y.saturating_sub(1));
+    let hosts_y = inner.y.saturating_add(1);
+    let hosts_bottom = manage_y.unwrap_or(controls_y);
+    let hosts_area = Rect::new(
+        inner.x,
+        hosts_y,
+        inner.width,
+        hosts_bottom.saturating_sub(hosts_y),
+    );
+    hitbox.remote_hosts.clear();
+    let host_count = config.map_or(0, |config| config.hosts().len());
+    let detached_sources = app
+        .remote_sources
+        .history_sources
+        .iter()
+        .filter(|source| source.detached())
+        .collect::<Vec<_>>();
+    let entry_count = host_count.saturating_add(detached_sources.len());
+    if entry_count > 0 {
+        let capacity = usize::from(hosts_area.height.saturating_sub(1));
+        let selected = app
+            .selected_setting
+            .saturating_sub(SettingItem::ALL.len())
+            .min(entry_count.saturating_sub(1));
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(capacity)
+            .min(entry_count.saturating_sub(capacity));
+        let visible = (start..entry_count.min(start.saturating_add(capacity))).collect::<Vec<_>>();
+        let rows = visible
+            .iter()
+            .map(|index| {
+                let selected = app.selected_setting == SettingItem::ALL.len() + *index;
+                let style = if selected {
+                    Style::default()
+                        .fg(palette.background)
+                        .bg(palette.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.foreground)
+                };
+                let cells = if *index < host_count {
+                    let host = &config.expect("host rows require remote config").hosts()[*index];
+                    let source = host.expected_source().and_then(|expected| {
+                        app.remote_sources
+                            .history_sources
+                            .iter()
+                            .find(|source| source.source_id() == &expected.node_id)
+                    });
+                    vec![
+                        Cell::from(if selected { "▌" } else { " " }),
+                        Cell::from(terminal_safe_text(host.id())),
+                        Cell::from(terminal_safe_text(host.ssh_host())),
+                        Cell::from(if host.is_paired() { "yes" } else { "no" }),
+                        Cell::from(if host.sync_enabled() { "on" } else { "off" }),
+                        Cell::from(source.map_or("-", |source| {
+                            if source.include_in_aggregates() {
+                                "in"
+                            } else {
+                                "out"
+                            }
+                        })),
+                        Cell::from(if host.redact_content() {
+                            "redacted"
+                        } else {
+                            "preview"
+                        }),
+                    ]
+                } else {
+                    let source = detached_sources[*index - host_count];
+                    vec![
+                        Cell::from(if selected { "▌" } else { " " }),
+                        Cell::from(terminal_safe_text(source.display_label())),
+                        Cell::from("detached"),
+                        Cell::from("-"),
+                        Cell::from("-"),
+                        Cell::from(if source.include_in_aggregates() {
+                            "in"
+                        } else {
+                            "out"
+                        }),
+                        Cell::from(match source.aggregate_redaction_profile() {
+                            crate::source_history::RedactionProfile::Redacted => "redacted",
+                            crate::source_history::RedactionProfile::PreviewEnabled => "preview",
+                        }),
+                    ]
+                };
+                Row::new(cells).style(style)
+            })
+            .collect::<Vec<_>>();
+        if !hosts_area.is_empty() {
+            let row_y = hosts_area.y.saturating_add(1);
+            for (offset, _) in visible.iter().enumerate() {
+                let y = row_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+                hitbox.remote_hosts.push(if y < hosts_area.bottom() {
+                    Rect::new(hosts_area.x, y, hosts_area.width, 1)
+                } else {
+                    Rect::default()
+                });
+            }
+            frame.render_widget(
+                Table::new(
+                    rows,
+                    [
+                        Constraint::Length(1),
+                        Constraint::Min(9),
+                        Constraint::Min(11),
+                        Constraint::Length(7),
+                        Constraint::Length(6),
+                        Constraint::Length(5),
+                        Constraint::Length(10),
+                    ],
+                )
+                .header(table_header(
+                    [
+                        "",
+                        "HOST / SOURCE",
+                        "SSH / STATE",
+                        "PAIRED",
+                        "AUTO",
+                        "AGG",
+                        "CONTENT",
+                    ],
+                    app.theme,
+                )),
+                hosts_area,
+            );
+        }
+        // Mouse rows are indexed by configuration order, even while the
+        // viewport is scrolled around a later selection.
+        if start > 0 {
+            let mut indexed = vec![Rect::default(); start];
+            indexed.append(&mut hitbox.remote_hosts);
+            hitbox.remote_hosts = indexed;
+        }
+    } else if !hosts_area.is_empty() {
+        let message = app
+            .remote_sources
+            .history_error
+            .as_deref()
+            .or(app.remote_sources.config_error.as_deref())
+            .unwrap_or("No configured or retained remote sources");
+        frame.render_widget(
+            Paragraph::new(terminal_safe_text(message)).style(Style::default().fg(
+                if app.remote_sources.history_error.is_some()
+                    || app.remote_sources.config_error.is_some()
+                {
+                    palette.error
+                } else {
+                    palette.muted
+                },
+            )),
+            hosts_area,
+        );
+    }
+
+    let selected = app.selected_remote_host();
+    let selected_source = app.selected_remote_source_metadata();
+    let selected_detached = app.selected_detached_remote_source().is_some();
+    if let Some(manage_y) = manage_y {
+        let manage_area = Rect::new(inner.x, manage_y, inner.width, 1);
+        let compact = inner.width < 54;
+        hitbox.remote_new_enabled = config.is_some() && idle && app.shortcuts_active();
+        hitbox.remote_edit_enabled = selected.is_some() && idle && app.shortcuts_active();
+        hitbox.remote_pair_enabled =
+            selected.is_some_and(|host| !host.is_paired()) && idle && app.shortcuts_active();
+        hitbox.remote_purge_enabled = selected_detached && idle && app.shortcuts_active();
+        hitbox.remote_remove_enabled = selected.is_some() && idle && app.shortcuts_active();
+        let mut spans = Vec::new();
+        let mut x = manage_area.x;
+        hitbox.remote_new = push_remote_control(
+            &mut spans,
+            &mut x,
+            manage_area,
+            'N',
+            if compact { "" } else { "New" },
+            hitbox.remote_new_enabled && shortcuts_active,
+            app.theme,
+        );
+        hitbox.remote_edit = push_remote_control(
+            &mut spans,
+            &mut x,
+            manage_area,
+            'E',
+            if compact { "" } else { "Edit" },
+            hitbox.remote_edit_enabled && shortcuts_active,
+            app.theme,
+        );
+        if selected_detached {
+            hitbox.remote_purge = push_remote_control(
+                &mut spans,
+                &mut x,
+                manage_area,
+                'P',
+                if compact { "" } else { "Purge" },
+                hitbox.remote_purge_enabled && shortcuts_active,
+                app.theme,
+            );
+        } else {
+            hitbox.remote_pair = push_remote_control(
+                &mut spans,
+                &mut x,
+                manage_area,
+                'P',
+                if compact { "" } else { "Pair" },
+                hitbox.remote_pair_enabled && shortcuts_active,
+                app.theme,
+            );
+        }
+        hitbox.remote_remove = push_remote_control(
+            &mut spans,
+            &mut x,
+            manage_area,
+            'D',
+            if compact { "" } else { "Remove" },
+            hitbox.remote_remove_enabled && shortcuts_active,
+            app.theme,
+        );
+        if let Some(host) = selected {
+            let budget = remote_bandwidth_status(app, host.id())
+                .map(remote_bandwidth_compact_label)
+                .unwrap_or_else(|| "Budget unavailable".to_owned());
+            spans.push(Span::styled(
+                format!("  {budget}"),
+                Style::default().fg(palette.muted),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), manage_area);
+    }
+
+    let controls_area = Rect::new(inner.x, controls_y, inner.width, 1);
+    let can_enable = selected.is_some_and(|host| host.is_paired()) && idle;
+    let can_test = selected.is_some() && idle;
+    let can_sync = selected
+        .is_some_and(|host| host.is_paired() && host.redact_content() == app.local_redact_content)
+        && idle;
+    hitbox.remote_enable_enabled = can_enable && app.shortcuts_active();
+    hitbox.remote_test_enabled = can_test && app.shortcuts_active();
+    hitbox.remote_sync_enabled = can_sync && app.shortcuts_active();
+    hitbox.remote_include_enabled = selected_source.is_some() && idle && app.shortcuts_active();
+    let enable_label = if selected.is_some_and(|host| host.sync_enabled()) {
+        "Disable host"
+    } else {
+        "Enable host"
+    };
+    let compact = inner.width < 54;
+    let mut spans = Vec::new();
+    let mut x = controls_area.x;
+    hitbox.remote_enable = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'H',
+        if compact { "" } else { enable_label },
+        hitbox.remote_enable_enabled && shortcuts_active,
+        app.theme,
+    );
+    hitbox.remote_test = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'C',
+        if compact { "" } else { "Test" },
+        hitbox.remote_test_enabled && shortcuts_active,
+        app.theme,
+    );
+    hitbox.remote_sync = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'S',
+        if compact { "" } else { "Sync now" },
+        hitbox.remote_sync_enabled && shortcuts_active,
+        app.theme,
+    );
+    let include_label = if selected_source.is_some_and(SourceMetadata::include_in_aggregates) {
+        "Exclude data"
+    } else {
+        "Include data"
+    };
+    hitbox.remote_include = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'I',
+        if compact { "" } else { include_label },
+        hitbox.remote_include_enabled && shortcuts_active,
+        app.theme,
+    );
+    if let Some(status) = app.remote_action_status.as_deref() {
+        spans.push(Span::styled(
+            format!("  {}", terminal_safe_text(status)),
+            Style::default().fg(if app.remote_action_running.is_some() {
+                palette.warning
+            } else {
+                palette.muted
+            }),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), controls_area);
+}
+
+fn render_project_mapping_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    hitbox: &mut SettingsControlsHitbox,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let palette = app.theme.palette();
+    let block = panel(" Project mappings · explicit only", app.theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let controls_y = inner.bottom().saturating_sub(1);
+    let rows_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        controls_y.saturating_sub(inner.y),
+    );
+    let base = app.project_mapping_selection_base();
+    let selected = app
+        .selected_setting
+        .checked_sub(base)
+        .filter(|index| *index < app.project_mappings.rows.len());
+    let capacity = usize::from(rows_area.height.saturating_sub(1));
+    let start = selected
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(app.project_mappings.rows.len().saturating_sub(capacity));
+    let end = app
+        .project_mappings
+        .rows
+        .len()
+        .min(start.saturating_add(capacity));
+    hitbox.project_rows = vec![Rect::default(); start];
+    let rows = app.project_mappings.rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            let index = start + offset;
+            let is_selected = selected == Some(index);
+            let style = if is_selected {
+                Style::default()
+                    .fg(palette.background)
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.foreground)
+            };
+            let (kind, label, detail) = match row {
+                ProjectMappingSettingsRow::Suggestion {
+                    instance_ids,
+                    proposed_label,
+                    evidence,
+                    ..
+                } => (
+                    "SUG",
+                    proposed_label.as_str().to_owned(),
+                    format!("{} instances · {evidence}", instance_ids.len()),
+                ),
+                ProjectMappingSettingsRow::LogicalProject {
+                    display_label,
+                    instance_ids,
+                    ..
+                } => (
+                    "LOG",
+                    display_label.as_str().to_owned(),
+                    format!("{} mapped instances", instance_ids.len()),
+                ),
+                ProjectMappingSettingsRow::MappedInstance {
+                    logical_project_id,
+                    logical_label,
+                    instance_id,
+                    instance_label,
+                } => (
+                    "  INST",
+                    instance_label.clone(),
+                    format!(
+                        "{} · {} · {}",
+                        logical_label.as_str(),
+                        short_project_instance_id(instance_id),
+                        logical_project_id
+                            .as_str()
+                            .strip_prefix("logical-project-")
+                            .unwrap_or(logical_project_id.as_str())
+                            .chars()
+                            .take(8)
+                            .collect::<String>()
+                    ),
+                ),
+                ProjectMappingSettingsRow::UnmappedInstance {
+                    instance_id,
+                    instance_label,
+                    source_label,
+                } => {
+                    let checked = app
+                        .project_mappings
+                        .selected_instances
+                        .contains(instance_id);
+                    (
+                        if checked { "[x] FREE" } else { "[ ] FREE" },
+                        instance_label.clone(),
+                        format!(
+                            "source {source_label} · {}",
+                            short_project_instance_id(instance_id)
+                        ),
+                    )
+                }
+            };
+            let y = rows_area
+                .y
+                .saturating_add(1)
+                .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+            hitbox.project_rows.push(if y < rows_area.bottom() {
+                Rect::new(rows_area.x, y, rows_area.width, 1)
+            } else {
+                Rect::default()
+            });
+            Row::new([
+                Cell::from(if is_selected { "▌" } else { " " }),
+                Cell::from(kind),
+                Cell::from(terminal_safe_text(&label)),
+                Cell::from(terminal_safe_text(&detail)),
+            ])
+            .style(style)
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() && !rows_area.is_empty() {
+        frame.render_widget(
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(1),
+                    Constraint::Length(8),
+                    Constraint::Min(12),
+                    Constraint::Min(18),
+                ],
+            )
+            .header(table_header(
+                ["", "TYPE", "PROJECT", "EVIDENCE / MEMBER"],
+                app.theme,
+            )),
+            rows_area,
+        );
+    } else if !rows_area.is_empty() {
+        let (message, tone) = app.project_mappings.error.as_deref().map_or(
+            (
+                "No project instances or explicit logical mappings",
+                palette.muted,
+            ),
+            |error| (error, palette.error),
+        );
+        frame.render_widget(
+            Paragraph::new(terminal_safe_text(message)).style(Style::default().fg(tone)),
+            rows_area,
+        );
+    }
+
+    let controls_area = Rect::new(inner.x, controls_y, inner.width, 1);
+    let mut spans = Vec::new();
+    let mut x = controls_area.x;
+    hitbox.project_accept_enabled = matches!(
+        app.selected_project_mapping_row(),
+        Some(ProjectMappingSettingsRow::Suggestion { .. })
+    ) && app.shortcuts_active();
+    hitbox.project_toggle_enabled = matches!(
+        app.selected_project_mapping_row(),
+        Some(ProjectMappingSettingsRow::UnmappedInstance { .. })
+    ) && app.shortcuts_active();
+    hitbox.project_merge_enabled = app.project_mappings.selected_instances.len() >= 2
+        && app.project_settings_focused()
+        && app.shortcuts_active();
+    hitbox.project_split_enabled = matches!(
+        app.selected_project_mapping_row(),
+        Some(
+            ProjectMappingSettingsRow::LogicalProject { .. }
+                | ProjectMappingSettingsRow::MappedInstance { .. }
+        )
+    ) && app.shortcuts_active();
+    let compact = inner.width < 70;
+    hitbox.project_accept = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'J',
+        if compact { "" } else { "Accept merge" },
+        hitbox.project_accept_enabled,
+        app.theme,
+    );
+    hitbox.project_toggle = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'T',
+        if compact { "" } else { "Select" },
+        hitbox.project_toggle_enabled,
+        app.theme,
+    );
+    hitbox.project_merge = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'M',
+        if compact { "" } else { "Merge selected" },
+        hitbox.project_merge_enabled,
+        app.theme,
+    );
+    hitbox.project_split = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'X',
+        if compact { "" } else { "Split mapping" },
+        hitbox.project_split_enabled,
+        app.theme,
+    );
+    if let Some(status) = app.project_mappings.status.as_deref() {
+        spans.push(Span::styled(
+            format!("  {}", terminal_safe_text(status)),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), controls_area);
+}
+
 fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut hitbox = SettingsControlsHitbox::default();
-    if area.height < 14 {
-        let capacity = usize::from(area.height.saturating_sub(2)).min(SettingItem::ALL.len());
+    let remote_entry_count = app
+        .remote_sources
+        .config
+        .as_ref()
+        .map_or(0, |config| config.hosts().len())
+        .saturating_add(
+            app.remote_sources
+                .history_sources
+                .iter()
+                .filter(|source| source.detached())
+                .count(),
+        );
+    let desired_remote_height = u16::try_from(remote_entry_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(8)
+        .clamp(7, 14);
+    let remote_height = desired_remote_height.min(area.height.saturating_sub(7).max(1));
+    let desired_project_height = u16::try_from(app.project_mappings.rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .clamp(5, 12);
+    if area.height < 16 || area.width < 80 {
+        if area.height < 18 {
+            let show_projects = app.selected_project_mapping_row().is_some();
+            let detail_height = if show_projects {
+                desired_project_height
+            } else {
+                desired_remote_height
+            }
+            .min(area.height.saturating_sub(3).max(1));
+            let settings_height = area.height.saturating_sub(detail_height);
+            let rows = Layout::vertical([
+                Constraint::Length(settings_height),
+                Constraint::Length(detail_height),
+            ])
+            .split(area);
+            let capacity =
+                usize::from(rows[0].height.saturating_sub(2)).min(SettingItem::ALL.len());
+            let end = app
+                .selected_setting
+                .min(SettingItem::ALL.len() - 1)
+                .saturating_add(1)
+                .max(capacity)
+                .min(SettingItem::ALL.len());
+            let start = end.saturating_sub(capacity);
+            render_settings_group(
+                frame,
+                rows[0],
+                app,
+                " Settings",
+                &SettingItem::ALL[start..end],
+                true,
+                &mut hitbox,
+            );
+            if show_projects {
+                render_project_mapping_settings(frame, rows[1], app, &mut hitbox);
+            } else {
+                render_remote_sources_settings(frame, rows[1], app, &mut hitbox);
+            }
+            app.settings_controls_hitbox = Some(hitbox);
+            return;
+        }
+        let project_height = desired_project_height.min(
+            area.height
+                .saturating_sub(remote_height)
+                .saturating_sub(1)
+                .max(1),
+        );
+        let settings_height = area
+            .height
+            .saturating_sub(remote_height)
+            .saturating_sub(project_height);
+        let rows = Layout::vertical([
+            Constraint::Length(settings_height),
+            Constraint::Length(remote_height),
+            Constraint::Length(project_height),
+        ])
+        .split(area);
+        let capacity = usize::from(rows[0].height.saturating_sub(2)).min(SettingItem::ALL.len());
         let end = app
             .selected_setting
             .min(SettingItem::ALL.len() - 1)
@@ -6779,23 +11712,27 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let start = end.saturating_sub(capacity);
         render_settings_group(
             frame,
-            area,
+            rows[0],
             app,
             " Settings",
             &SettingItem::ALL[start..end],
             true,
             &mut hitbox,
         );
+        render_remote_sources_settings(frame, rows[1], app, &mut hitbox);
+        render_project_mapping_settings(frame, rows[2], app, &mut hitbox);
     } else {
         let rows = Layout::vertical([
             Constraint::Length(6),
-            Constraint::Length(6),
+            Constraint::Length(remote_height),
             Constraint::Min(3),
         ])
         .split(area);
+        let settings_columns =
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(rows[0]);
         render_settings_group(
             frame,
-            rows[0],
+            settings_columns[0],
             app,
             " Display",
             &SettingItem::ALL[..4],
@@ -6804,25 +11741,15 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
         render_settings_group(
             frame,
-            rows[1],
+            settings_columns[1],
             app,
             " Table columns",
             &SettingItem::ALL[4..],
             true,
             &mut hitbox,
         );
-        let description = [
-            "Column choices apply to Tasks, Turns, and Models.",
-            "API EQ. uses the selected 5h/week scope and is independent of EST Longx.",
-            "Narrow panes keep API EQ. visible first and may omit lower-priority columns.",
-        ];
-        frame.render_widget(
-            Paragraph::new(description.map(Line::from).to_vec())
-                .block(panel(" Behavior", app.theme))
-                .style(Style::default().fg(app.theme.palette().muted))
-                .wrap(Wrap { trim: true }),
-            rows[2],
-        );
+        render_remote_sources_settings(frame, rows[1], app, &mut hitbox);
+        render_project_mapping_settings(frame, rows[2], app, &mut hitbox);
     }
     app.settings_controls_hitbox = Some(hitbox);
 }
@@ -6900,8 +11827,22 @@ fn summary_history_inputs_eq(current: &HistoryData, incoming: &HistoryData) -> b
 }
 
 fn prepare_summary(app: &App, query_now: DateTime<Utc>) -> PreparedSummary {
+    let snapshot = if matches!(
+        app.history_source_applied_selection,
+        HistorySourceSelection::Remote(_)
+    ) {
+        let mut source_scoped = app.snapshot.clone();
+        // Live task rows are local metadata-only overlays. Applying them to a
+        // remote projection can relabel a same-ID remote thread/project with
+        // unrelated local metadata, so exact SSH scopes consume only metadata
+        // persisted in their source-filtered history buckets.
+        source_scoped.tasks.clear();
+        Cow::Owned(source_scoped)
+    } else {
+        Cow::Borrowed(&app.snapshot)
+    };
     prepare_shared_summary(
-        &app.snapshot,
+        snapshot.as_ref(),
         &app.history,
         app.summary_range,
         query_now,
@@ -7624,27 +12565,57 @@ fn render_summary_tree(
         || app.summary_range.label().to_string(),
         |note| format!("{} ({note})", app.summary_range.label()),
     );
+    let coverage_percent = prepared.coverage_percent(app.summary_metric);
+    let backfill_partial = app.summary_range == SummaryRange::ThirtyDays
+        && app.history.summary_backfill_attempt_complete == Some(false)
+        && !summary_history_coverage_complete(
+            &app.history,
+            prepared.usage.window.ends_at - ChronoDuration::nanoseconds(1),
+        );
     let mut title = format!(
-        "Usage tree · {range_label} · {total} · {:.0}% coverage",
-        prepared.coverage_percent(app.summary_metric)
+        "Usage tree · {} · {range_label} · {total} · {:.0}% coverage",
+        app.history_source_scope_label(),
+        coverage_percent
     );
     if partial {
         title.push_str(" · PARTIAL");
     }
     if app.summary_backfill_running {
         title = format!(
-            "Usage tree · BACKFILLING 30d · {range_label} · {total} · {:.0}% coverage{}",
-            prepared.coverage_percent(app.summary_metric),
+            "Usage tree · {} · BACKFILLING 30d · {range_label} · {total} · {:.0}% coverage{}",
+            app.history_source_scope_label(),
+            coverage_percent,
             if partial { " · PARTIAL" } else { "" }
         );
-    } else if app.summary_range == SummaryRange::ThirtyDays
-        && app.history.summary_backfill_attempt_complete == Some(false)
-        && !summary_history_coverage_complete(
-            &app.history,
-            prepared.usage.window.ends_at - ChronoDuration::nanoseconds(1),
-        )
-    {
+    } else if backfill_partial {
         title.push_str(" · BACKFILL PARTIAL");
+    }
+    // Keep the applied source and data-quality state visible when the tree is
+    // rendered in a compact split. Less important totals/coverage are dropped
+    // before ratatui can clip the state suffix from the panel title.
+    let title_width = usize::from(area.width.saturating_sub(2));
+    if UnicodeWidthStr::width(title.as_str()) > title_width {
+        let source = app.history_source_compact_scope_label();
+        let compact_range = range_label.as_str();
+        let status = if app.summary_backfill_running {
+            Some("BACKFILLING 30d")
+        } else if backfill_partial {
+            Some("BACKFILL PARTIAL")
+        } else if partial {
+            Some("PARTIAL")
+        } else {
+            None
+        };
+        title = format!("Usage tree · source {source} · {compact_range} · {total}");
+        if let Some(status) = status {
+            title.push_str(&format!(" · {status}"));
+        }
+        if UnicodeWidthStr::width(title.as_str()) > title_width {
+            title = format!("Usage tree · source {source} · {compact_range}");
+            if let Some(status) = status {
+                title.push_str(&format!(" · {status}"));
+            }
+        }
     }
     let block = panel(&title, app.theme);
     let inner = block.inner(area);
@@ -9195,6 +14166,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
         return;
     }
     let data = prepare_trend_data_at(app, now);
+    let source_scope = app.history_source_scope_label();
     let visible_panels: &[TrendPanelId] = if compact {
         match app.trend_section {
             TrendSection::Remaining => &[TrendPanelId::Remaining],
@@ -9240,6 +14212,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
                     panels[0],
                     &data,
                     app.theme,
+                    &source_scope,
                     inspect_mode,
                     &mut inspection,
                 ) {
@@ -9250,6 +14223,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
                     panels[1],
                     &data,
                     app.theme,
+                    &source_scope,
                     inspect_mode,
                     &mut inspection,
                 ) {
@@ -9266,6 +14240,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
                     panels[0],
                     &data,
                     app.theme,
+                    &source_scope,
                     inspect_mode,
                     &mut inspection,
                 ) {
@@ -9276,6 +14251,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
                     panels[1],
                     &data,
                     app.theme,
+                    &source_scope,
                     inspect_mode,
                     &mut inspection,
                 ) {
@@ -9311,6 +14287,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
             weekly[0],
             &data,
             app.theme,
+            &source_scope,
             inspect_mode,
             &mut inspection,
         ) {
@@ -9321,6 +14298,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
             weekly[1],
             &data,
             app.theme,
+            &source_scope,
             inspect_mode,
             &mut inspection,
         ) {
@@ -9335,6 +14313,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
             half_hour[0],
             &data,
             app.theme,
+            &source_scope,
             inspect_mode,
             &mut inspection,
         ) {
@@ -9345,6 +14324,7 @@ fn render_trends_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateT
             half_hour[1],
             &data,
             app.theme,
+            &source_scope,
             inspect_mode,
             &mut inspection,
         ) {
@@ -9416,7 +14396,8 @@ fn render_remaining_trend_panel(
         ],
         TrendPanelSpec {
             panel: TrendPanelId::Remaining,
-            title: "Quota Remaining",
+            title: "Quota Remaining · GLOBAL",
+            source_scope: None,
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(15),
             },
@@ -9438,6 +14419,7 @@ fn render_weekly_token_trend_panel(
     area: Rect,
     data: &TrendsReport,
     theme: Theme,
+    source_scope: &str,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
@@ -9453,6 +14435,7 @@ fn render_weekly_token_trend_panel(
         TrendPanelSpec {
             panel: TrendPanelId::WeeklyTokens,
             title: "Weekly Local Tokens",
+            source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(45),
             },
@@ -9474,6 +14457,7 @@ fn render_weekly_estimated_trend_panel(
     area: Rect,
     data: &TrendsReport,
     theme: Theme,
+    source_scope: &str,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
@@ -9491,6 +14475,7 @@ fn render_weekly_estimated_trend_panel(
             data.history_warning_count,
             data.history_read_only,
         );
+        let title = format!("{title} · {source_scope}");
         render_trend_message_panel(
             frame,
             area,
@@ -9513,6 +14498,7 @@ fn render_weekly_estimated_trend_panel(
         TrendPanelSpec {
             panel: TrendPanelId::WeeklyEstimated,
             title: base_title,
+            source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Line {
                 maximum_gap: ChronoDuration::minutes(45),
             },
@@ -9534,6 +14520,7 @@ fn render_half_hour_token_trend_panel(
     area: Rect,
     data: &TrendsReport,
     theme: Theme,
+    source_scope: &str,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
@@ -9549,6 +14536,7 @@ fn render_half_hour_token_trend_panel(
         TrendPanelSpec {
             panel: TrendPanelId::LocalTokens,
             title: "15m Local Tokens",
+            source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Bar {
                 expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
@@ -9570,6 +14558,7 @@ fn render_half_hour_estimated_trend_panel(
     area: Rect,
     data: &TrendsReport,
     theme: Theme,
+    source_scope: &str,
     inspect_mode: bool,
     inspection: &mut Option<TrendInspection>,
 ) -> Option<TrendChartHitbox> {
@@ -9587,6 +14576,7 @@ fn render_half_hour_estimated_trend_panel(
             data.history_warning_count,
             data.history_read_only,
         );
+        let title = format!("{title} · {source_scope}");
         render_trend_message_panel(
             frame,
             area,
@@ -9609,6 +14599,7 @@ fn render_half_hour_estimated_trend_panel(
         TrendPanelSpec {
             panel: TrendPanelId::LocalEstimated,
             title: base_title,
+            source_scope: Some(source_scope),
             graph_kind: TrendGraphKind::Bar {
                 expected_step: ChronoDuration::minutes(LOCAL_BUCKET_MINUTES),
             },
@@ -9653,11 +14644,14 @@ fn render_time_series_panel(
         .map(|series| series.points.len())
         .sum::<usize>();
     if point_count == 0 {
-        let title = trend_panel_status_title(
+        let mut title = trend_panel_status_title(
             spec.title,
             spec.history_warning_count,
             spec.history_read_only,
         );
+        if let Some(source_scope) = spec.source_scope {
+            title.push_str(&format!(" · {source_scope}"));
+        }
         render_empty_trend_panel(frame, area, &title, spec.theme);
         if inspection.is_some_and(|inspection| inspection.panel == spec.panel) {
             *inspection = None;
@@ -9848,6 +14842,29 @@ fn render_time_series_panel(
     }
     if partial && spec.history_warning_count == 0 {
         panel_title.push_str(" · PARTIAL");
+    }
+    if let Some(source_scope) = spec.source_scope {
+        panel_title.push_str(&format!(" · {source_scope}"));
+        if UnicodeWidthStr::width(panel_title.as_str()) > usize::from(area.width.saturating_sub(2))
+        {
+            // Preserve the established title/sample prefix while ensuring an
+            // exact source never gets clipped off a half-width chart title.
+            panel_title = format!(
+                "{} · {} · {source_scope}",
+                spec.title,
+                if point_count == 1 {
+                    "1 sample".to_string()
+                } else {
+                    format!("{point_count} samples")
+                }
+            );
+            if spec.history_warning_count > 0 || partial {
+                panel_title.push_str(" · PARTIAL");
+            }
+            if spec.history_read_only {
+                panel_title.push_str(" · READ-ONLY");
+            }
+        }
     }
 
     let panel_block = panel(&panel_title, spec.theme);
@@ -10520,6 +15537,207 @@ fn render_app_server_failure_notice(frame: &mut Frame<'_>, area: Rect, theme: Th
     );
 }
 
+fn remote_sync_result_label(result: Option<RemoteSyncAttemptResult>) -> &'static str {
+    match result {
+        Some(RemoteSyncAttemptResult::Success) => "success",
+        Some(RemoteSyncAttemptResult::Failure) => "failure",
+        None => "never",
+    }
+}
+
+fn remote_sync_completion_label(completion: Option<RemoteSyncHealthCompletion>) -> &'static str {
+    match completion {
+        Some(RemoteSyncHealthCompletion::Complete) => "complete",
+        Some(RemoteSyncHealthCompletion::Continuation) => "continuation",
+        Some(RemoteSyncHealthCompletion::BootstrapRestarted) => "bootstrap-restarted",
+        None => "-",
+    }
+}
+
+fn remote_sync_error_label(error: Option<RemoteSyncErrorCategory>) -> &'static str {
+    match error {
+        Some(RemoteSyncErrorCategory::Configuration) => "configuration",
+        Some(RemoteSyncErrorCategory::Policy) => "policy",
+        Some(RemoteSyncErrorCategory::Busy) => "busy",
+        Some(RemoteSyncErrorCategory::ResourceLimit) => "resource-limit",
+        Some(RemoteSyncErrorCategory::LocalState) => "local-state",
+        Some(RemoteSyncErrorCategory::Protocol) => "protocol",
+        Some(RemoteSyncErrorCategory::ProcessContainment) => "process-pause",
+        Some(RemoteSyncErrorCategory::Transport) => "transport",
+        Some(RemoteSyncErrorCategory::Remote) => "remote",
+        None => "-",
+    }
+}
+
+fn remote_bandwidth_status<'a>(
+    app: &'a App,
+    host_id: &str,
+) -> Option<&'a RemoteBandwidthHostStatus> {
+    app.remote_sources
+        .bandwidth
+        .iter()
+        .find(|status| status.host_id == host_id)
+}
+
+fn remote_bandwidth_threshold_label(status: RemoteBandwidthThresholdStatus) -> &'static str {
+    match status {
+        RemoteBandwidthThresholdStatus::Ok => "ok",
+        RemoteBandwidthThresholdStatus::Paused => "paused",
+        RemoteBandwidthThresholdStatus::Unknown => "unknown",
+    }
+}
+
+fn format_remote_bandwidth_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_float = bytes as f64;
+    if bytes_float >= GIB {
+        format!("{:.1} GiB", bytes_float / GIB)
+    } else if bytes_float >= MIB {
+        format!("{:.1} MiB", bytes_float / MIB)
+    } else if bytes_float >= KIB {
+        format!("{:.1} KiB", bytes_float / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn remote_bandwidth_compact_label(status: &RemoteBandwidthHostStatus) -> String {
+    let Some(bytes) = status.rolling_bytes else {
+        return "Budget unavailable".to_owned();
+    };
+    let state = if status.hard == RemoteBandwidthThresholdStatus::Paused {
+        "HARD PAUSED"
+    } else if status.soft == RemoteBandwidthThresholdStatus::Paused {
+        "SOFT PAUSED"
+    } else if status.soft == RemoteBandwidthThresholdStatus::Unknown
+        || status.hard == RemoteBandwidthThresholdStatus::Unknown
+    {
+        "UNKNOWN"
+    } else {
+        "OK"
+    };
+    format!("Budget {} · {state}", format_remote_bandwidth_bytes(bytes))
+}
+
+fn remote_health_entries(app: &App) -> Vec<(String, bool, Option<&RemoteSyncHostHealth>)> {
+    let mut entries = BTreeMap::<String, (bool, Option<&RemoteSyncHostHealth>)>::new();
+    if let Some(config) = app.remote_sources.config.as_ref() {
+        for host in config.hosts() {
+            entries.insert(host.id().to_owned(), (true, None));
+        }
+        for health in &app.remote_sources.health {
+            entries
+                .entry(health.host_id().to_owned())
+                .and_modify(|entry| entry.1 = Some(health))
+                .or_insert((false, Some(health)));
+        }
+    } else {
+        for health in &app.remote_sources.health {
+            entries.insert(
+                health.host_id().to_owned(),
+                (health.configured(), Some(health)),
+            );
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(host_id, (configured, health))| (host_id, configured, health))
+        .collect()
+}
+
+fn render_remote_sync_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let palette = app.theme.palette();
+    let entries = remote_health_entries(app);
+    let mut lines = Vec::new();
+    for (host_id, configured, health) in entries {
+        let (result, completion, pages, changes, bytes, failures, error) =
+            health.map_or(("never", "-", 0, 0, 0, 0, "-"), |health| {
+                (
+                    if health.budget_paused() {
+                        "budget-paused"
+                    } else {
+                        remote_sync_result_label(health.last_result())
+                    },
+                    remote_sync_completion_label(health.completion()),
+                    health.pages_committed(),
+                    health.changes_committed(),
+                    health.response_bytes(),
+                    health.consecutive_failures(),
+                    remote_sync_error_label(health.error_category()),
+                )
+            });
+        lines.push(Line::from(vec![
+            Span::styled(
+                terminal_safe_text(&host_id),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  configured={}  result={result}  completion={completion}  pages={pages}  changes={changes}  bytes={bytes}  failures={failures}  error={error}",
+                if configured { "yes" } else { "no" }
+            )),
+        ]));
+        lines.push(Line::from(format!(
+            "  attempt={}  success={}  next eligible={}  budget pause={}  budget resume={}",
+            local_full_time_label(
+                health.and_then(RemoteSyncHostHealth::last_attempt_at),
+                "never"
+            ),
+            local_full_time_label(
+                health.and_then(RemoteSyncHostHealth::last_success_at),
+                "never"
+            ),
+            local_full_time_label(health.and_then(RemoteSyncHostHealth::next_eligible_at), "-"),
+            local_full_time_label(health.and_then(RemoteSyncHostHealth::budget_paused_at), "-"),
+            local_full_time_label(health.and_then(RemoteSyncHostHealth::budget_resume_at), "-")
+        )));
+        if let Some(status) = remote_bandwidth_status(app, &host_id) {
+            let rolling = status.rolling_bytes.map_or_else(
+                || "unavailable".to_owned(),
+                |bytes| format!("{bytes} B ({})", format_remote_bandwidth_bytes(bytes)),
+            );
+            let error = status.error.as_deref().unwrap_or("-");
+            lines.push(Line::from(format!(
+                "  budget rolling={rolling}  soft={}/{}  hard={}/{}  resume={}  error={}",
+                remote_bandwidth_threshold_label(status.soft),
+                format_remote_bandwidth_bytes(REMOTE_BANDWIDTH_SOFT_LIMIT_BYTES),
+                remote_bandwidth_threshold_label(status.hard),
+                format_remote_bandwidth_bytes(REMOTE_BANDWIDTH_HARD_LIMIT_BYTES),
+                local_full_time_label(status.resume_at, "-"),
+                terminal_safe_text(error),
+            )));
+        } else {
+            lines.push(Line::from(
+                "  budget rolling=unavailable  soft=unknown  hard=unknown  resume=-  error=local-state/unavailable",
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No configured remote sources",
+            Style::default().fg(palette.muted),
+        )));
+    }
+    if let Some(error) = app.remote_sources.health_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("health read failed: {}", terminal_safe_text(error)),
+            Style::default().fg(palette.error),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel("Remote sync health", app.theme))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let palette = app.theme.palette();
     let source_height = u16::try_from(app.snapshot.sources.len())
@@ -10539,9 +15757,24 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
         .saturating_add(3)
         .max(3);
+    let remote_entries = remote_health_entries(app);
+    let has_remote_health = !remote_entries.is_empty() || app.remote_sources.health_error.is_some();
+    let remote_height = if has_remote_health {
+        u16::try_from(remote_entries.len())
+            .unwrap_or(u16::MAX)
+            .saturating_mul(3)
+            .saturating_add(2)
+            .clamp(5, 12)
+    } else {
+        0
+    };
     let available_reset_height = area
         .height
-        .saturating_sub(source_height.saturating_add(8))
+        .saturating_sub(
+            source_height
+                .saturating_add(8)
+                .saturating_add(remote_height),
+        )
         .max(3);
     let reset_height = desired_reset_height.min(available_reset_height);
     let rows = Layout::default()
@@ -10549,6 +15782,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([
             Constraint::Length(source_height),
             Constraint::Length(5),
+            Constraint::Length(remote_height),
             Constraint::Length(reset_height),
             Constraint::Min(3),
         ])
@@ -10617,7 +15851,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     render_resets(
         frame,
-        rows[2],
+        rows[3],
         &app.snapshot,
         app.reset_credit_fetch_status(Instant::now()),
         app.theme,
@@ -10664,8 +15898,12 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(issues)
             .block(panel("Diagnostics", app.theme))
             .wrap(Wrap { trim: true }),
-        rows[3],
+        rows[4],
     );
+
+    if remote_height > 0 {
+        render_remote_sync_health(frame, rows[2], app);
+    }
 }
 
 fn recorder_panel_status(app: &App) -> String {
@@ -13106,6 +18344,565 @@ fn task_display_label(task: &TaskRecord, omit_project: bool) -> String {
 
 fn task_project_name(task: &TaskRecord) -> Option<&str> {
     task.cwd.as_deref()?.file_name()?.to_str()
+}
+
+fn merge_remote_live_into_snapshot(
+    snapshot: &mut Snapshot,
+    states: &[SourceRemoteLiveSnapshot],
+    history: &RemoteOverviewHistory,
+) -> HashSet<(String, String)> {
+    merge_remote_live_into_snapshot_at(snapshot, states, history, Utc::now())
+}
+
+fn merge_remote_live_into_snapshot_at(
+    snapshot: &mut Snapshot,
+    states: &[SourceRemoteLiveSnapshot],
+    history: &RemoteOverviewHistory,
+    now: DateTime<Utc>,
+) -> HashSet<(String, String)> {
+    let projection =
+        project_remote_overview_history(history, &snapshot.window_analyses, snapshot.as_of);
+    let trusted_parent_edges = projection
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.parent_thread_id
+                .as_ref()
+                .map(|parent| (task.thread_id.clone(), parent.clone()))
+        })
+        .collect::<HashSet<_>>();
+    snapshot.tasks.retain(|task| {
+        !task.thread_id.starts_with("remote:")
+            && !task
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("remote:"))
+    });
+    snapshot
+        .turns
+        .retain(|turn| !turn.thread_id.starts_with("remote:"));
+    let local_task_count = snapshot.tasks.len();
+    let local_turn_count = snapshot.turns.len();
+    snapshot
+        .sources
+        .retain(|source| !source.source.starts_with("remote:"));
+    snapshot.warnings.retain(|warning| {
+        !warning.starts_with("remote live ") && !warning.starts_with("remote history ")
+    });
+    snapshot
+        .warnings
+        .extend(projection.warnings.iter().cloned());
+
+    for window in &projection.windows {
+        if let Some(analysis) = snapshot
+            .window_analyses
+            .iter_mut()
+            .find(|analysis| analysis.duration_mins == window.duration_mins)
+        {
+            apply_remote_window_projection(analysis, window);
+        }
+    }
+    for task in projection.tasks.iter().cloned() {
+        if let Some(existing) = snapshot
+            .tasks
+            .iter_mut()
+            .find(|existing| existing.thread_id == task.thread_id)
+        {
+            // A logical replica can resolve to an already-rendered local task.
+            // Keep the collector's exact status/source and use unified history
+            // only for its window analysis.
+            existing.turn_count = existing.turn_count.max(task.turn_count);
+            if existing.parent_thread_id.is_none() {
+                existing.parent_thread_id = task.parent_thread_id;
+            }
+        } else {
+            snapshot.tasks.push(task);
+        }
+    }
+    for turn in projection.turns.iter().cloned() {
+        if !snapshot.turns.iter().any(|existing| {
+            existing.thread_id == turn.thread_id && existing.turn_id == turn.turn_id
+        }) {
+            snapshot.turns.push(turn);
+        }
+    }
+
+    let logical_threads = projection
+        .windows
+        .iter()
+        .flat_map(|window| window.replaced_local_threads.iter().cloned())
+        .chain(
+            projection
+                .tasks
+                .iter()
+                .filter(|task| task.source.as_deref() == Some("remote:replica"))
+                .map(|task| task.thread_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+
+    for state in states {
+        let node = state.source.source_id().as_str();
+        let origin = terminal_safe_text(state.source.display_label());
+        let source_name = format!("remote:{origin}");
+        let (quality, stale) = remote_live_quality(state, now);
+        let mut quality_parts = state.partial_reasons.clone();
+        quality_parts.extend(state.warning_codes.iter().cloned());
+        quality_parts.sort();
+        quality_parts.dedup();
+        let message = format!(
+            "live revision {}; active + recent 24h cumulative task/turn tokens{}",
+            state.live_revision,
+            if quality_parts.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", quality_parts.join(","))
+            }
+        );
+        snapshot.sources.push(SourceStatus {
+            source: source_name.clone(),
+            status: quality.to_owned(),
+            as_of: state.received_at,
+            message: Some(message),
+        });
+        if quality != "ok" {
+            snapshot.partial = true;
+            snapshot.warnings.push(format!(
+                "remote live {origin} is {quality} (received {})",
+                state.received_at.to_rfc3339()
+            ));
+        }
+        snapshot.warnings.push(format!(
+            "remote live {origin} is a bounded status overlay; Overview window usage comes from synced history"
+        ));
+
+        let project_labels = state
+            .project_descriptors
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.observed_project_key.as_str(),
+                    descriptor.display_label.as_str(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for task in &state.snapshot.tasks {
+            let thread_id = if logical_threads.contains(task.thread_id.as_str())
+                && snapshot
+                    .tasks
+                    .iter()
+                    .any(|existing| existing.thread_id == task.thread_id.as_str())
+            {
+                task.thread_id.as_str().to_owned()
+            } else {
+                remote_live_thread_id(node, task.thread_id.as_str())
+            };
+            let parent_thread_id = task.parent_thread_id.as_ref().map(|parent| {
+                if logical_threads.contains(parent.as_str())
+                    && snapshot
+                        .tasks
+                        .iter()
+                        .any(|existing| existing.thread_id == parent.as_str())
+                {
+                    parent.as_str().to_owned()
+                } else {
+                    remote_live_thread_id(node, parent.as_str())
+                }
+            });
+            let title = task.title_preview.clone().unwrap_or_else(|| {
+                format!("Remote task {}", short_thread_id(task.thread_id.as_str()))
+            });
+            let cwd = task
+                .observed_project_key
+                .as_ref()
+                .and_then(|key| project_labels.get(key.as_str()))
+                .map(PathBuf::from);
+            let token_usage = local_token_usage(task.token_usage);
+            let status = if stale
+                && matches!(
+                    task.status,
+                    TaskStatus::Running
+                        | TaskStatus::WaitingApproval
+                        | TaskStatus::WaitingInput
+                        | TaskStatus::Idle
+                        | TaskStatus::Unknown
+                ) {
+                TaskStatus::Stale
+            } else {
+                task.status
+            };
+            let live_turn_count = usize::try_from(task.turn_count).unwrap_or(usize::MAX);
+            if let Some(existing) = snapshot
+                .tasks
+                .iter_mut()
+                .find(|existing| existing.thread_id == thread_id)
+            {
+                let is_local_logical = !existing
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("remote:"));
+                existing.turn_count = existing.turn_count.max(live_turn_count);
+                if existing.parent_thread_id.is_none() {
+                    existing.parent_thread_id = parent_thread_id;
+                }
+                if !is_local_logical {
+                    existing.title = title;
+                    if cwd.is_some() {
+                        existing.cwd = cwd;
+                    }
+                    existing.source = Some(source_name.clone());
+                    existing.created_at = existing.created_at.or(task.created_at);
+                    existing.updated_at = Some(task.updated_at);
+                    existing.status = status;
+                    existing.status_provenance = if stale {
+                        Provenance::Stale
+                    } else {
+                        Provenance::Inferred
+                    };
+                    existing.status_confidence = if stale {
+                        Confidence::Low
+                    } else {
+                        Confidence::Medium
+                    };
+                    existing.token_usage = token_usage;
+                }
+            } else {
+                snapshot.tasks.push(TaskRecord {
+                    thread_id,
+                    parent_thread_id,
+                    archived: false,
+                    title,
+                    cwd,
+                    source: Some(source_name.clone()),
+                    created_at: task.created_at,
+                    updated_at: Some(task.updated_at),
+                    status,
+                    status_provenance: if stale {
+                        Provenance::Stale
+                    } else {
+                        Provenance::Inferred
+                    },
+                    status_confidence: if stale {
+                        Confidence::Low
+                    } else {
+                        Confidence::Medium
+                    },
+                    token_usage,
+                    turn_count: live_turn_count,
+                    window_token_usage: TokenUsage::default(),
+                    local_token_share_percent: 0.0,
+                    estimated_quota_percent: 0.0,
+                    quota_confidence: Confidence::Unknown,
+                    api_equivalent_cost: None,
+                });
+            }
+        }
+        for turn in &state.snapshot.turns {
+            let token_usage = local_token_usage(turn.token_usage);
+            let status =
+                if stale && matches!(turn.status, TurnStatus::InProgress | TurnStatus::Unknown) {
+                    TurnStatus::Stale
+                } else {
+                    turn.status
+                };
+            let duration_ms = match (turn.started_at, turn.completed_at) {
+                (Some(started), Some(completed)) => {
+                    u64::try_from(completed.signed_duration_since(started).num_milliseconds()).ok()
+                }
+                _ => None,
+            };
+            let thread_id = if logical_threads.contains(turn.thread_id.as_str())
+                && snapshot
+                    .tasks
+                    .iter()
+                    .any(|task| task.thread_id == turn.thread_id.as_str())
+            {
+                turn.thread_id.as_str().to_owned()
+            } else {
+                remote_live_thread_id(node, turn.thread_id.as_str())
+            };
+            if let Some(existing) = snapshot.turns.iter_mut().find(|existing| {
+                existing.thread_id == thread_id && existing.turn_id == turn.turn_id
+            }) {
+                let local_logical = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.thread_id == thread_id)
+                    .and_then(|task| task.source.as_deref())
+                    .is_none_or(|source| !source.starts_with("remote:"));
+                if existing.model.is_none() {
+                    existing.model = turn.model.clone();
+                }
+                if existing.reasoning_effort.is_none() {
+                    existing.reasoning_effort = turn.reasoning_effort.clone();
+                }
+                if existing.service_tier.is_none() {
+                    existing.service_tier = turn.service_tier.clone();
+                }
+                if existing.message_preview.is_none() {
+                    existing.message_preview = turn.message_preview.clone();
+                }
+                if !local_logical {
+                    existing.started_at = turn.started_at.or(existing.started_at);
+                    existing.completed_at = turn.completed_at.or(existing.completed_at);
+                    existing.duration_ms = duration_ms.or(existing.duration_ms);
+                    existing.status = status;
+                    existing.token_usage = token_usage;
+                }
+            } else {
+                snapshot.turns.push(TurnRecord {
+                    thread_id,
+                    turn_id: turn.turn_id.clone(),
+                    model: turn.model.clone(),
+                    reasoning_effort: turn.reasoning_effort.clone(),
+                    service_tier: turn.service_tier.clone(),
+                    message_preview: turn.message_preview.clone(),
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                    duration_ms,
+                    status,
+                    token_usage,
+                    window_token_usage: TokenUsage::default(),
+                    local_token_share_percent: 0.0,
+                    estimated_quota_percent: 0.0,
+                    quota_confidence: Confidence::Unknown,
+                    api_equivalent_cost: None,
+                });
+            }
+        }
+    }
+    ensure_remote_task_ancestor_closure(&mut snapshot.tasks, &trusted_parent_edges);
+    apply_preferred_remote_window_usage(snapshot);
+    snapshot.tasks[local_task_count..].sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    snapshot.turns[local_turn_count..].sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+            .then_with(|| left.turn_id.cmp(&right.turn_id))
+    });
+    snapshot
+        .sources
+        .sort_by(|left, right| left.source.cmp(&right.source));
+    snapshot.warnings.sort();
+    snapshot.warnings.dedup();
+    trusted_parent_edges
+}
+
+fn apply_remote_window_projection(
+    analysis: &mut WindowAnalysis,
+    remote: &crate::remote_overview::RemoteOverviewWindow,
+) {
+    analysis.threads.retain(|usage| {
+        !usage.thread_id.starts_with("remote:")
+            && !remote.replaced_local_threads.contains(&usage.thread_id)
+    });
+    analysis.turns.retain(|usage| {
+        !usage.thread_id.starts_with("remote:")
+            && !remote.replaced_local_threads.contains(&usage.thread_id)
+    });
+    analysis.threads.extend(remote.threads.iter().cloned());
+    analysis.turns.extend(remote.turns.iter().cloned());
+    let total_tokens = analysis
+        .threads
+        .iter()
+        .map(|usage| usage.usage.token_usage.total_tokens)
+        .fold(0_u64, u64::saturating_add);
+    for usage in &mut analysis.threads {
+        usage.usage.local_token_share_percent = if total_tokens == 0 {
+            0.0
+        } else {
+            usage.usage.token_usage.total_tokens as f64 / total_tokens as f64 * 100.0
+        };
+    }
+    for usage in &mut analysis.turns {
+        usage.usage.local_token_share_percent = if total_tokens == 0 {
+            0.0
+        } else {
+            usage.usage.token_usage.total_tokens as f64 / total_tokens as f64 * 100.0
+        };
+    }
+    let mut combined = TokenUsage::default();
+    for usage in &analysis.threads {
+        combined.add_assign(usage.usage.token_usage);
+    }
+    analysis.attribution.local_token_usage = combined;
+    if !remote.threads.is_empty() {
+        // Unified project groups are replica-safe, but the snapshot does not
+        // retain a compatible all-source quota denominator or per-thread model
+        // split. Do not synthesize either breakdown or silently change the
+        // analysis-level API total.
+        analysis.partial = true;
+        analysis.partial_reasons.extend([
+            "remote_quota_estimate_not_projected".to_owned(),
+            "remote_models_not_projected".to_owned(),
+            "remote_api_total_not_projected".to_owned(),
+        ]);
+    }
+    analysis
+        .partial_reasons
+        .extend(remote.partial_reasons.iter().cloned());
+    analysis.partial_reasons.sort();
+    analysis.partial_reasons.dedup();
+    if let Some(long_context) = analysis.api_long_context.as_mut() {
+        apply_remote_window_projection(long_context, remote);
+    }
+}
+
+fn ensure_remote_task_ancestor_closure(
+    tasks: &mut Vec<TaskRecord>,
+    trusted_parent_edges: &HashSet<(String, String)>,
+) {
+    let missing = tasks
+        .iter()
+        .filter(|task| {
+            task.thread_id.starts_with("remote:")
+                || task
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("remote:"))
+                || task.parent_thread_id.as_ref().is_some_and(|parent| {
+                    trusted_parent_edges.contains(&(task.thread_id.clone(), parent.clone()))
+                })
+        })
+        .filter_map(|task| task.parent_thread_id.as_ref())
+        .filter(|parent| !tasks.iter().any(|task| &task.thread_id == *parent))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for thread_id in missing {
+        tasks.push(TaskRecord {
+            title: format!("Remote task {}", short_thread_id(&thread_id)),
+            thread_id,
+            parent_thread_id: None,
+            archived: false,
+            cwd: None,
+            source: Some("remote:history".to_string()),
+            created_at: None,
+            updated_at: None,
+            status: TaskStatus::Completed,
+            status_provenance: Provenance::Inferred,
+            status_confidence: Confidence::Low,
+            token_usage: TokenUsage::default(),
+            turn_count: 0,
+            window_token_usage: TokenUsage::default(),
+            local_token_share_percent: 0.0,
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+            api_equivalent_cost: None,
+        });
+    }
+}
+
+fn apply_preferred_remote_window_usage(snapshot: &mut Snapshot) {
+    let Some(analysis) = snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 300)
+    else {
+        return;
+    };
+    let task_usage = analysis
+        .threads
+        .iter()
+        .map(|usage| (usage.thread_id.clone(), usage.usage))
+        .collect::<HashMap<_, _>>();
+    let turn_usage = analysis
+        .turns
+        .iter()
+        .map(|usage| {
+            (
+                (usage.thread_id.clone(), usage.turn_id.clone()),
+                usage.usage,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for task in &mut snapshot.tasks {
+        if let Some(usage) = task_usage.get(&task.thread_id).copied() {
+            task.window_token_usage = usage.token_usage;
+            task.local_token_share_percent = usage.local_token_share_percent;
+            task.estimated_quota_percent = usage.estimated_quota_percent;
+            task.quota_confidence = usage.quota_confidence;
+            task.api_equivalent_cost = Some(usage.api_equivalent_cost);
+        }
+    }
+    for turn in &mut snapshot.turns {
+        if let Some(usage) = turn_usage
+            .get(&(turn.thread_id.clone(), turn.turn_id.clone()))
+            .copied()
+        {
+            turn.window_token_usage = usage.token_usage;
+            turn.local_token_share_percent = usage.local_token_share_percent;
+            turn.estimated_quota_percent = usage.estimated_quota_percent;
+            turn.quota_confidence = usage.quota_confidence;
+            turn.api_equivalent_cost = Some(usage.api_equivalent_cost);
+        }
+    }
+}
+
+fn remote_live_quality(
+    state: &SourceRemoteLiveSnapshot,
+    now: DateTime<Utc>,
+) -> (&'static str, bool) {
+    let stale = now.signed_duration_since(state.received_at) > REMOTE_LIVE_STALE_AFTER;
+    let partial = !state.range_complete
+        || !state.partial_reasons.is_empty()
+        || !state.warning_codes.is_empty();
+    if stale {
+        ("stale", true)
+    } else if partial {
+        ("partial", false)
+    } else {
+        ("ok", false)
+    }
+}
+
+/// A refresh can return byte-for-byte identical durable live state while its
+/// receive timestamp crosses the freshness boundary. Compare the derived
+/// source quality so that transition redraws exactly once without making every
+/// unchanged polling cycle rebuild the Overview snapshot.
+fn remote_live_quality_requires_remerge(
+    snapshot: &Snapshot,
+    states: &[SourceRemoteLiveSnapshot],
+    now: DateTime<Utc>,
+) -> bool {
+    states.iter().any(|state| {
+        let source_name = format!(
+            "remote:{}",
+            terminal_safe_text(state.source.display_label())
+        );
+        let (quality, _) = remote_live_quality(state, now);
+        snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == source_name)
+            .is_none_or(|source| source.status != quality)
+    })
+}
+
+fn has_remote_live_load_error(snapshot: &Snapshot) -> bool {
+    snapshot
+        .warnings
+        .iter()
+        .any(|warning| warning.starts_with("remote live load failed:"))
+}
+
+fn remote_live_thread_id(node_id: &str, thread_id: &str) -> String {
+    format!("remote:{node_id}:{thread_id}")
+}
+
+fn local_token_usage(usage: RemoteTokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        total_tokens: usage.total_tokens,
+    }
 }
 
 fn format_tokens(tokens: TokenUsage) -> String {

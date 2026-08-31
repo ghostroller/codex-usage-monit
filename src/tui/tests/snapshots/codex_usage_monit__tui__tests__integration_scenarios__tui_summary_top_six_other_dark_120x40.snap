@@ -4,9 +4,9 @@ expression: many_projects.frame().snapshot_text()
 ---
 size=120x40
 rows:
-00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings
+00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings  | [S]Source
 01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 1d [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
-02|┌Usage tree · Cycle · known 360.0K · 0% coverage · PARTIAL─┐┌Top projects · Tokens · share of known────────────────────┐
+02|┌Usage tree · source All · Cycle · known 360.0K · PARTIAL──┐┌Top projects · Tokens · share of known────────────────────┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  ││■ project-7                       80.0K  22.2% ██·········│
 04|│▌80.0K          22.2%    [+] PROJ ■ project-7             ││■ project-6                       70.0K  19.4% ██·········│
 05|│ 70.0K          19.4%    [+] PROJ ■ project-6             ││■ project-5                       60.0K  16.7% ██·········│
@@ -55,7 +55,9 @@ styles:
 00:043+001 fg=#3fb9c0 bg=#121417 mods=bold text="3"
 00:044+011 fg=#7e8691 bg=#121417 mods=none text=" Other  |  "
 00:055+001 fg=#3fb9c0 bg=#121417 mods=bold text="4"
-00:056+064 fg=#7e8691 bg=#121417 mods=none text=" Settings                                                       "
+00:056+014 fg=#7e8691 bg=#121417 mods=none text=" Settings  | ["
+00:070+001 fg=#3fb9c0 bg=#121417 mods=bold text="S"
+00:071+049 fg=#7e8691 bg=#121417 mods=none text="]Source                                          "
 01:000+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
 01:001+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="C"
 01:002+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Cycle"
@@ -83,8 +85,8 @@ styles:
 01:098+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
 01:099+019 fg=#7e8691 bg=#121417 mods=none text="]Toggle [X]Collapse"
 02:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
-02:001+057 fg=#f4f6f8 bg=#121417 mods=bold text="Usage tree · Cycle · known 360.0K · 0% coverage · PARTIAL"
-02:058+003 fg=#4b525c bg=#121417 mods=none text="─┐┌"
+02:001+056 fg=#f4f6f8 bg=#121417 mods=bold text="Usage tree · source All · Cycle · known 360.0K · PARTIAL"
+02:057+004 fg=#4b525c bg=#121417 mods=none text="──┐┌"
 02:061+038 fg=#f4f6f8 bg=#121417 mods=bold text="Top projects · Tokens · share of known"
 02:099+021 fg=#4b525c bg=#121417 mods=none text="────────────────────┐"
 03:000+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -326,6 +328,7 @@ ViewTrends binding=2 rect=15,0,10,1
 ViewSummary binding=U rect=28,0,11,1
 ViewOther binding=3 rect=42,0,9,1
 ViewSettings binding=4 rect=54,0,12,1
+HistorySource binding=S rect=69,0,9,1
 SummaryRangeCycle binding=C rect=0,1,8,1
 SummaryRangeSevenDays binding=7 rect=9,1,5,1
 SummaryRangeThirtyDays binding=M rect=15,1,6,1

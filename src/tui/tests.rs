@@ -1,4 +1,7 @@
 use super::*;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::path::Path;
+
 use crate::domain::{
     ApiCostAmount, ApiEquivalentCost, AttributionSummary, CollectionStats, LimitBucket,
     LimitWindow, ModelUsage, PicoUsd, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
@@ -6,6 +9,17 @@ use crate::domain::{
     WindowUsage,
 };
 use crate::history::{LocalHalfHourBucket, LocalProjectUsageGroup, QuotaPoint, WeeklyLocalPoint};
+use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
+use crate::remote_protocol::{
+    GitRepositoryFingerprint, ProtocolRevisions, RemoteLiveSnapshot, RemoteLiveTask,
+    RemoteLiveTurn, RemoteTokenUsage, SourceGeneration,
+};
+use crate::remote_sync::{RemoteSyncCompletion, RemoteSyncReport};
+use crate::source_history::{
+    LocalObservationMode, RedactionProfile, SourceBucketRecord, SourceHistoryRemoteBinding,
+    SourceHistoryRemoteGenerationId, SourceKind, SourceMetadata,
+};
+use crate::source_identity::NodeId;
 use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
@@ -557,6 +571,8 @@ fn summary_backfill_persists_only_buckets_with_usage_evidence() {
         timestamp: first_usage,
         thread_id: "thread-with-evidence".to_string(),
         turn_id: Some("turn-with-evidence".to_string()),
+        usage_event_id: None,
+        usage_event_identity_exact: false,
         model: Some("gpt-5.6-sol".to_string()),
         service_tier: None,
         tokens: TokenUsage {
@@ -1012,6 +1028,7 @@ fn account_refresh_result(
             ..AccountSnapshot::default()
         },
         history_observation: crate::history::HistoryObservation::default(),
+        local_session_digests: Default::default(),
     }
 }
 
@@ -1105,9 +1122,616 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
             },
             account: AccountSnapshot::default(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         Theme::Light,
     )
+}
+
+fn remote_live_fixture(
+    received_at: DateTime<Utc>,
+    range_complete: bool,
+) -> SourceRemoteLiveSnapshot {
+    let captured_at = received_at - ChronoDuration::minutes(1);
+    let node_id: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
+    SourceRemoteLiveSnapshot {
+        source: SourceMetadata::new(node_id.clone(), SourceKind::Ssh, "dev-server").unwrap(),
+        source_generation: SourceGeneration {
+            node_id,
+            generation: NonZeroU64::new(1).unwrap(),
+        },
+        revisions: crate::remote_agent::current_revisions(),
+        redaction_profile: RedactionProfile::Redacted,
+        live_revision: NonZeroU64::new(1).unwrap(),
+        snapshot: RemoteLiveSnapshot {
+            captured_at,
+            tasks: vec![RemoteLiveTask {
+                thread_id: "remote-thread".parse().unwrap(),
+                parent_thread_id: None,
+                observed_project_key: None,
+                title_preview: None,
+                created_at: Some(captured_at - ChronoDuration::minutes(1)),
+                updated_at: captured_at,
+                status: TaskStatus::Running,
+                token_usage: RemoteTokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    total_tokens: 10,
+                    ..RemoteTokenUsage::default()
+                },
+                turn_count: 1,
+            }],
+            turns: vec![RemoteLiveTurn {
+                thread_id: "remote-thread".parse().unwrap(),
+                turn_id: "turn-1".to_owned(),
+                model: Some("gpt-5.6-sol".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+                service_tier: None,
+                message_preview: None,
+                started_at: Some(captured_at),
+                completed_at: None,
+                status: TurnStatus::InProgress,
+                token_usage: RemoteTokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    total_tokens: 10,
+                    ..RemoteTokenUsage::default()
+                },
+            }],
+        },
+        project_descriptors: Vec::new(),
+        remote_observed_at: captured_at,
+        received_at,
+        range_complete,
+        partial_reasons: (!range_complete)
+            .then(|| "rollout_scan_incomplete".to_owned())
+            .into_iter()
+            .collect(),
+        warning_codes: Vec::new(),
+    }
+}
+
+#[test]
+fn unchanged_remote_live_state_crosses_stale_boundary_once_including_error_refreshes() {
+    let mut app = interaction_test_app(0, 0);
+    let local_as_of = app.snapshot.as_of;
+    let received_at = local_as_of + ChronoDuration::hours(1);
+    let state = remote_live_fixture(received_at, true);
+    let fresh_at = received_at + ChronoDuration::minutes(1);
+
+    assert!(app.replace_remote_live_states_at(vec![state.clone()], fresh_at));
+    assert_eq!(app.snapshot.as_of, local_as_of);
+    assert_eq!(app.snapshot.sources[0].status, "ok");
+    assert_eq!(app.snapshot.tasks[0].status, TaskStatus::Running);
+    assert_eq!(
+        app.snapshot.tasks[0].status_provenance,
+        Provenance::Inferred
+    );
+    assert_eq!(app.snapshot.turns[0].status, TurnStatus::InProgress);
+    assert!(!app.replace_remote_live_states_at(
+        vec![state.clone()],
+        received_at + ChronoDuration::minutes(15),
+    ));
+
+    let stale_at = received_at + ChronoDuration::minutes(16);
+    assert!(app.record_remote_live_load_error_at("disk busy".to_owned(), stale_at));
+    assert_eq!(app.snapshot.sources[0].status, "stale");
+    assert_eq!(app.snapshot.tasks[0].status, TaskStatus::Stale);
+    assert_eq!(app.snapshot.turns[0].status, TurnStatus::Stale);
+    assert!(
+        app.snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("remote live load failed:"))
+    );
+    assert!(!app.record_remote_live_load_error_at(
+        "disk busy".to_owned(),
+        stale_at + ChronoDuration::minutes(1),
+    ));
+    assert!(app.replace_remote_live_states_at(vec![state], stale_at + ChronoDuration::minutes(1),));
+    assert!(!has_remote_live_load_error(&app.snapshot));
+    let unchanged = app.remote_live_states.clone();
+    assert!(!app.replace_remote_live_states_at(unchanged, stale_at + ChronoDuration::minutes(2),));
+}
+
+#[test]
+fn remote_live_partial_error_and_source_removal_restore_local_quality() {
+    let mut app = interaction_test_app(0, 0);
+    let local_as_of = app.snapshot.as_of;
+    let received_at = local_as_of + ChronoDuration::hours(1);
+    let partial = remote_live_fixture(received_at, false);
+
+    assert!(
+        app.replace_remote_live_states_at(vec![partial], received_at + ChronoDuration::minutes(1),)
+    );
+    assert!(app.snapshot.partial);
+    assert_eq!(app.snapshot.sources[0].status, "partial");
+
+    let complete = remote_live_fixture(received_at + ChronoDuration::minutes(2), true);
+    assert!(app.replace_remote_live_states_at(
+        vec![complete.clone()],
+        received_at + ChronoDuration::minutes(3),
+    ));
+    assert!(!app.snapshot.partial);
+    assert_eq!(app.snapshot.sources[0].status, "ok");
+
+    assert!(app.record_remote_live_load_error_at(
+        "temporarily unreadable".to_owned(),
+        received_at + ChronoDuration::minutes(4),
+    ));
+    assert!(app.snapshot.partial);
+    // A successful read with identical state must clear the transient error
+    // instead of taking the ordinary unchanged-state fast path.
+    assert!(app.replace_remote_live_states_at(
+        vec![complete],
+        received_at + ChronoDuration::minutes(5),
+    ));
+    assert!(!app.snapshot.partial);
+    assert!(!has_remote_live_load_error(&app.snapshot));
+
+    assert!(
+        app.replace_remote_live_states_at(Vec::new(), received_at + ChronoDuration::minutes(6),)
+    );
+    assert!(!app.snapshot.partial);
+    assert!(app.snapshot.sources.is_empty());
+    assert!(app.snapshot.tasks.is_empty());
+    assert!(app.snapshot.turns.is_empty());
+    assert_eq!(app.snapshot.as_of, local_as_of);
+}
+
+#[test]
+fn collapsed_remote_subtree_uses_projected_window_tokens_not_live_cumulative_tokens() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
+    app.local_snapshot = app.snapshot.clone();
+    let received_at = app.snapshot.as_of + ChronoDuration::hours(1);
+    let mut state = remote_live_fixture(received_at, true);
+    let node_id = state.source.source_id().as_str().to_owned();
+    let parent_id = state.snapshot.tasks[0].thread_id.clone();
+    let mut child = state.snapshot.tasks[0].clone();
+    child.thread_id = "remote-child".parse().unwrap();
+    child.parent_thread_id = Some(parent_id);
+    child.token_usage = RemoteTokenUsage {
+        input_tokens: 16,
+        output_tokens: 4,
+        total_tokens: 20,
+        ..RemoteTokenUsage::default()
+    };
+    child.turn_count = 0;
+    state.snapshot.tasks.push(child);
+    state
+        .snapshot
+        .tasks
+        .sort_by(|left, right| left.thread_id.as_str().cmp(right.thread_id.as_str()));
+
+    assert!(
+        app.replace_remote_live_states_at(vec![state], received_at + ChronoDuration::minutes(1),)
+    );
+    let root_thread_id = remote_live_thread_id(&node_id, "remote-thread");
+    let child_thread_id = remote_live_thread_id(&node_id, "remote-child");
+    let root_index = app
+        .snapshot
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == root_thread_id)
+        .unwrap();
+    let child_index = app
+        .snapshot
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == child_thread_id)
+        .unwrap();
+    assert_eq!(
+        task_usage_for_scope(
+            &app.snapshot,
+            WindowScope::Week,
+            &app.snapshot.tasks[root_index],
+        ),
+        WindowUsage::default(),
+        "analysis misses must not reinterpret a cumulative remote live counter as window usage",
+    );
+    let analysis = app
+        .snapshot
+        .window_analyses
+        .iter_mut()
+        .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+        .unwrap();
+    analysis.threads.extend([
+        ThreadWindowUsage {
+            thread_id: root_thread_id.clone(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    total_tokens: 10,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        },
+        ThreadWindowUsage {
+            thread_id: child_thread_id.clone(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 16,
+                    output_tokens: 4,
+                    total_tokens: 20,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        },
+    ]);
+    let collapsed = TaskListRow {
+        index: root_index,
+        prefix: String::new(),
+        depth: 0,
+        has_children: true,
+        collapsed: true,
+        hidden_descendants: vec![child_index],
+    };
+
+    let usage = aggregate_task_row_usage(&app.snapshot, WindowScope::Week, &collapsed, true);
+    assert_eq!(usage.token_usage.input_tokens, 24);
+    assert_eq!(usage.token_usage.output_tokens, 6);
+    assert_eq!(usage.token_usage.total_tokens, 30);
+    assert_eq!(usage.quota_confidence, Confidence::Unknown);
+}
+
+fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistory {
+    let node: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
+    let group = LocalProjectUsageGroup {
+        thread_id: format!("remote-thread@{node}"),
+        turn_id: Some(format!("turn-1@{node}")),
+        session_thread_id: Some(format!("remote-thread@{node}")),
+        message_preview: Some("remote prompt".to_owned()),
+        project_label: Some("remote-project".to_owned()),
+        title: Some("Remote history task".to_owned()),
+        token_usage: TokenUsage {
+            input_tokens: 24,
+            output_tokens: 6,
+            total_tokens: 30,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 30,
+        api_equivalent_cost: exact_api_cost(30),
+        call_count: 1,
+        ..LocalProjectUsageGroup::default()
+    };
+    let history = HistoryData {
+        half_hour_buckets: vec![LocalHalfHourBucket {
+            starts_at: as_of - ChronoDuration::minutes(15),
+            ends_at: as_of,
+            sampled_at: as_of,
+            token_usage: group.token_usage,
+            estimated_cost_units: group.estimated_cost_units,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
+            estimator_revision: 1,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            call_count: 1,
+            groups: Vec::new(),
+            project_groups: vec![group],
+            partial_reasons: Vec::new(),
+        }],
+        ..HistoryData::default()
+    };
+    RemoteOverviewHistory::from_unified(&history, [(node, "dev-server".to_owned())], as_of)
+}
+
+#[test]
+fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::FiveHours, 100, 100.0);
+    add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
+    app.local_snapshot = app.snapshot.clone();
+    let history = remote_overview_history_fixture(app.snapshot.as_of);
+    let received_at = app.snapshot.as_of + ChronoDuration::minutes(1);
+    let live = remote_live_fixture(received_at, true);
+
+    let mut snapshot = app.local_snapshot.clone();
+    merge_remote_live_into_snapshot_at(
+        &mut snapshot,
+        std::slice::from_ref(&live),
+        &history,
+        received_at,
+    );
+    merge_remote_live_into_snapshot_at(
+        &mut snapshot,
+        std::slice::from_ref(&live),
+        &history,
+        received_at,
+    );
+    let remote_id = remote_live_thread_id(live.source.source_id().as_str(), "remote-thread");
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.thread_id == remote_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.thread_id == remote_id && turn.turn_id == "turn-1")
+            .count(),
+        1
+    );
+    for duration in [300, 10_080] {
+        let analysis = snapshot
+            .window_analyses
+            .iter()
+            .find(|analysis| analysis.duration_mins == duration)
+            .unwrap();
+        let remote = analysis
+            .threads
+            .iter()
+            .find(|usage| usage.thread_id == remote_id)
+            .unwrap();
+        assert_eq!(remote.usage.token_usage.total_tokens, 30);
+        assert_eq!(
+            analysis
+                .threads
+                .iter()
+                .filter(|usage| usage.thread_id == remote_id)
+                .count(),
+            1
+        );
+    }
+
+    merge_remote_live_into_snapshot_at(
+        &mut snapshot,
+        &[],
+        &RemoteOverviewHistory::default(),
+        received_at,
+    );
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .all(|task| !task.thread_id.starts_with("remote:"))
+    );
+    assert!(
+        snapshot
+            .turns
+            .iter()
+            .all(|turn| !turn.thread_id.starts_with("remote:"))
+    );
+}
+
+#[test]
+fn unified_remote_replica_marker_trusts_history_parent_edge() {
+    let mut app = interaction_test_app(2, 0);
+    let parent = app.snapshot.tasks[0].clone();
+    let mut child = app.snapshot.tasks[1].clone();
+    child.source = Some("remote:replica".to_owned());
+    child.parent_thread_id = Some(parent.thread_id.clone());
+    app.trusted_remote_parent_edges
+        .insert((child.thread_id.clone(), parent.thread_id.clone()));
+    assert!(app.trusts_task_parent_edge(&child, &parent));
+}
+
+#[test]
+fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
+    app.local_snapshot = app.snapshot.clone();
+    let as_of = app.snapshot.as_of;
+    let node: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
+    let make_group = |thread: &str, parent: Option<&str>, tokens: u64| LocalProjectUsageGroup {
+        thread_id: format!("logical-thread:{thread}"),
+        turn_id: Some(format!("{thread}-turn@{node}")),
+        parent_thread_id: parent.map(|parent| format!("logical-thread:{parent}")),
+        session_thread_id: Some("logical-thread:parent".to_owned()),
+        title: Some(thread.to_owned()),
+        token_usage: TokenUsage {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: u128::from(tokens),
+        call_count: 1,
+        ..LocalProjectUsageGroup::default()
+    };
+    let groups = vec![
+        make_group("parent", None, 10),
+        make_group("child", Some("parent"), 20),
+    ];
+    let history_data = HistoryData {
+        half_hour_buckets: vec![LocalHalfHourBucket {
+            starts_at: as_of - ChronoDuration::minutes(15),
+            ends_at: as_of,
+            sampled_at: as_of,
+            token_usage: TokenUsage {
+                input_tokens: 30,
+                total_tokens: 30,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: 30,
+            api_long_context_extra_cost_units: Some(0),
+            long_context_usage_unknown: false,
+            estimator_revision: 1,
+            project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            call_count: 2,
+            groups: Vec::new(),
+            project_groups: groups,
+            partial_reasons: Vec::new(),
+        }],
+        ..HistoryData::default()
+    };
+    let history = RemoteOverviewHistory::from_unified(
+        &history_data,
+        [(node.clone(), "dev-server".to_owned())],
+        as_of,
+    );
+    let mut live = remote_live_fixture(as_of + ChronoDuration::minutes(1), true);
+    live.snapshot.tasks[0].thread_id = "parent".parse().unwrap();
+    let mut child = live.snapshot.tasks[0].clone();
+    child.thread_id = "child".parse().unwrap();
+    child.parent_thread_id = Some("parent".parse().unwrap());
+    live.snapshot.tasks.push(child);
+
+    let mut snapshot = app.local_snapshot.clone();
+    let trusted_edges = merge_remote_live_into_snapshot_at(&mut snapshot, &[live], &history, as_of);
+    let parent = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.thread_id == "parent")
+        .unwrap();
+    let child = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.thread_id == "child")
+        .unwrap();
+    assert_eq!(parent.source.as_deref(), Some("remote:dev-server"));
+    assert_eq!(child.source.as_deref(), Some("remote:dev-server"));
+    assert_eq!(child.parent_thread_id.as_deref(), Some("parent"));
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.thread_id == "parent")
+            .count(),
+        1
+    );
+    assert!(trusted_edges.contains(&("child".to_owned(), "parent".to_owned())));
+
+    app.snapshot = snapshot;
+    app.trusted_remote_parent_edges = trusted_edges;
+    app.task_list_mode = TaskListMode::Tree;
+    let rows = app.filtered_task_rows_with_expanded(None);
+    let child_index = app
+        .snapshot
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == "child")
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.index == child_index)
+            .unwrap()
+            .depth,
+        1
+    );
+}
+
+fn install_remote_sources_fixture(
+    app: &mut App,
+    directory: &Path,
+    now: DateTime<Utc>,
+) -> (RemotesConfigStore, RemoteSyncHealthStore) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let config_store = RemotesConfigStore::new(directory.join("config").join("remotes.json"));
+    let mut transaction = config_store.begin_transaction().unwrap();
+    transaction
+        .apply(RemotesConfigMutation::add_host("dev", "dev-box"))
+        .unwrap();
+    transaction
+        .apply(RemotesConfigMutation::pair_pin(
+            "dev",
+            SourceGeneration {
+                node_id: "node-11111111111111111111111111111111".parse().unwrap(),
+                generation: NonZeroU64::new(1).unwrap(),
+            },
+        ))
+        .unwrap();
+    transaction
+        .apply(RemotesConfigMutation::enable_host("dev"))
+        .unwrap();
+    transaction
+        .apply(RemotesConfigMutation::add_host("lab", "lab-box"))
+        .unwrap();
+    transaction
+        .apply(RemotesConfigMutation::set_auto_sync_enabled(true))
+        .unwrap();
+    let config = config_store.commit(transaction).unwrap();
+
+    let health_store = RemoteSyncHealthStore::new(directory.to_path_buf());
+    health_store
+        .record_success(
+            "dev",
+            config.host("dev").unwrap().expected_source(),
+            now,
+            &RemoteSyncReport {
+                pages_committed: 2,
+                changes_committed: 17,
+                live_state_changed: false,
+                response_bytes: 4_096,
+                completion: RemoteSyncCompletion::Complete,
+            },
+            Some(now + ChronoDuration::minutes(1)),
+        )
+        .unwrap();
+    health_store
+        .record_failure(
+            "lab",
+            None,
+            now - ChronoDuration::minutes(2),
+            RemoteSyncErrorCategory::Transport,
+            Some(now + ChronoDuration::minutes(3)),
+        )
+        .unwrap();
+
+    app.remote_config_store = config_store.clone();
+    app.remote_health_store = Some(health_store.clone());
+    app.remote_bandwidth_store = Some(RemoteBandwidthBudgetStore::new(directory.to_path_buf()));
+    app.local_redact_content = true;
+    app.reload_remote_sources();
+    (config_store, health_store)
+}
+
+fn install_empty_remote_sources_fixture(app: &mut App, directory: &Path) -> RemotesConfigStore {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let config_store = RemotesConfigStore::new(directory.join("config").join("remotes.json"));
+    let config = config_store.load_or_create().unwrap();
+    app.remote_config_store = config_store.clone();
+    app.remote_sources.config = Some(config);
+    app.remote_sources.config_error = None;
+    app.remote_sources.history_sources.clear();
+    config_store
+}
+
+fn record_remote_bandwidth(app: &App, host_id: &str, recorded_at: DateTime<Utc>, bytes: usize) {
+    let source = app
+        .remote_sources
+        .config
+        .as_ref()
+        .and_then(|config| config.host(host_id))
+        .and_then(|host| host.expected_source())
+        .cloned();
+    let store = app.remote_bandwidth_store.as_ref().unwrap();
+    let reservation = match store
+        .begin_attempt(
+            host_id,
+            source.as_ref().map(|source| &source.node_id),
+            recorded_at,
+            RemoteBandwidthTransferKind::ManualOverride,
+            bytes,
+        )
+        .unwrap()
+    {
+        crate::remote_bandwidth_budget::RemoteBandwidthAdmission::Granted(reservation) => {
+            reservation
+        }
+        crate::remote_bandwidth_budget::RemoteBandwidthAdmission::Paused(pause) => {
+            panic!("manual override unexpectedly paused: {pause:?}")
+        }
+    };
+    store
+        .complete_attempt(&reservation, recorded_at, bytes)
+        .unwrap();
 }
 
 fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
@@ -1483,6 +2107,7 @@ fn resume_confirmation_revalidates_after_refresh_and_reuses_known_panes() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -1772,6 +2397,19 @@ fn set_task_parent(app: &mut App, child: usize, parent: usize) {
     task.parent_thread_id = Some(parent_thread_id);
 }
 
+fn set_remote_task_identity(
+    app: &mut App,
+    index: usize,
+    node: &str,
+    remote_thread_id: &str,
+    parent_thread_id: Option<&str>,
+) {
+    let task = &mut app.snapshot.tasks[index];
+    task.thread_id = format!("remote:{node}:{remote_thread_id}");
+    task.parent_thread_id = parent_thread_id.map(|parent| format!("remote:{node}:{parent}"));
+    task.source = Some("remote:dev-server".to_string());
+}
+
 fn expand_task_tree(app: &mut App) {
     app.task_list_mode = TaskListMode::Tree;
     let collapsible = app.filtered_collapsible_task_threads();
@@ -1793,6 +2431,7 @@ fn render_models_content_for_scope(
             snapshot: snapshot.clone(),
             account: AccountSnapshot::default(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         Theme::Dark,
     );
@@ -2937,6 +3576,293 @@ fn summary_preferences_survive_store_round_trip_while_navigation_resets() {
 }
 
 #[test]
+fn summary_and_trends_share_an_exact_persisted_source_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(1, 1);
+    install_remote_sources_fixture(&mut app, directory.path(), now);
+    let local_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
+    let remote_id: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
+    app.history_local_source_id = Some(local_id.clone());
+
+    assert_eq!(
+        app.history_source_choices(),
+        vec![
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Local(local_id.clone()),
+            HistorySourceSelection::Remote(remote_id.clone()),
+        ]
+    );
+
+    app.cycle_history_source();
+    assert_eq!(
+        app.history_source_selection,
+        HistorySourceSelection::Local(local_id.clone())
+    );
+    let local_generation = app.history_source_generation;
+    app.cycle_history_source();
+    assert_eq!(
+        app.history_source_selection,
+        HistorySourceSelection::Remote(remote_id.clone())
+    );
+    let remote_generation = app.history_source_generation;
+    assert!(remote_generation > local_generation);
+
+    let stale = TuiHistoryProjection {
+        history: HistoryData::default(),
+        selection: HistorySourceSelection::Local(local_id),
+        status: Some(HistorySourceSelectionStatus::Applied),
+        query_error: None,
+    };
+    assert!(!app.apply_history_projection(local_generation, stale));
+    assert!(app.history_source_loading);
+    assert_eq!(
+        app.history_source_selection,
+        HistorySourceSelection::Remote(remote_id.clone())
+    );
+
+    let current = TuiHistoryProjection {
+        history: HistoryData::default(),
+        selection: HistorySourceSelection::Remote(remote_id.clone()),
+        status: Some(HistorySourceSelectionStatus::Unavailable(
+            HistorySourceUnavailableReason::NotFound,
+        )),
+        query_error: None,
+    };
+    assert!(app.apply_history_projection(remote_generation, current));
+    assert!(!app.history_source_loading);
+    assert_eq!(
+        app.history_source_status,
+        Some(HistorySourceSelectionStatus::Unavailable(
+            HistorySourceUnavailableReason::NotFound
+        ))
+    );
+    assert_eq!(
+        app.ui_state().history_source_selection,
+        UiHistorySourceSelection::Remote { node_id: remote_id }
+    );
+}
+
+#[test]
+fn missing_saved_source_remains_desired_and_never_falls_back_to_all() {
+    let mut app = interaction_test_app(1, 1);
+    let missing_id: NodeId = "node-33333333333333333333333333333333".parse().unwrap();
+    app.apply_ui_state(
+        &UiState {
+            history_source_selection: UiHistorySourceSelection::Remote {
+                node_id: missing_id.clone(),
+            },
+            ..UiState::default()
+        },
+        None,
+    );
+    assert_eq!(
+        app.history_source_selection,
+        HistorySourceSelection::Remote(missing_id.clone())
+    );
+    assert_eq!(
+        app.history_source_choices(),
+        vec![
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Remote(missing_id.clone()),
+        ]
+    );
+
+    let unavailable = TuiHistoryProjection {
+        history: HistoryData::default(),
+        selection: HistorySourceSelection::Remote(missing_id.clone()),
+        status: Some(HistorySourceSelectionStatus::Unavailable(
+            HistorySourceUnavailableReason::NotFound,
+        )),
+        query_error: None,
+    };
+    assert!(app.apply_history_projection(0, unavailable));
+    assert_eq!(
+        app.history_source_applied_selection,
+        HistorySourceSelection::Remote(missing_id)
+    );
+    assert!(app.history_source_scope_label().contains("UNAVAILABLE"));
+}
+
+#[test]
+fn excluded_exact_source_is_labeled_as_inspect_only_instead_of_unavailable() {
+    let mut app = interaction_test_app(1, 1);
+    let source_id: NodeId = "node-55555555555555555555555555555555".parse().unwrap();
+    app.history_source_selection = HistorySourceSelection::Remote(source_id.clone());
+    app.history_source_applied_selection = HistorySourceSelection::Remote(source_id);
+    app.history_source_status = Some(HistorySourceSelectionStatus::AppliedExcludedFromAggregates);
+
+    assert!(
+        app.history_source_scope_label()
+            .contains("EXCLUDED (inspect only)")
+    );
+    assert!(app.history_source_compact_scope_label().ends_with(" EXCL"));
+}
+
+#[test]
+fn detached_recorded_ssh_source_remains_in_the_source_cycle() {
+    let mut app = interaction_test_app(1, 1);
+    let detached_id: NodeId = "node-44444444444444444444444444444444".parse().unwrap();
+    app.history_remote_sources = vec![(detached_id.clone(), "retired-build-host".to_string())];
+
+    assert_eq!(
+        app.history_source_choices(),
+        vec![
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Remote(detached_id.clone()),
+        ]
+    );
+    app.cycle_history_source();
+    assert_eq!(
+        app.history_source_selection,
+        HistorySourceSelection::Remote(detached_id.clone())
+    );
+    assert_eq!(
+        app.history_source_label(&HistorySourceSelection::Remote(detached_id)),
+        "SSH retired-build-host"
+    );
+}
+
+#[test]
+fn source_controls_are_keyboard_styled_and_whole_label_clickable_in_compact_themes() {
+    let local_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
+    for (view, theme, width) in [
+        (View::Summary, Theme::Dark, 120),
+        (View::Summary, Theme::Light, 60),
+        (View::Trends, Theme::Dark, 120),
+        (View::Trends, Theme::Light, 60),
+    ] {
+        let mut app = interaction_test_app(1, 1);
+        app.view = view;
+        app.theme = theme;
+        app.history_local_source_id = Some(local_id.clone());
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &mut app, Utc::now()))
+            .unwrap();
+        let hitbox = app.history_source_control_hitbox;
+        assert!(!hitbox.is_empty(), "{view:?} {theme:?} width={width}");
+        assert_eq!(
+            terminal.backend().buffer()[(hitbox.x, hitbox.y)].symbol(),
+            "["
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(hitbox.x + 1, hitbox.y)].symbol(),
+            "S"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(hitbox.x + 1, hitbox.y)].fg,
+            theme.palette().accent
+        );
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('S'))));
+        assert_eq!(
+            app.history_source_selection,
+            HistorySourceSelection::Local(local_id.clone())
+        );
+        app.history_source_selection = HistorySourceSelection::AllIncluded;
+        app.history_source_loading = false;
+        app.history_source_query_pending = false;
+        assert!(handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                hitbox.right() - 1,
+                hitbox.y,
+            ),
+        ));
+        assert_eq!(
+            app.history_source_selection,
+            HistorySourceSelection::Local(local_id.clone())
+        );
+    }
+}
+
+#[test]
+fn filtered_history_titles_name_the_scope_while_quota_is_explicitly_global() {
+    let now = DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let local_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
+    let mut app = interaction_test_app(1, 1);
+    app.history_local_source_id = Some(local_id.clone());
+    app.request_history_source(HistorySourceSelection::Local(local_id.clone()));
+    let generation = app.history_source_generation;
+    assert!(app.apply_history_projection(
+        generation,
+        TuiHistoryProjection {
+            history: trend_history_fixture(now),
+            selection: HistorySourceSelection::Local(local_id),
+            status: Some(HistorySourceSelectionStatus::Applied),
+            query_error: None,
+        },
+    ));
+
+    app.view = View::Trends;
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+    let trends = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 120, 40));
+    assert!(trends.contains("Quota Remaining · GLOBAL"));
+    assert!(trends.contains("Weekly Local Tokens"));
+    assert!(trends.contains("source Local"));
+
+    app.view = View::Summary;
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+    let summary = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 120, 40));
+    assert!(summary.contains("Usage tree · source Local"));
+}
+
+#[test]
+fn remote_summary_never_overlays_same_id_local_task_metadata() {
+    let mut app = interaction_test_app(1, 1);
+    let now = app.snapshot.as_of;
+    app.snapshot.tasks[0].thread_id = "shared-thread".to_string();
+    app.snapshot.tasks[0].title = "local title must not leak".to_string();
+    app.snapshot.tasks[0].cwd = Some("/tmp/local-project".into());
+    let mut bucket = tui_runtime_test_bucket(now - ChronoDuration::minutes(15), 42);
+    bucket.project_groups[0] = LocalProjectUsageGroup {
+        thread_id: "shared-thread".to_string(),
+        project_id: Some("remote-project-id".to_string()),
+        project_label: Some("remote-project".to_string()),
+        title: Some("remote title".to_string()),
+        source: Some("ssh".to_string()),
+        token_usage: bucket.token_usage,
+        estimated_cost_units: bucket.estimated_cost_units,
+        api_long_context_extra_cost_units: bucket.api_long_context_extra_cost_units,
+        api_equivalent_cost: ApiCostAmount::default(),
+        call_count: 1,
+        ..LocalProjectUsageGroup::default()
+    };
+    app.history.half_hour_buckets = vec![bucket];
+    app.history_source_applied_selection =
+        HistorySourceSelection::Remote("node-ffffffffffffffffffffffffffffffff".parse().unwrap());
+    app.summary_range = SummaryRange::SevenDays;
+
+    let prepared = prepare_summary(&app, now);
+    let remote_project = prepared
+        .usage
+        .projects
+        .iter()
+        .find(|project| project.key == "remote-project-id")
+        .expect("remote project remains attributed by remote history");
+    assert_eq!(remote_project.label, "remote-project");
+    assert_eq!(
+        remote_project.sessions[0].title.as_deref(),
+        Some("remote title")
+    );
+    assert!(
+        prepared
+            .usage
+            .projects
+            .iter()
+            .all(|project| project.label != "local-project")
+    );
+}
+
+#[test]
 fn saved_tree_mode_starts_with_every_parent_collapsed() {
     let mut app = interaction_test_app(3, 1);
     set_task_parent(&mut app, 0, 2);
@@ -3539,6 +4465,92 @@ fn tree_rows_group_visible_subagents_by_subtree_recency_and_break_cycles() {
 }
 
 #[test]
+fn remote_tree_defaults_collapsed_and_expands_nested_same_node_edges() {
+    const NODE: &str = "node-0123456789abcdef0123456789abcdef";
+    const OTHER_NODE: &str = "node-fedcba9876543210fedcba9876543210";
+    let mut app = interaction_test_app(4, 1);
+    set_remote_task_identity(&mut app, 0, NODE, "grandchild", Some("child"));
+    set_remote_task_identity(&mut app, 1, NODE, "child", Some("root"));
+    set_remote_task_identity(&mut app, 2, OTHER_NODE, "other-root", None);
+    set_remote_task_identity(&mut app, 3, NODE, "root", None);
+    app.task_list_mode = TaskListMode::Tree;
+
+    let collapsed = app.filtered_task_rows();
+    assert_eq!(
+        collapsed.iter().map(|row| row.index).collect::<Vec<_>>(),
+        vec![3, 2]
+    );
+    assert!(collapsed[0].has_children);
+    assert!(collapsed[0].collapsed);
+    assert_eq!(collapsed[0].hidden_descendants, vec![1, 0]);
+
+    assert!(app.set_task_collapsed(3, false));
+    let root_expanded = app.filtered_task_rows();
+    assert_eq!(
+        root_expanded
+            .iter()
+            .map(|row| row.index)
+            .collect::<Vec<_>>(),
+        vec![3, 1, 2]
+    );
+    assert_eq!(root_expanded[1].depth, 1);
+    assert!(root_expanded[1].collapsed);
+
+    assert!(app.set_task_collapsed(1, false));
+    let nested_expanded = app.filtered_task_rows();
+    assert_eq!(
+        nested_expanded
+            .iter()
+            .map(|row| row.index)
+            .collect::<Vec<_>>(),
+        vec![3, 1, 0, 2]
+    );
+    assert_eq!(
+        nested_expanded
+            .iter()
+            .map(|row| row.depth)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 0]
+    );
+
+    app.selected_task = 0;
+    app.selected_turn = 0;
+    assert!(app.set_task_collapsed(3, true));
+    assert_eq!(app.selected_task, 3);
+    assert_eq!(
+        app.selected_thread_id(),
+        Some(format!("remote:{NODE}:root").as_str())
+    );
+}
+
+#[test]
+fn remote_tree_rejects_cross_node_malformed_and_missing_parent_edges() {
+    const NODE_A: &str = "node-0123456789abcdef0123456789abcdef";
+    const NODE_B: &str = "node-fedcba9876543210fedcba9876543210";
+    let mut app = interaction_test_app(6, 1);
+
+    set_remote_task_identity(&mut app, 0, NODE_A, "cross-node-child", None);
+    set_remote_task_identity(&mut app, 3, NODE_B, "cross-node-parent", None);
+    app.snapshot.tasks[0].parent_thread_id = Some(format!("remote:{NODE_B}:cross-node-parent"));
+
+    set_remote_task_identity(&mut app, 1, NODE_A, "orphan", Some("missing-parent"));
+
+    app.snapshot.tasks[2].thread_id = "remote:not-a-node:malformed-child".to_string();
+    app.snapshot.tasks[2].parent_thread_id = Some(format!("remote:{NODE_A}:valid-parent"));
+    app.snapshot.tasks[2].source = Some("remote:dev-server".to_string());
+    set_remote_task_identity(&mut app, 4, NODE_A, "valid-parent", None);
+
+    app.snapshot.tasks[5].parent_thread_id = Some(app.snapshot.tasks[4].thread_id.clone());
+    app.snapshot.tasks[5].source = Some("desktop".to_string());
+
+    expand_task_tree(&mut app);
+    let rows = app.filtered_task_rows();
+    assert_eq!(rows.len(), 6);
+    assert!(rows.iter().all(|row| row.depth == 0));
+    assert!(rows.iter().all(|row| !row.has_children));
+}
+
+#[test]
 fn tree_collapse_hides_nested_rows_keeps_rank_and_promotes_filtered_orphans() {
     let mut app = interaction_test_app(6, 2);
     set_task_parent(&mut app, 0, 3);
@@ -4041,6 +5053,7 @@ fn tree_mode_and_refresh_move_a_newly_hidden_child_to_its_collapsed_parent() {
             snapshot,
             account: refreshed.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -4066,6 +5079,7 @@ fn refresh_retains_live_expansions_and_drops_removed_parent_state() {
             snapshot: app.snapshot.clone(),
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -4083,6 +5097,7 @@ fn refresh_retains_live_expansions_and_drops_removed_parent_state() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -4412,6 +5427,7 @@ fn tree_click_scroll_and_refresh_keep_flattened_positions_mapped_by_thread() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -6773,6 +7789,7 @@ fn refresh_preserves_viewport_rows_and_leaves_empty_turn_focus() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -6803,6 +7820,7 @@ fn refresh_preserves_viewport_rows_and_leaves_empty_turn_focus() {
             snapshot: no_turns,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -6832,6 +7850,7 @@ fn refresh_keeps_a_top_task_viewport_following_new_rows() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -6877,6 +7896,7 @@ fn refresh_restores_filtered_turn_selection_and_viewport_by_id() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -6930,6 +7950,7 @@ fn refresh_reveals_a_previously_visible_selection_after_reordering() {
             snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -7897,6 +8918,8 @@ fn api_long_context_toggle_reweights_weekly_and_fifteen_minute_estimates_without
         timestamp,
         thread_id: thread_id.to_string(),
         turn_id: Some(format!("{thread_id}-turn")),
+        usage_event_id: None,
+        usage_event_identity_exact: false,
         model: Some("gpt-5.6-luna".to_string()),
         service_tier: None,
         tokens: TokenUsage {
@@ -8213,6 +9236,475 @@ fn history_view_cutoff_uses_15_minute_alignment() {
     );
 }
 
+fn tui_runtime_test_bucket(starts_at: DateTime<Utc>, tokens: u64) -> LocalHalfHourBucket {
+    let ends_at = starts_at + ChronoDuration::minutes(15);
+    LocalHalfHourBucket {
+        starts_at,
+        ends_at,
+        sampled_at: ends_at,
+        token_usage: TokenUsage {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: u128::from(tokens),
+        api_long_context_extra_cost_units: Some(0),
+        long_context_usage_unknown: false,
+        estimator_revision: HISTORY_ESTIMATOR_REVISION,
+        project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
+        api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+        call_count: 1,
+        groups: Vec::new(),
+        project_groups: vec![LocalProjectUsageGroup {
+            thread_id: "thread-1".to_string(),
+            project_id: Some("project-1".to_string()),
+            project_label: Some("project".to_string()),
+            token_usage: TokenUsage {
+                input_tokens: tokens,
+                total_tokens: tokens,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: u128::from(tokens),
+            api_equivalent_cost: ApiCostAmount::default(),
+            call_count: 1,
+            ..LocalProjectUsageGroup::default()
+        }],
+        partial_reasons: Vec::new(),
+    }
+}
+
+fn tui_runtime_test_observation(starts_at: DateTime<Utc>, tokens: u64) -> HistoryObservation {
+    HistoryObservation {
+        observed_at: starts_at + ChronoDuration::minutes(20),
+        half_hour_buckets: vec![tui_runtime_test_bucket(starts_at, tokens)],
+        ..HistoryObservation::default()
+    }
+}
+
+#[test]
+fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let warnings = match prepare_tui_history_runtime(
+        &mut runtime,
+        &profile_lease,
+        starts_at + ChronoDuration::minutes(20),
+    ) {
+        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("unexpected legacy fallback: {warnings:?}")
+        }
+    };
+    assert!(
+        warnings.is_empty(),
+        "unexpected setup warnings: {warnings:?}"
+    );
+    runtime
+        .record_local_observation(
+            &tui_runtime_test_observation(starts_at, 10),
+            LocalObservationMode::Incremental,
+        )
+        .unwrap();
+
+    let active = match runtime.ownership().load_manifest().unwrap() {
+        OwnershipManifestStatus::Initialized(manifest) => manifest,
+        OwnershipManifestStatus::Uninitialized => panic!("ownership must be initialized"),
+    };
+    assert_eq!(active.state(), HistoryOwnershipState::V2Active);
+    let remote_id: NodeId = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+    {
+        let lease = runtime.ownership().acquire_writer_lease().unwrap();
+        let authority = runtime
+            .ownership()
+            .authorize_v2_write(&lease, &active)
+            .unwrap();
+        let writer = runtime.source_history().writer(&authority).unwrap();
+        writer
+            .save_source_metadata(
+                &SourceMetadata::new_with_redaction_profile(
+                    remote_id.clone(),
+                    SourceKind::Ssh,
+                    "remote",
+                    runtime.redaction_profile(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let generation: SourceHistoryRemoteGenerationId =
+            "ingest-gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let binding = SourceHistoryRemoteBinding::new(
+            SourceGeneration {
+                node_id: remote_id.clone(),
+                generation: NonZeroU64::new(1).unwrap(),
+            },
+            ProtocolRevisions {
+                history_format: one,
+                metric: one,
+                estimator: one,
+                project_breakdown: one,
+                api_pricing_catalog: one,
+            },
+        )
+        .unwrap();
+        writer
+            .ensure_remote_history_generation(
+                &remote_id,
+                runtime.redaction_profile(),
+                &generation,
+                &binding,
+            )
+            .unwrap();
+        let mut remote_bucket = tui_runtime_test_bucket(starts_at, 20);
+        remote_bucket.project_groups[0].thread_id = "thread-remote".to_owned();
+        writer
+            .apply_remote_history_generation_page(
+                &remote_id,
+                runtime.redaction_profile(),
+                &generation,
+                &binding,
+                &[SourceBucketRecord::upsert(1, remote_bucket).unwrap()],
+                &[],
+            )
+            .unwrap();
+        writer
+            .activate_remote_history_generation(
+                &remote_id,
+                runtime.redaction_profile(),
+                None,
+                &generation,
+                &binding,
+                starts_at + ChronoDuration::minutes(20),
+            )
+            .unwrap();
+        writer.validate().unwrap();
+    }
+
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
+    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    assert_eq!(history.half_hour_buckets.len(), 1);
+    assert_eq!(
+        history.half_hour_buckets[0].token_usage.total_tokens, 30,
+        "the TUI projection must add the persisted local and SSH source slices"
+    );
+}
+
+#[test]
+fn recent_legacy_recorder_defers_tui_v2_cutover() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+    let mut status = RecorderStatusFile::started_with_interval(
+        now,
+        runtime.legacy_history().namespace().to_string(),
+        60,
+    );
+    status.record_success(now);
+    crate::service::write_recorder_status(
+        &default_status_file(runtime.legacy_history().history_root().unwrap()),
+        &status,
+    )
+    .unwrap();
+
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, now) {
+        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("legacy status should retain the fenced V1 runtime: {warnings:?}")
+        }
+    };
+    assert!(warnings.iter().any(|warning| {
+        warning.contains("source-aware history cutover deferred while legacy recorder")
+    }));
+    let manifest = match runtime.ownership().load_manifest().unwrap() {
+        OwnershipManifestStatus::Initialized(manifest) => manifest,
+        OwnershipManifestStatus::Uninitialized => panic!("ownership must be initialized"),
+    };
+    assert_eq!(manifest.state(), HistoryOwnershipState::V1Active);
+}
+
+#[test]
+fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let _recorder_guard =
+        match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
+            TryRecorderInstanceLock::Acquired(guard) => guard,
+            TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
+        };
+
+    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => warnings,
+        TuiHistoryRuntimePreparation::Ready(warnings) => {
+            panic!("busy recorder must force legacy fallback: {warnings:?}")
+        }
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| { warning.contains("cutover deferred while the recorder is active") })
+    );
+    assert_eq!(
+        runtime.ownership().load_manifest().unwrap(),
+        OwnershipManifestStatus::Uninitialized,
+        "a busy current recorder must prevent even the start of migration"
+    );
+}
+
+#[test]
+fn same_profile_recorder_on_v2_allows_tui_persistence() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("an active V2 manifest must remain queryable: {warnings:?}")
+        }
+    };
+    assert!(warnings.is_empty());
+    let _recorder_profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let _recorder_guard =
+        match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
+            TryRecorderInstanceLock::Acquired(guard) => guard,
+            TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
+        };
+
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
+    store.stage(&tui_runtime_test_observation(starts_at, 51));
+    assert!(matches!(
+        store.flush_staged_if_due(Duration::ZERO).unwrap(),
+        Some(HistoryRuntimeWriteReport::V2(_))
+    ));
+    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    assert_eq!(history.half_hour_buckets.len(), 1);
+    assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 51);
+}
+
+#[test]
+fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("unexpected legacy fallback: {warnings:?}")
+        }
+    };
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 11, 0, 0).unwrap();
+    let observed_at = starts_at + ChronoDuration::minutes(20);
+    store.stage_full_observation(&tui_runtime_test_observation(starts_at, 73));
+
+    let _recorder_profile_lease = acquire_tui_history_profile_lease(match &store.backend {
+        TuiHistoryBackend::Runtime(runtime) => runtime,
+        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+    })
+    .unwrap();
+    let _recorder_guard =
+        match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
+            TryRecorderInstanceLock::Acquired(guard) => guard,
+            TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
+        };
+    assert!(matches!(
+        store
+            .flush_staged_reconcile(starts_at - ChronoDuration::hours(1), observed_at)
+            .unwrap(),
+        Some(HistoryRuntimeWriteReport::V2(_))
+    ));
+    let marker = store
+        .mark_summary_backfill_attempt(observed_at, true)
+        .unwrap();
+    assert_eq!(marker.completed_at, observed_at);
+    assert!(marker.complete);
+}
+
+#[test]
+fn tui_revalidates_profile_lease_before_each_runtime_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
+        TuiHistoryRuntimePreparation::Ready(_) => {}
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("unexpected legacy fallback: {warnings:?}")
+        }
+    }
+    let marker = profile_lease
+        .lock_path()
+        .parent()
+        .unwrap()
+        .join("active-profile.json");
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 11, 30, 0).unwrap();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
+    store.stage(&tui_runtime_test_observation(starts_at, 19));
+    std::fs::remove_file(marker).unwrap();
+
+    let error = store.flush_staged().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(store.profile_lease.is_none());
+    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    assert!(history.read_only);
+    assert!(
+        history
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("profile lease could not be revalidated") })
+    );
+}
+
+#[test]
+fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut preview_runtime =
+        HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let preview_lease = acquire_tui_history_profile_lease(&preview_runtime).unwrap();
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+    match prepare_tui_history_runtime(&mut preview_runtime, &preview_lease, Utc::now()) {
+        TuiHistoryRuntimePreparation::Ready(_) => {}
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("unexpected legacy fallback: {warnings:?}")
+        }
+    }
+    preview_runtime
+        .record_local_observation(
+            &tui_runtime_test_observation(starts_at, 11),
+            LocalObservationMode::Incremental,
+        )
+        .unwrap();
+    drop(preview_lease);
+
+    let redacted_runtime = HistoryRuntime::new(history_root, &codex_home, true).unwrap();
+    let _opposite_profile_lease = acquire_tui_history_profile_lease(&redacted_runtime).unwrap();
+    let selection_error = acquire_tui_history_profile_lease(&preview_runtime).unwrap_err();
+    assert_eq!(selection_error.kind(), io::ErrorKind::WouldBlock);
+
+    let mut store = TuiHistoryStore::runtime(
+        preview_runtime,
+        None,
+        vec![format!(
+            "{TUI_HISTORY_PROFILE_BUSY_WARNING}: {selection_error}"
+        )],
+    );
+    store.stage(&tui_runtime_test_observation(starts_at, 99));
+    assert!(store.flush_staged().unwrap().is_none());
+    let marker_error = store
+        .mark_summary_backfill_attempt(starts_at, true)
+        .unwrap_err();
+    assert_eq!(marker_error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(marker_error.to_string(), TUI_HISTORY_PROFILE_BUSY_WARNING);
+
+    let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+    assert!(history.read_only);
+    assert_eq!(history.half_hour_buckets.len(), 1);
+    assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 11);
+    assert!(
+        history
+            .warnings
+            .iter()
+            .any(|warning| { warning.starts_with(TUI_HISTORY_PROFILE_BUSY_WARNING) })
+    );
+}
+
+#[test]
+fn legacy_tui_fallback_keeps_live_history_when_persistence_is_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("not-a-directory");
+    std::fs::write(&history_root, b"occupied").unwrap();
+    let legacy = HistoryStore::new(history_root, &codex_home);
+    let mut store =
+        TuiHistoryStore::legacy_fallback(legacy, vec!["source-aware test fallback".to_string()]);
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+
+    let mut observation = tui_runtime_test_observation(starts_at, 42);
+    observation.quota_points.push(QuotaPoint {
+        observed_at: starts_at,
+        limit_id: "codex".to_string(),
+        duration_mins: 300,
+        resets_at: starts_at + ChronoDuration::hours(5),
+        used_percent: 20.0,
+        remaining_percent: 80.0,
+        provenance: Provenance::ServerSnapshot,
+    });
+    let (history, _) = stage_and_load_history(
+        &mut store,
+        &observation,
+        &[],
+        &LocalSessionDigestEvidence::default(),
+        starts_at + ChronoDuration::minutes(20),
+        &PerfLog::default(),
+        true,
+    );
+
+    assert_eq!(history.half_hour_buckets.len(), 1);
+    assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 42);
+    assert!(
+        history
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("source-aware test fallback"))
+    );
+    assert!(
+        history
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("history persistence failed"))
+    );
+
+    let source_id: NodeId = "node-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap();
+    let exact = store.load_since_with_staged_selected(
+        &HistorySourceSelection::Remote(source_id),
+        starts_at - ChronoDuration::hours(1),
+    );
+    assert!(exact.history.half_hour_buckets.is_empty());
+    assert!(exact.history.weekly_local_points.is_empty());
+    assert_eq!(exact.history.quota_points, observation.quota_points);
+    assert!(exact.history.read_only);
+    assert!(matches!(
+        exact.status,
+        Some(HistorySourceSelectionStatus::Unavailable(
+            HistorySourceUnavailableReason::UnsupportedByLegacy
+        ))
+    ));
+    assert!(
+        exact
+            .history
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("source-aware test fallback"))
+    );
+}
+
 #[test]
 fn summary_does_not_mix_api_amounts_from_an_outdated_catalog() {
     let amount = ApiCostAmount {
@@ -8242,7 +9734,7 @@ fn summary_does_not_mix_api_amounts_from_an_outdated_catalog() {
 }
 
 #[test]
-fn recorder_health_uses_now_instead_of_the_frozen_snapshot_clock() {
+fn recorder_health_treats_future_heartbeat_as_recent_during_clock_rollback() {
     let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -8254,7 +9746,10 @@ fn recorder_health_uses_now_instead_of_the_frozen_snapshot_clock() {
         60,
     );
     status.record_success(now - ChronoDuration::minutes(1));
-    assert!(!status.heartbeat_is_recent(app.snapshot.as_of));
+    assert!(
+        status.heartbeat_is_recent(app.snapshot.as_of),
+        "an apparent future heartbeat is ambiguous clock rollback and must fail closed"
+    );
     app.recorder_health.status = Some(status);
 
     assert!(recorder_panel_status_at(&app, now).starts_with("running "));
@@ -8856,6 +10351,2058 @@ fn trends_controls_clip_only_whole_buttons_in_tiny_terminals() {
             assert_eq!(app.trend_day_offset, 2);
         }
     }
+}
+
+fn project_mapping_observation(
+    source_digit: char,
+    project_digit: char,
+    label: Option<&str>,
+) -> crate::project_mapping::ProjectObservation {
+    let source_id: NodeId = format!("node-{}", source_digit.to_string().repeat(32))
+        .parse()
+        .unwrap();
+    let observed_project_key = format!(
+        "opk-hmac-sha256-v1-{}",
+        project_digit.to_string().repeat(64)
+    )
+    .parse()
+    .unwrap();
+    crate::project_mapping::ProjectObservation::new(
+        crate::project_mapping::SourceObservedProject::new(source_id, observed_project_key),
+    )
+    .with_display_label(label.map(|label| label.parse().unwrap()))
+    .with_git_evidence(
+        Some(
+            format!("git-sha256-v1-{}", "a".repeat(64))
+                .parse::<GitRepositoryFingerprint>()
+                .unwrap(),
+        ),
+        Some("workspace".to_owned()),
+    )
+    .unwrap()
+}
+
+fn project_mapping_observation_without_git(
+    source_digit: char,
+    project_digit: char,
+    label: &str,
+) -> crate::project_mapping::ProjectObservation {
+    let source_id: NodeId = format!("node-{}", source_digit.to_string().repeat(32))
+        .parse()
+        .unwrap();
+    let observed_project_key = format!(
+        "opk-hmac-sha256-v1-{}",
+        project_digit.to_string().repeat(64)
+    )
+    .parse()
+    .unwrap();
+    crate::project_mapping::ProjectObservation::new(
+        crate::project_mapping::SourceObservedProject::new(source_id, observed_project_key),
+    )
+    .with_display_label(Some(label.parse().unwrap()))
+}
+
+fn install_project_mapping_fixture(app: &mut App, directory: &Path) -> ProjectMappingStore {
+    let store = ProjectMappingStore::new(directory.join("config/project-mappings.json"));
+    let initial = store.load_or_create().unwrap();
+    let first = store
+        .resolve_or_create(
+            initial.revision(),
+            project_mapping_observation('1', '1', Some("shared-project")),
+        )
+        .unwrap();
+    store
+        .resolve_or_create(
+            first.mappings().revision(),
+            project_mapping_observation('2', '2', Some("shared-project")),
+        )
+        .unwrap();
+    app.project_mapping_store = store.clone();
+    app.reload_project_mappings();
+    store
+}
+
+#[test]
+fn settings_project_mappings_render_and_keyboard_actions_use_explicit_cas() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let store = install_project_mapping_fixture(&mut app, directory.path());
+    app.view = View::Settings;
+    app.selected_setting = app.project_mapping_selection_base();
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(60, 14), (100, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Project mappings"));
+            assert!(content.contains("SUG"));
+            assert!(content.contains("shared-project"));
+            let controls = app.settings_controls_hitbox.as_ref().unwrap();
+            assert!(controls.project_accept_enabled);
+            assert!(!controls.project_accept.is_empty());
+            let shortcut = &terminal.backend().buffer()
+                [(controls.project_accept.x + 1, controls.project_accept.y)];
+            assert_eq!(shortcut.symbol(), "J");
+            assert_eq!(shortcut.fg, theme.palette().accent);
+            assert!(shortcut.modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('j'))));
+    let merged = store.load().unwrap();
+    assert_eq!(merged.logical_projects().len(), 1);
+    assert_eq!(
+        merged.logical_projects()[0].display_label().as_str(),
+        "shared-project"
+    );
+    assert!(merged.merge_suggestions().is_empty());
+    assert!(
+        app.project_mappings
+            .status
+            .as_deref()
+            .is_some_and(|status| { status.contains("Merged 2 instances as shared-project") })
+    );
+
+    let logical_index = app
+        .project_mappings
+        .rows
+        .iter()
+        .position(|row| matches!(row, ProjectMappingSettingsRow::LogicalProject { .. }))
+        .unwrap();
+    app.selected_setting = app.project_mapping_selection_base() + logical_index;
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(
+        app.settings_controls_hitbox
+            .as_ref()
+            .unwrap()
+            .project_split_enabled
+    );
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('x'))));
+    assert!(store.load().unwrap().logical_projects().is_empty());
+}
+
+#[test]
+fn settings_project_mapping_rows_and_actions_are_whole_label_clickable() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let store = install_project_mapping_fixture(&mut app, directory.path());
+    app.view = View::Settings;
+    app.selected_setting = 0;
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    let controls = app.settings_controls_hitbox.clone().unwrap();
+    let suggestion_row = controls.project_rows[0];
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            suggestion_row.right() - 1,
+            suggestion_row.y,
+        ),
+    ));
+    assert_eq!(app.selected_setting, app.project_mapping_selection_base());
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let accept = app
+        .settings_controls_hitbox
+        .as_ref()
+        .unwrap()
+        .project_accept;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            accept.right() - 1,
+            accept.y,
+        ),
+    ));
+    assert_eq!(store.load().unwrap().logical_projects().len(), 1);
+
+    let instance_index = app
+        .project_mappings
+        .rows
+        .iter()
+        .position(|row| matches!(row, ProjectMappingSettingsRow::MappedInstance { .. }))
+        .unwrap();
+    app.selected_setting = app.project_mapping_selection_base() + instance_index;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let split = app.settings_controls_hitbox.as_ref().unwrap().project_split;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            split.right() - 1,
+            split.y,
+        ),
+    ));
+    let mappings = store.load().unwrap();
+    assert_eq!(mappings.logical_projects().len(), 1);
+    assert_eq!(
+        mappings
+            .instances()
+            .iter()
+            .filter(|instance| instance.logical_project_id().is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn settings_unmapped_projects_support_explicit_multi_select_merge_by_keyboard_and_mouse() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProjectMappingStore::new(directory.path().join("config/project-mappings.json"));
+    let initial = store.load_or_create().unwrap();
+    let first = store
+        .resolve_or_create(
+            initial.revision(),
+            project_mapping_observation_without_git('1', '1', "manual-project"),
+        )
+        .unwrap();
+    store
+        .resolve_or_create(
+            first.mappings().revision(),
+            project_mapping_observation_without_git('2', '2', "manual-project"),
+        )
+        .unwrap();
+
+    let mut app = interaction_test_app(0, 0);
+    app.project_mapping_store = store.clone();
+    app.reload_project_mappings();
+    app.view = View::Settings;
+    assert_eq!(app.project_mappings.rows.len(), 2);
+    assert!(
+        app.project_mappings
+            .rows
+            .iter()
+            .all(|row| matches!(row, ProjectMappingSettingsRow::UnmappedInstance { .. }))
+    );
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        app.selected_setting = app.project_mapping_selection_base();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("FREE"));
+        let controls = app.settings_controls_hitbox.as_ref().unwrap();
+        assert!(controls.project_toggle_enabled);
+        assert!(!controls.project_toggle.is_empty());
+        let shortcut = &terminal.backend().buffer()
+            [(controls.project_toggle.x + 1, controls.project_toggle.y)];
+        assert_eq!(shortcut.symbol(), "T");
+        assert_eq!(shortcut.fg, theme.palette().accent);
+        assert!(shortcut.modifier.contains(Modifier::BOLD));
+    }
+
+    app.theme = Theme::Dark;
+    app.selected_setting = app.project_mapping_selection_base();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('t'))));
+    assert_eq!(app.project_mappings.selected_instances.len(), 1);
+
+    app.selected_setting += 1;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let toggle = app
+        .settings_controls_hitbox
+        .as_ref()
+        .unwrap()
+        .project_toggle;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.right() - 1,
+            toggle.y,
+        ),
+    ));
+    assert_eq!(app.project_mappings.selected_instances.len(), 2);
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let controls = app.settings_controls_hitbox.as_ref().unwrap();
+    assert!(controls.project_merge_enabled);
+    let merge = controls.project_merge;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            merge.right() - 1,
+            merge.y,
+        ),
+    ));
+    let mappings = store.load().unwrap();
+    assert_eq!(mappings.logical_projects().len(), 1);
+    assert_eq!(
+        mappings.logical_projects()[0].display_label().as_str(),
+        "manual-project"
+    );
+    assert_eq!(
+        mappings
+            .instances()
+            .iter()
+            .filter(|instance| instance.logical_project_id().is_some())
+            .count(),
+        2
+    );
+
+    // Re-open the same explicit mapping so the visible M binding is also
+    // exercised through the keyboard (the first merge used its whole mouse
+    // hitbox above).
+    let instance_ids = mappings
+        .instances()
+        .iter()
+        .map(|instance| instance.instance_id().clone())
+        .collect::<Vec<_>>();
+    store
+        .split_instances(mappings.revision(), &instance_ids)
+        .unwrap();
+    app.reload_project_mappings();
+    app.selected_setting = app.project_mapping_selection_base();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('t'))));
+    app.selected_setting += 1;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let toggle = app
+        .settings_controls_hitbox
+        .as_ref()
+        .unwrap()
+        .project_toggle;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.right() - 1,
+            toggle.y,
+        ),
+    ));
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('m'))));
+    assert_eq!(store.load().unwrap().logical_projects().len(), 1);
+}
+
+#[test]
+fn settings_project_mapping_stale_revision_reloads_without_merging() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let store = install_project_mapping_fixture(&mut app, directory.path());
+    app.view = View::Settings;
+    app.selected_setting = app.project_mapping_selection_base();
+    let stale_revision = app.project_mappings.mappings.as_ref().unwrap().revision();
+    store
+        .resolve_or_create(stale_revision, project_mapping_observation('3', '3', None))
+        .unwrap();
+
+    app.accept_selected_project_merge();
+    assert!(store.load().unwrap().logical_projects().is_empty());
+    assert_eq!(
+        app.project_mappings.mappings.as_ref().unwrap().revision(),
+        stale_revision + 1
+    );
+    assert_eq!(
+        app.project_mappings.status.as_deref(),
+        Some("Project merge failed (busy)")
+    );
+}
+
+#[test]
+fn settings_project_mapping_merge_without_labels_uses_a_stable_short_instance_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let store = ProjectMappingStore::new(directory.path().join("config/project-mappings.json"));
+    let initial = store.load_or_create().unwrap();
+    let first = store
+        .resolve_or_create(
+            initial.revision(),
+            project_mapping_observation('1', '1', None),
+        )
+        .unwrap();
+    store
+        .resolve_or_create(
+            first.mappings().revision(),
+            project_mapping_observation('2', '2', None),
+        )
+        .unwrap();
+    app.project_mapping_store = store.clone();
+    app.reload_project_mappings();
+    app.selected_setting = app.project_mapping_selection_base();
+    let proposed = match app.selected_project_mapping_row().unwrap() {
+        ProjectMappingSettingsRow::Suggestion { proposed_label, .. } => {
+            proposed_label.as_str().to_owned()
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(proposed.chars().count(), 8);
+    assert!(
+        proposed
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+
+    app.accept_selected_project_merge();
+    assert_eq!(
+        store.load().unwrap().logical_projects()[0]
+            .display_label()
+            .as_str(),
+        proposed
+    );
+}
+
+#[test]
+fn settings_project_mapping_load_errors_are_sanitized() {
+    let directory = tempfile::tempdir().unwrap();
+    let blocked = directory.path().join("private-project-path");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let mut app = interaction_test_app(0, 0);
+    app.project_mapping_store = ProjectMappingStore::new(blocked.join("project-mappings.json"));
+    app.reload_project_mappings();
+    let error = app.project_mappings.error.as_deref().unwrap();
+    assert!(error.starts_with("local-state/"));
+    assert!(!error.contains("private-project-path"));
+
+    app.view = View::Settings;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("local-state/"));
+    assert!(!content.contains("private-project-path"));
+}
+
+#[test]
+fn settings_remote_sources_render_across_compact_light_and_dark_layouts() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), now);
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(60, 12), (100, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Remote sources"));
+            assert!(content.contains("Automatic sync: On"));
+            assert!(content.contains("dev"));
+            assert!(content.contains("yes"));
+            assert!(content.contains("redacted"));
+            assert!(content.contains("Budget 0 B · OK"));
+
+            let controls = app.settings_controls_hitbox.as_ref().unwrap();
+            for (area, shortcut) in [
+                (controls.remote_global, "G"),
+                (controls.remote_new, "N"),
+                (controls.remote_edit, "E"),
+                (controls.remote_remove, "D"),
+                (controls.remote_enable, "H"),
+                (controls.remote_test, "C"),
+                (controls.remote_sync, "S"),
+            ] {
+                assert!(!area.is_empty(), "missing {shortcut} at {width}x{height}");
+                let cell = &terminal.backend().buffer()[(area.x + 1, area.y)];
+                assert_eq!(cell.symbol(), shortcut);
+                assert_eq!(cell.fg, theme.palette().accent);
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_remote_panel_is_keyboard_and_mouse_reachable_in_wide_and_compact_layouts() {
+    for (width, height) in [(60, 12), (100, 24)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = interaction_test_app(0, 0);
+        let config_store = install_empty_remote_sources_fixture(&mut app, directory.path());
+        app.view = View::Settings;
+        app.selected_setting = SettingItem::ALL.len() - 1;
+
+        // The synthetic empty-panel position is reachable through ordinary
+        // Settings navigation; no invisible global shortcut is required.
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Down)));
+        assert_eq!(app.selected_setting, SettingItem::ALL.len());
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let controls = app.settings_controls_hitbox.clone().unwrap();
+        for (area, shortcut) in [(controls.remote_global, "G"), (controls.remote_new, "N")] {
+            assert!(!area.is_empty(), "missing {shortcut} at {width}x{height}");
+            let shortcut_cell = &terminal.backend().buffer()[(area.x + 1, area.y)];
+            assert_eq!(shortcut_cell.symbol(), shortcut);
+            assert_eq!(shortcut_cell.fg, app.theme.palette().accent);
+            assert!(shortcut_cell.modifier.contains(Modifier::BOLD));
+        }
+
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('g'))));
+        assert!(config_store.load().unwrap().auto_sync_enabled());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('n'))));
+        assert!(app.remote_editor.is_some());
+
+        // A fresh app proves the complete visible labels remain clickable,
+        // including the compact `[G]` / `[N]` forms.
+        let mouse_directory = tempfile::tempdir().unwrap();
+        let mut mouse_app = interaction_test_app(0, 0);
+        let mouse_store =
+            install_empty_remote_sources_fixture(&mut mouse_app, mouse_directory.path());
+        mouse_app.view = View::Settings;
+        mouse_app.selected_setting = SettingItem::ALL.len();
+        let mut mouse_terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        mouse_terminal
+            .draw(|frame| render(frame, &mut mouse_app))
+            .unwrap();
+        let mouse_controls = mouse_app.settings_controls_hitbox.clone().unwrap();
+        assert!(handle_mouse_event(
+            &mut mouse_app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                mouse_controls.remote_global.right() - 1,
+                mouse_controls.remote_global.y,
+            ),
+        ));
+        assert!(mouse_store.load().unwrap().auto_sync_enabled());
+        mouse_terminal
+            .draw(|frame| render(frame, &mut mouse_app))
+            .unwrap();
+        let new_area = mouse_app
+            .settings_controls_hitbox
+            .as_ref()
+            .unwrap()
+            .remote_new;
+        assert!(handle_mouse_event(
+            &mut mouse_app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                new_area.right() - 1,
+                new_area.y,
+            ),
+        ));
+        assert!(mouse_app.remote_editor.is_some());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_running_remote_action_worker_terminates_and_reaps_its_process_tree() {
+    let directory = tempfile::tempdir().unwrap();
+    let primary_pid_file = directory.path().join("primary.pid");
+    let descendant_pid_file = directory.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .env("PRIMARY_PID_FILE", &primary_pid_file)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_file)
+        .args([
+            "-c",
+            "echo $$ > \"$PRIMARY_PID_FILE\"; sleep 30 & echo $! > \"$DESCENDANT_PID_FILE\"; wait",
+        ]);
+
+    let cancellation = RemoteActionCancellation::default();
+    let worker_cancellation = cancellation.clone();
+    let worker = thread::spawn(move || {
+        let _ = run_cancellable_remote_action_command(command, &worker_cancellation);
+    });
+    let guard = RemoteActionWorkerGuard {
+        cancellation,
+        worker: Some(worker),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (!primary_pid_file.is_file() || !descendant_pid_file.is_file())
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let primary_pid: libc::pid_t = std::fs::read_to_string(&primary_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant_pid: libc::pid_t = std::fs::read_to_string(&descendant_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(primary_pid, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+    // This is the same Drop path taken when the TUI run loop returns on q,
+    // Ctrl-C, a signal, or an input error.
+    drop(guard);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && (unsafe { libc::kill(primary_pid, 0) } == 0
+            || unsafe { libc::kill(descendant_pid, 0) } == 0)
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(primary_pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
+#[cfg(unix)]
+#[test]
+fn real_isolated_tui_helper_accepts_its_parent_process_tree_contract() {
+    const PROBE_MODE_ENV: &str = "CODEX_USAGE_MONIT_TEST_TUI_HELPER_CONTRACT_PROBE";
+    const PROBE_TOKEN_ENV: &str = "CODEX_USAGE_MONIT_TEST_TUI_HELPER_REQUESTED_TOKEN";
+
+    if std::env::var_os(PROBE_MODE_ENV).is_some() {
+        let requested = std::env::var(PROBE_TOKEN_ENV).unwrap();
+        assert!(
+            crate::remote_transport::tui_process_tree_inheritance_is_authorized(Some(&requested)),
+            "the real child should observe its TUI parent, fresh process group, and matching capability"
+        );
+        return;
+    }
+
+    let executable = std::env::current_exe().unwrap();
+    let contract = TuiProcessTreeInheritanceContract::generate().unwrap();
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--exact",
+            "tui::tests::real_isolated_tui_helper_accepts_its_parent_process_tree_contract",
+            "--nocapture",
+        ])
+        .env(PROBE_MODE_ENV, "1")
+        .env(PROBE_TOKEN_ENV, contract.token_for_test());
+    contract.apply_environment_for_test(&mut command);
+
+    let output =
+        run_cancellable_remote_action_command(command, &RemoteActionCancellation::default())
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "real helper contract probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn remote_ui_helper_inherits_the_outer_cancellation_tree() {
+    let config = CollectConfig {
+        codex_home: PathBuf::from("/tmp/codex-home"),
+        ..CollectConfig::default()
+    };
+    let request = RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Sync,
+        host_id: "devbox".to_owned(),
+        config_revision: 7,
+    };
+
+    let command =
+        remote_ui_action_command(Path::new("/tmp/codex-usage-monit"), &config, &request).unwrap();
+    let args = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some("--inherit-remote-process-tree")
+    );
+    let capability = args.get(1).expect("the TUI helper capability is missing");
+    assert_eq!(capability.len(), 64);
+    let environment = command
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(ToOwned::to_owned),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let environment_capability = environment
+        .get("CODEX_USAGE_MONIT_TUI_PROCESS_TREE_TOKEN")
+        .and_then(Option::as_deref);
+    let environment_parent = environment
+        .get("CODEX_USAGE_MONIT_TUI_PROCESS_TREE_PARENT")
+        .and_then(Option::as_deref);
+    assert!(
+        crate::remote_transport::validate_tui_process_tree_inheritance(
+            Some(capability),
+            environment_capability,
+            environment_parent,
+            Some(std::process::id()),
+            true,
+        )
+    );
+    assert!(args.windows(2).any(|pair| pair == ["remote", "sync"]));
+    assert!(args.windows(2).any(|pair| pair == ["sync", "devbox"]));
+}
+
+#[test]
+fn settings_shortcuts_are_isolated_to_the_selected_panel_in_wide_and_compact_layouts() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    install_project_mapping_fixture(&mut app, directory.path());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+
+    let display_before = (
+        app.theme,
+        app.turns_default_visible,
+        app.models_visible,
+        app.api_long_context_multiplier,
+        app.table_columns,
+    );
+    let config_before = config_store.load().unwrap();
+    let mut compact = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    compact.draw(|frame| render(frame, &mut app)).unwrap();
+    let compact_controls = app.settings_controls_hitbox.clone().unwrap();
+    assert!(!compact_controls.remote_edit.is_empty());
+    assert_eq!(
+        compact.backend().buffer()[(
+            compact_controls.remote_edit.x + 1,
+            compact_controls.remote_edit.y
+        )]
+            .fg,
+        app.theme.palette().accent
+    );
+    for item in SettingItem::ALL {
+        let area = compact_controls.rows[item.index()];
+        if !area.is_empty() {
+            assert_eq!(
+                compact.backend().buffer()[(area.x + 3, area.y)].fg,
+                app.theme.palette().muted,
+                "main shortcut {} stayed active while a remote row had focus",
+                item.shortcut()
+            );
+        }
+    }
+
+    for code in [
+        KeyCode::Char('t'),
+        KeyCode::Char('v'),
+        KeyCode::Char('m'),
+        KeyCode::Char('l'),
+        KeyCode::Char('k'),
+        KeyCode::Char('p'),
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char(' '),
+    ] {
+        assert!(!handle_key_event(&mut app, key_event(code)));
+    }
+    assert_eq!(
+        (
+            app.theme,
+            app.turns_default_visible,
+            app.models_visible,
+            app.api_long_context_multiplier,
+            app.table_columns,
+        ),
+        display_before
+    );
+    assert_eq!(
+        config_store.load().unwrap().config_revision(),
+        config_before.config_revision(),
+        "Enter and Space must not hide an enable/include action"
+    );
+    assert_eq!(
+        config_store
+            .load()
+            .unwrap()
+            .host("dev")
+            .unwrap()
+            .sync_enabled(),
+        config_before.host("dev").unwrap().sync_enabled()
+    );
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('e'))));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.mode),
+        Some(RemoteEditorMode::Edit),
+        "E must remain the visible remote Edit binding"
+    );
+    assert_eq!(
+        app.table_columns.estimated_quota,
+        display_before.4.estimated_quota
+    );
+    app.cancel_remote_editor();
+
+    app.selected_setting = app.project_mapping_selection_base();
+    let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    wide.draw(|frame| render(frame, &mut app)).unwrap();
+    let wide_controls = app.settings_controls_hitbox.clone().unwrap();
+    for item in SettingItem::ALL {
+        let area = wide_controls.rows[item.index()];
+        assert!(!area.is_empty());
+        assert_eq!(
+            wide.backend().buffer()[(area.x + 3, area.y)].fg,
+            app.theme.palette().muted,
+            "main shortcut {} stayed active while a project row had focus",
+            item.shortcut()
+        );
+    }
+    assert_eq!(
+        wide.backend().buffer()[(
+            wide_controls.remote_global.x + 1,
+            wide_controls.remote_global.y
+        )]
+            .fg,
+        app.theme.palette().muted,
+        "remote keyboard controls must be inactive outside the remote panel"
+    );
+    assert_eq!(
+        wide.backend().buffer()[(
+            wide_controls.project_accept.x + 1,
+            wide_controls.project_accept.y
+        )]
+            .fg,
+        app.theme.palette().accent
+    );
+
+    for shortcut in ['t', 'v', 'm', 'l', 'k', 'p', 'e', 'a', 'g', 'n'] {
+        assert!(!handle_key_event(
+            &mut app,
+            key_event(KeyCode::Char(shortcut))
+        ));
+    }
+    assert_eq!(
+        (
+            app.theme,
+            app.turns_default_visible,
+            app.models_visible,
+            app.api_long_context_multiplier,
+            app.table_columns,
+        ),
+        display_before
+    );
+    assert!(app.remote_editor.is_none());
+    assert!(app.pending_remote_action.is_none());
+    assert_eq!(
+        config_store.load().unwrap().config_revision(),
+        config_before.config_revision()
+    );
+
+    // Keyboard focus only affects the shortcut binding. The entire rendered
+    // control remains a valid mouse target, including its non-shortcut tail.
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            wide_controls.remote_global.right() - 1,
+            wide_controls.remote_global.y,
+        ),
+    ));
+    assert!(!config_store.load().unwrap().auto_sync_enabled());
+    assert_eq!(app.selected_setting, app.project_mapping_selection_base());
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('g'))));
+    assert!(!config_store.load().unwrap().auto_sync_enabled());
+
+    let api_row = wide_controls.rows[SettingItem::ApiEquivalent.index()];
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            api_row.right() - 1,
+            api_row.y,
+        ),
+    ));
+    assert_ne!(
+        app.table_columns.api_equivalent,
+        display_before.4.api_equivalent
+    );
+}
+
+#[test]
+fn settings_remote_source_policy_is_distinct_clickable_and_uses_offline_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let attached_id: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
+    let attached = SourceMetadata::new_with_redaction_profile(
+        attached_id,
+        SourceKind::Ssh,
+        "dev",
+        crate::source_history::RedactionProfile::Redacted,
+    )
+    .unwrap();
+    let detached_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
+    let mut detached = SourceMetadata::new_with_redaction_profile(
+        detached_id.clone(),
+        SourceKind::Ssh,
+        "archived lab",
+        crate::source_history::RedactionProfile::Redacted,
+    )
+    .unwrap();
+    detached.set_detached(true);
+    detached.set_include_in_aggregates(false);
+    let history_store = SourceHistoryStore::new(
+        directory.path().join("source-history"),
+        "0123456789abcdef".parse().unwrap(),
+    );
+    history_store.save_source_metadata(&attached).unwrap();
+    history_store.save_source_metadata(&detached).unwrap();
+    app.remote_source_history_store = Some(history_store);
+    app.reload_remote_sources_with_history(true);
+    assert_eq!(app.remote_sources.history_sources.len(), 2);
+    app.view = View::Settings;
+    app.selected_setting =
+        SettingItem::ALL.len() + app.remote_sources.config.as_ref().unwrap().hosts().len();
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(60, 14), (100, 24)] {
+            let mut render_terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            render_terminal
+                .draw(|frame| render(frame, &mut app))
+                .unwrap();
+            let controls = app.settings_controls_hitbox.as_ref().unwrap();
+            assert!(controls.remote_purge_enabled);
+            assert!(!controls.remote_purge.is_empty());
+            assert!(controls.remote_pair.is_empty());
+            let shortcut = &render_terminal.backend().buffer()
+                [(controls.remote_purge.x + 1, controls.remote_purge.y)];
+            assert_eq!(shortcut.symbol(), "P");
+            assert_eq!(shortcut.fg, theme.palette().accent);
+            assert!(shortcut.modifier.contains(Modifier::BOLD));
+        }
+    }
+    app.theme = Theme::Light;
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("archived"));
+    assert!(content.contains("detached"));
+    assert!(content.contains("AGG"));
+
+    let controls = app.settings_controls_hitbox.clone().unwrap();
+    assert!(controls.remote_include_enabled);
+    assert!(!controls.remote_include.is_empty());
+    assert!(controls.remote_purge_enabled);
+    assert!(!controls.remote_purge.is_empty());
+    assert!(controls.remote_pair.is_empty());
+    let shortcut =
+        &terminal.backend().buffer()[(controls.remote_include.x + 1, controls.remote_include.y)];
+    assert_eq!(shortcut.symbol(), "I");
+    assert_eq!(shortcut.fg, app.theme.palette().accent);
+    assert!(shortcut.modifier.contains(Modifier::BOLD));
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('i'))));
+    let request = app.pending_remote_action.clone().unwrap();
+    assert_eq!(request.kind, RemoteUiActionKind::Include);
+    assert_eq!(request.host_id, detached_id.as_str());
+    let mut command = Command::new("codex-usage-monit");
+    append_remote_ui_action_args(&mut command, &request);
+    assert_eq!(
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec![
+            "remote".to_owned(),
+            "source".to_owned(),
+            "include".to_owned(),
+            detached_id.to_string(),
+        ]
+    );
+    assert_eq!(config_store.load().unwrap().hosts().len(), 2);
+
+    app.pending_remote_action = None;
+    app.remote_action_running = None;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let include = app
+        .settings_controls_hitbox
+        .as_ref()
+        .unwrap()
+        .remote_include;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            include.right() - 1,
+            include.y,
+        ),
+    ));
+    assert_eq!(
+        app.pending_remote_action
+            .as_ref()
+            .map(|request| &request.kind),
+        Some(&RemoteUiActionKind::Include)
+    );
+
+    app.pending_remote_action = None;
+    app.remote_action_running = None;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('p'))));
+    assert_eq!(
+        app.remote_purge_confirmation
+            .as_ref()
+            .map(|confirmation| &confirmation.source_id),
+        Some(&detached_id)
+    );
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let popup_content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(popup_content.contains("Purge retained source history?"));
+    let confirmation = app.remote_purge_confirmation_hitbox.unwrap();
+    assert!(!confirmation.confirm.is_empty());
+    assert!(!confirmation.cancel.is_empty());
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            confirmation.cancel.right() - 1,
+            confirmation.cancel.y,
+        ),
+    ));
+    assert!(app.remote_purge_confirmation.is_none());
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let purge = app.settings_controls_hitbox.as_ref().unwrap().remote_purge;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            purge.right() - 1,
+            purge.y,
+        ),
+    ));
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let confirmation = app.remote_purge_confirmation_hitbox.unwrap();
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            confirmation.confirm.right() - 1,
+            confirmation.confirm.y,
+        ),
+    ));
+    let request = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(request.kind, RemoteUiActionKind::Purge);
+    assert_eq!(request.host_id, detached_id.as_str());
+    let mut command = Command::new("codex-usage-monit");
+    append_remote_ui_action_args(&mut command, request);
+    assert_eq!(
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec![
+            "remote".to_owned(),
+            "source".to_owned(),
+            "purge".to_owned(),
+            detached_id.to_string(),
+        ]
+    );
+}
+
+#[test]
+fn settings_remote_purge_rechecks_that_the_source_is_still_detached() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let source_id: NodeId = "node-22222222222222222222222222222222".parse().unwrap();
+    let mut source = SourceMetadata::new_with_redaction_profile(
+        source_id.clone(),
+        SourceKind::Ssh,
+        "archived lab",
+        crate::source_history::RedactionProfile::Redacted,
+    )
+    .unwrap();
+    source.set_detached(true);
+    let history_store = SourceHistoryStore::new(
+        directory.path().join("source-history"),
+        "0123456789abcdef".parse().unwrap(),
+    );
+    history_store.save_source_metadata(&source).unwrap();
+    app.remote_source_history_store = Some(history_store.clone());
+    app.reload_remote_sources_with_history(true);
+    app.view = View::Settings;
+    app.selected_setting =
+        SettingItem::ALL.len() + app.remote_sources.config.as_ref().unwrap().hosts().len();
+
+    app.begin_remote_purge_confirmation();
+    assert_eq!(
+        app.remote_purge_confirmation
+            .as_ref()
+            .map(|confirmation| &confirmation.source_id),
+        Some(&source_id)
+    );
+    history_store
+        .update_source_metadata(&source_id, |metadata| {
+            metadata.set_detached(false);
+            Ok(())
+        })
+        .unwrap();
+
+    app.confirm_remote_purge();
+    assert!(app.pending_remote_action.is_none());
+    assert!(app.remote_purge_confirmation.is_none());
+    assert_eq!(
+        app.remote_action_status.as_deref(),
+        Some("Source changed; purge was not started")
+    );
+}
+
+#[test]
+fn settings_remote_keyboard_mutations_persist_and_actions_are_single_host() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), now);
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('g'))));
+    assert!(!config_store.load().unwrap().auto_sync_enabled());
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('h'))));
+    assert!(
+        !config_store
+            .load()
+            .unwrap()
+            .host("dev")
+            .unwrap()
+            .sync_enabled()
+    );
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('c'))));
+    let test = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(test.kind, RemoteUiActionKind::Test);
+    assert_eq!(test.host_id, "dev");
+    app.pending_remote_action = None;
+    app.remote_action_running = None;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('s'))));
+    let sync = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(sync.kind, RemoteUiActionKind::Sync);
+    assert_eq!(sync.host_id, "dev");
+    assert_eq!(config_store.load().unwrap().hosts().len(), 2);
+}
+
+#[test]
+fn settings_remote_control_geometry_is_stable_while_an_action_is_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let active = app.settings_controls_hitbox.clone().unwrap();
+
+    app.remote_action_running = Some(RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Test,
+        host_id: "dev".to_owned(),
+        config_revision: app
+            .remote_sources
+            .config
+            .as_ref()
+            .unwrap()
+            .config_revision(),
+    });
+    app.remote_action_status = Some("远程连接测试运行中".to_owned());
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let inactive = app.settings_controls_hitbox.clone().unwrap();
+    assert_eq!(active.remote_global, inactive.remote_global);
+    assert_eq!(active.remote_new, inactive.remote_new);
+    assert_eq!(active.remote_edit, inactive.remote_edit);
+    assert_eq!(active.remote_pair, inactive.remote_pair);
+    assert_eq!(active.remote_remove, inactive.remote_remove);
+    assert_eq!(active.remote_enable, inactive.remote_enable);
+    assert_eq!(active.remote_test, inactive.remote_test);
+    assert_eq!(active.remote_sync, inactive.remote_sync);
+    assert_eq!(active.remote_include, inactive.remote_include);
+    assert!(!inactive.remote_global_enabled);
+    assert!(!inactive.remote_new_enabled);
+    assert!(!inactive.remote_edit_enabled);
+    assert!(!inactive.remote_pair_enabled);
+    assert!(!inactive.remote_remove_enabled);
+    assert!(!inactive.remote_enable_enabled);
+    assert!(!inactive.remote_test_enabled);
+    assert!(!inactive.remote_sync_enabled);
+    assert!(!inactive.remote_include_enabled);
+    for area in [
+        inactive.remote_global,
+        inactive.remote_new,
+        inactive.remote_edit,
+        inactive.remote_pair,
+        inactive.remote_remove,
+        inactive.remote_enable,
+        inactive.remote_test,
+        inactive.remote_sync,
+        inactive.remote_include,
+    ] {
+        assert_eq!(
+            terminal.backend().buffer()[(area.x + 1, area.y)].fg,
+            app.theme.palette().muted
+        );
+    }
+}
+
+#[test]
+fn settings_remote_config_controls_respect_running_and_pending_action_gates() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    let before = config_store.load().unwrap();
+    assert!(before.host("dev").unwrap().sync_enabled());
+    app.remote_action_running = Some(RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Test,
+        host_id: "dev".to_owned(),
+        config_revision: before.config_revision(),
+    });
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let disabled = app.settings_controls_hitbox.clone().unwrap();
+    assert!(!disabled.remote_global_enabled);
+    assert!(!disabled.remote_new_enabled);
+    assert!(!disabled.remote_edit_enabled);
+    assert!(!disabled.remote_remove_enabled);
+    assert!(!disabled.remote_enable_enabled);
+    for code in [
+        KeyCode::Char('g'),
+        KeyCode::Char('n'),
+        KeyCode::Char('e'),
+        KeyCode::Char('d'),
+        KeyCode::Char('h'),
+        KeyCode::Enter,
+        KeyCode::Char(' '),
+    ] {
+        assert!(!handle_key_event(&mut app, key_event(code)));
+        let unchanged = config_store.load().unwrap();
+        assert_eq!(unchanged.config_revision(), before.config_revision());
+        assert!(unchanged.auto_sync_enabled());
+        assert!(unchanged.host("dev").unwrap().sync_enabled());
+    }
+    for area in [
+        disabled.remote_global,
+        disabled.remote_new,
+        disabled.remote_edit,
+        disabled.remote_remove,
+        disabled.remote_enable,
+    ] {
+        assert!(!handle_mouse_event(
+            &mut app,
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                area.right() - 1,
+                area.y,
+            ),
+        ));
+        assert_eq!(
+            config_store.load().unwrap().config_revision(),
+            before.config_revision()
+        );
+    }
+
+    app.remote_action_running = None;
+    app.selected_setting = SettingItem::ALL.len();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let stale_active = app.settings_controls_hitbox.clone().unwrap();
+    app.pending_remote_action = Some(RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Sync,
+        host_id: "dev".to_owned(),
+        config_revision: before.config_revision(),
+    });
+    // The state may become busy after a frame is drawn. Method-level guards
+    // must still reject stale active keyboard and mouse hitboxes.
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('g'))));
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('n'))));
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('e'))));
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('d'))));
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('h'))));
+    for (label, area) in [
+        ("global", stale_active.remote_global),
+        ("new", stale_active.remote_new),
+        ("edit", stale_active.remote_edit),
+        ("remove", stale_active.remote_remove),
+        ("enable", stale_active.remote_enable),
+    ] {
+        assert!(
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    area.right() - 1,
+                    area.y,
+                ),
+            ),
+            "{label} stale hitbox"
+        );
+    }
+    assert_eq!(
+        config_store.load().unwrap().config_revision(),
+        before.config_revision()
+    );
+
+    app.pending_remote_action = None;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Enter)));
+    assert!(
+        config_store
+            .load()
+            .unwrap()
+            .host("dev")
+            .unwrap()
+            .sync_enabled()
+    );
+}
+
+#[test]
+fn settings_remote_mouse_uses_whole_control_and_host_hitboxes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let controls = app.settings_controls_hitbox.clone().unwrap();
+
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            controls.remote_global.right() - 1,
+            controls.remote_global.y,
+        ),
+    ));
+    assert!(!config_store.load().unwrap().auto_sync_enabled());
+
+    let first_host = controls.remote_hosts[0];
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            first_host.right() - 1,
+            first_host.y,
+        ),
+    ));
+    assert_eq!(app.selected_remote_host_id().as_deref(), Some("dev"));
+
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            controls.remote_test.right() - 1,
+            controls.remote_test.y,
+        ),
+    ));
+    assert_eq!(
+        app.pending_remote_action
+            .as_ref()
+            .map(|request| request.host_id.as_str()),
+        Some("dev")
+    );
+}
+
+#[test]
+fn settings_remote_editor_consumes_printable_shortcuts_before_global_bindings() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let before = config_store.load().unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+    assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('n'))));
+    assert!(app.remote_editor.is_some());
+    for character in "node4GHCSqJX".chars() {
+        assert!(!handle_key_event(
+            &mut app,
+            key_event(KeyCode::Char(character))
+        ));
+    }
+    assert_eq!(app.view, View::Settings);
+    assert_eq!(app.remote_editor.as_ref().unwrap().host_id, "node4GHCSqJX");
+    assert_eq!(
+        config_store.load().unwrap().config_revision(),
+        before.config_revision()
+    );
+
+    handle_key_event(&mut app, key_event(KeyCode::Tab));
+    for character in "ssh-GHCS4JX".chars() {
+        handle_key_event(&mut app, key_event(KeyCode::Char(character)));
+    }
+    assert_eq!(app.remote_editor.as_ref().unwrap().ssh_host, "ssh-GHCS4JX");
+    handle_key_event(&mut app, key_event(KeyCode::Tab));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::AgentExecutable)
+    );
+    assert_eq!(
+        app.remote_editor
+            .as_ref()
+            .map(|editor| editor.agent_executable.as_str()),
+        Some(DEFAULT_REMOTE_AGENT_EXECUTABLE)
+    );
+    handle_key_event(&mut app, key_event(KeyCode::BackTab));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::SshHost)
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Tab));
+    handle_key_event(&mut app, key_event(KeyCode::Home));
+    for character in "~/.local/bin/".chars() {
+        handle_key_event(&mut app, key_event(KeyCode::Char(character)));
+    }
+    assert_eq!(
+        app.remote_editor.as_ref().unwrap().agent_executable,
+        "~/.local/bin/codex-usage-monit"
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Tab));
+    let redacted = app.remote_editor.as_ref().unwrap().redact_content;
+    handle_key_event(&mut app, key_event(KeyCode::Char(' ')));
+    assert_ne!(app.remote_editor.as_ref().unwrap().redact_content, redacted);
+    handle_key_event(&mut app, key_event(KeyCode::Esc));
+    assert!(app.remote_editor.is_none());
+    assert_eq!(
+        config_store.load().unwrap().config_revision(),
+        before.config_revision()
+    );
+}
+
+#[test]
+fn settings_remote_add_and_edit_stage_exact_single_host_cli_arguments() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let revision = config_store.load().unwrap().config_revision();
+
+    app.begin_remote_add();
+    for character in "new_host".chars() {
+        app.insert_remote_editor_character(character);
+    }
+    app.cycle_remote_editor_field(true);
+    for character in "new-box".chars() {
+        app.insert_remote_editor_character(character);
+    }
+    app.cycle_remote_editor_field(true);
+    app.move_remote_editor_cursor(false, Some(false));
+    for character in "/opt/".chars() {
+        app.insert_remote_editor_character(character);
+    }
+    app.cycle_remote_editor_field(true);
+    app.toggle_remote_editor_content();
+    app.submit_remote_editor();
+    let request = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(request.host_id, "new_host");
+    assert_eq!(request.config_revision, revision);
+    assert!(matches!(
+        &request.kind,
+        RemoteUiActionKind::Add {
+            ssh_host,
+            agent_executable,
+            redact_content: false,
+        } if ssh_host == "new-box" && agent_executable == "/opt/codex-usage-monit"
+    ));
+    let mut command = Command::new("codex-usage-monit");
+    append_remote_ui_action_args(&mut command, request);
+    let args = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        vec![
+            "remote".to_owned(),
+            "add".to_owned(),
+            "new_host".to_owned(),
+            "--expected-revision".to_owned(),
+            revision.to_string(),
+            "--ssh-host".to_owned(),
+            "new-box".to_owned(),
+            "--agent-executable".to_owned(),
+            "/opt/codex-usage-monit".to_owned(),
+            "--redact-content".to_owned(),
+            "false".to_owned(),
+        ]
+    );
+    assert!(!args.iter().any(|argument| argument == "--all"));
+
+    app.pending_remote_action = None;
+    app.remote_action_running = None;
+    app.begin_selected_remote_edit();
+    let editor = app.remote_editor.as_ref().unwrap();
+    assert_eq!(editor.mode, RemoteEditorMode::Edit);
+    assert_eq!(editor.host_id, "dev");
+    assert_eq!(editor.field, RemoteEditorField::SshHost);
+    assert_eq!(editor.ssh_host, "dev-box");
+    assert_eq!(editor.agent_executable, DEFAULT_REMOTE_AGENT_EXECUTABLE);
+    app.submit_remote_editor();
+    assert!(matches!(
+        &app.pending_remote_action.as_ref().unwrap().kind,
+        RemoteUiActionKind::Edit {
+            ssh_host,
+            agent_executable,
+            ..
+        } if ssh_host == "dev-box" && agent_executable == DEFAULT_REMOTE_AGENT_EXECUTABLE
+    ));
+}
+
+#[test]
+fn settings_remote_crud_mouse_controls_and_remove_confirmation_work_in_compact_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len() + 1;
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let controls = app.settings_controls_hitbox.clone().unwrap();
+    for area in [
+        controls.remote_new,
+        controls.remote_edit,
+        controls.remote_pair,
+        controls.remote_remove,
+        controls.remote_enable,
+        controls.remote_test,
+        controls.remote_sync,
+    ] {
+        assert!(!area.is_empty());
+        assert!(area.right() <= 60);
+    }
+
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            controls.remote_new.right() - 1,
+            controls.remote_new.y,
+        ),
+    ));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.mode),
+        Some(RemoteEditorMode::Add)
+    );
+    app.cancel_remote_editor();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let pair = app.settings_controls_hitbox.as_ref().unwrap().remote_pair;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            pair.right() - 1,
+            pair.y,
+        ),
+    ));
+    let pair_request = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(pair_request.host_id, "lab");
+    assert!(matches!(&pair_request.kind, RemoteUiActionKind::Pair));
+    app.pending_remote_action = None;
+    app.remote_action_running = None;
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let edit = app.settings_controls_hitbox.as_ref().unwrap().remote_edit;
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            edit.right() - 1,
+            edit.y,
+        ),
+    ));
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let editor_hitbox = app.remote_editor_hitbox.unwrap();
+    assert!(!editor_hitbox.ssh_host.is_empty());
+    assert!(!editor_hitbox.agent_executable.is_empty());
+    assert!(!editor_hitbox.content.is_empty());
+    assert!(!editor_hitbox.next.is_empty());
+    assert!(!editor_hitbox.save.is_empty());
+    assert!(!editor_hitbox.cancel.is_empty());
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            editor_hitbox.next.right() - 1,
+            editor_hitbox.next.y,
+        ),
+    ));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::AgentExecutable)
+    );
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            editor_hitbox.content.right() - 1,
+            editor_hitbox.content.y,
+        ),
+    ));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::Content)
+    );
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            editor_hitbox.cancel.right() - 1,
+            editor_hitbox.cancel.y,
+        ),
+    ));
+    assert!(app.remote_editor.is_none());
+
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let remove = app.settings_controls_hitbox.as_ref().unwrap().remote_remove;
+    handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            remove.right() - 1,
+            remove.y,
+        ),
+    );
+    assert_eq!(
+        app.remote_remove_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.host_id.as_str()),
+        Some("lab")
+    );
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let confirmation = app.remote_remove_confirmation_hitbox.unwrap();
+    assert!(!confirmation.confirm.is_empty());
+    assert!(!confirmation.cancel.is_empty());
+    handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            confirmation.confirm.right() - 1,
+            confirmation.confirm.y,
+        ),
+    );
+    let request = app.pending_remote_action.as_ref().unwrap();
+    assert_eq!(request.host_id, "lab");
+    assert!(matches!(&request.kind, RemoteUiActionKind::Remove));
+    let mut command = Command::new("codex-usage-monit");
+    append_remote_ui_action_args(&mut command, request);
+    let args = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        vec![
+            "remote".to_owned(),
+            "remove".to_owned(),
+            "lab".to_owned(),
+            "--expected-revision".to_owned(),
+            request.config_revision.to_string(),
+        ]
+    );
+    assert!(!args.iter().any(|argument| argument == "--keep-included"));
+}
+
+#[test]
+fn settings_remote_completion_is_applied_only_to_the_matching_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let revision = config_store.load().unwrap().config_revision();
+    app.request_remote_action(RemoteUiActionKind::Test);
+    let running = app.remote_action_running.clone().unwrap();
+    app.apply_remote_action_completion(RemoteUiActionCompletion {
+        request: RemoteUiActionRequest {
+            kind: RemoteUiActionKind::Test,
+            host_id: "lab".to_owned(),
+            config_revision: revision,
+        },
+        result: Err("command failed".to_owned()),
+    });
+    assert_eq!(app.remote_action_running.as_ref(), Some(&running));
+    assert!(
+        app.remote_action_status
+            .as_deref()
+            .is_some_and(|status| status.contains("started"))
+    );
+
+    app.apply_remote_action_completion(RemoteUiActionCompletion {
+        request: running,
+        result: Ok(RemoteUiActionOutcome::Complete),
+    });
+    assert!(app.remote_action_running.is_none());
+    assert!(
+        app.remote_action_status
+            .as_deref()
+            .is_some_and(|status| status.contains("completed for dev"))
+    );
+}
+
+#[test]
+fn settings_remote_editor_next_control_is_clickable_in_terse_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    app.begin_selected_remote_edit();
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::SshHost)
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(36, 12)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let hitbox = app.remote_editor_hitbox.unwrap();
+    assert_eq!(hitbox.next.width, UnicodeWidthStr::width("[Tab]") as u16);
+    assert!(handle_mouse_event(
+        &mut app,
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            hitbox.next.right() - 1,
+            hitbox.next.y,
+        ),
+    ));
+    assert_eq!(
+        app.remote_editor.as_ref().map(|editor| editor.field),
+        Some(RemoteEditorField::AgentExecutable)
+    );
+}
+
+#[test]
+fn settings_remote_editor_refuses_a_stale_config_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    app.begin_selected_remote_edit();
+    let original_revision = app.remote_editor.as_ref().unwrap().config_revision;
+    config_store
+        .update(
+            original_revision,
+            RemotesConfigMutation::set_auto_sync_enabled(false),
+        )
+        .unwrap();
+
+    app.submit_remote_editor();
+    assert!(app.pending_remote_action.is_none());
+    assert!(app.remote_action_running.is_none());
+    assert!(
+        app.remote_editor
+            .as_ref()
+            .and_then(|editor| editor.validation_error.as_deref())
+            .is_some_and(|error| error.contains("config changed"))
+    );
+}
+
+#[test]
+fn other_view_shows_sanitized_per_host_remote_sync_health_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), now);
+    app.view = View::Health;
+    let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(content.contains("Remote sync health"));
+    assert!(content.contains("dev  configured=yes"));
+    assert!(content.contains("result=success"));
+    assert!(content.contains("completion=complete"));
+    assert!(content.contains("pages=2"));
+    assert!(content.contains("changes=17"));
+    assert!(content.contains("bytes=4096"));
+    assert!(content.contains("failures=0"));
+    assert!(content.contains("lab  configured=yes"));
+    assert!(content.contains("result=failure"));
+    assert!(content.contains("error=transport"));
+    assert!(content.contains("budget rolling=0 B (0 B)"));
+    assert!(content.contains("soft=ok/150.0 MiB"));
+    assert!(content.contains("hard=ok/250.0 MiB"));
+    assert!(content.contains(&local_full_time_label(Some(now), "never")));
+    assert!(content.contains(&local_full_time_label(
+        Some(now + ChronoDuration::minutes(1)),
+        "-"
+    )));
+    assert!(!content.contains("dev-box"));
+    assert!(!content.contains("lab-box"));
+}
+
+#[test]
+fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, health_store) =
+        install_remote_sources_fixture(&mut app, directory.path(), now);
+    let config = config_store.load().unwrap();
+    let source = config.host("dev").unwrap().expected_source().unwrap();
+
+    assert!(!app.reload_remote_sources());
+    health_store
+        .record_failure(
+            "dev",
+            Some(source),
+            now + ChronoDuration::minutes(1),
+            RemoteSyncErrorCategory::Transport,
+            Some(now + ChronoDuration::minutes(5)),
+        )
+        .unwrap();
+    assert!(app.reload_remote_sources());
+    assert!(!app.reload_remote_sources());
+}
+
+#[test]
+fn other_view_renders_budget_pause_as_distinct_health_state_with_exact_resume() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = DateTime::parse_from_rfc3339("2026-08-31T08:15:30Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, health_store) =
+        install_remote_sources_fixture(&mut app, directory.path(), now);
+    let config = config_store.load().unwrap();
+    let source = config.host("dev").unwrap().expected_source().unwrap();
+    let paused_at = now + ChronoDuration::minutes(2);
+    let resume_at = now + ChronoDuration::hours(24);
+    health_store
+        .record_pause(
+            "dev",
+            Some(source),
+            paused_at,
+            crate::remote_bandwidth_budget::RemoteBandwidthBudgetLevel::Hard,
+            Some(resume_at),
+        )
+        .unwrap();
+    assert!(app.reload_remote_sources());
+
+    app.view = View::Health;
+    let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+    terminal
+        .draw(|frame| render_at(frame, &mut app, now))
+        .unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("result=budget-paused"));
+    assert!(content.contains("failures=0"));
+    assert!(content.contains(&local_full_time_label(Some(paused_at), "-")));
+    assert!(content.contains(&local_full_time_label(Some(resume_at), "-")));
+}
+
+#[test]
+fn remote_bandwidth_reload_detects_changes_and_renders_soft_hard_resume_times() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), now);
+
+    assert!(!app.reload_remote_sources());
+    record_remote_bandwidth(&app, "dev", Utc::now(), 160 * 1024 * 1024);
+    assert!(app.reload_remote_sources());
+    assert!(!app.reload_remote_sources());
+    let soft = remote_bandwidth_status(&app, "dev").unwrap();
+    assert_eq!(soft.rolling_bytes, Some(160 * 1024 * 1024));
+    assert_eq!(soft.soft, RemoteBandwidthThresholdStatus::Paused);
+    assert_eq!(soft.hard, RemoteBandwidthThresholdStatus::Ok);
+    let soft_resume = soft.resume_at.expect("soft resume time");
+
+    app.view = View::Health;
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(80, 24), (180, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_remote_sync_health(frame, frame.area(), &app))
+                .unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("budget rolling=167772160 B (160.0 MiB)"));
+            assert!(content.contains("soft=paused/150.0 MiB"));
+            assert!(content.contains("hard=ok/250.0 MiB"));
+            assert!(content.contains(&local_full_time_label(Some(soft_resume), "-")));
+            assert!(!content.contains("dev-box"));
+        }
+    }
+
+    record_remote_bandwidth(&app, "dev", Utc::now(), 100 * 1024 * 1024);
+    assert!(app.reload_remote_sources());
+    let hard = remote_bandwidth_status(&app, "dev").unwrap();
+    assert_eq!(hard.rolling_bytes, Some(260 * 1024 * 1024));
+    assert_eq!(hard.soft, RemoteBandwidthThresholdStatus::Paused);
+    assert_eq!(hard.hard, RemoteBandwidthThresholdStatus::Paused);
+    assert!(hard.resume_at.is_some());
+
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Budget 260.0 MiB · HARD PAUSED"));
+}
+
+#[test]
+fn remote_bandwidth_refresh_is_a_read_only_batch_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let budget_directory = directory.path().join("remote-bandwidth-v1");
+
+    // Observing a fresh store must not create even the budget directory or
+    // stable lock file.
+    assert!(!budget_directory.exists());
+    assert!(!app.reload_remote_sources());
+    assert!(!budget_directory.exists());
+
+    record_remote_bandwidth(&app, "dev", Utc::now(), 8 * 1024);
+    let ledger_path = budget_directory.join("ledger.json");
+    let before = std::fs::read(&ledger_path).unwrap();
+    let before_json: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let before_last_observed = before_json.get("lastObservedAt").cloned();
+    let before_modified = std::fs::metadata(&ledger_path).unwrap().modified().unwrap();
+    let mut before_names = std::fs::read_dir(&budget_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    before_names.sort();
+
+    assert!(app.reload_remote_sources());
+    for _ in 0..4 {
+        assert!(!app.reload_remote_sources());
+    }
+    assert_eq!(
+        remote_bandwidth_status(&app, "dev").and_then(|status| status.rolling_bytes),
+        Some(8 * 1024)
+    );
+
+    let after = std::fs::read(&ledger_path).unwrap();
+    let after_json: serde_json::Value = serde_json::from_slice(&after).unwrap();
+    let mut after_names = std::fs::read_dir(&budget_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    after_names.sort();
+    assert_eq!(
+        after, before,
+        "refresh must not atomically rewrite the ledger"
+    );
+    assert_eq!(
+        after_json.get("lastObservedAt"),
+        before_last_observed.as_ref()
+    );
+    assert_eq!(
+        std::fs::metadata(&ledger_path).unwrap().modified().unwrap(),
+        before_modified
+    );
+    assert_eq!(
+        after_names, before_names,
+        "refresh must not create temp files"
+    );
+}
+
+#[test]
+fn unpaired_remote_bandwidth_uses_only_the_local_host_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+
+    record_remote_bandwidth(&app, "lab", Utc::now(), 4 * 1024);
+    assert!(app.reload_remote_sources());
+    let status = remote_bandwidth_status(&app, "lab").expect("unpaired host budget");
+    assert_eq!(status.rolling_bytes, Some(4 * 1024));
+    assert_eq!(status.soft, RemoteBandwidthThresholdStatus::Ok);
+    assert_eq!(status.hard, RemoteBandwidthThresholdStatus::Ok);
+
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len() + 1;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Budget 4.0 KiB · OK"));
+
+    let ledger = std::fs::read_to_string(
+        directory
+            .path()
+            .join("remote-bandwidth-v1")
+            .join("ledger.json"),
+    )
+    .unwrap();
+    assert!(ledger.contains("\"hostId\": \"lab\""));
+    assert!(!ledger.contains("lab-box"));
 }
 
 #[test]
@@ -9659,6 +13206,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
             snapshot: inserted_snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -9675,6 +13223,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
             snapshot: removed_snapshot,
             account: app.account.clone(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -9698,6 +13247,7 @@ fn refresh_preserves_selected_turn_by_id_and_falls_back_when_removed() {
             snapshot: replacement_snapshot,
             account: replacement.account,
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         },
         false,
     );
@@ -9953,6 +13503,7 @@ fn renders_all_views_at_common_terminal_sizes() {
             snapshot,
             account: AccountSnapshot::default(),
             history_observation: crate::history::HistoryObservation::default(),
+            local_session_digests: Default::default(),
         };
 
         for theme in [Theme::Dark, Theme::Light] {

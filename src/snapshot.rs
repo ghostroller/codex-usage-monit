@@ -18,6 +18,7 @@ use crate::domain::{
 use crate::history::HistoryObservation;
 use crate::perf::{RefreshMetrics, RefreshStageMetrics};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
+use crate::source_export::{LocalSessionDigestEvidence, materialize_local_session_digest_evidence};
 
 const RESET_CREDIT_DETAILS_CACHE_TTL_MINUTES: i64 = 5;
 
@@ -26,6 +27,9 @@ pub struct CollectionResult {
     pub snapshot: Snapshot,
     pub account: AccountSnapshot,
     pub history_observation: HistoryObservation,
+    /// Short-lived, content-free sidecar consumed by local v2 persistence.
+    /// App state deliberately drops it after the corresponding history write.
+    pub local_session_digests: LocalSessionDigestEvidence,
 }
 
 struct LocalCollection {
@@ -599,7 +603,7 @@ fn collect_snapshot_with_local(
     sort_span.finish_with(|| format!("tasks={} turns={}", tasks.len(), turns.len()));
     let sort_us = elapsed_us(sort_perf_started);
 
-    let partial = !errors.is_empty()
+    let mut partial = !errors.is_empty()
         || limits.is_empty()
         || future_account_limits > 0
         || future_reset_credits
@@ -647,6 +651,25 @@ fn collect_snapshot_with_local(
             &history_partial_reasons,
             local_coverage_starts_at,
         );
+    let session_digest_scan_complete = scan_local
+        && rollout_complete
+        && !rollout_source_degraded
+        && dataset.stats.scanned_files == dataset.stats.discovered_files;
+    let local_session_digests = match materialize_local_session_digest_evidence(
+        &dataset.calls,
+        &history_observation.half_hour_buckets,
+        now,
+        session_digest_scan_complete,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            partial = true;
+            warnings.push(format!(
+                "local session digest evidence is unavailable: {error}"
+            ));
+            LocalSessionDigestEvidence::empty(now)
+        }
+    };
 
     let result = CollectionResult {
         snapshot: Snapshot {
@@ -673,6 +696,7 @@ fn collect_snapshot_with_local(
         },
         account,
         history_observation,
+        local_session_digests,
     };
     if let Some(cache) = rollout_cache {
         cache.set_external_boundary(
@@ -793,6 +817,7 @@ fn record_refresh_performance(
         changed,
         reduced_rebuilt: refresh.rebuilt,
         discovery_full_scan: refresh.discovery_full_scan,
+        discovery_complete: refresh.discovery_complete,
         discovery_cache_hit: refresh.discovery_cache_hit,
         discovery_invalidated: refresh.discovery_invalidated,
         discovery_probed_files: saturating_u64(refresh.discovery_probed_files),
@@ -805,8 +830,16 @@ fn record_refresh_performance(
         reparsed_files: saturating_u64(refresh.reparsed_files),
         tail_parsed_files: saturating_u64(refresh.tail_parsed_files),
         tail_parsed_bytes: refresh.tail_parsed_bytes,
+        tail_guard_validation_bytes: refresh.tail_guard_validation_bytes,
         full_parsed_files: saturating_u64(refresh.full_parsed_files),
+        full_parsed_bytes: refresh.full_parsed_bytes,
         reused_files: saturating_u64(refresh.reused_files),
+        disk_exact_reused_files: saturating_u64(refresh.disk_exact_reused_files),
+        disk_tail_reused_files: saturating_u64(refresh.disk_tail_reused_files),
+        disk_large_exact_reused_files: saturating_u64(refresh.disk_large_exact_reused_files),
+        disk_large_tail_reused_files: saturating_u64(refresh.disk_large_tail_reused_files),
+        persistent_hash_bytes: refresh.persistent_hash_bytes,
+        persistent_large_guard_bytes: refresh.persistent_large_guard_bytes,
         incrementally_reduced_threads: saturating_u64(refresh.incrementally_reduced_threads),
         full_rebuild: refresh.full_rebuild,
         tasks: saturating_u64(tasks),
@@ -1167,6 +1200,8 @@ mod tests {
             timestamp,
             thread_id: thread_id.to_string(),
             turn_id: Some(turn_id.to_string()),
+            usage_event_id: None,
+            usage_event_identity_exact: false,
             model: Some(model.to_string()),
             service_tier: None,
             tokens: TokenUsage {

@@ -1,4 +1,171 @@
 use super::*;
+use chrono::TimeZone;
+
+#[test]
+fn fallback_usage_event_identity_is_path_independent_and_semantically_stable() {
+    let timestamp = Utc
+        .with_ymd_and_hms(2026, 8, 30, 10, 11, 12)
+        .single()
+        .unwrap();
+    let cumulative = TokenUsage {
+        input_tokens: 120,
+        cached_input_tokens: 80,
+        output_tokens: 9,
+        reasoning_output_tokens: 4,
+        total_tokens: 129,
+        ..TokenUsage::default()
+    };
+    let last = TokenUsage {
+        input_tokens: 20,
+        cached_input_tokens: 10,
+        output_tokens: 9,
+        reasoning_output_tokens: 4,
+        total_tokens: 29,
+        ..TokenUsage::default()
+    };
+
+    let first = fallback_usage_event_id("thread-copy", timestamp, cumulative, Some(last));
+    let copied = fallback_usage_event_id("thread-copy", timestamp, cumulative, Some(last));
+    let changed_thread = fallback_usage_event_id("thread-other", timestamp, cumulative, Some(last));
+    let changed_counter = fallback_usage_event_id(
+        "thread-copy",
+        timestamp,
+        TokenUsage {
+            total_tokens: cumulative.total_tokens + 1,
+            ..cumulative
+        },
+        Some(last),
+    );
+
+    assert_eq!(first, copied);
+    assert_ne!(first, changed_thread);
+    assert_ne!(first, changed_counter);
+    assert!(first.parse::<crate::source_history::UsageEventId>().is_ok());
+    assert_eq!(first.len(), "usage-sha256-v1-".len() + 64);
+}
+
+#[test]
+fn normalized_token_counter_event_is_exportable_as_exact_replica_identity() {
+    let timestamp = Utc
+        .with_ymd_and_hms(2026, 8, 30, 10, 11, 12)
+        .single()
+        .unwrap();
+    let usage = TokenUsage {
+        input_tokens: 120,
+        cached_input_tokens: 80,
+        output_tokens: 9,
+        reasoning_output_tokens: 4,
+        total_tokens: 129,
+        ..TokenUsage::default()
+    };
+    let mut thread = ThreadBuilder {
+        thread_id: "thread-copy".to_owned(),
+        ..ThreadBuilder::default()
+    };
+    let mut dataset = RolloutDataset::default();
+
+    apply_token_count(
+        &mut thread,
+        TokenCounterSample {
+            total: Some(usage),
+            last: Some(usage),
+        },
+        None,
+        timestamp,
+        Path::new("/copy/rollout.jsonl"),
+        7,
+        &mut dataset,
+    );
+
+    assert_eq!(dataset.calls.len(), 1);
+    assert!(dataset.calls[0].usage_event_identity_exact);
+    assert!(dataset.calls[0].request_usage_exact);
+    assert_eq!(
+        dataset.calls[0].usage_event_id.as_deref(),
+        Some(fallback_usage_event_id(
+            "thread-copy",
+            timestamp,
+            usage,
+            Some(usage)
+        ))
+        .as_deref()
+    );
+}
+
+fn prepare_private_cache_fixture_directory(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+fn write_private_cache_fixture(path: &Path, contents: impl AsRef<[u8]>) {
+    prepare_private_cache_fixture_directory(path.parent().unwrap());
+    fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[test]
+fn windows_rollout_identity_requires_matching_volume_and_full_file_id() {
+    let first = [1_u8; 16];
+    let mut replacement = first;
+    replacement[15] = 2;
+
+    assert!(windows_stable_identity_matches(
+        Some(7),
+        Some(first),
+        Some(7),
+        Some(first)
+    ));
+    assert!(!windows_stable_identity_matches(
+        Some(7),
+        Some(first),
+        Some(8),
+        Some(first)
+    ));
+    assert!(!windows_stable_identity_matches(
+        Some(7),
+        Some(first),
+        Some(7),
+        Some(replacement)
+    ));
+    assert!(!windows_stable_identity_matches(None, None, None, None));
+
+    assert!(windows_snapshot_identity_matches(
+        11, 12, None, None, 11, 12, None, None,
+    ));
+    assert!(!windows_snapshot_identity_matches(
+        11,
+        12,
+        Some(7),
+        Some(first),
+        11,
+        12,
+        None,
+        None,
+    ));
+    assert!(!windows_snapshot_identity_matches(
+        11, 12, None, None, 13, 12, None, None,
+    ));
+    assert!(!windows_snapshot_identity_matches(
+        11,
+        12,
+        Some(7),
+        Some(first),
+        11,
+        12,
+        Some(7),
+        Some(replacement),
+    ));
+}
 
 #[test]
 fn oversized_rollout_lines_are_drained_before_parsing_the_next_record() {
@@ -211,6 +378,7 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     };
     let mut cache = RolloutCache::new();
     cache.scan(&config, now).unwrap();
+    assert!(cache.last_refresh().discovery_complete);
     let discovery = cache.discovery_cache.as_mut().unwrap();
     discovery.complete = false;
     discovery.unreadable_files = 1;
@@ -232,6 +400,7 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
         .unwrap();
     assert!(cache.last_refresh().discovery_cache_hit);
     assert!(!cache.last_refresh().discovery_full_scan);
+    assert!(!cache.last_refresh().discovery_complete);
     assert_eq!(cache.last_refresh().reparsed_files, 1);
     assert_eq!(cached.turns.len(), 1);
     assert_eq!(cached.stats.unreadable_files, 1);
@@ -245,6 +414,7 @@ fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
         .unwrap();
     let retried = cache.scan(&config, now).unwrap();
     assert!(cache.last_refresh().discovery_full_scan);
+    assert!(cache.last_refresh().discovery_complete);
     assert_eq!(retried.stats.unreadable_files, 0);
     assert!(retried.warnings.is_empty());
 }
@@ -294,9 +464,9 @@ fn pruning_removes_entries_until_within_bounds() {
     let first = temp.path().join("a.json");
     let second = temp.path().join("b.json");
     let third = temp.path().join("c.json");
-    fs::write(&first, b"one").unwrap();
-    fs::write(&second, b"two").unwrap();
-    fs::write(&third, b"three").unwrap();
+    write_private_cache_fixture(&first, b"one");
+    write_private_cache_fixture(&second, b"two");
+    write_private_cache_fixture(&third, b"three");
 
     let pruned = prune_cache_directory(temp.path(), None, 1, u64::MAX, SystemTime::UNIX_EPOCH);
 
@@ -309,8 +479,8 @@ fn pruning_removes_only_stale_cache_temporary_files() {
     let temp = tempfile::tempdir().unwrap();
     let stale = temp.path().join(".0123456789abcdef.json.42.7.tmp");
     let unrelated = temp.path().join("notes.tmp");
-    fs::write(&stale, b"partial").unwrap();
-    fs::write(&unrelated, b"keep").unwrap();
+    write_private_cache_fixture(&stale, b"partial");
+    write_private_cache_fixture(&unrelated, b"keep");
 
     let pruned = prune_cache_directory(
         temp.path(),
@@ -330,8 +500,8 @@ fn write_budget_reserves_atomic_temporary_file_space_before_each_entry() {
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("a.json");
     let target = temp.path().join("b.json");
-    fs::write(&first, [0_u8; 8]).unwrap();
-    fs::write(&target, [0_u8; 8]).unwrap();
+    write_private_cache_fixture(&first, [0_u8; 8]);
+    write_private_cache_fixture(&target, [0_u8; 8]);
     let mut budget = PersistentCacheBudget {
         directory: temp.path().to_owned(),
         usage: PersistentCacheUsage {
@@ -361,7 +531,8 @@ fn oversized_entry_is_suppressed_after_the_first_serialization() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("rollout.jsonl");
     fs::write(&source, b"{}\n").unwrap();
-    let fingerprint = FileFingerprint::from_metadata(&source.metadata().unwrap()).unwrap();
+    let fingerprint =
+        FileFingerprint::from_path_and_metadata(&source, &source.metadata().unwrap()).unwrap();
     let key = CacheKey {
         codex_home: temp.path().join("home"),
         redact_content: false,
@@ -394,7 +565,8 @@ fn oversized_entry_is_suppressed_after_the_first_serialization() {
     assert_eq!(second.failures, 0);
 
     fs::write(&source, b"").unwrap();
-    let fingerprint = FileFingerprint::from_metadata(&source.metadata().unwrap()).unwrap();
+    let fingerprint =
+        FileFingerprint::from_path_and_metadata(&source, &source.metadata().unwrap()).unwrap();
     cache.files.insert(
         source.clone(),
         CachedFile {
@@ -406,7 +578,7 @@ fn oversized_entry_is_suppressed_after_the_first_serialization() {
         },
     );
     cache.dirty_files.insert(source);
-    let after_shrink = cache.persist_dirty_files_with_limit(&config, &key, 1024);
+    let after_shrink = cache.persist_dirty_files_with_limit(&config, &key, 4096);
     assert_eq!(after_shrink.written, 1);
     assert!(cache.unpersistable_files.is_empty());
 }
@@ -442,10 +614,168 @@ fn persistent_hit_is_rejected_if_source_changed_after_discovery() {
 
     fs::write(&source, b"{}\n{}\n").unwrap();
 
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+    let mut tail_guard_bytes = 0;
     assert!(matches!(
-        load_persistent_file(&cache_root, &key, &discovered),
+        load_persistent_file(
+            &cache_root,
+            &key,
+            &discovered,
+            &mut hash_bytes,
+            &mut large_guard_bytes,
+            &mut tail_guard_bytes,
+        ),
         PersistentLoad::Miss
     ));
+    assert_eq!(hash_bytes, 0);
+    assert_eq!(large_guard_bytes, 0);
+    assert_eq!(tail_guard_bytes, 0);
+}
+
+#[test]
+fn persistent_exact_hit_uses_the_metadata_only_fast_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("rollout.jsonl");
+    fs::write(&source, b"old-content\n").unwrap();
+    let old = inspect_rollout_file(&source).unwrap();
+    let key = CacheKey {
+        codex_home: temp.path().join("home"),
+        redact_content: false,
+    };
+    let cached = CachedFile {
+        fingerprint: old.fingerprint,
+        parsed: ParsedFile {
+            complete: true,
+            ..ParsedFile::default()
+        },
+    };
+    let cache_root = temp.path().join("cache");
+    persist_file_entry(
+        &cache_root,
+        &key,
+        &source,
+        &cached,
+        MAX_PERSISTENT_ENTRY_BYTES,
+    )
+    .unwrap();
+
+    let current = inspect_rollout_file(&source).unwrap();
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+    let mut tail_guard_bytes = 0;
+    assert!(matches!(
+        load_persistent_file(
+            &cache_root,
+            &key,
+            &current,
+            &mut hash_bytes,
+            &mut large_guard_bytes,
+            &mut tail_guard_bytes,
+        ),
+        PersistentLoad::Exact { .. }
+    ));
+    assert_eq!(hash_bytes, 0);
+    assert_eq!(large_guard_bytes, 0);
+    assert_eq!(tail_guard_bytes, 0);
+}
+
+#[test]
+fn persistent_prefix_hash_refuses_io_above_the_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("rollout.jsonl");
+    fs::write(&source, b"small").unwrap();
+    let mut hash_bytes = 0;
+
+    let error = sha256_file_prefix(
+        &source,
+        MAX_PERSISTENT_PREFIX_HASH_BYTES + 1,
+        &mut hash_bytes,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(hash_bytes, 0);
+}
+
+#[test]
+fn persistent_entry_above_the_full_hash_limit_uses_bounded_guards() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("rollout.jsonl");
+    let file = File::create(&source).unwrap();
+    file.set_len(MAX_PERSISTENT_PREFIX_HASH_BYTES + 1).unwrap();
+    let fingerprint = inspect_rollout_file(&source).unwrap().fingerprint;
+    let cached = CachedFile {
+        fingerprint,
+        parsed: ParsedFile {
+            complete: true,
+            ..ParsedFile::default()
+        },
+    };
+    let key = CacheKey {
+        codex_home: temp.path().join("home"),
+        redact_content: false,
+    };
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+
+    let contents = serialize_persistent_entry(
+        &key,
+        &source,
+        &cached,
+        MAX_PERSISTENT_ENTRY_BYTES,
+        &mut hash_bytes,
+        &mut large_guard_bytes,
+    )
+    .unwrap();
+    let entry: PersistentFileEntry = serde_json::from_slice(&contents).unwrap();
+    let PersistentSourceValidation::BoundedPrefixGuards { prefix_len, guards } =
+        entry.source_validation.unwrap()
+    else {
+        panic!("large rollout entry must use bounded guards");
+    };
+    assert_eq!(prefix_len, MAX_PERSISTENT_PREFIX_HASH_BYTES + 1);
+    assert_eq!(guards.len(), LARGE_PREFIX_GUARD_WINDOWS);
+    assert_eq!(
+        hash_bytes,
+        (LARGE_PREFIX_GUARD_WINDOWS * LARGE_PREFIX_GUARD_WINDOW_BYTES) as u64
+    );
+    assert_eq!(large_guard_bytes, hash_bytes);
+}
+
+#[test]
+fn malformed_large_guard_shape_is_rejected_before_source_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("rollout.jsonl");
+    let file = File::create(&source).unwrap();
+    file.set_len(MAX_PERSISTENT_PREFIX_HASH_BYTES + 1).unwrap();
+    let fingerprint = inspect_rollout_file(&source).unwrap().fingerprint;
+    let mut build_hash_bytes = 0;
+    let mut build_guard_bytes = 0;
+    let mut validation = build_source_validation(
+        &source,
+        &fingerprint,
+        &mut build_hash_bytes,
+        &mut build_guard_bytes,
+    )
+    .unwrap();
+    let PersistentSourceValidation::BoundedPrefixGuards { guards, .. } = &mut validation else {
+        panic!("large rollout entry must use bounded guards");
+    };
+    guards[1].offset = guards[1].offset.saturating_add(1);
+
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+    assert!(!source_validation_matches(
+        &source,
+        fingerprint.len,
+        &fingerprint,
+        &validation,
+        &mut hash_bytes,
+        &mut large_guard_bytes,
+    ));
+    assert_eq!(hash_bytes, 0);
+    assert_eq!(large_guard_bytes, 0);
 }
 
 #[test]
@@ -526,7 +856,11 @@ fn file_reordering_marks_only_threads_whose_internal_replay_order_changed() {
         cache.insert(
             path.clone(),
             CachedFile {
-                fingerprint: FileFingerprint::from_metadata(&path.metadata().unwrap()).unwrap(),
+                fingerprint: FileFingerprint::from_path_and_metadata(
+                    path,
+                    &path.metadata().unwrap(),
+                )
+                .unwrap(),
                 parsed: ParsedFile {
                     owner_thread_id: Some(owner_thread_id.to_string()),
                     complete: true,
@@ -781,6 +1115,8 @@ fn future_session_metadata_does_not_decorate_an_older_visible_call() {
         timestamp: now - ChronoDuration::seconds(30),
         thread_id: thread_id.clone(),
         turn_id: Some(turn_id),
+        usage_event_id: None,
+        usage_event_identity_exact: false,
         model: Some("gpt-5.6-sol".to_string()),
         service_tier: None,
         tokens: TokenUsage {

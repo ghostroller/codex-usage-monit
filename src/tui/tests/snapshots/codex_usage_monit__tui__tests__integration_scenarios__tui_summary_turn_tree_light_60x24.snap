@@ -4,9 +4,9 @@ expression: summary.frame().snapshot_text()
 ---
 size=60x24
 rows:
-00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
+00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set  | [S]Source
 01|[C][7][M] [K][E][A] [B] 1d [I]Inspect [G]All [L] [↵] [X]
-02|┌Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL─┐
+02|┌Usage tree · source All · Cycle · known 320.0K · PARTIAL──┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  │
 04|│ 190.0K         59.4%    [-] PROJ ■ alpha-service         █
 05|│▌190.0K         59.4%    └─ [-] SESS API billing dashboard█
@@ -39,7 +39,9 @@ styles:
 00:030+001 fg=#006c75 bg=#f7f9fc mods=bold text="3"
 00:031+011 fg=#5f6b7a bg=#f7f9fc mods=none text=" Other  |  "
 00:042+001 fg=#006c75 bg=#f7f9fc mods=bold text="4"
-00:043+017 fg=#5f6b7a bg=#f7f9fc mods=none text=" Set             "
+00:043+009 fg=#5f6b7a bg=#f7f9fc mods=none text=" Set  | ["
+00:052+001 fg=#006c75 bg=#f7f9fc mods=bold text="S"
+00:053+007 fg=#5f6b7a bg=#f7f9fc mods=none text="]Source"
 01:000+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
 01:001+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="C"
 01:002+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
@@ -67,8 +69,8 @@ styles:
 01:054+001 fg=#006c75 bg=#f7f9fc mods=bold text="X"
 01:055+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
 02:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
-02:001+057 fg=#17202a bg=#f7f9fc mods=bold text="Usage tree · Cycle · known 320.0K · 1% coverage · PARTIAL"
-02:058+002 fg=#7d8998 bg=#f7f9fc mods=none text="─┐"
+02:001+056 fg=#17202a bg=#f7f9fc mods=bold text="Usage tree · source All · Cycle · known 320.0K · PARTIAL"
+02:057+003 fg=#7d8998 bg=#f7f9fc mods=none text="──┐"
 03:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 03:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  "
 03:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
@@ -172,6 +174,7 @@ ViewTrends binding=2 rect=10,0,6,1
 ViewSummary binding=U rect=19,0,7,1
 ViewOther binding=3 rect=29,0,9,1
 ViewSettings binding=4 rect=41,0,7,1
+HistorySource binding=S rect=51,0,9,1
 SummaryRangeCycle binding=C rect=0,1,3,1
 SummaryRangeSevenDays binding=7 rect=3,1,3,1
 SummaryRangeThirtyDays binding=M rect=6,1,3,1

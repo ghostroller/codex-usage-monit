@@ -679,6 +679,14 @@ pub struct UsageCall {
     pub timestamp: DateTime<Utc>,
     pub thread_id: String,
     pub turn_id: Option<String>,
+    /// Stable, source-path-independent identity of the underlying rollout
+    /// token-counter event when one can be derived. Remote replica detection
+    /// uses this value; it is not a request count.
+    pub usage_event_id: Option<String>,
+    /// True only for a native immutable event identifier. Current token-count
+    /// rollouts generally expose a deterministic fallback, so callers must
+    /// keep this false instead of overstating exact dedupe evidence.
+    pub usage_event_identity_exact: bool,
     pub model: Option<String>,
     pub service_tier: Option<String>,
     pub tokens: TokenUsage,
