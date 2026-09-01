@@ -889,6 +889,161 @@ fn termination_request_wakes_the_run_loop_without_terminal_io() {
     assert!(termination.is_requested());
 }
 
+#[cfg(unix)]
+#[test]
+fn terminal_fd_poll_distinguishes_idle_input_from_pty_hangup() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    let (mut input, mut peer) = UnixStream::pair().unwrap();
+    assert_eq!(
+        poll_terminal_fd(input.as_raw_fd(), Duration::ZERO).unwrap(),
+        TerminalEventWait::TimedOut,
+        "an attached idle terminal must remain asleep"
+    );
+
+    peer.write_all(b"x").unwrap();
+    assert_eq!(
+        poll_terminal_fd(input.as_raw_fd(), Duration::ZERO).unwrap(),
+        TerminalEventWait::Ready
+    );
+    let mut byte = [0_u8; 1];
+    input.read_exact(&mut byte).unwrap();
+    drop(peer);
+    assert_eq!(
+        poll_terminal_fd(input.as_raw_fd(), Duration::from_millis(10)).unwrap(),
+        TerminalEventWait::Disconnected,
+        "a closed PTY peer must make the TUI exit before crossterm can spin"
+    );
+}
+
+#[test]
+fn initial_tui_placeholder_is_renderable_without_rollout_or_history_data() {
+    let config = CollectConfig {
+        codex_home: PathBuf::from("/tmp/codex-home"),
+        offline: false,
+        ..CollectConfig::default()
+    };
+    let result = initial_loading_result(&config);
+
+    assert!(initial_collection_loading(&result.snapshot));
+    assert!(result.snapshot.tasks.is_empty());
+    assert!(result.snapshot.turns.is_empty());
+    assert!(result.history_observation.half_hour_buckets.is_empty());
+
+    let mut app = App::new(result, Theme::Dark);
+    app.initial_bootstrap_pending = true;
+    app.history_source_loading = true;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Loading quota and usage"));
+}
+
+#[test]
+fn headless_initial_refresh_uses_the_deferred_data_ready_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    let trace_path = directory.path().join("initial-trace.jsonl");
+    std::fs::create_dir(&codex_home).unwrap();
+    let config = CollectConfig {
+        codex_home: codex_home.clone(),
+        offline: true,
+        rollout_cache_dir: None,
+        trace_log: TraceLog::enabled(&trace_path),
+        ..CollectConfig::default()
+    };
+    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
+    let history_store = Arc::new(Mutex::new(TuiHistoryStore::legacy_fallback(
+        HistoryStore::new(directory.path().join("history"), &codex_home),
+        Vec::new(),
+    )));
+    let mut app = App::new(initial_loading_result(&config), Theme::Dark);
+    app.initial_bootstrap_pending = true;
+    app.history_source_loading = true;
+    app.worker_running = true;
+
+    let completion = collect_initial_refresh_completion(
+        &config,
+        &rollout_cache,
+        &history_store,
+        app.history_source_generation,
+        &app.history_source_selection,
+    );
+    assert!(completion.result.is_some());
+    assert!(completion.history.is_some());
+    assert!(!completion.refreshed_account);
+
+    app.initial_bootstrap_pending = false;
+    assert!(apply_refresh_completion(&mut app, completion));
+    assert!(!app.worker_running);
+    assert!(!app.history_source_loading);
+    assert!(!initial_collection_loading(&app.snapshot));
+
+    config.trace_log.finish();
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(trace.contains("\"stage\":\"tui.initial_data_ready\""));
+    assert!(trace.contains("\"sourceScope\":\"all\""));
+}
+
+#[test]
+fn online_initial_data_ready_defers_account_rpc_and_keeps_refresh_due() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    let trace_path = directory.path().join("initial-online-trace.jsonl");
+    std::fs::create_dir(&codex_home).unwrap();
+    let config = CollectConfig {
+        codex_home: codex_home.clone(),
+        // If the initial helper accidentally performs the network account
+        // collection, this deliberately unrunnable path creates an observable
+        // app-server trace/error instead of touching the developer's Codex.
+        codex_bin: Some(directory.path().join("must-not-run-codex")),
+        offline: false,
+        rollout_cache_dir: None,
+        trace_log: TraceLog::enabled(&trace_path),
+        ..CollectConfig::default()
+    };
+    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
+    let history_store = Arc::new(Mutex::new(TuiHistoryStore::legacy_fallback(
+        HistoryStore::new(directory.path().join("history"), &codex_home),
+        Vec::new(),
+    )));
+    let mut app = App::new(initial_loading_result(&config), Theme::Dark);
+    app.initial_bootstrap_pending = true;
+    app.history_source_loading = true;
+    app.worker_running = true;
+
+    let completion = collect_initial_refresh_completion(
+        &config,
+        &rollout_cache,
+        &history_store,
+        app.history_source_generation,
+        &app.history_source_selection,
+    );
+    assert!(completion.result.is_some());
+    assert!(!completion.refreshed_account);
+
+    app.initial_bootstrap_pending = false;
+    assert!(apply_refresh_completion(&mut app, completion));
+    assert!(!app.worker_running);
+    assert!(app.account_refresh_due(Instant::now()));
+    assert!(!initial_collection_loading(&app.snapshot));
+
+    config.trace_log.finish();
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(trace.contains("\"stage\":\"tui.initial_data_ready\""));
+    assert!(trace.contains("\"accountRefresh\":false"));
+    assert!(trace.contains("\"accountRefreshDeferred\":true"));
+    assert!(!trace.contains("\"stage\":\"app_server.account_snapshot\""));
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_close_handler_waits_until_terminal_restoration() {
@@ -9693,6 +9848,191 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
 }
 
 #[test]
+fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    assert!(matches!(
+        prepare_tui_history_runtime(
+            &mut runtime,
+            &profile_lease,
+            starts_at + ChronoDuration::minutes(20)
+        ),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    runtime
+        .record_local_observation(
+            &tui_runtime_test_observation(starts_at, 10),
+            LocalObservationMode::Incremental,
+        )
+        .unwrap();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
+    let selection = HistorySourceSelection::AllIncluded;
+    let now = starts_at + ChronoDuration::minutes(20);
+    let since = history_view_since(now);
+    let durable = store.load_since_with_staged_selected(&selection, since);
+    assert_eq!(
+        durable.history.half_hour_buckets[0]
+            .token_usage
+            .total_tokens,
+        10
+    );
+    assert_eq!(store.projection_cache_delivery_clones, 0);
+    assert!(store.projection_cache_valid(&selection, since, false));
+    assert_eq!(
+        store.projection_cache_delivery_clones, 0,
+        "a validity probe must not clone the cached projection"
+    );
+    assert!(
+        store
+            .reload_since_if_stale_with_staged_selected(&selection, since)
+            .is_none()
+    );
+    assert_eq!(
+        store.projection_cache_delivery_clones, 0,
+        "an unchanged maintenance poll must neither clone nor deliver history"
+    );
+    assert!(
+        flush_or_reload_history_if_due(&mut store, now, &PerfLog::default(), &selection).is_none()
+    );
+    assert_eq!(
+        store.projection_cache_delivery_clones, 0,
+        "the unchanged two-second maintenance path must only probe the cache"
+    );
+
+    store.stage(&tui_runtime_test_observation(starts_at, 20));
+    let cached = store.cached_projection(&selection, since, false).unwrap();
+    let fresh = match &mut store.backend {
+        TuiHistoryBackend::Runtime(runtime) => {
+            runtime
+                .load_unified_history_since_with_staged_selected(&selection, since)
+                .unwrap()
+                .history
+        }
+        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+    };
+    assert_eq!(cached.history, fresh);
+    assert_eq!(
+        cached.history.half_hour_buckets[0].token_usage.total_tokens,
+        10
+    );
+}
+
+#[test]
+fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    assert!(matches!(
+        prepare_tui_history_runtime(
+            &mut runtime,
+            &profile_lease,
+            starts_at + ChronoDuration::minutes(20)
+        ),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    let observation = tui_runtime_test_observation(starts_at, 10);
+    runtime
+        .record_local_observation(&observation, LocalObservationMode::Incremental)
+        .unwrap();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
+    let selection = HistorySourceSelection::AllIncluded;
+    let since = starts_at - ChronoDuration::hours(1);
+    store.load_since_with_staged_selected(&selection, since);
+    let original_revision = store.projection_cache.as_ref().unwrap().revision.clone();
+
+    store.stage(&observation);
+    let write_result = store.flush_staged();
+    assert_eq!(
+        tui_history_cache_effect(&write_result),
+        TuiHistoryCacheEffect::RebaseRevision
+    );
+    let report = match &write_result {
+        Ok(Some(HistoryRuntimeWriteReport::V2(report))) => report,
+        other => panic!("unexpected write result: {other:?}"),
+    };
+    assert_eq!(report.account.shards_written, 0);
+    assert_eq!(report.buckets.shards_written, 0);
+    assert_eq!(report.weekly.shards_written, 0);
+    assert_eq!(report.session_digests.shards_written, 0);
+    assert_eq!(report.garbage_collection.shards_pruned, 0);
+    assert!(store.cached_projection(&selection, since, true).is_some());
+    let rebased_revision = &store.projection_cache.as_ref().unwrap().revision;
+    assert!(
+        original_revision.same_query_inputs_except_local_revision(rebased_revision),
+        "a no-op write may advance only the local observation revision"
+    );
+    assert_ne!(
+        original_revision.local_observation_revision,
+        rebased_revision.local_observation_revision
+    );
+
+    let mut durable_change = report.clone();
+    durable_change.buckets.shards_written = 1;
+    assert_eq!(
+        tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(durable_change)))),
+        TuiHistoryCacheEffect::Invalidate
+    );
+    let mut gc_change = report.clone();
+    gc_change.garbage_collection.shards_pruned = 1;
+    assert_eq!(
+        tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(gc_change)))),
+        TuiHistoryCacheEffect::Invalidate
+    );
+
+    let mut mapping_changed = rebased_revision.clone();
+    mapping_changed.project_mapping_revision =
+        mapping_changed.project_mapping_revision.saturating_add(1);
+    assert!(!rebased_revision.same_query_inputs_except_local_revision(&mapping_changed));
+    let mut sources_changed = rebased_revision.clone();
+    sources_changed.sources.clear();
+    assert!(!rebased_revision.same_query_inputs_except_local_revision(&sources_changed));
+    let local_source_id = match &store.backend {
+        TuiHistoryBackend::Runtime(runtime) => runtime.source_identity().node_id().clone(),
+        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+    };
+    assert!(
+        store
+            .cached_projection(
+                &HistorySourceSelection::Local(local_source_id),
+                since,
+                false,
+            )
+            .is_none()
+    );
+    assert!(
+        store
+            .cached_projection(&selection, since + ChronoDuration::minutes(15), false)
+            .is_none()
+    );
+
+    let projection = store.clone_cached_projection().unwrap();
+    let revision_before = store.projection_cache.as_ref().unwrap().revision.clone();
+    let mut revision_after = revision_before.clone();
+    revision_after.local_observation_revision =
+        revision_after.local_observation_revision.saturating_add(1);
+    assert!(!store.cache_projection_if_revision_consistent(
+        &selection,
+        since,
+        &projection,
+        Some(revision_before),
+        Some(revision_after),
+    ));
+    assert!(
+        store.projection_cache.is_none(),
+        "a query whose revision changed before publication must not be cached"
+    );
+}
+
+#[test]
 fn recent_legacy_recorder_defers_tui_v2_cutover() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
@@ -11233,21 +11573,22 @@ fn dropping_running_remote_action_worker_terminates_and_reaps_its_process_tree()
     };
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    while (!primary_pid_file.is_file() || !descendant_pid_file.is_file())
-        && Instant::now() < deadline
-    {
+    let (primary_pid, descendant_pid) = loop {
+        let primary_pid = std::fs::read_to_string(&primary_pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<libc::pid_t>().ok());
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<libc::pid_t>().ok());
+        if let (Some(primary_pid), Some(descendant_pid)) = (primary_pid, descendant_pid) {
+            break (primary_pid, descendant_pid);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote action helper did not publish both process IDs before the deadline"
+        );
         thread::sleep(Duration::from_millis(10));
-    }
-    let primary_pid: libc::pid_t = std::fs::read_to_string(&primary_pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let descendant_pid: libc::pid_t = std::fs::read_to_string(&descendant_pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
     assert_eq!(unsafe { libc::kill(primary_pid, 0) }, 0);
     assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
 
@@ -11357,6 +11698,95 @@ fn remote_ui_helper_inherits_the_outer_cancellation_tree() {
     );
     assert!(args.windows(2).any(|pair| pair == ["remote", "sync"]));
     assert!(args.windows(2).any(|pair| pair == ["sync", "devbox"]));
+    assert!(!args.iter().any(|argument| argument == "--trace-log"));
+}
+
+#[test]
+fn remote_ui_parent_traces_helper_actions_without_forwarding_the_log() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace_path = directory.path().join("parent-trace.jsonl");
+    let trace = TraceLog::enabled(&trace_path);
+    let config = CollectConfig {
+        codex_home: directory.path().join("codex-home"),
+        trace_log: trace.clone(),
+        ..CollectConfig::default()
+    };
+    let actions = [
+        RemoteUiActionKind::Add {
+            ssh_host: "add-private-box".to_owned(),
+            agent_executable: DEFAULT_REMOTE_AGENT_EXECUTABLE.to_owned(),
+            redact_content: true,
+        },
+        RemoteUiActionKind::Edit {
+            ssh_host: "edit-private-box".to_owned(),
+            agent_executable: DEFAULT_REMOTE_AGENT_EXECUTABLE.to_owned(),
+            redact_content: true,
+        },
+        RemoteUiActionKind::Test,
+        RemoteUiActionKind::Sync,
+    ];
+
+    for (index, kind) in actions.into_iter().enumerate() {
+        let request = RemoteUiActionRequest {
+            kind,
+            host_id: format!("private-host-{index}"),
+            config_revision: index as u64 + 1,
+        };
+        let command =
+            remote_ui_action_command(Path::new("codex-usage-monit"), &config, &request).unwrap();
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|argument| argument == "--trace-log"));
+        let cancellation = RemoteActionCancellation::default();
+        assert_eq!(
+            trace_remote_ui_action(&request, &trace, &cancellation, || {
+                Ok(RemoteUiActionOutcome::Complete)
+            }),
+            Ok(RemoteUiActionOutcome::Complete)
+        );
+    }
+    trace.finish();
+
+    let contents = std::fs::read_to_string(trace_path).unwrap();
+    assert_eq!(
+        contents.matches("\"stage\":\"tui.remote.action\"").count(),
+        8
+    );
+    for action in ["add", "edit", "test", "sync"] {
+        assert!(contents.contains(&format!("\"action\":\"{action}\"")));
+    }
+    assert!(!contents.contains("private-host-"));
+    assert!(!contents.contains("add-private-box"));
+    assert!(!contents.contains("edit-private-box"));
+}
+
+#[test]
+fn remote_ui_parent_traces_user_cancellation_distinctly() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace_path = directory.path().join("parent-trace.jsonl");
+    let trace = TraceLog::enabled(&trace_path);
+    let cancellation = RemoteActionCancellation::default();
+    cancellation.cancel();
+    let request = RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Sync,
+        host_id: "private-host".to_owned(),
+        config_revision: 1,
+    };
+
+    assert_eq!(
+        trace_remote_ui_action(&request, &trace, &cancellation, || {
+            Err("command terminated".to_owned())
+        }),
+        Err("command terminated".to_owned())
+    );
+    trace.finish();
+
+    let contents = std::fs::read_to_string(trace_path).unwrap();
+    assert!(contents.contains("\"outcome\":\"cancelled\""));
+    assert!(contents.contains("\"reason\":\"user_cancelled\""));
+    assert!(!contents.contains("command terminated"));
 }
 
 #[test]

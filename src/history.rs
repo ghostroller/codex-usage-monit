@@ -3906,7 +3906,10 @@ fn quota_point_payload_eq(left: &QuotaPoint, right: &QuotaPoint) -> bool {
         && left.provenance == right.provenance
 }
 
-fn half_hour_bucket_payload_eq(left: &LocalHalfHourBucket, right: &LocalHalfHourBucket) -> bool {
+pub(crate) fn half_hour_bucket_payload_eq(
+    left: &LocalHalfHourBucket,
+    right: &LocalHalfHourBucket,
+) -> bool {
     half_hour_bucket_evidence_eq(left, right) && left.partial_reasons == right.partial_reasons
 }
 
@@ -3925,7 +3928,10 @@ fn half_hour_bucket_evidence_eq(left: &LocalHalfHourBucket, right: &LocalHalfHou
         && left.project_groups == right.project_groups
 }
 
-fn weekly_local_point_payload_eq(left: &WeeklyLocalPoint, right: &WeeklyLocalPoint) -> bool {
+pub(crate) fn weekly_local_point_payload_eq(
+    left: &WeeklyLocalPoint,
+    right: &WeeklyLocalPoint,
+) -> bool {
     weekly_local_point_evidence_eq(left, right) && left.partial_reasons == right.partial_reasons
 }
 

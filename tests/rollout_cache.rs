@@ -9,6 +9,7 @@ use codex_usage_monit::domain::{RolloutDataset, TaskStatus, TurnStatus};
 use codex_usage_monit::rollout::{RolloutCache, scan_rollouts};
 use codex_usage_monit::snapshot::{collect_snapshot_cached, collect_snapshot_cached_if_changed};
 use codex_usage_monit::startup::StartupTrace;
+use codex_usage_monit::trace::TraceLog;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -104,6 +105,48 @@ fn assert_dataset_eq(left: &RolloutDataset, right: &RolloutDataset) {
     assert_eq!(left.rate_observations, right.rate_observations);
     assert_eq!(left.stats, right.stats);
     assert_eq!(left.warnings, right.warnings);
+}
+
+#[test]
+fn trace_only_rollout_reduce_reports_real_counts() {
+    let temp = TempDir::new().unwrap();
+    let now = Utc::now() - chrono::Duration::seconds(1);
+    write_jsonl(
+        &temp.path().join("sessions/rollout-trace.jsonl"),
+        &[
+            json!({
+                "timestamp": timestamp(now),
+                "type": "session_meta",
+                "payload": {"id": "trace-thread", "timestamp": timestamp(now)}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "trace-turn"}
+            }),
+            json!({
+                "timestamp": timestamp(now),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": usage(10)}}
+            }),
+        ],
+    );
+    let trace_path = temp.path().join("trace.jsonl");
+    let mut config = config(temp.path());
+    config.trace_log = TraceLog::enabled(&trace_path);
+    let mut cache = RolloutCache::new();
+
+    cache.scan(&config, now).unwrap();
+    config.trace_log.finish();
+
+    let reduce = fs::read_to_string(trace_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["event"] == "span_finish" && event["stage"] == "rollout.reduce")
+        .expect("trace contains rollout.reduce finish");
+    assert!(reduce["fields"]["threads"].as_u64().unwrap() > 0);
+    assert!(reduce["fields"]["calls"].as_u64().unwrap() > 0);
 }
 
 #[test]

@@ -50,6 +50,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::remote_protocol::GitRepositoryFingerprint;
+use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const FINGERPRINT_DOMAIN: &[u8] = b"codex-usage-monit/git-remote/v1\0";
 const FINGERPRINT_PREFIX: &str = "git-sha256-v1-";
@@ -712,6 +713,42 @@ fn bounded_command_output(
     arguments: &[&str],
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
+    let trace_span = process_trace_log().span_with("git.process", || {
+        TraceFields::new()
+            .label(
+                "programKind",
+                if program == OsStr::new("git") {
+                    "git"
+                } else {
+                    "test_helper"
+                },
+            )
+            .label("operation", git_operation_kind(arguments))
+            .duration_ms("timeoutMs", timeout)
+    });
+    let result = bounded_command_output_inner(program, cwd, arguments, timeout);
+    match &result {
+        Ok(output) => trace_span.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new().usize("stdoutBytes", output.len())
+        }),
+        Err(error) => trace_span.finish_with(
+            if error.kind() == io::ErrorKind::TimedOut {
+                TraceOutcome::Timeout
+            } else {
+                TraceOutcome::Error
+            },
+            || TraceFields::new().label("errorKind", git_io_error_kind(error)),
+        ),
+    }
+    result
+}
+
+fn bounded_command_output_inner(
+    program: &OsStr,
+    cwd: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -758,6 +795,29 @@ fn bounded_command_output(
     #[cfg(windows)]
     {
         bounded_command_output_windows(child, process_tree, stdout, timeout)
+    }
+}
+
+fn git_operation_kind(arguments: &[&str]) -> &'static str {
+    match arguments {
+        ["rev-parse", "--show-toplevel"] => "repository_root",
+        ["config", "--local", "--get", "remote.origin.url"] => "origin_lookup",
+        _ => "other",
+    }
+}
+
+fn git_io_error_kind(error: &io::Error) -> &'static str {
+    if git_command_exit_code(error).is_some() {
+        "exit_failure"
+    } else {
+        match error.kind() {
+            io::ErrorKind::TimedOut => "timeout",
+            io::ErrorKind::NotFound => "not_found",
+            io::ErrorKind::PermissionDenied => "permission_denied",
+            io::ErrorKind::InvalidData => "invalid_data",
+            io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            _ => "io",
+        }
     }
 }
 

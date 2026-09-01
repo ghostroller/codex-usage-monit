@@ -57,6 +57,7 @@ use crate::source_history::{
 };
 use crate::source_identity::{SourceIdentity, SourceIdentityStore};
 use crate::source_model::ObservedProjectKey;
+use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
 const SOURCE_IDENTITY_FILE: &str = "source-identity.json";
@@ -65,6 +66,38 @@ const V2_GARBAGE_COLLECTION_INTERVAL: StdDuration = StdDuration::from_secs(6 * 6
 const V2_GARBAGE_COLLECTION_PROCESS_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 const MAX_GARBAGE_COLLECTION_WARNING_CHARS: usize = 320;
 const PROJECT_MAPPING_CAS_ATTEMPTS: usize = 4;
+
+fn local_observation_write_trace_fields(report: &LocalObservationWriteReport) -> TraceFields {
+    TraceFields::new()
+        .u64("revision", report.revision)
+        .usize("accountShardsWritten", report.account.shards_written)
+        .usize("accountShardsSkipped", report.account.shards_skipped)
+        .usize("accountRecordCount", report.account_records)
+        .usize("bucketShardsWritten", report.buckets.shards_written)
+        .usize("bucketShardsSkipped", report.buckets.shards_skipped)
+        .usize("bucketRecordCount", report.bucket_records)
+        .usize("bucketTombstoneCount", report.bucket_tombstones)
+        .usize("weeklyShardsWritten", report.weekly.shards_written)
+        .usize("weeklyShardsSkipped", report.weekly.shards_skipped)
+        .usize("weeklyRecordCount", report.weekly_records)
+        .usize("weeklyTombstoneCount", report.weekly_tombstones)
+        .usize("digestShardsWritten", report.session_digests.shards_written)
+        .usize("digestShardsSkipped", report.session_digests.shards_skipped)
+        .usize("digestRecordCount", report.session_digest_records)
+        .usize("digestTombstoneCount", report.session_digest_tombstones)
+        .bool(
+            "garbageCollectionAttempted",
+            report.garbage_collection.attempted,
+        )
+        .usize(
+            "garbageCollectionShardsPruned",
+            report.garbage_collection.shards_pruned,
+        )
+        .bool(
+            "garbageCollectionFailed",
+            report.garbage_collection.warning.is_some(),
+        )
+}
 
 /// Backend-specific persistence details from one runtime-managed flush.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -883,25 +916,54 @@ impl HistoryRuntime {
         evidence: &LocalSessionDigestEvidence,
         mode: LocalObservationMode,
     ) -> io::Result<LocalObservationWriteReport> {
-        let normalized = self.prepare_local_collection_observation(observation, tasks);
-        let digests = finalize_local_session_digests(&self.source_identity, evidence, &normalized)?;
-        let lease = self.ownership.acquire_writer_lease()?;
-        let active = self.load_exact_v2_active_manifest()?;
-        let authority = self.ownership.authorize_v2_write(&lease, &active)?;
-        let writer = self.source_history.writer(&authority)?;
-        let mut report = writer.record_local_observation_with_session_digests(
-            &self.source_identity,
-            LOCAL_SOURCE_LABEL,
-            self.redaction_profile,
-            &normalized,
-            mode,
-            &digests,
-            evidence.scan_complete(),
-        )?;
-        self.maybe_garbage_collect_after_local_write(&writer, observation.observed_at, &mut report);
-        writer.validate()?;
-        self.validate_exact_active_manifest(&active)?;
-        Ok(report)
+        let trace = process_trace_log().span_with("history.local_collection.write", || {
+            TraceFields::new()
+                .label(
+                    "mode",
+                    match mode {
+                        LocalObservationMode::Incremental => "incremental",
+                        LocalObservationMode::Reconcile { .. } => "reconcile",
+                    },
+                )
+                .usize("taskCount", tasks.len())
+                .usize("accountInputCount", observation.quota_points.len())
+                .usize("bucketInputCount", observation.half_hour_buckets.len())
+                .usize("weeklyInputCount", observation.weekly_local_points.len())
+        });
+        let result = (|| {
+            let normalized = self.prepare_local_collection_observation(observation, tasks);
+            let digests =
+                finalize_local_session_digests(&self.source_identity, evidence, &normalized)?;
+            let lease = self.ownership.acquire_writer_lease()?;
+            let active = self.load_exact_v2_active_manifest()?;
+            let authority = self.ownership.authorize_v2_write(&lease, &active)?;
+            let writer = self.source_history.writer(&authority)?;
+            let mut report = writer.record_local_observation_with_session_digests(
+                &self.source_identity,
+                LOCAL_SOURCE_LABEL,
+                self.redaction_profile,
+                &normalized,
+                mode,
+                &digests,
+                evidence.scan_complete(),
+            )?;
+            self.maybe_garbage_collect_after_local_write(
+                &writer,
+                observation.observed_at,
+                &mut report,
+            );
+            writer.validate()?;
+            self.validate_exact_active_manifest(&active)?;
+            Ok(report)
+        })();
+        match &result {
+            Ok(report) => trace.finish(
+                TraceOutcome::Ok,
+                local_observation_write_trace_fields(report),
+            ),
+            Err(_) => trace.finish(TraceOutcome::Error, TraceFields::new()),
+        }
+        result
     }
 
     fn maybe_garbage_collect_after_local_write(

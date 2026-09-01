@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::domain::{TaskRecord, TaskStatus};
+use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const ENV_BIN: &str = "/usr/bin/env";
 const POWERSHELL_BIN: &str = "powershell.exe";
@@ -739,16 +740,46 @@ fn execute_command(
     plan: &CommandPlan,
     operation: ZellijOperation,
 ) -> Result<std::process::Output, ZellijError> {
-    let output = Command::new(&plan.program)
+    let trace_span = process_trace_log().span_with("terminal.zellij.process", || {
+        TraceFields::new().label(
+            "operation",
+            match operation {
+                ZellijOperation::NewPane => "new_pane",
+                ZellijOperation::ListPanes => "list_panes",
+                ZellijOperation::FocusPane => "focus_pane",
+            },
+        )
+    });
+    let result = Command::new(&plan.program)
         .args(&plan.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|source| ZellijError::Spawn { operation, source })?;
+        .map_err(|source| ZellijError::Spawn { operation, source });
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            trace_span.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "spawn")
+            });
+            return Err(error);
+        }
+    };
     if output.status.success() {
+        trace_span.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("stdoutBytes", output.stdout.len())
+                .usize("stderrBytes", output.stderr.len())
+        });
         Ok(output)
     } else {
+        trace_span.finish_with(TraceOutcome::Error, || {
+            TraceFields::new()
+                .label("errorKind", "exit_failure")
+                .usize("stdoutBytes", output.stdout.len())
+                .usize("stderrBytes", output.stderr.len())
+        });
         Err(ZellijError::Rejected {
             operation,
             code: output.status.code(),

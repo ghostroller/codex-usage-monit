@@ -57,7 +57,7 @@ use crate::remote_sync_health::{
 use crate::remote_sync_scheduler::{
     MonotonicRemoteSyncClock, RemoteSyncScheduler, RemoteSyncSchedulerTick,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::remote_transport::probe_remote_with_environment;
 use crate::remote_transport::{
     RemoteProbeOptions, RemoteProbeReport, RemoteTransportError, SshCommandEnvironment,
@@ -103,11 +103,18 @@ use crate::summary_report::{
     summary_backfill_config, summary_backfill_scan_complete, summary_history_backfill_needed,
     summary_history_coverage_complete,
 };
+use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 use crate::trends::{TrendsReport, build_trends_report};
 use crate::tui::Theme;
 
 struct PerfLogGuard {
     log: PerfLog,
+    path: Option<PathBuf>,
+    reported_error: Option<String>,
+}
+
+struct TraceLogGuard {
+    log: TraceLog,
     path: Option<PathBuf>,
     reported_error: Option<String>,
 }
@@ -185,6 +192,47 @@ impl Drop for PerfLogGuard {
     }
 }
 
+impl TraceLogGuard {
+    fn new(log: TraceLog, path: Option<PathBuf>) -> Self {
+        Self {
+            log,
+            path,
+            reported_error: None,
+        }
+    }
+
+    fn report_error(&mut self) {
+        let mut stderr = io::stderr().lock();
+        let _ = self.report_error_to(&mut stderr);
+    }
+
+    fn report_error_to(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        let Some(error) = self.log.log_error() else {
+            return Ok(());
+        };
+        if self.reported_error.as_deref() == Some(error.as_str()) {
+            return Ok(());
+        }
+        if let Some(path) = self.path.as_deref() {
+            writeln!(
+                writer,
+                "warning: --trace-log disabled for {path:?}: {error}"
+            )?;
+        } else {
+            writeln!(writer, "warning: --trace-log disabled: {error}")?;
+        }
+        self.reported_error = Some(error);
+        Ok(())
+    }
+}
+
+impl Drop for TraceLogGuard {
+    fn drop(&mut self) {
+        self.log.finish();
+        self.report_error();
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-usage-monit",
@@ -229,6 +277,10 @@ pub struct Cli {
     /// Write low-overhead runtime performance samples as JSONL.
     #[arg(long, global = true, value_name = "FILE")]
     perf_log: Option<PathBuf>,
+
+    /// Write content-free operation traces as JSONL (may add diagnostic I/O).
+    #[arg(long, global = true, value_name = "FILE")]
+    trace_log: Option<PathBuf>,
 
     /// Internal PATH override preserved by service registrations.
     #[arg(
@@ -281,7 +333,7 @@ enum Command {
     Service(ServiceArgs),
     /// Configure and test explicitly allowlisted remote Codex machines.
     Remote(RemoteArgs),
-    /// Profile the normal TUI cold-start path without entering interactive mode.
+    /// Profile TUI first-frame and initial data-ready work without entering interactive mode.
     DebugStartup(DebugStartupArgs),
     /// Internal commands used by the remote usage exporter.
     #[command(hide = true)]
@@ -759,6 +811,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     };
     let trace_initialized_at = Instant::now();
     let perf_log_path = cli.perf_log.clone();
+    let trace_log_path = cli.trace_log.clone();
     let service_remotes_config = cli.service_remotes_config.clone().map(absolute_path);
     let inherit_remote_process_tree =
         tui_process_tree_inheritance_is_authorized(cli.inherit_remote_process_tree.as_deref());
@@ -768,6 +821,15 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         .unwrap_or_default();
     let mut perf_log_guard = PerfLogGuard::new(perf_log.clone(), perf_log_path.clone());
     perf_log_guard.report_error();
+    let trace_log = trace_log_path
+        .as_deref()
+        .map(TraceLog::enabled)
+        .unwrap_or_default();
+    if trace_log.is_enabled() {
+        crate::trace::set_process_trace_log(trace_log.clone());
+    }
+    let mut trace_log_guard = TraceLogGuard::new(trace_log.clone(), trace_log_path.clone());
+    trace_log_guard.report_error();
     trace.record_interval(
         "cli.parse",
         process_started,
@@ -799,6 +861,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         crate::cache::default_rollout_cache_dir()
     };
     config.perf_log = perf_log;
+    config.trace_log = trace_log.clone();
     config.startup_trace = trace.clone();
     config_span.finish_with(|| {
         format!(
@@ -819,6 +882,28 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
             }
         )
     });
+    trace_log
+        .span_with("cli.config", || {
+            TraceFields::new()
+                .label("command", command_name(cli.command.as_ref()))
+                .label(
+                    "build",
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                )
+                .u64(
+                    "lookbackDays",
+                    u64::try_from(config.lookback_days).unwrap_or(0),
+                )
+                .usize("maxFiles", config.max_files)
+                .bool("offline", config.offline)
+                .bool("redactContent", config.redact_content)
+                .bool("rolloutCache", config.rollout_cache_dir.is_some())
+        })
+        .finish_with(TraceOutcome::Ok, TraceFields::new);
 
     let Some(command) = cli.command else {
         if let Some(theme) = cli.theme {
@@ -841,10 +926,21 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
 
     let command = match command {
         Command::Record(args) => {
-            return run_recorder(config, args, service_remotes_config, perf_log_path);
+            return run_recorder(
+                config,
+                args,
+                service_remotes_config,
+                perf_log_path,
+                trace_log_path,
+            );
         }
         Command::Service(args) => {
-            return run_service(&config, args, perf_log_path.as_deref());
+            return run_service(
+                &config,
+                args,
+                perf_log_path.as_deref(),
+                trace_log_path.as_deref(),
+            );
         }
         Command::Remote(args) => {
             return run_remote(&config, args, inherit_remote_process_tree);
@@ -861,7 +957,12 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
             return outcome;
         }
         Command::Health(args) => {
-            let outcome = run_health(&config, args, perf_log_path.as_deref());
+            let outcome = run_health(
+                &config,
+                args,
+                perf_log_path.as_deref(),
+                trace_log_path.as_deref(),
+            );
             finish_report_trace(&trace, "health", &outcome);
             return outcome;
         }
@@ -2433,7 +2534,8 @@ fn remote_ssh_environment(
         )
     } else {
         SshCommandEnvironment::new(collect_config.app_server_path.clone())
-    };
+    }
+    .with_trace_log(collect_config.trace_log.clone());
     if let Some(cancellation) = cancellation {
         environment.with_cancellation(Arc::clone(cancellation))
     } else {
@@ -2636,13 +2738,19 @@ fn run_trends(config: &CollectConfig, args: TrendsArgs) -> Result<i32> {
     })
 }
 
-fn run_health(config: &CollectConfig, args: HealthArgs, perf_log: Option<&Path>) -> Result<i32> {
+fn run_health(
+    config: &CollectConfig,
+    args: HealthArgs,
+    perf_log: Option<&Path>,
+    trace_log: Option<&Path>,
+) -> Result<i32> {
     let result = collect_snapshot(config, None, true);
     let now = Utc::now().max(result.snapshot.as_of);
     let (history_store, history) =
         collect_and_load_report_history(config, &result, args.history_dir);
     let (recorder_status, recorder_error) = recorder_status_for_history(&history_store);
-    let (service, service_error) = service_status_for_history(config, &history_store, perf_log);
+    let (service, service_error) =
+        service_status_for_history(config, &history_store, perf_log, trace_log);
     let report = HealthReport::new_with_service_error(
         &result.snapshot,
         &history,
@@ -3247,6 +3355,7 @@ fn service_status_for_history(
     config: &CollectConfig,
     store: &ReportHistoryStore,
     perf_log: Option<&Path>,
+    trace_log: Option<&Path>,
 ) -> (Option<crate::service::ServiceStatus>, Option<String>) {
     let store = store.legacy_history();
     let Some(history_root) = store.history_root() else {
@@ -3257,7 +3366,7 @@ fn service_status_for_history(
     };
     let history_dir = absolute_path(history_root.to_path_buf());
     let status_file = default_status_file(&history_dir);
-    let status = build_service_options(config, history_dir, status_file, perf_log)
+    let status = build_service_options(config, history_dir, status_file, perf_log, trace_log)
         .and_then(|options| service_status(&options));
     match status {
         Ok(status) => (Some(status), None),
@@ -3304,17 +3413,25 @@ fn write_stdout_status(output: &str) -> Result<bool> {
     }
 }
 
-fn run_service(config: &CollectConfig, args: ServiceArgs, perf_log: Option<&Path>) -> Result<i32> {
+fn run_service(
+    config: &CollectConfig,
+    args: ServiceArgs,
+    perf_log: Option<&Path>,
+    trace_log: Option<&Path>,
+) -> Result<i32> {
     let history_dir = default_history_root()
         .map(absolute_path)
         .ok_or_else(|| anyhow::anyhow!("a user state directory is unavailable"))?;
     let status_file = default_status_file(&history_dir);
-    let mut options = build_service_options(config, history_dir, status_file, perf_log)?;
+    let mut options = build_service_options(config, history_dir, status_file, perf_log, trace_log)?;
     if matches!(&args.action, ServiceAction::Install) && !config.offline {
         options.codex_bin = Some(resolve_service_codex(config)?);
     }
     if matches!(&args.action, ServiceAction::Install) && perf_log.is_some() {
         config.perf_log.finish();
+    }
+    if matches!(&args.action, ServiceAction::Install) && trace_log.is_some() {
+        config.trace_log.finish();
     }
     let (status, output_format) = match args.action {
         ServiceAction::Install => (install_service(&options)?, None),
@@ -3340,6 +3457,7 @@ fn build_service_options(
     history_dir: PathBuf,
     status_file: PathBuf,
     perf_log: Option<&Path>,
+    trace_log: Option<&Path>,
 ) -> Result<ServiceOptions> {
     let mut options = ServiceOptions::new(
         std::env::current_exe().map_err(anyhow::Error::from)?,
@@ -3348,6 +3466,7 @@ fn build_service_options(
         status_file,
         perf_log.map(|path| absolute_path(path.to_path_buf())),
     );
+    options.trace_log = trace_log.map(|path| absolute_path(path.to_path_buf()));
     options.lookback_days = config.lookback_days;
     options.max_files = config.max_files;
     options.active_grace_minutes = config.active_grace.as_secs().div_ceil(60);
@@ -3913,6 +4032,7 @@ fn run_recorder(
     args: RecordArgs,
     remotes_config_file: Option<PathBuf>,
     perf_log_file: Option<PathBuf>,
+    trace_log_file: Option<PathBuf>,
 ) -> Result<i32> {
     validate_service_cutover_contract(
         args.service_cutover_protocol.as_deref(),
@@ -3924,6 +4044,7 @@ fn run_recorder(
             &args,
             remotes_config_file.clone(),
             perf_log_file.clone(),
+            trace_log_file.clone(),
         )?;
         if expected.service_definition_id() != provided_definition_id {
             bail!("service recorder arguments do not match their service definition identity");
@@ -4200,6 +4321,7 @@ fn recorder_service_options_for_identity(
     args: &RecordArgs,
     remotes_config_file: Option<PathBuf>,
     perf_log_file: Option<PathBuf>,
+    trace_log_file: Option<PathBuf>,
 ) -> Result<ServiceOptions> {
     let history_dir = args.history_dir.as_ref().ok_or_else(|| {
         anyhow::anyhow!("service recorder identity requires an explicit history directory")
@@ -4214,6 +4336,7 @@ fn recorder_service_options_for_identity(
         absolute_path(status_file.clone()),
         perf_log_file.map(absolute_path),
     );
+    expected.trace_log = trace_log_file.map(absolute_path);
     expected.codex_bin = config.codex_bin.clone().map(absolute_path);
     expected.lookback_days = config.lookback_days;
     expected.max_files = config.max_files;
@@ -4397,6 +4520,9 @@ fn output_paths_for_command(cli: &Cli) -> Vec<(&'static str, PathBuf)> {
     }
     if let Some(path) = cli.perf_log.as_deref() {
         paths.push(("--perf-log", path.to_path_buf()));
+    }
+    if let Some(path) = cli.trace_log.as_deref() {
+        paths.push(("--trace-log", path.to_path_buf()));
     }
     if let Some(path) = status_file_for_command(cli) {
         let label = match cli.command.as_ref() {
@@ -6142,12 +6268,14 @@ mod tests {
                         history_dir.clone(),
                         status_file.clone(),
                         None,
+                        None,
                     )
                     .unwrap();
                     let second = build_service_options(
                         &config,
                         history_dir.clone(),
                         status_file.clone(),
+                        None,
                         None,
                     )
                     .unwrap();
@@ -6238,6 +6366,7 @@ mod tests {
                         record,
                         cli.service_remotes_config.clone(),
                         cli.perf_log.clone(),
+                        cli.trace_log.clone(),
                     )
                     .unwrap();
                     assert_eq!(expected.service_definition_id(), payload.definition_id);
@@ -7783,6 +7912,7 @@ mod tests {
     fn runtime_perf_log_is_optional_and_global() {
         let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
         assert_eq!(default.perf_log, None);
+        assert_eq!(default.trace_log, None);
 
         let before = Cli::try_parse_from([
             "codex-usage-monit",
@@ -7801,6 +7931,51 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(after.perf_log, Some(PathBuf::from("/tmp/perf.jsonl")));
+
+        let trace_before = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--trace-log",
+            "/tmp/trace.jsonl",
+            "snapshot",
+        ])
+        .unwrap();
+        assert_eq!(
+            trace_before.trace_log,
+            Some(PathBuf::from("/tmp/trace.jsonl"))
+        );
+
+        let trace_after = Cli::try_parse_from([
+            "codex-usage-monit",
+            "snapshot",
+            "--trace-log",
+            "/tmp/trace.jsonl",
+        ])
+        .unwrap();
+        assert_eq!(
+            trace_after.trace_log,
+            Some(PathBuf::from("/tmp/trace.jsonl"))
+        );
+    }
+
+    #[test]
+    fn trace_log_rejects_aliases_with_other_output_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_dir = temp.path().join("working");
+        std::fs::create_dir(&current_dir).unwrap();
+        let cli = Cli::try_parse_from([
+            OsString::from("codex-usage-monit"),
+            OsString::from("--perf-log"),
+            current_dir.join("logs/trace.jsonl").into_os_string(),
+            OsString::from("--trace-log"),
+            OsString::from("./logs/../logs/trace.jsonl"),
+            OsString::from("snapshot"),
+        ])
+        .unwrap();
+        let error = validate_output_paths_from(output_paths_for_command(&cli), &current_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--perf-log"));
+        assert!(error.contains("--trace-log"));
     }
 
     #[test]
@@ -8107,6 +8282,23 @@ mod tests {
         let warnings = String::from_utf8(warnings).unwrap();
         assert_eq!(warnings.lines().count(), 1);
         assert!(warnings.contains("--perf-log disabled"));
+        assert!(warnings.contains(&format!("{:?}", temp.path())));
+    }
+
+    #[test]
+    fn trace_log_initialization_errors_are_reported_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = TraceLog::enabled(temp.path());
+        assert!(!log.is_enabled());
+        let mut guard = TraceLogGuard::new(log, Some(temp.path().to_owned()));
+        let mut warnings = Vec::new();
+
+        guard.report_error_to(&mut warnings).unwrap();
+        guard.report_error_to(&mut warnings).unwrap();
+
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert_eq!(warnings.lines().count(), 1);
+        assert!(warnings.contains("--trace-log disabled"));
         assert!(warnings.contains(&format!("{:?}", temp.path())));
     }
 

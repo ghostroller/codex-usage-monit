@@ -584,11 +584,11 @@ IFS= read -r initialized || exit 45
 case "$initialized" in *'"method":"initialized"'*) ;; *) exit 46 ;; esac
 IFS= read -r limits || exit 47
 case "$limits" in *'"method":"account/rateLimits/read"'*) ;; *) exit 48 ;; esac
+printf '%s\n' 'this is not json'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":3,"credits":[{"id":"opaque-sensitive-id","grantedAt":1783834200,"expiresAt":1784439000,"status":"available","resetType":"codexRateLimits","title":"Reset Codex limits","description":"One reset opportunity"},{"id":"bad-detail","grantedAt":"not-seconds","status":"available","resetType":"codexRateLimits"}]}}}'
 IFS= read -r usage || exit 49
 case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 50 ;; esac
-printf '%s\n' 'this is not json'
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":3,"credits":[{"id":"opaque-sensitive-id","grantedAt":1783834200,"expiresAt":1784439000,"status":"available","resetType":"codexRateLimits","title":"Reset Codex limits","description":"One reset opportunity"},{"id":"bad-detail","grantedAt":"not-seconds","status":"available","resetType":"codexRateLimits"}]}}}'
 "#;
 
     with_mock_codex(script, |directory| {
@@ -669,10 +669,10 @@ IFS= read -r initialize || exit 42
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
 IFS= read -r initialized || exit 43
 IFS= read -r limits || exit 44
-IFS= read -r usage || exit 45
 sleep 0.02
-printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":0,"credits":[]}}}'
+IFS= read -r usage || exit 45
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 "#;
 
     with_mock_codex(script, |directory| {
@@ -728,9 +728,9 @@ IFS= read -r initialize || exit 71
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
 IFS= read -r initialized || exit 72
 IFS= read -r limits || exit 73
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":-1}}}'
 IFS= read -r usage || exit 74
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":-1}}}'
 "#;
 
     with_mock_codex(script, |directory| {
@@ -764,9 +764,9 @@ IFS= read -r initialize || exit 81
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
 IFS= read -r initialized || exit 82
 IFS= read -r limits || exit 83
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":true}}}'
 IFS= read -r usage || exit 84
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":23,"windowDurationMins":300}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":2,"credits":true}}}'
 "#;
 
     with_mock_codex(script, |directory| {
@@ -798,32 +798,124 @@ IFS= read -r initialize || exit 61
 printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
 IFS= read -r initialized || exit 62
 IFS= read -r limits || exit 63
-IFS= read -r usage || exit 64
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":17,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null}}'
+case "$limits" in *'"method":"account/rateLimits/read"'*) ;; *) exit 64 ;; esac
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":17,"windowDurationMins":300,"resetsAt":1783834200}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"opaque-id","grantedAt":1783834200,"expiresAt":1784439000,"status":"available","resetType":"codexRateLimits"}]}}}'
+IFS= read -r usage || exit 65
+case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 66 ;; esac
 while IFS= read -r ignored; do :; done
 "#;
 
     with_mock_codex(script, |directory| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
-            app_server_timeout: Duration::from_millis(100),
+            app_server_timeout: Duration::from_secs(5),
+            ..CollectConfig::default()
+        };
+        let started = Instant::now();
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "optional usage must not consume the five-second primary RPC deadline"
+        );
+        assert_eq!(snapshot.limits.len(), 1);
+        assert_eq!(
+            snapshot.limits[0].primary.as_ref().unwrap().used_percent,
+            17.0
+        );
+        let reset_credits = snapshot.rate_limit_reset_credits.as_ref().unwrap();
+        assert_eq!(reset_credits.available_count, 1);
+        assert_eq!(reset_credits.credits.as_ref().unwrap().len(), 1);
+        assert!(snapshot.usage.is_none());
+        assert!(snapshot.errors.is_empty());
+        assert!(snapshot.warnings.is_empty());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fetches_optional_usage_only_after_the_primary_response() {
+    let script = r#"#!/bin/bash
+IFS= read -r initialize || exit 101
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 102
+IFS= read -r limits || exit 103
+case "$limits" in *'"method":"account/rateLimits/read"'*) ;; *) exit 104 ;; esac
+# The optional request must not already be queued while the primary request is
+# outstanding. A pre-primary usage write makes this read succeed and the mock
+# exits without returning id=2.
+if IFS= read -r -t 0.05 early_usage; then exit 107; fi
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":21,"windowDurationMins":300}},"rateLimitsByLimitId":null}}'
+IFS= read -r usage || exit 105
+case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 106 ;; esac
+printf '%s\n' '{"id":3,"result":{"summary":{"lifetimeTokens":1234,"currentStreakDays":7},"dailyUsageBuckets":[]}}'
+while IFS= read -r ignored; do :; done
+"#;
+
+    with_mock_codex(script, |directory| {
+        let config = CollectConfig {
+            codex_home: directory.join("home"),
+            app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
 
         let snapshot = fetch_account_snapshot(&config).unwrap();
 
         assert_eq!(snapshot.limits.len(), 1);
-        assert_eq!(
-            snapshot.limits[0].primary.as_ref().unwrap().used_percent,
-            17.0
-        );
-        assert!(snapshot.usage.is_none());
+        let usage = snapshot.usage.as_ref().unwrap();
+        assert_eq!(usage.lifetime_tokens, Some(1234));
+        assert_eq!(usage.current_streak_days, Some(7));
+        assert!(snapshot.warnings.is_empty());
         assert!(snapshot.errors.is_empty());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_usage_eof_does_not_degrade_snapshot_health() {
+    let primary_reset = (Utc::now() + chrono::Duration::hours(2)).timestamp();
+    let weekly_reset = (Utc::now() + chrono::Duration::days(5)).timestamp();
+    let script = r#"#!/bin/sh
+IFS= read -r initialize || exit 111
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 112
+IFS= read -r limits || exit 113
+case "$limits" in *'"method":"account/rateLimits/read"'*) ;; *) exit 114 ;; esac
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":21,"windowDurationMins":300,"resetsAt":__PRIMARY_RESET__},"secondary":{"usedPercent":9,"windowDurationMins":10080,"resetsAt":__WEEKLY_RESET__}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":0,"credits":[]}}}'
+IFS= read -r usage || exit 115
+case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 116 ;; esac
+exit 0
+"#
+    .replace("__PRIMARY_RESET__", &primary_reset.to_string())
+    .replace("__WEEKLY_RESET__", &weekly_reset.to_string());
+
+    with_mock_codex(&script, |directory| {
+        let codex_home = directory.join("home");
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home,
+            app_server_timeout: Duration::from_secs(2),
+            ..CollectConfig::default()
+        };
+        let mut cache = RolloutCache::new();
+
+        let result = collect_snapshot_cached(&config, None, true, &mut cache);
+
+        assert!(result.account.usage.is_none());
+        assert!(result.account.warnings.is_empty());
+        assert!(result.account.errors.is_empty());
+        let app_server = result
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "app_server")
+            .unwrap();
+        assert_eq!(app_server.status, "ok");
         assert!(
-            snapshot
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("usage/read did not complete"))
+            !result.snapshot.partial,
+            "optional usage EOF must not make an otherwise complete snapshot partial: {:?}",
+            result.snapshot.warnings
         );
     });
 }
@@ -855,7 +947,7 @@ while IFS= read -r ignored; do :; done
         assert!(started.elapsed() < Duration::from_secs(2));
         let report = trace.report();
         assert!(report.events.iter().any(|event| {
-            event.stage == "app_server.initialize" && event.detail == "status=error"
+            event.stage == "app_server.initialize" && event.detail == "status=error kind=timeout"
         }));
         assert!(
             report
@@ -863,10 +955,8 @@ while IFS= read -r ignored; do :; done
                 .iter()
                 .any(|event| event.stage == "app_server.shutdown")
         );
-        assert!(
-            report.events.iter().any(|event| {
-                event.stage == "app_server.total" && event.detail == "status=error"
-            })
-        );
+        assert!(report.events.iter().any(|event| {
+            event.stage == "app_server.total" && event.detail == "status=timeout"
+        }));
     });
 }

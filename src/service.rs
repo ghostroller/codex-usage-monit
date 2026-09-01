@@ -107,6 +107,7 @@ pub struct ServiceOptions {
     pub history_dir: PathBuf,
     pub status_file: PathBuf,
     pub perf_log: Option<PathBuf>,
+    pub trace_log: Option<PathBuf>,
     /// Exact remotes.json selected when the service definition is installed.
     /// Background managers do not reliably inherit the installing shell's
     /// CODEX_USAGE_MONIT_CONFIG_DIR environment.
@@ -163,6 +164,7 @@ impl ServiceOptions {
             history_dir,
             status_file,
             perf_log,
+            trace_log: None,
             remotes_config_file: None,
             project_mapping_file: None,
             environment_path: env::var_os("PATH"),
@@ -206,6 +208,10 @@ impl ServiceOptions {
         if let Some(perf_log) = self.perf_log.as_deref() {
             arguments.push(OsString::from("--perf-log"));
             arguments.push(perf_log.as_os_str().to_owned());
+        }
+        if let Some(trace_log) = self.trace_log.as_deref() {
+            arguments.push(OsString::from("--trace-log"));
+            arguments.push(trace_log.as_os_str().to_owned());
         }
         if let Some(remotes_config_file) = self.remotes_config_file.as_deref() {
             arguments.push(OsString::from("--service-remotes-config"));
@@ -1462,6 +1468,13 @@ fn validate_options(options: &ServiceOptions) -> Result<()> {
         .is_some_and(|path| path.to_str().is_none())
     {
         bail!("performance log path cannot be represented in a service definition");
+    }
+    if options
+        .trace_log
+        .as_deref()
+        .is_some_and(|path| path.to_str().is_none())
+    {
+        bail!("trace log path cannot be represented in a service definition");
     }
     if let Some(path) = options.remotes_config_file.as_deref() {
         if !path.is_absolute() {
@@ -4335,6 +4348,7 @@ mod tests {
             Some(root.join("State Dir/perf log.jsonl")),
         );
         options.codex_bin = Some(root.join("Codex & $% tools/codex.cmd"));
+        options.trace_log = Some(root.join("State Dir/trace log.jsonl"));
         options.environment_path = Some(OsString::from("/opt/codex & tools/bin:/usr/bin"));
         options.remotes_config_file = Some(root.join("Config Dir/remotes.json"));
         options.project_mapping_file = Some(root.join("Config Dir/project-mappings.json"));
@@ -4357,6 +4371,7 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\A B\State Dir\perf log.jsonl")),
         );
         options.codex_bin = Some(PathBuf::from(r"C:\Users\A B\Codex & $% tools\codex.cmd"));
+        options.trace_log = Some(PathBuf::from(r"C:\Users\A B\State Dir\trace log.jsonl"));
         options.environment_path = Some(OsString::from("/opt/codex & tools/bin:/usr/bin"));
         options.remotes_config_file = Some(PathBuf::from(r"C:\Users\A B\Config Dir\remotes.json"));
         options.project_mapping_file = Some(PathBuf::from(
@@ -4421,6 +4436,7 @@ mod tests {
         }));
         assert!(arguments.contains(&root.join("State Dir/history-v1").into_os_string()));
         assert!(arguments.contains(&root.join("State Dir/perf log.jsonl").into_os_string()));
+        assert!(arguments.contains(&root.join("State Dir/trace log.jsonl").into_os_string()));
         assert!(arguments.contains(&OsString::from("--service-remotes-config")));
         assert!(arguments.contains(&root.join("Config Dir/remotes.json").into_os_string()));
         assert!(arguments.contains(&OsString::from("--service-project-mapping-file")));

@@ -1,6 +1,10 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{self, Stdout, Write};
+#[cfg(unix)]
+use std::fs::File;
+use std::io::{self, IsTerminal, Stdout, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,12 +78,12 @@ use text::{
 
 #[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
-use crate::api_cost::{format_api_cost_amount, format_pico_usd};
+use crate::api_cost::{format_api_cost_amount, format_pico_usd, pricing_metadata};
 use crate::attribution::ESTIMATED_COST_UNITS_PER_CREDIT;
 use crate::config::CollectConfig;
 use crate::domain::{
-    AccountSnapshot, ApiCostAmount, AttributionSummary, Confidence, ModelUsage, Provenance,
-    Snapshot, SourceStatus, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus,
+    AccountSnapshot, ApiCostAmount, AttributionSummary, CollectionStats, Confidence, ModelUsage,
+    Provenance, Snapshot, SourceStatus, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus,
     WindowAnalysis, WindowUsage, terminal_safe_text,
 };
 #[cfg(test)]
@@ -91,6 +95,7 @@ use crate::history_profile_lease::{
 };
 use crate::history_query::{
     HistorySourceSelection, HistorySourceSelectionStatus, HistorySourceUnavailableReason,
+    UnifiedHistoryBackend,
 };
 use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
 use crate::open_config::{OpenConfig, OpenConfigStore};
@@ -125,7 +130,7 @@ use crate::session_launch::{
     render_resume_command,
 };
 use crate::snapshot::{
-    CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed,
+    CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed_coalesced,
 };
 use crate::source_export::LocalSessionDigestEvidence;
 use crate::source_history::{
@@ -153,6 +158,7 @@ use crate::summary_report::{
     SUMMARY_BACKFILL_MAX_FILES, SUMMARY_BACKFILL_RETRY_DAYS, SUMMARY_HISTORY_DAYS,
     SummaryDailyCoverage, expected_summary_coverage, summary_api_cost_for_catalog,
 };
+use crate::trace::{TraceFields, TraceLog, TraceOutcome, process_trace_log};
 use crate::trends::{
     TrendPoint, TrendReadout, TrendReadoutValue, TrendsReport, build_trends_report,
 };
@@ -209,6 +215,31 @@ struct TuiRemoteOverviewCache {
     initialized: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TuiHistoryProjectionRevision {
+    ownership: OwnershipManifestStatus,
+    project_mapping_revision: u64,
+    local_observation_revision: u64,
+    sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
+}
+
+impl TuiHistoryProjectionRevision {
+    fn same_query_inputs_except_local_revision(&self, other: &Self) -> bool {
+        self.ownership == other.ownership
+            && self.project_mapping_revision == other.project_mapping_revision
+            && self.sources == other.sources
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TuiHistoryProjectionCache {
+    selection: HistorySourceSelection,
+    since: DateTime<Utc>,
+    revision: TuiHistoryProjectionRevision,
+    projection: TuiHistoryProjection,
+    loaded_at: Instant,
+}
+
 /// History state used by the interactive UI.
 ///
 /// The canonical user-level store is ownership-aware and source-aware. The
@@ -221,6 +252,9 @@ struct TuiHistoryStore {
     profile_lease: Option<HistoryProfileLeaseGuard>,
     setup_warnings: Vec<String>,
     last_runtime_load_at: Option<Instant>,
+    projection_cache: Option<TuiHistoryProjectionCache>,
+    #[cfg(test)]
+    projection_cache_delivery_clones: usize,
     remote_overview_cache: TuiRemoteOverviewCache,
 }
 
@@ -243,6 +277,9 @@ impl TuiHistoryStore {
             profile_lease,
             setup_warnings,
             last_runtime_load_at: None,
+            projection_cache: None,
+            #[cfg(test)]
+            projection_cache_delivery_clones: 0,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
     }
@@ -253,6 +290,9 @@ impl TuiHistoryStore {
             profile_lease: None,
             setup_warnings,
             last_runtime_load_at: None,
+            projection_cache: None,
+            #[cfg(test)]
+            projection_cache_delivery_clones: 0,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
     }
@@ -517,6 +557,171 @@ impl TuiHistoryStore {
             .history
     }
 
+    /// Cheap, content-free generation vector for one source projection. The
+    /// local revision covers account/bucket/weekly/digest writes, while each
+    /// SSH active-generation reference covers an atomic remote replacement.
+    /// Metadata and project-mapping revisions complete the query inputs.
+    fn projection_revision(
+        &self,
+        selection: &HistorySourceSelection,
+    ) -> io::Result<Option<TuiHistoryProjectionRevision>> {
+        let Some(before) = self.projection_revision_once(selection)? else {
+            return Ok(None);
+        };
+        let Some(after) = self.projection_revision_once(selection)? else {
+            return Ok(None);
+        };
+        Ok((before == after).then_some(after))
+    }
+
+    fn projection_revision_once(
+        &self,
+        selection: &HistorySourceSelection,
+    ) -> io::Result<Option<TuiHistoryProjectionRevision>> {
+        let TuiHistoryBackend::Runtime(runtime) = &self.backend else {
+            return Ok(None);
+        };
+        let ownership = runtime.ownership().load_manifest()?;
+        if !matches!(
+            &ownership,
+            OwnershipManifestStatus::Initialized(manifest)
+                if manifest.state() == HistoryOwnershipState::V2Active
+        ) {
+            return Ok(None);
+        }
+        let project_mapping_revision = match runtime.project_mapping_store().load() {
+            Ok(mappings) => mappings.revision(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        let local_observation_revision = runtime.source_history().load_local_observation_revision(
+            runtime.source_identity(),
+            runtime.redaction_profile(),
+        )?;
+        let mut metadata = runtime.source_history().list_source_metadata()?;
+        metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
+        let selected = metadata.into_iter().filter(|source| match selection {
+            HistorySourceSelection::AllIncluded => source.include_in_aggregates(),
+            HistorySourceSelection::Local(source_id)
+            | HistorySourceSelection::Remote(source_id) => source.source_id() == source_id,
+        });
+        let sources = selected
+            .map(|source| {
+                let active = (source.kind() == SourceKind::Ssh)
+                    .then(|| {
+                        runtime.source_history().active_remote_history_ref(
+                            source.source_id(),
+                            source.aggregate_redaction_profile(),
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok((source, active))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Some(TuiHistoryProjectionRevision {
+            ownership,
+            project_mapping_revision,
+            local_observation_revision,
+            sources,
+        }))
+    }
+
+    /// Validates (and, for a proven no-op write, rebases) the cache without
+    /// cloning its potentially large projection. The two-second maintenance
+    /// poll uses this probe when it only needs to decide whether to reload.
+    fn projection_cache_valid(
+        &mut self,
+        selection: &HistorySourceSelection,
+        since: DateTime<Utc>,
+        rebase_revision: bool,
+    ) -> bool {
+        let Some(revision) = self.projection_revision(selection).ok().flatten() else {
+            return false;
+        };
+        let Some(cache) = self.projection_cache.as_mut() else {
+            return false;
+        };
+        if cache.selection != *selection
+            || cache.since != since
+            || cache.loaded_at.elapsed() >= HISTORY_FLUSH_INTERVAL
+            || if rebase_revision {
+                !cache
+                    .revision
+                    .same_query_inputs_except_local_revision(&revision)
+            } else {
+                cache.revision != revision
+            }
+        {
+            return false;
+        }
+        if rebase_revision {
+            cache.revision = revision;
+        }
+        true
+    }
+
+    fn clone_cached_projection(&mut self) -> Option<TuiHistoryProjection> {
+        if self.projection_cache.is_none() {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.projection_cache_delivery_clones =
+                self.projection_cache_delivery_clones.saturating_add(1);
+        }
+        let cache = self
+            .projection_cache
+            .as_ref()
+            .expect("projection cache presence was checked above");
+        let mut projection = cache.projection.clone();
+        if !self.write_permitted() {
+            projection.history.read_only = true;
+        }
+        self.merge_setup_warnings(&mut projection.history);
+        normalize_history_warnings(&mut projection.history);
+        Some(projection)
+    }
+
+    fn cached_projection(
+        &mut self,
+        selection: &HistorySourceSelection,
+        since: DateTime<Utc>,
+        rebase_revision: bool,
+    ) -> Option<TuiHistoryProjection> {
+        self.projection_cache_valid(selection, since, rebase_revision)
+            .then(|| self.clone_cached_projection())
+            .flatten()
+    }
+
+    fn cache_projection_if_revision_consistent(
+        &mut self,
+        selection: &HistorySourceSelection,
+        since: DateTime<Utc>,
+        projection: &TuiHistoryProjection,
+        revision_before: Option<TuiHistoryProjectionRevision>,
+        revision_after: Option<TuiHistoryProjectionRevision>,
+    ) -> bool {
+        let Some(revision) =
+            revision_before.filter(|before| Some(before) == revision_after.as_ref())
+        else {
+            self.invalidate_projection_cache();
+            return false;
+        };
+        self.projection_cache = Some(TuiHistoryProjectionCache {
+            selection: selection.clone(),
+            since,
+            revision,
+            projection: projection.clone(),
+            loaded_at: Instant::now(),
+        });
+        true
+    }
+
+    fn invalidate_projection_cache(&mut self) {
+        self.projection_cache = None;
+    }
+
     /// Performs an ownership-consistent disk query for the exact requested
     /// projection. This deliberately bypasses the TUI's 30-second reload gate;
     /// source switches must filter before aggregation and must never reuse an
@@ -527,14 +732,21 @@ impl TuiHistoryStore {
         since: DateTime<Utc>,
     ) -> TuiHistoryProjection {
         let runtime_backend = matches!(&self.backend, TuiHistoryBackend::Runtime(_));
-        let (mut history, status, query_error) = match &mut self.backend {
+        let revision_before = runtime_backend
+            .then(|| self.projection_revision(selection).ok().flatten())
+            .flatten();
+        let (mut history, status, query_error, cacheable) = match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => {
                 match runtime.load_unified_history_since_with_staged_selected(selection, since) {
-                    Ok(snapshot) => (
-                        snapshot.history,
-                        Some(snapshot.source_selection_status),
-                        None,
-                    ),
+                    Ok(snapshot) => {
+                        let cacheable = snapshot.backend == UnifiedHistoryBackend::V2;
+                        (
+                            snapshot.history,
+                            Some(snapshot.source_selection_status),
+                            None,
+                            cacheable,
+                        )
+                    }
                     Err(error) => {
                         let mut history = HistoryData::default();
                         // Only an all-source failure may expose the legacy
@@ -548,7 +760,7 @@ impl TuiHistoryStore {
                         history
                             .warnings
                             .push(format!("history query failed: {error}"));
-                        (history, None, Some(error.to_string()))
+                        (history, None, Some(error.to_string()), false)
                     }
                 }
             }
@@ -557,6 +769,7 @@ impl TuiHistoryStore {
                     store.load_since_with_staged(since),
                     Some(HistorySourceSelectionStatus::Applied),
                     None,
+                    false,
                 ),
                 HistorySourceSelection::Local(_) | HistorySourceSelection::Remote(_) => {
                     // Quota is account-global, so preserve it (plus legacy
@@ -576,6 +789,7 @@ impl TuiHistoryStore {
                             HistorySourceUnavailableReason::UnsupportedByLegacy,
                         )),
                         None,
+                        false,
                     )
                 }
             },
@@ -588,12 +802,25 @@ impl TuiHistoryStore {
         }
         self.merge_setup_warnings(&mut history);
         normalize_history_warnings(&mut history);
-        TuiHistoryProjection {
+        let projection = TuiHistoryProjection {
             history,
             selection: selection.clone(),
             status,
             query_error,
+        };
+        if cacheable && projection.query_error.is_none() {
+            let revision_after = self.projection_revision(selection).ok().flatten();
+            self.cache_projection_if_revision_consistent(
+                selection,
+                since,
+                &projection,
+                revision_before,
+                revision_after,
+            );
+        } else if runtime_backend {
+            self.invalidate_projection_cache();
         }
+        projection
     }
 
     fn reload_since_if_stale_with_staged_selected(
@@ -607,10 +834,7 @@ impl TuiHistoryStore {
             // shard stamp as its staleness oracle. Mirror the legacy 30-second
             // read cache instead of rescanning all source shards on every
             // two-second local rollout poll.
-            if self
-                .last_runtime_load_at
-                .is_some_and(|loaded| loaded.elapsed() < HISTORY_FLUSH_INTERVAL)
-            {
+            if self.projection_cache_valid(selection, since, false) {
                 return None;
             }
             return Some(self.load_since_with_staged_selected(selection, since));
@@ -644,12 +868,16 @@ impl TuiHistoryStore {
                 TUI_HISTORY_PROFILE_BUSY_WARNING,
             ));
         }
-        match &mut self.backend {
+        let result = match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => {
                 runtime.mark_summary_backfill_attempt(completed_at, complete)
             }
             TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+        };
+        if result.is_ok() {
+            self.invalidate_projection_cache();
         }
+        result
     }
 }
 
@@ -694,6 +922,139 @@ const SUMMARY_STACKED_PROJECT_LIMIT: usize = 6;
 const SUMMARY_PROJECT_COLOR_CANDIDATES: usize = 24;
 const SUMMARY_PROJECT_COLOR_MIN_DISTANCE_SQUARED: u32 = 5_000;
 const MAX_DEBUG_STARTUP_CELLS: u32 = 500_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalEventWait {
+    Ready,
+    TimedOut,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Disconnected,
+}
+
+#[cfg(unix)]
+enum TerminalInputFd {
+    Stdin,
+    Tty(File),
+}
+
+#[cfg(unix)]
+struct TerminalInputMonitor {
+    fd: TerminalInputFd,
+}
+
+#[cfg(unix)]
+impl TerminalInputMonitor {
+    fn open() -> io::Result<Self> {
+        if !io::stdout().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "interactive TUI output is not attached to a terminal",
+            ));
+        }
+        // Crossterm uses stdin when it is a TTY and otherwise opens /dev/tty.
+        // Mirror that choice so POLLHUP/POLLERR can be observed before calling
+        // crossterm's reader. Crossterm 0.28 loops on a zero-byte TTY read, so
+        // entering it after a PTY hangup can otherwise consume a full CPU core.
+        let fd = if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            TerminalInputFd::Stdin
+        } else {
+            TerminalInputFd::Tty(File::options().read(true).write(true).open("/dev/tty")?)
+        };
+        Ok(Self { fd })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        match &self.fd {
+            TerminalInputFd::Stdin => libc::STDIN_FILENO,
+            TerminalInputFd::Tty(file) => file.as_raw_fd(),
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> io::Result<TerminalEventWait> {
+        poll_terminal_fd(self.raw_fd(), timeout)
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalInputMonitor;
+
+#[cfg(not(unix))]
+impl TerminalInputMonitor {
+    fn open() -> io::Result<Self> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "interactive TUI input/output is not attached to a terminal",
+            ))
+        } else {
+            Ok(Self)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn poll_terminal_fd(fd: RawFd, timeout: Duration) -> io::Result<TerminalEventWait> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(TerminalEventWait::TimedOut)
+        } else {
+            Err(error)
+        };
+    }
+    if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Ok(TerminalEventWait::Disconnected);
+    }
+    if descriptor.revents & libc::POLLIN != 0 {
+        Ok(TerminalEventWait::Ready)
+    } else {
+        Ok(TerminalEventWait::TimedOut)
+    }
+}
+
+fn wait_for_terminal_event(
+    monitor: &TerminalInputMonitor,
+    timeout: Duration,
+) -> io::Result<TerminalEventWait> {
+    #[cfg(unix)]
+    {
+        if monitor.wait(timeout)? == TerminalEventWait::Disconnected {
+            return Ok(TerminalEventWait::Disconnected);
+        }
+        // Check the terminal again immediately before entering crossterm. Use
+        // a zero timeout there: the blocking wait above owns pacing, while the
+        // second hangup check closes the race that created detached busy loops.
+        if monitor.wait(Duration::ZERO)? == TerminalEventWait::Disconnected {
+            return Ok(TerminalEventWait::Disconnected);
+        }
+        return event::poll(Duration::ZERO).map(|ready| {
+            if ready {
+                TerminalEventWait::Ready
+            } else {
+                TerminalEventWait::TimedOut
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = monitor;
+        event::poll(timeout).map(|ready| {
+            if ready {
+                TerminalEventWait::Ready
+            } else {
+                TerminalEventWait::TimedOut
+            }
+        })
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -2415,6 +2776,13 @@ impl RemoteUiActionKind {
             Self::Purge => "purge",
         }
     }
+
+    fn may_change_history_projection(&self) -> bool {
+        matches!(
+            self,
+            Self::Sync | Self::Include | Self::Exclude | Self::Purge
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2526,6 +2894,13 @@ impl RemoteActionCancellation {
         if let Some(target) = state.target {
             let _ = target.terminate();
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled
     }
 }
 
@@ -2887,6 +3262,10 @@ struct App {
     quit_confirmation_hitbox: Option<QuitConfirmationHitbox>,
     quit_requested: bool,
     turn_reveal_pending: bool,
+    /// True only for the real TUI's placeholder first frame. The initial
+    /// rollout scan and history projection start in the refresh worker after
+    /// the terminal has already rendered.
+    initial_bootstrap_pending: bool,
     worker_running: bool,
     last_local_refresh: Instant,
     next_account_refresh: Instant,
@@ -3016,6 +3395,7 @@ impl App {
             quit_confirmation_hitbox: None,
             quit_requested: false,
             turn_reveal_pending: false,
+            initial_bootstrap_pending: false,
             worker_running: false,
             last_local_refresh: Instant::now(),
             next_account_refresh: Instant::now(),
@@ -3917,6 +4297,10 @@ impl App {
             return;
         }
         self.history_source_selection = selection;
+        self.force_history_source_refresh();
+    }
+
+    fn force_history_source_refresh(&mut self) {
         self.history_source_generation = self.history_source_generation.wrapping_add(1);
         self.history_source_loading = true;
         self.history_source_query_pending = true;
@@ -4926,6 +5310,8 @@ impl App {
         if self.pending_remote_action.as_ref() == Some(&completion.request) {
             self.pending_remote_action = None;
         }
+        let refresh_history =
+            completion.result.is_ok() && completion.request.kind.may_change_history_projection();
         self.remote_action_running = None;
         self.reload_remote_sources_with_history(true);
         if completion.result.is_ok()
@@ -4956,6 +5342,9 @@ impl App {
                 completion.request.host_id
             ),
         });
+        if refresh_history {
+            self.force_history_source_refresh();
+        }
     }
 
     fn toggle_setting(&mut self, item: SettingItem) {
@@ -7830,8 +8219,12 @@ pub fn run_with_theme(config: CollectConfig, theme: Theme) -> Result<()> {
 }
 
 fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>) -> Result<()> {
+    // Validate the interactive endpoint before touching rollout or history
+    // state. This keeps accidental service/non-TTY invocation cheap and avoids
+    // starting work that can no longer be observed or cancelled by a user.
+    let terminal_input = TerminalInputMonitor::open()?;
     let (ui_state_store, rollout_cache, history_store, mut app) =
-        prepare_initial_tui(&config, theme_override);
+        prepare_deferred_initial_tui(&config, theme_override);
     let termination = TerminationSignal::install()?;
     let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
     let guard = TerminalGuard::enter()?;
@@ -7862,6 +8255,7 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
         rollout_cache,
         Arc::clone(&history_store),
         &ui_state_store,
+        &terminal_input,
     );
     let cursor_result = terminal.show_cursor();
     drop(guard);
@@ -7873,7 +8267,56 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     result
 }
 
-fn prepare_initial_tui(
+fn initial_loading_result(config: &CollectConfig) -> CollectionResult {
+    let now = Utc::now();
+    let app_server_status = if config.offline { "offline" } else { "loading" };
+    let app_server_message = if config.offline {
+        "disabled by --offline"
+    } else {
+        "initial account collection is running"
+    };
+    CollectionResult {
+        snapshot: Snapshot {
+            schema_version: 2,
+            api_pricing: pricing_metadata(),
+            api_equivalent_cost: None,
+            as_of: now,
+            partial: true,
+            codex_home: config.codex_home.clone(),
+            sources: vec![
+                SourceStatus {
+                    source: "rollout_jsonl".to_owned(),
+                    status: "loading".to_owned(),
+                    as_of: now,
+                    message: Some("initial rollout collection is running".to_owned()),
+                },
+                SourceStatus {
+                    source: "app_server".to_owned(),
+                    status: app_server_status.to_owned(),
+                    as_of: now,
+                    message: Some(app_server_message.to_owned()),
+                },
+            ],
+            limits: Vec::new(),
+            rate_limit_reset_credits: None,
+            rate_limit_reset_credits_partial: !config.offline,
+            account_usage: None,
+            tasks: Vec::new(),
+            turns: Vec::new(),
+            models: Vec::new(),
+            attribution: AttributionSummary::default(),
+            window_analyses: Vec::new(),
+            stats: CollectionStats::default(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        },
+        account: AccountSnapshot::default(),
+        history_observation: HistoryObservation::default(),
+        local_session_digests: LocalSessionDigestEvidence::empty(now),
+    }
+}
+
+fn prepare_deferred_initial_tui(
     config: &CollectConfig,
     theme_override: Option<Theme>,
 ) -> (
@@ -7917,96 +8360,41 @@ fn prepare_initial_tui(
     } else {
         "kind=in_memory"
     });
-    let snapshot_span = config.startup_trace.span("tui.initial_snapshot");
-    let initial = {
-        let mut cache = rollout_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        collect_snapshot_cached(config, None, false, &mut cache)
-    };
-    snapshot_span.finish_with(|| {
-        format!(
-            "tasks={} turns={} files={} lines={}",
-            initial.snapshot.tasks.len(),
-            initial.snapshot.turns.len(),
-            initial.snapshot.stats.scanned_files,
-            initial.snapshot.stats.parsed_lines
-        )
-    });
-    let history_span = config.startup_trace.span("tui.history_load");
+
+    // Runtime discovery/lease acquisition is bounded metadata work. The
+    // expensive projection scan, staging flush, remote overview load, and
+    // rollout parse all run in the refresh worker after the first frame.
+    let history_span = config.startup_trace.span("tui.history_prepare");
     let mut history_store = prepare_tui_history_store(config);
     let local_source_id = history_store.local_source_id();
     let remote_history_sources = history_store.remote_history_sources();
     let remote_source_history_store = history_store.source_history_store();
-    let initial_selection: HistorySourceSelection = (&ui_state.history_source_selection).into();
-    let initial_history_observation = collection_history_observation(&initial, config.offline);
-    let (all_history, recorder_health) = stage_and_load_history(
-        &mut history_store,
-        initial_history_observation.as_ref(),
-        &initial.snapshot.tasks,
-        &initial.local_session_digests,
-        initial.snapshot.as_of,
-        &config.perf_log,
-        true,
-    );
-    let initial_remote_overview_history =
-        history_store.load_remote_overview_history(Some(&all_history), initial.snapshot.as_of);
-    let initial_projection = if matches!(&initial_selection, HistorySourceSelection::AllIncluded) {
-        TuiHistoryProjection {
-            history: all_history,
-            selection: initial_selection.clone(),
-            status: Some(HistorySourceSelectionStatus::Applied),
-            query_error: None,
-        }
-    } else {
-        history_store.load_since_with_staged_selected(
-            &initial_selection,
-            history_view_since(initial.snapshot.as_of),
-        )
-    };
     history_span.finish_with(|| {
         format!(
-            "quota_points={} local_buckets={} warnings={} read_only={}",
-            initial_projection.history.quota_points.len(),
-            initial_projection.history.half_hour_buckets.len(),
-            initial_projection.history.warnings.len(),
-            initial_projection.history.read_only
+            "local_source={} remote_sources={}",
+            local_source_id.is_some(),
+            remote_history_sources.len()
         )
     });
+
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
-    let mut app = App::new(initial, initial_theme);
+    let mut app = App::new(initial_loading_result(config), initial_theme);
     app.history_local_source_id = local_source_id;
     app.history_remote_sources = remote_history_sources;
     app.remote_source_history_store = remote_source_history_store;
     app.local_redact_content = config.redact_content;
     app.reload_remote_sources();
-    match history_store.load_remote_live_states() {
-        Ok(states) => {
-            app.replace_remote_live_states(states);
-        }
-        Err(error) => {
-            app.record_remote_live_load_error(error);
-        }
-    }
-    match initial_remote_overview_history {
-        Ok(history) => {
-            app.replace_remote_overview_history(history);
-        }
-        Err(error) => {
-            app.record_remote_overview_history_load_error(error);
-        }
-    }
-    app.replace_recorder_health(recorder_health);
     app.apply_ui_state(&ui_state, theme_override);
+    app.history_source_loading = true;
+    app.initial_bootstrap_pending = true;
     if app.view == View::Settings {
         app.reload_project_mappings();
     }
-    app.apply_history_projection(0, initial_projection);
     app.apply_open_config(open_config, open_config_error);
     app_span.finish_with(|| {
         format!(
-            "theme={} turns_visible={} models_visible={} tree={}",
+            "theme={} turns_visible={} models_visible={} tree={} initial=deferred",
             match initial_theme {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
@@ -8016,7 +8404,7 @@ fn prepare_initial_tui(
             matches!(app.task_list_mode, TaskListMode::Tree)
         )
     });
-    bootstrap_span.finish("status=ready_to_render");
+    bootstrap_span.finish("status=ready_to_render initial=deferred");
     (
         ui_state_store,
         rollout_cache,
@@ -8241,13 +8629,13 @@ fn apply_tui_history_write_metrics(
 
 fn merge_tui_history_write_result(
     history: &mut HistoryData,
-    write_result: io::Result<Option<HistoryRuntimeWriteReport>>,
+    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
     operation: &str,
 ) {
     match write_result {
         Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
             history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings);
+            history.warnings.extend(report.warnings.iter().cloned());
         }
         Ok(Some(HistoryRuntimeWriteReport::V2(_))) | Ok(None) => {}
         Err(error) => history
@@ -8256,6 +8644,7 @@ fn merge_tui_history_write_result(
     }
 }
 
+#[cfg(test)]
 fn stage_and_load_history(
     store: &mut TuiHistoryStore,
     observation: &HistoryObservation,
@@ -8328,6 +8717,72 @@ enum TuiHistoryStageMode {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiHistoryCacheEffect {
+    Preserve,
+    RebaseRevision,
+    Invalidate,
+}
+
+fn tui_history_cache_effect(
+    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
+) -> TuiHistoryCacheEffect {
+    match write_result {
+        Ok(None) => TuiHistoryCacheEffect::Preserve,
+        Ok(Some(HistoryRuntimeWriteReport::V1(_))) | Err(_) => TuiHistoryCacheEffect::Invalidate,
+        Ok(Some(HistoryRuntimeWriteReport::V2(report))) => {
+            let shards_written = report
+                .account
+                .shards_written
+                .saturating_add(report.buckets.shards_written)
+                .saturating_add(report.weekly.shards_written)
+                .saturating_add(report.session_digests.shards_written)
+                .saturating_add(report.garbage_collection.shards_pruned);
+            if shards_written == 0 && report.garbage_collection.warning.is_none() {
+                TuiHistoryCacheEffect::RebaseRevision
+            } else {
+                TuiHistoryCacheEffect::Invalidate
+            }
+        }
+    }
+}
+
+fn append_tui_history_write_trace_fields(
+    fields: TraceFields,
+    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
+) -> TraceFields {
+    match write_result {
+        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => fields
+            .label("writeBackend", "v1")
+            .usize("writeShardsWritten", report.shards_written)
+            .usize("writeShardsSkipped", report.shards_skipped)
+            .usize("writeShardsPruned", report.shards_pruned),
+        Ok(Some(HistoryRuntimeWriteReport::V2(report))) => fields
+            .label("writeBackend", "v2")
+            .usize("accountShardsWritten", report.account.shards_written)
+            .usize("accountShardsSkipped", report.account.shards_skipped)
+            .usize("accountRecordCount", report.account_records)
+            .usize("bucketShardsWritten", report.buckets.shards_written)
+            .usize("bucketShardsSkipped", report.buckets.shards_skipped)
+            .usize("bucketRecordCount", report.bucket_records)
+            .usize("bucketTombstoneCount", report.bucket_tombstones)
+            .usize("weeklyShardsWritten", report.weekly.shards_written)
+            .usize("weeklyShardsSkipped", report.weekly.shards_skipped)
+            .usize("weeklyRecordCount", report.weekly_records)
+            .usize("weeklyTombstoneCount", report.weekly_tombstones)
+            .usize("digestShardsWritten", report.session_digests.shards_written)
+            .usize("digestShardsSkipped", report.session_digests.shards_skipped)
+            .usize("digestRecordCount", report.session_digest_records)
+            .usize("digestTombstoneCount", report.session_digest_tombstones)
+            .usize(
+                "garbageCollectionShardsPruned",
+                report.garbage_collection.shards_pruned,
+            ),
+        Ok(None) => fields.label("writeBackend", "none"),
+        Err(_) => fields.label("writeBackend", "error"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage_and_load_history_selected_with_mode(
     store: &mut TuiHistoryStore,
@@ -8339,6 +8794,14 @@ fn stage_and_load_history_selected_with_mode(
     mode: TuiHistoryStageMode,
     selection: &HistorySourceSelection,
 ) -> (TuiHistoryProjection, RecorderHealth) {
+    let trace = process_trace_log().span_with("history.stage_load", || {
+        TraceFields::new()
+            .label("mode", history_stage_mode_label(mode))
+            .label("sourceScope", history_source_scope_label(selection))
+            .usize("taskCount", tasks.len())
+            .usize("bucketCount", observation.half_hour_buckets.len())
+            .usize("weeklyPointCount", observation.weekly_local_points.len())
+    });
     let total_started = Instant::now();
     let stage_started = Instant::now();
     match mode {
@@ -8359,9 +8822,21 @@ fn stage_and_load_history_selected_with_mode(
             store.flush_staged_if_due(HISTORY_FLUSH_INTERVAL)
         }
     };
+    let write_failed = write_result.is_err();
     let record_elapsed = record_started.elapsed();
     let load_started = Instant::now();
-    let mut projection = store.load_since_with_staged_selected(selection, since);
+    let cache_effect = tui_history_cache_effect(&write_result);
+    if cache_effect == TuiHistoryCacheEffect::Invalidate {
+        store.invalidate_projection_cache();
+    }
+    let cached = match cache_effect {
+        TuiHistoryCacheEffect::Preserve => store.cached_projection(selection, since, false),
+        TuiHistoryCacheEffect::RebaseRevision => store.cached_projection(selection, since, true),
+        TuiHistoryCacheEffect::Invalidate => None,
+    };
+    let cache_hit = cached.is_some();
+    let mut projection =
+        cached.unwrap_or_else(|| store.load_since_with_staged_selected(selection, since));
     let load_elapsed = load_started.elapsed();
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, Some(load_elapsed));
@@ -8376,15 +8851,70 @@ fn stage_and_load_history_selected_with_mode(
         u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    merge_tui_history_write_result(&mut projection.history, write_result, "history persistence");
+    merge_tui_history_write_result(
+        &mut projection.history,
+        &write_result,
+        "history persistence",
+    );
     normalize_history_warnings(&mut projection.history);
-    if metrics.record_performed {
+    let record_performed = metrics.record_performed;
+    if record_performed {
         perf_log.record_history(metrics);
     } else {
         perf_log.record_history_runtime(total_started.elapsed());
     }
     let recorder_health = load_recorder_health(store);
+    let outcome = if write_failed || projection.query_error.is_some() {
+        TraceOutcome::Partial
+    } else {
+        TraceOutcome::Ok
+    };
+    trace.finish_with(outcome, || {
+        append_tui_history_write_trace_fields(
+            TraceFields::new()
+                .u64(
+                    "stageUs",
+                    u64::try_from(stage_elapsed.as_micros()).unwrap_or(u64::MAX),
+                )
+                .u64(
+                    "recordUs",
+                    u64::try_from(record_elapsed.as_micros()).unwrap_or(u64::MAX),
+                )
+                .u64(
+                    "loadUs",
+                    u64::try_from(load_elapsed.as_micros()).unwrap_or(u64::MAX),
+                )
+                .bool("recordPerformed", record_performed)
+                .bool("readOnly", projection.history.read_only)
+                .bool("writeFailed", write_failed)
+                .bool("queryFailed", projection.query_error.is_some())
+                .bool("projectionCacheHit", cache_hit)
+                .usize("quotaPointCount", projection.history.quota_points.len())
+                .usize("bucketCount", projection.history.half_hour_buckets.len())
+                .usize(
+                    "weeklyPointCount",
+                    projection.history.weekly_local_points.len(),
+                ),
+            &write_result,
+        )
+    });
     (projection, recorder_health)
+}
+
+fn history_stage_mode_label(mode: TuiHistoryStageMode) -> &'static str {
+    match mode {
+        TuiHistoryStageMode::Incremental { force_flush: true } => "incremental_force_flush",
+        TuiHistoryStageMode::Incremental { force_flush: false } => "incremental",
+        TuiHistoryStageMode::Full => "full",
+    }
+}
+
+fn history_source_scope_label(selection: &HistorySourceSelection) -> &'static str {
+    match selection {
+        HistorySourceSelection::AllIncluded => "all",
+        HistorySourceSelection::Local(_) => "local",
+        HistorySourceSelection::Remote(_) => "remote",
+    }
 }
 
 fn flush_or_reload_history_if_due(
@@ -8402,14 +8932,29 @@ fn flush_or_reload_history_if_due(
         Err(_) => true,
     };
     let load_started = Instant::now();
+    let since = history_view_since(now);
+    let cache_effect = tui_history_cache_effect(&write_result);
+    if cache_effect == TuiHistoryCacheEffect::Invalidate {
+        store.invalidate_projection_cache();
+    }
+    let cache_valid = match cache_effect {
+        TuiHistoryCacheEffect::Preserve => store.projection_cache_valid(selection, since, false),
+        TuiHistoryCacheEffect::RebaseRevision => {
+            store.projection_cache_valid(selection, since, true)
+        }
+        TuiHistoryCacheEffect::Invalidate => false,
+    };
+    if cache_valid && !record_performed {
+        perf_log.record_history_runtime(total_started.elapsed());
+        return None;
+    }
+    let cached = cache_valid
+        .then(|| store.clone_cached_projection())
+        .flatten();
     let reloaded =
-        store.reload_since_if_stale_with_staged_selected(selection, history_view_since(now));
+        cached.or_else(|| store.reload_since_if_stale_with_staged_selected(selection, since));
     let (mut projection, load_elapsed) = match reloaded {
         Some(projection) => (projection, Some(load_started.elapsed())),
-        None if record_performed => (
-            store.load_since_with_staged_selected(selection, history_view_since(now)),
-            Some(load_started.elapsed()),
-        ),
         None => {
             perf_log.record_history_runtime(total_started.elapsed());
             return None;
@@ -8424,7 +8969,11 @@ fn flush_or_reload_history_if_due(
         u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    merge_tui_history_write_result(&mut projection.history, write_result, "history persistence");
+    merge_tui_history_write_result(
+        &mut projection.history,
+        &write_result,
+        "history persistence",
+    );
     normalize_history_warnings(&mut projection.history);
     metrics.warnings = metrics
         .warnings
@@ -8437,9 +8986,15 @@ fn flush_or_reload_history_if_due(
 
 fn flush_staged_history_on_exit(history_store: &Arc<Mutex<TuiHistoryStore>>, perf_log: &PerfLog) {
     let total_started = Instant::now();
-    let mut store = history_store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = match history_store.try_lock() {
+        Ok(store) => store,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        // Never turn a prompt terminal exit into a wait for an expensive
+        // initial rollout/history worker. The worker owns the staged data and
+        // the process is already exiting; a recorder or the next refresh can
+        // persist a later observation.
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
     let record_started = Instant::now();
     let write_result = store.flush_staged();
     if matches!(&write_result, Ok(None)) {
@@ -8499,16 +9054,78 @@ pub fn debug_startup(
         "debug-startup canvas exceeds {MAX_DEBUG_STARTUP_CELLS} cells"
     );
     let trace = config.startup_trace.clone();
-    let (_ui_state_store, _rollout_cache, _history_store, mut app) =
-        prepare_initial_tui(&config, theme_override);
+    let (_ui_state_store, rollout_cache, history_store, mut app) =
+        prepare_deferred_initial_tui(&config, theme_override);
     let terminal_span = trace.span("tui.headless_terminal_setup");
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal_span.finish_with(|| format!("width={width} height={height}"));
     let draw_span = trace.span("tui.first_frame");
     terminal.draw(|frame| render(frame, &mut app))?;
     draw_span.finish_with(|| format!("backend=test width={width} height={height}"));
-    trace.finish("startup.ready", "mode=debug_startup backend=test");
+
+    // `debug-startup` deliberately renders the same lightweight placeholder
+    // as the real TUI first, then runs the exact deferred bootstrap path to
+    // data-ready. Keeping collection/history work in the shared helper makes
+    // this command useful for diagnosing slow cold starts without allowing a
+    // second headless-only implementation to drift from production.
+    let data_ready_span = trace.span("tui.initial_data_ready");
+    let history_source_generation = app.history_source_generation;
+    let history_source_selection = app.history_source_selection.clone();
+    app.initial_bootstrap_pending = false;
+    app.worker_running = true;
+    let completion = collect_initial_refresh_completion(
+        &config,
+        &rollout_cache,
+        &history_store,
+        history_source_generation,
+        &history_source_selection,
+    );
+    let refreshed = apply_refresh_completion(&mut app, completion);
+    let ready_draw_span = trace.span("tui.data_ready_frame");
+    terminal.draw(|frame| render(frame, &mut app))?;
+    ready_draw_span.finish_with(|| format!("backend=test width={width} height={height}"));
+    data_ready_span.finish_with(|| format!("refreshed={refreshed}"));
+    trace.finish(
+        "startup.ready",
+        "mode=debug_startup backend=test state=data_ready",
+    );
     Ok(())
+}
+
+fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> bool {
+    let mut refresh_changed = false;
+    if completion.summary_backfill {
+        app.summary_backfill_running = false;
+    }
+    if let Some(result) = completion.result {
+        app.replace(result, completion.refreshed_account);
+        refresh_changed = true;
+    } else {
+        app.finish_unchanged_refresh();
+    }
+    if let Some(history) = completion.history
+        && app.apply_history_projection(history.generation, history.projection)
+    {
+        refresh_changed = true;
+    }
+    if let Some(recorder_health) = completion.recorder_health {
+        app.replace_recorder_health(recorder_health);
+        refresh_changed = true;
+    }
+    if let Some(remote_live) = completion.remote_live {
+        refresh_changed |= match remote_live {
+            Ok(states) => app.replace_remote_live_states(states),
+            Err(error) => app.record_remote_live_load_error(error),
+        };
+    }
+    if let Some(remote_history) = completion.remote_overview_history {
+        refresh_changed |= match remote_history {
+            Ok(history) => app.replace_remote_overview_history(history),
+            Err(error) => app.record_remote_overview_history_load_error(error),
+        };
+    }
+    refresh_changed |= app.reload_remote_sources();
+    refresh_changed
 }
 
 fn run_loop(
@@ -8519,6 +9136,7 @@ fn run_loop(
     rollout_cache: Arc<Mutex<RolloutCache>>,
     history_store: Arc<Mutex<TuiHistoryStore>>,
     ui_state_store: &UiStateStore,
+    terminal_input: &TerminalInputMonitor,
 ) -> Result<()> {
     let mut first_frame = true;
     let mut redraw_reasons = RedrawReasons::default();
@@ -8530,41 +9148,8 @@ fn run_loop(
             return Ok(());
         }
         while let Ok(completion) = context.refresh_receiver.try_recv() {
-            let mut refresh_changed = false;
-            if completion.summary_backfill {
-                app.summary_backfill_running = false;
-            }
-            if let Some(result) = completion.result {
-                app.replace(result, completion.refreshed_account);
-                refresh_changed = true;
-            } else {
-                app.finish_unchanged_refresh();
-            }
-            if let Some(history) = completion.history
-                && app.apply_history_projection(history.generation, history.projection)
-            {
-                refresh_changed = true;
-            }
-            if let Some(recorder_health) = completion.recorder_health {
-                app.replace_recorder_health(recorder_health);
-                refresh_changed = true;
-            }
-            if let Some(remote_live) = completion.remote_live {
-                refresh_changed |= match remote_live {
-                    Ok(states) => app.replace_remote_live_states(states),
-                    Err(error) => app.record_remote_live_load_error(error),
-                };
-            }
-            if let Some(remote_history) = completion.remote_overview_history {
-                refresh_changed |= match remote_history {
-                    Ok(history) => app.replace_remote_overview_history(history),
-                    Err(error) => app.record_remote_overview_history_load_error(error),
-                };
-            }
+            let refresh_changed = apply_refresh_completion(app, completion);
             if refresh_changed {
-                redraw_reasons.insert(RedrawReasons::SNAPSHOT);
-            }
-            if app.reload_remote_sources() {
                 redraw_reasons.insert(RedrawReasons::SNAPSHOT);
             }
             refresh_worker.join();
@@ -8616,42 +9201,52 @@ fn run_loop(
             redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
 
-        if event::poll(context.termination.poll_timeout(next_run_loop_poll_timeout(
-            app,
-            Instant::now(),
-            !config.offline,
-        )))? {
-            config.perf_log.record_event_wakeup();
-            let previous_ui_state = app.ui_state();
-            let mut should_quit = false;
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    redraw_reasons.insert(RedrawReasons::INPUT);
-                    if handle_key_event(app, key) {
-                        should_quit = true;
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    let kind = mouse.kind;
-                    let handled = handle_mouse_event(app, mouse);
-                    if mouse_event_requests_redraw(kind, handled) {
+        match wait_for_terminal_event(
+            terminal_input,
+            context.termination.poll_timeout(next_run_loop_poll_timeout(
+                app,
+                Instant::now(),
+                !config.offline,
+            )),
+        )? {
+            TerminalEventWait::Ready => {
+                config.perf_log.record_event_wakeup();
+                let previous_ui_state = app.ui_state();
+                let mut should_quit = false;
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         redraw_reasons.insert(RedrawReasons::INPUT);
+                        if handle_key_event(app, key) {
+                            should_quit = true;
+                        }
                     }
-                    if app.quit_requested {
-                        should_quit = true;
+                    Event::Mouse(mouse) => {
+                        let kind = mouse.kind;
+                        let handled = handle_mouse_event(app, mouse);
+                        if mouse_event_requests_redraw(kind, handled) {
+                            redraw_reasons.insert(RedrawReasons::INPUT);
+                        }
+                        if app.quit_requested {
+                            should_quit = true;
+                        }
                     }
+                    Event::Resize(_, _) => redraw_reasons.insert(RedrawReasons::RESIZE),
+                    _ => {}
                 }
-                Event::Resize(_, _) => redraw_reasons.insert(RedrawReasons::RESIZE),
-                _ => {}
+                let current_ui_state = app.ui_state();
+                if current_ui_state != previous_ui_state {
+                    let _ = ui_state_store.save(&current_ui_state);
+                }
+                if should_quit {
+                    refresh_worker.detach();
+                    return Ok(());
+                }
             }
-            let current_ui_state = app.ui_state();
-            if current_ui_state != previous_ui_state {
-                let _ = ui_state_store.save(&current_ui_state);
-            }
-            if should_quit {
+            TerminalEventWait::Disconnected => {
                 refresh_worker.detach();
                 return Ok(());
             }
+            TerminalEventWait::TimedOut => {}
         }
 
         if let Some(request) = app.pending_resume.take() {
@@ -8687,6 +9282,131 @@ fn run_loop(
     }
 }
 
+fn collect_initial_refresh_completion(
+    config: &CollectConfig,
+    rollout_cache: &Arc<Mutex<RolloutCache>>,
+    history_store: &Arc<Mutex<TuiHistoryStore>>,
+    history_source_generation: u64,
+    history_source_selection: &HistorySourceSelection,
+) -> RefreshCompletion {
+    let operation_trace = config.trace_log.span_with("tui.initial_data_ready", || {
+        TraceFields::new().bool("offline", config.offline).label(
+            "sourceScope",
+            history_source_scope_label(history_source_selection),
+        )
+    });
+    // Initial data-ready is deliberately local-only. A cold or temporarily
+    // unavailable network account RPC must not hold the first useful TUI
+    // snapshot behind its 12/30-second deadline. `App::new` leaves
+    // `next_account_refresh` due immediately, and because this completion is
+    // explicitly marked `refreshed_account=false`, the ordinary run loop starts
+    // the unchanged account refresh path as soon as this local bootstrap has
+    // been applied. One-shot CLI and recorder collection do not use this helper.
+    let refresh_account = false;
+    let snapshot_span = config.startup_trace.span("tui.initial_snapshot");
+    let result = {
+        let mut cache = rollout_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        collect_snapshot_cached(config, None, refresh_account, &mut cache)
+    };
+    snapshot_span.finish_with(|| {
+        format!(
+            "tasks={} turns={} files={} lines={} account={}",
+            result.snapshot.tasks.len(),
+            result.snapshot.turns.len(),
+            result.snapshot.stats.scanned_files,
+            result.snapshot.stats.parsed_lines,
+            if config.offline {
+                "disabled"
+            } else {
+                "deferred"
+            }
+        )
+    });
+
+    let history_observation = collection_history_observation(&result, config.offline);
+    let history_span = config.startup_trace.span("tui.initial_history");
+    let (projection, recorder_health, remote_live, remote_overview_history) = {
+        let mut history_store = history_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (projection, recorder_health) = stage_and_load_history_selected(
+            &mut history_store,
+            history_observation.as_ref(),
+            &result.snapshot.tasks,
+            &result.local_session_digests,
+            result.snapshot.as_of,
+            &config.perf_log,
+            false,
+            history_source_selection,
+        );
+        let remote_live = history_store.load_remote_live_states();
+        let unified_seed = matches!(projection.selection, HistorySourceSelection::AllIncluded)
+            .then_some(&projection.history);
+        let remote_overview_history =
+            history_store.load_remote_overview_history(unified_seed, result.snapshot.as_of);
+        (
+            projection,
+            recorder_health,
+            remote_live,
+            remote_overview_history,
+        )
+    };
+    history_span.finish_with(|| {
+        format!(
+            "quota_points={} buckets={} weekly_points={} query_error={} remote_live_error={} remote_overview_error={}",
+            projection.history.quota_points.len(),
+            projection.history.half_hour_buckets.len(),
+            projection.history.weekly_local_points.len(),
+            projection.query_error.is_some(),
+            remote_live.is_err(),
+            remote_overview_history.is_err()
+        )
+    });
+    let partial = result.snapshot.partial
+        || projection.query_error.is_some()
+        || remote_live.is_err()
+        || remote_overview_history.is_err();
+    operation_trace.finish_with(
+        if partial {
+            TraceOutcome::Partial
+        } else {
+            TraceOutcome::Ok
+        },
+        || {
+            TraceFields::new()
+                .bool("accountRefresh", refresh_account)
+                .bool("accountRefreshDeferred", !config.offline)
+                .bool("snapshotPartial", result.snapshot.partial)
+                .usize("taskCount", result.snapshot.tasks.len())
+                .usize("turnCount", result.snapshot.turns.len())
+                .usize("scannedFiles", result.snapshot.stats.scanned_files)
+                .usize("bucketCount", projection.history.half_hour_buckets.len())
+                .usize(
+                    "weeklyPointCount",
+                    projection.history.weekly_local_points.len(),
+                )
+                .bool("historyQueryFailed", projection.query_error.is_some())
+                .bool("remoteLiveFailed", remote_live.is_err())
+                .bool("remoteOverviewFailed", remote_overview_history.is_err())
+        },
+    );
+
+    RefreshCompletion {
+        result: Some(result),
+        remote_live: Some(remote_live),
+        remote_overview_history: Some(remote_overview_history),
+        history: Some(HistoryRefreshCompletion {
+            generation: history_source_generation,
+            projection,
+        }),
+        recorder_health: Some(recorder_health),
+        refreshed_account: refresh_account,
+        summary_backfill: false,
+    }
+}
+
 fn start_refresh_if_due(
     app: &mut App,
     config: &CollectConfig,
@@ -8698,6 +9418,27 @@ fn start_refresh_if_due(
     let now = Instant::now();
     if app.worker_running {
         return false;
+    }
+    if app.initial_bootstrap_pending {
+        let worker_config = config.clone();
+        let worker_sender = context.refresh_sender.clone();
+        let worker_cache = Arc::clone(rollout_cache);
+        let worker_history = Arc::clone(history_store);
+        let history_source_generation = app.history_source_generation;
+        let history_source_selection = app.history_source_selection.clone();
+        app.initial_bootstrap_pending = false;
+        app.worker_running = true;
+        refresh_worker.start(thread::spawn(move || {
+            let completion = collect_initial_refresh_completion(
+                &worker_config,
+                &worker_cache,
+                &worker_history,
+                history_source_generation,
+                &history_source_selection,
+            );
+            let _ = worker_sender.send(completion);
+        }));
+        return true;
     }
     if app.history_source_query_pending {
         let generation = app.history_source_generation;
@@ -8855,7 +9596,11 @@ fn start_refresh_if_due(
                     &mut cache,
                 ))
             } else {
-                collect_snapshot_cached_if_changed(&worker_config, Some(cached_account), &mut cache)
+                collect_snapshot_cached_if_changed_coalesced(
+                    &worker_config,
+                    Some(cached_account),
+                    &mut cache,
+                )
             }
         };
         let (history_and_recorder, remote_live, remote_overview_history) = {
@@ -9506,35 +10251,97 @@ fn execute_remote_ui_action(
     config: &CollectConfig,
     cancellation: &RemoteActionCancellation,
 ) -> RemoteUiActionCompletion {
-    let result = (|| -> Result<RemoteUiActionOutcome, String> {
-        if !matches!(
-            &request.kind,
-            RemoteUiActionKind::Include | RemoteUiActionKind::Exclude | RemoteUiActionKind::Purge
-        ) {
-            let current = RemotesConfigStore::discover()
-                .load_or_create()
-                .map_err(|_| "remote config unavailable".to_owned())?;
-            if current.config_revision() != request.config_revision {
-                return Err("configuration changed".to_owned());
+    let result = trace_remote_ui_action(
+        &request,
+        &config.trace_log,
+        cancellation,
+        || -> Result<RemoteUiActionOutcome, String> {
+            if !matches!(
+                &request.kind,
+                RemoteUiActionKind::Include
+                    | RemoteUiActionKind::Exclude
+                    | RemoteUiActionKind::Purge
+            ) {
+                let current = RemotesConfigStore::discover()
+                    .load_or_create()
+                    .map_err(|_| "remote config unavailable".to_owned())?;
+                if current.config_revision() != request.config_revision {
+                    return Err("configuration changed".to_owned());
+                }
             }
-        }
-        let executable = std::env::current_exe().map_err(|_| "launcher unavailable".to_owned())?;
-        let command = remote_ui_action_command(&executable, config, &request)
-            .map_err(|_| "launcher unavailable".to_owned())?;
-        // Capturing both streams prevents a child process from corrupting the
-        // alternate-screen TUI. The CLI's remote transport and diagnostics are
-        // already bounded; the UI intentionally exposes only a sanitized
-        // outcome and leaves detailed troubleshooting to the CLI invocation.
-        let output = run_cancellable_remote_action_command(command, cancellation)
-            .map_err(|_| "launcher unavailable".to_owned())?;
-        match output.status.code() {
-            Some(0) => Ok(RemoteUiActionOutcome::Complete),
-            Some(2) => Ok(RemoteUiActionOutcome::NeedsAttention),
-            Some(_) => Err("command failed".to_owned()),
-            None => Err("command terminated".to_owned()),
-        }
-    })();
+            let executable =
+                std::env::current_exe().map_err(|_| "launcher unavailable".to_owned())?;
+            let command = remote_ui_action_command(&executable, config, &request)
+                .map_err(|_| "launcher unavailable".to_owned())?;
+            // Capturing both streams prevents a child process from corrupting
+            // the alternate-screen TUI. The parent trace span deliberately
+            // covers the whole helper lifetime; the trace path is not passed
+            // to the child because a second TraceLog would truncate it.
+            let output = run_cancellable_remote_action_command(command, cancellation)
+                .map_err(|_| "launcher unavailable".to_owned())?;
+            match output.status.code() {
+                Some(0) => Ok(RemoteUiActionOutcome::Complete),
+                Some(2) => Ok(RemoteUiActionOutcome::NeedsAttention),
+                Some(_) => Err("command failed".to_owned()),
+                None => Err("command terminated".to_owned()),
+            }
+        },
+    );
     RemoteUiActionCompletion { request, result }
+}
+
+fn trace_remote_ui_action(
+    request: &RemoteUiActionRequest,
+    trace_log: &TraceLog,
+    cancellation: &RemoteActionCancellation,
+    action: impl FnOnce() -> Result<RemoteUiActionOutcome, String>,
+) -> Result<RemoteUiActionOutcome, String> {
+    let span = trace_log.span_with("tui.remote.action", || {
+        TraceFields::new()
+            .label("action", request.kind.label())
+            .opaque("hostId", &request.host_id)
+            .u64("configRevision", request.config_revision)
+            .bool(
+                "mutatesConfiguration",
+                matches!(
+                    &request.kind,
+                    RemoteUiActionKind::Add { .. }
+                        | RemoteUiActionKind::Edit { .. }
+                        | RemoteUiActionKind::Pair
+                        | RemoteUiActionKind::Remove
+                        | RemoteUiActionKind::Include
+                        | RemoteUiActionKind::Exclude
+                        | RemoteUiActionKind::Purge
+                ),
+            )
+    });
+    let result = action();
+    match &result {
+        Ok(RemoteUiActionOutcome::Complete) => span.finish(TraceOutcome::Ok, TraceFields::new()),
+        Ok(RemoteUiActionOutcome::NeedsAttention) => {
+            span.finish(TraceOutcome::Partial, TraceFields::new())
+        }
+        Err(_) if cancellation.is_cancelled() => span.finish(
+            TraceOutcome::Cancelled,
+            TraceFields::new().label("reason", "user_cancelled"),
+        ),
+        Err(error) => span.finish(
+            TraceOutcome::Error,
+            TraceFields::new().label("errorKind", remote_ui_action_error_kind(error)),
+        ),
+    }
+    result
+}
+
+fn remote_ui_action_error_kind(error: &str) -> &'static str {
+    match error {
+        "remote config unavailable" => "config_unavailable",
+        "configuration changed" => "config_changed",
+        "launcher unavailable" => "launcher_unavailable",
+        "command failed" => "command_failed",
+        "command terminated" => "command_terminated",
+        _ => "action_failed",
+    }
 }
 
 fn remote_ui_action_command(
@@ -9549,6 +10356,8 @@ fn remote_ui_action_command(
     if config.redact_content {
         command.arg("--redact-content");
     }
+    // Keep trace ownership in the TUI process. Passing its path to this
+    // helper would let the child truncate the parent's active trace file.
     append_remote_ui_action_args(&mut command, request);
     Ok(command)
 }
@@ -15529,6 +16338,13 @@ fn app_server_call_failed(snapshot: &Snapshot) -> bool {
         })
 }
 
+fn initial_collection_loading(snapshot: &Snapshot) -> bool {
+    snapshot
+        .sources
+        .iter()
+        .any(|source| source.status == "loading")
+}
+
 fn app_server_failure_message(width: u16) -> &'static str {
     if width >= 59 {
         "Unable to call codex app-server · try installing Codex CLI"
@@ -16167,8 +16983,13 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
     let windows = ordered_quota_windows(snapshot);
 
     if windows.is_empty() {
+        let message = if initial_collection_loading(snapshot) {
+            "Loading quota and usage..."
+        } else {
+            "Quota unavailable"
+        };
         frame.render_widget(
-            Paragraph::new("Quota unavailable")
+            Paragraph::new(message)
                 .alignment(Alignment::Center)
                 .block(panel("Quota", theme)),
             area,
@@ -16999,7 +17820,9 @@ fn task_panel_block(
                 )
             })
             .unwrap_or_else(|| {
-                let label = if app.snapshot.tasks.is_empty() {
+                let label = if initial_collection_loading(&app.snapshot) {
+                    "loading usage..."
+                } else if app.snapshot.tasks.is_empty() {
                     "no tasks"
                 } else {
                     "no matches"

@@ -54,6 +54,7 @@ pub mod source_model;
 pub mod startup;
 pub mod summary;
 pub mod summary_report;
+pub mod trace;
 pub mod trends;
 pub mod tui;
 pub mod ui_state;

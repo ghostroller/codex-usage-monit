@@ -267,9 +267,11 @@ IFS= read -r initialize || exit 43
 printf '%s\n' '{"id":1,"result":{"userAgent":"fixture-app-server"}}'
 IFS= read -r initialized || exit 44
 IFS= read -r limits || exit 45
-IFS= read -r usage || exit 46
-printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled in fixture"}}'
+case "$limits" in *'"method":"account/rateLimits/read"'*) ;; *) exit 46 ;; esac
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":"Codex","planType":"plus","primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1783834200},"secondary":{"usedPercent":27,"windowDurationMins":10080,"resetsAt":1784439000}},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":1,"credits":[]}}}'
+IFS= read -r usage || exit 47
+case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 48 ;; esac
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled in fixture"}}'
 "#,
     )
     .unwrap();

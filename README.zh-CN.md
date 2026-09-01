@@ -154,7 +154,7 @@ codex-usage-monit --offline snapshot --format json --compact
 | `record` | 不启动 TUI，持续记录本地和账户历史。 |
 | `service` | 安装、检查或删除可选的用户级后台记录服务。 |
 | `remote` | 配置、测试和同步显式加入 allowlist 的 SSH 机器；该功能正在为 v0.4 开发。 |
-| `debug-startup` | 分析正常 TUI 冷启动流程，但不进入交互模式。 |
+| `debug-startup` | 分析 TUI 占位首帧和初始数据就绪两阶段，但不进入交互模式。 |
 
 一次性数据命令支持 `--format text|json` 和 `--compact`，后者会把 JSON 写成单行；`debug-startup` 则提供 `--width` 和 `--height` 来设置无界面渲染尺寸。snapshot 系列命令（`snapshot`、`limits`、`tasks`、`turns`、`models`、`attribution`、`windows`）以及 `summary`、`trends` 都接受 `--long-context`，只为本次调用选择可选 Longx 估算；默认仍为基础口径，API 等价费用不会随之改变。
 
@@ -276,6 +276,7 @@ codex-usage-monit record --foreground
 | `--theme dark|light` | 选择 TUI 主题。也可以用 `bright` 作为 `light` 的别名。 |
 | `--startup-log <FILE>` | 把启动计时事件写成 JSONL。 |
 | `--perf-log <FILE>` | 把运行时性能事件写成 JSONL。 |
+| `--trace-log <FILE>` | 把可选的单次操作诊断 trace 写成 JSONL。 |
 
 运行 `codex-usage-monit --help` 或 `codex-usage-monit <command> --help` 可以查看完整选项。
 
@@ -511,10 +512,12 @@ codex-usage-monit --days 14 --max-files 2000
 codex-usage-monit debug-startup
 codex-usage-monit --startup-log /tmp/codex-usage-startup.jsonl
 codex-usage-monit --perf-log /tmp/codex-usage-perf.jsonl
+codex-usage-monit --trace-log /tmp/codex-usage-trace.jsonl
 ```
 
 首次运行、解析器版本变化或禁用缓存时，因为需要从头解析 rollout，耗时可能更长。
 运行时日志会记录采集刷新、历史写入/读取耗时和分片数量、绘制聚合，以及周期性的 CPU、内存和 I/O 样本，不包含 session 内容。
+trace 日志粒度更细并会增加少量诊断 I/O，因此默认关闭。启用后会记录高耗时操作和外部进程边界，包括 App Server RPC、有界 Git 探测和 SSH 交换的耗时、结果分类、字节数、限制参数，以及远端目标的单向指纹。它不会记录凭据、session 文本、原始主机名、文件路径、stderr 正文或完整命令行。Unix 上的 trace 文件会以私有权限创建；安装 recorder 服务时也会保留显式指定的 trace 路径。
 
 ## 文档
 

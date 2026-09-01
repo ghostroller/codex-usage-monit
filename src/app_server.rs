@@ -43,6 +43,7 @@ use crate::domain::{
     LimitWindow, Provenance, RateLimitResetCredit, RateLimitResetCreditsSnapshot,
 };
 use crate::startup::StartupTrace;
+use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 
 const INITIALIZE_ID: u64 = 1;
 const RATE_LIMITS_ID: u64 = 2;
@@ -57,6 +58,11 @@ const APP_SERVER_READER_QUEUE: usize = 2;
 const APP_SERVER_MAX_PROTOCOL_WARNINGS: usize = 32;
 const APP_SERVER_MAX_RESET_CREDIT_DETAILS: usize = 4_096;
 const APP_SERVER_READER_JOIN_GRACE: Duration = Duration::from_millis(250);
+// `account/usage/read` is optional analytics metadata. Recent Codex versions
+// can take many seconds to answer it even after fresh quota/reset data is
+// available. Give an already-in-flight response a small chance to arrive, but
+// never let it hold the account snapshot until the primary RPC deadline.
+const APP_SERVER_OPTIONAL_USAGE_GRACE: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const DESKTOP_CLI_RESOURCE_DIAGNOSTIC: &str = "Codex Desktop packaged resource";
 #[cfg(windows)]
@@ -78,6 +84,46 @@ enum ReaderTask {
 struct ProtocolWarnings {
     retained: Vec<String>,
     suppressed: usize,
+}
+
+#[derive(Debug)]
+struct AppServerResponseTimeout;
+
+impl std::fmt::Display for AppServerResponseTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("codex app-server response timed out")
+    }
+}
+
+impl std::error::Error for AppServerResponseTimeout {}
+
+#[derive(Debug)]
+struct AppServerReaderDisconnected;
+
+impl std::fmt::Display for AppServerReaderDisconnected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("codex app-server stdout reader disconnected")
+    }
+}
+
+impl std::error::Error for AppServerReaderDisconnected {}
+
+fn app_server_trace_outcome(error: &anyhow::Error) -> TraceOutcome {
+    if error.is::<AppServerResponseTimeout>() {
+        TraceOutcome::Timeout
+    } else {
+        TraceOutcome::Error
+    }
+}
+
+fn app_server_trace_error_kind(error: &anyhow::Error, fallback: &'static str) -> &'static str {
+    if error.is::<AppServerResponseTimeout>() {
+        "timeout"
+    } else if error.is::<AppServerReaderDisconnected>() {
+        "disconnected"
+    } else {
+        fallback
+    }
 }
 
 impl ProtocolWarnings {
@@ -115,25 +161,73 @@ struct ChildGuard {
     child: Child,
     process_tree: ProcessTree,
     startup_trace: StartupTrace,
+    trace_log: TraceLog,
     reaped: bool,
 }
 
 impl ChildGuard {
-    fn terminate_and_reap(&mut self) {
+    fn terminate_and_reap(&mut self) -> io::Result<()> {
         if self.reaped {
-            return;
+            return Ok(());
         }
-        self.process_tree.terminate(&mut self.child);
-        let _ = self.child.wait();
+
+        // Own the spans here rather than in `Drop`: normal callers explicitly
+        // reap before reader-thread cleanup, so a Drop-owned span only measured
+        // a later no-op. This boundary now includes process-group/Job
+        // termination and the blocking wait which actually reaps the child.
+        let shutdown_span = self.startup_trace.span("app_server.shutdown");
+        let shutdown_trace = self
+            .trace_log
+            .span_with("app_server.process.shutdown", TraceFields::new);
+        let terminate_error = self.process_tree.terminate(&mut self.child).err();
+        let wait_error = self.child.wait().map(|_| ()).err();
         self.reaped = true;
+
+        let error_kind = shutdown_error_kind(terminate_error.is_some(), wait_error.is_some());
+        if let Some(error_kind) = error_kind {
+            shutdown_span.finish(format!("status=error kind={error_kind}"));
+            shutdown_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new()
+                    .label("errorKind", error_kind)
+                    .bool("terminateFailed", terminate_error.is_some())
+                    .bool("waitFailed", wait_error.is_some())
+            });
+            Err(combine_shutdown_errors(terminate_error, wait_error))
+        } else {
+            shutdown_span.finish("status=reaped");
+            shutdown_trace.finish_with(TraceOutcome::Ok, TraceFields::new);
+            Ok(())
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let shutdown_span = self.startup_trace.span("app_server.shutdown");
-        self.terminate_and_reap();
-        shutdown_span.finish("status=reaped");
+        let _ = self.terminate_and_reap();
+    }
+}
+
+fn shutdown_error_kind(terminate_failed: bool, wait_failed: bool) -> Option<&'static str> {
+    match (terminate_failed, wait_failed) {
+        (false, false) => None,
+        (true, false) => Some("terminate"),
+        (false, true) => Some("wait"),
+        (true, true) => Some("terminate_and_wait"),
+    }
+}
+
+fn combine_shutdown_errors(
+    terminate_error: Option<io::Error>,
+    wait_error: Option<io::Error>,
+) -> io::Error {
+    match (terminate_error, wait_error) {
+        (Some(terminate), Some(wait)) => io::Error::new(
+            terminate.kind(),
+            format!("app-server termination failed: {terminate}; child wait failed: {wait}"),
+        ),
+        (Some(error), None) => error,
+        (None, Some(error)) => error,
+        (None, None) => io::Error::other("app-server cleanup failed without an error"),
     }
 }
 
@@ -156,12 +250,27 @@ fn attach_process_tree(child: &mut Child) -> io::Result<ProcessTree> {
 
 #[cfg(unix)]
 impl ProcessTree {
-    fn terminate(&mut self, child: &mut Child) {
+    fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
         // Every ordinary wrapper and descendant inherits this group. Killing
         // it also closes stdout/stderr copies held outside the direct child.
         let killed_group = unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == 0;
-        if !killed_group {
-            let _ = child.kill();
+        if killed_group {
+            return Ok(());
+        }
+
+        let group_error = io::Error::last_os_error();
+        let child_running = child.try_wait()?.is_none();
+        if child_running {
+            child.kill()?;
+        }
+        // ESRCH plus an already-exited direct child means the process group no
+        // longer exists. Other group failures remain observable even when the
+        // direct-child fallback succeeded because descendants may have escaped
+        // cleanup.
+        if group_error.raw_os_error() == Some(libc::ESRCH) && !child_running {
+            Ok(())
+        } else {
+            Err(group_error)
         }
     }
 }
@@ -261,18 +370,45 @@ fn resume_suspended_child(child: &Child) -> io::Result<()> {
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn terminate(&mut self, child: &mut Child) {
+    fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
+        let mut errors = Vec::new();
+        let mut job_terminated = false;
         if !self.job.is_null() {
-            unsafe {
-                // Close is a kill-on-close fallback if explicit termination
-                // races with process shutdown.
-                TerminateJobObject(self.job, 1);
-                CloseHandle(self.job);
+            // Close is also a kill-on-close fallback if explicit termination
+            // races with process shutdown, but retain both API failures so the
+            // trace does not report a false successful cleanup.
+            if unsafe { TerminateJobObject(self.job, 1) } == 0 {
+                errors.push(("job_terminate", io::Error::last_os_error()));
+            } else {
+                job_terminated = true;
             }
-            self.job = std::ptr::null_mut();
+            if unsafe { CloseHandle(self.job) } == 0 {
+                errors.push(("job_close", io::Error::last_os_error()));
+            } else {
+                self.job = std::ptr::null_mut();
+            }
         }
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
+        if !job_terminated {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(error) = child.kill() {
+                        errors.push(("child_kill", error));
+                    }
+                }
+                Err(error) => errors.push(("child_status", error)),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let kind = errors[0].1.kind();
+            let detail = errors
+                .into_iter()
+                .map(|(stage, error)| format!("{stage}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(io::Error::new(kind, detail))
         }
     }
 }
@@ -313,9 +449,27 @@ fn fetch_account_snapshot_inner(
     config: &CollectConfig,
     snapshot_as_of: Option<DateTime<Utc>>,
 ) -> Result<AccountSnapshot> {
+    let operation_trace = config
+        .trace_log
+        .span_with("app_server.account_snapshot", || {
+            TraceFields::new()
+                .bool("offline", config.offline)
+                .duration_ms("timeoutMs", config.app_server_timeout)
+                .label(
+                    "executableSource",
+                    if config.codex_bin.is_some() {
+                        "explicit"
+                    } else {
+                        "discovered"
+                    },
+                )
+        });
     let total_span = config.startup_trace.span("app_server.total");
     if config.offline {
         total_span.finish("status=offline");
+        operation_trace.finish_with(TraceOutcome::Skipped, || {
+            TraceFields::new().label("reason", "offline")
+        });
         return Ok(AccountSnapshot {
             warnings: vec!["Codex app-server collection is disabled in offline mode".to_string()],
             ..AccountSnapshot::default()
@@ -323,13 +477,30 @@ fn fetch_account_snapshot_inner(
     }
 
     let spawn_span = config.startup_trace.span("app_server.spawn");
-    let mut command = codex_command(config).context("failed to resolve a runnable Codex CLI")?;
+    let process_trace = config.trace_log.span_with("app_server.process.spawn", || {
+        TraceFields::new().label("operation", "account_read")
+    });
+    let mut command = match codex_command(config).context("failed to resolve a runnable Codex CLI")
+    {
+        Ok(command) => command,
+        Err(error) => {
+            spawn_span.finish("status=error kind=resolve");
+            process_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "resolve")
+            });
+            total_span.finish("status=error kind=resolve");
+            operation_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "resolve")
+            });
+            return Err(error);
+        }
+    };
     if let Some(path) = config.app_server_path.as_deref() {
         command.env("PATH", path);
     }
     configure_process_tree(&mut command);
     let program = command.get_program().to_owned();
-    let mut spawned_child = command
+    let spawn_result = command
         .arg("app-server")
         .env("CODEX_HOME", &config.codex_home)
         .stdin(Stdio::piped())
@@ -337,41 +508,113 @@ fn fetch_account_snapshot_inner(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| app_server_spawn_error(&program, error))
-        .context("failed to spawn `codex app-server`")?;
-    let process_tree = attach_process_tree(&mut spawned_child)
-        .inspect_err(|_| {
+        .context("failed to spawn `codex app-server`");
+    let mut spawned_child = match spawn_result {
+        Ok(child) => {
+            process_trace.finish_with(TraceOutcome::Ok, TraceFields::new);
+            child
+        }
+        Err(error) => {
+            process_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "spawn")
+            });
+            spawn_span.finish("status=error kind=spawn");
+            total_span.finish("status=error kind=spawn");
+            operation_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "spawn")
+            });
+            return Err(error);
+        }
+    };
+
+    let containment_trace = config
+        .trace_log
+        .span_with("app_server.process.attach", TraceFields::new);
+    let process_tree = match attach_process_tree(&mut spawned_child) {
+        Ok(process_tree) => {
+            containment_trace.finish_with(TraceOutcome::Ok, TraceFields::new);
+            process_tree
+        }
+        Err(source) => {
             let _ = spawned_child.kill();
             let _ = spawned_child.wait();
-        })
-        .context("failed to contain the codex app-server process tree")?;
+            containment_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "process_isolation")
+            });
+            spawn_span.finish("status=error kind=process_isolation");
+            total_span.finish("status=error kind=process_isolation");
+            operation_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "process_isolation")
+            });
+            return Err(source).context("failed to contain the codex app-server process tree");
+        }
+    };
     spawn_span.finish("command=codex_app_server");
 
     let io_span = config.startup_trace.span("app_server.io_setup");
+    let io_trace = config
+        .trace_log
+        .span_with("app_server.process.io_setup", || {
+            TraceFields::new().duration_ms("timeoutMs", config.app_server_timeout)
+        });
     let mut child = ChildGuard {
         child: spawned_child,
         process_tree,
         startup_trace: config.startup_trace.clone(),
+        trace_log: config.trace_log.clone(),
         reaped: false,
     };
-    let stdin = child
-        .child
-        .stdin
-        .take()
-        .context("codex app-server did not expose stdin")?;
-    let stdout = child
-        .child
-        .stdout
-        .take()
-        .context("codex app-server did not expose stdout")?;
-    let stderr = child
-        .child
-        .stderr
-        .take()
-        .context("codex app-server did not expose stderr")?;
-
-    let deadline = Instant::now()
-        .checked_add(config.app_server_timeout)
-        .context("app-server timeout exceeds the platform's supported range")?;
+    let io_setup = (|| {
+        let stdin = child
+            .child
+            .stdin
+            .take()
+            .context("codex app-server did not expose stdin")
+            .map_err(|error| ("stdin_pipe", error))?;
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .context("codex app-server did not expose stdout")
+            .map_err(|error| ("stdout_pipe", error))?;
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .context("codex app-server did not expose stderr")
+            .map_err(|error| ("stderr_pipe", error))?;
+        let deadline = Instant::now()
+            .checked_add(config.app_server_timeout)
+            .context("app-server timeout exceeds the platform's supported range")
+            .map_err(|error| ("deadline", error))?;
+        Ok((stdin, stdout, stderr, deadline))
+    })();
+    let (stdin, stdout, stderr, deadline) = match io_setup {
+        Ok(setup) => {
+            io_span.finish_with(|| {
+                format!(
+                    "status=ok timeout_ms={}",
+                    config.app_server_timeout.as_millis()
+                )
+            });
+            io_trace.finish_with(TraceOutcome::Ok, TraceFields::new);
+            setup
+        }
+        Err((error_kind, error)) => {
+            io_span.finish(format!("status=error kind={error_kind}"));
+            io_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", error_kind)
+            });
+            let cleanup_failed = child.terminate_and_reap().is_err();
+            total_span.finish(format!("status=error kind={error_kind}"));
+            operation_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new()
+                    .label("errorKind", error_kind)
+                    .bool("cleanupFailed", cleanup_failed)
+            });
+            return Err(error);
+        }
+    };
 
     let (reader_tx, reader_rx) = mpsc::sync_channel(APP_SERVER_READER_QUEUE);
     let (reader_done_tx, reader_done_rx) = mpsc::channel();
@@ -389,10 +632,12 @@ fn fetch_account_snapshot_inner(
     });
     let mut stdin = stdin;
     let mut protocol_warnings = ProtocolWarnings::default();
-    io_span.finish_with(|| format!("timeout_ms={}", config.app_server_timeout.as_millis()));
 
     let result = (|| {
         let initialize_span = config.startup_trace.span("app_server.initialize");
+        let initialize_trace = config.trace_log.span_with("app_server.rpc.initialize", || {
+            TraceFields::new().duration_ms("timeoutMs", config.app_server_timeout)
+        });
         let initialize_result = (|| -> Result<()> {
             write_message(
                 &mut stdin,
@@ -424,66 +669,73 @@ fn fetch_account_snapshot_inner(
             }
         })();
         if let Err(error) = initialize_result {
-            initialize_span.finish("status=error");
+            let outcome = app_server_trace_outcome(&error);
+            let error_kind = app_server_trace_error_kind(&error, "rpc");
+            initialize_span.finish(format!("status=error kind={error_kind}"));
+            initialize_trace.finish_with(outcome, || {
+                TraceFields::new().label("errorKind", error_kind)
+            });
             return Err(error);
         }
         initialize_span.finish("status=ok");
+        initialize_trace.finish_with(TraceOutcome::Ok, TraceFields::new);
 
         let account_span = config.startup_trace.span("app_server.account_reads");
-        write_message(&mut stdin, &json!({ "method": "initialized" }))?;
-        write_message(
-            &mut stdin,
-            &json!({ "method": "account/rateLimits/read", "id": RATE_LIMITS_ID }),
-        )?;
-        write_message(
-            &mut stdin,
-            &json!({ "method": "account/usage/read", "id": ACCOUNT_USAGE_ID }),
-        )?;
+        let account_trace = config
+            .trace_log
+            .span_with("app_server.rpc.account_reads", || {
+                TraceFields::new()
+                    .usize("requestCount", 1)
+                    .duration_ms("timeoutMs", config.app_server_timeout)
+            });
+        let request_result = (|| -> Result<()> {
+            write_message(&mut stdin, &json!({ "method": "initialized" }))?;
+            write_message(
+                &mut stdin,
+                &json!({ "method": "account/rateLimits/read", "id": RATE_LIMITS_ID }),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = request_result {
+            account_span.finish("status=error kind=write");
+            account_trace.finish_with(TraceOutcome::Error, || {
+                TraceFields::new().label("errorKind", "write")
+            });
+            return Err(error);
+        }
 
-        let mut rate_limits = None;
-        let mut account_usage = None;
-        while rate_limits.is_none() || account_usage.is_none() {
-            let event = match recv_event(deadline, &reader_rx, "account snapshot", &stderr_output) {
-                Ok(event) => event,
-                Err(error) if rate_limits.is_some() => {
-                    push_protocol_warning(
-                        &mut protocol_warnings,
-                        format!(
-                            "account/usage/read did not complete after rate limits were received: {error:#}"
-                        ),
-                    );
-                    break;
-                }
-                Err(error) => {
-                    account_span.finish("status=error kind=receive");
-                    return Err(error);
-                }
-            };
+        let rate_limits;
+        let rate_limits_rpc_category;
+        loop {
+            let event =
+                match recv_event(deadline, &reader_rx, "account rate limits", &stderr_output) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let outcome = app_server_trace_outcome(&error);
+                        let error_kind = app_server_trace_error_kind(&error, "receive");
+                        account_span.finish(format!("status=error kind={error_kind}"));
+                        account_trace.finish_with(outcome, || {
+                            TraceFields::new().label("errorKind", error_kind)
+                        });
+                        return Err(error);
+                    }
+                };
             match event {
                 ReaderEvent::Message(message) => {
-                    if response_id(&message) == Some(RATE_LIMITS_ID) && rate_limits.is_none() {
-                        rate_limits = Some(response_payload(&message));
-                    } else if response_id(&message) == Some(ACCOUNT_USAGE_ID)
-                        && account_usage.is_none()
-                    {
-                        account_usage = Some(response_payload(&message));
+                    if response_id(&message) == Some(RATE_LIMITS_ID) {
+                        rate_limits_rpc_category = rpc_error_category(&message);
+                        rate_limits = response_payload(&message);
+                        break;
                     }
                 }
                 ReaderEvent::Malformed(message) => {
                     push_protocol_warning(&mut protocol_warnings, message);
                 }
                 ReaderEvent::Eof => {
-                    if rate_limits.is_some() {
-                        push_protocol_warning(
-                            &mut protocol_warnings,
-                            format!(
-                                "codex app-server closed stdout before returning account/usage/read{}",
-                                stderr_suffix(&stderr_output)
-                            ),
-                        );
-                        break;
-                    }
                     account_span.finish("status=error kind=eof");
+                    account_trace.finish_with(TraceOutcome::Error, || {
+                        TraceFields::new().label("errorKind", "eof")
+                    });
                     bail!(
                         "codex app-server closed stdout before returning the account snapshot{}",
                         stderr_suffix(&stderr_output)
@@ -491,23 +743,46 @@ fn fetch_account_snapshot_inner(
                 }
             }
         }
+        let rate_limits_rpc_error = rate_limits.is_err();
+        let account_reads_partial = protocol_warnings.len() > 0 || rate_limits_rpc_error;
+        let account_usage =
+            fetch_optional_account_usage(config, &mut stdin, deadline, &reader_rx, &stderr_output);
         account_span.finish_with(|| {
             format!(
                 "status={} rate_limits={} usage={} warnings={}",
-                if account_usage.is_some() {
-                    "ok"
-                } else {
+                if account_reads_partial {
                     "partial"
+                } else {
+                    "ok"
                 },
-                rate_limits.is_some(),
+                true,
                 account_usage.is_some(),
                 protocol_warnings.len()
             )
         });
+        account_trace.finish_with(
+            if account_reads_partial {
+                TraceOutcome::Partial
+            } else {
+                TraceOutcome::Ok
+            },
+            || {
+                let fields = TraceFields::new()
+                    .bool("rateLimits", true)
+                    .bool("usage", account_usage.is_some())
+                    .bool("rateLimitsRpcError", rate_limits_rpc_error)
+                    .usize("protocolWarnings", protocol_warnings.len());
+                if let Some(category) = rate_limits_rpc_category {
+                    fields.label("rateLimitsRpcCategory", category)
+                } else {
+                    fields
+                }
+            },
+        );
 
         let parse_span = config.startup_trace.span("app_server.parse_responses");
         let mut snapshot = AccountSnapshot::default();
-        match rate_limits.expect("rate-limit response must be present") {
+        match rate_limits {
             Ok(result) => {
                 let as_of = snapshot_as_of.unwrap_or_else(Utc::now);
                 match parse_rate_limits_result(&result, as_of) {
@@ -540,22 +815,7 @@ fn fetch_account_snapshot_inner(
                 .errors
                 .push(format!("account/rateLimits/read failed: {message}")),
         }
-        if let Some(account_usage) = account_usage {
-            match account_usage {
-                Ok(result) => match parse_account_usage_result(&result) {
-                    Ok(usage) => snapshot.usage = Some(usage),
-                    Err(error) => push_protocol_warning(
-                        &mut protocol_warnings,
-                        format!("account/usage/read returned invalid data: {error:#}"),
-                    ),
-                },
-                Err(message) if optional_usage_rpc_unavailable(&message) => {}
-                Err(message) => push_protocol_warning(
-                    &mut protocol_warnings,
-                    format!("account/usage/read failed: {message}"),
-                ),
-            }
-        }
+        snapshot.usage = account_usage;
 
         parse_span.finish_with(|| {
             format!(
@@ -573,11 +833,48 @@ fn fetch_account_snapshot_inner(
     })();
 
     drop(stdin);
-    child.terminate_and_reap();
+    let cleanup_result = child.terminate_and_reap();
     drop(reader_rx);
     finish_reader_threads(stdout_reader, stderr_reader, reader_done_rx);
     drop(child);
-    total_span.finish_with(|| format!("status={}", if result.is_ok() { "ok" } else { "error" }));
+    let snapshot_partial = result.as_ref().is_ok_and(|snapshot| {
+        !snapshot.warnings.is_empty()
+            || !snapshot.errors.is_empty()
+            || snapshot.rate_limit_reset_credits_partial
+    });
+    let operation_outcome = match &result {
+        Err(error) => app_server_trace_outcome(error),
+        Ok(_) if snapshot_partial || cleanup_result.is_err() => TraceOutcome::Partial,
+        Ok(_) => TraceOutcome::Ok,
+    };
+    let status = match operation_outcome {
+        TraceOutcome::Ok => "ok",
+        TraceOutcome::Partial => "partial",
+        TraceOutcome::Timeout => "timeout",
+        _ => "error",
+    };
+    total_span.finish_with(|| format!("status={status}"));
+    operation_trace.finish_with(operation_outcome, || {
+        let mut warning_count = 0;
+        let mut error_count = 0;
+        let mut reset_credits_partial = false;
+        if let Ok(snapshot) = &result {
+            warning_count = snapshot.warnings.len();
+            error_count = snapshot.errors.len();
+            reset_credits_partial = snapshot.rate_limit_reset_credits_partial;
+        }
+        let fields = TraceFields::new()
+            .bool("cleanupFailed", cleanup_result.is_err())
+            .bool("snapshotPartial", snapshot_partial)
+            .usize("warningCount", warning_count)
+            .usize("errorCount", error_count)
+            .bool("resetCreditsPartial", reset_credits_partial);
+        if let Err(error) = &result {
+            fields.label("errorKind", app_server_trace_error_kind(error, "operation"))
+        } else {
+            fields
+        }
+    });
     result
 }
 
@@ -1109,6 +1406,146 @@ fn response_payload(message: &Value) -> std::result::Result<Value, String> {
         .ok_or_else(|| "response contained neither result nor error".to_string())
 }
 
+fn rpc_error_category(message: &Value) -> Option<&'static str> {
+    let error = message.get("error")?;
+    let Some(code) = error.get("code").and_then(Value::as_i64) else {
+        return Some("uncategorized");
+    };
+    Some(match code {
+        -32700 => "parse_error",
+        -32600 => "invalid_request",
+        -32601 => "method_not_found",
+        -32602 => "invalid_params",
+        -32603 => "internal_error",
+        -32099..=-32000 => "server_error",
+        _ => "application_error",
+    })
+}
+
+fn shorter_deadline(overall_deadline: Instant, grace: Duration) -> Instant {
+    Instant::now()
+        .checked_add(grace)
+        .map_or(overall_deadline, |grace_deadline| {
+            overall_deadline.min(grace_deadline)
+        })
+}
+
+fn fetch_optional_account_usage(
+    config: &CollectConfig,
+    stdin: &mut impl Write,
+    overall_deadline: Instant,
+    receiver: &mpsc::Receiver<ReaderEvent>,
+    stderr: &Arc<Mutex<String>>,
+) -> Option<AccountTokenUsage> {
+    let trace = config
+        .trace_log
+        .span_with("app_server.rpc.optional_usage", || {
+            TraceFields::new().duration_ms("graceMs", APP_SERVER_OPTIONAL_USAGE_GRACE)
+        });
+    if write_message(
+        stdin,
+        &json!({ "method": "account/usage/read", "id": ACCOUNT_USAGE_ID }),
+    )
+    .is_err()
+    {
+        trace.finish_with(TraceOutcome::Partial, || {
+            TraceFields::new().label("partialReason", "write")
+        });
+        return None;
+    }
+
+    let deadline = shorter_deadline(overall_deadline, APP_SERVER_OPTIONAL_USAGE_GRACE);
+    let mut malformed_frames = 0_usize;
+    let mut ignored_messages = 0_usize;
+    loop {
+        let event = match recv_event(deadline, receiver, "optional account usage", stderr) {
+            Ok(event) => event,
+            Err(error) => {
+                let error_kind = app_server_trace_error_kind(&error, "receive");
+                trace.finish_with(app_server_trace_outcome(&error), || {
+                    TraceFields::new()
+                        .label("partialReason", error_kind)
+                        .usize("malformedFrames", malformed_frames)
+                        .usize("ignoredMessages", ignored_messages)
+                });
+                return None;
+            }
+        };
+        match event {
+            ReaderEvent::Message(message) if response_id(&message) == Some(ACCOUNT_USAGE_ID) => {
+                let rpc_category = rpc_error_category(&message);
+                return match response_payload(&message) {
+                    Ok(result) => match parse_account_usage_result(&result) {
+                        Ok(usage) => {
+                            trace.finish_with(TraceOutcome::Ok, || {
+                                TraceFields::new()
+                                    .bool("response", true)
+                                    .usize("malformedFrames", malformed_frames)
+                                    .usize("ignoredMessages", ignored_messages)
+                            });
+                            Some(usage)
+                        }
+                        Err(_) => {
+                            trace.finish_with(TraceOutcome::Partial, || {
+                                TraceFields::new()
+                                    .label("partialReason", "invalid_payload")
+                                    .usize("malformedFrames", malformed_frames)
+                                    .usize("ignoredMessages", ignored_messages)
+                            });
+                            None
+                        }
+                    },
+                    Err(message) => {
+                        let unsupported = optional_usage_rpc_unavailable(&message);
+                        trace.finish_with(
+                            if unsupported {
+                                TraceOutcome::Skipped
+                            } else {
+                                TraceOutcome::Partial
+                            },
+                            || {
+                                let fields = TraceFields::new()
+                                    .label(
+                                        "partialReason",
+                                        if unsupported {
+                                            "unsupported"
+                                        } else {
+                                            "rpc_error"
+                                        },
+                                    )
+                                    .bool("unsupported", unsupported)
+                                    .usize("malformedFrames", malformed_frames)
+                                    .usize("ignoredMessages", ignored_messages);
+                                if let Some(category) = rpc_category {
+                                    fields.label("rpcCategory", category)
+                                } else {
+                                    fields
+                                }
+                            },
+                        );
+                        None
+                    }
+                };
+            }
+            ReaderEvent::Message(_) => {
+                ignored_messages = ignored_messages.saturating_add(1);
+            }
+            ReaderEvent::Malformed(_) => {
+                malformed_frames = malformed_frames.saturating_add(1);
+            }
+            ReaderEvent::Eof => {
+                trace.finish_with(TraceOutcome::Partial, || {
+                    TraceFields::new()
+                        .label("partialReason", "eof")
+                        .usize("malformedFrames", malformed_frames)
+                        .usize("ignoredMessages", ignored_messages)
+                });
+                return None;
+            }
+        }
+    }
+}
+
 fn format_rpc_error(error: &Value) -> String {
     let Some(object) = error.as_object() else {
         return compact_diagnostic_text(&error.to_string(), RPC_ERROR_MESSAGE_LIMIT);
@@ -1174,24 +1611,24 @@ fn recv_event(
 ) -> Result<ReaderEvent> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .ok_or_else(|| {
-            anyhow!(
-                "timed out waiting for codex app-server {operation}{}",
-                stderr_suffix(stderr)
-            )
-        })?;
+        .ok_or_else(|| app_server_timeout_error(operation, stderr))?;
     receiver
         .recv_timeout(remaining)
         .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => anyhow!(
-                "timed out waiting for codex app-server {operation}{}",
-                stderr_suffix(stderr)
-            ),
-            mpsc::RecvTimeoutError::Disconnected => anyhow!(
-                "codex app-server stdout reader stopped while waiting for {operation}{}",
-                stderr_suffix(stderr)
-            ),
+            mpsc::RecvTimeoutError::Timeout => app_server_timeout_error(operation, stderr),
+            mpsc::RecvTimeoutError::Disconnected => anyhow::Error::new(AppServerReaderDisconnected)
+                .context(format!(
+                    "codex app-server stdout reader stopped while waiting for {operation}{}",
+                    stderr_suffix(stderr)
+                )),
         })
+}
+
+fn app_server_timeout_error(operation: &str, stderr: &Arc<Mutex<String>>) -> anyhow::Error {
+    anyhow::Error::new(AppServerResponseTimeout).context(format!(
+        "timed out waiting for codex app-server {operation}{}",
+        stderr_suffix(stderr)
+    ))
 }
 
 fn push_protocol_warning(warnings: &mut ProtocolWarnings, warning: String) {
@@ -1449,20 +1886,55 @@ fn timestamp_from_integer(value: i64, key: &str) -> Result<DateTime<Utc>> {
 
 #[cfg(test)]
 mod diagnostic_tests {
+    use std::fs;
     use std::io::Cursor;
-    use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, mpsc};
+    #[cfg(unix)]
+    use std::time::Duration;
+    use std::time::Instant;
 
     use chrono::Utc;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         APP_SERVER_MAX_PROTOCOL_WARNINGS, APP_SERVER_MAX_RESET_CREDIT_DETAILS, ProtocolWarnings,
-        RPC_ERROR_MESSAGE_LIMIT, ReaderEvent, codex_command, compact_diagnostic_text,
-        format_rpc_error, optional_usage_rpc_unavailable, parse_rate_limit_reset_credits_result,
-        parse_rate_limit_reset_credits_result_lossy, read_stdout_with_limit,
+        RPC_ERROR_MESSAGE_LIMIT, ReaderEvent, app_server_trace_outcome, codex_command,
+        compact_diagnostic_text, fetch_account_snapshot, format_rpc_error,
+        optional_usage_rpc_unavailable, parse_rate_limit_reset_credits_result,
+        parse_rate_limit_reset_credits_result_lossy, read_stdout_with_limit, recv_event,
+        rpc_error_category, shutdown_error_kind,
     };
     use crate::config::CollectConfig;
+    use crate::trace::{TraceLog, TraceOutcome};
+
+    fn read_trace_events(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn assert_trace_finish<'a>(
+        events: &'a [Value],
+        stage: &str,
+        outcome: &str,
+        error_kind: Option<&str>,
+    ) -> &'a Value {
+        let event = events
+            .iter()
+            .find(|event| {
+                event["event"] == "span_finish"
+                    && event["stage"] == stage
+                    && event["outcome"] == outcome
+            })
+            .unwrap_or_else(|| panic!("missing {outcome} trace finish for {stage}: {events:#?}"));
+        if let Some(error_kind) = error_kind {
+            assert_eq!(event["fields"]["errorKind"], error_kind);
+        }
+        event
+    }
 
     #[test]
     fn explicit_codex_bin_is_passed_directly_to_the_runtime_command() {
@@ -1478,6 +1950,278 @@ mod diagnostic_tests {
     }
 
     #[test]
+    fn spawn_setup_failure_has_explicit_trace_outcomes_without_sensitive_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("trace.jsonl");
+        let missing = temp.path().join("private/missing-codex");
+        let trace = TraceLog::enabled(&trace_path);
+        let config = CollectConfig {
+            codex_bin: Some(missing.clone()),
+            trace_log: trace.clone(),
+            ..CollectConfig::default()
+        };
+
+        assert!(fetch_account_snapshot(&config).is_err());
+        trace.finish();
+
+        let contents = fs::read_to_string(&trace_path).unwrap();
+        assert!(!contents.contains(&missing.to_string_lossy().into_owned()));
+        assert!(!contents.contains("\"outcome\":\"abandoned\""));
+        let events = read_trace_events(&trace_path);
+        assert_trace_finish(&events, "app_server.process.spawn", "error", Some("spawn"));
+        assert_trace_finish(
+            &events,
+            "app_server.account_snapshot",
+            "error",
+            Some("spawn"),
+        );
+    }
+
+    #[test]
+    fn shutdown_error_categories_are_stable_and_content_free() {
+        assert_eq!(shutdown_error_kind(false, false), None);
+        assert_eq!(shutdown_error_kind(true, false), Some("terminate"));
+        assert_eq!(shutdown_error_kind(false, true), Some("wait"));
+        assert_eq!(shutdown_error_kind(true, true), Some("terminate_and_wait"));
+    }
+
+    #[test]
+    fn response_deadline_is_preserved_as_a_timeout_outcome() {
+        let (_sender, receiver) = mpsc::channel();
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let error = recv_event(Instant::now(), &receiver, "test response", &stderr)
+            .err()
+            .expect("an empty channel at its deadline must time out");
+
+        assert!(format!("{error:#}").contains("timed out waiting"));
+        assert_eq!(app_server_trace_outcome(&error), TraceOutcome::Timeout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_setup_failure_traces_real_process_shutdown_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("trace.jsonl");
+        let fake_codex = temp.path().join("private-codex");
+        fs::write(&fake_codex, b"#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let trace = TraceLog::enabled(&trace_path);
+        let config = CollectConfig {
+            codex_bin: Some(fake_codex.clone()),
+            app_server_timeout: Duration::MAX,
+            trace_log: trace.clone(),
+            ..CollectConfig::default()
+        };
+
+        let error = fetch_account_snapshot(&config).unwrap_err();
+        assert!(error.to_string().contains("timeout exceeds"));
+        trace.finish();
+
+        let contents = fs::read_to_string(&trace_path).unwrap();
+        assert!(!contents.contains(&fake_codex.to_string_lossy().into_owned()));
+        assert!(!contents.contains("\"outcome\":\"abandoned\""));
+        let events = read_trace_events(&trace_path);
+        assert_trace_finish(
+            &events,
+            "app_server.process.io_setup",
+            "error",
+            Some("deadline"),
+        );
+        assert_trace_finish(
+            &events,
+            "app_server.account_snapshot",
+            "error",
+            Some("deadline"),
+        );
+        let shutdown = assert_trace_finish(&events, "app_server.process.shutdown", "ok", None);
+        assert!(shutdown["durationUs"].as_u64().is_some());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "span_start"
+                        && event["stage"] == "app_server.process.shutdown"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "span_finish"
+                        && event["stage"] == "app_server.process.shutdown"
+                })
+                .count(),
+            1
+        );
+        let shutdown_finish = events
+            .iter()
+            .position(|event| {
+                event["event"] == "span_finish" && event["stage"] == "app_server.process.shutdown"
+            })
+            .unwrap();
+        let parent_finish = events
+            .iter()
+            .position(|event| {
+                event["event"] == "span_finish" && event["stage"] == "app_server.account_snapshot"
+            })
+            .unwrap();
+        assert!(
+            shutdown_finish < parent_finish,
+            "the parent operation must cover setup-failure cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_timeout_is_traced_as_timeout_through_parent_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("trace.jsonl");
+        let fake_codex = temp.path().join("private-timeout-codex");
+        fs::write(&fake_codex, b"#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let trace = TraceLog::enabled(&trace_path);
+        let config = CollectConfig {
+            codex_bin: Some(fake_codex.clone()),
+            app_server_timeout: Duration::from_millis(25),
+            trace_log: trace.clone(),
+            ..CollectConfig::default()
+        };
+
+        let error = fetch_account_snapshot(&config).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out waiting"));
+        trace.finish();
+
+        let contents = fs::read_to_string(&trace_path).unwrap();
+        assert!(!contents.contains(&fake_codex.to_string_lossy().into_owned()));
+        assert!(!contents.contains("\"outcome\":\"abandoned\""));
+        let events = read_trace_events(&trace_path);
+        assert_trace_finish(
+            &events,
+            "app_server.rpc.initialize",
+            "timeout",
+            Some("timeout"),
+        );
+        assert_trace_finish(
+            &events,
+            "app_server.account_snapshot",
+            "timeout",
+            Some("timeout"),
+        );
+        assert_trace_finish(&events, "app_server.process.shutdown", "ok", None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_usage_timeout_is_traced_without_degrading_the_parent_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("trace.jsonl");
+        let fake_codex = temp.path().join("private-usage-timeout-codex");
+        fs::write(
+            &fake_codex,
+            br#"#!/bin/sh
+IFS= read -r initialize || exit 1
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r initialized || exit 2
+IFS= read -r limits || exit 3
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null}}}'
+IFS= read -r usage || exit 4
+sleep 5
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let trace = TraceLog::enabled(&trace_path);
+        let config = CollectConfig {
+            codex_bin: Some(fake_codex),
+            app_server_timeout: Duration::from_secs(2),
+            trace_log: trace.clone(),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+        assert_eq!(snapshot.limits.len(), 1);
+        assert!(snapshot.warnings.is_empty());
+        trace.finish();
+
+        let events = read_trace_events(&trace_path);
+        assert_trace_finish(&events, "app_server.rpc.account_reads", "ok", None);
+        let usage = assert_trace_finish(&events, "app_server.rpc.optional_usage", "timeout", None);
+        assert_eq!(usage["fields"]["partialReason"], "timeout");
+        let parent = assert_trace_finish(&events, "app_server.account_snapshot", "ok", None);
+        assert_eq!(parent["fields"]["snapshotPartial"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_error_snapshot_is_partial_and_parent_covers_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let trace_path = temp.path().join("trace.jsonl");
+        let fake_codex = temp.path().join("private-partial-codex");
+        fs::write(
+            &fake_codex,
+            br#"#!/bin/sh
+IFS= read -r initialize || exit 1
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r initialized || exit 2
+IFS= read -r limits || exit 3
+printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"private quota failure"}}'
+IFS= read -r usage || exit 4
+printf '%s\n' '{"id":3,"result":{"summary":{},"dailyUsageBuckets":[]}}'
+sleep 5
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let trace = TraceLog::enabled(&trace_path);
+        let config = CollectConfig {
+            codex_bin: Some(fake_codex.clone()),
+            app_server_timeout: Duration::from_secs(2),
+            trace_log: trace.clone(),
+            ..CollectConfig::default()
+        };
+
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+        assert_eq!(snapshot.errors.len(), 1);
+        trace.finish();
+
+        let contents = fs::read_to_string(&trace_path).unwrap();
+        assert!(!contents.contains("private quota failure"));
+        assert!(!contents.contains(&fake_codex.to_string_lossy().into_owned()));
+        let events = read_trace_events(&trace_path);
+        let reads = assert_trace_finish(&events, "app_server.rpc.account_reads", "partial", None);
+        assert_eq!(reads["fields"]["rateLimitsRpcError"], true);
+        assert_eq!(reads["fields"]["rateLimitsRpcCategory"], "server_error");
+        assert_trace_finish(&events, "app_server.rpc.optional_usage", "ok", None);
+        let parent = assert_trace_finish(&events, "app_server.account_snapshot", "partial", None);
+        assert_eq!(parent["fields"]["cleanupFailed"], false);
+        assert_eq!(parent["fields"]["snapshotPartial"], true);
+        assert_eq!(parent["fields"]["errorCount"], 1);
+        let shutdown_finish = events
+            .iter()
+            .position(|event| {
+                event["event"] == "span_finish" && event["stage"] == "app_server.process.shutdown"
+            })
+            .unwrap();
+        let parent_finish = events
+            .iter()
+            .position(|event| {
+                event["event"] == "span_finish" && event["stage"] == "app_server.account_snapshot"
+            })
+            .unwrap();
+        assert!(shutdown_finish < parent_finish);
+    }
+
+    #[test]
     fn unsupported_optional_usage_errors_are_recognized_without_matching_other_failures() {
         assert!(optional_usage_rpc_unavailable(
             "usage disabled (code -32601)"
@@ -1488,6 +2232,32 @@ mod diagnostic_tests {
         assert!(!optional_usage_rpc_unavailable(
             "Invalid request: malformed payload (code -32600)"
         ));
+    }
+
+    #[test]
+    fn rpc_error_categories_are_content_free_and_stable() {
+        assert_eq!(
+            rpc_error_category(&json!({
+                "id": 2,
+                "error": { "code": -32601, "message": "private details" }
+            })),
+            Some("method_not_found")
+        );
+        assert_eq!(
+            rpc_error_category(&json!({
+                "id": 2,
+                "error": { "code": -32042, "message": "private details" }
+            })),
+            Some("server_error")
+        );
+        assert_eq!(
+            rpc_error_category(&json!({
+                "id": 2,
+                "error": { "message": "private details" }
+            })),
+            Some("uncategorized")
+        );
+        assert_eq!(rpc_error_category(&json!({ "id": 2, "result": {} })), None);
     }
 
     #[test]
@@ -1615,6 +2385,7 @@ mod diagnostic_tests {
             child,
             process_tree,
             startup_trace: StartupTrace::default(),
+            trace_log: crate::trace::TraceLog::default(),
             reaped: false,
         };
         let mut reader = BufReader::new(stdout);
@@ -1623,7 +2394,7 @@ mod diagnostic_tests {
         assert_eq!(ready.trim(), "ready");
 
         let started = Instant::now();
-        child.terminate_and_reap();
+        child.terminate_and_reap().unwrap();
         let mut remainder = Vec::new();
         reader.read_to_end(&mut remainder).unwrap();
 
@@ -1664,6 +2435,7 @@ mod diagnostic_tests {
             child: primary,
             process_tree,
             startup_trace: StartupTrace::default(),
+            trace_log: crate::trace::TraceLog::default(),
             reaped: false,
         };
 
@@ -1701,7 +2473,7 @@ mod diagnostic_tests {
         );
 
         let started = Instant::now();
-        primary.terminate_and_reap();
+        primary.terminate_and_reap().unwrap();
         finish_reader_threads(stdout_reader, stderr_reader, done_rx);
 
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -1784,6 +2556,7 @@ mod tests {
             child,
             process_tree,
             startup_trace: StartupTrace::default(),
+            trace_log: crate::trace::TraceLog::default(),
             reaped: false,
         };
 
@@ -1792,12 +2565,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         if !marker.exists() {
-            child.terminate_and_reap();
+            let _ = child.terminate_and_reap();
             panic!("suspended child did not resume and create its marker");
         }
 
         let started = Instant::now();
-        child.terminate_and_reap();
+        child.terminate_and_reap().unwrap();
         let mut reader = io::BufReader::new(stdout);
         let mut remainder = Vec::new();
         reader.read_to_end(&mut remainder).unwrap();

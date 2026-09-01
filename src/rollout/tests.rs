@@ -328,6 +328,198 @@ fn external_as_of_boundary_materializes_without_rollout_changes() {
 }
 
 #[test]
+fn interactive_materialization_coalesces_bursts_without_losing_pending_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let now = Utc::now();
+    let path = sessions.join("rollout.jsonl");
+    fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread\"}}}}\n",
+            now.to_rfc3339()
+        ),
+    )
+    .unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        active_grace: Duration::from_secs(60),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+
+    assert!(
+        cache
+            .scan_if_changed_coalesced_with_external_boundary(&config, now, None)
+            .unwrap()
+            .is_some()
+    );
+    fs::write(
+        sessions.join("rollout-second.jsonl"),
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"second-thread\"}}}}\n",
+            (now + ChronoDuration::seconds(1)).to_rfc3339()
+        ),
+    )
+    .unwrap();
+    cache.discovery_cache.as_mut().unwrap().full_scan_at = Instant::now()
+        .checked_sub(DISCOVERY_FULL_RESCAN_INTERVAL)
+        .unwrap();
+
+    assert!(
+        cache
+            .scan_if_changed_coalesced_with_external_boundary(
+                &config,
+                now + ChronoDuration::seconds(1),
+                None,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        cache.materialization_pending,
+        "refresh={:?}",
+        cache.last_refresh()
+    );
+    assert!(
+        cache
+            .scan_if_changed_coalesced_with_external_boundary(
+                &config,
+                now + ChronoDuration::seconds(9),
+                None,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let materialized = cache
+        .scan_if_changed_coalesced_with_external_boundary(
+            &config,
+            now + ChronoDuration::seconds(10),
+            None,
+        )
+        .unwrap()
+        .expect("pending changes materialize at the bounded deadline");
+    assert_eq!(materialized.tasks.len(), 2);
+    assert!(!cache.materialization_pending);
+}
+
+#[test]
+fn coalesced_rebuild_invalidates_cached_as_of_projection_before_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let base = Utc::now() - ChronoDuration::seconds(1);
+    let future = base + ChronoDuration::seconds(60);
+    let path = sessions.join("rollout-as-of-coalesced.jsonl");
+    let records = [
+        serde_json::json!({
+            "timestamp": base.to_rfc3339(),
+            "type": "session_meta",
+            "payload": {"id": "coalesced-as-of-thread"}
+        }),
+        serde_json::json!({
+            "timestamp": base.to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "turn"}
+        }),
+        serde_json::json!({
+            "timestamp": (base + ChronoDuration::seconds(1)).to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 100
+            }}}
+        }),
+        serde_json::json!({
+            "timestamp": future.to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 200,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 200
+            }}}
+        }),
+    ];
+    fs::write(
+        &path,
+        records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        active_grace: Duration::from_secs(3_600),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+    let initial_at = base + ChronoDuration::seconds(5);
+
+    let initial = cache
+        .scan_if_changed_coalesced_with_external_boundary(&config, initial_at, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.tasks[0].token_usage.total_tokens, 100);
+    assert!(cache.as_of_reduced.is_some());
+
+    let appended_at = base + ChronoDuration::seconds(6);
+    fs::write(
+        sessions.join("rollout-as-of-coalesced-new-thread.jsonl"),
+        serde_json::json!({
+            "timestamp": appended_at.to_rfc3339(),
+            "type": "session_meta",
+            "payload": {"id": "deferred-new-thread"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    cache.discovery_cache.as_mut().unwrap().full_scan_at = Instant::now()
+        .checked_sub(DISCOVERY_FULL_RESCAN_INTERVAL)
+        .unwrap();
+
+    assert!(
+        cache
+            .scan_if_changed_coalesced_with_external_boundary(&config, appended_at, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(cache.last_refresh().rebuilt);
+    assert!(cache.materialization_pending);
+    assert!(
+        cache.as_of_reduced.is_none(),
+        "a deferred rebuild must invalidate the previous as-of projection"
+    );
+
+    let due = cache
+        .scan_if_changed_coalesced_with_external_boundary(
+            &config,
+            initial_at + ChronoDuration::seconds(10),
+            None,
+        )
+        .unwrap()
+        .expect("the pending rebuild must materialize at the coalescing deadline");
+    assert!(!cache.last_refresh().rebuilt);
+    assert_eq!(due.tasks.len(), 2);
+    assert!(
+        due.tasks
+            .iter()
+            .any(|task| task.thread_id == "deferred-new-thread")
+    );
+    assert_eq!(due.calls.len(), 1);
+    assert!(!cache.materialization_pending);
+}
+
+#[test]
 fn local_coverage_restarts_after_a_gap_longer_than_the_scan_lookback() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("sessions")).unwrap();

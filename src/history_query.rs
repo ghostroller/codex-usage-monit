@@ -33,6 +33,7 @@ use crate::source_history::{
 };
 use crate::source_identity::NodeId;
 use crate::source_model::{ObservedProjectKey, ThreadId};
+use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
@@ -517,16 +518,83 @@ fn load_v2_history_since(
     selection: &HistorySourceSelection,
     since: DateTime<Utc>,
 ) -> io::Result<Option<V2HistoryRead>> {
+    let trace = process_trace_log().span_with("history.v2.query", || {
+        TraceFields::new().label(
+            "sourceScope",
+            match selection {
+                HistorySourceSelection::AllIncluded => "all",
+                HistorySourceSelection::Local(_) => "local",
+                HistorySourceSelection::Remote(_) => "remote",
+            },
+        )
+    });
+    let result = load_v2_history_since_inner(
+        query_redaction,
+        ownership_epoch,
+        store,
+        project_mapping,
+        bound_local_source_id,
+        selection,
+        since,
+    );
+    match &result {
+        Ok(Some(read)) => trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new()
+                .usize("sourceCount", read.included_sources.len())
+                .usize("quotaPointCount", read.history.quota_points.len())
+                .usize("bucketCount", read.history.half_hour_buckets.len())
+                .usize("weeklyPointCount", read.history.weekly_local_points.len()),
+        ),
+        Ok(None) => trace.finish(
+            TraceOutcome::Partial,
+            TraceFields::new().label("reason", "revision_changed"),
+        ),
+        Err(_) => trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    result
+}
+
+fn load_v2_history_since_inner(
+    query_redaction: RedactionProfile,
+    ownership_epoch: u64,
+    store: &SourceHistoryStore,
+    project_mapping: &LoadedProjectMappingProjection,
+    bound_local_source_id: Option<&NodeId>,
+    selection: &HistorySourceSelection,
+    since: DateTime<Utc>,
+) -> io::Result<Option<V2HistoryRead>> {
     let evidence_since = since
         .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let mut metadata_before = store.list_source_metadata()?;
+    let metadata_trace = process_trace_log().span(
+        "history.v2.metadata_load",
+        TraceFields::new().label("phase", "before"),
+    );
+    let metadata_result = store.list_source_metadata();
+    match &metadata_result {
+        Ok(metadata) => metadata_trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new().usize("sourceCount", metadata.len()),
+        ),
+        Err(_) => metadata_trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    let mut metadata_before = metadata_result?;
     metadata_before
         .sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
 
     // Account quota is global and intentionally loaded once, independently
     // of how many local or SSH sources participate.
-    let account = store.load_account_since(evidence_since)?;
+    let account_trace = process_trace_log().span("history.v2.account_load", TraceFields::new());
+    let account_result = store.load_account_since(evidence_since);
+    match &account_result {
+        Ok(account) => account_trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new().usize("recordCount", account.quota_points.len()),
+        ),
+        Err(_) => account_trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    let account = account_result?;
     let mut slices = Vec::new();
     let mut replica_evidence = Vec::new();
     let mut included_sources = Vec::new();
@@ -583,85 +651,137 @@ fn load_v2_history_since(
             .collect()
     };
 
-    for metadata in selected_metadata {
-        let source_redaction = metadata.aggregate_redaction_profile();
-        if query_redaction == RedactionProfile::Redacted
-            && source_redaction == RedactionProfile::PreviewEnabled
-        {
-            // Do not even open the preview namespace from a redacted query.
-            redaction_skipped_sources.push(metadata.source_id().clone());
-            continue;
-        }
+    let local_source_count = selected_metadata
+        .iter()
+        .filter(|metadata| metadata.kind() == SourceKind::Local)
+        .count();
+    let remote_source_count = selected_metadata
+        .iter()
+        .filter(|metadata| metadata.kind() == SourceKind::Ssh)
+        .count();
+    let sources_trace = process_trace_log().span(
+        "history.v2.source_families_load",
+        TraceFields::new()
+            .usize("localSourceCount", local_source_count)
+            .usize("remoteSourceCount", remote_source_count),
+    );
+    let sources_result = (|| -> io::Result<Option<()>> {
+        for metadata in selected_metadata {
+            let source_redaction = metadata.aggregate_redaction_profile();
+            if query_redaction == RedactionProfile::Redacted
+                && source_redaction == RedactionProfile::PreviewEnabled
+            {
+                // Do not even open the preview namespace from a redacted query.
+                redaction_skipped_sources.push(metadata.source_id().clone());
+                continue;
+            }
 
-        let (buckets, weekly_local_points, digest_records, active_remote_ref) =
-            match metadata.kind() {
-                SourceKind::Local => {
-                    let snapshot = store.load_local_observation_snapshot_since(
-                        metadata.source_id(),
-                        source_redaction,
-                        evidence_since,
-                        detect_replicas,
-                    )?;
-                    if snapshot.source != *metadata {
-                        return Ok(None);
+            let (buckets, weekly_local_points, digest_records, active_remote_ref) =
+                match metadata.kind() {
+                    SourceKind::Local => {
+                        let snapshot = store.load_local_observation_snapshot_since(
+                            metadata.source_id(),
+                            source_redaction,
+                            evidence_since,
+                            detect_replicas,
+                        )?;
+                        if snapshot.source != *metadata {
+                            return Ok(None);
+                        }
+                        (
+                            snapshot.buckets,
+                            snapshot.weekly_local_points,
+                            snapshot.session_digest_records,
+                            None,
+                        )
                     }
-                    (
-                        snapshot.buckets,
-                        snapshot.weekly_local_points,
-                        snapshot.session_digest_records,
-                        None,
-                    )
-                }
-                SourceKind::Ssh => {
-                    // One combined snapshot call per remote source. It holds the
-                    // remote active-generation lock across bucket and digest
-                    // families, so a generation switch cannot splice them. The
-                    // current exporter has no remote weekly wire family; weekly
-                    // cumulative points are derived from these source buckets.
-                    let snapshot = store.load_remote_history_snapshot_since(
-                        metadata.source_id(),
-                        source_redaction,
-                        evidence_since,
-                    )?;
-                    let buckets = snapshot
-                        .bucket_records
-                        .iter()
-                        .filter_map(|record| match record.change() {
-                            SourceBucketChange::Upsert(bucket) => Some((**bucket).clone()),
-                            SourceBucketChange::Tombstone => None,
-                        })
-                        .collect();
-                    (
-                        buckets,
-                        Vec::new(),
-                        snapshot.session_digest_records,
-                        snapshot.active_ref,
-                    )
-                }
-            };
-        let digests = digest_records
-            .into_iter()
-            .filter_map(|record| match record.change() {
-                SourceSessionDigestChange::Upsert(digest) => Some((**digest).clone()),
-                SourceSessionDigestChange::Tombstone => None,
-            })
-            .collect();
-        included_sources.push(metadata.source_id().clone());
-        slices.push(SourceSlice {
-            metadata: metadata.clone(),
-            buckets,
-            weekly_local_points,
-        });
-        replica_evidence.push(SourceReplicaEvidence {
-            source_id: metadata.source_id().clone(),
-            redaction_profile: source_redaction,
-            digests,
-            active_remote_ref,
-            active_facts: BTreeMap::new(),
-        });
+                    SourceKind::Ssh => {
+                        // One combined snapshot call per remote source. It holds the
+                        // remote active-generation lock across bucket and digest
+                        // families, so a generation switch cannot splice them. The
+                        // current exporter has no remote weekly wire family; weekly
+                        // cumulative points are derived from these source buckets.
+                        let snapshot = store.load_remote_history_snapshot_since(
+                            metadata.source_id(),
+                            source_redaction,
+                            evidence_since,
+                        )?;
+                        let buckets = snapshot
+                            .bucket_records
+                            .iter()
+                            .filter_map(|record| match record.change() {
+                                SourceBucketChange::Upsert(bucket) => Some((**bucket).clone()),
+                                SourceBucketChange::Tombstone => None,
+                            })
+                            .collect();
+                        (
+                            buckets,
+                            Vec::new(),
+                            snapshot.session_digest_records,
+                            snapshot.active_ref,
+                        )
+                    }
+                };
+            let digests = digest_records
+                .into_iter()
+                .filter_map(|record| match record.change() {
+                    SourceSessionDigestChange::Upsert(digest) => Some((**digest).clone()),
+                    SourceSessionDigestChange::Tombstone => None,
+                })
+                .collect();
+            included_sources.push(metadata.source_id().clone());
+            slices.push(SourceSlice {
+                metadata: metadata.clone(),
+                buckets,
+                weekly_local_points,
+            });
+            replica_evidence.push(SourceReplicaEvidence {
+                source_id: metadata.source_id().clone(),
+                redaction_profile: source_redaction,
+                digests,
+                active_remote_ref,
+                active_facts: BTreeMap::new(),
+            });
+        }
+        Ok(Some(()))
+    })();
+    let loaded_bucket_count = slices.iter().map(|slice| slice.buckets.len()).sum();
+    let loaded_weekly_count = slices
+        .iter()
+        .map(|slice| slice.weekly_local_points.len())
+        .sum();
+    let loaded_digest_count = replica_evidence
+        .iter()
+        .map(|evidence| evidence.digests.len())
+        .sum();
+    match &sources_result {
+        Ok(Some(())) => sources_trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new()
+                .usize("bucketRecordCount", loaded_bucket_count)
+                .usize("weeklyRecordCount", loaded_weekly_count)
+                .usize("digestRecordCount", loaded_digest_count),
+        ),
+        Ok(None) => sources_trace.finish(TraceOutcome::Partial, TraceFields::new()),
+        Err(_) => sources_trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    if sources_result?.is_none() {
+        return Ok(None);
     }
 
-    let mut metadata_after = store.list_source_metadata()?;
+    let metadata_trace = process_trace_log().span(
+        "history.v2.metadata_load",
+        TraceFields::new().label("phase", "after"),
+    );
+    let metadata_result = store.list_source_metadata();
+    match &metadata_result {
+        Ok(metadata) => metadata_trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new().usize("sourceCount", metadata.len()),
+        ),
+        Err(_) => metadata_trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    let mut metadata_after = metadata_result?;
     metadata_after.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     if metadata_before != metadata_after {
         return Ok(None);
@@ -672,12 +792,33 @@ fn load_v2_history_since(
 
     let mut replica_report = LogicalReplicaReport::default();
     if matches!(selection, HistorySourceSelection::AllIncluded) {
-        replica_report = resolve_logical_replicas(
+        // Preserve the reset-cycle interpretation from the physical inputs.
+        // Logical replica resolution clears cumulative baselines because they
+        // cannot be decomposed per thread; canonicalizing first prevents each
+        // rolling zero-usage estimate from becoming an anchored marker.
+        let weekly_cycle_resets = canonical_weekly_resets(&slices, &account.quota_points);
+        let replica_trace = process_trace_log().span_with("history.v2.replica_resolve", || {
+            TraceFields::new()
+                .usize("sourceCount", slices.len())
+                .usize("digestRecordCount", loaded_digest_count)
+        });
+        let replica_result = resolve_logical_replicas(
             store,
             &mut slices,
             &mut replica_evidence,
             &project_mapping.projection,
-        )?;
+            &weekly_cycle_resets,
+        );
+        match &replica_result {
+            Ok(report) => replica_trace.finish(
+                TraceOutcome::Ok,
+                TraceFields::new()
+                    .usize("logicalThreadCount", report.logical_threads.len())
+                    .usize("warningCount", report.warnings.len()),
+            ),
+            Err(_) => replica_trace.finish(TraceOutcome::Error, TraceFields::new()),
+        }
+        replica_report = replica_result?;
     }
 
     let weekly_local_points = aggregate_source_weekly_points(&slices, &account.quota_points, since);
@@ -694,10 +835,19 @@ fn load_v2_history_since(
     } else {
         None
     };
+    let aggregate_trace = process_trace_log().span_with("history.v2.bucket_aggregate", || {
+        TraceFields::new()
+            .usize("sourceCount", slices.len())
+            .usize("inputBucketCount", loaded_bucket_count)
+    });
     let bucket_projection = aggregate_source_buckets_with_logical_threads(
         &slices,
         &project_mapping.projection,
         &replica_report.logical_threads,
+    );
+    aggregate_trace.finish(
+        TraceOutcome::Ok,
+        TraceFields::new().usize("outputBucketCount", bucket_projection.buckets.len()),
     );
     let mut history = HistoryData {
         quota_points: account
@@ -809,6 +959,7 @@ fn resolve_logical_replicas(
     slices: &mut [SourceSlice],
     evidence: &mut [SourceReplicaEvidence],
     project_mapping: &ProjectMappingProjection,
+    weekly_cycle_resets: &[DateTime<Utc>],
 ) -> io::Result<LogicalReplicaReport> {
     // Bucket project groups are an independent replica signal. In particular,
     // a v1 -> v2 migration can persist buckets before its matching digest, so
@@ -1127,7 +1278,7 @@ fn resolve_logical_replicas(
         // queried bucket window includes the preceding full cycle, so derive
         // the logical projection from adjusted buckets instead of retaining a
         // physically duplicated baseline.
-        replace_weekly_baselines_with_cycle_markers(slices);
+        replace_weekly_baselines_with_cycle_markers(slices, weekly_cycle_resets);
     }
     report.warnings.sort();
     report.warnings.dedup();
@@ -1274,23 +1425,17 @@ fn mark_unhandled_authority_lower_bound(
     }
 }
 
-fn replace_weekly_baselines_with_cycle_markers(slices: &mut [SourceSlice]) {
-    let resets = slices
-        .iter()
-        .flat_map(|source| {
-            source
-                .weekly_local_points
-                .iter()
-                .map(|point| point.resets_at)
-        })
-        .collect::<BTreeSet<_>>();
+fn replace_weekly_baselines_with_cycle_markers(
+    slices: &mut [SourceSlice],
+    canonical_resets: &[DateTime<Utc>],
+) {
     for source in slices.iter_mut() {
         source.weekly_local_points.clear();
     }
     let Some(marker_source) = slices.first_mut() else {
         return;
     };
-    for resets_at in resets {
+    for &resets_at in canonical_resets {
         let observed_at = resets_at
             .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
             .unwrap_or(DateTime::<Utc>::MIN_UTC);
@@ -2188,8 +2333,46 @@ fn aggregate_source_weekly_points(
     account_quota: &[QuotaPoint],
     since: DateTime<Utc>,
 ) -> Vec<WeeklyLocalPoint> {
+    let trace = process_trace_log().span_with("history.weekly_aggregate", || {
+        TraceFields::new()
+            .usize("sourceCount", sources.len())
+            .usize("quotaPointCount", account_quota.len())
+    });
+    let (points, work) = aggregate_source_weekly_points_with_work(sources, account_quota, since);
+    trace.finish_with(TraceOutcome::Ok, || {
+        TraceFields::new()
+            .usize("resetCycles", work.reset_cycles)
+            .usize("timelinePoints", work.timeline_points)
+            .usize("sourceEvaluations", work.source_evaluations)
+            .usize("weeklyAdvances", work.weekly_advances)
+            .usize("bucketAdvances", work.bucket_advances)
+            .usize("coverageAdvances", work.coverage_advances)
+            .usize("outputPoints", points.len())
+    });
+    points
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WeeklyAggregationWork {
+    reset_cycles: usize,
+    timeline_points: usize,
+    source_evaluations: usize,
+    weekly_advances: usize,
+    bucket_advances: usize,
+    coverage_advances: usize,
+}
+
+fn aggregate_source_weekly_points_with_work(
+    sources: &[SourceSlice],
+    account_quota: &[QuotaPoint],
+    since: DateTime<Utc>,
+) -> (Vec<WeeklyLocalPoint>, WeeklyAggregationWork) {
     let resets = canonical_weekly_resets(sources, account_quota);
     let mut points = Vec::new();
+    let mut work = WeeklyAggregationWork {
+        reset_cycles: resets.len(),
+        ..WeeklyAggregationWork::default()
+    };
     for resets_at in resets {
         let cycle_starts_at = resets_at
             .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
@@ -2216,15 +2399,20 @@ fn aggregate_source_weekly_points(
             );
         }
 
+        let mut cursors = sources
+            .iter()
+            .map(|source| WeeklySourceCursor::new(source, cycle_starts_at, resets_at))
+            .collect::<Vec<_>>();
+
         for observed_at in timeline
             .into_iter()
             .filter(|observed_at| *observed_at >= since && *observed_at < resets_at)
         {
+            work.timeline_points = work.timeline_points.saturating_add(1);
             let mut aggregate = WeeklyAccumulator::default();
-            for source in sources {
-                if let Some(component) =
-                    source_weekly_cumulative_at(source, cycle_starts_at, resets_at, observed_at)
-                {
+            for cursor in &mut cursors {
+                work.source_evaluations = work.source_evaluations.saturating_add(1);
+                if let Some(component) = cursor.advance_to(observed_at, &mut work) {
                     aggregate.add_assign(component);
                 }
             }
@@ -2255,7 +2443,7 @@ fn aggregate_source_weekly_points(
         }
     }
     points.sort_by_key(|point| (point.observed_at, point.resets_at));
-    points
+    (points, work)
 }
 
 fn canonical_weekly_resets(
@@ -2263,12 +2451,33 @@ fn canonical_weekly_resets(
     account_quota: &[QuotaPoint],
 ) -> Vec<DateTime<Utc>> {
     let mut resets = Vec::new();
-    // Account reset timestamps are canonical when available.
+    // A server reports `observed_at + 7d` while a completely unused weekly
+    // window is not anchored yet. Persisted samples of that rolling estimate
+    // must not each become a distinct cycle. Non-zero account observations
+    // are authoritative; retain only the newest zero-evidence candidate so an
+    // actually idle current cycle can still be represented.
+    let latest_anchored_observation = account_quota
+        .iter()
+        .filter(|point| {
+            point.duration_mins == WEEKLY_WINDOW_MINUTES
+                && point.limit_id.trim().eq_ignore_ascii_case("codex")
+                && quota_point_establishes_weekly_cycle(point)
+        })
+        .map(|point| point.observed_at)
+        .chain(
+            sources
+                .iter()
+                .flat_map(|source| &source.weekly_local_points)
+                .filter(|point| weekly_point_establishes_cycle(point))
+                .map(|point| point.observed_at),
+        )
+        .max();
     let mut account_resets = account_quota
         .iter()
         .filter(|point| {
             point.duration_mins == WEEKLY_WINDOW_MINUTES
                 && point.limit_id.trim().eq_ignore_ascii_case("codex")
+                && quota_point_establishes_weekly_cycle(point)
         })
         .map(|point| point.resets_at)
         .collect::<Vec<_>>();
@@ -2276,15 +2485,54 @@ fn canonical_weekly_resets(
     for candidate in account_resets {
         push_reset_if_distinct(&mut resets, candidate);
     }
-    for candidate in sources
+    let mut source_resets = sources
         .iter()
         .flat_map(|source| &source.weekly_local_points)
+        .filter(|point| weekly_point_establishes_cycle(point))
         .map(|point| point.resets_at)
+        .collect::<Vec<_>>();
+    source_resets.sort();
+    for candidate in source_resets {
+        push_reset_if_distinct(&mut resets, candidate);
+    }
+    let latest_unanchored = account_quota
+        .iter()
+        .filter(|point| {
+            point.duration_mins == WEEKLY_WINDOW_MINUTES
+                && point.limit_id.trim().eq_ignore_ascii_case("codex")
+                && !quota_point_establishes_weekly_cycle(point)
+        })
+        .map(|point| (point.observed_at, true, point.resets_at))
+        .chain(
+            sources
+                .iter()
+                .flat_map(|source| &source.weekly_local_points)
+                .filter(|point| !weekly_point_establishes_cycle(point))
+                .map(|point| (point.observed_at, false, point.resets_at)),
+        )
+        // Prefer the account timestamp on an exact observation tie.
+        .max_by_key(|(observed_at, account, _)| (*observed_at, *account));
+    if let Some((observed_at, _, candidate)) = latest_unanchored
+        && latest_anchored_observation.is_none_or(|anchored| observed_at > anchored)
     {
         push_reset_if_distinct(&mut resets, candidate);
     }
     resets.sort();
     resets
+}
+
+fn quota_point_establishes_weekly_cycle(point: &QuotaPoint) -> bool {
+    point.used_percent > 0.0 || point.remaining_percent < 100.0
+}
+
+fn weekly_point_establishes_cycle(point: &WeeklyLocalPoint) -> bool {
+    !point.token_usage.is_zero()
+        || point.estimated_cost_units > 0
+        || point.call_count > 0
+        || point
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS)
 }
 
 fn push_reset_if_distinct(resets: &mut Vec<DateTime<Utc>>, candidate: DateTime<Utc>) {
@@ -2303,6 +2551,148 @@ fn reset_matches(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
         <= RESET_DRIFT_SECONDS as u64
 }
 
+struct WeeklySourceCursor<'a> {
+    source_kind: SourceKind,
+    cycle_starts_at: DateTime<Utc>,
+    weekly: Vec<&'a WeeklyLocalPoint>,
+    buckets: Vec<&'a LocalHalfHourBucket>,
+    coverage_buckets: Vec<&'a LocalHalfHourBucket>,
+    weekly_index: usize,
+    bucket_index: usize,
+    coverage_index: usize,
+    base_observed_at: Option<DateTime<Utc>>,
+    aggregate: WeeklyAccumulator,
+    coverage_through: DateTime<Utc>,
+    coverage_gap: bool,
+}
+
+impl<'a> WeeklySourceCursor<'a> {
+    fn new(
+        source: &'a SourceSlice,
+        cycle_starts_at: DateTime<Utc>,
+        resets_at: DateTime<Utc>,
+    ) -> Self {
+        let mut weekly = source
+            .weekly_local_points
+            .iter()
+            .filter(|point| reset_matches(point.resets_at, resets_at))
+            .filter(|point| point.observed_at >= cycle_starts_at)
+            .filter(|point| point.observed_at < resets_at)
+            .collect::<Vec<_>>();
+        weekly.sort_by_key(|point| point.observed_at);
+        let mut buckets = source
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.starts_at >= cycle_starts_at && bucket.ends_at <= resets_at)
+            .collect::<Vec<_>>();
+        buckets.sort_by_key(|bucket| (bucket.ends_at, bucket.starts_at));
+        let mut coverage_buckets = source
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.ends_at > cycle_starts_at && bucket.starts_at < resets_at)
+            .collect::<Vec<_>>();
+        coverage_buckets.sort_by_key(|bucket| (bucket.starts_at, bucket.ends_at));
+        Self {
+            source_kind: source.metadata.kind(),
+            cycle_starts_at,
+            weekly,
+            buckets,
+            coverage_buckets,
+            weekly_index: 0,
+            bucket_index: 0,
+            coverage_index: 0,
+            base_observed_at: None,
+            aggregate: WeeklyAccumulator::default(),
+            coverage_through: cycle_starts_at,
+            coverage_gap: false,
+        }
+    }
+
+    fn advance_to(
+        &mut self,
+        observed_at: DateTime<Utc>,
+        work: &mut WeeklyAggregationWork,
+    ) -> Option<WeeklyAccumulator> {
+        while self
+            .weekly
+            .get(self.weekly_index)
+            .is_some_and(|point| point.observed_at <= observed_at)
+        {
+            let point = self.weekly[self.weekly_index];
+            self.aggregate = WeeklyAccumulator::default();
+            self.aggregate.add_weekly(point);
+            if point.observed_at.timestamp().rem_euclid(15 * 60) != 0 {
+                self.aggregate
+                    .partial_reasons
+                    .insert("weekly_source_boundary_excludes_partial_bucket".to_string());
+            }
+            self.base_observed_at = Some(point.observed_at);
+            self.weekly_index += 1;
+            work.weekly_advances = work.weekly_advances.saturating_add(1);
+        }
+
+        let bucket_cutoff = self.base_observed_at.unwrap_or(self.cycle_starts_at);
+        while self
+            .buckets
+            .get(self.bucket_index)
+            .is_some_and(|bucket| bucket.ends_at <= observed_at)
+        {
+            let bucket = self.buckets[self.bucket_index];
+            if bucket.starts_at >= bucket_cutoff {
+                self.aggregate.add_bucket(bucket);
+            }
+            self.bucket_index += 1;
+            work.bucket_advances = work.bucket_advances.saturating_add(1);
+        }
+
+        if !self.aggregate.present {
+            return None;
+        }
+        let mut aggregate = self.aggregate.clone();
+        if self.base_observed_at.is_none() {
+            if self.source_kind == SourceKind::Ssh {
+                aggregate
+                    .partial_reasons
+                    .insert("remote_weekly_from_buckets_lower_bound".to_string());
+            } else if !self.coverage_complete_through(observed_at, work) {
+                aggregate
+                    .partial_reasons
+                    .insert("local_weekly_from_buckets_lower_bound".to_string());
+            }
+        }
+        Some(aggregate)
+    }
+
+    fn coverage_complete_through(
+        &mut self,
+        observed_at: DateTime<Utc>,
+        work: &mut WeeklyAggregationWork,
+    ) -> bool {
+        let target = observed_at - Duration::seconds(observed_at.timestamp().rem_euclid(15 * 60));
+        if target <= self.cycle_starts_at {
+            return target == self.cycle_starts_at;
+        }
+        while self
+            .coverage_buckets
+            .get(self.coverage_index)
+            .is_some_and(|bucket| bucket.starts_at < target)
+        {
+            let bucket = self.coverage_buckets[self.coverage_index];
+            if !self.coverage_gap {
+                if bucket.starts_at > self.coverage_through {
+                    self.coverage_gap = true;
+                } else if bucket.ends_at > self.coverage_through {
+                    self.coverage_through = bucket.ends_at;
+                }
+            }
+            self.coverage_index += 1;
+            work.coverage_advances = work.coverage_advances.saturating_add(1);
+        }
+        !self.coverage_gap && self.coverage_through >= target
+    }
+}
+
+#[cfg(test)]
 fn source_weekly_cumulative_at(
     source: &SourceSlice,
     cycle_starts_at: DateTime<Utc>,
@@ -2351,6 +2741,7 @@ fn source_weekly_cumulative_at(
     aggregate.present.then_some(aggregate)
 }
 
+#[cfg(test)]
 fn source_buckets_cover_cycle(
     buckets: &[LocalHalfHourBucket],
     cycle_starts_at: DateTime<Utc>,
@@ -2379,7 +2770,7 @@ fn source_buckets_cover_cycle(
     false
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WeeklyAccumulator {
     present: bool,
     token_usage: TokenUsage,
@@ -4541,6 +4932,171 @@ mod tests {
                 .partial_reasons
                 .contains(&"remote_weekly_from_buckets_lower_bound".to_string())
         );
+    }
+
+    #[test]
+    fn weekly_projection_advances_each_bucket_once_per_cycle() {
+        let resets_at = at(8, 0, 0);
+        let cycle_starts_at = at(1, 0, 0);
+        let mut buckets = Vec::new();
+        for index in 0..96_i64 {
+            buckets.push(bucket(
+                cycle_starts_at + Duration::minutes(index * 15),
+                1,
+                "local",
+            ));
+        }
+        let sources = vec![SourceSlice {
+            metadata: source(
+                SOURCE_A,
+                "local",
+                SourceKind::Local,
+                RedactionProfile::Redacted,
+            ),
+            buckets,
+            weekly_local_points: vec![weekly(cycle_starts_at, resets_at, 10)],
+        }];
+
+        let (points, work) = aggregate_source_weekly_points_with_work(
+            &sources,
+            &[quota(cycle_starts_at, resets_at)],
+            cycle_starts_at,
+        );
+
+        assert_eq!(work.reset_cycles, 1);
+        assert_eq!(work.bucket_advances, 96);
+        assert_eq!(work.weekly_advances, 1);
+        assert_eq!(work.source_evaluations, work.timeline_points);
+        assert_eq!(points.last().unwrap().token_usage.total_tokens, 106);
+        // The former implementation rescanned all 96 buckets for every one
+        // of the 97 timeline points. The cursor bound is linear in inputs plus
+        // emitted points, rather than their product.
+        assert!(work.bucket_advances < work.timeline_points * 2);
+    }
+
+    #[test]
+    fn weekly_projection_cursor_matches_reference_rescan_semantics() {
+        let cycle_starts_at = at(1, 0, 0);
+        let resets_at = at(8, 0, 0);
+        let mut buckets = Vec::new();
+        for index in 0..12_i64 {
+            buckets.push(bucket(
+                cycle_starts_at + Duration::minutes(index * 15),
+                u64::try_from(index + 1).unwrap(),
+                "local",
+            ));
+        }
+        let source = SourceSlice {
+            metadata: source(
+                SOURCE_A,
+                "local",
+                SourceKind::Local,
+                RedactionProfile::Redacted,
+            ),
+            buckets,
+            weekly_local_points: vec![
+                weekly(cycle_starts_at + Duration::minutes(37), resets_at, 100),
+                weekly(cycle_starts_at + Duration::minutes(92), resets_at, 200),
+            ],
+        };
+        let mut timeline = source
+            .buckets
+            .iter()
+            .map(|bucket| bucket.ends_at)
+            .chain(
+                source
+                    .weekly_local_points
+                    .iter()
+                    .map(|point| point.observed_at),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut cursor = WeeklySourceCursor::new(&source, cycle_starts_at, resets_at);
+        let mut work = WeeklyAggregationWork::default();
+        for observed_at in std::mem::take(&mut timeline) {
+            assert_eq!(
+                cursor.advance_to(observed_at, &mut work),
+                source_weekly_cumulative_at(&source, cycle_starts_at, resets_at, observed_at),
+                "cursor diverged at {observed_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_zero_usage_reset_estimates_collapse_to_the_latest_candidate() {
+        let first_observed = at(1, 0, 0);
+        let mut quota_points = Vec::new();
+        for index in 0..36_i64 {
+            let observed_at = first_observed + Duration::minutes(index * 5);
+            let mut point = quota(observed_at, observed_at + Duration::days(7));
+            point.used_percent = 0.0;
+            point.remaining_percent = 100.0;
+            quota_points.push(point);
+        }
+
+        let resets = canonical_weekly_resets(&[], &quota_points);
+        assert_eq!(resets.len(), 1);
+        assert_eq!(
+            resets[0],
+            quota_points
+                .last()
+                .expect("latest rolling estimate")
+                .resets_at
+        );
+    }
+
+    #[test]
+    fn logical_replica_markers_keep_rolling_zero_resets_canonical() {
+        let first_observed = at(1, 0, 0);
+        let mut rolling_points = Vec::new();
+        for index in 0..3_i64 {
+            let observed_at = first_observed + Duration::minutes(index * 30);
+            let mut point = weekly(observed_at, observed_at + Duration::days(7), 0);
+            point.call_count = 0;
+            rolling_points.push(point);
+        }
+        let mut sources = vec![SourceSlice {
+            metadata: source(
+                SOURCE_A,
+                "local",
+                SourceKind::Local,
+                RedactionProfile::Redacted,
+            ),
+            buckets: Vec::new(),
+            weekly_local_points: rolling_points,
+        }];
+        let account_observed = first_observed + Duration::minutes(90);
+        let mut account_point = quota(account_observed, account_observed + Duration::days(7));
+        account_point.used_percent = 0.0;
+        account_point.remaining_percent = 100.0;
+        let account_quota = vec![account_point];
+
+        let canonical = canonical_weekly_resets(&sources, &account_quota);
+        assert_eq!(canonical, vec![account_observed + Duration::days(7)]);
+
+        // Logical replica handling discards physical weekly baselines. It must
+        // rebuild only the already-canonical cycles, not turn every rolling
+        // zero estimate into a durable-looking anchored cycle marker.
+        replace_weekly_baselines_with_cycle_markers(&mut sources, &canonical);
+        assert_eq!(sources[0].weekly_local_points.len(), 1);
+        assert_eq!(canonical_weekly_resets(&sources, &account_quota), canonical);
+        let (_, work) =
+            aggregate_source_weekly_points_with_work(&sources, &account_quota, first_observed);
+        assert_eq!(work.reset_cycles, 1);
+    }
+
+    #[test]
+    fn anchored_reset_is_retained_alongside_the_latest_idle_cycle() {
+        let anchored_reset = at(8, 0, 0);
+        let mut anchored = quota(at(2, 0, 0), anchored_reset);
+        anchored.used_percent = 1.0;
+        anchored.remaining_percent = 99.0;
+        let idle_observed = at(9, 0, 0);
+        let mut idle = quota(idle_observed, idle_observed + Duration::days(7));
+        idle.used_percent = 0.0;
+        idle.remaining_percent = 100.0;
+
+        let resets = canonical_weekly_resets(&[], &[anchored, idle.clone()]);
+        assert_eq!(resets, vec![anchored_reset, idle.resets_at]);
     }
 
     #[test]

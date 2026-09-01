@@ -23,6 +23,7 @@ use crate::domain::{
     UsageCall,
 };
 use crate::session_index::load_thread_titles;
+use crate::trace::{TraceFields, TraceOutcome};
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 3;
@@ -42,6 +43,11 @@ const PERSISTENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DISCOVERY_FULL_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_INCOMPLETE_RESCAN_INTERVAL: Duration = Duration::from_secs(10);
+// Interactive refreshes may observe several active rollout files advancing at
+// once. Parsing/reduction remains incremental, but delay the expensive cloned
+// dataset + downstream snapshot projections briefly so one burst produces one
+// coherent UI update instead of repeatedly deriving the same full lookback.
+const SNAPSHOT_MATERIALIZE_COALESCE_INTERVAL: Duration = Duration::from_secs(10);
 const TAIL_GUARD_BYTES: usize = 256;
 const OWNER_PROBE_MAX_BYTES: u64 = 64 * 1024;
 const OWNER_PROBE_MAX_LINES: usize = 32;
@@ -607,6 +613,7 @@ pub struct RolloutCache {
     omitted_owner_probes: HashMap<PathBuf, CachedOwnerProbe>,
     local_coverage_started_at: Option<DateTime<Utc>>,
     local_coverage_last_complete_at: Option<DateTime<Utc>>,
+    materialization_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1049,7 +1056,7 @@ impl RolloutCache {
     /// title index only when their metadata fingerprints change.
     pub fn scan(&mut self, config: &CollectConfig, now: DateTime<Utc>) -> Result<RolloutDataset> {
         Ok(self
-            .scan_inner(config, now, true, None)?
+            .scan_inner(config, now, true, false, None)?
             .expect("a forced rollout scan always materializes a dataset"))
     }
 
@@ -1060,7 +1067,7 @@ impl RolloutCache {
         next_external_boundary: Option<DateTime<Utc>>,
     ) -> Result<RolloutDataset> {
         Ok(self
-            .scan_inner(config, now, true, next_external_boundary)?
+            .scan_inner(config, now, true, false, next_external_boundary)?
             .expect("a forced rollout scan always materializes a dataset"))
     }
 
@@ -1071,7 +1078,7 @@ impl RolloutCache {
         config: &CollectConfig,
         now: DateTime<Utc>,
     ) -> Result<Option<RolloutDataset>> {
-        self.scan_inner(config, now, false, None)
+        self.scan_inner(config, now, false, false, None)
     }
 
     pub(crate) fn scan_if_changed_with_external_boundary(
@@ -1080,7 +1087,20 @@ impl RolloutCache {
         now: DateTime<Utc>,
         next_external_boundary: Option<DateTime<Utc>>,
     ) -> Result<Option<RolloutDataset>> {
-        self.scan_inner(config, now, false, next_external_boundary)
+        self.scan_inner(config, now, false, false, next_external_boundary)
+    }
+
+    /// Interactive variant which preserves every parsed/reduced change while
+    /// coalescing repeated full-lookback materialization into a bounded window.
+    /// A pending update is emitted even when the next discovery pass itself is
+    /// unchanged, so the latest state cannot be lost.
+    pub(crate) fn scan_if_changed_coalesced_with_external_boundary(
+        &mut self,
+        config: &CollectConfig,
+        now: DateTime<Utc>,
+        next_external_boundary: Option<DateTime<Utc>>,
+    ) -> Result<Option<RolloutDataset>> {
+        self.scan_inner(config, now, false, true, next_external_boundary)
     }
 
     pub(crate) fn set_external_boundary(
@@ -1097,8 +1117,21 @@ impl RolloutCache {
         config: &CollectConfig,
         now: DateTime<Utc>,
         force_materialize: bool,
+        coalesce_materialization: bool,
         next_external_boundary: Option<DateTime<Utc>>,
     ) -> Result<Option<RolloutDataset>> {
+        let operation_trace = config.trace_log.span_with("rollout.scan", || {
+            TraceFields::new()
+                .bool("forceMaterialize", force_materialize)
+                .bool("coalesceMaterialization", coalesce_materialization)
+                .u64(
+                    "lookbackDays",
+                    u64::try_from(config.lookback_days).unwrap_or(0),
+                )
+                .usize("maxFiles", config.max_files)
+                .bool("persistentCache", config.rollout_cache_dir.is_some())
+                .bool("redactContent", config.redact_content)
+        });
         let trace_active = config.startup_trace.is_active();
         let perf_active = config.perf_log.is_enabled();
         let scan_started = trace_active.then(Instant::now);
@@ -1135,6 +1168,7 @@ impl RolloutCache {
             self.omitted_owner_probes.clear();
             self.local_coverage_started_at = None;
             self.local_coverage_last_complete_at = None;
+            self.materialization_pending = false;
             self.key = Some(key.clone());
         }
         let external_boundary_changed = self
@@ -1153,6 +1187,9 @@ impl RolloutCache {
         let mut discovery_suppressed_warnings = 0_usize;
         let discovery_started = perf_active.then(Instant::now);
         let discovery_span = config.startup_trace.span("rollout.discover");
+        let discovery_trace = config
+            .trace_log
+            .span_with("rollout.discover", TraceFields::new);
         let mut files = self.discover_rollout_files(
             config,
             now,
@@ -1178,6 +1215,17 @@ impl RolloutCache {
             files.len(),
             discovery.stats.truncated_files
         ));
+        discovery_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .bool("fullScan", refresh.discovery_full_scan)
+                .bool("cacheHit", refresh.discovery_cache_hit)
+                .bool("invalidated", refresh.discovery_invalidated)
+                .usize("probedFiles", refresh.discovery_probed_files)
+                .usize("probedDirs", refresh.discovery_probed_dirs)
+                .usize("selectedFiles", files.len())
+                .u64("selectedBytes", selected_bytes)
+                .u64("largestFileBytes", largest_file_bytes)
+        });
 
         // Parsing itself is file-local. Use a stable path order here, then
         // derive the semantic replay order from parsed event timestamps below.
@@ -1227,6 +1275,9 @@ impl RolloutCache {
 
         let cache_load_started = perf_active.then(Instant::now);
         let cache_load_span = config.startup_trace.span("rollout.cache_load");
+        let cache_load_trace = config
+            .trace_log
+            .span_with("rollout.cache_load", TraceFields::new);
         let mut disk_tail_candidates = HashMap::new();
         if let Some(cache_root) = config.rollout_cache_dir.as_deref() {
             for file in &files {
@@ -1279,9 +1330,20 @@ impl RolloutCache {
                 refresh.persistent_large_guard_bytes
             )
         });
+        cache_load_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("exactHits", refresh.disk_exact_reused_files)
+                .usize("tailCandidates", disk_tail_candidates.len())
+                .usize("misses", refresh.disk_misses)
+                .usize("corrupt", refresh.disk_corrupt_files)
+                .u64("validationBytes", refresh.persistent_hash_bytes)
+        });
 
         let parse_started = perf_active.then(Instant::now);
         let parse_span = config.startup_trace.span("rollout.parse_files");
+        let parse_trace = config.trace_log.span_with("rollout.parse", || {
+            TraceFields::new().usize("selectedFiles", files.len())
+        });
         let mut slowest_parse_us = 0_u128;
         let mut slowest_file_bytes = 0_u64;
         let mut changed_thread_ids = HashSet::new();
@@ -1393,6 +1455,17 @@ impl RolloutCache {
             refresh.disk_large_tail_reused_files,
             refresh.stability_retries
         ));
+        parse_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("reparsedFiles", refresh.reparsed_files)
+                .usize("reusedFiles", refresh.reused_files)
+                .usize("tailParsedFiles", refresh.tail_parsed_files)
+                .u64("tailParsedBytes", refresh.tail_parsed_bytes)
+                .usize("fullParsedFiles", refresh.full_parsed_files)
+                .u64("fullParsedBytes", refresh.full_parsed_bytes)
+                .usize("parsedLines", parsed_lines)
+                .usize("cachedEvents", cached_events)
+        });
 
         sort_rollout_files_for_replay(&mut files, &self.files);
         let replay_plan = build_replay_plan(
@@ -1406,6 +1479,9 @@ impl RolloutCache {
 
         let cache_save_started = perf_active.then(Instant::now);
         let cache_save_span = config.startup_trace.span("rollout.cache_save");
+        let cache_save_trace = config
+            .trace_log
+            .span_with("rollout.cache_save", TraceFields::new);
         let write = self.persist_dirty_files(config, &key, cache_usage);
         refresh.disk_written_files = write.written;
         refresh.disk_write_failures = write.failures;
@@ -1439,6 +1515,21 @@ impl RolloutCache {
                 write.large_guard_bytes
             )
         });
+        cache_save_trace.finish_with(
+            if refresh.disk_write_failures == 0 {
+                TraceOutcome::Ok
+            } else {
+                TraceOutcome::Partial
+            },
+            || {
+                TraceFields::new()
+                    .usize("writtenFiles", refresh.disk_written_files)
+                    .usize("failures", refresh.disk_write_failures)
+                    .usize("deferredFiles", refresh.disk_deferred_files)
+                    .usize("oversizedFiles", refresh.disk_oversized_files)
+                    .usize("prunedFiles", refresh.disk_pruned_files)
+            },
+        );
 
         let selected = files
             .iter()
@@ -1530,6 +1621,9 @@ impl RolloutCache {
 
         let reduce_started = perf_active.then(Instant::now);
         let reduce_span = config.startup_trace.span("rollout.reduce");
+        let reduce_trace = config.trace_log.span_with("rollout.reduce", || {
+            TraceFields::new().bool("required", must_rebuild)
+        });
         if must_rebuild {
             let mut replay_warnings_truncated = false;
             if let Some(reduced) = self.reduced.as_mut() {
@@ -1566,7 +1660,7 @@ impl RolloutCache {
             refresh.rebuilt = true;
         }
         refresh.reduce_us = elapsed_micros(reduce_started);
-        let (reduced_threads, reduced_calls) = if trace_active {
+        let (reduced_threads, reduced_calls) = if trace_active || config.trace_log.is_enabled() {
             self.reduced
                 .as_ref()
                 .map(|reduced| (reduced.threads.len(), reduced.dataset.calls.len()))
@@ -1581,6 +1675,14 @@ impl RolloutCache {
                 refresh.full_rebuild,
                 refresh.incrementally_reduced_threads
             )
+        });
+        reduce_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .bool("rebuilt", refresh.rebuilt)
+                .bool("fullRebuild", refresh.full_rebuild)
+                .usize("incrementalThreads", refresh.incrementally_reduced_threads)
+                .usize("threads", reduced_threads)
+                .usize("calls", reduced_calls)
         });
         self.selected = selected;
 
@@ -1620,21 +1722,52 @@ impl RolloutCache {
                 self.last_materialized_at
                     .is_some_and(|last| last < boundary && boundary <= now)
             });
+        let projection_changed = refresh.rebuilt || discovery_changed || title_changed;
+        if projection_changed {
+            // A coalesced scan may update `reduced` without materializing it.
+            // The prior as-of projection was derived from the old reduced
+            // state and must never be reused by a later deadline-only scan.
+            self.as_of_reduced = None;
+        }
+        self.materialization_pending |= projection_changed;
+        let coalesce_due = !coalesce_materialization
+            || self.last_materialized_at.is_none_or(|last| {
+                now < last
+                    || now
+                        .signed_duration_since(last)
+                        .to_std()
+                        .is_ok_and(|elapsed| elapsed >= SNAPSHOT_MATERIALIZE_COALESCE_INTERVAL)
+            });
         let should_materialize = force_materialize
             || self.last_materialized_at.is_none()
-            || refresh.rebuilt
-            || discovery_changed
-            || title_changed
             || external_boundary_changed
-            || freshness_changed;
+            || freshness_changed
+            || (self.materialization_pending && coalesce_due);
         self.last_discovery = Some(discovery_state);
         if !should_materialize {
             self.last_refresh = refresh;
+            operation_trace.finish_with(TraceOutcome::Skipped, || {
+                TraceFields::new()
+                    .label(
+                        "reason",
+                        if self.materialization_pending {
+                            "coalescing"
+                        } else {
+                            "unchanged"
+                        },
+                    )
+                    .bool("materializationPending", self.materialization_pending)
+                    .usize("selectedFiles", files.len())
+                    .u64("selectedBytes", selected_bytes)
+            });
             return Ok(None);
         }
 
         let materialize_started = perf_active.then(Instant::now);
         let materialize_span = config.startup_trace.span("rollout.materialize");
+        let materialize_trace = config
+            .trace_log
+            .span_with("rollout.materialize", TraceFields::new);
         let reuse_as_of_reduced = !refresh.rebuilt
             && self.as_of_reduced.is_some()
             && self
@@ -1691,6 +1824,7 @@ impl RolloutCache {
         refresh.materialize_us = elapsed_micros(materialize_started);
         self.last_refresh = refresh;
         self.last_materialized_at = Some(now);
+        self.materialization_pending = false;
         self.last_materialized_active_grace = Some(config.active_grace);
         self.next_freshness_deadline = next_freshness_deadline;
         self.next_as_of_evidence_boundary = next_as_of_evidence_boundary;
@@ -1702,6 +1836,13 @@ impl RolloutCache {
                 dataset.calls.len(),
                 dataset.rate_observations.len()
             )
+        });
+        materialize_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("tasks", dataset.tasks.len())
+                .usize("turns", dataset.turns.len())
+                .usize("calls", dataset.calls.len())
+                .usize("observations", dataset.rate_observations.len())
         });
         if let Some(scan_started) = scan_started {
             config
@@ -1734,6 +1875,13 @@ impl RolloutCache {
                 )
             });
         }
+        operation_trace.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("scannedFiles", dataset.stats.scanned_files)
+                .usize("parsedLines", dataset.stats.parsed_lines)
+                .u64("selectedBytes", selected_bytes)
+                .bool("rebuilt", refresh.rebuilt)
+        });
         Ok(Some(dataset))
     }
 

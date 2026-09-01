@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::history::{HistoryObservation, redacted_history_observation};
+use crate::history::{
+    HistoryObservation, half_hour_bucket_payload_eq, redacted_history_observation,
+    weekly_local_point_payload_eq,
+};
 use crate::source_identity::SourceIdentity;
 
 const STATE_FILE: &str = "local-observation-state.json";
@@ -16,6 +19,7 @@ const MARKER_FILE: &str = "summary-backfill-attempt.json";
 const MARKER_LOCK: &str = "summary-backfill-attempt.lock";
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 16 * 1024;
+const WEEKLY_LIVE_TAIL_LOOKBACK_MINUTES: i64 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalObservationMode {
@@ -33,6 +37,13 @@ pub struct LocalObservationWriteReport {
     pub buckets: SourceHistoryWriteReport,
     pub weekly: SourceHistoryWriteReport,
     pub session_digests: SourceHistoryWriteReport,
+    /// Number of validated records presented to each family writer. Shard
+    /// reports below distinguish durable writes from semantic no-ops; these
+    /// counts make recorder traces useful without exposing any payload.
+    pub account_records: usize,
+    pub bucket_records: usize,
+    pub weekly_records: usize,
+    pub session_digest_records: usize,
     pub bucket_tombstones: usize,
     pub weekly_tombstones: usize,
     pub session_digest_tombstones: usize,
@@ -181,6 +192,10 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 session_digests,
                 session_digest_scan_complete,
             )?;
+            let account_records = observation.quota_points.len();
+            let bucket_record_count = bucket_records.len();
+            let weekly_record_count = weekly_records.len();
+            let session_digest_record_count = session_digest_records.len();
             let account = store.record_account_points_unfenced(&observation.quota_points)?;
             let buckets = store.record_source_bucket_changes_unfenced(
                 identity.node_id(),
@@ -209,6 +224,10 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 buckets,
                 weekly,
                 session_digests,
+                account_records,
+                bucket_records: bucket_record_count,
+                weekly_records: weekly_record_count,
+                session_digest_records: session_digest_record_count,
                 bucket_tombstones,
                 weekly_tombstones,
                 session_digest_tombstones,
@@ -307,6 +326,28 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
+    /// Loads the monotonic local-observation revision under the same shared
+    /// source lock used by combined history reads. TUI projection caches use
+    /// this cheap stamp to notice recorder writes without reopening every
+    /// historical shard.
+    pub fn load_local_observation_revision(
+        &self,
+        identity: &SourceIdentity,
+        redaction_profile: RedactionProfile,
+    ) -> io::Result<u64> {
+        let lock_directory = self.source_directory(identity.node_id());
+        if !self.private_directory_exists(&lock_directory)? {
+            return Ok(0);
+        }
+        self.validate_private_path(&lock_directory)?;
+        let state_lock = open_lock_file(&lock_directory, STATE_LOCK)?;
+        lock_shared(&state_lock, &lock_directory, STATE_LOCK)?;
+        let directory = local_state_directory(self, identity.node_id(), redaction_profile);
+        let revision = load_last_reserved_revision(self, &directory, identity, redaction_profile);
+        drop(state_lock);
+        revision
+    }
+
     /// Loads all local source families under the shared local-observation
     /// state lock. `include_session_digests=false` avoids opening digest
     /// shards when replica detection is disabled while preserving the same
@@ -574,30 +615,128 @@ fn build_records(
     usize,
     usize,
 )> {
-    let mut buckets = observation
+    // A complete collection observation carries the whole lookback window.
+    // Reissuing every unchanged payload with the newly reserved revision
+    // rewrites every historical day on every recorder tick. Read the relevant
+    // live records once and only publish actual semantic changes. `sampledAt`
+    // is intentionally ignored by the bucket payload comparison: advancing
+    // the collection wall clock adds no evidence to an already closed bucket.
+    let load_since = observation
         .half_hour_buckets
         .iter()
-        .cloned()
-        .map(|bucket| SourceBucketRecord::upsert(revision, bucket))
-        .collect::<io::Result<Vec<_>>>()?;
-    let mut weekly = observation
-        .weekly_local_points
-        .iter()
-        .cloned()
-        .map(|point| SourceWeeklyRecord::upsert(revision, point))
-        .collect::<io::Result<Vec<_>>>()?;
+        .map(|bucket| bucket.starts_at)
+        .chain(
+            observation
+                .weekly_local_points
+                .iter()
+                // Include the preceding checkpoint even when a stateless
+                // observation has no buckets. Without this bounded lookback,
+                // each rolling zero-usage reset estimate becomes a new live
+                // tail record merely because its timestamp moved one minute.
+                .map(|point| {
+                    point.observed_at - chrono::Duration::minutes(WEEKLY_LIVE_TAIL_LOOKBACK_MINUTES)
+                }),
+        )
+        .chain(match mode {
+            LocalObservationMode::Reconcile { from, .. } => Some(from),
+            LocalObservationMode::Incremental => None,
+        })
+        .min();
+    let existing = match load_since {
+        Some(since) => {
+            Some(store.load_source_records_since(identity.node_id(), redaction_profile, since)?)
+        }
+        None => None,
+    };
+    let existing_buckets = existing
+        .as_ref()
+        .into_iter()
+        .flat_map(|history| history.records.iter())
+        .map(|record| (record.starts_at(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut buckets = Vec::new();
+    for bucket in &observation.half_hour_buckets {
+        // Validate every incoming fact before deciding whether it is a
+        // semantic no-op. Otherwise an invalid lookback sample that happens
+        // to match persisted payload fields could bypass the store boundary's
+        // validation entirely.
+        let record = SourceBucketRecord::upsert(revision, bucket.clone())?;
+        let unchanged = existing_buckets
+            .get(&bucket.starts_at)
+            .and_then(|record| match record.change() {
+                SourceBucketChange::Upsert(existing) => Some(existing.as_ref()),
+                SourceBucketChange::Tombstone => None,
+            })
+            .is_some_and(|existing| bucket_record_is_unchanged(existing, bucket));
+        if !unchanged {
+            buckets.push(record);
+        }
+    }
+
+    // Non-boundary weekly samples are live-tail checkpoints. When their
+    // cumulative payload is unchanged, persisting a new wall-clock key every
+    // minute creates an unbounded sequence which later multiplies Summary
+    // aggregation work. Preserve exact 30-minute samples, but suppress an
+    // equivalent non-boundary checkpoint for the same reset cycle.
+    let mut known_weekly = existing
+        .as_ref()
+        .into_iter()
+        .flat_map(|history| history.weekly_records.iter())
+        .filter_map(|record| match record.change() {
+            SourceWeeklyChange::Upsert(point) => Some((**point).clone()),
+            SourceWeeklyChange::Tombstone => None,
+        })
+        .collect::<Vec<_>>();
+    known_weekly.sort_by_key(|point| point.observed_at);
+    let mut weekly = Vec::new();
+    for point in &observation.weekly_local_points {
+        // As with buckets, equivalence is an optimization after validation,
+        // never an alternate acceptance path for malformed observations.
+        let record = SourceWeeklyRecord::upsert(revision, point.clone())?;
+        let same_key = known_weekly.iter().find(|existing| {
+            existing.observed_at == point.observed_at && existing.resets_at == point.resets_at
+        });
+        if same_key.is_some_and(|existing| weekly_local_point_payload_eq(existing, point)) {
+            continue;
+        }
+        let redundant_live_tail = matches!(mode, LocalObservationMode::Incremental)
+            && !is_exact_weekly_boundary(point.observed_at)
+            && known_weekly
+                .iter()
+                .rev()
+                .find(|existing| existing.observed_at < point.observed_at)
+                .is_some_and(|existing| weekly_live_tail_payload_eq(existing, point));
+        if redundant_live_tail {
+            continue;
+        }
+        weekly.push(record);
+        if let Some(existing) = known_weekly.iter_mut().find(|existing| {
+            existing.observed_at == point.observed_at && existing.resets_at == point.resets_at
+        }) {
+            *existing = point.clone();
+        } else {
+            known_weekly.push(point.clone());
+            known_weekly.sort_by_key(|point| point.observed_at);
+        }
+    }
     let mut bucket_tombstones = 0;
     let mut weekly_tombstones = 0;
     if let LocalObservationMode::Reconcile { from, to } = mode {
-        let existing =
-            store.load_source_records_since(identity.node_id(), redaction_profile, from)?;
         let incoming_buckets = observation
             .half_hour_buckets
             .iter()
             .map(|bucket| bucket.starts_at)
             .collect::<BTreeSet<_>>();
-        for record in existing.records {
-            if record.starts_at() < to
+        for record in existing
+            .as_ref()
+            .into_iter()
+            .flat_map(|history| history.records.iter())
+        {
+            // Bucket reconciliation is keyed by `starts_at`: only keys in the
+            // declared half-open window are authoritative, even though the
+            // shared read may include an earlier live-tail lookback.
+            if record.starts_at() >= from
+                && record.starts_at() < to
                 && matches!(record.change(), SourceBucketChange::Upsert(_))
                 && !incoming_buckets.contains(&record.starts_at())
             {
@@ -610,9 +749,14 @@ fn build_records(
             .iter()
             .map(|point| (point.observed_at, point.resets_at))
             .collect::<BTreeSet<_>>();
-        for record in existing.weekly_records {
+        for record in existing
+            .as_ref()
+            .into_iter()
+            .flat_map(|history| history.weekly_records.iter())
+        {
             let key = (record.observed_at(), record.resets_at());
-            if record.observed_at() < to
+            if record.observed_at() >= from
+                && record.observed_at() < to
                 && matches!(record.change(), SourceWeeklyChange::Upsert(_))
                 && !incoming_weekly.contains(&key)
             {
@@ -622,6 +766,50 @@ fn build_records(
         }
     }
     Ok((buckets, weekly, bucket_tombstones, weekly_tombstones))
+}
+
+fn bucket_record_is_unchanged(
+    existing: &LocalHalfHourBucket,
+    incoming: &LocalHalfHourBucket,
+) -> bool {
+    if !half_hour_bucket_payload_eq(existing, incoming) {
+        return false;
+    }
+    // A closed sample already carries the strongest timestamp for its bucket;
+    // do not let a later lookback observation downgrade or rewrite it. While a
+    // bucket is still open, however, a newer `sampled_at` is observable
+    // freshness evidence (and the eventual exact end closes the bucket), so
+    // only an older/equal open sample is a semantic no-op.
+    existing.sampled_at >= existing.ends_at || incoming.sampled_at <= existing.sampled_at
+}
+
+fn weekly_live_tail_payload_eq(existing: &WeeklyLocalPoint, incoming: &WeeklyLocalPoint) -> bool {
+    if weekly_local_point_payload_eq(existing, incoming) {
+        return true;
+    }
+    // A completely unused server cycle has no stable anchor: the advertised
+    // reset moves with every observation. Treat only those two zero-evidence
+    // points as equivalent across reset timestamps. Once any usage appears,
+    // the exact reset remains part of the persisted identity.
+    weekly_point_has_no_usage(existing)
+        && weekly_point_has_no_usage(incoming)
+        && existing.token_usage == incoming.token_usage
+        && existing.estimated_cost_units == incoming.estimated_cost_units
+        && existing.api_long_context_extra_cost_units == incoming.api_long_context_extra_cost_units
+        && existing.long_context_usage_unknown == incoming.long_context_usage_unknown
+        && existing.estimator_revision == incoming.estimator_revision
+        && existing.call_count == incoming.call_count
+        && existing.partial_reasons == incoming.partial_reasons
+}
+
+fn weekly_point_has_no_usage(point: &WeeklyLocalPoint) -> bool {
+    point.token_usage.is_zero() && point.estimated_cost_units == 0 && point.call_count == 0
+}
+
+fn is_exact_weekly_boundary(timestamp: DateTime<Utc>) -> bool {
+    const WEEKLY_SAMPLE_SECONDS: i64 = 30 * 60;
+    timestamp.timestamp().rem_euclid(WEEKLY_SAMPLE_SECONDS) == 0
+        && timestamp.timestamp_subsec_nanos() == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -927,6 +1115,297 @@ mod tests {
         let writer = history.writer(&authority).unwrap();
         let identity = SourceIdentity::from_test_parts(SOURCE.parse().unwrap(), SECRET);
         test(&identity, &history, &writer);
+    }
+
+    #[test]
+    fn unchanged_lookback_does_not_rewrite_historical_shards() {
+        with_writer(|identity, history, writer| {
+            let old_start = at(29, 23, 45);
+            let recent_start = at(30, 12, 0);
+            let reset = at(30, 12, 0) + Duration::days(7);
+            let mut live_weekly = weekly(at(30, 12, 1), 30);
+            live_weekly.resets_at = reset;
+            let first_observation = HistoryObservation {
+                observed_at: at(30, 12, 1),
+                half_hour_buckets: vec![bucket(old_start, 10), bucket(recent_start, 20)],
+                weekly_local_points: vec![live_weekly.clone()],
+                ..HistoryObservation::default()
+            };
+            let first = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &first_observation,
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(first.buckets.shards_written, 2);
+            assert_eq!(first.weekly.shards_written, 1);
+
+            let old_path = shard_path(
+                &history.source_buckets_directory(identity.node_id(), RedactionProfile::Redacted),
+                old_start.date_naive(),
+            );
+            let old_contents = fs::read(&old_path).unwrap();
+
+            let unchanged_old = bucket(old_start, 10);
+            let mut unchanged_recent = bucket(recent_start, 20);
+            unchanged_recent.sampled_at = at(30, 12, 2);
+            let mut next_live_weekly = live_weekly.clone();
+            next_live_weekly.observed_at = at(30, 12, 2);
+            let second = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: at(30, 12, 2),
+                        half_hour_buckets: vec![unchanged_old.clone(), unchanged_recent],
+                        weekly_local_points: vec![next_live_weekly.clone()],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(second.revision, first.revision + 1);
+            assert_eq!(second.buckets.shards_written, 0);
+            assert_eq!(second.weekly.shards_written, 0);
+            assert_eq!(fs::read(&old_path).unwrap(), old_contents);
+
+            let third = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: at(30, 12, 3),
+                        half_hour_buckets: vec![unchanged_old, bucket(recent_start, 21)],
+                        weekly_local_points: vec![next_live_weekly],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(third.buckets.shards_written, 1);
+            assert_eq!(third.weekly.shards_written, 0);
+            assert_eq!(fs::read(&old_path).unwrap(), old_contents);
+
+            let stored = history
+                .load_source_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    old_start,
+                )
+                .unwrap();
+            assert_eq!(stored.records.len(), 2);
+            assert_eq!(stored.weekly_records.len(), 1);
+        });
+    }
+
+    #[test]
+    fn open_bucket_closure_is_persisted_even_when_payload_is_unchanged() {
+        with_writer(|identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            let mut open = bucket(starts_at, 20);
+            open.sampled_at = starts_at + Duration::minutes(5);
+            let first = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: open.sampled_at,
+                        half_hour_buckets: vec![open],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(first.buckets.shards_written, 1);
+
+            let mut later_open = bucket(starts_at, 20);
+            later_open.sampled_at = starts_at + Duration::minutes(12);
+            let later = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: later_open.sampled_at,
+                        half_hour_buckets: vec![later_open],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(later.buckets.shards_written, 1);
+
+            let closed = bucket(starts_at, 20);
+            let second = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: closed.sampled_at,
+                        half_hour_buckets: vec![closed.clone()],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(second.buckets.shards_written, 1);
+
+            let stored = history
+                .load_source_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                )
+                .unwrap();
+            assert_eq!(stored.records.len(), 1);
+            let SourceBucketChange::Upsert(stored) = stored.records[0].change() else {
+                panic!("expected live bucket");
+            };
+            assert_eq!(stored.sampled_at, closed.ends_at);
+        });
+    }
+
+    #[test]
+    fn stateless_zero_usage_live_tail_does_not_grow_every_minute() {
+        with_writer(|identity, history, writer| {
+            let first_at = at(30, 12, 1);
+            let mut first = weekly(first_at, 0);
+            first.call_count = 0;
+            let first_report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: first_at,
+                        weekly_local_points: vec![first],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(first_report.weekly.shards_written, 1);
+
+            let second_at = at(30, 12, 2);
+            let mut second = weekly(second_at, 0);
+            second.call_count = 0;
+            let second_report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: second_at,
+                        weekly_local_points: vec![second],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(second_report.weekly.shards_written, 0);
+
+            let boundary_at = at(30, 12, 30);
+            let mut boundary = weekly(boundary_at, 0);
+            boundary.call_count = 0;
+            let boundary_report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: boundary_at,
+                        weekly_local_points: vec![boundary],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert_eq!(boundary_report.weekly.shards_written, 1);
+
+            let stored = history
+                .load_source_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    first_at - Duration::minutes(1),
+                )
+                .unwrap();
+            assert_eq!(stored.weekly_records.len(), 2);
+        });
+    }
+
+    #[test]
+    fn reconcile_replaces_an_equivalent_live_tail_instead_of_removing_both() {
+        with_writer(|identity, history, writer| {
+            let first_at = at(30, 12, 1);
+            let first = weekly(first_at, 30);
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: first_at,
+                        weekly_local_points: vec![first.clone()],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+
+            let second_at = at(30, 12, 2);
+            let mut second = first;
+            second.observed_at = second_at;
+            let report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: second_at,
+                        weekly_local_points: vec![second.clone()],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Reconcile {
+                        from: at(30, 12, 0),
+                        to: at(30, 12, 3),
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.weekly.shards_written, 1);
+            assert_eq!(report.weekly_tombstones, 1);
+
+            let stored = history
+                .load_source_records_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    at(30, 12, 0),
+                )
+                .unwrap();
+            assert_eq!(stored.weekly_records.len(), 2);
+            assert!(stored.weekly_records.iter().any(|record| {
+                record.observed_at() == first_at
+                    && matches!(record.change(), SourceWeeklyChange::Tombstone)
+            }));
+            assert!(stored.weekly_records.iter().any(|record| {
+                record.observed_at() == second_at
+                    && matches!(record.change(), SourceWeeklyChange::Upsert(_))
+            }));
+            let projected = history
+                .load_source_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    at(30, 12, 0),
+                )
+                .unwrap();
+            assert_eq!(projected.weekly_local_points, vec![second]);
+        });
     }
 
     fn session_digest(
@@ -1680,6 +2159,155 @@ mod tests {
                 .unwrap();
             assert_eq!(after.buckets.len(), 1);
             assert_eq!(after.weekly_local_points.len(), 1);
+        });
+    }
+
+    #[test]
+    fn reconcile_tombstones_only_keys_inside_declared_window() {
+        with_writer(|identity, history, writer| {
+            let before = at(30, 9, 45);
+            let from = at(30, 10, 0);
+            let to = at(30, 10, 15);
+            let retained_weekly_at = at(30, 10, 1);
+            let missing_weekly_at = at(30, 10, 5);
+            let before_weekly_at = at(30, 9, 50);
+            let retained_weekly = weekly(retained_weekly_at, 30);
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: to,
+                        half_hour_buckets: vec![bucket(before, 10), bucket(from, 20)],
+                        weekly_local_points: vec![
+                            weekly(before_weekly_at, 10),
+                            retained_weekly.clone(),
+                            weekly(missing_weekly_at, 40),
+                        ],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+
+            // The retained weekly point makes the shared read start 30 minutes
+            // before `from`. Records found there are comparison context only;
+            // the reconcile authority is still strictly keyed by [from, to).
+            let report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: to,
+                        weekly_local_points: vec![retained_weekly],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Reconcile { from, to },
+                )
+                .unwrap();
+            assert_eq!(report.bucket_tombstones, 1);
+            assert_eq!(report.weekly_tombstones, 1);
+
+            let projected = history
+                .load_source_since(identity.node_id(), RedactionProfile::Redacted, before)
+                .unwrap();
+            assert_eq!(
+                projected
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.starts_at)
+                    .collect::<Vec<_>>(),
+                vec![before]
+            );
+            assert_eq!(
+                projected
+                    .weekly_local_points
+                    .iter()
+                    .map(|point| point.observed_at)
+                    .collect::<Vec<_>>(),
+                vec![before_weekly_at, retained_weekly_at]
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_equivalent_bucket_is_rejected_before_no_op_filtering() {
+        with_writer(|identity, _history, writer| {
+            let starts_at = at(30, 10, 0);
+            let persisted = bucket(starts_at, 10);
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: persisted.sampled_at,
+                        half_hour_buckets: vec![persisted.clone()],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+
+            let mut invalid = persisted;
+            invalid.sampled_at = invalid.ends_at + Duration::minutes(1);
+            let error = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: invalid.sampled_at,
+                        half_hour_buckets: vec![invalid],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn invalid_zero_weekly_tail_is_rejected_before_equivalence_filtering() {
+        with_writer(|identity, _history, writer| {
+            let first_at = at(30, 10, 1);
+            let mut first = weekly(first_at, 0);
+            first.call_count = 0;
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: first_at,
+                        weekly_local_points: vec![first],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+
+            let second_at = at(30, 10, 2);
+            let mut invalid = weekly(second_at, 0);
+            invalid.call_count = 0;
+            invalid.resets_at = invalid.observed_at;
+            let error = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: second_at,
+                        weekly_local_points: vec![invalid],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         });
     }
 

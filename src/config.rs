@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::perf::PerfLog;
 use crate::startup::StartupTrace;
+use crate::trace::TraceLog;
 
 #[derive(Clone, Debug)]
 pub struct CollectConfig {
@@ -19,6 +20,7 @@ pub struct CollectConfig {
     pub offline: bool,
     pub app_server_timeout: Duration,
     pub perf_log: PerfLog,
+    pub trace_log: TraceLog,
     pub startup_trace: StartupTrace,
 }
 
@@ -36,6 +38,7 @@ impl Default for CollectConfig {
             offline: false,
             app_server_timeout: default_app_server_timeout(cfg!(windows)),
             perf_log: PerfLog::default(),
+            trace_log: TraceLog::default(),
             startup_trace: StartupTrace::default(),
         }
     }

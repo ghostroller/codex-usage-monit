@@ -50,6 +50,7 @@ use crate::remote_protocol::{
     decode_remote_frame, decoded_remote_frame_payload_len, encode_remote_frame,
 };
 use crate::source_history::RedactionProfile;
+use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 
 pub const DEFAULT_REMOTE_AGENT_EXECUTABLE: &str = "codex-usage-monit";
 const SSH_REMOTE_AGENT_ARGUMENTS: [&str; 2] = ["remote-agent", "export"];
@@ -273,6 +274,7 @@ pub struct SshCommandEnvironment {
     path: Option<OsString>,
     inherit_parent_process_tree: bool,
     cancellation: Option<Arc<AtomicBool>>,
+    trace_log: TraceLog,
 }
 
 impl SshCommandEnvironment {
@@ -281,6 +283,7 @@ impl SshCommandEnvironment {
             path,
             inherit_parent_process_tree: false,
             cancellation: None,
+            trace_log: TraceLog::default(),
         }
     }
 
@@ -293,6 +296,7 @@ impl SshCommandEnvironment {
             path,
             inherit_parent_process_tree: true,
             cancellation: None,
+            trace_log: TraceLog::default(),
         }
     }
 
@@ -302,6 +306,11 @@ impl SshCommandEnvironment {
     /// owned process group after a stop/signal becomes a safe notification.
     pub(crate) fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub(crate) fn with_trace_log(mut self, trace_log: TraceLog) -> Self {
+        self.trace_log = trace_log;
         self
     }
 
@@ -672,25 +681,15 @@ pub fn probe_remote_with_agent_executable_and_environment(
     options: &RemoteProbeOptions,
     environment: &SshCommandEnvironment,
 ) -> Result<RemoteProbeReport, RemoteTransportError> {
-    validate_ssh_host(ssh_host)?;
-    if environment.cancellation_requested() {
-        return Err(RemoteTransportError::Cancelled {
-            cleanup_error: None,
-        });
-    }
-    let program = environment
-        .resolve_program()
-        .map_err(|error| RemoteTransportError::Spawn {
-            error,
-            cleanup_error: None,
-        })?;
-    probe_remote_with_program_agent_executable_and_environment(
-        program,
+    let request = probe_request(options)?;
+    let report: RemoteExchangeReport = exchange_remote_with_agent_executable_and_environment(
         ssh_host,
         agent_executable,
-        options,
+        &request,
+        options.timeout,
         environment,
-    )
+    )?;
+    probe_report_from_exchange(report)
 }
 
 #[cfg(test)]
@@ -755,6 +754,12 @@ fn probe_remote_with_program_agent_executable_and_environment(
             options.timeout,
             environment,
         )?;
+    probe_report_from_exchange(report)
+}
+
+fn probe_report_from_exchange(
+    report: RemoteExchangeReport,
+) -> Result<RemoteProbeReport, RemoteTransportError> {
     match &report.response.result {
         RemoteExportResponseBody::Probe(_) => {}
         RemoteExportResponseBody::Failure(failure) => {
@@ -846,25 +851,38 @@ where
     D: DeserializeOwned + RemotePagePayload,
     F: DeserializeOwned + RemotePagePayload,
 {
-    validate_ssh_host(ssh_host)?;
-    if environment.cancellation_requested() {
-        return Err(RemoteTransportError::Cancelled {
-            cleanup_error: None,
-        });
-    }
-    let program = environment
-        .resolve_program()
-        .map_err(|error| RemoteTransportError::Spawn {
-            error,
-            cleanup_error: None,
-        })?;
-    exchange_remote_with_program_agent_executable_and_environment(
-        program,
+    let response_limits = RemoteFrameLimits::default();
+    trace_remote_exchange(
+        environment,
         ssh_host,
         agent_executable,
         request,
         timeout,
-        environment,
+        response_limits,
+        || {
+            validate_ssh_host(ssh_host)?;
+            if environment.cancellation_requested() {
+                return Err(RemoteTransportError::Cancelled {
+                    cleanup_error: None,
+                });
+            }
+            let program =
+                environment
+                    .resolve_program()
+                    .map_err(|error| RemoteTransportError::Spawn {
+                        error,
+                        cleanup_error: None,
+                    })?;
+            exchange_remote_with_program_and_limits_inner(
+                program,
+                ssh_host,
+                agent_executable,
+                request,
+                timeout,
+                response_limits,
+                environment,
+            )
+        },
     )
 }
 
@@ -945,21 +963,32 @@ where
     D: DeserializeOwned + RemotePagePayload,
     F: DeserializeOwned + RemotePagePayload,
 {
-    validate_ssh_host(ssh_host)?;
-    let program = environment
-        .resolve_program()
-        .map_err(|error| RemoteTransportError::Spawn {
-            error,
-            cleanup_error: None,
-        })?;
-    exchange_remote_with_program_and_limits(
-        program,
+    trace_remote_exchange(
+        environment,
         ssh_host,
         agent_executable,
         request,
         timeout,
         response_limits,
-        environment,
+        || {
+            validate_ssh_host(ssh_host)?;
+            let program =
+                environment
+                    .resolve_program()
+                    .map_err(|error| RemoteTransportError::Spawn {
+                        error,
+                        cleanup_error: None,
+                    })?;
+            exchange_remote_with_program_and_limits_inner(
+                program,
+                ssh_host,
+                agent_executable,
+                request,
+                timeout,
+                response_limits,
+                environment,
+            )
+        },
     )
 }
 
@@ -1028,6 +1057,98 @@ where
 }
 
 fn exchange_remote_with_program_and_limits<D, F>(
+    ssh_program: PathBuf,
+    ssh_host: &str,
+    agent_executable: &str,
+    request: &RemoteExportRequest,
+    timeout: Duration,
+    response_limits: RemoteFrameLimits,
+    environment: &SshCommandEnvironment,
+) -> Result<RemoteExchangeReport<D, F>, RemoteTransportError>
+where
+    D: DeserializeOwned + RemotePagePayload,
+    F: DeserializeOwned + RemotePagePayload,
+{
+    trace_remote_exchange(
+        environment,
+        ssh_host,
+        agent_executable,
+        request,
+        timeout,
+        response_limits,
+        || {
+            exchange_remote_with_program_and_limits_inner(
+                ssh_program,
+                ssh_host,
+                agent_executable,
+                request,
+                timeout,
+                response_limits,
+                environment,
+            )
+        },
+    )
+}
+
+fn trace_remote_exchange<D, F>(
+    environment: &SshCommandEnvironment,
+    ssh_host: &str,
+    agent_executable: &str,
+    request: &RemoteExportRequest,
+    timeout: Duration,
+    response_limits: RemoteFrameLimits,
+    exchange: impl FnOnce() -> Result<RemoteExchangeReport<D, F>, RemoteTransportError>,
+) -> Result<RemoteExchangeReport<D, F>, RemoteTransportError>
+where
+    D: DeserializeOwned + RemotePagePayload,
+    F: DeserializeOwned + RemotePagePayload,
+{
+    let operation = match &request.request {
+        RemoteExportRequestBody::Probe(_) => "probe",
+        RemoteExportRequestBody::Delta(_) => "delta",
+        RemoteExportRequestBody::SessionFacts(_) => "session_facts",
+    };
+    let trace_span = environment.trace_log.span_with("remote.ssh.exchange", || {
+        TraceFields::new()
+            .label("operation", operation)
+            .opaque("hostId", ssh_host)
+            .duration_ms("timeoutMs", timeout)
+            .usize("maxResponseBytes", response_limits.max_encoded_bytes)
+            .bool(
+                "customAgentExecutable",
+                agent_executable != DEFAULT_REMOTE_AGENT_EXECUTABLE,
+            )
+            .bool("ownsProcessTree", environment.owns_process_tree())
+    });
+    let result = exchange();
+    match &result {
+        Ok(report) => trace_span.finish_with(TraceOutcome::Ok, || {
+            TraceFields::new()
+                .usize("requestBytes", report.request_bytes)
+                .usize("responseBytes", report.response_bytes)
+                .usize("decodedResponseBytes", report.response_decoded_bytes)
+                .usize("stderrBytes", report.stderr_bytes)
+        }),
+        Err(error) => trace_span.finish_with(
+            match error {
+                RemoteTransportError::Timeout { .. } => TraceOutcome::Timeout,
+                RemoteTransportError::Cancelled { .. } => TraceOutcome::Cancelled,
+                _ => TraceOutcome::Error,
+            },
+            || {
+                TraceFields::new()
+                    .label("errorKind", remote_transport_error_kind(error))
+                    .bool(
+                        "containmentUncertain",
+                        error.process_containment_uncertain(),
+                    )
+            },
+        ),
+    }
+    result
+}
+
+fn exchange_remote_with_program_and_limits_inner<D, F>(
     ssh_program: PathBuf,
     ssh_host: &str,
     agent_executable: &str,
@@ -1331,6 +1452,29 @@ where
         response_decoded_bytes,
         stderr_bytes: stderr.bytes.len(),
     })
+}
+
+fn remote_transport_error_kind(error: &RemoteTransportError) -> &'static str {
+    match error {
+        RemoteTransportError::InvalidHost(_) => "invalid_host",
+        RemoteTransportError::InvalidTimeout => "invalid_timeout",
+        RemoteTransportError::InvalidResponseLimit => "invalid_response_limit",
+        RemoteTransportError::Spawn { .. } => "spawn",
+        RemoteTransportError::ProcessIsolation { .. } => "process_isolation",
+        RemoteTransportError::RequestWrite(_) => "request_write",
+        RemoteTransportError::Wait { .. } => "wait",
+        RemoteTransportError::Timeout { .. } => "timeout",
+        RemoteTransportError::Cancelled { .. } => "cancelled",
+        RemoteTransportError::OutputRead(_) => "output_read",
+        RemoteTransportError::StdoutLimitExceeded { .. } => "stdout_limit",
+        RemoteTransportError::StderrLimitExceeded { .. } => "stderr_limit",
+        RemoteTransportError::ExitFailure { .. } => "exit_failure",
+        RemoteTransportError::Protocol(_) => "protocol",
+        RemoteTransportError::Remote(_) => "remote_failure",
+        RemoteTransportError::UnexpectedResponse => "unexpected_response",
+        RemoteTransportError::WorkerPanicked => "worker_panicked",
+        RemoteTransportError::ProcessCleanup { .. } => "process_cleanup",
+    }
 }
 
 fn probe_request(
@@ -2329,6 +2473,54 @@ mod tests {
             ),
             Err(RemoteTransportError::InvalidHost(_))
         ));
+    }
+
+    #[test]
+    fn trace_covers_host_validation_before_saved_path_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace_path = directory.path().join("trace.jsonl");
+        let trace = TraceLog::enabled(&trace_path);
+        let environment =
+            SshCommandEnvironment::new(Some(env::join_paths([directory.path()]).unwrap()))
+                .with_trace_log(trace.clone());
+
+        let error = probe_remote_with_environment(
+            "-oProxyCommand=secret",
+            &RemoteProbeOptions::default(),
+            &environment,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RemoteTransportError::InvalidHost(_)));
+        trace.finish();
+
+        let contents = std::fs::read_to_string(trace_path).unwrap();
+        assert!(contents.contains("\"stage\":\"remote.ssh.exchange\""));
+        assert!(contents.contains("\"errorKind\":\"invalid_host\""));
+        assert!(!contents.contains("-oProxyCommand=secret"));
+    }
+
+    #[test]
+    fn trace_covers_saved_path_ssh_resolution_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace_path = directory.path().join("trace.jsonl");
+        let trace = TraceLog::enabled(&trace_path);
+        let environment =
+            SshCommandEnvironment::new(Some(env::join_paths([directory.path()]).unwrap()))
+                .with_trace_log(trace.clone());
+
+        let error = probe_remote_with_environment(
+            "private-devbox",
+            &RemoteProbeOptions::default(),
+            &environment,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RemoteTransportError::Spawn { .. }));
+        trace.finish();
+
+        let contents = std::fs::read_to_string(trace_path).unwrap();
+        assert!(contents.contains("\"stage\":\"remote.ssh.exchange\""));
+        assert!(contents.contains("\"errorKind\":\"spawn\""));
+        assert!(!contents.contains("private-devbox"));
     }
 
     #[test]

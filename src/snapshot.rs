@@ -19,6 +19,7 @@ use crate::history::HistoryObservation;
 use crate::perf::{RefreshMetrics, RefreshStageMetrics};
 use crate::rollout::{RolloutCache, RolloutCacheMetrics, RolloutCacheRefresh, scan_rollouts};
 use crate::source_export::{LocalSessionDigestEvidence, materialize_local_session_digest_evidence};
+use crate::trace::{TraceFields, TraceOutcome};
 
 const RESET_CREDIT_DETAILS_CACHE_TTL_MINUTES: i64 = 5;
 
@@ -99,6 +100,7 @@ fn collect_local_source(
     scan_local: bool,
     rollout_cache: Option<&mut RolloutCache>,
     only_if_changed: bool,
+    coalesce_materialization: bool,
     next_external_boundary: Option<DateTime<Utc>>,
 ) -> LocalCollection {
     let span = config.startup_trace.span("snapshot.local_scan");
@@ -106,7 +108,13 @@ fn collect_local_source(
         let (scan_result, local_coverage_starts_at, rollout_refresh, rollout_metrics) =
             match rollout_cache {
                 Some(cache) => {
-                    let result = if only_if_changed {
+                    let result = if only_if_changed && coalesce_materialization {
+                        cache.scan_if_changed_coalesced_with_external_boundary(
+                            config,
+                            now,
+                            next_external_boundary,
+                        )
+                    } else if only_if_changed {
                         cache.scan_if_changed_with_external_boundary(
                             config,
                             now,
@@ -263,8 +271,16 @@ pub fn collect_snapshot(
     cached_account: Option<AccountSnapshot>,
     refresh_account: bool,
 ) -> CollectionResult {
-    collect_snapshot_with_local(config, cached_account, refresh_account, true, None, false)
-        .expect("a forced snapshot collection always returns a result")
+    collect_snapshot_with_local(
+        config,
+        cached_account,
+        refresh_account,
+        true,
+        None,
+        false,
+        false,
+    )
+    .expect("a forced snapshot collection always returns a result")
 }
 
 pub fn collect_snapshot_cached(
@@ -279,6 +295,7 @@ pub fn collect_snapshot_cached(
         refresh_account,
         true,
         Some(rollout_cache),
+        false,
         false,
     )
     .expect("a forced cached snapshot collection always returns a result")
@@ -298,6 +315,27 @@ pub fn collect_snapshot_cached_if_changed(
         true,
         Some(rollout_cache),
         true,
+        false,
+    )
+}
+
+/// Interactive counterpart which coalesces bursts of rollout changes before
+/// rebuilding the full snapshot projection. The rollout cache still parses
+/// and reduces every change, and emits the newest pending state within the
+/// bounded materialization interval.
+pub(crate) fn collect_snapshot_cached_if_changed_coalesced(
+    config: &CollectConfig,
+    cached_account: Option<AccountSnapshot>,
+    rollout_cache: &mut RolloutCache,
+) -> Option<CollectionResult> {
+    collect_snapshot_with_local(
+        config,
+        cached_account,
+        false,
+        true,
+        Some(rollout_cache),
+        true,
+        true,
     )
 }
 
@@ -306,8 +344,16 @@ pub fn collect_limits_snapshot(
     cached_account: Option<AccountSnapshot>,
     refresh_account: bool,
 ) -> CollectionResult {
-    collect_snapshot_with_local(config, cached_account, refresh_account, false, None, false)
-        .expect("a forced limits collection always returns a result")
+    collect_snapshot_with_local(
+        config,
+        cached_account,
+        refresh_account,
+        false,
+        None,
+        false,
+        false,
+    )
+    .expect("a forced limits collection always returns a result")
 }
 
 fn collect_snapshot_with_local(
@@ -317,6 +363,7 @@ fn collect_snapshot_with_local(
     scan_local: bool,
     mut rollout_cache: Option<&mut RolloutCache>,
     only_if_changed: bool,
+    coalesce_materialization: bool,
 ) -> Option<CollectionResult> {
     debug_assert!(!only_if_changed || !refresh_account);
     let total_started = config.startup_trace.is_active().then(Instant::now);
@@ -337,6 +384,7 @@ fn collect_snapshot_with_local(
                     scan_local,
                     rollout_cache.as_deref_mut(),
                     only_if_changed,
+                    coalesce_materialization,
                     next_external_boundary,
                 )
             },
@@ -352,6 +400,7 @@ fn collect_snapshot_with_local(
                 scan_local,
                 rollout_cache.as_deref_mut(),
                 only_if_changed,
+                coalesce_materialization,
                 next_external_boundary,
             ),
             None,
@@ -640,6 +689,15 @@ fn collect_snapshot_with_local(
     let local_coverage_starts_at = (!rollout_source_degraded)
         .then_some(local_coverage_starts_at)
         .flatten();
+    let history_trace = config
+        .trace_log
+        .span_with("snapshot.history_observation", || {
+            TraceFields::new()
+                .usize("calls", dataset.calls.len())
+                .usize("tasks", tasks.len())
+                .usize("turns", turns.len())
+                .usize("interactions", dataset.agent_interactions.len())
+        });
     let history_observation =
         HistoryObservation::from_sources_with_tasks_turns_and_interactions_and_coverage(
             now,
@@ -651,18 +709,40 @@ fn collect_snapshot_with_local(
             &history_partial_reasons,
             local_coverage_starts_at,
         );
+    history_trace.finish_with(TraceOutcome::Ok, || {
+        TraceFields::new()
+            .usize("buckets", history_observation.half_hour_buckets.len())
+            .usize(
+                "weeklyPoints",
+                history_observation.weekly_local_points.len(),
+            )
+    });
     let session_digest_scan_complete = scan_local
         && rollout_complete
         && !rollout_source_degraded
         && dataset.stats.scanned_files == dataset.stats.discovered_files;
+    let digest_trace = config.trace_log.span_with("snapshot.session_digests", || {
+        TraceFields::new()
+            .usize("calls", dataset.calls.len())
+            .usize("buckets", history_observation.half_hour_buckets.len())
+            .bool("scanComplete", session_digest_scan_complete)
+    });
     let local_session_digests = match materialize_local_session_digest_evidence(
         &dataset.calls,
         &history_observation.half_hour_buckets,
         now,
         session_digest_scan_complete,
     ) {
-        Ok(evidence) => evidence,
+        Ok(evidence) => {
+            digest_trace.finish_with(TraceOutcome::Ok, || {
+                TraceFields::new().usize("digests", evidence.digest_count())
+            });
+            evidence
+        }
         Err(error) => {
+            digest_trace.finish_with(TraceOutcome::Partial, || {
+                TraceFields::new().label("reason", "materialization_failed")
+            });
             partial = true;
             warnings.push(format!(
                 "local session digest evidence is unavailable: {error}"

@@ -7,6 +7,7 @@
 //! [`ObservedProjectKey`]. It intentionally refuses to guess when a rollout's
 //! project path cannot be resolved.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -39,6 +40,7 @@ use crate::source_history::{
 };
 use crate::source_identity::SourceIdentity;
 use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, SessionReplicaKey, ThreadId};
+use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
 
 const SESSION_DIGEST_DOMAIN: &[u8] = b"codex-usage-monit/session-digest/v1\0";
 const PROJECT_BREAKDOWN_DIGEST_DOMAIN: &[u8] = b"codex-usage-monit/session-project-breakdown/v1\0";
@@ -1394,15 +1396,15 @@ fn remote_api_cost(cost: ApiCostAmount) -> RemoteApiCostAmount {
     }
 }
 
-#[derive(Clone, Debug)]
-struct DigestEvent {
+#[derive(Clone, Copy, Debug)]
+struct DigestEvent<'call> {
     semantic_hash: [u8; 32],
-    call: UsageCall,
+    call: &'call UsageCall,
 }
 
 #[derive(Clone, Debug, Default)]
-struct SessionDigestAccumulator {
-    events: BTreeMap<String, DigestEvent>,
+struct SessionDigestAccumulator<'call> {
+    events: HashMap<Cow<'call, str>, DigestEvent<'call>>,
     observed_project_keys: BTreeSet<ObservedProjectKey>,
     partial_reasons: BTreeSet<String>,
     exact_event_identity: bool,
@@ -1420,11 +1422,17 @@ fn materialize_session_digests(
     observed_at: DateTime<Utc>,
     scan_complete: bool,
 ) -> io::Result<(Vec<RemoteSessionDigest>, usize, usize)> {
+    let trace = process_trace_log();
+    let bucket_trace = trace.span_with("source_export.session_digest.bucket_index", || {
+        TraceFields::new().usize("buckets", buckets.len())
+    });
     let retention_start = observed_at
         .checked_sub_days(Days::new(SESSION_DIGEST_RETENTION_DAYS))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let mut project_keys = BTreeMap::<(ThreadId, NaiveDate), BTreeSet<ObservedProjectKey>>::new();
     let mut bucket_partial_reasons = BTreeMap::<(ThreadId, NaiveDate), BTreeSet<String>>::new();
+    let mut project_breakdown_groups =
+        BTreeMap::<(ThreadId, NaiveDate), Vec<(DateTime<Utc>, &LocalProjectUsageGroup)>>::new();
     for bucket in buckets {
         let day = bucket.starts_at.date_naive();
         let reasons = normalized_partial_reasons(&bucket.partial_reasons);
@@ -1436,35 +1444,52 @@ fn materialize_session_digests(
             let Ok(thread_id) = ThreadId::from_str(&group.thread_id) else {
                 continue;
             };
+            let key = (thread_id.clone(), day);
+            project_breakdown_groups
+                .entry(key.clone())
+                .or_default()
+                .push((bucket.starts_at, group));
             if let Some(project_key) = group
                 .project_id
                 .as_deref()
                 .and_then(|value| ObservedProjectKey::from_str(value).ok())
             {
                 project_keys
-                    .entry((thread_id.clone(), day))
+                    .entry(key.clone())
                     .or_default()
                     .insert(project_key);
             }
             bucket_partial_reasons
-                .entry((thread_id, day))
+                .entry(key)
                 .or_default()
                 .extend(reasons.iter().cloned());
         }
     }
+    bucket_trace.finish_with(TraceOutcome::Ok, || {
+        TraceFields::new()
+            .usize("projectKeys", project_keys.len())
+            .usize("projectGroups", project_breakdown_groups.len())
+    });
 
-    let mut accumulators = BTreeMap::<(ThreadId, NaiveDate), SessionDigestAccumulator>::new();
+    let call_trace = trace.span_with("source_export.session_digest.call_index", || {
+        TraceFields::new().usize("calls", calls.len())
+    });
+    let mut accumulators = HashMap::<(&str, NaiveDate), SessionDigestAccumulator<'_>>::new();
+    let mut valid_thread_ids = HashMap::<&str, bool>::new();
     let mut missing_event_identities = 0_usize;
     let mut invalid_threads = 0_usize;
     for call in calls {
         if call.timestamp > observed_at || call.timestamp < retention_start {
             continue;
         }
-        let Ok(thread_id) = ThreadId::from_str(&call.thread_id) else {
+        let valid_thread_id = *valid_thread_ids
+            .entry(call.thread_id.as_str())
+            .or_insert_with(|| ThreadId::from_str(&call.thread_id).is_ok());
+        if !valid_thread_id {
             invalid_threads = invalid_threads.saturating_add(1);
             continue;
-        };
-        let key = (thread_id, call.timestamp.date_naive());
+        }
+        let key = (call.thread_id.as_str(), call.timestamp.date_naive());
         let accumulator = accumulators
             .entry(key)
             .or_insert_with(|| SessionDigestAccumulator {
@@ -1476,14 +1501,18 @@ fn materialize_session_digests(
             .usage_event_id
             .as_deref()
             .and_then(|value| UsageEventId::from_str(value).ok());
-        let (event_id, exact_identity) = if let Some(event_id) = parsed_event_id {
+        let (event_id, exact_identity) = if parsed_event_id.is_some() {
             if !call.usage_event_identity_exact {
                 accumulator
                     .partial_reasons
                     .insert(FALLBACK_EVENT_REASON.to_owned());
             }
             (
-                event_id.as_str().to_owned(),
+                Cow::Borrowed(
+                    call.usage_event_id
+                        .as_deref()
+                        .expect("a parsed usage event ID came from this call"),
+                ),
                 call.usage_event_identity_exact,
             )
         } else {
@@ -1495,7 +1524,10 @@ fn materialize_session_digests(
                 .partial_reasons
                 .insert(FALLBACK_EVENT_REASON.to_owned());
             (
-                format!("usage-derived-sha256-v1-{}", lower_hex(&semantic_hash)),
+                Cow::Owned(format!(
+                    "usage-derived-sha256-v1-{}",
+                    lower_hex(&semantic_hash)
+                )),
                 false,
             )
         };
@@ -1514,7 +1546,7 @@ fn materialize_session_digests(
                 if semantic_hash < existing.semantic_hash {
                     *existing = DigestEvent {
                         semantic_hash,
-                        call: call.clone(),
+                        call,
                     };
                 }
             }
@@ -1523,22 +1555,38 @@ fn materialize_session_digests(
                     event_id,
                     DigestEvent {
                         semantic_hash,
-                        call: call.clone(),
+                        call,
                     },
                 );
             }
         }
     }
+    call_trace.finish_with(TraceOutcome::Ok, || {
+        TraceFields::new()
+            .usize("accumulators", accumulators.len())
+            .usize("missingEventIdentities", missing_event_identities)
+            .usize("invalidThreads", invalid_threads)
+    });
 
+    let materialize_trace = trace.span_with("source_export.session_digest.materialize", || {
+        TraceFields::new().usize("accumulators", accumulators.len())
+    });
     let revisions = current_revisions();
     let mut digests = Vec::with_capacity(accumulators.len());
+    let mut coverage_by_day = BTreeMap::<NaiveDate, DigestCoverage>::new();
     for ((thread_id, day), mut accumulator) in accumulators {
+        let thread_id = ThreadId::from_str(thread_id)
+            .expect("session digest accumulators contain validated thread IDs");
         let range_start = utc_day_start(day)?;
         let range_end = range_start.checked_add_days(Days::new(1)).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "session digest day overflows")
         })?;
-        let coverage = digest_coverage(range_start, range_end, buckets, observed_at, scan_complete);
-        accumulator.partial_reasons.extend(coverage.partial_reasons);
+        let coverage = coverage_by_day.entry(day).or_insert_with(|| {
+            digest_coverage(range_start, range_end, buckets, observed_at, scan_complete)
+        });
+        accumulator
+            .partial_reasons
+            .extend(coverage.partial_reasons.iter().cloned());
         if accumulator
             .events
             .values()
@@ -1565,12 +1613,12 @@ fn materialize_session_digests(
         let mut api_long_context_extra_cost_units = 0_u128;
         let mut api_cost = ApiCostAccumulator::default();
         for event in accumulator.events.values() {
-            api_cost.add_call(&event.call);
+            api_cost.add_call(event.call);
             if is_spark_model(event.call.model.as_deref()) {
                 continue;
             }
             token_usage.add_assign(event.call.tokens);
-            let weight = estimate_call_weight(&event.call);
+            let weight = estimate_call_weight(event.call);
             estimated_cost_units = estimated_cost_units.saturating_add(weight.units);
             api_long_context_extra_cost_units = api_long_context_extra_cost_units
                 .saturating_add(weight.api_long_context_extra_units);
@@ -1598,8 +1646,14 @@ fn materialize_session_digests(
         })?;
         let fingerprint =
             digest_fingerprint(&thread_id, range_start, range_end, &accumulator.events)?;
-        let project_breakdown_fingerprint =
-            project_breakdown_fingerprint(&thread_id, range_start, range_end, buckets)?;
+        let project_breakdown_fingerprint = project_breakdown_fingerprint_from_groups(
+            &thread_id,
+            range_start,
+            range_end,
+            project_breakdown_groups
+                .remove(&(thread_id.clone(), day))
+                .unwrap_or_default(),
+        )?;
         digests.push(RemoteSessionDigest {
             thread_id,
             range_start,
@@ -1634,6 +1688,11 @@ fn materialize_session_digests(
     digests.sort_by(|left, right| {
         (left.thread_id.as_str(), left.range_start)
             .cmp(&(right.thread_id.as_str(), right.range_start))
+    });
+    materialize_trace.finish_with(TraceOutcome::Ok, || {
+        TraceFields::new()
+            .usize("digests", digests.len())
+            .usize("coverageDays", coverage_by_day.len())
     });
     Ok((digests, missing_event_identities, invalid_threads))
 }
@@ -1886,16 +1945,14 @@ fn digest_fingerprint(
     thread_id: &ThreadId,
     range_start: DateTime<Utc>,
     range_end: DateTime<Utc>,
-    events: &BTreeMap<String, DigestEvent>,
+    events: &HashMap<Cow<'_, str>, DigestEvent<'_>>,
 ) -> io::Result<RemoteSessionDigestFingerprint> {
-    let fingerprint = digest_fingerprint_value(
-        thread_id,
-        range_start,
-        range_end,
-        events
-            .iter()
-            .map(|(event_id, event)| (event_id.as_str(), event.semantic_hash)),
-    );
+    let mut events = events
+        .iter()
+        .map(|(event_id, event)| (event_id.as_ref(), event.semantic_hash))
+        .collect::<Vec<_>>();
+    events.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let fingerprint = digest_fingerprint_value(thread_id, range_start, range_end, events);
     RemoteSessionDigestFingerprint::from_str(&fingerprint)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -1935,6 +1992,15 @@ fn project_breakdown_fingerprint(
                 .map(move |group| (bucket.starts_at, group))
         })
         .collect::<Vec<_>>();
+    project_breakdown_fingerprint_from_groups(thread_id, range_start, range_end, groups)
+}
+
+fn project_breakdown_fingerprint_from_groups<'a>(
+    thread_id: &ThreadId,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+    groups: impl IntoIterator<Item = (DateTime<Utc>, &'a LocalProjectUsageGroup)>,
+) -> io::Result<RemoteSessionDigestFingerprint> {
     let fingerprint =
         project_breakdown_fingerprint_value(thread_id, range_start, range_end, groups);
     RemoteSessionDigestFingerprint::from_str(&fingerprint)

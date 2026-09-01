@@ -154,7 +154,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, inspect, or remove the optional per-user recorder. |
 | `remote` | Configure, test, and synchronize explicitly allowlisted SSH machines. This is under development for v0.4. |
-| `debug-startup` | Profile the normal TUI cold-start path without entering interactive mode. |
+| `debug-startup` | Profile both the TUI's placeholder first frame and its initial data-ready work without entering interactive mode. |
 
 The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render. The snapshot-family commands (`snapshot`, `limits`, `tasks`, `turns`, `models`, `attribution`, and `windows`) plus `summary` and `trends` accept `--long-context` to select the optional Longx estimate for that invocation; the default remains the base estimate, and API-equivalent cost never changes.
 
@@ -276,6 +276,7 @@ Global options should appear before the subcommand.
 | `--theme dark|light` | Choose the TUI theme. `bright` is accepted as an alias for `light`. |
 | `--startup-log <FILE>` | Write startup timing events as JSONL. |
 | `--perf-log <FILE>` | Write runtime performance events as JSONL. |
+| `--trace-log <FILE>` | Write opt-in, per-operation diagnostic traces as JSONL. |
 
 Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the complete option list.
 
@@ -511,10 +512,12 @@ codex-usage-monit --days 14 --max-files 2000
 codex-usage-monit debug-startup
 codex-usage-monit --startup-log /tmp/codex-usage-startup.jsonl
 codex-usage-monit --perf-log /tmp/codex-usage-perf.jsonl
+codex-usage-monit --trace-log /tmp/codex-usage-trace.jsonl
 ```
 
 The first run, a parser-version change, or a disabled cache can be slower because rollouts must be parsed from scratch.
 Runtime logs include collection refreshes, history record/load timings and shard counts, draw aggregates, and periodic CPU/memory/I/O samples without session content.
+The trace log is more detailed and may add diagnostic I/O, so it is disabled by default. When enabled it records expensive-operation and external-process boundaries, including App Server RPCs, bounded Git probes, and SSH exchanges with durations, result classes, byte counts, limits, and a one-way remote-target fingerprint. It never records credentials, session text, raw host names, filesystem paths, stderr text, or complete command lines. Trace files are created with private permissions on Unix; service installation preserves an explicitly selected trace path for the recorder.
 
 ## Documentation
 
