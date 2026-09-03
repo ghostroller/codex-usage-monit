@@ -233,6 +233,54 @@ impl ApiCostAmount {
         self.priced_tokens = self.priced_tokens.saturating_add(other.priced_tokens);
     }
 
+    /// Returns the component-wise delta from an older aggregate when every
+    /// counter in `self` dominates the corresponding counter in `older`.
+    ///
+    /// API cost aggregates contain both monetary bounds and coverage counters;
+    /// treating only the dollar amount as monotonic can manufacture an invalid
+    /// coverage result when two independently collected views overlap.
+    pub fn checked_delta_from(self, older: Self) -> Option<Self> {
+        Some(Self {
+            minimum_pico_usd: PicoUsd::new(
+                self.minimum_pico_usd
+                    .value()
+                    .checked_sub(older.minimum_pico_usd.value())?,
+            ),
+            maximum_pico_usd: PicoUsd::new(
+                self.maximum_pico_usd
+                    .value()
+                    .checked_sub(older.maximum_pico_usd.value())?,
+            ),
+            observed_samples: self.observed_samples.checked_sub(older.observed_samples)?,
+            priced_samples: self.priced_samples.checked_sub(older.priced_samples)?,
+            observed_tokens: self.observed_tokens.checked_sub(older.observed_tokens)?,
+            priced_tokens: self.priced_tokens.checked_sub(older.priced_tokens)?,
+        })
+    }
+
+    pub fn componentwise_max(self, other: Self) -> Self {
+        Self {
+            minimum_pico_usd: PicoUsd::new(
+                self.minimum_pico_usd
+                    .value()
+                    .max(other.minimum_pico_usd.value()),
+            ),
+            maximum_pico_usd: PicoUsd::new(
+                self.maximum_pico_usd
+                    .value()
+                    .max(other.maximum_pico_usd.value()),
+            ),
+            observed_samples: self.observed_samples.max(other.observed_samples),
+            priced_samples: self.priced_samples.max(other.priced_samples),
+            observed_tokens: self.observed_tokens.max(other.observed_tokens),
+            priced_tokens: self.priced_tokens.max(other.priced_tokens),
+        }
+    }
+
+    pub fn is_zero(self) -> bool {
+        self == Self::default()
+    }
+
     pub fn range_is_exact(self) -> bool {
         self.minimum_pico_usd == self.maximum_pico_usd
     }

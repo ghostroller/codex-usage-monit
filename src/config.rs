@@ -44,8 +44,8 @@ impl Default for CollectConfig {
     }
 }
 
-fn default_app_server_timeout(windows: bool) -> Duration {
-    Duration::from_secs(if windows { 30 } else { 12 })
+fn default_app_server_timeout(_windows: bool) -> Duration {
+    Duration::from_secs(30)
 }
 
 pub fn default_codex_home() -> PathBuf {
@@ -107,8 +107,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_app_server_timeout_allows_for_cli_cold_start() {
+    fn app_server_timeout_allows_for_network_backed_rate_limit_reads() {
         assert_eq!(default_app_server_timeout(true), Duration::from_secs(30));
-        assert_eq!(default_app_server_timeout(false), Duration::from_secs(12));
+        assert_eq!(default_app_server_timeout(false), Duration::from_secs(30));
     }
 }

@@ -596,7 +596,144 @@ fn remote_models_keep_historical_api_lower_bound_and_make_live_tail_quota_unknow
 }
 
 #[test]
-fn remote_model_projection_marks_unpersisted_live_tail_api_as_a_lower_bound() {
+fn remote_window_projection_keeps_local_remote_thread_and_model_token_totals_equal() {
+    let mut analysis = WindowAnalysis {
+        duration_mins: 300,
+        attribution: AttributionSummary::default(),
+        threads: vec![ThreadWindowUsage {
+            thread_id: "local".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        }],
+        partial: false,
+        partial_reasons: Vec::new(),
+        turns: Vec::new(),
+        models: Vec::new(),
+        api_equivalent_cost: ApiEquivalentCost::default(),
+        api_pricing: Default::default(),
+        api_long_context: None,
+    };
+    let remote = crate::remote_overview::RemoteOverviewWindow {
+        duration_mins: 300,
+        threads: vec![ThreadWindowUsage {
+            thread_id: "remote:host:thread".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 30,
+                    total_tokens: 30,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        }],
+        models: Some(vec![crate::remote_overview::RemoteOverviewModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            token_usage: TokenUsage {
+                input_tokens: 130,
+                total_tokens: 130,
+                ..TokenUsage::default()
+            },
+            estimated_cost_units: 130,
+            api_long_context_extra_cost_units: Some(0),
+            ..crate::remote_overview::RemoteOverviewModelUsage::default()
+        }]),
+        model_token_usage: TokenUsage {
+            input_tokens: 130,
+            total_tokens: 130,
+            ..TokenUsage::default()
+        },
+        estimated_cost_units: 130,
+        api_long_context_extra_cost_units: Some(0),
+        ..crate::remote_overview::RemoteOverviewWindow::default()
+    };
+
+    apply_remote_window_projection(&mut analysis, &remote);
+
+    let thread_tokens = analysis
+        .threads
+        .iter()
+        .map(|thread| thread.usage.token_usage.total_tokens)
+        .sum::<u64>();
+    let model_tokens = analysis
+        .models
+        .iter()
+        .map(|model| model.token_usage.total_tokens)
+        .sum::<u64>();
+    assert_eq!(thread_tokens, 130);
+    assert_eq!(model_tokens, 130);
+    assert_eq!(analysis.attribution.local_token_usage.total_tokens, 130);
+    assert!((analysis.threads[0].usage.local_token_share_percent - 76.923_076).abs() < 0.000_01);
+    assert!((analysis.threads[1].usage.local_token_share_percent - 23.076_923).abs() < 0.000_01);
+}
+
+#[test]
+fn remote_window_projection_keeps_the_larger_total_when_token_breakdowns_cross() {
+    let mut analysis = WindowAnalysis {
+        duration_mins: 300,
+        attribution: AttributionSummary::default(),
+        threads: vec![ThreadWindowUsage {
+            thread_id: "local-and-remote-projects".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 130,
+                    cached_input_tokens: 100,
+                    total_tokens: 140,
+                    ..TokenUsage::default()
+                },
+                ..WindowUsage::default()
+            },
+        }],
+        partial: false,
+        partial_reasons: Vec::new(),
+        turns: Vec::new(),
+        models: Vec::new(),
+        api_equivalent_cost: ApiEquivalentCost::default(),
+        api_pricing: Default::default(),
+        api_long_context: None,
+    };
+    let remote_total = TokenUsage {
+        input_tokens: 120,
+        cached_input_tokens: 110,
+        total_tokens: 150,
+        ..TokenUsage::default()
+    };
+    let remote = crate::remote_overview::RemoteOverviewWindow {
+        duration_mins: 300,
+        models: Some(vec![crate::remote_overview::RemoteOverviewModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            token_usage: remote_total,
+            ..crate::remote_overview::RemoteOverviewModelUsage::default()
+        }]),
+        model_token_usage: remote_total,
+        ..crate::remote_overview::RemoteOverviewWindow::default()
+    };
+
+    apply_remote_window_projection(&mut analysis, &remote);
+
+    assert_eq!(analysis.attribution.local_token_usage, remote_total);
+    assert_eq!(
+        analysis
+            .models
+            .iter()
+            .map(|model| model.token_usage.total_tokens)
+            .sum::<u64>(),
+        150
+    );
+    assert!(
+        analysis
+            .partial_reasons
+            .contains(&"remote_model_thread_totals_inconsistent".to_owned())
+    );
+}
+
+#[test]
+fn remote_model_projection_reconciles_live_tail_api_total_without_fabricating_model_attribution() {
     let as_of = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
     let history_cost = ApiCostAmount {
         minimum_pico_usd: PicoUsd::new(100),
@@ -625,6 +762,14 @@ fn remote_model_projection_marks_unpersisted_live_tail_api_as_a_lower_bound() {
                     input_tokens: 120,
                     total_tokens: 120,
                     ..TokenUsage::default()
+                },
+                api_equivalent_cost: ApiCostAmount {
+                    minimum_pico_usd: PicoUsd::new(120),
+                    maximum_pico_usd: PicoUsd::new(120),
+                    observed_samples: 2,
+                    priced_samples: 2,
+                    observed_tokens: 120,
+                    priced_tokens: 120,
                 },
                 ..WindowUsage::default()
             },
@@ -679,14 +824,90 @@ fn remote_model_projection_marks_unpersisted_live_tail_api_as_a_lower_bound() {
         120
     );
     assert_eq!(analysis.api_equivalent_cost.amount.observed_tokens, 120);
-    assert_eq!(analysis.api_equivalent_cost.amount.priced_tokens, 100);
+    assert_eq!(analysis.api_equivalent_cost.amount.priced_tokens, 120);
+    assert_eq!(
+        analysis.api_equivalent_cost.amount.minimum_pico_usd.value(),
+        120
+    );
+    assert_eq!(analysis.models[0].api_equivalent_cost.priced_tokens, 100);
     assert!(
         analysis
             .api_equivalent_cost
             .partial_reasons
-            .contains(&"remote_live_tail_api_cost_partial".to_owned())
+            .contains(&"remote_live_tail_model_api_breakdown_partial".to_owned())
     );
     assert!(analysis.api_equivalent_cost.is_partial());
+}
+
+#[test]
+fn remote_window_projection_keeps_the_api_total_without_a_model_breakdown() {
+    let cost = |pico_usd: u128, samples: u64, tokens: u64| ApiCostAmount {
+        minimum_pico_usd: PicoUsd::new(pico_usd),
+        maximum_pico_usd: PicoUsd::new(pico_usd),
+        observed_samples: samples,
+        priced_samples: samples,
+        observed_tokens: tokens,
+        priced_tokens: tokens,
+    };
+    let mut analysis = WindowAnalysis {
+        duration_mins: 300,
+        attribution: AttributionSummary::default(),
+        threads: vec![ThreadWindowUsage {
+            thread_id: "local".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
+                api_equivalent_cost: cost(100, 1, 100),
+                ..WindowUsage::default()
+            },
+        }],
+        partial: false,
+        partial_reasons: Vec::new(),
+        turns: Vec::new(),
+        models: Vec::new(),
+        api_equivalent_cost: ApiEquivalentCost::default(),
+        api_pricing: Default::default(),
+        api_long_context: None,
+    };
+    let total_tokens = TokenUsage {
+        input_tokens: 130,
+        total_tokens: 130,
+        ..TokenUsage::default()
+    };
+    let remote = crate::remote_overview::RemoteOverviewWindow {
+        duration_mins: 300,
+        threads: vec![ThreadWindowUsage {
+            thread_id: "remote:host:thread".to_owned(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: 30,
+                    total_tokens: 30,
+                    ..TokenUsage::default()
+                },
+                api_equivalent_cost: cost(30, 1, 30),
+                ..WindowUsage::default()
+            },
+        }],
+        models: None,
+        model_token_usage: total_tokens,
+        api_equivalent_cost: Some(ApiEquivalentCost {
+            amount: cost(130, 2, 130),
+            ..ApiEquivalentCost::default()
+        }),
+        ..crate::remote_overview::RemoteOverviewWindow::default()
+    };
+
+    apply_remote_window_projection(&mut analysis, &remote);
+
+    assert_eq!(analysis.attribution.local_token_usage, total_tokens);
+    assert_eq!(
+        analysis.api_equivalent_cost.amount,
+        cost(130, 2, 130),
+        "the all-source API total must not depend on model rows being available"
+    );
 }
 
 #[test]
@@ -1950,6 +2171,31 @@ fn remote_history_and_live_overlay_are_idempotent_and_never_double_count() {
             .turns
             .iter()
             .all(|turn| !turn.thread_id.starts_with("remote:"))
+    );
+}
+
+#[test]
+fn remote_history_synced_after_the_local_snapshot_is_visible_on_the_same_merge() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::Week, 100, 100.0);
+    app.local_snapshot = app.snapshot.clone();
+    let merge_at = app.snapshot.as_of + ChronoDuration::minutes(1);
+    let history = remote_overview_history_fixture(merge_at);
+    let mut snapshot = app.local_snapshot.clone();
+
+    merge_remote_live_into_snapshot_at(&mut snapshot, &[], &history, merge_at);
+
+    let analysis = snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == WindowScope::Week.duration_mins())
+        .unwrap();
+    assert_eq!(analysis.attribution.local_token_usage.total_tokens, 130);
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.title == "Remote history task")
     );
 }
 
@@ -3733,7 +3979,7 @@ fn overview_keeps_reset_expiry_reminder_inside_the_quota_panel() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(app.task_table_hitbox.is_some());
-    assert!(content.contains("codex app-server failed · install CLI"));
+    assert!(content.contains("Quota failed · cached · see Other"));
     assert!(content.contains("Models ·"));
 }
 
@@ -3744,15 +3990,15 @@ fn overview_places_app_server_failure_between_sessions_and_models_at_all_sizes()
             Theme::Dark,
             80,
             40,
-            "Unable to call codex app-server · try installing Codex CLI",
+            "Codex CLI unavailable · install it or set --codex-bin",
         ),
         (
             Theme::Light,
             40,
             24,
-            "codex app-server failed · install CLI",
+            "Codex CLI unavailable · configure CLI",
         ),
-        (Theme::Dark, 24, 24, "app-server failed · CLI"),
+        (Theme::Dark, 24, 24, "Codex CLI unavailable"),
     ] {
         let mut app = interaction_test_app(1, 1);
         app.theme = theme;
@@ -3760,7 +4006,7 @@ fn overview_places_app_server_failure_between_sessions_and_models_at_all_sizes()
             source: "app_server".to_string(),
             status: "error".to_string(),
             as_of: app.snapshot.as_of,
-            message: Some("failed to spawn codex app-server".to_string()),
+            message: Some("[executable_unavailable] failed to spawn codex app-server".to_string()),
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -3799,7 +4045,7 @@ fn overview_keeps_app_server_failure_stable_across_local_only_refresh_state() {
     let now = app.snapshot.as_of;
     app.snapshot
         .warnings
-        .push("app-server refresh failed: access denied".to_string());
+        .push("app-server refresh failed [timeout]: request timed out".to_string());
     app.snapshot.sources = vec![SourceStatus {
         source: "app_server".to_string(),
         status: "stale".to_string(),
@@ -3840,7 +4086,7 @@ fn overview_keeps_app_server_failure_stable_across_local_only_refresh_state() {
         .map(|cell| cell.symbol())
         .collect::<String>();
 
-    assert!(content.contains("Unable to call codex app-server · try installing Codex CLI"));
+    assert!(content.contains("Codex quota refresh timed out · showing cached quota · retrying"));
 }
 
 #[test]
@@ -4502,6 +4748,10 @@ fn models_panel_prioritizes_token_usage_and_reports_clipping() {
         ends_at: now + chrono::Duration::hours(4),
         used_percent: 10.0,
     });
+    app.snapshot.attribution.local_token_usage = TokenUsage {
+        total_tokens: 1_110,
+        ..TokenUsage::default()
+    };
     app.snapshot.models = vec![
         model_usage("small-model", 10),
         model_usage("largest-model", 1_000),
@@ -4509,8 +4759,10 @@ fn models_panel_prioritizes_token_usage_and_reports_clipping() {
     ];
 
     let compact = render_models_content(&app.snapshot, 100, 7);
-    assert!(compact.contains("Models · 5h · top 1/3"));
-    assert!(compact.contains("largest-model"));
+    assert!(compact.contains("Models · 5h · TOTAL"));
+    assert!(compact.contains("TOTAL"));
+    assert!(compact.contains("1.1K"));
+    assert!(!compact.contains("largest-model"));
     assert!(!compact.contains("small-model"));
     assert!(!compact.contains("medium-model"));
 
@@ -4518,9 +4770,102 @@ fn models_panel_prioritizes_token_usage_and_reports_clipping() {
     let largest = expanded.find("largest-model").unwrap();
     let medium = expanded.find("medium-model").unwrap();
     let small = expanded.find("small-model").unwrap();
+    let total = expanded.rfind("TOTAL").unwrap();
     assert!(largest < medium && medium < small);
-    assert!(!expanded.contains("top 3/3"));
+    assert!(small < total);
+    assert!(expanded.contains("Models · 5h · TOTAL"));
 }
+
+#[test]
+fn models_panel_groups_hidden_models_and_keeps_an_authoritative_total() {
+    let mut models = vec![
+        model_usage("largest", 1_000),
+        model_usage("medium", 100),
+        model_usage("small", 10),
+    ];
+    for (model, share) in models.iter_mut().zip([90.0, 9.0, 1.0]) {
+        model.local_token_share_percent = share;
+    }
+    let attribution = AttributionSummary {
+        local_token_usage: TokenUsage {
+            total_tokens: 1_110,
+            ..TokenUsage::default()
+        },
+        proxy_projected_percent: 25.0,
+        confidence: Confidence::Low,
+        ..AttributionSummary::default()
+    };
+
+    let (rows, projection) = model_table_display_rows(
+        &models,
+        3,
+        Some(&attribution),
+        None,
+        ApiCostWindowState::Complete,
+    );
+
+    assert_eq!(projection.direct_models, 1);
+    assert_eq!(projection.aggregated_models, 2);
+    assert_eq!(rows[0].model, "largest");
+    assert_eq!(rows[1].model, "Other (2)");
+    assert_eq!(rows[1].token_usage.total_tokens, 110);
+    assert_eq!(rows[2].model, "TOTAL");
+    assert_eq!(rows[2].token_usage.total_tokens, 1_110);
+    assert_eq!(rows[2].local_token_share_percent, 100.0);
+
+    let (compact, projection) = model_table_display_rows(
+        &models,
+        2,
+        Some(&attribution),
+        None,
+        ApiCostWindowState::Complete,
+    );
+    assert_eq!(projection.direct_models, 0);
+    assert_eq!(projection.aggregated_models, 3);
+    assert_eq!(compact[0].model, "Attributed (3)");
+    assert_eq!(compact[0].token_usage.total_tokens, 1_110);
+    assert_eq!(compact[1].model, "TOTAL");
+}
+
+#[test]
+fn models_panel_exposes_tokens_that_cannot_be_attributed_to_a_model() {
+    let models = vec![model_usage("known-model", 100)];
+    let attribution = AttributionSummary {
+        local_token_usage: TokenUsage {
+            total_tokens: 130,
+            ..TokenUsage::default()
+        },
+        ..AttributionSummary::default()
+    };
+
+    let (rows, projection) = model_table_display_rows(
+        &models,
+        3,
+        Some(&attribution),
+        None,
+        ApiCostWindowState::Complete,
+    );
+
+    assert_eq!(rows[0].model, "known-model");
+    assert_eq!(rows[1].model, "Unattributed");
+    assert_eq!(rows[1].token_usage.total_tokens, 30);
+    assert!((rows[0].local_token_share_percent - 76.923_076).abs() < 0.000_01);
+    assert!((rows[1].local_token_share_percent - 23.076_923).abs() < 0.000_01);
+    assert_eq!(rows[2].model, "TOTAL");
+    assert_eq!(projection.unattributed_tokens, 30);
+
+    let (compact, projection) = model_table_display_rows(
+        &models,
+        2,
+        Some(&attribution),
+        None,
+        ApiCostWindowState::Complete,
+    );
+    assert_eq!(compact[0].model, "known-model");
+    assert_eq!(compact[1].model, "TOTAL");
+    assert_eq!(projection.unattributed_tokens, 30);
+}
+
 #[test]
 fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
     let mut app = interaction_test_app(1, 1);

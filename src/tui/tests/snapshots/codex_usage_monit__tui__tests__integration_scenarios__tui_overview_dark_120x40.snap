@@ -34,13 +34,13 @@ rows:
 27|│                                                            ││turn=turn-main-2                                        │
 28|│                                                            ││message=Add deterministic TUI scenarios and snapshots   │
 29|└  R RUN   W WAIT   D DONE   X STOP   F FAIL   ? STALE  ─────┘└ gpt-5.3-codex · high ──────────────────────────────────┘
-30|┌ Models · 5h──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+30|┌ Models · 5h · TOTAL──────────────────────────────────────────────────────────────────────────────────────────────────┐
 31|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 │
 32|│10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              │
 33|│Credit-rate-weighted quota proxy, not server per-task accounting                                                      │
 34|│MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ.│
 35|│gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000│
-36|│                                                                                                                      │
+36|│TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000│
 37|│                                                                                                                      │
 38|│                                                                                                                      │
 39|└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -239,8 +239,8 @@ styles:
 29:084+036 fg=#4b525c bg=#121417 mods=none text=" ──────────────────────────────────┘"
 30:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 30:001+007 fg=#f4f6f8 bg=#121417 mods=bold text=" Models"
-30:008+005 fg=#7e8691 bg=#121417 mods=none text=" · 5h"
-30:013+107 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+30:008+013 fg=#7e8691 bg=#121417 mods=none text=" · 5h · TOTAL"
+30:021+099 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────────────────────────────────────────────────────────────────────────┐"
 31:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 31:001+118 fg=#7e8691 bg=#121417 mods=none text="Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 "
 31:119+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -257,6 +257,7 @@ styles:
 35:001+118 fg=#dadee4 bg=#121417 mods=none text="gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000"
 35:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 36:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+36:001+118 fg=#f4f6f8 bg=#121417 mods=bold text="TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000"
 36:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 37:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 37:119+001 fg=#4b525c bg=#121417 mods=none text="│"

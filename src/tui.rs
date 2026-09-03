@@ -9297,7 +9297,7 @@ fn collect_initial_refresh_completion(
     });
     // Initial data-ready is deliberately local-only. A cold or temporarily
     // unavailable network account RPC must not hold the first useful TUI
-    // snapshot behind its 12/30-second deadline. `App::new` leaves
+    // snapshot behind its network-backed RPC deadline. `App::new` leaves
     // `next_account_refresh` due immediately, and because this completion is
     // explicitly marked `refreshed_account=false`, the ordinary run loop starts
     // the unchanged account refresh path as soon as this local bootstrap has
@@ -11699,7 +11699,7 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         render_tasks(frame, task_area, app, true);
     }
     if app_server_failed {
-        render_app_server_failure_notice(frame, rows[row_index], app.theme);
+        render_app_server_failure_notice(frame, rows[row_index], &app.snapshot, app.theme);
         row_index += 1;
     }
     if app.models_visible {
@@ -16329,7 +16329,7 @@ fn app_server_call_failed(snapshot: &Snapshot) -> bool {
     snapshot
         .warnings
         .iter()
-        .any(|value| value.starts_with("app-server refresh failed:"))
+        .any(|value| value.starts_with("app-server refresh failed"))
         || snapshot.sources.iter().any(|source| {
             source.source == "app_server"
                 && (source.status == "error"
@@ -16345,19 +16345,85 @@ fn initial_collection_loading(snapshot: &Snapshot) -> bool {
         .any(|source| source.status == "loading")
 }
 
-fn app_server_failure_message(width: u16) -> &'static str {
-    if width >= 59 {
-        "Unable to call codex app-server · try installing Codex CLI"
-    } else if width >= 37 {
-        "codex app-server failed · install CLI"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppServerFailureNoticeKind {
+    Timeout,
+    ExecutableUnavailable,
+    Other,
+}
+
+fn app_server_failure_notice_kind(snapshot: &Snapshot) -> AppServerFailureNoticeKind {
+    let diagnostics = snapshot
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .chain(
+            snapshot
+                .sources
+                .iter()
+                .filter(|source| source.source == "app_server")
+                .filter_map(|source| source.message.as_deref()),
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    if diagnostics.contains("[timeout]") || diagnostics.contains("timed out") {
+        AppServerFailureNoticeKind::Timeout
+    } else if diagnostics.contains("[executable_unavailable]")
+        || diagnostics.contains("no such file or directory")
+        || diagnostics.contains("not found")
+    {
+        AppServerFailureNoticeKind::ExecutableUnavailable
     } else {
-        "app-server failed · CLI"
+        AppServerFailureNoticeKind::Other
     }
 }
 
-fn render_app_server_failure_notice(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+fn app_server_failure_message(snapshot: &Snapshot, width: u16) -> &'static str {
+    let has_cached_quota = !snapshot.limits.is_empty();
+    match (app_server_failure_notice_kind(snapshot), has_cached_quota) {
+        (AppServerFailureNoticeKind::Timeout, true) if width >= 72 => {
+            "Codex quota refresh timed out · showing cached quota · retrying"
+        }
+        (AppServerFailureNoticeKind::Timeout, false) if width >= 54 => {
+            "Codex quota refresh timed out · retrying in background"
+        }
+        (AppServerFailureNoticeKind::Timeout, true) if width >= 42 => {
+            "Quota refresh timed out · cached · retrying"
+        }
+        (AppServerFailureNoticeKind::Timeout, false) if width >= 32 => {
+            "Quota refresh timed out · retrying"
+        }
+        (AppServerFailureNoticeKind::Timeout, true) => "Quota timeout · cached",
+        (AppServerFailureNoticeKind::Timeout, false) => "Quota refresh timeout",
+        (AppServerFailureNoticeKind::ExecutableUnavailable, _) if width >= 58 => {
+            "Codex CLI unavailable · install it or set --codex-bin"
+        }
+        (AppServerFailureNoticeKind::ExecutableUnavailable, _) if width >= 38 => {
+            "Codex CLI unavailable · configure CLI"
+        }
+        (AppServerFailureNoticeKind::ExecutableUnavailable, _) => "Codex CLI unavailable",
+        (AppServerFailureNoticeKind::Other, true) if width >= 66 => {
+            "Codex quota refresh failed · showing cached quota · see Other"
+        }
+        (AppServerFailureNoticeKind::Other, false) if width >= 52 => {
+            "Codex quota refresh failed · see Other diagnostics"
+        }
+        (AppServerFailureNoticeKind::Other, true) if width >= 38 => {
+            "Quota failed · cached · see Other"
+        }
+        (AppServerFailureNoticeKind::Other, _) => "Codex quota refresh failed",
+    }
+}
+
+fn render_app_server_failure_notice(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &Snapshot,
+    theme: Theme,
+) {
     frame.render_widget(
-        Paragraph::new(app_server_failure_message(area.width))
+        Paragraph::new(app_server_failure_message(snapshot, area.width))
             .style(
                 Style::default()
                     .fg(theme.palette().warning)
@@ -18792,6 +18858,246 @@ fn model_api_cost_state(
     }
 }
 
+#[derive(Clone, Debug)]
+struct ModelTableDisplayRow {
+    model: String,
+    token_usage: TokenUsage,
+    local_token_share_percent: f64,
+    estimated_quota_percent: f64,
+    quota_confidence: Confidence,
+    api_equivalent_cost: ApiCostAmount,
+    api_cost_state: ApiCostWindowState,
+    is_total: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModelTableProjection {
+    direct_models: usize,
+    aggregated_models: usize,
+    unattributed_tokens: u64,
+    has_unattributed_api_cost: bool,
+}
+
+fn aggregate_model_table_display_row(
+    label: String,
+    models: &[ModelUsage],
+    api_cost_analysis: Option<&WindowAnalysis>,
+    api_cost_state: ApiCostWindowState,
+) -> ModelTableDisplayRow {
+    let mut token_usage = TokenUsage::default();
+    let mut estimated_quota_percent = 0.0;
+    let mut api_equivalent_cost = ApiCostAmount::default();
+    let mut quota_confidence = None;
+    for model in models {
+        token_usage.add_assign(model.token_usage);
+        estimated_quota_percent += model.estimated_quota_percent;
+        api_equivalent_cost.add_assign(model_api_cost_for_analysis(api_cost_analysis, model));
+        if !model.token_usage.is_zero()
+            || model.estimated_quota_percent > 0.0
+            || model.quota_confidence != Confidence::Unknown
+        {
+            quota_confidence = Some(match quota_confidence {
+                None => model.quota_confidence,
+                Some(current) => weakest_quota_confidence(current, model.quota_confidence),
+            });
+        }
+    }
+    ModelTableDisplayRow {
+        model: label,
+        token_usage,
+        local_token_share_percent: models
+            .iter()
+            .map(|model| model.local_token_share_percent)
+            .sum(),
+        estimated_quota_percent,
+        quota_confidence: quota_confidence.unwrap_or(Confidence::Unknown),
+        api_equivalent_cost,
+        api_cost_state: model_api_cost_state(api_cost_state, api_equivalent_cost),
+        is_total: false,
+    }
+}
+
+fn model_table_display_rows(
+    models: &[ModelUsage],
+    visible_capacity: usize,
+    attribution: Option<&AttributionSummary>,
+    api_cost_analysis: Option<&WindowAnalysis>,
+    api_cost_state: ApiCostWindowState,
+) -> (Vec<ModelTableDisplayRow>, ModelTableProjection) {
+    if visible_capacity == 0 {
+        return (Vec::new(), ModelTableProjection::default());
+    }
+
+    let fallback_tokens = models
+        .iter()
+        .fold(TokenUsage::default(), |mut total, model| {
+            total.add_assign(model.token_usage);
+            total
+        });
+    let total_tokens = attribution
+        .map(|value| value.local_token_usage)
+        .unwrap_or(fallback_tokens);
+    let fallback_api = models
+        .iter()
+        .fold(ApiCostAmount::default(), |mut total, model| {
+            total.add_assign(model_api_cost_for_analysis(api_cost_analysis, model));
+            total
+        });
+    let total_api = api_cost_analysis
+        .map(|value| value.api_equivalent_cost.amount)
+        .unwrap_or(fallback_api);
+    let unattributed_token_count = total_tokens
+        .total_tokens
+        .saturating_sub(fallback_tokens.total_tokens);
+    let unattributed_token_usage = (unattributed_token_count > 0).then(|| {
+        total_tokens
+            .delta_from(fallback_tokens)
+            .unwrap_or(TokenUsage {
+                total_tokens: unattributed_token_count,
+                ..TokenUsage::default()
+            })
+    });
+    let unattributed_api_cost = total_api
+        .checked_delta_from(fallback_api)
+        .filter(|amount| !amount.is_zero());
+    let unattributed = if unattributed_token_usage.is_some() || unattributed_api_cost.is_some() {
+        let token_usage = unattributed_token_usage.unwrap_or_default();
+        let api_equivalent_cost = unattributed_api_cost.unwrap_or_default();
+        Some(ModelTableDisplayRow {
+            model: "Unattributed".to_owned(),
+            token_usage,
+            local_token_share_percent: if total_tokens.total_tokens == 0 {
+                0.0
+            } else {
+                token_usage.total_tokens as f64 / total_tokens.total_tokens as f64 * 100.0
+            },
+            estimated_quota_percent: 0.0,
+            quota_confidence: Confidence::Unknown,
+            api_equivalent_cost,
+            api_cost_state: if unattributed_api_cost.is_some() {
+                model_api_cost_state(api_cost_state, api_equivalent_cost)
+            } else {
+                ApiCostWindowState::Unavailable
+            },
+            is_total: false,
+        })
+    } else {
+        None
+    };
+    let total = ModelTableDisplayRow {
+        model: "TOTAL".to_owned(),
+        token_usage: total_tokens,
+        local_token_share_percent: if total_tokens.total_tokens == 0 {
+            0.0
+        } else {
+            100.0
+        },
+        estimated_quota_percent: attribution.map_or_else(
+            || {
+                models
+                    .iter()
+                    .map(|model| model.estimated_quota_percent)
+                    .sum()
+            },
+            |value| value.proxy_projected_percent,
+        ),
+        quota_confidence: attribution.map_or(Confidence::Unknown, |value| value.confidence),
+        api_equivalent_cost: total_api,
+        api_cost_state,
+        is_total: true,
+    };
+
+    if visible_capacity == 1 {
+        return (
+            vec![total],
+            ModelTableProjection {
+                unattributed_tokens: unattributed_token_count,
+                has_unattributed_api_cost: unattributed_api_cost.is_some(),
+                ..ModelTableProjection::default()
+            },
+        );
+    }
+
+    let show_unattributed = unattributed.is_some() && (models.is_empty() || visible_capacity >= 3);
+    let model_capacity = visible_capacity - 1 - usize::from(show_unattributed);
+    let mut rows = Vec::with_capacity(visible_capacity);
+    let mut projection = if models.is_empty() || model_capacity == 0 {
+        ModelTableProjection::default()
+    } else if models.len() <= model_capacity {
+        rows.extend(models.iter().map(|model| ModelTableDisplayRow {
+            model: model.model.clone(),
+            token_usage: model.token_usage,
+            local_token_share_percent: model.local_token_share_percent,
+            estimated_quota_percent: model.estimated_quota_percent,
+            quota_confidence: model.quota_confidence,
+            api_equivalent_cost: model_api_cost_for_analysis(api_cost_analysis, model),
+            api_cost_state: model_api_cost_state(
+                api_cost_state,
+                model_api_cost_for_analysis(api_cost_analysis, model),
+            ),
+            is_total: false,
+        }));
+        ModelTableProjection {
+            direct_models: models.len(),
+            aggregated_models: 0,
+            ..ModelTableProjection::default()
+        }
+    } else if model_capacity == 1 {
+        rows.push(aggregate_model_table_display_row(
+            format!("Attributed ({})", models.len()),
+            models,
+            api_cost_analysis,
+            api_cost_state,
+        ));
+        ModelTableProjection {
+            direct_models: 0,
+            aggregated_models: models.len(),
+            ..ModelTableProjection::default()
+        }
+    } else {
+        let direct_models = model_capacity - 1;
+        rows.extend(models[..direct_models].iter().map(|model| {
+            let api_equivalent_cost = model_api_cost_for_analysis(api_cost_analysis, model);
+            ModelTableDisplayRow {
+                model: model.model.clone(),
+                token_usage: model.token_usage,
+                local_token_share_percent: model.local_token_share_percent,
+                estimated_quota_percent: model.estimated_quota_percent,
+                quota_confidence: model.quota_confidence,
+                api_equivalent_cost,
+                api_cost_state: model_api_cost_state(api_cost_state, api_equivalent_cost),
+                is_total: false,
+            }
+        }));
+        let aggregated_models = models.len() - direct_models;
+        rows.push(aggregate_model_table_display_row(
+            format!("Other ({aggregated_models})"),
+            &models[direct_models..],
+            api_cost_analysis,
+            api_cost_state,
+        ));
+        ModelTableProjection {
+            direct_models,
+            aggregated_models,
+            ..ModelTableProjection::default()
+        }
+    };
+    for row in &mut rows {
+        row.local_token_share_percent = if total_tokens.total_tokens == 0 {
+            0.0
+        } else {
+            row.token_usage.total_tokens as f64 / total_tokens.total_tokens as f64 * 100.0
+        };
+    }
+    if show_unattributed {
+        rows.push(unattributed.expect("unattributed row must exist when it is reserved"));
+    }
+    rows.push(total);
+    projection.unattributed_tokens = unattributed_token_count;
+    projection.has_unattributed_api_cost = unattributed_api_cost.is_some();
+    (rows, projection)
+}
+
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let theme = app.theme;
     let window_scope = app.window_scope;
@@ -18853,14 +19159,17 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .split(panel_inner);
     let model_area = regions[1];
     let visible_capacity = usize::from(model_area.height.saturating_sub(1));
+    let (display_rows, display_projection) = model_table_display_rows(
+        &models,
+        visible_capacity,
+        attribution,
+        api_cost_analysis,
+        api_cost_state,
+    );
     let api_cost_values = if app.table_columns.api_equivalent {
-        models
+        display_rows
             .iter()
-            .take(visible_capacity)
-            .map(|model| {
-                let cost = model_api_cost_for_analysis(api_cost_analysis, model);
-                format_scoped_api_cost_amount(model_api_cost_state(api_cost_state, cost), cost)
-            })
+            .map(|row| format_scoped_api_cost_amount(row.api_cost_state, row.api_equivalent_cost))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -18868,7 +19177,6 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let api_cost_width = api_cost_column_width(api_cost_analysis, &api_cost_values);
     let visible_columns =
         model_visible_columns(app.table_columns, model_area.width, api_cost_width);
-    let visible_count = models.len().min(visible_capacity);
     let scope = attribution
         .and_then(|attribution| attribution.window.as_ref())
         .map(|window| window.label.clone());
@@ -18879,8 +19187,32 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if attribution.is_none() {
         title_suffix.push_str(" unavailable");
     }
-    if visible_count < models.len() {
-        title_suffix.push_str(&format!(" · top {visible_count}/{}", models.len()));
+    if display_projection.aggregated_models > 0 {
+        if display_projection.direct_models == 0 {
+            title_suffix.push_str(&format!(
+                " · grouped {} models · TOTAL",
+                display_projection.aggregated_models
+            ));
+        } else {
+            title_suffix.push_str(&format!(
+                " · top {}/{} + Other · TOTAL",
+                display_projection.direct_models,
+                models.len()
+            ));
+        }
+    } else if !display_rows.is_empty() {
+        title_suffix.push_str(" · TOTAL");
+    }
+    if display_projection.unattributed_tokens > 0 {
+        title_suffix.push_str(&format!(
+            " · unattributed {}",
+            format_tokens(TokenUsage {
+                total_tokens: display_projection.unattributed_tokens,
+                ..TokenUsage::default()
+            })
+        ));
+    } else if display_projection.has_unattributed_api_cost {
+        title_suffix.push_str(" · unattributed API EQ.");
     }
     frame.render_widget(models_panel_block(app, &title_suffix), area);
 
@@ -18899,7 +19231,13 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if model_area.is_empty() {
         return;
     }
-    if models.is_empty() {
+    let has_authoritative_usage = attribution.is_some_and(|value| {
+        !value.local_token_usage.is_zero()
+            || value.proxy_projected_percent > 0.0
+            || value.confidence != Confidence::Unknown
+    }) || api_cost_analysis
+        .is_some_and(|value| !value.api_equivalent_cost.amount.is_zero());
+    if models.is_empty() && !has_authoritative_usage {
         let message = if attribution.is_some() {
             format!(
                 "No token usage in the current {} window",
@@ -18921,31 +19259,36 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let rows = models
+    let rows = display_rows
         .iter()
-        .take(visible_capacity)
         .enumerate()
-        .map(|(visible_position, model)| {
-            let mut cells = vec![Cell::from(terminal_safe_text(&model.model))];
+        .map(|(visible_position, row)| {
+            let mut cells = vec![Cell::from(terminal_safe_text(&row.model))];
             if visible_columns.tokens {
-                cells.push(Cell::from(format_tokens(model.token_usage)));
+                cells.push(Cell::from(format_tokens(row.token_usage)));
             }
             if visible_columns.token_share {
-                cells.push(Cell::from(format!(
-                    "{:.1}%",
-                    model.local_token_share_percent
-                )));
+                cells.push(Cell::from(format!("{:.1}%", row.local_token_share_percent)));
             }
             if visible_columns.estimated_quota {
                 cells.push(Cell::from(format_estimated_quota(
-                    model.estimated_quota_percent,
-                    model.quota_confidence,
+                    row.estimated_quota_percent,
+                    row.quota_confidence,
                 )));
             }
             if visible_columns.api_equivalent {
                 cells.push(Cell::from(api_cost_values[visible_position].clone()));
             }
-            Row::new(cells)
+            let rendered = Row::new(cells);
+            if row.is_total {
+                rendered.style(
+                    Style::default()
+                        .fg(theme.palette().title)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                rendered
+            }
         })
         .collect::<Vec<_>>();
     let mut headers = vec!["MODEL"];
@@ -19210,8 +19553,13 @@ fn merge_remote_live_into_snapshot_at(
     history: &RemoteOverviewHistory,
     now: DateTime<Utc>,
 ) -> HashSet<(String, String)> {
+    // A manual/automatic remote sync can finish after the local rollout
+    // snapshot was captured. Project through the merge time so a newly
+    // persisted remote bucket is visible immediately instead of waiting for
+    // the next local refresh solely to advance `snapshot.as_of`.
+    let projection_as_of = snapshot.as_of.max(now);
     let projection =
-        project_remote_overview_history(history, &snapshot.window_analyses, snapshot.as_of);
+        project_remote_overview_history(history, &snapshot.window_analyses, projection_as_of);
     let trusted_parent_edges = projection
         .tasks
         .iter()
@@ -19572,20 +19920,33 @@ fn apply_remote_window_projection_mode(
         .map(|usage| usage.usage.token_usage.total_tokens)
         .fold(0_u64, u64::saturating_add);
     let mut combined = TokenUsage::default();
+    let mut merged_thread_api_cost = ApiCostAmount::default();
     for usage in &analysis.threads {
         combined.add_assign(usage.usage.token_usage);
+        merged_thread_api_cost.add_assign(usage.usage.api_equivalent_cost);
     }
     let live_tail_residual = combined
         .delta_from(remote.model_token_usage)
         .filter(|residual| !residual.is_zero());
-    let (window_tokens, model_thread_inconsistent) =
-        if remote.model_token_usage.delta_from(combined).is_some() {
-            (remote.model_token_usage, false)
-        } else if combined.delta_from(remote.model_token_usage).is_some() {
-            (combined, false)
-        } else {
-            (combined, true)
-        };
+    let has_live_tail = live_tail_residual.is_some()
+        || combined.total_tokens > remote.model_token_usage.total_tokens;
+    let model_dominates_threads = remote.model_token_usage.delta_from(combined).is_some();
+    let threads_dominate_model = combined.delta_from(remote.model_token_usage).is_some();
+    let model_thread_inconsistent = !model_dominates_threads && !threads_dominate_model;
+    let window_tokens = if model_dominates_threads {
+        remote.model_token_usage
+    } else if threads_dominate_model {
+        combined
+    } else if remote.model_token_usage.total_tokens >= combined.total_tokens {
+        // Token sub-counters can cross when the unified model history and the
+        // thread/project projection have different coverage. The all-source
+        // model total is the stronger lower bound when its total is larger;
+        // retain it and report the incompatible breakdown instead of silently
+        // falling back to a smaller thread total.
+        remote.model_token_usage
+    } else {
+        combined
+    };
     let total_tokens = window_tokens.total_tokens;
     for usage in &mut analysis.threads {
         usage.usage.local_token_share_percent = if total_tokens == 0 {
@@ -19622,29 +19983,65 @@ fn apply_remote_window_projection_mode(
             api_long_context,
             &mut model_reasons,
         );
-        if let Some(api_equivalent_cost) = remote.api_equivalent_cost.as_ref() {
-            analysis.api_equivalent_cost = api_equivalent_cost.clone();
-            if let Some(residual) = live_tail_residual {
-                analysis.api_equivalent_cost.amount.observed_tokens = analysis
+        analysis.partial_reasons.extend(model_reasons);
+    }
+    // The all-source API total is independently useful even when an older or
+    // partial history generation cannot provide a model breakdown. Do not
+    // gate the authoritative total on `remote.models` being available.
+    if let Some(api_equivalent_cost) = remote.api_equivalent_cost.as_ref() {
+        analysis.api_equivalent_cost = api_equivalent_cost.clone();
+        let remote_api_cost = analysis.api_equivalent_cost.amount;
+        if let Some(residual) = merged_thread_api_cost.checked_delta_from(remote_api_cost) {
+            if !residual.is_zero() {
+                // The unified history can lag the live local rollout tail.
+                // Thread rows are already source-deduplicated above, so a
+                // monotonic aggregate is authoritative for the window total.
+                // Its model attribution is intentionally left partial: the
+                // historical model aggregate does not expose enough source
+                // detail to assign this delta safely.
+                analysis.api_equivalent_cost.amount = merged_thread_api_cost;
+                analysis
                     .api_equivalent_cost
-                    .amount
-                    .observed_tokens
-                    .saturating_add(residual.total_tokens);
+                    .partial_reasons
+                    .push("remote_live_tail_model_api_breakdown_partial".to_owned());
+            } else if has_live_tail {
+                // The token view has moved past the persisted history, but the
+                // thread records do not contain a complete billable cost delta
+                // for that tail.
                 analysis
                     .api_equivalent_cost
                     .partial_reasons
                     .push("remote_live_tail_api_cost_partial".to_owned());
             }
-            if model_thread_inconsistent {
-                analysis
-                    .api_equivalent_cost
-                    .partial_reasons
-                    .push("remote_model_thread_totals_inconsistent".to_owned());
-            }
-            analysis.api_equivalent_cost.partial_reasons.sort();
-            analysis.api_equivalent_cost.partial_reasons.dedup();
+        } else if remote_api_cost
+            .checked_delta_from(merged_thread_api_cost)
+            .is_none()
+        {
+            // Neither view dominates component-wise. Preserve every known
+            // lower bound without pretending the overlapping aggregates can
+            // be added together.
+            analysis.api_equivalent_cost.amount =
+                remote_api_cost.componentwise_max(merged_thread_api_cost);
+            analysis
+                .api_equivalent_cost
+                .partial_reasons
+                .push("remote_thread_api_totals_inconsistent".to_owned());
+        } else if has_live_tail {
+            // Tokens can be newer than the persisted history even when no
+            // complete API-cost delta is available for the live tail.
+            analysis
+                .api_equivalent_cost
+                .partial_reasons
+                .push("remote_live_tail_api_cost_partial".to_owned());
         }
-        analysis.partial_reasons.extend(model_reasons);
+        if model_thread_inconsistent {
+            analysis
+                .api_equivalent_cost
+                .partial_reasons
+                .push("remote_model_thread_totals_inconsistent".to_owned());
+        }
+        analysis.api_equivalent_cost.partial_reasons.sort();
+        analysis.api_equivalent_cost.partial_reasons.dedup();
     }
     analysis.partial_reasons.extend(
         remote

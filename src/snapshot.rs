@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::api_cost::pricing_metadata;
-use crate::app_server::fetch_account_snapshot_as_of;
+use crate::app_server::{app_server_failure_kind, fetch_account_snapshot_as_of};
 use crate::attribution::{analyze_windows, project_five_hour_analysis};
 use crate::config::CollectConfig;
 use crate::domain::{
@@ -475,7 +475,8 @@ fn collect_snapshot_with_local(
             }
             Err(error) => {
                 account_status = "error";
-                let warning = format!("app-server refresh failed: {error:#}");
+                let failure_kind = app_server_failure_kind(&error).label();
+                let warning = format!("app-server refresh failed [{failure_kind}]: {error:#}");
                 if !account.warnings.contains(&warning) {
                     account.warnings.push(warning);
                 }
@@ -488,7 +489,7 @@ fn collect_snapshot_with_local(
                         "stale".to_string()
                     },
                     as_of: now,
-                    message: Some(error.to_string()),
+                    message: Some(format!("[{failure_kind}] {error}")),
                 });
             }
         }

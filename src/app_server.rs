@@ -108,6 +108,52 @@ impl std::fmt::Display for AppServerReaderDisconnected {
 
 impl std::error::Error for AppServerReaderDisconnected {}
 
+#[derive(Debug)]
+struct AppServerDeadlineOverflow;
+
+impl std::fmt::Display for AppServerDeadlineOverflow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("app-server timeout exceeds the platform's supported range")
+    }
+}
+
+impl std::error::Error for AppServerDeadlineOverflow {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppServerFailureKind {
+    Timeout,
+    ExecutableUnavailable,
+    Disconnected,
+    Other,
+}
+
+impl AppServerFailureKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ExecutableUnavailable => "executable_unavailable",
+            Self::Disconnected => "disconnected",
+            Self::Other => "other",
+        }
+    }
+}
+
+pub(crate) fn app_server_failure_kind(error: &anyhow::Error) -> AppServerFailureKind {
+    if error.is::<AppServerResponseTimeout>() {
+        AppServerFailureKind::Timeout
+    } else if error.is::<AppServerReaderDisconnected>() {
+        AppServerFailureKind::Disconnected
+    } else if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+    }) {
+        AppServerFailureKind::ExecutableUnavailable
+    } else {
+        AppServerFailureKind::Other
+    }
+}
+
 fn app_server_trace_outcome(error: &anyhow::Error) -> TraceOutcome {
     if error.is::<AppServerResponseTimeout>() {
         TraceOutcome::Timeout
@@ -117,13 +163,21 @@ fn app_server_trace_outcome(error: &anyhow::Error) -> TraceOutcome {
 }
 
 fn app_server_trace_error_kind(error: &anyhow::Error, fallback: &'static str) -> &'static str {
-    if error.is::<AppServerResponseTimeout>() {
-        "timeout"
-    } else if error.is::<AppServerReaderDisconnected>() {
-        "disconnected"
-    } else {
-        fallback
+    if error.is::<AppServerDeadlineOverflow>() {
+        return "deadline";
     }
+    match app_server_failure_kind(error) {
+        AppServerFailureKind::Timeout => "timeout",
+        AppServerFailureKind::ExecutableUnavailable => "executable_unavailable",
+        AppServerFailureKind::Disconnected => "disconnected",
+        AppServerFailureKind::Other => fallback,
+    }
+}
+
+fn app_server_rpc_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::Error::new(AppServerDeadlineOverflow))
 }
 
 impl ProtocolWarnings {
@@ -515,13 +569,14 @@ fn fetch_account_snapshot_inner(
             child
         }
         Err(error) => {
+            let error_kind = app_server_failure_kind(&error).label();
             process_trace.finish_with(TraceOutcome::Error, || {
-                TraceFields::new().label("errorKind", "spawn")
+                TraceFields::new().label("errorKind", error_kind)
             });
-            spawn_span.finish("status=error kind=spawn");
-            total_span.finish("status=error kind=spawn");
+            spawn_span.finish(format!("status=error kind={error_kind}"));
+            total_span.finish(format!("status=error kind={error_kind}"));
             operation_trace.finish_with(TraceOutcome::Error, || {
-                TraceFields::new().label("errorKind", "spawn")
+                TraceFields::new().label("errorKind", error_kind)
             });
             return Err(error);
         }
@@ -583,13 +638,9 @@ fn fetch_account_snapshot_inner(
             .take()
             .context("codex app-server did not expose stderr")
             .map_err(|error| ("stderr_pipe", error))?;
-        let deadline = Instant::now()
-            .checked_add(config.app_server_timeout)
-            .context("app-server timeout exceeds the platform's supported range")
-            .map_err(|error| ("deadline", error))?;
-        Ok((stdin, stdout, stderr, deadline))
+        Ok((stdin, stdout, stderr))
     })();
-    let (stdin, stdout, stderr, deadline) = match io_setup {
+    let (stdin, stdout, stderr) = match io_setup {
         Ok(setup) => {
             io_span.finish_with(|| {
                 format!(
@@ -636,7 +687,10 @@ fn fetch_account_snapshot_inner(
     let result = (|| {
         let initialize_span = config.startup_trace.span("app_server.initialize");
         let initialize_trace = config.trace_log.span_with("app_server.rpc.initialize", || {
-            TraceFields::new().duration_ms("timeoutMs", config.app_server_timeout)
+            TraceFields::new()
+                .label("rpcMethod", "initialize")
+                .label("deadlineScope", "rpc")
+                .duration_ms("timeoutMs", config.app_server_timeout)
         });
         let initialize_result = (|| -> Result<()> {
             write_message(
@@ -655,6 +709,8 @@ fn fetch_account_snapshot_inner(
                 }),
             )
             .context("failed to initialize codex app-server")?;
+
+            let deadline = app_server_rpc_deadline(config.app_server_timeout)?;
 
             match wait_for_response(
                 INITIALIZE_ID,
@@ -686,6 +742,8 @@ fn fetch_account_snapshot_inner(
             .span_with("app_server.rpc.account_reads", || {
                 TraceFields::new()
                     .usize("requestCount", 1)
+                    .label("rpcMethod", "account/rateLimits/read")
+                    .label("deadlineScope", "rpc")
                     .duration_ms("timeoutMs", config.app_server_timeout)
             });
         let request_result = (|| -> Result<()> {
@@ -703,6 +761,8 @@ fn fetch_account_snapshot_inner(
             });
             return Err(error);
         }
+
+        let deadline = app_server_rpc_deadline(config.app_server_timeout)?;
 
         let rate_limits;
         let rate_limits_rpc_category;
@@ -1968,12 +2028,17 @@ mod diagnostic_tests {
         assert!(!contents.contains(&missing.to_string_lossy().into_owned()));
         assert!(!contents.contains("\"outcome\":\"abandoned\""));
         let events = read_trace_events(&trace_path);
-        assert_trace_finish(&events, "app_server.process.spawn", "error", Some("spawn"));
+        assert_trace_finish(
+            &events,
+            "app_server.process.spawn",
+            "error",
+            Some("executable_unavailable"),
+        );
         assert_trace_finish(
             &events,
             "app_server.account_snapshot",
             "error",
-            Some("spawn"),
+            Some("executable_unavailable"),
         );
     }
 
@@ -2025,7 +2090,7 @@ mod diagnostic_tests {
         let events = read_trace_events(&trace_path);
         assert_trace_finish(
             &events,
-            "app_server.process.io_setup",
+            "app_server.rpc.initialize",
             "error",
             Some("deadline"),
         );
@@ -2114,6 +2179,45 @@ mod diagnostic_tests {
             Some("timeout"),
         );
         assert_trace_finish(&events, "app_server.process.shutdown", "ok", None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_and_rate_limit_reads_receive_independent_rpc_deadlines() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_codex = temp.path().join("private-two-phase-codex");
+        fs::write(
+            &fake_codex,
+            br#"#!/bin/sh
+IFS= read -r initialize || exit 1
+sleep 0.25
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r initialized || exit 2
+IFS= read -r limits || exit 3
+sleep 0.25
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null}}}'
+IFS= read -r usage || exit 4
+printf '%s\n' '{"id":3,"result":{"summary":{},"dailyUsageBuckets":[]}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = CollectConfig {
+            codex_bin: Some(fake_codex),
+            app_server_timeout: Duration::from_millis(400),
+            ..CollectConfig::default()
+        };
+
+        let started = Instant::now();
+        let snapshot = fetch_account_snapshot(&config).unwrap();
+
+        assert_eq!(snapshot.limits.len(), 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "the fixture must exceed one shared 400ms deadline"
+        );
     }
 
     #[cfg(unix)]

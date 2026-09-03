@@ -20,7 +20,7 @@ rows:
 13|│▏high/gpt-5.3-code Add determini D 0       -       $0.0000│
 14|│ medium/gpt-… FAST Inspect the e D 0       -       $0.0000│
 15|└──────────────────────────────────────────────────────────┘
-16|┌ Models · 5h · top 0/1────────────────────────────────────┐
+16|┌ Models · 5h──────────────────────────────────────────────┐
 17|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to │
 18|│07-12 06:30                                               │
 19|│Tokens 10.0K · EST ~37.50pp · codex gauge × credit-rate   │
@@ -140,8 +140,8 @@ styles:
 15:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└──────────────────────────────────────────────────────────┘"
 16:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
 16:001+007 fg=#17202a bg=#f7f9fc mods=bold text=" Models"
-16:008+015 fg=#5f6b7a bg=#f7f9fc mods=none text=" · 5h · top 0/1"
-16:023+037 fg=#7d8998 bg=#f7f9fc mods=none text="────────────────────────────────────┐"
+16:008+005 fg=#5f6b7a bg=#f7f9fc mods=none text=" · 5h"
+16:013+047 fg=#7d8998 bg=#f7f9fc mods=none text="──────────────────────────────────────────────┐"
 17:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 17:001+058 fg=#5f6b7a bg=#f7f9fc mods=none text="Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to "
 17:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
