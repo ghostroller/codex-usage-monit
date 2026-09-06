@@ -8,19 +8,17 @@
 //! raw error text.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::replace_file;
+#[cfg(test)]
+use crate::private_state_store::stable_lock_share_mode;
+use crate::private_state_store::{LockFilePolicy, LockMode, PrivateStoreLayout};
 use crate::remote_sync::{MIN_REMOTE_SYNC_RESPONSE_BYTES, RemoteSyncReport};
 use crate::source_identity::NodeId;
-#[cfg(windows)]
-use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
 
 pub const REMOTE_BANDWIDTH_BUDGET_SCHEMA_VERSION: u32 = 1;
 pub const REMOTE_BANDWIDTH_WINDOW_HOURS: i64 = 24;
@@ -49,19 +47,38 @@ const MAX_HOST_ID_BYTES: usize = 64;
 const MAX_BYTES_PER_ENTRY: u64 = 512 * 1024 * 1024;
 const ENTRY_ID_BYTES: usize = 16;
 const ENTRY_ID_HEX_BYTES: usize = ENTRY_ID_BYTES * 2;
-const TEMP_FILE_ATTEMPTS: usize = 128;
+const ENTRY_ID_ATTEMPTS: usize = 128;
 
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const PRIVATE_STORE: PrivateStoreLayout = PrivateStoreLayout {
+    store_name: "remote bandwidth",
+    data_file_name: BUDGET_FILE,
+    data_path_name: "remote bandwidth ledger",
+    data_subject: "remote bandwidth ledger file",
+    lock_file_name: BUDGET_LOCK_FILE,
+    lock_subject: "remote bandwidth ledger lock",
+    temporary_subject: "remote bandwidth ledger temporary file",
+    maximum_file_bytes: MAX_BUDGET_FILE_BYTES,
+};
 
 /// Returns the estimated on-wire byte cost of one completed sync run.
 ///
-/// Every committed page represents one SSH exchange. A zero-page result still
-/// consumed one response (for example `BootstrapRestarted`), so it receives
-/// one fixed conservative exchange charge. This estimate deliberately does
-/// not claim to be an exact interface byte counter.
+/// `RemoteSyncReport::exchanges` counts every validated SSH response, including
+/// a terminal cursor-expired response after earlier pages were committed. This
+/// estimate deliberately does not claim to be an exact interface byte counter.
 pub fn estimated_remote_sync_network_bytes(report: &RemoteSyncReport) -> io::Result<usize> {
-    let exchanges = report.pages_committed.max(1);
-    let overhead = exchanges
+    let completion_requires_exchange = matches!(
+        report.completion,
+        crate::remote_sync::RemoteSyncCompletion::BootstrapRestarted(_)
+    );
+    if report.exchanges < report.pages_committed
+        || ((report.response_bytes > 0 || completion_requires_exchange) && report.exchanges == 0)
+    {
+        return Err(invalid_input(
+            "remote sync report has an invalid SSH exchange count",
+        ));
+    }
+    let overhead = report
+        .exchanges
         .checked_mul(REMOTE_BANDWIDTH_ESTIMATED_SSH_EXCHANGE_OVERHEAD_BYTES)
         .ok_or_else(|| invalid_input("remote bandwidth SSH overhead overflows usize"))?;
     report
@@ -1007,39 +1024,17 @@ impl RemoteBandwidthBudgetStore {
     }
 
     fn read_ledger_snapshot(&self) -> io::Result<StoredRemoteBandwidthLedger> {
-        if !self.state_root.is_absolute() {
-            return Err(invalid_input(
-                "remote bandwidth state root must be absolute",
-            ));
-        }
-        match validate_state_root(&self.state_root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(StoredRemoteBandwidthLedger::default());
-            }
-            Err(error) => return Err(error),
-        }
         let directory = self.budget_directory();
-        match validate_private_directory(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(StoredRemoteBandwidthLedger::default());
-            }
-            Err(error) => return Err(error),
+        if !PRIVATE_STORE.directory_exists_beneath(&self.state_root, &directory)? {
+            return Ok(StoredRemoteBandwidthLedger::default());
         }
         let path = self.budget_path();
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                validate_private_file_metadata(&metadata, "remote bandwidth ledger file")?
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(StoredRemoteBandwidthLedger::default());
-            }
-            Err(error) => return Err(error),
+        if !PRIVATE_STORE.data_file_exists(&path)? {
+            return Ok(StoredRemoteBandwidthLedger::default());
         }
-        let _lock = open_existing_shared_lock_file(&directory)?;
-        let contents =
-            read_private_bounded(&path, MAX_BUDGET_FILE_BYTES, "remote bandwidth ledger file")?;
+        let _lock =
+            PRIVATE_STORE.open_lock(&directory, LockMode::Shared, LockFilePolicy::Existing)?;
+        let contents = PRIVATE_STORE.read_bounded(&path)?;
         deserialize_ledger(&contents)
     }
 
@@ -1056,8 +1051,9 @@ impl RemoteBandwidthBudgetStore {
         operation: impl FnOnce(&mut StoredRemoteBandwidthLedger) -> io::Result<R>,
     ) -> io::Result<R> {
         let directory = self.budget_directory();
-        create_private_directory_beneath(&self.state_root, &directory)?;
-        let _lock = open_locked_lock_file(&directory)?;
+        PRIVATE_STORE.create_directory_beneath(&self.state_root, &directory)?;
+        let _lock =
+            PRIVATE_STORE.open_lock(&directory, LockMode::Exclusive, LockFilePolicy::Create)?;
         let mut ledger = read_optional_ledger(&self.budget_path())?;
         let result = operation(&mut ledger)?;
         ledger.validate()?;
@@ -1166,7 +1162,7 @@ fn utc_minute_key(value: DateTime<Utc>) -> i64 {
 }
 
 fn allocate_entry_id(entries: &[LedgerEntry]) -> io::Result<String> {
-    for _ in 0..TEMP_FILE_ATTEMPTS {
+    for _ in 0..ENTRY_ID_ATTEMPTS {
         let mut random = [0_u8; ENTRY_ID_BYTES];
         getrandom::fill(&mut random)
             .map_err(|error| io::Error::other(format!("could not generate ledger ID: {error}")))?;
@@ -1280,480 +1276,16 @@ fn deserialize_ledger(contents: &[u8]) -> io::Result<StoredRemoteBandwidthLedger
 }
 
 fn read_optional_ledger(path: &Path) -> io::Result<StoredRemoteBandwidthLedger> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(StoredRemoteBandwidthLedger::default());
-        }
-        Err(error) => return Err(error),
+    if !PRIVATE_STORE.data_path_exists(path)? {
+        return Ok(StoredRemoteBandwidthLedger::default());
     }
-    let contents =
-        read_private_bounded(path, MAX_BUDGET_FILE_BYTES, "remote bandwidth ledger file")?;
+    let contents = PRIVATE_STORE.read_bounded(path)?;
     deserialize_ledger(&contents)
 }
 
 fn write_ledger_atomically(path: &Path, ledger: &StoredRemoteBandwidthLedger) -> io::Result<()> {
     let contents = serialize_ledger(ledger)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_input("remote bandwidth ledger path has no parent"))?;
-    validate_private_directory(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_file_metadata(&metadata, "remote bandwidth ledger file")?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let (temporary_path, mut temporary) = create_temporary_file(parent, BUDGET_FILE)?;
-    let result = (|| {
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        replace_file(&temporary_path, path)?;
-        validate_published_private_file(path, "remote bandwidth ledger file")?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
-}
-
-fn read_private_bounded(path: &Path, maximum: u64, subject: &str) -> io::Result<Vec<u8>> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_private_file_metadata(&path_metadata, subject)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let mut file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    let metadata = file.metadata()?;
-    validate_private_file_metadata(&metadata, subject)?;
-    ensure_private_file(path, &file, &metadata, subject)?;
-    ensure_opened_file_matches_path(path, &file, &path_metadata, &metadata, subject)?;
-    if metadata.len() > maximum {
-        return Err(invalid_data(format!("{subject} is too large")));
-    }
-    let mut contents = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(maximum + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() as u64 > maximum {
-        return Err(invalid_data(format!("{subject} is too large")));
-    }
-    Ok(contents)
-}
-
-fn open_locked_lock_file(directory: &Path) -> io::Result<File> {
-    validate_private_directory(directory)?;
-    let path = directory.join(BUDGET_LOCK_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => validate_private_file_metadata(&metadata, "remote bandwidth ledger lock")?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    add_nofollow_flags(&mut options);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(stable_lock_share_mode());
-    }
-    let file = options
-        .open(&path)
-        .map_err(|error| map_nofollow_error(error, "remote bandwidth ledger lock"))?;
-    validate_opened_private_file(&path, &file, "remote bandwidth ledger lock")?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    validate_private_directory(directory)?;
-    validate_opened_private_file(&path, &file, "remote bandwidth ledger lock")?;
-    Ok(file)
-}
-
-fn open_existing_shared_lock_file(directory: &Path) -> io::Result<File> {
-    validate_private_directory(directory)?;
-    let path = directory.join(BUDGET_LOCK_FILE);
-    let metadata = fs::symlink_metadata(&path)?;
-    validate_private_file_metadata(&metadata, "remote bandwidth ledger lock")?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(stable_lock_share_mode());
-    }
-    let file = options
-        .open(&path)
-        .map_err(|error| map_nofollow_error(error, "remote bandwidth ledger lock"))?;
-    validate_opened_private_file(&path, &file, "remote bandwidth ledger lock")?;
-    fs2::FileExt::lock_shared(&file)?;
-    validate_private_directory(directory)?;
-    validate_opened_private_file(&path, &file, "remote bandwidth ledger lock")?;
-    Ok(file)
-}
-
-fn validate_opened_private_file(path: &Path, file: &File, subject: &str) -> io::Result<()> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_private_file_metadata(&path_metadata, subject)?;
-    let opened_metadata = file.metadata()?;
-    validate_private_file_metadata(&opened_metadata, subject)?;
-    ensure_private_file(path, file, &opened_metadata, subject)?;
-    ensure_opened_file_matches_path(path, file, &path_metadata, &opened_metadata, subject)
-}
-
-fn create_temporary_file(parent: &Path, file_name: &str) -> io::Result<(PathBuf, File)> {
-    for _ in 0..TEMP_FILE_ATTEMPTS {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        add_nofollow_flags(&mut options);
-        match options.open(&path) {
-            Ok(file) => {
-                validate_opened_private_file(
-                    &path,
-                    &file,
-                    "remote bandwidth ledger temporary file",
-                )?;
-                return Ok((path, file));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a remote bandwidth temporary file",
-    ))
-}
-
-fn validate_published_private_file(path: &Path, subject: &str) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    validate_opened_private_file(path, &file, subject)
-}
-
-fn create_private_directory_beneath(root: &Path, path: &Path) -> io::Result<()> {
-    if !root.is_absolute() {
-        return Err(invalid_input(
-            "remote bandwidth state root must be absolute",
-        ));
-    }
-    match validate_state_root(root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => create_state_root(root)?,
-        Err(error) => return Err(error),
-    }
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| invalid_input("remote bandwidth path is outside its state root"))?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(invalid_input(
-                "remote bandwidth path contains a non-normal component",
-            ));
-        };
-        current.push(name);
-        match validate_private_directory(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_private_child_directory(&current)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    validate_private_directory(path)
-}
-
-fn create_state_root(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir_all(path)?;
-    validate_state_root(path)
-}
-
-fn create_private_child_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    #[cfg(not(unix))]
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    validate_private_directory(path)
-}
-
-fn validate_state_root(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
-        return Err(invalid_data(
-            "remote bandwidth state root must be a real directory",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // SAFETY: geteuid has no preconditions and retains no pointers.
-        let effective_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != effective_uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote bandwidth state root must be owned by the current user",
-            ));
-        }
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("remote bandwidth state root must have mode 0700 (found {mode:04o})"),
-            ));
-        }
-    }
-    #[cfg(windows)]
-    validate_windows_private_directory(path, "remote bandwidth state root")?;
-    Ok(())
-}
-
-fn validate_private_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata_is_link_or_reparse(&metadata) {
-        return Err(invalid_data(
-            "remote bandwidth directory must not be a symbolic link or reparse point",
-        ));
-    }
-    if !metadata.file_type().is_dir() {
-        return Err(invalid_data("remote bandwidth path must be a directory"));
-    }
-    ensure_private_path(&metadata, "remote bandwidth directory")?;
-    #[cfg(windows)]
-    validate_windows_private_directory(path, "remote bandwidth directory")?;
-    Ok(())
-}
-
-fn validate_private_file_metadata(metadata: &fs::Metadata, subject: &str) -> io::Result<()> {
-    if metadata_is_link_or_reparse(metadata) {
-        return Err(invalid_data(format!(
-            "{subject} must not be a symbolic link or reparse point"
-        )));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(invalid_data(format!("{subject} must be a regular file")));
-    }
-    ensure_private_path(metadata, subject)
-}
-
-#[cfg(unix)]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(unix)]
-fn ensure_private_path(metadata: &fs::Metadata, subject: &str) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    // SAFETY: geteuid has no preconditions and retains no pointers.
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{subject} must be owned by the current user"),
-        ));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{subject} must not be accessible by group or other users"),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_private_path(_metadata: &fs::Metadata, _subject: &str) -> io::Result<()> {
-    Ok(())
-}
-
-fn ensure_private_file(
-    path: &Path,
-    file: &File,
-    _metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    #[cfg(windows)]
-    validate_windows_private_file(path, file, subject)?;
-    #[cfg(not(windows))]
-    let _ = (path, file, subject);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_opened_file_matches_path(
-    _path: &Path,
-    _opened_file: &File,
-    path_metadata: &fs::Metadata,
-    opened_metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
-    {
-        Ok(())
-    } else {
-        Err(invalid_data(format!(
-            "{subject} changed while it was being opened"
-        )))
-    }
-}
-
-#[cfg(windows)]
-fn ensure_opened_file_matches_path(
-    path: &Path,
-    opened_file: &File,
-    _path_metadata: &fs::Metadata,
-    _opened_metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let current = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    if windows_file_identity(&current)? == windows_file_identity(opened_file)? {
-        Ok(())
-    } else {
-        Err(invalid_data(format!(
-            "{subject} changed while it was being opened"
-        )))
-    }
-}
-
-#[cfg(windows)]
-fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: the live handle and output pointer are valid for this call.
-    let success =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
-    if success == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the API reported that it initialized the output structure.
-    let information = unsafe { information.assume_init() };
-    Ok((
-        information.dwVolumeSerialNumber,
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_opened_file_matches_path(
-    _path: &Path,
-    _opened_file: &File,
-    _path_metadata: &fs::Metadata,
-    _opened_metadata: &fs::Metadata,
-    _subject: &str,
-) -> io::Result<()> {
-    Ok(())
-}
-
-fn add_nofollow_flags(options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-}
-
-#[cfg(any(windows, test))]
-fn stable_lock_share_mode() -> u32 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        FILE_SHARE_READ | FILE_SHARE_WRITE
-    }
-    #[cfg(not(windows))]
-    {
-        0x0000_0001 | 0x0000_0002
-    }
-}
-
-fn map_nofollow_error(error: io::Error, subject: &str) -> io::Error {
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        return invalid_data(format!("{subject} must not be a symbolic link"));
-    }
-    #[cfg(not(unix))]
-    let _ = subject;
-    error
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
+    PRIVATE_STORE.write_atomically(path, &contents)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -1767,6 +1299,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::str::FromStr;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1908,6 +1441,7 @@ mod tests {
                 &reservation,
                 now,
                 &RemoteSyncReport {
+                    exchanges,
                     pages_committed: exchanges,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -2008,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn report_network_estimate_charges_one_four_and_zero_page_exchanges() {
+    fn report_network_estimate_charges_actual_exchanges_including_cursor_expiry() {
         assert_eq!(REMOTE_BANDWIDTH_ESTIMATED_BYTES_PER_SSH_HOP, 100 * 1024);
         assert_eq!(REMOTE_BANDWIDTH_UNKNOWN_EFFECTIVE_HOPS, 3);
         assert_eq!(
@@ -2016,6 +1550,7 @@ mod tests {
             300 * 1024
         );
         let one_page = RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 1,
             changes_committed: 0,
             live_state_changed: false,
@@ -2027,6 +1562,7 @@ mod tests {
             1_000 + 300 * 1024
         );
         let four_pages = RemoteSyncReport {
+            exchanges: 4,
             pages_committed: 4,
             changes_committed: 0,
             live_state_changed: false,
@@ -2038,6 +1574,7 @@ mod tests {
             2_000 + 4 * 300 * 1024
         );
         let restarted_without_a_committed_page = RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 0,
             changes_committed: 0,
             live_state_changed: false,
@@ -2052,11 +1589,44 @@ mod tests {
             estimated_remote_sync_network_bytes(&restarted_without_a_committed_page).unwrap(),
             300 * 1024
         );
+
+        let restarted_after_one_committed_page = RemoteSyncReport {
+            exchanges: 2,
+            pages_committed: 1,
+            changes_committed: 1,
+            live_state_changed: false,
+            response_bytes: 1_500,
+            completion: RemoteSyncCompletion::BootstrapRestarted(RemoteDeltaNextRequestPosition {
+                delta_cursor: None,
+                exact_range: None,
+                known_live_revision: None,
+            }),
+        };
+        assert_eq!(
+            estimated_remote_sync_network_bytes(&restarted_after_one_committed_page).unwrap(),
+            1_500 + 2 * 300 * 1024
+        );
     }
 
     #[test]
     fn report_network_estimate_and_settlement_fail_closed_at_numeric_and_entry_bounds() {
+        let missing_exchange = RemoteSyncReport {
+            exchanges: 0,
+            pages_committed: 1,
+            changes_committed: 0,
+            live_state_changed: false,
+            response_bytes: 1,
+            completion: RemoteSyncCompletion::Complete,
+        };
+        assert_eq!(
+            estimated_remote_sync_network_bytes(&missing_exchange)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
         let response_overflow = RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 1,
             changes_committed: 0,
             live_state_changed: false,
@@ -2070,6 +1640,7 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         let overhead_overflow = RemoteSyncReport {
+            exchanges: usize::MAX,
             pages_committed: usize::MAX,
             changes_committed: 0,
             live_state_changed: false,
@@ -2104,6 +1675,7 @@ mod tests {
                 &exact_reservation,
                 exact_at,
                 &RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -2132,6 +1704,7 @@ mod tests {
                 &excessive_reservation,
                 exact_at,
                 &RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -2177,6 +1750,7 @@ mod tests {
                     &reservation,
                     now,
                     &RemoteSyncReport {
+                        exchanges: if pages == 0 { 1 } else { pages },
                         pages_committed: pages,
                         changes_committed: 0,
                         live_state_changed: false,
@@ -2869,7 +2443,9 @@ mod tests {
     fn future_schema_and_oversized_input_fail_closed() {
         let directory = tempdir().unwrap();
         let store = test_store(&directory);
-        create_private_directory_beneath(store.state_root(), &store.budget_directory()).unwrap();
+        PRIVATE_STORE
+            .create_directory_beneath(store.state_root(), &store.budget_directory())
+            .unwrap();
         let future = serde_json::json!({
             "schemaVersion": REMOTE_BANDWIDTH_BUDGET_SCHEMA_VERSION + 1,
             "entries": []

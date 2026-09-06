@@ -418,9 +418,8 @@ impl RemotesConfig {
         let mut referenced_node_ids = HashSet::with_capacity(self.hosts.len());
         let mut referenced_sources = Vec::with_capacity(self.hosts.len());
         for host in &self.hosts {
-            validate_host_id(&host.id)?;
-            validate_ssh_host(&host.ssh_host)?;
-            validate_agent_executable(&host.agent_executable)?;
+            validate_remote_host_input(&host.id, &host.ssh_host, &host.agent_executable)
+                .map_err(invalid_config)?;
             if !host_ids.insert(host.id.as_str()) {
                 return Err(invalid_config(format!(
                     "duplicate remote host id {:?}",
@@ -725,6 +724,17 @@ pub(crate) enum TryCurrentHost<R> {
     Changed,
 }
 
+/// Result of a nonblocking read of the remote allowlist.
+///
+/// `Busy` is deliberately distinct from an I/O error: callers on latency-
+/// sensitive paths can retain their last validated snapshot and retry after
+/// the concurrent writer publishes its atomic replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TryLoadRemotesConfig {
+    Loaded(RemotesConfig),
+    Busy,
+}
+
 impl Default for RemotesConfigStore {
     fn default() -> Self {
         Self::discover()
@@ -757,6 +767,43 @@ impl RemotesConfigStore {
         let parent = config_parent(path);
         let _lock = open_locked_lock_file(parent, LockMode::Shared)?;
         read_config(path)
+    }
+
+    /// Reads the allowlist without waiting for a concurrent writer.
+    ///
+    /// This never creates or replaces the config itself. The stable lock
+    /// sidecar can still be initialized when its already-private parent
+    /// exists, because reading a config without joining the same lock domain
+    /// would permit a torn view across an atomic replacement.
+    pub(crate) fn try_load(&self) -> io::Result<TryLoadRemotesConfig> {
+        let path = self.required_path()?;
+        let parent = config_parent(path);
+        let Some(_lock) = try_open_locked_lock_file(parent, LockMode::Shared)? else {
+            return Ok(TryLoadRemotesConfig::Busy);
+        };
+        read_config(path).map(TryLoadRemotesConfig::Loaded)
+    }
+
+    /// Nonblocking counterpart to [`Self::load_or_create`].
+    ///
+    /// Existing configs use a shared lock. A missing config is published only
+    /// after a nonblocking upgrade to the exclusive lock, so first-run TUI
+    /// rendering never waits behind another creator and cannot overwrite its
+    /// result.
+    pub(crate) fn try_load_or_create(&self) -> io::Result<TryLoadRemotesConfig> {
+        match self.try_load() {
+            Ok(loaded) => return Ok(loaded),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let path = self.required_path()?;
+        let parent = config_parent(path);
+        create_private_directory(parent)?;
+        let Some(_lock) = try_open_locked_lock_file(parent, LockMode::Exclusive)? else {
+            return Ok(TryLoadRemotesConfig::Busy);
+        };
+        load_or_create_locked(path).map(TryLoadRemotesConfig::Loaded)
     }
 
     /// Runs one short local mutation only while an exact host snapshot remains
@@ -956,6 +1003,12 @@ impl RemotesConfigStore {
             .store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn lock_exclusive_for_test(&self) -> io::Result<File> {
+        let path = self.required_path()?;
+        open_locked_lock_file(config_parent(path), LockMode::Exclusive)
+    }
+
     /// Pins a probe result only if the exact host entry that was probed is
     /// still current. The revision and host comparison happen while holding
     /// the same exclusive lock as the write, so even a non-cooperating writer
@@ -1125,11 +1178,23 @@ fn validate_intervals(active: u64, idle: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_host_id(id: &str) -> io::Result<()> {
+/// Validates the three user-authored connection fields shared by config
+/// deserialization, CLI mutations, and the TUI editor. Keeping these rules at
+/// the allowlist boundary prevents an editor-only preflight from drifting
+/// away from the values the durable store will accept.
+pub(crate) fn validate_remote_host_input(
+    id: &str,
+    ssh_host: &str,
+    agent_executable: &str,
+) -> Result<(), String> {
+    validate_host_id(id)?;
+    validate_ssh_host(ssh_host)?;
+    validate_agent_executable(agent_executable)
+}
+
+fn validate_host_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > MAX_HOST_ID_BYTES {
-        return Err(invalid_config(format!(
-            "host id must contain between 1 and {MAX_HOST_ID_BYTES} bytes"
-        )));
+        return Err(format!("Host ID must contain 1-{MAX_HOST_ID_BYTES} bytes"));
     }
     let bytes = id.as_bytes();
     if !bytes[0].is_ascii_alphanumeric()
@@ -1137,46 +1202,46 @@ fn validate_host_id(id: &str) -> io::Result<()> {
             .iter()
             .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
     {
-        return Err(invalid_config(
-            "host id must start with an ASCII letter or digit and contain only ASCII letters, digits, '-' or '_'",
-        ));
+        return Err(
+            "Host ID must start with an ASCII letter or digit and use only letters, digits, '-' or '_'"
+                .to_owned(),
+        );
     }
     Ok(())
 }
 
-fn validate_ssh_host(ssh_host: &str) -> io::Result<()> {
+fn validate_ssh_host(ssh_host: &str) -> Result<(), String> {
     if ssh_host.is_empty() || ssh_host.len() > MAX_SSH_HOST_BYTES {
-        return Err(invalid_config(format!(
-            "sshHost must contain between 1 and {MAX_SSH_HOST_BYTES} bytes"
-        )));
+        return Err(format!(
+            "SSH alias must contain 1-{MAX_SSH_HOST_BYTES} bytes"
+        ));
     }
     if ssh_host.starts_with('-') {
-        return Err(invalid_config("sshHost must not start with '-'"));
+        return Err("SSH alias must not start with '-'".to_owned());
     }
     if ssh_host.chars().any(char::is_control) {
-        return Err(invalid_config(
-            "sshHost must not contain control characters",
-        ));
+        return Err("SSH alias must not contain control characters".to_owned());
     }
     if ssh_host.chars().any(char::is_whitespace) {
-        return Err(invalid_config("sshHost must not contain whitespace"));
+        return Err("SSH alias must not contain whitespace".to_owned());
     }
     Ok(())
 }
 
-fn validate_agent_executable(agent_executable: &str) -> io::Result<()> {
+pub(crate) fn validate_agent_executable(agent_executable: &str) -> Result<(), String> {
     if agent_executable.is_empty() || agent_executable.len() > MAX_AGENT_EXECUTABLE_BYTES {
-        return Err(invalid_config(format!(
-            "agentExecutable must contain between 1 and {MAX_AGENT_EXECUTABLE_BYTES} bytes"
-        )));
+        return Err(format!(
+            "Agent executable must contain 1-{MAX_AGENT_EXECUTABLE_BYTES} bytes"
+        ));
     }
     if agent_executable.bytes().any(|byte| {
         !byte.is_ascii_alphanumeric()
             && !matches!(byte, b'/' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
     }) {
-        return Err(invalid_config(
-            "agentExecutable may contain only ASCII letters, digits, '/', '.', '_', ':', '+', '~', and '-'",
-        ));
+        return Err(
+            "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -1861,6 +1926,60 @@ mod tests {
             }
         );
         RemotesConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn nonblocking_load_reports_busy_and_never_publishes_without_exclusive_lock() {
+        let directory = tempdir().unwrap();
+        #[cfg(unix)]
+        set_mode(directory.path(), 0o700);
+        let path = directory.path().join(CONFIG_FILE);
+        let store = RemotesConfigStore::new(path.clone());
+
+        // Establish only the stable lock sidecar, then model another process
+        // creating/updating the config. A latency-sensitive reader must not
+        // wait and must not publish the default through the shared path.
+        let holder = open_lock_file(directory.path()).unwrap();
+        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        assert_eq!(store.try_load().unwrap(), TryLoadRemotesConfig::Busy);
+        assert_eq!(
+            store.try_load_or_create().unwrap(),
+            TryLoadRemotesConfig::Busy
+        );
+        assert!(!path.exists());
+
+        drop(holder);
+        let TryLoadRemotesConfig::Loaded(created) = store.try_load_or_create().unwrap() else {
+            panic!("released first-run config lock remained busy");
+        };
+        assert_eq!(created, RemotesConfig::default());
+        assert!(path.exists());
+        assert_eq!(
+            store.try_load().unwrap(),
+            TryLoadRemotesConfig::Loaded(created)
+        );
+    }
+
+    #[test]
+    fn shared_remote_host_input_validation_reports_the_invalid_field() {
+        assert_eq!(
+            validate_remote_host_input("_dev", "dev-box", DEFAULT_REMOTE_AGENT_EXECUTABLE),
+            Err(
+                "Host ID must start with an ASCII letter or digit and use only letters, digits, '-' or '_'"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            validate_remote_host_input("dev", "dev\nbox", DEFAULT_REMOTE_AGENT_EXECUTABLE),
+            Err("SSH alias must not contain control characters".to_owned())
+        );
+        assert_eq!(
+            validate_remote_host_input("dev", "dev-box", "codex usage"),
+            Err(
+                "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

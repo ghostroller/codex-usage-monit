@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -35,6 +35,10 @@ const MAX_FACT_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_FACT_BATCH_CHANGES: usize = 250_000;
 const MAX_FACT_GENERATION_RECORDS: usize = 1_000_000;
 const MAX_FACT_RETENTION_DAYS: i64 = 35;
+// An exact 35-day interval can touch 36 distinct UTC calendar days when its
+// endpoints are not midnight. Record timestamps remain the authoritative
+// retention bound; this only caps the number of possible daily shards.
+const MAX_FACT_RETENTION_UTC_DAYS: usize = 36;
 const MAX_FACT_GENERATION_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FACT_NAMESPACE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FACT_NAMESPACE_ENTRIES: u64 = 250_000;
@@ -1389,9 +1393,10 @@ impl SourceHistoryStore {
                     day,
                 ),
             };
+            let mut record_index = digest_record_index(&shard.records)?;
             let mut changed = false;
             for record in additions {
-                changed |= apply_digest_record(&mut shard.records, record)?;
+                changed |= apply_digest_record(&mut shard.records, &mut record_index, record)?;
             }
             if !changed {
                 report.shards_skipped += 1;
@@ -1410,6 +1415,23 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
     ) -> io::Result<SourceSessionDigestRecordsData> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_source_session_digest_records_since_with_budget(
+            source_id,
+            redaction_profile,
+            since,
+            &mut budget,
+        )
+    }
+
+    pub(crate) fn load_source_session_digest_records_since_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceSessionDigestRecordsData> {
+        budget.charge_source()?;
         self.with_source_metadata_shared(source_id, |source| {
             let records = if source.kind() == SourceKind::Ssh {
                 self.with_active_remote_history_generation(
@@ -1419,20 +1441,22 @@ impl SourceHistoryStore {
                         let Some(generation_directory) = generation_directory else {
                             return Ok(Vec::new());
                         };
-                        self.load_source_session_digest_records_from_directory(
+                        self.load_source_session_digest_records_from_directory_with_budget(
                             source_id,
                             redaction_profile,
                             since,
                             &generation_directory.join(DIGESTS_DIRECTORY),
+                            budget,
                         )
                     },
                 )?
             } else {
-                self.load_source_session_digest_records_from_directory(
+                self.load_source_session_digest_records_from_directory_with_budget(
                     source_id,
                     redaction_profile,
                     since,
                     &self.source_digests_directory(source_id, redaction_profile),
+                    budget,
                 )?
             };
             Ok(SourceSessionDigestRecordsData {
@@ -1443,12 +1467,13 @@ impl SourceHistoryStore {
         })
     }
 
-    pub(super) fn load_source_session_digest_records_from_directory(
+    pub(super) fn load_source_session_digest_records_from_directory_with_budget(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
         directory: &Path,
+        budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
         if !self.private_directory_exists(directory)? {
             return Ok(Vec::new());
@@ -1456,15 +1481,22 @@ impl SourceHistoryStore {
         let lock = open_lock_file(directory, DIGESTS_LOCK_FILE)?;
         lock_shared(&lock, directory, DIGESTS_LOCK_FILE)?;
         let mut records = Vec::new();
+        let mut record_index = HashMap::new();
         for (day, path) in evidence_shard_entries_since(self, directory, since)? {
-            let Some(shard) =
-                read_digest_shard(&path, &self.profile_id, source_id, redaction_profile, day)?
+            let Some(shard) = read_digest_shard_with_budget(
+                &path,
+                &self.profile_id,
+                source_id,
+                redaction_profile,
+                day,
+                budget,
+            )?
             else {
                 continue;
             };
             for record in shard.records {
                 if digest_record_intersects_since(&record, since) {
-                    let _ = apply_digest_record(&mut records, record)?;
+                    let _ = apply_digest_record(&mut records, &mut record_index, record)?;
                 }
             }
         }
@@ -1954,7 +1986,19 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         thread_id: &ThreadId,
     ) -> io::Result<Option<ActiveFactSet>> {
-        let source = self.load_source_metadata(source_id)?;
+        let mut budget = SourceHistoryReadBudget::for_query();
+        budget.charge_source()?;
+        self.load_active_fact_set_with_budget(source_id, redaction_profile, thread_id, &mut budget)
+    }
+
+    pub(crate) fn load_active_fact_set_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        thread_id: &ThreadId,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<Option<ActiveFactSet>> {
+        let source = self.load_source_metadata_with_budget(source_id, budget)?;
         let replica = SessionReplicaKey::new(source_id.clone(), thread_id.clone());
         let shard_key = ThreadShardKey::from_replica(&replica);
         let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
@@ -1964,18 +2008,23 @@ impl SourceHistoryStore {
         let lock_name = fact_lock_name(&shard_key);
         let lock = open_lock_file(&manifests, &lock_name)?;
         lock_shared(&lock, &manifests, &lock_name)?;
-        let Some(manifest) = self.read_active_fact_manifest_unlocked(
+        let Some(manifest) = self.read_active_fact_manifest_unlocked_with_budget(
             source_id,
             redaction_profile,
             &replica,
             &shard_key,
+            budget,
         )?
         else {
             return Ok(None);
         };
         validate_fact_remote_binding(source.kind(), source_id, manifest.remote_binding.as_ref())?;
-        let records =
-            self.read_fact_generation_unlocked(source_id, redaction_profile, &manifest)?;
+        let records = self.read_fact_generation_unlocked_with_budget(
+            source_id,
+            redaction_profile,
+            &manifest,
+            budget,
+        )?;
         Ok(Some(ActiveFactSet {
             replica,
             redaction_profile,
@@ -1994,14 +2043,53 @@ impl SourceHistoryStore {
         replica: &SessionReplicaKey,
         shard_key: &ThreadShardKey,
     ) -> io::Result<Option<ActiveFactManifest>> {
+        self.read_active_fact_manifest_unlocked_inner(
+            source_id,
+            redaction_profile,
+            replica,
+            shard_key,
+            None,
+        )
+    }
+
+    fn read_active_fact_manifest_unlocked_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        replica: &SessionReplicaKey,
+        shard_key: &ThreadShardKey,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<Option<ActiveFactManifest>> {
+        self.read_active_fact_manifest_unlocked_inner(
+            source_id,
+            redaction_profile,
+            replica,
+            shard_key,
+            Some(budget),
+        )
+    }
+
+    fn read_active_fact_manifest_unlocked_inner(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        replica: &SessionReplicaKey,
+        shard_key: &ThreadShardKey,
+        mut budget: Option<&mut SourceHistoryReadBudget>,
+    ) -> io::Result<Option<ActiveFactManifest>> {
         let directory = self.source_fact_manifests_directory(source_id, redaction_profile);
         self.validate_private_path(&directory)?;
         let path = fact_manifest_path(&directory, shard_key);
-        let manifest: ActiveFactManifest =
-            match read_optional_json_file(&path, MAX_FACT_MANIFEST_BYTES)? {
-                Some(manifest) => manifest,
-                None => return Ok(None),
-            };
+        let manifest = match budget.as_mut() {
+            Some(budget) => {
+                read_optional_json_file_with_budget(&path, MAX_FACT_MANIFEST_BYTES, budget)?
+            }
+            None => read_optional_json_file(&path, MAX_FACT_MANIFEST_BYTES)?,
+        };
+        let manifest: ActiveFactManifest = match manifest {
+            Some(manifest) => manifest,
+            None => return Ok(None),
+        };
         validate_active_manifest(
             &manifest,
             &self.profile_id,
@@ -2033,6 +2121,45 @@ impl SourceHistoryStore {
             &manifest.thread_shard_key,
             &manifest.active_generation,
             &manifest.shard_days,
+        )?;
+        if records.len() != manifest.record_count {
+            return Err(invalid_data(
+                "active fact generation record count does not match its manifest",
+            ));
+        }
+        if manifest
+            .retained_since
+            .is_some_and(|cutoff| records.iter().any(|record| record.occurred_at() < cutoff))
+        {
+            return Err(invalid_data(
+                "active fact generation contains a record below its retention floor",
+            ));
+        }
+        Ok(records)
+    }
+
+    fn read_fact_generation_unlocked_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        manifest: &ActiveFactManifest,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<Vec<UsageEventFactRecord>> {
+        let directory = self
+            .source_facts_directory(source_id, redaction_profile)
+            .join(manifest.thread_shard_key.as_str())
+            .join(manifest.active_generation.as_str());
+        let records = read_fact_generation_with_budget(
+            self,
+            &directory,
+            &self.profile_id,
+            source_id,
+            redaction_profile,
+            &manifest.replica,
+            &manifest.thread_shard_key,
+            &manifest.active_generation,
+            &manifest.shard_days,
+            budget,
         )?;
         if records.len() != manifest.record_count {
             return Err(invalid_data(
@@ -2198,15 +2325,48 @@ fn group_digest_records_by_day(
     Ok(result)
 }
 
+type DigestRecordKey = (ThreadId, DateTime<Utc>);
+type DigestRecordIndex = HashMap<DigestRecordKey, usize>;
+
+fn digest_record_index(records: &[SourceSessionDigestRecord]) -> io::Result<DigestRecordIndex> {
+    let mut index = HashMap::new();
+    index.try_reserve(records.len()).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate session digest record index: {error}"
+        ))
+    })?;
+    for (position, record) in records.iter().enumerate() {
+        let key = (record.thread_id.clone(), record.range_start);
+        if index.insert(key, position).is_some() {
+            return Err(invalid_data(
+                "session digest record set contains duplicate thread/range keys",
+            ));
+        }
+    }
+    Ok(index)
+}
+
 fn apply_digest_record(
     records: &mut Vec<SourceSessionDigestRecord>,
+    record_index: &mut DigestRecordIndex,
     mut incoming: SourceSessionDigestRecord,
 ) -> io::Result<bool> {
     incoming.validate()?;
-    let Some(index) = records.iter().position(|record| {
-        record.thread_id == incoming.thread_id && record.range_start == incoming.range_start
-    }) else {
+    let key = (incoming.thread_id.clone(), incoming.range_start);
+    let Some(index) = record_index.get(&key).copied() else {
+        records.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate session digest record buffer: {error}"
+            ))
+        })?;
+        record_index.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate session digest record index: {error}"
+            ))
+        })?;
+        let index = records.len();
         records.push(incoming);
+        record_index.insert(key, index);
         return Ok(true);
     };
     let existing = &records[index];
@@ -2256,10 +2416,46 @@ fn read_digest_shard(
     redaction_profile: RedactionProfile,
     day: NaiveDate,
 ) -> io::Result<Option<SessionDigestShard>> {
-    let mut shard: SessionDigestShard = match read_optional_gzip_json_file(path)? {
+    read_digest_shard_inner(path, profile_id, source_id, redaction_profile, day, None)
+}
+
+fn read_digest_shard_with_budget(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<SessionDigestShard>> {
+    read_digest_shard_inner(
+        path,
+        profile_id,
+        source_id,
+        redaction_profile,
+        day,
+        Some(budget),
+    )
+}
+
+fn read_digest_shard_inner(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Option<SessionDigestShard>> {
+    let shard = match budget.as_deref_mut() {
+        Some(budget) => read_optional_gzip_json_file_with_budget(path, budget)?,
+        None => read_optional_gzip_json_file(path)?,
+    };
+    let mut shard: SessionDigestShard = match shard {
         Some(shard) => shard,
         None => return Ok(None),
     };
+    if let Some(budget) = budget.as_mut() {
+        budget.charge_records(shard.records.len())?;
+    }
     if shard.format_version != SESSION_DIGEST_SHARD_FORMAT_VERSION
         || shard.metric_revision != SESSION_EVIDENCE_METRIC_REVISION
         || &shard.profile_id != profile_id
@@ -2269,7 +2465,8 @@ fn read_digest_shard(
     {
         return Err(envelope_mismatch(path, "session digest envelope"));
     }
-    let mut unique = Vec::with_capacity(shard.records.len());
+    let mut unique = Vec::new();
+    let mut record_index = HashMap::new();
     for record in std::mem::take(&mut shard.records) {
         record.validate()?;
         if record.range_start().date_naive() != day {
@@ -2280,7 +2477,7 @@ fn read_digest_shard(
         {
             return Err(envelope_mismatch(path, "session digest replica source"));
         }
-        let _ = apply_digest_record(&mut unique, record)?;
+        let _ = apply_digest_record(&mut unique, &mut record_index, record)?;
     }
     sort_digest_records(&mut unique);
     shard.records = unique;
@@ -2380,11 +2577,7 @@ fn validate_fact_record_span(records: &[UsageEventFactRecord]) -> io::Result<()>
         .map(UsageEventFactRecord::occurred_at)
         .max()
         .expect("a nonempty record set has a maximum timestamp");
-    let day_span = last
-        .date_naive()
-        .signed_duration_since(first.date_naive())
-        .num_days();
-    if day_span >= MAX_FACT_RETENTION_DAYS {
+    if last.signed_duration_since(first) > Duration::days(MAX_FACT_RETENTION_DAYS) {
         return Err(invalid_data(
             "fact records span more than the 35-day retention window",
         ));
@@ -2475,6 +2668,60 @@ fn read_fact_generation(
     generation: &FactBatchId,
     expected_days: &[NaiveDate],
 ) -> io::Result<Vec<UsageEventFactRecord>> {
+    read_fact_generation_inner(
+        store,
+        directory,
+        profile_id,
+        source_id,
+        redaction_profile,
+        replica,
+        shard_key,
+        generation,
+        expected_days,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_fact_generation_with_budget(
+    store: &SourceHistoryStore,
+    directory: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    replica: &SessionReplicaKey,
+    shard_key: &ThreadShardKey,
+    generation: &FactBatchId,
+    expected_days: &[NaiveDate],
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Vec<UsageEventFactRecord>> {
+    read_fact_generation_inner(
+        store,
+        directory,
+        profile_id,
+        source_id,
+        redaction_profile,
+        replica,
+        shard_key,
+        generation,
+        expected_days,
+        Some(budget),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_fact_generation_inner(
+    store: &SourceHistoryStore,
+    directory: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    replica: &SessionReplicaKey,
+    shard_key: &ThreadShardKey,
+    generation: &FactBatchId,
+    expected_days: &[NaiveDate],
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Vec<UsageEventFactRecord>> {
     store.validate_private_path(directory)?;
     validate_sorted_unique_days(expected_days)?;
     let entries = evidence_shard_entries(store, directory)?;
@@ -2496,8 +2743,11 @@ fn read_fact_generation(
                 "fact generation decoded size exceeds its hard cap",
             ));
         }
-        let (shard, decoded_bytes): (FactShard, u64) =
-            read_gzip_json_file_with_limit(&path, remaining.min(MAX_EVIDENCE_SHARD_BYTES))?;
+        let shard_limit = remaining.min(MAX_EVIDENCE_SHARD_BYTES);
+        let (shard, decoded_bytes): (FactShard, u64) = match budget.as_deref_mut() {
+            Some(budget) => read_gzip_json_file_inner(&path, shard_limit, Some(budget))?,
+            None => read_gzip_json_file_with_limit(&path, shard_limit)?,
+        };
         total_decoded_bytes = total_decoded_bytes
             .checked_add(decoded_bytes)
             .ok_or_else(|| invalid_data("fact generation decoded size overflowed"))?;
@@ -2513,6 +2763,19 @@ fn read_fact_generation(
         {
             return Err(envelope_mismatch(&path, "fact shard envelope"));
         }
+        let next_record_count = records
+            .len()
+            .checked_add(shard.records.len())
+            .ok_or_else(|| invalid_data("fact generation record count overflowed"))?;
+        if next_record_count > MAX_FACT_GENERATION_RECORDS {
+            return Err(invalid_data("fact generation contains too many records"));
+        }
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.charge_records(shard.records.len())?;
+        }
+        records.try_reserve(shard.records.len()).map_err(|error| {
+            io::Error::other(format!("could not allocate fact record buffer: {error}"))
+        })?;
         for record in shard.records {
             validate_fact_record_namespace(&record, replica)?;
             if record.occurred_at().date_naive() != day {
@@ -2524,9 +2787,6 @@ fn read_fact_generation(
                 ));
             }
             records.push(record);
-            if records.len() > MAX_FACT_GENERATION_RECORDS {
-                return Err(invalid_data("fact generation contains too many records"));
-            }
         }
     }
     sort_fact_records(&mut records);
@@ -2635,7 +2895,7 @@ fn validate_active_manifest(
 }
 
 fn validate_sorted_unique_days(days: &[NaiveDate]) -> io::Result<()> {
-    if days.len() > usize::try_from(MAX_FACT_RETENTION_DAYS).unwrap_or(usize::MAX) {
+    if days.len() > MAX_FACT_RETENTION_UTC_DAYS {
         return Err(invalid_data(
             "fact shard set exceeds the 35-day retention window",
         ));
@@ -2644,7 +2904,7 @@ fn validate_sorted_unique_days(days: &[NaiveDate]) -> io::Result<()> {
         return Err(invalid_data("fact shard days must be sorted and unique"));
     }
     if days.first().zip(days.last()).is_some_and(|(first, last)| {
-        last.signed_duration_since(*first).num_days() >= MAX_FACT_RETENTION_DAYS
+        last.signed_duration_since(*first).num_days() > MAX_FACT_RETENTION_DAYS
     }) {
         return Err(invalid_data(
             "fact shard set exceeds the 35-day retention window",
@@ -2796,6 +3056,17 @@ fn read_optional_gzip_json_file<T: for<'de> Deserialize<'de>>(
     }
 }
 
+fn read_optional_gzip_json_file_with_budget<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<T>> {
+    match read_gzip_json_file_inner(path, MAX_EVIDENCE_SHARD_BYTES, Some(budget)) {
+        Ok((value, _)) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_gzip_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     read_gzip_json_file_with_limit(path, MAX_EVIDENCE_SHARD_BYTES).map(|(value, _)| value)
 }
@@ -2803,6 +3074,14 @@ fn read_gzip_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<
 fn read_gzip_json_file_with_limit<T: for<'de> Deserialize<'de>>(
     path: &Path,
     maximum_decoded_bytes: u64,
+) -> io::Result<(T, u64)> {
+    read_gzip_json_file_inner(path, maximum_decoded_bytes, None)
+}
+
+fn read_gzip_json_file_inner<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum_decoded_bytes: u64,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
 ) -> io::Result<(T, u64)> {
     let path_metadata = fs::symlink_metadata(path)?;
     validate_data_file_metadata(path, &path_metadata)?;
@@ -2829,14 +3108,50 @@ fn read_gzip_json_file_with_limit<T: for<'de> Deserialize<'de>>(
         )));
     }
     let mut decoded = Vec::new();
-    GzDecoder::new(file)
-        .take(maximum_decoded_bytes.saturating_add(1))
-        .read_to_end(&mut decoded)?;
-    if decoded.len() as u64 > maximum_decoded_bytes {
-        return Err(invalid_data(format!(
-            "decompressed session evidence file {} is too large",
-            path.display()
-        )));
+    if let Some(budget) = budget.as_mut() {
+        let (decoded_limit, query_budget_is_binding) =
+            budget.shard_decoded_byte_allowance(maximum_decoded_bytes)?;
+        let mut decoder = GzDecoder::new(file);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = decoder.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let next_size = (decoded.len() as u64)
+                .checked_add(count as u64)
+                .ok_or_else(|| invalid_data("session evidence decoded size overflowed"))?;
+            if next_size > decoded_limit {
+                if query_budget_is_binding {
+                    return Err(history_query_budget_exceeded(format!(
+                        "decoded-byte budget exhausted while reading {}",
+                        path.display()
+                    )));
+                } else {
+                    return Err(invalid_data(format!(
+                        "decompressed session evidence file {} is too large",
+                        path.display()
+                    )));
+                }
+            }
+            budget.charge_decoded_bytes(count as u64)?;
+            decoded.try_reserve(count).map_err(|error| {
+                io::Error::other(format!(
+                    "could not allocate session evidence buffer: {error}"
+                ))
+            })?;
+            decoded.extend_from_slice(&buffer[..count]);
+        }
+    } else {
+        GzDecoder::new(file)
+            .take(maximum_decoded_bytes.saturating_add(1))
+            .read_to_end(&mut decoded)?;
+        if decoded.len() as u64 > maximum_decoded_bytes {
+            return Err(invalid_data(format!(
+                "decompressed session evidence file {} is too large",
+                path.display()
+            )));
+        }
     }
     let decoded_bytes = u64::try_from(decoded.len())
         .map_err(|_| invalid_data("session evidence decoded size overflowed"))?;
@@ -3496,13 +3811,45 @@ mod tests {
     }
 
     fn store(root: &Path) -> SourceHistoryStore {
+        store_with_kind(root, SourceKind::Local)
+    }
+
+    fn store_with_kind(root: &Path, kind: SourceKind) -> SourceHistoryStore {
         let store = SourceHistoryStore::new(root.join("state-root"), PROFILE.parse().unwrap());
         store
-            .save_source_metadata(
-                &SourceMetadata::new(source_id(), SourceKind::Local, "build-host").unwrap(),
-            )
+            .save_source_metadata(&SourceMetadata::new(source_id(), kind, "build-host").unwrap())
             .unwrap();
         store
+    }
+
+    #[test]
+    fn gzip_query_budget_counts_decoded_bytes_before_buffer_growth() {
+        let directory = tempdir().unwrap();
+        let store = store(directory.path());
+        let digests = store.source_digests_directory(&source_id(), RedactionProfile::Redacted);
+        store.prepare_private_directory(&digests).unwrap();
+        let path = digests.join("budget-test.json.gz");
+        let payload = vec!["x".repeat(256 * 1024)];
+        let decoded_bytes =
+            write_gzip_json_atomically_with_limit(&store, &path, &payload, 512 * 1024).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() * 10 < decoded_bytes);
+
+        let mut exact = SourceHistoryReadBudget::with_limits(decoded_bytes, 1, 1);
+        let (decoded, measured): (Vec<String>, u64) =
+            read_gzip_json_file_inner(&path, MAX_EVIDENCE_SHARD_BYTES, Some(&mut exact)).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(measured, decoded_bytes);
+        assert_eq!(exact.decoded_bytes_remaining, 0);
+
+        let mut short = SourceHistoryReadBudget::with_limits(decoded_bytes - 1, 1, 1);
+        let error = read_gzip_json_file_inner::<Vec<String>>(
+            &path,
+            MAX_EVIDENCE_SHARD_BYTES,
+            Some(&mut short),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("decoded-byte budget"));
     }
 
     fn thread(value: &str) -> ThreadId {
@@ -3827,6 +4174,31 @@ mod tests {
     }
 
     #[test]
+    fn indexed_digest_application_handles_large_unique_sets_and_revisions() {
+        let start = at(8, 28, 1);
+        let end = start + Duration::hours(1);
+        let mut records = Vec::new();
+        let mut record_index = HashMap::new();
+        for offset in 0_u64..10_000 {
+            let thread_id = format!("thread-indexed-{offset}");
+            let record =
+                SourceSessionDigestRecord::upsert(1, digest(&thread_id, start, end, offset + 1))
+                    .unwrap();
+            assert!(apply_digest_record(&mut records, &mut record_index, record).unwrap());
+        }
+        assert_eq!(records.len(), 10_000);
+        assert_eq!(record_index.len(), records.len());
+
+        let replacement =
+            SourceSessionDigestRecord::upsert(2, digest("thread-indexed-5000", start, end, 99_999))
+                .unwrap();
+        assert!(apply_digest_record(&mut records, &mut record_index, replacement).unwrap());
+        assert_eq!(records.len(), 10_000);
+        let key = (thread("thread-indexed-5000"), start);
+        assert_eq!(records[*record_index.get(&key).unwrap()].revision(), 2);
+    }
+
+    #[test]
     fn gc_retains_crossing_tombstone_and_rejects_late_old_upsert() {
         let root = tempdir().unwrap();
         let store = store(root.path());
@@ -4089,6 +4461,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn active_fact_reads_share_the_query_record_budget() {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let cursor = FactCursor::new(7, 10).unwrap();
+        let batch_id = FactBatchId::generate().unwrap();
+        let snapshot = batch(
+            batch_id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-budget",
+            None,
+            cursor,
+            at(8, 28, 2),
+            vec![
+                UsageEventFactRecord::upsert(
+                    1,
+                    fact("thread-budget", "event-budget", at(8, 28, 1), 10),
+                )
+                .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &snapshot)
+            .unwrap();
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &batch_id)
+            .unwrap();
+
+        let mut budget =
+            SourceHistoryReadBudget::with_limits(MAX_HISTORY_QUERY_DECODED_BYTES, 0, 1);
+        let error = store
+            .load_active_fact_set_with_budget(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-budget"),
+                &mut budget,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(SourceHistoryReadBudget::is_exhaustion(&error));
+        assert!(error.to_string().contains("record budget"));
     }
 
     #[test]
@@ -4552,7 +4967,7 @@ mod tests {
             &source_id(),
             RedactionProfile::Redacted,
             cutoff_day,
-            at(9, 5, 0),
+            Utc::now() + Duration::hours(FACT_STAGING_TTL_HOURS + 1),
         )
         .unwrap();
         let digests = store
@@ -4932,17 +5347,57 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
-        let within_window = vec![
-            UsageEventFactRecord::upsert(1, fact("thread-limit", "event-1", at(8, 1, 0), 1))
+        let crosses_thirty_six_utc_days_within_window = vec![
+            UsageEventFactRecord::upsert(1, fact("thread-limit", "event-1", at(8, 1, 23), 1))
                 .unwrap(),
-            UsageEventFactRecord::upsert(1, fact("thread-limit", "event-2", at(9, 4, 0), 1))
+            UsageEventFactRecord::upsert(
+                1,
+                fact(
+                    "thread-limit",
+                    "event-2",
+                    at(9, 5, 23) - Duration::seconds(1),
+                    1,
+                ),
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            crosses_thirty_six_utc_days_within_window[1]
+                .occurred_at()
+                .date_naive()
+                .signed_duration_since(
+                    crosses_thirty_six_utc_days_within_window[0]
+                        .occurred_at()
+                        .date_naive(),
+                )
+                .num_days(),
+            MAX_FACT_RETENTION_DAYS
+        );
+        assert!(
+            crosses_thirty_six_utc_days_within_window[1]
+                .occurred_at()
+                .signed_duration_since(crosses_thirty_six_utc_days_within_window[0].occurred_at(),)
+                < Duration::days(MAX_FACT_RETENTION_DAYS)
+        );
+        assert!(validate_fact_record_span(&crosses_thirty_six_utc_days_within_window).is_ok());
+        let exact_window = vec![
+            crosses_thirty_six_utc_days_within_window[0].clone(),
+            UsageEventFactRecord::upsert(1, fact("thread-limit", "event-3", at(9, 5, 23), 1))
                 .unwrap(),
         ];
-        assert!(validate_fact_record_span(&within_window).is_ok());
+        assert!(validate_fact_record_span(&exact_window).is_ok());
         let outside_window = vec![
-            within_window[0].clone(),
-            UsageEventFactRecord::upsert(1, fact("thread-limit", "event-3", at(9, 5, 0), 1))
-                .unwrap(),
+            exact_window[0].clone(),
+            UsageEventFactRecord::upsert(
+                1,
+                fact(
+                    "thread-limit",
+                    "event-4",
+                    at(9, 5, 23) + Duration::seconds(1),
+                    1,
+                ),
+            )
+            .unwrap(),
         ];
         assert_eq!(
             validate_fact_record_span(&outside_window)
@@ -5008,6 +5463,79 @@ mod tests {
             .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn exact_retention_window_round_trips_through_local_and_remote_fact_batches() {
+        let root = tempdir().unwrap();
+        let first = at(8, 1, 23);
+        let changes = (0..=MAX_FACT_RETENTION_DAYS)
+            .map(|day| {
+                UsageEventFactRecord::upsert(
+                    1,
+                    fact(
+                        "thread-retention-boundary",
+                        &format!("event-{day:02}"),
+                        first + Duration::days(day),
+                        1,
+                    ),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changes
+                .iter()
+                .map(UsageEventFactRecord::occurred_at)
+                .map(|timestamp| timestamp.date_naive())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            MAX_FACT_RETENTION_UTC_DAYS
+        );
+
+        for (directory, kind) in [("local", SourceKind::Local), ("remote", SourceKind::Ssh)] {
+            let store = store_with_kind(&root.path().join(directory), kind);
+            let remote_binding = (kind == SourceKind::Ssh)
+                .then(|| {
+                    SourceHistoryRemoteBinding::new(
+                        crate::remote_protocol::SourceGeneration {
+                            node_id: source_id(),
+                            generation: std::num::NonZeroU64::new(1).unwrap(),
+                        },
+                        crate::remote_agent::current_revisions(),
+                    )
+                })
+                .transpose()
+                .unwrap();
+            let batch_id = FactBatchId::generate().unwrap();
+            let batch = CompleteFactBatch {
+                batch_id: batch_id.clone(),
+                kind: FactBatchKind::Snapshot,
+                replica: replica("thread-retention-boundary"),
+                expected_active_version: None,
+                remote_binding,
+                validated_digests: Vec::new(),
+                activate_cursor: FactCursor::new(1, changes.len() as u64).unwrap(),
+                completed_at: first + Duration::days(MAX_FACT_RETENTION_DAYS),
+                changes: changes.clone(),
+            };
+
+            store
+                .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &batch)
+                .unwrap();
+            store
+                .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &batch_id)
+                .unwrap();
+            let active = store
+                .load_active_fact_set(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    &thread("thread-retention-boundary"),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.records.len(), MAX_FACT_RETENTION_UTC_DAYS);
+        }
     }
 
     #[test]

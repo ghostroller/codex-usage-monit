@@ -8,11 +8,14 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use chrono::{DateTime, Duration, Utc};
+use walkdir::WalkDir;
 
 use crate::config::CollectConfig;
 use crate::domain::{TaskStatus, TurnStatus};
@@ -25,7 +28,7 @@ use crate::remote_delta_journal::{
 use crate::remote_export_plan::plan_remote_export_records;
 use crate::remote_export_state::{
     RemoteDeltaCursorExpired, RemoteDeltaPageRead, RemoteExportDeltaPage, RemoteExportLivePage,
-    RemoteExportStateStore,
+    RemoteExportStateStore, RemoteRevisionFenceMode, try_acquire_revision_fence,
 };
 use crate::remote_protocol::{
     DeltaCursor, DeltaPage, DeltaPayload, DeltaRequest, MAX_LIVE_SERIALIZED_BYTES, MAX_LIVE_TASKS,
@@ -46,6 +49,14 @@ const HISTORICAL_COVERAGE_UNPROVEN: &str = "historical_coverage_unproven";
 const LIVE_SNAPSHOT_TRUNCATED: &str = "live_snapshot_truncated";
 const LIVE_SNAPSHOT_LOOKBACK_HOURS: i64 = 24;
 const GIT_EVIDENCE_CACHE_FILE: &str = "git-evidence-cache-v1.json";
+const EXPORT_LOCK_FILE_NAME: &str = "remote-export.lock";
+const REVISION_FENCE_LOCK_FILE_NAME: &str = "remote-revision.lock";
+const FACT_BATCH_NAMESPACE: &str = "session-fact-batches-v1";
+const FROZEN_BATCH_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const OLD_REVISION_GRACE: StdDuration = FROZEN_BATCH_TTL;
+const MAX_RETAINED_OLD_REVISIONS: usize = 2;
+const MAX_REVISION_DIRECTORY_ENTRIES: usize = 32_768;
+const MAX_REVISION_DELETIONS_PER_REQUEST: usize = 2;
 // At the minimum one-minute scheduler interval, repeatedly replacing a fully
 // occupied snapshot remains below 96 MiB/day before compression. Aggregate
 // history pages and SSH framing are budgeted separately by the center.
@@ -162,6 +173,8 @@ pub fn prepare_remote_delta_page(
     let source = source_generation(identity);
     let state_root = revision_bound_state_root(identity_store, revisions)
         .map_err(RemoteDeltaPrepareError::Internal)?;
+    let _revision_fence = try_acquire_revision_fence(&state_root, RemoteRevisionFenceMode::Shared)
+        .map_err(map_state_error)?;
     let git_evidence_cache_path = state_root.join(GIT_EVIDENCE_CACHE_FILE);
     let state_store = RemoteExportStateStore::new(state_root, source.clone(), redaction_profile);
     let mut session = state_store
@@ -208,6 +221,12 @@ pub fn prepare_remote_delta_page(
             }
         }
     }
+
+    // A pending durable page above remains a filesystem-only fast path. Run
+    // bounded revision maintenance only when this request is already about to
+    // pay for a complete rollout collection/materialization.
+    sweep_old_revision_state(identity_store, revisions, SystemTime::now())
+        .map_err(RemoteDeltaPrepareError::Internal)?;
 
     let collection =
         collect_remote_rollouts(config, &request.range, observed_at, redaction_profile)
@@ -556,6 +575,522 @@ pub(crate) fn revision_bound_state_root(
     )))
 }
 
+#[derive(Debug)]
+struct OldRevisionCandidate {
+    path: PathBuf,
+    modified: SystemTime,
+    lock_paths: Vec<PathBuf>,
+    active_frozen_continuation: bool,
+    has_revision_fence: bool,
+    retired: bool,
+    saturated: bool,
+}
+
+/// Bounded maintenance for revision-qualified exporter state. The exact
+/// current tuple is excluded before any recursive traversal. Older tuples are
+/// removable only after every discovered exporter lock is acquired and no
+/// unexpired frozen continuation exists.
+pub(crate) fn sweep_old_revision_state(
+    identity_store: &SourceIdentityStore,
+    revisions: &ProtocolRevisions,
+    now: SystemTime,
+) -> Result<(), anyhow::Error> {
+    let current_root = revision_bound_state_root(identity_store, revisions)?;
+    let namespace = current_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("remote export revision root has no parent"))?;
+    match validate_revision_directory(namespace) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut candidates = Vec::new();
+    let mut namespace_saturated = false;
+    for (index, entry) in fs::read_dir(namespace)?.enumerate() {
+        if index == MAX_REVISION_DIRECTORY_ENTRIES {
+            namespace_saturated = true;
+            break;
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        validate_revision_storage_entry(&path, &metadata)?;
+        if !metadata.file_type().is_dir() {
+            return Err(invalid_revision_data(
+                "remote export revision namespace contains a non-directory entry",
+            )
+            .into());
+        }
+        if path == current_root {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| invalid_revision_data("remote export revision name is not UTF-8"))?
+            .to_owned();
+        let retired = validate_revision_directory_name(&name)?;
+        candidates.push(scan_old_revision_candidate(path, retired, now)?);
+    }
+    validate_revision_directory(namespace)?;
+
+    candidates.sort_by(|left, right| {
+        left.retired
+            .cmp(&right.retired)
+            .reverse()
+            .then_with(|| left.modified.cmp(&right.modified))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut retained = candidates
+        .iter()
+        .filter(|candidate| !candidate.retired)
+        .count();
+    let mut deleted = 0_usize;
+    for candidate in candidates {
+        if deleted == MAX_REVISION_DELETIONS_PER_REQUEST {
+            break;
+        }
+        if candidate.saturated || candidate.active_frozen_continuation {
+            continue;
+        }
+        let expired = now
+            .duration_since(candidate.modified)
+            .is_ok_and(|age| age >= OLD_REVISION_GRACE);
+        let over_capacity = namespace_saturated || retained > MAX_RETAINED_OLD_REVISIONS;
+        // A pre-fence development build may still be serving this namespace.
+        // Capacity pressure is not enough to cross that compatibility boundary;
+        // require the full grace before installing/acquiring the new fence.
+        if !candidate.has_revision_fence && !expired {
+            continue;
+        }
+        if !candidate.retired && !expired && !over_capacity {
+            continue;
+        }
+        let revision_fence =
+            match try_acquire_revision_fence(&candidate.path, RemoteRevisionFenceMode::Exclusive) {
+                Ok(fence) => fence,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error.into()),
+            };
+        let Some(locks) = try_lock_revision_exporters(&candidate.lock_paths)? else {
+            continue;
+        };
+        // Lock discovery and validation are repeated while the locks are held.
+        // A changed set is conservatively retained rather than deleting state
+        // whose activity fence was not acquired.
+        let revalidated =
+            scan_old_revision_candidate(candidate.path.clone(), candidate.retired, now)?;
+        if revalidated.saturated
+            || revalidated.active_frozen_continuation
+            || revalidated.lock_paths != candidate.lock_paths
+        {
+            continue;
+        }
+
+        #[cfg(windows)]
+        {
+            drop(locks);
+            drop(revision_fence);
+        }
+
+        let removal_path = if candidate.retired {
+            candidate.path.clone()
+        } else {
+            match retire_revision_directory(&candidate.path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                #[cfg(windows)]
+                Err(error) if windows_revision_path_is_busy(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let removed = match fs::remove_dir_all(&removal_path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            #[cfg(windows)]
+            Err(error) if windows_revision_path_is_busy(&error) => false,
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(not(windows))]
+        {
+            drop(locks);
+            drop(revision_fence);
+        }
+        if !removed {
+            continue;
+        }
+        sync_revision_parent(&removal_path)?;
+        if !candidate.retired {
+            retained = retained.saturating_sub(1);
+        }
+        deleted = deleted.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn scan_old_revision_candidate(
+    path: PathBuf,
+    retired: bool,
+    now: SystemTime,
+) -> Result<OldRevisionCandidate, anyhow::Error> {
+    validate_revision_directory(&path)?;
+    let mut modified = fs::symlink_metadata(&path)?.modified()?;
+    let mut lock_paths = Vec::new();
+    let mut active_frozen_continuation = false;
+    let mut has_revision_fence = false;
+    let mut saturated = false;
+    for (index, entry) in WalkDir::new(&path)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if index == MAX_REVISION_DIRECTORY_ENTRIES {
+            saturated = true;
+            break;
+        }
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(entry_path)?;
+        validate_revision_storage_entry(entry_path, &metadata)?;
+        modified = modified.max(metadata.modified()?);
+        if metadata.file_type().is_file() && entry.file_name() == EXPORT_LOCK_FILE_NAME {
+            lock_paths.push(entry_path.to_path_buf());
+        }
+        if entry.depth() == 1
+            && metadata.file_type().is_file()
+            && entry.file_name() == REVISION_FENCE_LOCK_FILE_NAME
+        {
+            has_revision_fence = true;
+        }
+        if entry.depth() == 5
+            && metadata.file_type().is_dir()
+            && is_frozen_batch_path(&path, entry_path)
+            && !entry.file_name().to_string_lossy().starts_with(".gc-")
+        {
+            let batch_is_live = now
+                .duration_since(metadata.modified()?)
+                .map_or(true, |age| age < FROZEN_BATCH_TTL);
+            active_frozen_continuation |= batch_is_live;
+        }
+    }
+    validate_revision_directory(&path)?;
+    lock_paths.sort();
+    lock_paths.dedup();
+    Ok(OldRevisionCandidate {
+        path,
+        modified,
+        lock_paths,
+        active_frozen_continuation,
+        has_revision_fence,
+        retired,
+        saturated,
+    })
+}
+
+fn is_frozen_batch_path(revision_root: &Path, path: &Path) -> bool {
+    path.strip_prefix(revision_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| component.as_os_str() == FACT_BATCH_NAMESPACE)
+}
+
+fn validate_revision_directory_name(name: &str) -> io::Result<bool> {
+    let (name, retired) = match name.strip_prefix(".gc-") {
+        Some(name) => (name, true),
+        None => (name, false),
+    };
+    let mut parts = name.split('-');
+    let valid = [
+        ("h", parts.next()),
+        ("m", parts.next()),
+        ("e", parts.next()),
+        ("p", parts.next()),
+        ("a", parts.next()),
+    ]
+    .into_iter()
+    .all(|(prefix, part)| {
+        part.and_then(|part| part.strip_prefix(prefix))
+            .and_then(|number| number.parse::<u32>().ok())
+            .is_some_and(|number| number > 0)
+    }) && parts.next().is_none();
+    if !valid {
+        return Err(invalid_revision_data(
+            "remote export revision directory name is invalid",
+        ));
+    }
+    Ok(retired)
+}
+
+fn try_lock_revision_exporters(paths: &[PathBuf]) -> io::Result<Option<Vec<File>>> {
+    let mut locks = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(lock) = try_lock_existing_exporter(path)? else {
+            return Ok(None);
+        };
+        locks.push(lock);
+    }
+    Ok(Some(locks))
+}
+
+/// Holds every exporter source lock found below one already validated state
+/// subtree. A second bounded scan closes the ordinary create-between-scan
+/// race; callers must retain this guard through rename/removal on Unix. On
+/// Windows they drop it immediately before rename, where the existing lock
+/// handles' lack of DELETE sharing provides the atomic activity fence.
+pub(crate) struct RemoteExporterTreeLocks {
+    _locks: Vec<File>,
+}
+
+pub(crate) fn try_lock_exporter_tree(
+    root: &Path,
+    maximum_entries: usize,
+) -> io::Result<Option<RemoteExporterTreeLocks>> {
+    let Some(paths) = scan_exporter_lock_paths(root, maximum_entries)? else {
+        return Ok(None);
+    };
+    let Some(locks) = try_lock_revision_exporters(&paths)? else {
+        return Ok(None);
+    };
+    let Some(revalidated) = scan_exporter_lock_paths(root, maximum_entries)? else {
+        return Ok(None);
+    };
+    if revalidated != paths {
+        return Ok(None);
+    }
+    Ok(Some(RemoteExporterTreeLocks { _locks: locks }))
+}
+
+fn scan_exporter_lock_paths(
+    root: &Path,
+    maximum_entries: usize,
+) -> io::Result<Option<Vec<PathBuf>>> {
+    validate_revision_directory(root)?;
+    let mut paths = Vec::new();
+    for (index, entry) in WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if index == maximum_entries {
+            return Ok(None);
+        }
+        let entry = entry.map_err(io::Error::other)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        validate_revision_storage_entry(entry.path(), &metadata)?;
+        if metadata.file_type().is_file() && entry.file_name() == EXPORT_LOCK_FILE_NAME {
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+    validate_revision_directory(root)?;
+    paths.sort();
+    paths.dedup();
+    Ok(Some(paths))
+}
+
+fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<File>> {
+    let before = fs::symlink_metadata(path)?;
+    validate_revision_storage_entry(path, &before)?;
+    if !before.file_type().is_file() {
+        return Err(invalid_revision_data(
+            "remote exporter lock is not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    add_revision_nofollow_flags(&mut options);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options.open(path)?;
+    validate_open_revision_lock(path, &file, &before)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    validate_open_revision_lock(path, &file, &before)?;
+    Ok(Some(file))
+}
+
+fn validate_open_revision_lock(path: &Path, file: &File, _before: &fs::Metadata) -> io::Result<()> {
+    let opened = file.metadata()?;
+    validate_revision_storage_entry(path, &opened)?;
+    let current = fs::symlink_metadata(path)?;
+    validate_revision_storage_entry(path, &current)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if _before.dev() != opened.dev()
+            || _before.ino() != opened.ino()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+        {
+            return Err(invalid_revision_data(
+                "remote exporter lock changed while it was being acquired",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    crate::source_identity::validate_windows_private_file(
+        path,
+        file,
+        "remote exporter revision lock",
+    )?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "remote revision GC is unsupported on this platform",
+    ));
+    Ok(())
+}
+
+fn add_revision_nofollow_flags(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn retire_revision_directory(path: &Path) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_revision_data("remote revision has no parent directory"))?;
+    validate_revision_directory(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_revision_data("remote revision name is not UTF-8"))?;
+    if validate_revision_directory_name(name)? {
+        return Ok(path.to_path_buf());
+    }
+    let retired = parent.join(format!(".gc-{name}"));
+    match fs::symlink_metadata(&retired) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a retired remote revision already exists",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(path, &retired)?;
+    validate_revision_directory(&retired)?;
+    validate_revision_directory(parent)?;
+    sync_revision_parent(&retired)?;
+    Ok(retired)
+}
+
+fn validate_revision_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if revision_metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+        return Err(invalid_revision_data(
+            "remote export revision path is not a private directory",
+        ));
+    }
+    validate_revision_storage_entry(path, &metadata)
+}
+
+fn validate_revision_storage_entry(_path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if revision_metadata_is_link_or_reparse(metadata)
+        || !(metadata.file_type().is_dir() || metadata.file_type().is_file())
+    {
+        return Err(invalid_revision_data(
+            "remote export revision contains a link or special entry",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // SAFETY: geteuid has no preconditions and retains no pointers.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote export revision entry is not private to the current user",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if metadata.file_type().is_dir() {
+        crate::source_identity::validate_windows_private_directory(
+            _path,
+            "remote export revision directory",
+        )?;
+    }
+    #[cfg(windows)]
+    if metadata.file_type().is_file() {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        add_revision_nofollow_flags(&mut options);
+        let file = options.open(_path)?;
+        crate::source_identity::validate_windows_private_file(
+            _path,
+            &file,
+            "remote export revision file",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revision_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn revision_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn revision_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn windows_revision_path_is_busy(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(unix)]
+fn sync_revision_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_revision_data("remote revision path has no parent"))?;
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_revision_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn invalid_revision_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
 /// Probe the exact revision-bound exporter namespace used by Delta requests,
 /// rather than only the source-identity parent directory.
 pub(crate) fn probe_remote_export_state_writable(
@@ -681,6 +1216,187 @@ mod tests {
             SourceIdentityStore::at_path(directory.path().join("state/source-identity.json"));
         let identity = store.load_or_create().unwrap();
         (directory, config, store, identity, now)
+    }
+
+    fn revision_variant(offset: u32) -> ProtocolRevisions {
+        let mut revisions = current_revisions();
+        revisions.metric = NonZeroU32::new(revisions.metric.get() + offset).unwrap();
+        revisions
+    }
+
+    fn create_revision_state(
+        store: &SourceIdentityStore,
+        identity: &SourceIdentity,
+        revisions: &ProtocolRevisions,
+        observed_at: DateTime<Utc>,
+    ) -> PathBuf {
+        let root = revision_bound_state_root(store, revisions).unwrap();
+        drop(try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Shared).unwrap());
+        let state = RemoteExportStateStore::new(
+            root.clone(),
+            source_generation(identity),
+            RedactionProfile::Redacted,
+        );
+        drop(state.try_begin(observed_at).unwrap());
+        root
+    }
+
+    fn future_after_revision_grace(paths: &[PathBuf]) -> SystemTime {
+        let newest = paths
+            .iter()
+            .flat_map(|path| {
+                WalkDir::new(path)
+                    .follow_links(false)
+                    .into_iter()
+                    .map(|entry| {
+                        fs::symlink_metadata(entry.unwrap().path())
+                            .unwrap()
+                            .modified()
+                            .unwrap()
+                    })
+            })
+            .max()
+            .unwrap();
+        newest
+            .checked_add(OLD_REVISION_GRACE)
+            .and_then(|time| time.checked_add(StdDuration::from_secs(1)))
+            .unwrap()
+    }
+
+    fn create_private_test_tree(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut current = Some(path);
+            while let Some(directory) = current {
+                if directory.ends_with("remote-export-revisions-v2") {
+                    break;
+                }
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+                current = directory.parent();
+            }
+        }
+    }
+
+    #[test]
+    fn revision_gc_never_removes_the_current_tuple() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let revisions = current_revisions();
+        let current = create_revision_state(&store, &identity, &revisions, now);
+        let future = future_after_revision_grace(std::slice::from_ref(&current));
+
+        sweep_old_revision_state(&store, &revisions, future).unwrap();
+
+        assert!(current.exists());
+    }
+
+    #[test]
+    fn revision_gc_retires_expired_state_and_finishes_crash_retirement() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let old = create_revision_state(&store, &identity, &revision_variant(1), now);
+        let future = future_after_revision_grace(std::slice::from_ref(&old));
+
+        let retired = retire_revision_directory(&old).unwrap();
+        assert!(!old.exists());
+        assert!(retired.exists());
+        sweep_old_revision_state(&store, &current, future).unwrap();
+
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn revision_gc_skips_an_active_revision_fence() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let old = create_revision_state(&store, &identity, &revision_variant(1), now);
+        let future = future_after_revision_grace(std::slice::from_ref(&old));
+        let _active = try_acquire_revision_fence(&old, RemoteRevisionFenceMode::Shared).unwrap();
+
+        sweep_old_revision_state(&store, &current, future).unwrap();
+
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn revision_gc_skips_an_active_child_exporter_lock() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let revisions = revision_variant(1);
+        let old = revision_bound_state_root(&store, &revisions).unwrap();
+        let state = RemoteExportStateStore::new(
+            old.clone(),
+            source_generation(&identity),
+            RedactionProfile::PreviewEnabled,
+        );
+        let active = state.try_begin(now).unwrap();
+        let future = future_after_revision_grace(std::slice::from_ref(&old));
+
+        sweep_old_revision_state(&store, &current, future).unwrap();
+
+        assert!(old.exists());
+        drop(active);
+    }
+
+    #[test]
+    fn revision_gc_never_uses_capacity_to_bypass_the_legacy_grace() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let roots = (1..=u32::try_from(MAX_RETAINED_OLD_REVISIONS + 1).unwrap())
+            .map(|offset| {
+                let root = revision_bound_state_root(&store, &revision_variant(offset)).unwrap();
+                let state = RemoteExportStateStore::new(
+                    root.clone(),
+                    source_generation(&identity),
+                    RedactionProfile::Redacted,
+                );
+                drop(state.try_begin(now).unwrap());
+                assert!(!root.join(REVISION_FENCE_LOCK_FILE_NAME).exists());
+                root
+            })
+            .collect::<Vec<_>>();
+
+        sweep_old_revision_state(&store, &current, SystemTime::now()).unwrap();
+
+        assert!(roots.iter().all(|root| root.exists()));
+    }
+
+    #[test]
+    fn revision_gc_protects_a_fresh_frozen_continuation_under_capacity_pressure() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let roots = (1..=u32::try_from(MAX_RETAINED_OLD_REVISIONS + 1).unwrap())
+            .map(|offset| create_revision_state(&store, &identity, &revision_variant(offset), now))
+            .collect::<Vec<_>>();
+        let protected = roots[0]
+            .join(FACT_BATCH_NAMESPACE)
+            .join("t-a44fe4c93f7307987391ecf96f80f74f7ad59d70423f46182ad294e99aa6a467")
+            .join("retention-35")
+            .join("snapshot")
+            .join("fact-snapshot-live");
+        create_private_test_tree(&protected);
+
+        sweep_old_revision_state(&store, &current, SystemTime::now()).unwrap();
+
+        assert!(roots[0].exists());
+        assert!(protected.exists());
+    }
+
+    #[test]
+    fn revision_gc_deletion_limit_converges_across_requests() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let current = current_revisions();
+        let roots = (1..=4)
+            .map(|offset| create_revision_state(&store, &identity, &revision_variant(offset), now))
+            .collect::<Vec<_>>();
+        let future = future_after_revision_grace(&roots);
+
+        sweep_old_revision_state(&store, &current, future).unwrap();
+        assert_eq!(roots.iter().filter(|root| root.exists()).count(), 2);
+        sweep_old_revision_state(&store, &current, future).unwrap();
+        assert!(roots.iter().all(|root| !root.exists()));
     }
 
     #[test]
@@ -828,6 +1544,13 @@ mod tests {
             .unwrap()
             .replace("gpt-5.6-sol", &"x".repeat(257));
         fs::write(rollout, invalid).unwrap();
+        let revision_root = revision_bound_state_root(&store, &revisions).unwrap();
+        create_private_test_tree(
+            &revision_root
+                .parent()
+                .unwrap()
+                .join("invalid-revision-that-must-not-be-scanned"),
+        );
 
         let mut continuation = request(now);
         continuation.delta_cursor = Some(prefix_page.next_delta_cursor);

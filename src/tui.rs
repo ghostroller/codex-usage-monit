@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
 use std::io::{self, IsTerminal, Stdout, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
@@ -117,6 +119,7 @@ use crate::remote_sync_health::{
 use crate::remote_transport::TuiProcessTreeInheritanceContract;
 use crate::remotes_config::{
     DEFAULT_REMOTE_AGENT_EXECUTABLE, RemotesConfig, RemotesConfigMutation, RemotesConfigStore,
+    TryLoadRemotesConfig, validate_remote_host_input,
 };
 use crate::rollout::RolloutCache;
 use crate::service::{
@@ -177,6 +180,7 @@ const REMOTE_LIVE_STALE_AFTER: ChronoDuration = ChronoDuration::minutes(15);
 const ACCOUNT_REFRESH: Duration = Duration::from_secs(45);
 const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(5), Duration::from_secs(10)];
+const REFRESH_WORKER_PANIC_RETRY: Duration = Duration::from_secs(5);
 const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
@@ -195,10 +199,8 @@ const RESUME_CONFIRM_MIN_INNER_WIDTH: u16 = 44;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const TUI_HISTORY_PROFILE_BUSY_WARNING: &str =
     "history persistence is read-only because another redaction profile is active";
-const REMOTE_EDITOR_MAX_HOST_ID_BYTES: usize = 64;
-const REMOTE_EDITOR_MAX_SSH_HOST_BYTES: usize = 255;
-const REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES: usize = 512;
 const REMOTE_SOURCE_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const REMOTE_CONFIG_BUSY_RETRY: Duration = Duration::from_millis(250);
 
 enum TuiHistoryBackend {
     Runtime(Box<HistoryRuntime>),
@@ -208,6 +210,13 @@ enum TuiHistoryBackend {
 enum TuiHistoryRuntimePreparation {
     Ready(Vec<String>),
     LegacyFallback(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredTuiHistoryPreparation {
+    AlreadyPrepared,
+    Ready,
+    LegacyFallback,
 }
 
 #[derive(Debug, Default)]
@@ -253,11 +262,14 @@ struct TuiHistoryProjectionCache {
 struct TuiHistoryStore {
     backend: TuiHistoryBackend,
     profile_lease: Option<HistoryProfileLeaseGuard>,
+    runtime_preparation_pending: bool,
     setup_warnings: Vec<String>,
     last_runtime_load_at: Option<Instant>,
     projection_cache: Option<TuiHistoryProjectionCache>,
     #[cfg(test)]
     projection_cache_delivery_clones: usize,
+    #[cfg(test)]
+    deferred_runtime_preparation_hook: Option<Box<dyn FnOnce() + Send>>,
     remote_overview_cache: TuiRemoteOverviewCache,
 }
 
@@ -278,26 +290,96 @@ impl TuiHistoryStore {
         Self {
             backend: TuiHistoryBackend::Runtime(Box::new(runtime)),
             profile_lease,
+            runtime_preparation_pending: false,
             setup_warnings,
             last_runtime_load_at: None,
             projection_cache: None,
             #[cfg(test)]
             projection_cache_delivery_clones: 0,
+            #[cfg(test)]
+            deferred_runtime_preparation_hook: None,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
+    }
+
+    fn deferred_runtime(runtime: HistoryRuntime, profile_lease: HistoryProfileLeaseGuard) -> Self {
+        let mut store = Self::runtime(runtime, Some(profile_lease), Vec::new());
+        store.runtime_preparation_pending = true;
+        store
     }
 
     fn legacy_fallback(store: HistoryStore, setup_warnings: Vec<String>) -> Self {
         Self {
             backend: TuiHistoryBackend::LegacyFallback(Box::new(store)),
             profile_lease: None,
+            runtime_preparation_pending: false,
             setup_warnings,
             last_runtime_load_at: None,
             projection_cache: None,
             #[cfg(test)]
             projection_cache_delivery_clones: 0,
+            #[cfg(test)]
+            deferred_runtime_preparation_hook: None,
             remote_overview_cache: TuiRemoteOverviewCache::default(),
         }
+    }
+
+    fn prepare_deferred_runtime(
+        &mut self,
+        codex_home: &Path,
+        redact_content: bool,
+        now: DateTime<Utc>,
+    ) -> DeferredTuiHistoryPreparation {
+        if !self.runtime_preparation_pending {
+            return DeferredTuiHistoryPreparation::AlreadyPrepared;
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.deferred_runtime_preparation_hook.take() {
+            hook();
+        }
+
+        let fallback_root = match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime
+                .legacy_history()
+                .history_root()
+                .map(Path::to_path_buf),
+            TuiHistoryBackend::LegacyFallback(_) => None,
+        };
+        let preparation = match (&mut self.backend, self.profile_lease.as_ref()) {
+            (TuiHistoryBackend::Runtime(runtime), Some(profile_lease)) => {
+                prepare_tui_history_runtime(runtime, profile_lease, now)
+            }
+            _ => {
+                self.runtime_preparation_pending = false;
+                return DeferredTuiHistoryPreparation::AlreadyPrepared;
+            }
+        };
+        self.runtime_preparation_pending = false;
+        match preparation {
+            TuiHistoryRuntimePreparation::Ready(warnings) => {
+                self.setup_warnings.extend(warnings);
+                DeferredTuiHistoryPreparation::Ready
+            }
+            TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+                let legacy = fallback_root.map_or_else(
+                    || HistoryStore::discover_with_redaction(codex_home, redact_content),
+                    |history_root| {
+                        HistoryStore::new_with_redaction(history_root, codex_home, redact_content)
+                    },
+                );
+                self.backend = TuiHistoryBackend::LegacyFallback(Box::new(legacy));
+                self.profile_lease = None;
+                self.setup_warnings.extend(warnings);
+                self.invalidate_projection_cache();
+                DeferredTuiHistoryPreparation::LegacyFallback
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_deferred_runtime_preparation_hook(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.deferred_runtime_preparation_hook = Some(Box::new(hook));
     }
 
     fn legacy_history(&self) -> &HistoryStore {
@@ -421,18 +503,31 @@ impl TuiHistoryStore {
         }
     }
 
+    fn ui_source_state(&mut self) -> TuiHistorySourceState {
+        TuiHistorySourceState {
+            local_source_id: self.local_source_id(),
+            remote_sources: self.remote_history_sources(),
+            source_history_store: self.source_history_store(),
+        }
+    }
+
     fn merge_setup_warnings(&self, history: &mut HistoryData) {
         history.warnings.extend(self.setup_warnings.iter().cloned());
     }
 
     fn write_permitted(&self) -> bool {
-        matches!(&self.backend, TuiHistoryBackend::Runtime(_)) && self.profile_lease.is_some()
+        !self.runtime_preparation_pending
+            && matches!(&self.backend, TuiHistoryBackend::Runtime(_))
+            && self.profile_lease.is_some()
     }
 
     /// Revalidates the process-lifetime profile selection immediately before
     /// every runtime write. A replaced lock/marker must fail closed even when
     /// the TUI acquired a valid lease at startup.
     fn validate_runtime_write_authority(&mut self) -> io::Result<bool> {
+        if self.runtime_preparation_pending {
+            return Ok(false);
+        }
         if !matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
             return Ok(true);
         }
@@ -665,9 +760,7 @@ impl TuiHistoryStore {
     }
 
     fn clone_cached_projection(&mut self) -> Option<TuiHistoryProjection> {
-        if self.projection_cache.is_none() {
-            return None;
-        }
+        self.projection_cache.as_ref()?;
         #[cfg(test)]
         {
             self.projection_cache_delivery_clones =
@@ -1037,13 +1130,13 @@ fn wait_for_terminal_event(
         if monitor.wait(Duration::ZERO)? == TerminalEventWait::Disconnected {
             return Ok(TerminalEventWait::Disconnected);
         }
-        return event::poll(Duration::ZERO).map(|ready| {
+        event::poll(Duration::ZERO).map(|ready| {
             if ready {
                 TerminalEventWait::Ready
             } else {
                 TerminalEventWait::TimedOut
             }
-        });
+        })
     }
 
     #[cfg(not(unix))]
@@ -2583,9 +2676,67 @@ struct RefreshCompletion {
     remote_live: Option<Result<Vec<SourceRemoteLiveSnapshot>, String>>,
     remote_overview_history: Option<Result<RemoteOverviewHistory, String>>,
     history: Option<HistoryRefreshCompletion>,
+    history_source_state: Option<TuiHistorySourceState>,
     recorder_health: Option<RecorderHealth>,
     refreshed_account: bool,
     summary_backfill: bool,
+    worker_failure: Option<RefreshWorkerFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshWorkerFailure {
+    Initial,
+    HistorySourceQuery,
+    SummaryBackfill,
+    AccountRefresh,
+    LocalRefresh,
+}
+
+impl RefreshWorkerFailure {
+    fn warning(self) -> &'static str {
+        match self {
+            Self::Initial => "initial refresh worker panicked; retrying after backoff",
+            Self::HistorySourceQuery => {
+                "history source query worker panicked; select the source again to retry"
+            }
+            Self::SummaryBackfill => "30-day summary backfill worker panicked; retry deferred",
+            Self::AccountRefresh => "account refresh worker panicked; retrying after backoff",
+            Self::LocalRefresh => "local refresh worker panicked; retrying after backoff",
+        }
+    }
+}
+
+fn refresh_worker_panic_completion(failure: RefreshWorkerFailure) -> RefreshCompletion {
+    RefreshCompletion {
+        result: None,
+        remote_live: None,
+        remote_overview_history: None,
+        history: None,
+        history_source_state: None,
+        recorder_health: None,
+        refreshed_account: false,
+        summary_backfill: failure == RefreshWorkerFailure::SummaryBackfill,
+        worker_failure: Some(failure),
+    }
+}
+
+fn send_refresh_completion_catching_panics<Work, OnPanic>(
+    sender: &mpsc::Sender<RefreshCompletion>,
+    work: Work,
+    on_panic: OnPanic,
+) where
+    Work: FnOnce() -> RefreshCompletion,
+    OnPanic: FnOnce() -> RefreshCompletion,
+{
+    let completion =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| on_panic());
+    let _ = sender.send(completion);
+}
+
+struct TuiHistorySourceState {
+    local_source_id: Option<NodeId>,
+    remote_sources: Vec<(NodeId, String)>,
+    source_history_store: Option<SourceHistoryStore>,
 }
 
 #[derive(Clone, Debug)]
@@ -2828,6 +2979,15 @@ enum RemoteActionProcessTarget {
 
 impl RemoteActionProcessTarget {
     fn terminate(self) -> io::Result<()> {
+        self.terminate_inner(false)
+    }
+
+    #[cfg(unix)]
+    fn terminate_after_observed_exit(self) -> io::Result<()> {
+        self.terminate_inner(true)
+    }
+
+    fn terminate_inner(self, leader_exit_observed: bool) -> io::Result<()> {
         #[cfg(unix)]
         let Self::ProcessGroup(process_group) = self;
         #[cfg(unix)]
@@ -2838,6 +2998,14 @@ impl RemoteActionProcessTarget {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
                 Ok(())
+            } else if cfg!(target_vendor = "apple")
+                && leader_exit_observed
+                && error.raw_os_error() == Some(libc::EPERM)
+            {
+                // Darwin reports EPERM when an unreaped group leader is the
+                // group's only remaining member. This is safe only after
+                // waitid(WNOWAIT) established that the retained leader exited.
+                Ok(())
             } else {
                 Err(error)
             }
@@ -2847,6 +3015,7 @@ impl RemoteActionProcessTarget {
         let Self::Job(job) = self;
         #[cfg(windows)]
         {
+            let _ = leader_exit_observed;
             let job = job as HANDLE;
             if unsafe { TerminateJobObject(job, 1) } != 0 {
                 Ok(())
@@ -2857,6 +3026,7 @@ impl RemoteActionProcessTarget {
 
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = leader_exit_observed;
             let _ = self;
             Ok(())
         }
@@ -3198,6 +3368,7 @@ struct App {
     // contaminate unrelated local/account quality.
     local_snapshot_partial: bool,
     last_remote_source_metadata_reload: Option<Instant>,
+    remote_config_retry_not_before: Option<Instant>,
     remote_health_store: Option<RemoteSyncHealthStore>,
     remote_bandwidth_store: Option<RemoteBandwidthBudgetStore>,
     pending_remote_action: Option<RemoteUiActionRequest>,
@@ -3272,6 +3443,7 @@ struct App {
     /// the terminal has already rendered.
     initial_bootstrap_pending: bool,
     worker_running: bool,
+    refresh_retry_not_before: Option<Instant>,
     startup_progress_tracker: Option<StartupLoadProgressTracker>,
     startup_progress: StartupLoadProgress,
     startup_progress_last_redraw: Instant,
@@ -3336,6 +3508,7 @@ impl App {
             trusted_remote_parent_edges: HashSet::new(),
             local_snapshot_partial,
             last_remote_source_metadata_reload: None,
+            remote_config_retry_not_before: None,
             remote_health_store: discover_remote_sync_health_store(),
             remote_bandwidth_store: discover_remote_bandwidth_budget_store(),
             pending_remote_action: None,
@@ -3405,6 +3578,7 @@ impl App {
             turn_reveal_pending: false,
             initial_bootstrap_pending: false,
             worker_running: false,
+            refresh_retry_not_before: None,
             startup_progress_tracker: None,
             startup_progress: StartupLoadProgress::default(),
             startup_progress_last_redraw: Instant::now(),
@@ -3416,6 +3590,12 @@ impl App {
 
     fn account_refresh_due(&self, now: Instant) -> bool {
         now >= self.next_account_refresh
+    }
+
+    fn refresh_retry_wait(&self, now: Instant) -> Option<Duration> {
+        self.refresh_retry_not_before
+            .map(|retry_not_before| retry_not_before.saturating_duration_since(now))
+            .filter(|wait| !wait.is_zero())
     }
 
     fn attach_startup_progress(&mut self, tracker: StartupLoadProgressTracker) {
@@ -3484,17 +3664,26 @@ impl App {
             self.account_refresh_retry_count = 0;
             ACCOUNT_REFRESH
         } else {
-            let delay = ACCOUNT_REFRESH_RETRY_DELAYS
-                .get(self.account_refresh_retry_count)
-                .copied()
-                .unwrap_or(ACCOUNT_REFRESH);
-            self.account_refresh_retry_count = self
-                .account_refresh_retry_count
-                .saturating_add(1)
-                .min(ACCOUNT_REFRESH_RETRY_DELAYS.len());
-            delay
+            self.next_account_refresh_retry_delay()
         };
         self.next_account_refresh = now.checked_add(delay).unwrap_or(now);
+    }
+
+    fn schedule_account_refresh_retry(&mut self, now: Instant) {
+        let delay = self.next_account_refresh_retry_delay();
+        self.next_account_refresh = now.checked_add(delay).unwrap_or(now);
+    }
+
+    fn next_account_refresh_retry_delay(&mut self) -> Duration {
+        let delay = ACCOUNT_REFRESH_RETRY_DELAYS
+            .get(self.account_refresh_retry_count)
+            .copied()
+            .unwrap_or(ACCOUNT_REFRESH);
+        self.account_refresh_retry_count = self
+            .account_refresh_retry_count
+            .saturating_add(1)
+            .min(ACCOUNT_REFRESH_RETRY_DELAYS.len());
+        delay
     }
 
     fn apply_ui_state(&mut self, state: &UiState, theme_override: Option<Theme>) {
@@ -4336,7 +4525,10 @@ impl App {
     }
 
     fn request_history_source(&mut self, selection: HistorySourceSelection) {
-        if selection == self.history_source_selection && !self.history_source_loading {
+        if selection == self.history_source_selection
+            && !self.history_source_loading
+            && self.history_source_query_error.is_none()
+        {
             return;
         }
         self.history_source_selection = selection;
@@ -4712,12 +4904,15 @@ impl App {
             || self.last_remote_source_metadata_reload.is_none_or(|last| {
                 now.saturating_duration_since(last) >= REMOTE_SOURCE_METADATA_REFRESH_INTERVAL
             });
-        let mut reloaded = load_remote_sources_state(
+        let (mut reloaded, config_busy) = load_remote_sources_state(
             &self.remote_config_store,
             self.remote_health_store.as_ref(),
             self.remote_bandwidth_store.as_ref(),
+            self.remote_sources.config.as_ref(),
             Utc::now(),
         );
+        self.remote_config_retry_not_before =
+            config_busy.then(|| now.checked_add(REMOTE_CONFIG_BUSY_RETRY).unwrap_or(now));
         if refresh_history {
             (reloaded.history_sources, reloaded.history_error) =
                 load_remote_history_sources(self.remote_source_history_store.as_ref());
@@ -4765,6 +4960,16 @@ impl App {
                 .min(self.settings_selection_count().saturating_sub(1));
         }
         changed
+    }
+
+    fn retry_remote_config_if_due(&mut self, now: Instant) -> bool {
+        if self
+            .remote_config_retry_not_before
+            .is_none_or(|retry_at| now < retry_at)
+        {
+            return false;
+        }
+        self.reload_remote_sources()
     }
 
     fn update_remote_config(&mut self, mutation: RemotesConfigMutation, label: &str) {
@@ -5012,46 +5217,7 @@ impl App {
     }
 
     fn validate_remote_editor(&self, editor: &RemoteEditorState) -> Result<(), String> {
-        if editor.host_id.is_empty() || editor.host_id.len() > REMOTE_EDITOR_MAX_HOST_ID_BYTES {
-            return Err(format!(
-                "Host ID must contain 1-{REMOTE_EDITOR_MAX_HOST_ID_BYTES} bytes"
-            ));
-        }
-        let bytes = editor.host_id.as_bytes();
-        if !bytes[0].is_ascii_alphanumeric()
-            || bytes
-                .iter()
-                .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
-        {
-            return Err("Host ID must use ASCII letters, digits, '-' or '_'".to_owned());
-        }
-        if editor.ssh_host.is_empty() || editor.ssh_host.len() > REMOTE_EDITOR_MAX_SSH_HOST_BYTES {
-            return Err(format!(
-                "SSH alias must contain 1-{REMOTE_EDITOR_MAX_SSH_HOST_BYTES} bytes"
-            ));
-        }
-        if editor.ssh_host.starts_with('-')
-            || editor.ssh_host.chars().any(char::is_control)
-            || editor.ssh_host.chars().any(char::is_whitespace)
-        {
-            return Err("SSH alias must not start with '-' or contain whitespace".to_owned());
-        }
-        if editor.agent_executable.is_empty()
-            || editor.agent_executable.len() > REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES
-        {
-            return Err(format!(
-                "Agent executable must contain 1-{REMOTE_EDITOR_MAX_AGENT_EXECUTABLE_BYTES} bytes"
-            ));
-        }
-        if editor.agent_executable.bytes().any(|byte| {
-            !byte.is_ascii_alphanumeric()
-                && !matches!(byte, b'/' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
-        }) {
-            return Err(
-                "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
-                    .to_owned(),
-            );
-        }
+        validate_remote_host_input(&editor.host_id, &editor.ssh_host, &editor.agent_executable)?;
         let current = self.remote_config_store.load().map_err(|error| {
             format!("Remote config unavailable ({})", io_error_category(&error))
         })?;
@@ -5979,6 +6145,7 @@ impl App {
             self.startup_progress = tracker.snapshot();
         }
         self.worker_running = false;
+        self.refresh_retry_not_before = None;
         let now = Instant::now();
         self.last_local_refresh = if force_local_materialization {
             now.checked_sub(LOCAL_REFRESH).unwrap_or(now)
@@ -6109,8 +6276,79 @@ impl App {
         true
     }
 
+    fn record_refresh_worker_failure(
+        &mut self,
+        failure: RefreshWorkerFailure,
+        now: Instant,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
+        fn push_warning(snapshot: &mut Snapshot, warning: &str) {
+            snapshot.partial = true;
+            if !snapshot
+                .warnings
+                .iter()
+                .any(|candidate| candidate == warning)
+            {
+                snapshot.warnings.push(warning.to_owned());
+                snapshot.warnings.sort();
+                snapshot.warnings.dedup();
+            }
+        }
+
+        let warning = terminal_safe_text(failure.warning());
+        push_warning(&mut self.snapshot, &warning);
+        push_warning(&mut self.local_snapshot, &warning);
+        self.local_snapshot_partial = true;
+        self.refresh_retry_not_before =
+            Some(now.checked_add(REFRESH_WORKER_PANIC_RETRY).unwrap_or(now));
+
+        match failure {
+            RefreshWorkerFailure::Initial => {
+                // The initial worker owns deferred history activation and source
+                // enumeration as well as the first local snapshot. A panic can
+                // happen before either step is published, so retain the whole
+                // bootstrap operation for a bounded automatic retry instead of
+                // falling through to an ordinary local/account refresh.
+                self.initial_bootstrap_pending = true;
+                self.history_source_loading = false;
+                self.history_source_query_pending = false;
+                self.history_source_status = None;
+                self.history_source_query_error = Some(warning);
+            }
+            RefreshWorkerFailure::HistorySourceQuery => {
+                self.history_source_loading = false;
+                self.history_source_query_pending = false;
+                self.history_source_status = None;
+                self.history_source_query_error = Some(warning);
+            }
+            RefreshWorkerFailure::SummaryBackfill => {
+                self.summary_backfill_pending = false;
+                self.summary_backfill_running = false;
+                self.history.summary_backfill_attempted_at = Some(observed_at);
+                self.history.summary_backfill_attempt_complete = Some(false);
+                if !self
+                    .history
+                    .warnings
+                    .iter()
+                    .any(|candidate| candidate == &warning)
+                {
+                    self.history.warnings.push(warning);
+                    self.history.warnings.sort();
+                    self.history.warnings.dedup();
+                }
+                self.summary_cache = None;
+            }
+            RefreshWorkerFailure::AccountRefresh => {
+                self.schedule_account_refresh_retry(now);
+            }
+            RefreshWorkerFailure::LocalRefresh => {}
+        }
+        true
+    }
+
     fn finish_unchanged_refresh(&mut self) {
         self.worker_running = false;
+        self.refresh_retry_not_before = None;
         self.last_local_refresh = Instant::now();
     }
 
@@ -8304,12 +8542,14 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     let result = run_loop(
         &mut terminal,
         &mut app,
-        &config,
-        &context,
-        rollout_cache,
-        Arc::clone(&history_store),
-        &ui_state_store,
-        &terminal_input,
+        RunLoopResources {
+            config: &config,
+            context: &context,
+            rollout_cache,
+            history_store: Arc::clone(&history_store),
+            ui_state_store: &ui_state_store,
+            terminal_input: &terminal_input,
+        },
     );
     let cursor_result = terminal.show_cursor();
     drop(guard);
@@ -8418,29 +8658,18 @@ fn prepare_deferred_initial_tui(
         "kind=in_memory"
     });
 
-    // Runtime discovery/lease acquisition is bounded metadata work. The
-    // expensive projection scan, staging flush, remote overview load, and
-    // rollout parse all run in the refresh worker after the first frame.
+    // Runtime discovery and the non-blocking profile lease are the only
+    // history work allowed before the first frame. Ownership activation,
+    // migration, source enumeration, projection scans, staging flushes, and
+    // remote overview loading all run in the deferred refresh worker.
     let history_span = config.startup_trace.span("tui.history_prepare");
-    let mut history_store = prepare_tui_history_store(config);
-    let local_source_id = history_store.local_source_id();
-    let remote_history_sources = history_store.remote_history_sources();
-    let remote_source_history_store = history_store.source_history_store();
-    history_span.finish_with(|| {
-        format!(
-            "local_source={} remote_sources={}",
-            local_source_id.is_some(),
-            remote_history_sources.len()
-        )
-    });
+    let history_store = prepare_tui_history_store(config);
+    history_span.finish("activation=deferred");
 
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial_loading_result(config), initial_theme);
     app.attach_startup_progress(startup_progress);
-    app.history_local_source_id = local_source_id;
-    app.history_remote_sources = remote_history_sources;
-    app.remote_source_history_store = remote_source_history_store;
     app.local_redact_content = config.redact_content;
     app.reload_remote_sources();
     app.apply_ui_state(&ui_state, theme_override);
@@ -8473,23 +8702,8 @@ fn prepare_deferred_initial_tui(
 
 fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
     match HistoryRuntime::discover(&config.codex_home, config.redact_content) {
-        Ok(mut runtime) => match acquire_tui_history_profile_lease(&runtime) {
-            Ok(profile_lease) => {
-                match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
-                    TuiHistoryRuntimePreparation::Ready(warnings) => {
-                        TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings)
-                    }
-                    TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-                        TuiHistoryStore::legacy_fallback(
-                            HistoryStore::discover_with_redaction(
-                                &config.codex_home,
-                                config.redact_content,
-                            ),
-                            warnings,
-                        )
-                    }
-                }
-            }
+        Ok(runtime) => match acquire_tui_history_profile_lease(&runtime) {
+            Ok(profile_lease) => TuiHistoryStore::deferred_runtime(runtime, profile_lease),
             Err(error) => TuiHistoryStore::runtime(
                 runtime,
                 None,
@@ -9153,6 +9367,15 @@ pub fn debug_startup(
 }
 
 fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> bool {
+    apply_refresh_completion_at(app, completion, Instant::now(), Utc::now())
+}
+
+fn apply_refresh_completion_at(
+    app: &mut App,
+    completion: RefreshCompletion,
+    now: Instant,
+    observed_at: DateTime<Utc>,
+) -> bool {
     let mut refresh_changed = false;
     if completion.summary_backfill {
         app.summary_backfill_running = false;
@@ -9166,6 +9389,13 @@ fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> boo
     if let Some(history) = completion.history
         && app.apply_history_projection(history.generation, history.projection)
     {
+        refresh_changed = true;
+    }
+    if let Some(source_state) = completion.history_source_state {
+        app.history_local_source_id = source_state.local_source_id;
+        app.history_remote_sources = source_state.remote_sources;
+        app.remote_source_history_store = source_state.source_history_store;
+        app.last_remote_source_metadata_reload = None;
         refresh_changed = true;
     }
     if let Some(recorder_health) = completion.recorder_health {
@@ -9184,20 +9414,35 @@ fn apply_refresh_completion(app: &mut App, completion: RefreshCompletion) -> boo
             Err(error) => app.record_remote_overview_history_load_error(error),
         };
     }
+    if let Some(failure) = completion.worker_failure {
+        refresh_changed |= app.record_refresh_worker_failure(failure, now, observed_at);
+    }
     refresh_changed |= app.reload_remote_sources();
     refresh_changed
+}
+
+struct RunLoopResources<'a> {
+    config: &'a CollectConfig,
+    context: &'a RunLoopContext<'a>,
+    rollout_cache: Arc<Mutex<RolloutCache>>,
+    history_store: Arc<Mutex<TuiHistoryStore>>,
+    ui_state_store: &'a UiStateStore,
+    terminal_input: &'a TerminalInputMonitor,
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
-    config: &CollectConfig,
-    context: &RunLoopContext<'_>,
-    rollout_cache: Arc<Mutex<RolloutCache>>,
-    history_store: Arc<Mutex<TuiHistoryStore>>,
-    ui_state_store: &UiStateStore,
-    terminal_input: &TerminalInputMonitor,
+    resources: RunLoopResources<'_>,
 ) -> Result<()> {
+    let RunLoopResources {
+        config,
+        context,
+        rollout_cache,
+        history_store,
+        ui_state_store,
+        terminal_input,
+    } = resources;
     let mut first_frame = true;
     let mut redraw_reasons = RedrawReasons::default();
     let mut refresh_worker = RefreshWorker::default();
@@ -9230,6 +9475,9 @@ fn run_loop(
         }
         if app.poll_startup_progress(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::PROGRESS);
+        }
+        if app.retry_remote_config_if_due(Instant::now()) {
+            redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
 
         if first_frame {
@@ -9359,6 +9607,27 @@ fn collect_initial_refresh_completion(
             history_source_scope_label(history_source_selection),
         )
     });
+    if let Some(progress) = startup_progress {
+        progress.set_stage(StartupLoadStage::LoadingHistory);
+    }
+    let activation_span = config.startup_trace.span("tui.history_activate");
+    let (history_preparation, history_source_state) = {
+        let mut history_store = history_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preparation = history_store.prepare_deferred_runtime(
+            &config.codex_home,
+            config.redact_content,
+            Utc::now(),
+        );
+        let source_state = history_store.ui_source_state();
+        (preparation, source_state)
+    };
+    activation_span.finish(match history_preparation {
+        DeferredTuiHistoryPreparation::AlreadyPrepared => "status=already_prepared",
+        DeferredTuiHistoryPreparation::Ready => "status=ready",
+        DeferredTuiHistoryPreparation::LegacyFallback => "status=legacy_fallback",
+    });
     // Initial data-ready is deliberately local-only. A cold or temporarily
     // unavailable network account RPC must not hold the first useful TUI
     // snapshot behind its network-backed RPC deadline. `App::new` leaves
@@ -9390,9 +9659,6 @@ fn collect_initial_refresh_completion(
     });
 
     let history_observation = collection_history_observation(&result, config.offline);
-    if let Some(progress) = startup_progress {
-        progress.set_stage(StartupLoadStage::LoadingHistory);
-    }
     let history_span = config.startup_trace.span("tui.initial_history");
     let (projection, recorder_health, remote_live, remote_overview_history) = {
         let mut history_store = history_store
@@ -9468,9 +9734,11 @@ fn collect_initial_refresh_completion(
             generation: history_source_generation,
             projection,
         }),
+        history_source_state: Some(history_source_state),
         recorder_health: Some(recorder_health),
         refreshed_account: refresh_account,
         summary_backfill: false,
+        worker_failure: None,
     }
 }
 
@@ -9506,9 +9774,11 @@ fn initial_refresh_panic_completion(config: &CollectConfig) -> RefreshCompletion
         remote_live: None,
         remote_overview_history: None,
         history: None,
+        history_source_state: None,
         recorder_health: None,
         refreshed_account: false,
         summary_backfill: false,
+        worker_failure: Some(RefreshWorkerFailure::Initial),
     }
 }
 
@@ -9524,6 +9794,10 @@ fn start_refresh_if_due(
     if app.worker_running {
         return false;
     }
+    if app.refresh_retry_wait(now).is_some() {
+        return false;
+    }
+    app.refresh_retry_not_before = None;
     if app.initial_bootstrap_pending {
         let worker_config = config.clone();
         let worker_sender = context.refresh_sender.clone();
@@ -9533,20 +9807,24 @@ fn start_refresh_if_due(
         let history_source_selection = app.history_source_selection.clone();
         let startup_progress = app.startup_progress_tracker.clone();
         app.initial_bootstrap_pending = false;
+        app.history_source_loading = true;
+        app.history_source_query_error = None;
         app.worker_running = true;
         refresh_worker.start(thread::spawn(move || {
-            let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                collect_initial_refresh_completion(
-                    &worker_config,
-                    &worker_cache,
-                    &worker_history,
-                    history_source_generation,
-                    &history_source_selection,
-                    startup_progress.as_ref(),
-                )
-            }))
-            .unwrap_or_else(|_| initial_refresh_panic_completion(&worker_config));
-            let _ = worker_sender.send(completion);
+            send_refresh_completion_catching_panics(
+                &worker_sender,
+                || {
+                    collect_initial_refresh_completion(
+                        &worker_config,
+                        &worker_cache,
+                        &worker_history,
+                        history_source_generation,
+                        &history_source_selection,
+                        startup_progress.as_ref(),
+                    )
+                },
+                || initial_refresh_panic_completion(&worker_config),
+            );
         }));
         return true;
     }
@@ -9558,22 +9836,33 @@ fn start_refresh_if_due(
         app.worker_running = true;
         app.history_source_query_pending = false;
         refresh_worker.start(thread::spawn(move || {
-            let projection = worker_history
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .load_since_with_staged_selected(&worker_selection, history_view_since(Utc::now()));
-            let _ = worker_sender.send(RefreshCompletion {
-                result: None,
-                remote_live: None,
-                remote_overview_history: None,
-                history: Some(HistoryRefreshCompletion {
-                    generation,
-                    projection,
-                }),
-                recorder_health: None,
-                refreshed_account: false,
-                summary_backfill: false,
-            });
+            send_refresh_completion_catching_panics(
+                &worker_sender,
+                || {
+                    let projection = worker_history
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .load_since_with_staged_selected(
+                            &worker_selection,
+                            history_view_since(Utc::now()),
+                        );
+                    RefreshCompletion {
+                        result: None,
+                        remote_live: None,
+                        remote_overview_history: None,
+                        history: Some(HistoryRefreshCompletion {
+                            generation,
+                            projection,
+                        }),
+                        history_source_state: None,
+                        recorder_health: None,
+                        refreshed_account: false,
+                        summary_backfill: false,
+                        worker_failure: None,
+                    }
+                },
+                || refresh_worker_panic_completion(RefreshWorkerFailure::HistorySourceQuery),
+            );
         }));
         return true;
     }
@@ -9609,78 +9898,90 @@ fn start_refresh_if_due(
         app.summary_backfill_pending = false;
         app.summary_backfill_running = true;
         refresh_worker.start(thread::spawn(move || {
-            let mut cache = RolloutCache::new();
-            let result = collect_snapshot_cached(&worker_config, None, false, &mut cache);
-            let scan_complete = summary_backfill_scan_complete(&result.snapshot);
-            let CollectionResult {
-                snapshot,
-                account,
-                mut history_observation,
-                local_session_digests,
-            } = result;
-            let observed_at = snapshot.as_of;
-            let tasks = snapshot.tasks.clone();
-            // Summary reconstruction is deliberately local-only. Never let
-            // offline fallback quota/weekly points replace server history.
-            history_observation.quota_points.clear();
-            history_observation.weekly_local_points.clear();
-            retain_summary_backfill_evidence_buckets(&mut history_observation);
-            drop(snapshot);
-            drop(account);
-            drop(cache);
-            let (mut projection, recorder_health) = {
-                let mut history_store = worker_history
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (mut projection, recorder_health) = stage_full_and_load_history_selected(
-                    &mut history_store,
-                    &history_observation,
-                    &tasks,
-                    &local_session_digests,
-                    observed_at,
-                    &worker_config.perf_log,
-                    &history_source_selection,
-                );
-                let coverage_complete =
-                    summary_history_coverage_complete(&projection.history, observed_at);
-                let requested_complete = scan_complete && coverage_complete;
-                match history_store.mark_summary_backfill_attempt(observed_at, requested_complete) {
-                    Ok(marker) => {
-                        projection.history.summary_backfill_attempted_at =
-                            Some(marker.completed_at);
-                        projection.history.summary_backfill_attempt_complete =
-                            Some(marker.complete);
+            send_refresh_completion_catching_panics(
+                &worker_sender,
+                || {
+                    let mut cache = RolloutCache::new();
+                    let result = collect_snapshot_cached(&worker_config, None, false, &mut cache);
+                    let scan_complete = summary_backfill_scan_complete(&result.snapshot);
+                    let CollectionResult {
+                        snapshot,
+                        account,
+                        mut history_observation,
+                        local_session_digests,
+                    } = result;
+                    let observed_at = snapshot.as_of;
+                    let tasks = snapshot.tasks.clone();
+                    // Summary reconstruction is deliberately local-only. Never let
+                    // offline fallback quota/weekly points replace server history.
+                    history_observation.quota_points.clear();
+                    history_observation.weekly_local_points.clear();
+                    retain_summary_backfill_evidence_buckets(&mut history_observation);
+                    drop(snapshot);
+                    drop(account);
+                    drop(cache);
+                    let (mut projection, recorder_health) = {
+                        let mut history_store = worker_history
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let (mut projection, recorder_health) =
+                            stage_full_and_load_history_selected(
+                                &mut history_store,
+                                &history_observation,
+                                &tasks,
+                                &local_session_digests,
+                                observed_at,
+                                &worker_config.perf_log,
+                                &history_source_selection,
+                            );
+                        let coverage_complete =
+                            summary_history_coverage_complete(&projection.history, observed_at);
+                        let requested_complete = scan_complete && coverage_complete;
+                        match history_store
+                            .mark_summary_backfill_attempt(observed_at, requested_complete)
+                        {
+                            Ok(marker) => {
+                                projection.history.summary_backfill_attempted_at =
+                                    Some(marker.completed_at);
+                                projection.history.summary_backfill_attempt_complete =
+                                    Some(marker.complete);
+                            }
+                            Err(error) => {
+                                // Keep an in-memory cooldown even when the durable
+                                // marker cannot be written, otherwise a read-only or
+                                // full state directory would trigger an immediate
+                                // expensive rescan loop.
+                                projection.history.summary_backfill_attempted_at =
+                                    Some(observed_at);
+                                projection.history.summary_backfill_attempt_complete =
+                                    Some(requested_complete);
+                                projection
+                                    .history
+                                    .warnings
+                                    .push(format!("summary backfill marker failed: {error}"));
+                            }
+                        }
+                        (projection, recorder_health)
+                    };
+                    projection.history.warnings.sort();
+                    projection.history.warnings.dedup();
+                    RefreshCompletion {
+                        result: None,
+                        remote_live: None,
+                        remote_overview_history: None,
+                        history: Some(HistoryRefreshCompletion {
+                            generation: history_source_generation,
+                            projection,
+                        }),
+                        history_source_state: None,
+                        recorder_health: Some(recorder_health),
+                        refreshed_account: false,
+                        summary_backfill: true,
+                        worker_failure: None,
                     }
-                    Err(error) => {
-                        // Keep an in-memory cooldown even when the durable
-                        // marker cannot be written, otherwise a read-only or
-                        // full state directory would trigger an immediate
-                        // expensive rescan loop.
-                        projection.history.summary_backfill_attempted_at = Some(observed_at);
-                        projection.history.summary_backfill_attempt_complete =
-                            Some(requested_complete);
-                        projection
-                            .history
-                            .warnings
-                            .push(format!("summary backfill marker failed: {error}"));
-                    }
-                }
-                (projection, recorder_health)
-            };
-            projection.history.warnings.sort();
-            projection.history.warnings.dedup();
-            let _ = worker_sender.send(RefreshCompletion {
-                result: None,
-                remote_live: None,
-                remote_overview_history: None,
-                history: Some(HistoryRefreshCompletion {
-                    generation: history_source_generation,
-                    projection,
-                }),
-                recorder_health: Some(recorder_health),
-                refreshed_account: false,
-                summary_backfill: true,
-            });
+                },
+                || refresh_worker_panic_completion(RefreshWorkerFailure::SummaryBackfill),
+            );
         }));
         return true;
     }
@@ -9694,110 +9995,123 @@ fn start_refresh_if_due(
     let worker_history = Arc::clone(history_store);
     let history_source_generation = app.history_source_generation;
     let history_source_selection = app.history_source_selection.clone();
+    let worker_failure = if account_refresh_due {
+        RefreshWorkerFailure::AccountRefresh
+    } else {
+        RefreshWorkerFailure::LocalRefresh
+    };
     app.worker_running = true;
     refresh_worker.start(thread::spawn(move || {
-        let result = if account_refresh_due {
-            let trace = worker_config
-                .trace_log
-                .span_with("tui.account_refresh", || {
-                    TraceFields::new()
-                        .bool("reuseLocalSnapshot", true)
-                        .usize("cachedTasks", cached_local_snapshot.tasks.len())
-                        .usize("cachedTurns", cached_local_snapshot.turns.len())
-                });
-            let refreshed = collect_account_refresh_for_snapshot(
-                &worker_config,
-                cached_local_snapshot,
-                cached_account,
-            );
-            trace.finish_with(
-                if account_refresh_is_complete(&refreshed) {
-                    TraceOutcome::Ok
+        send_refresh_completion_catching_panics(
+            &worker_sender,
+            || {
+                let result = if account_refresh_due {
+                    let trace = worker_config
+                        .trace_log
+                        .span_with("tui.account_refresh", || {
+                            TraceFields::new()
+                                .bool("reuseLocalSnapshot", true)
+                                .usize("cachedTasks", cached_local_snapshot.tasks.len())
+                                .usize("cachedTurns", cached_local_snapshot.turns.len())
+                        });
+                    let refreshed = collect_account_refresh_for_snapshot(
+                        &worker_config,
+                        cached_local_snapshot,
+                        cached_account,
+                    );
+                    trace.finish_with(
+                        if account_refresh_is_complete(&refreshed) {
+                            TraceOutcome::Ok
+                        } else {
+                            TraceOutcome::Partial
+                        },
+                        || {
+                            TraceFields::new()
+                                .usize("limits", refreshed.snapshot.limits.len())
+                                .usize("tasks", refreshed.snapshot.tasks.len())
+                                .usize("turns", refreshed.snapshot.turns.len())
+                                .bool("rolloutScan", false)
+                        },
+                    );
+                    Some(refreshed)
                 } else {
-                    TraceOutcome::Partial
-                },
-                || {
-                    TraceFields::new()
-                        .usize("limits", refreshed.snapshot.limits.len())
-                        .usize("tasks", refreshed.snapshot.tasks.len())
-                        .usize("turns", refreshed.snapshot.turns.len())
-                        .bool("rolloutScan", false)
-                },
-            );
-            Some(refreshed)
-        } else {
-            let mut cache = worker_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if force_local_materialization {
-                Some(collect_snapshot_cached(
-                    &worker_config,
-                    Some(cached_account),
-                    false,
-                    &mut cache,
-                ))
-            } else {
-                collect_snapshot_cached_if_changed_coalesced(
-                    &worker_config,
-                    Some(cached_account),
-                    &mut cache,
-                )
-            }
-        };
-        let (history_and_recorder, remote_live, remote_overview_history) = {
-            let mut history_store = worker_history
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let history = match result.as_ref() {
-                Some(result) => {
-                    let history_observation =
-                        collection_history_observation(result, worker_config.offline);
-                    Some(stage_and_load_history_selected(
-                        &mut history_store,
-                        history_observation.as_ref(),
-                        &result.snapshot.tasks,
-                        &result.local_session_digests,
-                        result.snapshot.as_of,
-                        &worker_config.perf_log,
-                        false,
-                        &history_source_selection,
-                    ))
+                    let mut cache = worker_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if force_local_materialization {
+                        Some(collect_snapshot_cached(
+                            &worker_config,
+                            Some(cached_account),
+                            false,
+                            &mut cache,
+                        ))
+                    } else {
+                        collect_snapshot_cached_if_changed_coalesced(
+                            &worker_config,
+                            Some(cached_account),
+                            &mut cache,
+                        )
+                    }
+                };
+                let (history_and_recorder, remote_live, remote_overview_history) = {
+                    let mut history_store = worker_history
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let history = match result.as_ref() {
+                        Some(result) => {
+                            let history_observation =
+                                collection_history_observation(result, worker_config.offline);
+                            Some(stage_and_load_history_selected(
+                                &mut history_store,
+                                history_observation.as_ref(),
+                                &result.snapshot.tasks,
+                                &result.local_session_digests,
+                                result.snapshot.as_of,
+                                &worker_config.perf_log,
+                                false,
+                                &history_source_selection,
+                            ))
+                        }
+                        None => flush_or_reload_history_if_due(
+                            &mut history_store,
+                            Utc::now(),
+                            &worker_config.perf_log,
+                            &history_source_selection,
+                        ),
+                    };
+                    let remote_live = history_store.load_remote_live_states();
+                    let unified_seed = history.as_ref().and_then(|(projection, _)| {
+                        matches!(projection.selection, HistorySourceSelection::AllIncluded)
+                            .then_some(&projection.history)
+                    });
+                    let remote_overview_history =
+                        history_store.load_remote_overview_history(unified_seed, Utc::now());
+                    (history, Some(remote_live), Some(remote_overview_history))
+                };
+                let (history, recorder_health) =
+                    history_and_recorder.map_or((None, None), |(projection, recorder_health)| {
+                        (
+                            Some(HistoryRefreshCompletion {
+                                generation: history_source_generation,
+                                projection,
+                            }),
+                            Some(recorder_health),
+                        )
+                    });
+                RefreshCompletion {
+                    result,
+                    remote_live,
+                    remote_overview_history,
+                    history,
+                    history_source_state: None,
+                    recorder_health,
+                    refreshed_account: account_refresh_due,
+                    summary_backfill: false,
+                    worker_failure: None,
                 }
-                None => flush_or_reload_history_if_due(
-                    &mut history_store,
-                    Utc::now(),
-                    &worker_config.perf_log,
-                    &history_source_selection,
-                ),
-            };
-            let remote_live = history_store.load_remote_live_states();
-            let unified_seed = history.as_ref().and_then(|(projection, _)| {
-                matches!(projection.selection, HistorySourceSelection::AllIncluded)
-                    .then_some(&projection.history)
-            });
-            let remote_overview_history =
-                history_store.load_remote_overview_history(unified_seed, Utc::now());
-            (history, Some(remote_live), Some(remote_overview_history))
-        };
-        let (history, recorder_health) =
-            history_and_recorder.map_or((None, None), |(projection, recorder_health)| {
-                (
-                    Some(HistoryRefreshCompletion {
-                        generation: history_source_generation,
-                        projection,
-                    }),
-                    Some(recorder_health),
-                )
-            });
-        let _ = worker_sender.send(RefreshCompletion {
-            result,
-            remote_live,
-            remote_overview_history,
-            history,
-            recorder_health,
-            refreshed_account: account_refresh_due,
-            summary_backfill: false,
-        });
+            },
+            || refresh_worker_panic_completion(worker_failure),
+        );
     }));
     false
 }
@@ -9810,16 +10124,22 @@ fn mouse_event_requests_redraw(kind: MouseEventKind, handled: bool) -> bool {
 fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: bool) -> Duration {
     let local_refresh_wait =
         LOCAL_REFRESH.saturating_sub(now.saturating_duration_since(app.last_local_refresh));
+    let refresh_retry_wait = app.refresh_retry_wait(now);
     let mut timeout = if app.worker_running {
         BACKGROUND_CHANNEL_POLL
+    } else if let Some(retry_wait) = refresh_retry_wait {
+        retry_wait
     } else {
         local_refresh_wait
     };
-    if account_refresh_enabled && !app.worker_running {
+    if account_refresh_enabled && !app.worker_running && refresh_retry_wait.is_none() {
         timeout = timeout.min(app.next_account_refresh.saturating_duration_since(now));
     }
     if !app.launching_threads.is_empty() || app.remote_action_running.is_some() {
         timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
+    }
+    if let Some(retry_at) = app.remote_config_retry_not_before {
+        timeout = timeout.min(retry_at.saturating_duration_since(now));
     }
     if let Some(notice) = app.open_notice.as_ref() {
         let notice_wait =
@@ -10067,13 +10387,20 @@ fn load_remote_sources_state(
     config_store: &RemotesConfigStore,
     health_store: Option<&RemoteSyncHealthStore>,
     bandwidth_store: Option<&RemoteBandwidthBudgetStore>,
+    previous_config: Option<&RemotesConfig>,
     now: DateTime<Utc>,
-) -> RemoteSourcesState {
-    let (config, config_error) = match config_store.load_or_create() {
-        Ok(config) => (Some(config), None),
+) -> (RemoteSourcesState, bool) {
+    let (config, config_error, config_busy) = match config_store.try_load_or_create() {
+        Ok(TryLoadRemotesConfig::Loaded(config)) => (Some(config), None, false),
+        Ok(TryLoadRemotesConfig::Busy) => (
+            previous_config.cloned(),
+            Some("local-state/busy; retrying".to_owned()),
+            true,
+        ),
         Err(error) => (
             None,
             Some(format!("local-state/{}", io_error_category(&error))),
+            false,
         ),
     };
     let (history_sources, history_error) = (Vec::new(), None);
@@ -10093,15 +10420,18 @@ fn load_remote_sources_state(
     let bandwidth = config.as_ref().map_or_else(Vec::new, |config| {
         load_remote_bandwidth_statuses(config, bandwidth_store, now)
     });
-    RemoteSourcesState {
-        config,
-        history_sources,
-        health,
-        bandwidth,
-        config_error,
-        history_error,
-        health_error,
-    }
+    (
+        RemoteSourcesState {
+            config,
+            history_sources,
+            health,
+            bandwidth,
+            config_error,
+            history_error,
+            health_error,
+        },
+        config_busy,
+    )
 }
 
 fn load_remote_history_sources(
@@ -10377,6 +10707,58 @@ fn run_cancellable_remote_action_command(
     };
     let target = process_tree.target();
     cancellation.register(target);
+    wait_for_remote_action_output(child, target, cancellation)
+}
+
+#[cfg(unix)]
+fn wait_for_remote_action_output(
+    mut child: Child,
+    target: RemoteActionProcessTarget,
+    cancellation: &RemoteActionCancellation,
+) -> io::Result<Output> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("remote action stdout pipe is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("remote action stderr pipe is unavailable"))?;
+    let stdout_worker = thread::spawn(move || read_remote_action_pipe(stdout));
+    let stderr_worker = thread::spawn(move || read_remote_action_pipe(stderr));
+
+    // Keep the exited leader waitable until every possible group signal has
+    // completed. Reaping first would release its numeric PID/PGID for reuse,
+    // allowing the normal-completion cleanup or a racing cancellation to kill
+    // an unrelated process group.
+    let observed = wait_for_remote_action_exit_without_reaping(&child);
+    let cleanup = if observed.is_ok() {
+        target.terminate_after_observed_exit()
+    } else {
+        target.terminate()
+    };
+    // Serialize removal with a racing cancel while the leader is still
+    // unreaped. Once this returns, no cancellation path retains the PGID.
+    cancellation.clear(target);
+    let status = child.wait();
+    let stdout = join_remote_action_pipe(stdout_worker, "stdout");
+    let stderr = join_remote_action_pipe(stderr_worker, "stderr");
+
+    observed?;
+    cleanup?;
+    Ok(Output {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+#[cfg(not(unix))]
+fn wait_for_remote_action_output(
+    child: Child,
+    target: RemoteActionProcessTarget,
+    cancellation: &RemoteActionCancellation,
+) -> io::Result<Output> {
     let output = child.wait_with_output();
     let cleanup = target.terminate();
     cancellation.clear(target);
@@ -10385,6 +10767,54 @@ fn run_cancellable_remote_action_command(
         (Ok(_), Err(error)) => Err(error),
         (Ok(output), Ok(())) => Ok(output),
     }
+}
+
+#[cfg(unix)]
+fn wait_for_remote_action_exit_without_reaping(child: &Child) -> io::Result<()> {
+    loop {
+        // SAFETY: siginfo_t is an output buffer for waitid. WNOWAIT preserves
+        // the exited child as waitable and therefore reserves its PID/PGID.
+        let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let child_id: libc::id_t = child.id();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child_id,
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid initialized information; si_pid is zero when
+            // WNOHANG observed no waitable event.
+            if unsafe { information.si_pid() } != 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_remote_action_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn join_remote_action_pipe(
+    worker: thread::JoinHandle<io::Result<Vec<u8>>>,
+    label: &str,
+) -> io::Result<Vec<u8>> {
+    worker
+        .join()
+        .map_err(|_| io::Error::other(format!("remote action {label} reader panicked")))?
 }
 
 fn execute_remote_ui_action(
@@ -10397,18 +10827,16 @@ fn execute_remote_ui_action(
         &config.trace_log,
         cancellation,
         || -> Result<RemoteUiActionOutcome, String> {
+            if cancellation.is_cancelled() {
+                return Err("command terminated".to_owned());
+            }
             if !matches!(
                 &request.kind,
                 RemoteUiActionKind::Include
                     | RemoteUiActionKind::Exclude
                     | RemoteUiActionKind::Purge
             ) {
-                let current = RemotesConfigStore::discover()
-                    .load_or_create()
-                    .map_err(|_| "remote config unavailable".to_owned())?;
-                if current.config_revision() != request.config_revision {
-                    return Err("configuration changed".to_owned());
-                }
+                validate_remote_ui_action_config(&RemotesConfigStore::discover(), &request)?;
             }
             let executable =
                 std::env::current_exe().map_err(|_| "launcher unavailable".to_owned())?;
@@ -10429,6 +10857,21 @@ fn execute_remote_ui_action(
         },
     );
     RemoteUiActionCompletion { request, result }
+}
+
+fn validate_remote_ui_action_config(
+    store: &RemotesConfigStore,
+    request: &RemoteUiActionRequest,
+) -> Result<(), String> {
+    let current = match store.try_load_or_create() {
+        Ok(TryLoadRemotesConfig::Loaded(current)) => current,
+        Ok(TryLoadRemotesConfig::Busy) => return Err("remote config busy".to_owned()),
+        Err(_) => return Err("remote config unavailable".to_owned()),
+    };
+    if current.config_revision() != request.config_revision {
+        return Err("configuration changed".to_owned());
+    }
+    Ok(())
 }
 
 fn trace_remote_ui_action(
@@ -10476,6 +10919,7 @@ fn trace_remote_ui_action(
 
 fn remote_ui_action_error_kind(error: &str) -> &'static str {
     match error {
+        "remote config busy" => "config_busy",
         "remote config unavailable" => "config_unavailable",
         "configuration changed" => "config_changed",
         "launcher unavailable" => "launcher_unavailable",

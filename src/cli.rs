@@ -41,7 +41,7 @@ use crate::remote_bandwidth_budget::{
 use crate::remote_fact_sync::{RemoteFactSyncLimits, RemoteFactTransport, SshRemoteFactTransport};
 use crate::remote_protocol::{ProbeResult, RemoteCapability, RemoteExportResponseBody};
 use crate::remote_source_metadata::{
-    finalize_remote_source_metadata, prepare_remote_source_metadata, purge_detached_remote_source,
+    prepare_remote_source_metadata, purge_detached_remote_source,
     reattach_remote_source_metadata_if_current, remove_remote_host_with_source_policy,
     set_remote_source_in_aggregates, unpair_remote_host_with_source_policy,
 };
@@ -49,7 +49,13 @@ use crate::remote_sync::{
     FilesystemRemoteDeltaLocalPhases, RemoteSyncCompletion, RemoteSyncError,
     RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport, SshRemoteDeltaTransport,
     TryRemoteHostSyncLease, build_remote_delta_ingest_binding, preflight_remote_delta_position,
-    sync_remote_delta_bounded, try_acquire_remote_host_sync_lease,
+    try_acquire_remote_host_sync_lease,
+};
+#[cfg(test)]
+use crate::remote_sync_attempt::remote_sync_error_proves_transport_not_started;
+use crate::remote_sync_attempt::{
+    AdmittedRemoteAggregateAttempt, RemoteAggregateAttemptError, RemoteSyncAttemptFinalizeError,
+    finalize_remote_sync_attempt,
 };
 use crate::remote_sync_health::{
     RemoteSyncAttemptResult, RemoteSyncErrorCategory, RemoteSyncHealthStore,
@@ -1554,27 +1560,19 @@ fn execute_remote_sync_at_state_root_with_transports(
     limits.max_response_bytes = reservation
         .granted_response_bytes()?
         .min(limits.max_response_bytes);
-    let sync_result = sync_remote_delta_bounded(
+    let sync_result = AdmittedRemoteAggregateAttempt::new(
         store,
         &selected,
-        runtime.profile_id().clone(),
+        &runtime,
         &mut local,
         transport,
-        attempted_at,
-        limits,
-    );
+        &bandwidth_budget,
+        &reservation,
+    )
+    .execute(attempted_at, limits, Utc::now, || Ok(()));
     let report = match sync_result {
         Ok(report) => report,
-        Err(error) => {
-            // Only variants that are structurally guaranteed to precede the
-            // first transport exchange may release a reservation. Transport,
-            // protocol, configuration-CAS, remote, and local errors can all
-            // happen after bytes have crossed the wire, so they retain the
-            // conservative 24h reservation.
-            if manual_error_proves_transport_not_started(&error) {
-                let _ = bandwidth_budget
-                    .cancel_attempt(&reservation, Utc::now().max(reservation.started_at()));
-            }
+        Err(RemoteAggregateAttemptError::Sync(error)) => {
             let health_write = if health_ready {
                 health_store
                     .record_sync_error_for_config(
@@ -1592,26 +1590,29 @@ fn execute_remote_sync_at_state_root_with_transports(
             finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
             return Err(anyhow::Error::new(error));
         }
+        Err(RemoteAggregateAttemptError::Settlement(error)) => {
+            let health_write = if health_ready {
+                health_store
+                    .record_failure(
+                        host.id(),
+                        source.as_ref(),
+                        Utc::now(),
+                        RemoteSyncErrorCategory::LocalState,
+                        None,
+                    )
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
+            return Err(anyhow::anyhow!(
+                "remote sync for {host_id:?} received and committed data but could not persist its bandwidth charge: {error}"
+            ));
+        }
+        Err(RemoteAggregateAttemptError::Fence(error)) => {
+            return Err(anyhow::Error::new(error));
+        }
     };
-    if let Err(error) = bandwidth_budget.complete_report(&reservation, Utc::now(), &report) {
-        let health_write = if health_ready {
-            health_store
-                .record_failure(
-                    host.id(),
-                    source.as_ref(),
-                    Utc::now(),
-                    RemoteSyncErrorCategory::LocalState,
-                    None,
-                )
-                .map(|_| ())
-        } else {
-            Ok(())
-        };
-        finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
-        return Err(anyhow::anyhow!(
-            "remote sync for {host_id:?} received and committed data but could not persist its bandwidth charge: {error}"
-        ));
-    }
 
     // Replica facts are a best-effort refinement after the aggregate page is
     // committed and charged. They receive a second admission so they cannot
@@ -1712,7 +1713,9 @@ fn execute_remote_sync_at_state_root_with_transports(
             fact_followup.error_category(),
         );
     }
-    if let Err(error) = history_profile_lease.validate() {
+    if let Err(error) =
+        finalize_remote_sync_attempt(&history_profile_lease, store, &selected, &runtime)
+    {
         let health_write = if health_ready {
             health_store
                 .record_failure(
@@ -1727,26 +1730,12 @@ fn execute_remote_sync_at_state_root_with_transports(
             Ok(())
         };
         finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
-        return Err(anyhow::anyhow!(
-            "remote sync for {host_id:?} could not revalidate its history profile after SSH: {error}"
-        ));
-    }
-    if let Err(error) = finalize_remote_source_metadata(store, &selected, &runtime) {
-        let health_write = if health_ready {
-            health_store
-                .record_failure(
-                    host.id(),
-                    source.as_ref(),
-                    Utc::now(),
-                    RemoteSyncErrorCategory::LocalState,
-                    None,
-                )
-                .map(|_| ())
-        } else {
-            Ok(())
+        return match error {
+            RemoteSyncAttemptFinalizeError::Profile(error) => Err(anyhow::anyhow!(
+                "remote sync for {host_id:?} could not revalidate its history profile after SSH: {error}"
+            )),
+            RemoteSyncAttemptFinalizeError::Metadata(error) => Err(anyhow::Error::new(error)),
         };
-        finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
-        return Err(anyhow::Error::new(error));
     }
     let completed_at = Utc::now();
     let health_write = if health_ready {
@@ -1811,15 +1800,6 @@ fn manual_remote_bandwidth_pause_error(
         pause.usage().rolling_bytes(),
         pause.limit_bytes(),
         resume,
-    )
-}
-
-fn manual_error_proves_transport_not_started(error: &RemoteSyncError) -> bool {
-    matches!(
-        error,
-        RemoteSyncError::HostNotPaired { .. }
-            | RemoteSyncError::InvalidLimits(_)
-            | RemoteSyncError::PreTransportLocal(_)
     )
 }
 
@@ -3967,6 +3947,7 @@ fn automatic_remote_sync_error_category(error: &RemoteSyncError) -> &'static str
         RemoteSyncError::HostNotPaired { .. }
         | RemoteSyncError::HostNotEnabledForAutomaticSync { .. } => "host is not eligible",
         RemoteSyncError::StaleHostSelection { .. }
+        | RemoteSyncError::PreTransportConfigurationChanged { .. }
         | RemoteSyncError::ConfigurationChanged { .. } => "configuration changed",
         RemoteSyncError::InvalidLimits(_) | RemoteSyncError::InvalidStartedAt => {
             "request validation"
@@ -5184,6 +5165,7 @@ mod tests {
                 source: None,
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -5227,6 +5209,7 @@ mod tests {
                 source: Some(source.clone()),
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 4,
                     live_state_changed: false,
@@ -5289,6 +5272,7 @@ mod tests {
                 source: Some(source),
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: changes,
                     live_state_changed: false,
@@ -5398,6 +5382,7 @@ mod tests {
                 source: Some(source),
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 9,
                     live_state_changed: false,
@@ -5588,6 +5573,7 @@ mod tests {
                 source: Some(beta_source),
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -5649,6 +5635,7 @@ mod tests {
                 source: Some(source),
                 process_containment_uncertain: false,
                 result: Ok(RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: false,
@@ -7776,6 +7763,7 @@ mod tests {
         let outcome = format_remote_sync_report(
             config.host("dev").unwrap(),
             &RemoteSyncReport {
+                exchanges: 3,
                 pages_committed: 3,
                 changes_committed: 3,
                 live_state_changed: false,
@@ -8904,33 +8892,38 @@ mod tests {
 
     #[test]
     fn manual_bandwidth_reservation_is_kept_for_ambiguous_post_transport_errors() {
-        assert!(manual_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::InvalidLimits("invalid limits")
         ));
-        assert!(manual_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::HostNotPaired {
                 host_id: "dev".to_owned(),
             }
         ));
-        assert!(manual_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
+            &RemoteSyncError::PreTransportConfigurationChanged {
+                host_id: "dev".to_owned(),
+            }
+        ));
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::PreTransportLocal(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "history writer busy",
             ))
         ));
-        assert!(!manual_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::ConfigurationChanged {
                 host_id: "dev".to_owned(),
             }
         ));
-        assert!(!manual_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::Transport(
                 crate::remote_transport::RemoteTransportError::InvalidHost(
                     "transport may already have transferred bytes".to_owned(),
                 )
             )
         ));
-        assert!(!manual_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::InvalidStartedAt
         ));
     }

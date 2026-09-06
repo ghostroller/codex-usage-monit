@@ -1951,7 +1951,7 @@ fn digest_fingerprint(
         .iter()
         .map(|(event_id, event)| (event_id.as_ref(), event.semantic_hash))
         .collect::<Vec<_>>();
-    events.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    events.sort_unstable_by_key(|(event_id, _)| *event_id);
     let fingerprint = digest_fingerprint_value(thread_id, range_start, range_end, events);
     RemoteSessionDigestFingerprint::from_str(&fingerprint)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))

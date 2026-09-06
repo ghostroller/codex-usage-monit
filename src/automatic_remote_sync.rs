@@ -27,14 +27,19 @@ use crate::remote_bandwidth_budget::{
 };
 use crate::remote_fact_sync::{RemoteFactSyncLimits, RemoteFactTransport, SshRemoteFactTransport};
 use crate::remote_protocol::MIN_REMOTE_RESPONSE_ENCODED_BYTES;
-use crate::remote_source_metadata::{
-    finalize_remote_source_metadata, prepare_remote_source_metadata,
-};
+use crate::remote_source_metadata::prepare_remote_source_metadata;
 use crate::remote_sync::{
     FilesystemRemoteDeltaLocalPhases, RemoteDeltaTransport, RemoteSyncError,
     RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport, SshRemoteDeltaTransport,
     TryRemoteHostSyncLease, build_remote_delta_ingest_binding, preflight_remote_delta_position,
-    sync_remote_delta_bounded, try_acquire_remote_host_sync_lease,
+    try_acquire_remote_host_sync_lease,
+};
+use crate::remote_sync_attempt::{
+    AdmittedRemoteAggregateAttempt, RemoteAggregateAttemptError, finalize_remote_sync_attempt,
+};
+#[cfg(test)]
+use crate::remote_sync_attempt::{
+    remote_sync_error_proves_transport_not_started, settle_successful_remote_aggregate,
 };
 #[cfg(test)]
 use crate::remote_sync_health::RemoteSyncAttemptResult;
@@ -482,17 +487,20 @@ where
 
         // Local phases acquire and release their own short writer/config
         // guards. No guard exists while the transport performs one-shot SSH.
-        let report = match sync_remote_delta_bounded(
+        let report = match AdmittedRemoteAggregateAttempt::new(
             &self.config_store,
             selected,
-            runtime.profile_id().clone(),
+            &runtime,
             &mut local,
             &mut self.transport,
-            Utc::now(),
-            budgeted_limits,
-        ) {
+            &self.bandwidth_budget,
+            &reservation,
+        )
+        .execute(Utc::now(), budgeted_limits, Utc::now, || {
+            ensure_automatic_selection_current(&self.config_store, selected)
+        }) {
             Ok(report) => report,
-            Err(error) => {
+            Err(RemoteAggregateAttemptError::Sync(error)) => {
                 if RemoteSyncErrorCategory::from_sync_error(&error)
                     == RemoteSyncErrorCategory::ProcessContainment
                 {
@@ -505,28 +513,13 @@ where
                         );
                     self.process_containment_uncertain = true;
                 }
-                // Cancel only when the error variant proves that transport
-                // could not have started. Every transport, configuration-CAS,
-                // protocol, remote, or local error is ambiguous after this
-                // boundary and therefore retains its 24h reservation. This is
-                // deliberately conservative and prevents repeated failed
-                // downloads from silently bypassing the hard cap.
-                if automatic_error_proves_transport_not_started(&error) {
-                    let _ = self
-                        .bandwidth_budget
-                        .cancel_attempt(&reservation, Utc::now().max(reservation.started_at()));
-                }
                 return Err(error);
             }
+            Err(RemoteAggregateAttemptError::Settlement(error)) => {
+                return Err(RemoteSyncError::Local(error));
+            }
+            Err(RemoteAggregateAttemptError::Fence(error)) => return Err(error),
         };
-        settle_automatic_aggregate_attempt_before_final_fence(
-            &self.bandwidth_budget,
-            &reservation,
-            &report,
-            Utc::now(),
-            &self.config_store,
-            selected,
-        )?;
         let fact_health = RemoteSyncHealthStore::new(self.state_root.clone());
         let fact_started_at = Utc::now();
         let prepared = prepare_automatic_fact_followup_without_config_lock(
@@ -633,9 +626,13 @@ where
                 );
             }
         })?;
-        profile_lease.validate().map_err(RemoteSyncError::Local)?;
-        let _ = finalize_remote_source_metadata(&self.config_store, selected, &runtime)
-            .map_err(RemoteSyncError::Local)?;
+        finalize_remote_sync_attempt(&profile_lease, &self.config_store, selected, &runtime)
+            .map_err(|error| match error {
+                crate::remote_sync_attempt::RemoteSyncAttemptFinalizeError::Profile(error)
+                | crate::remote_sync_attempt::RemoteSyncAttemptFinalizeError::Metadata(error) => {
+                    RemoteSyncError::Local(error)
+                }
+            })?;
         Ok(report)
     }
 }
@@ -659,28 +656,6 @@ fn prepare_automatic_fact_followup_without_config_lock<R>(
     let prepared = prepare();
     ensure_automatic_selection_current(config_store, selected)?;
     Ok(prepared)
-}
-
-/// Settles a successful aggregate response before rejecting a late result on
-/// the final exact config fence. The bytes were already transferred, so a
-/// concurrent disable/remove/edit must not leave the conservative reservation
-/// charged for the rest of its 24-hour lifetime.
-fn settle_automatic_aggregate_attempt_before_final_fence(
-    bandwidth_budget: &RemoteBandwidthBudgetStore,
-    reservation: &RemoteBandwidthReservation,
-    report: &RemoteSyncReport,
-    completed_at: DateTime<Utc>,
-    config_store: &RemotesConfigStore,
-    selected: &RemoteSyncHostSnapshot,
-) -> Result<(), RemoteSyncError> {
-    bandwidth_budget
-        .complete_report(
-            reservation,
-            completed_at.max(reservation.started_at()),
-            report,
-        )
-        .map_err(RemoteSyncError::Local)?;
-    ensure_automatic_selection_current(config_store, selected)
 }
 
 /// Settles every provably pre-transport or successful fact reservation before
@@ -870,15 +845,6 @@ fn local_collect_config(codex_home: PathBuf, redact_content: bool) -> CollectCon
         redact_content,
         ..CollectConfig::default()
     }
-}
-
-fn automatic_error_proves_transport_not_started(error: &RemoteSyncError) -> bool {
-    matches!(
-        error,
-        RemoteSyncError::HostNotPaired { .. }
-            | RemoteSyncError::InvalidLimits(_)
-            | RemoteSyncError::PreTransportLocal(_)
-    )
 }
 
 /// Injectable config reload boundary for the worker. The production store
@@ -1194,6 +1160,7 @@ mod tests {
         ) -> Result<RemoteSyncReport, RemoteSyncError> {
             self.calls.push(selected.host().id().to_owned());
             Ok(RemoteSyncReport {
+                exchanges: 0,
                 pages_committed: 0,
                 changes_committed: 0,
                 live_state_changed: false,
@@ -2138,6 +2105,7 @@ mod tests {
                 panic!("aggregate reservation should be admitted")
             };
             let report = RemoteSyncReport {
+                exchanges: 1,
                 pages_committed: 1,
                 changes_committed: 0,
                 live_state_changed: false,
@@ -2160,19 +2128,18 @@ mod tests {
             };
             store.update(config.config_revision(), mutation).unwrap();
 
-            let error = settle_automatic_aggregate_attempt_before_final_fence(
+            let error = settle_successful_remote_aggregate(
                 &budget,
                 &reservation,
                 &report,
-                Utc::now(),
-                &store,
-                &selected,
+                Utc::now().max(reservation.started_at()),
+                || ensure_automatic_selection_current(&store, &selected),
             )
             .unwrap_err();
 
             assert!(matches!(
                 error,
-                RemoteSyncError::ConfigurationChanged { .. }
+                RemoteAggregateAttemptError::Fence(RemoteSyncError::ConfigurationChanged { .. })
             ));
             let usage = budget
                 .usage("dev", Some(&expected_source.node_id), Utc::now())
@@ -2700,31 +2667,36 @@ mod tests {
 
     #[test]
     fn bandwidth_reservation_is_released_only_for_provably_pre_transport_errors() {
-        assert!(automatic_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::InvalidLimits("invalid limits")
         ));
-        assert!(automatic_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::HostNotPaired {
                 host_id: "dev".to_owned(),
             }
         ));
-        assert!(automatic_error_proves_transport_not_started(
+        assert!(remote_sync_error_proves_transport_not_started(
+            &RemoteSyncError::PreTransportConfigurationChanged {
+                host_id: "dev".to_owned(),
+            }
+        ));
+        assert!(remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::PreTransportLocal(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "history writer busy",
             ))
         ));
-        assert!(!automatic_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::ConfigurationChanged {
                 host_id: "dev".to_owned(),
             }
         ));
-        assert!(!automatic_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::Transport(RemoteTransportError::InvalidHost(
                 "transport may already have transferred bytes".to_owned(),
             ))
         ));
-        assert!(!automatic_error_proves_transport_not_started(
+        assert!(!remote_sync_error_proves_transport_not_started(
             &RemoteSyncError::InvalidStartedAt
         ));
     }
@@ -2841,6 +2813,7 @@ mod tests {
                 Some(&expected_source),
                 completed_at,
                 &RemoteSyncReport {
+                    exchanges: 1,
                     pages_committed: 1,
                     changes_committed: 0,
                     live_state_changed: true,

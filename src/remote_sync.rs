@@ -440,6 +440,10 @@ pub enum RemoteSyncCompletion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSyncReport {
+    /// Number of SSH exchanges that returned a validated response during this
+    /// run. This can exceed `pages_committed` when a continuation reports that
+    /// its cursor expired after earlier pages were committed.
+    pub exchanges: usize,
     pub pages_committed: usize,
     /// Typed bucket/session journal changes contained in committed pages.
     /// A terminal delta page can advance/confirm its cursor with zero changes;
@@ -904,6 +908,7 @@ pub fn sync_remote_delta_bounded(
     let mut position =
         preflight_remote_delta_position(config_store, selected, &binding, local, started_at)?;
     let mut report = RemoteSyncReport {
+        exchanges: 0,
         pages_committed: 0,
         changes_committed: 0,
         live_state_changed: false,
@@ -944,6 +949,7 @@ pub fn sync_remote_delta_bounded(
         // writer and ingest guards and drop them before returning.
         let exchange_timeout = limits.exchange_timeout.min(remaining_run_time);
         let exchange = transport.exchange_host(host, &request, exchange_timeout)?;
+        report.exchanges = report.exchanges.saturating_add(1);
         let received_at = Utc::now();
         let next_total = report
             .response_bytes
@@ -1173,6 +1179,9 @@ fn try_with_current_config<T>(
 fn mark_pre_transport_error(error: RemoteSyncError) -> RemoteSyncError {
     match error {
         RemoteSyncError::Local(error) => RemoteSyncError::PreTransportLocal(error),
+        RemoteSyncError::ConfigurationChanged { host_id } => {
+            RemoteSyncError::PreTransportConfigurationChanged { host_id }
+        }
         error => error,
     }
 }
@@ -1254,6 +1263,11 @@ pub enum RemoteSyncError {
     ConfigurationChanged {
         host_id: String,
     },
+    /// The selected host changed during a local preflight that is
+    /// structurally guaranteed to precede the first transport exchange.
+    PreTransportConfigurationChanged {
+        host_id: String,
+    },
     InvalidLimits(&'static str),
     InvalidStartedAt,
     ResponseBudgetExceeded,
@@ -1290,6 +1304,10 @@ impl fmt::Display for RemoteSyncError {
             Self::ConfigurationChanged { host_id } => write!(
                 formatter,
                 "remote host {host_id:?} changed while its sync request was in flight"
+            ),
+            Self::PreTransportConfigurationChanged { host_id } => write!(
+                formatter,
+                "remote host {host_id:?} changed before its SSH request was opened"
             ),
             Self::InvalidLimits(message) => formatter.write_str(message),
             Self::InvalidStartedAt => {
@@ -1846,6 +1864,54 @@ mod tests {
             transport.requests[0].accepted_revisions,
             current_accepted_revisions()
         );
+    }
+
+    #[test]
+    fn config_change_during_preflight_is_distinct_from_an_in_flight_change() {
+        let temp = TempDir::new().unwrap();
+        let (store, current, _, selected) = paired_config(&temp);
+        store
+            .update(
+                current.config_revision(),
+                RemotesConfigMutation::edit_host(
+                    "dev",
+                    RemoteHostEdit {
+                        ssh_host: Some("changed-alias".to_owned()),
+                        agent_executable: None,
+                        redact_content: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let guard = Rc::new(Cell::new(false));
+        let mut local = FakeLocal::new(guard.clone());
+        let mut transport = FakeTransport::new(
+            guard,
+            [FakeReply::Delta {
+                sequence: 1,
+                has_more: false,
+            }],
+        );
+
+        let error = sync_remote_delta_bounded(
+            &store,
+            &selected,
+            PROFILE.parse().unwrap(),
+            &mut local,
+            &mut transport,
+            at(30, 12),
+            limits(1),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            RemoteSyncError::PreTransportConfigurationChanged { host_id }
+                if host_id == "dev"
+        ));
+        assert!(crate::remote_sync_attempt::remote_sync_error_proves_transport_not_started(&error));
+        assert!(transport.requests.is_empty());
+        assert_eq!(local.recoveries, 0);
     }
 
     #[test]
@@ -2657,6 +2723,7 @@ mod tests {
             limits(1),
         )
         .unwrap();
+        assert_eq!(report.exchanges, 1);
         let RemoteSyncCompletion::BootstrapRestarted(restarted) = report.completion else {
             panic!("cursor expiry must restart bootstrap")
         };
@@ -2690,6 +2757,45 @@ mod tests {
         assert!(matches!(error, RemoteSyncError::UnboundResponseEnvelope));
         assert_eq!(local.restarts, 1);
         assert_eq!(local.bootstrap_generation, 42);
+    }
+
+    #[test]
+    fn cursor_expiry_after_a_committed_page_counts_both_exchanges() {
+        let temp = TempDir::new().unwrap();
+        let (store, _, _, selected) = paired_config(&temp);
+        let guard = Rc::new(Cell::new(false));
+        let mut local = FakeLocal::new(guard.clone());
+        let mut transport = FakeTransport::new(
+            guard,
+            [
+                FakeReply::Delta {
+                    sequence: 1,
+                    has_more: true,
+                },
+                FakeReply::CursorExpired,
+            ],
+        );
+
+        let report = sync_remote_delta_bounded(
+            &store,
+            &selected,
+            PROFILE.parse().unwrap(),
+            &mut local,
+            &mut transport,
+            at(30, 12),
+            limits(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.exchanges, 2);
+        assert_eq!(report.pages_committed, 1);
+        assert_eq!(report.response_bytes, 1_024);
+        assert!(matches!(
+            report.completion,
+            RemoteSyncCompletion::BootstrapRestarted(_)
+        ));
+        assert_eq!(local.commits, 1);
+        assert_eq!(local.restarts, 1);
     }
 
     #[test]

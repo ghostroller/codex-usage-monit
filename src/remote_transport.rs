@@ -49,6 +49,7 @@ use crate::remote_protocol::{
     RemoteFrameLimits, RemotePagePayload, RemoteProtocolError, SourceGeneration,
     decode_remote_frame, decoded_remote_frame_payload_len, encode_remote_frame,
 };
+use crate::remotes_config::validate_agent_executable;
 use crate::source_history::RedactionProfile;
 use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 
@@ -457,6 +458,7 @@ pub struct RemoteExchangeReport<D = EmptyRemotePayload, F = EmptyRemotePayload> 
 #[derive(Debug)]
 pub enum RemoteTransportError {
     InvalidHost(String),
+    InvalidAgentExecutable(String),
     InvalidTimeout,
     InvalidResponseLimit,
     Spawn {
@@ -524,6 +526,9 @@ impl fmt::Display for RemoteTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidHost(message) => write!(formatter, "invalid SSH host alias: {message}"),
+            Self::InvalidAgentExecutable(message) => {
+                write!(formatter, "invalid remote agent executable: {message}")
+            }
             Self::InvalidTimeout => formatter.write_str("remote request timeout must be non-zero"),
             Self::InvalidResponseLimit => {
                 formatter.write_str("remote probe response limit does not fit the protocol field")
@@ -692,7 +697,7 @@ pub fn probe_remote_with_agent_executable_and_environment(
     probe_report_from_exchange(report)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn probe_remote_with_program(
     ssh_program: PathBuf,
     ssh_host: &str,
@@ -721,7 +726,7 @@ fn probe_remote_with_program_and_agent_executable(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn probe_remote_with_program_and_environment(
     ssh_program: PathBuf,
     ssh_host: &str,
@@ -992,7 +997,7 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn exchange_remote_with_program<D, F>(
     ssh_program: PathBuf,
     ssh_host: &str,
@@ -1120,7 +1125,13 @@ where
             )
             .bool("ownsProcessTree", environment.owns_process_tree())
     });
-    let result = exchange();
+    // OpenSSH joins arguments following the host into one remote shell command.
+    // Validate the executable token at this lowest shared public boundary; a
+    // caller that bypasses RemotesConfig must not be able to inject shell
+    // syntax even though the value is one local argv element.
+    let result = validate_agent_executable(agent_executable)
+        .map_err(RemoteTransportError::InvalidAgentExecutable)
+        .and_then(|()| exchange());
     match &result {
         Ok(report) => trace_span.finish_with(TraceOutcome::Ok, || {
             TraceFields::new()
@@ -1269,8 +1280,14 @@ where
         )
     });
 
-    let status = match wait_until(&mut child, deadline, environment, &output_limit) {
-        Ok(ChildWaitOutcome::Exited(status)) => status,
+    let observed_exit = match wait_until(
+        &mut process_tree,
+        &mut child,
+        deadline,
+        environment,
+        &output_limit,
+    ) {
+        Ok(ChildWaitOutcome::Exited(exit)) => exit,
         Ok(ChildWaitOutcome::OutputLimitExceeded(limit)) => {
             let cleanup_error = combine_cleanup_errors(
                 terminate_and_reap_bounded(process_tree, child),
@@ -1307,10 +1324,53 @@ where
         }
     };
 
+    #[cfg(unix)]
+    let status = match observed_exit {
+        ObservedChildExit::Reaped(status) => status,
+        ObservedChildExit::Unreaped => {
+            if let Err(error) = process_tree.terminate_after_observed_exit(&mut child) {
+                let cleanup_error = combine_cleanup_errors(
+                    reap_child_bounded(child).err(),
+                    stop_pipe_workers_bounded(
+                        &input_worker,
+                        &stdout_worker,
+                        &stderr_worker,
+                        &io_stop,
+                    ),
+                );
+                return Err(RemoteTransportError::ProcessCleanup {
+                    error,
+                    cleanup_error,
+                });
+            }
+            match child.wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let cleanup_error = combine_cleanup_errors(
+                        reap_child_bounded(child).err(),
+                        stop_pipe_workers_bounded(
+                            &input_worker,
+                            &stdout_worker,
+                            &stderr_worker,
+                            &io_stop,
+                        ),
+                    );
+                    return Err(RemoteTransportError::Wait {
+                        error,
+                        cleanup_error,
+                    });
+                }
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let ObservedChildExit::Reaped(status) = observed_exit;
+
     // A successful primary process can still leave a ProxyCommand or other
-    // configured descendant holding our pipes. Reap the tracked tree and use
-    // the original end-to-end deadline for worker completion; no pipe holder
-    // may turn a bounded probe into an unbounded join.
+    // configured descendant holding our pipes. Finish any platform containment
+    // handle not already consumed by the Unix observe/cleanup/reap sequence,
+    // then use the original end-to-end deadline for worker completion; no pipe
+    // holder may turn a bounded probe into an unbounded join.
     if let Err(error) = process_tree.terminate(&mut child) {
         let cleanup_error =
             stop_pipe_workers_bounded(&input_worker, &stdout_worker, &stderr_worker, &io_stop);
@@ -1457,6 +1517,7 @@ where
 fn remote_transport_error_kind(error: &RemoteTransportError) -> &'static str {
     match error {
         RemoteTransportError::InvalidHost(_) => "invalid_host",
+        RemoteTransportError::InvalidAgentExecutable(_) => "invalid_agent_executable",
         RemoteTransportError::InvalidTimeout => "invalid_timeout",
         RemoteTransportError::InvalidResponseLimit => "invalid_response_limit",
         RemoteTransportError::Spawn { .. } => "spawn",
@@ -1757,13 +1818,20 @@ fn drain_bounded(reader: impl Read, limit: usize) -> io::Result<BoundedOutput> {
 }
 
 enum ChildWaitOutcome {
-    Exited(ExitStatus),
+    Exited(ObservedChildExit),
     OutputLimitExceeded(OutputLimit),
     TimedOut,
     Cancelled,
 }
 
+enum ObservedChildExit {
+    Reaped(ExitStatus),
+    #[cfg(unix)]
+    Unreaped,
+}
+
 fn wait_until(
+    process_tree: &mut ProcessTree,
     child: &mut Child,
     deadline: Instant,
     environment: &SshCommandEnvironment,
@@ -1773,8 +1841,8 @@ fn wait_until(
         if let Some(limit) = OutputLimit::load(output_limit) {
             return Ok(ChildWaitOutcome::OutputLimitExceeded(limit));
         }
-        if let Some(status) = child.try_wait()? {
-            return Ok(ChildWaitOutcome::Exited(status));
+        if let Some(exit) = process_tree.try_wait(child)? {
+            return Ok(ChildWaitOutcome::Exited(exit));
         }
         if environment.cancellation_requested() {
             return Ok(ChildWaitOutcome::Cancelled);
@@ -2056,7 +2124,30 @@ fn attach_process_tree(child: &mut Child, owned: bool) -> io::Result<ProcessTree
 
 #[cfg(unix)]
 impl ProcessTree {
+    /// Observes an owned process-group leader without releasing its PID/PGID,
+    /// then tears down the group before reaping the leader. `Child::try_wait`
+    /// cannot be used for the owned case because it reaps immediately, opening
+    /// a narrow window in which the numeric PGID could be reused before the
+    /// subsequent group cleanup signal.
+    fn try_wait(&mut self, child: &mut Child) -> io::Result<Option<ObservedChildExit>> {
+        if matches!(self, Self::OwnedProcessGroup(_)) {
+            return child_exited_without_reaping(child)
+                .map(|exited| exited.then_some(ObservedChildExit::Unreaped));
+        }
+        child
+            .try_wait()
+            .map(|status| status.map(ObservedChildExit::Reaped))
+    }
+
     fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
+        self.terminate_inner(child, false)
+    }
+
+    fn terminate_after_observed_exit(&mut self, child: &mut Child) -> io::Result<()> {
+        self.terminate_inner(child, true)
+    }
+
+    fn terminate_inner(&mut self, child: &mut Child, leader_exit_observed: bool) -> io::Result<()> {
         let process_tree = std::mem::replace(self, Self::Inherited);
         let Self::OwnedProcessGroup(process_group) = process_tree else {
             if child.try_wait()?.is_some() {
@@ -2072,6 +2163,17 @@ impl ProcessTree {
         if group_error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
+        // Darwin reports EPERM, rather than ESRCH, when the retained zombie
+        // leader is the group's only remaining member. This case is safe only
+        // after waitid(WNOWAIT) has established that the leader exited: its
+        // unreaped PID keeps the numeric identity unavailable for reuse, and
+        // any live same-user group member would make kill(2) succeed.
+        #[cfg(target_vendor = "apple")]
+        if leader_exit_observed && group_error.raw_os_error() == Some(libc::EPERM) {
+            return Ok(());
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = leader_exit_observed;
         match child.kill() {
             Ok(()) => Err(io::Error::new(
                 group_error.kind(),
@@ -2085,6 +2187,38 @@ impl ProcessTree {
                     "could not terminate SSH process group: {group_error}; could not terminate primary child: {child_error}"
                 ),
             )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    loop {
+        // SAFETY: `siginfo_t` is an output buffer for waitid. Zeroing it also
+        // gives the WNOHANG/no-event case a deterministic `si_pid() == 0`
+        // representation on the Unix targets supported by this crate.
+        let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: the PID belongs to the live `Child` handle. WNOWAIT leaves a
+        // reported exit waitable, which keeps the numeric leader PID
+        // unavailable for process/group-leader reuse until ProcessTree has
+        // finished group cleanup and calls Child::wait.
+        let child_id: libc::id_t = child.id();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child_id,
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid initialized `information`; si_pid is defined for
+            // a reported child event and remains zero for the no-event case.
+            return Ok(unsafe { information.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -2192,6 +2326,15 @@ fn resume_suspended_child(child: &Child) -> io::Result<()> {
 
 #[cfg(windows)]
 impl ProcessTree {
+    fn try_wait(&mut self, child: &mut Child) -> io::Result<Option<ObservedChildExit>> {
+        // Windows process and Job handles identify kernel objects rather than
+        // reusable numeric IDs, so observing/reaping the primary first cannot
+        // redirect the later Job cleanup to an unrelated process tree.
+        child
+            .try_wait()
+            .map(|status| status.map(ObservedChildExit::Reaped))
+    }
+
     fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
         let mut cleanup_error = None;
         if let Self::OwnedJob(job) = self
@@ -2476,6 +2619,34 @@ mod tests {
     }
 
     #[test]
+    fn hostile_agent_executable_is_rejected_before_ssh_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment =
+            SshCommandEnvironment::new(Some(env::join_paths([directory.path()]).unwrap()));
+
+        for executable in [
+            "",
+            "codex usage",
+            "codex;whoami",
+            "codex\nwhoami",
+            "codex$(whoami)",
+            "`whoami`",
+        ] {
+            let error = probe_remote_with_agent_executable_and_environment(
+                "dev-server",
+                executable,
+                &RemoteProbeOptions::default(),
+                &environment,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, RemoteTransportError::InvalidAgentExecutable(_)),
+                "unexpected error for {executable:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn trace_covers_host_validation_before_saved_path_resolution() {
         let directory = tempfile::tempdir().unwrap();
         let trace_path = directory.path().join("trace.jsonl");
@@ -2634,6 +2805,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let response_path = directory.path().join("response.frame");
         let script_path = directory.path().join("fake-ssh");
+        let descendant_pid_path = directory.path().join("normal-descendant.pid");
         let now = Utc::now();
         let response = RemoteProbeResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -2663,8 +2835,9 @@ mod tests {
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\ncat '{}'\n",
-                response_path.display()
+                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\ncat '{}'\n",
+                descendant_pid_path.display(),
+                response_path.display(),
             ),
         )
         .unwrap();
@@ -2677,6 +2850,60 @@ mod tests {
         assert!(report.request_bytes > 20);
         assert!(report.response_bytes > 20);
         assert_eq!(report.stderr_bytes, 0);
+        assert_process_exits_bounded(&descendant_pid_path, "normal-completion SSH descendant");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_observation_keeps_owned_group_leader_waitable_until_cleanup() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 23"]);
+        configure_process_tree(&mut command, true);
+        let mut child = command.spawn().unwrap();
+        let mut process_tree = attach_process_tree(&mut child, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while !child_exited_without_reaping(&child).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            child_exited_without_reaping(&child).unwrap(),
+            "WNOWAIT observation must leave the exited group leader waitable"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, 0) }, 0);
+        process_tree
+            .terminate_after_observed_exit(&mut child)
+            .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(23));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_owned_process_tree_kills_group_before_child_can_be_reaped() {
+        let directory = tempfile::tempdir().unwrap();
+        let descendant_pid_path = directory.path().join("drop-descendant.pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}'; exit 0",
+            descendant_pid_path.display()
+        ));
+        configure_process_tree(&mut command, true);
+        let mut child = command.spawn().unwrap();
+        let process_tree = attach_process_tree(&mut child, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_pid_path.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        while !child_exited_without_reaping(&child).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(child_exited_without_reaping(&child).unwrap());
+
+        drop(process_tree);
+        child.wait().unwrap();
+
+        assert_process_exits_bounded(&descendant_pid_path, "Drop-path SSH descendant");
     }
 
     #[cfg(unix)]
@@ -2887,7 +3114,10 @@ mod tests {
         loop {
             let alive = unsafe { libc::kill(pid, 0) } == 0;
             if !alive || Instant::now() >= deadline {
-                assert!(!alive, "{subject} remained alive after output overflow");
+                assert!(
+                    !alive,
+                    "{subject} remained alive after process-tree cleanup"
+                );
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -3000,9 +3230,13 @@ mod tests {
     fn timeout_terminates_the_fake_ssh_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let script_path = directory.path().join("fake-ssh-hang");
+        let descendant_pid_path = directory.path().join("timeout-descendant.pid");
         fs::write(
             &script_path,
-            "#!/bin/sh\ncat >/dev/null\nsleep 30 &\nwait\n",
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwait\n",
+                descendant_pid_path.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3014,6 +3248,7 @@ mod tests {
         let error = probe_remote_with_program(script_path, "dev-server", &options).unwrap_err();
         assert!(matches!(error, RemoteTransportError::Timeout { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert_process_exits_bounded(&descendant_pid_path, "timed-out SSH descendant");
     }
 
     #[cfg(unix)]

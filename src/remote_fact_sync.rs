@@ -14,7 +14,6 @@ use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ApiCostAmount, PicoUsd, TokenUsage};
 use crate::history_ownership::{
     HistoryOwnershipState, HistoryOwnershipStore, OwnershipManifestStatus, TryWriterLease,
 };
@@ -23,6 +22,7 @@ use crate::logical_replica::{
     active_facts_cover_digest, detect_replica_candidates,
 };
 use crate::remote_agent::{current_accepted_revisions, current_revisions};
+use crate::remote_domain_mapping::{local_session_usage_metrics, local_token_usage};
 use crate::remote_fact_exporter::MAX_COMPLETE_FACT_BATCH_RECORDS;
 use crate::remote_protocol::{
     DeltaPayload, FactCursor as RemoteFactCursor, FactDeltaPage, FactSnapshotPage,
@@ -40,11 +40,13 @@ use crate::remote_transport::{
     exchange_remote_with_frame_limits_and_environment,
 };
 use crate::remotes_config::{RemoteHostConfig, RemotesConfigStore};
+#[cfg(test)]
+use crate::source_history::SessionUsageMetrics;
 use crate::source_history::{
     ActiveFactSet, ActiveFactVersion, CompleteFactBatch, FactActivationReport, FactBatchId,
     FactBatchKind, FactCursor, FactDigestBinding, PrevalidatedFactPublication, RedactionProfile,
-    SessionDigestFingerprint, SessionUsageMetrics, SourceHistoryRemoteBinding, SourceHistoryStore,
-    SourceKind, SourceSessionDigest, SourceSessionDigestChange, UsageEventFact,
+    SessionDigestFingerprint, SourceHistoryReadBudget, SourceHistoryRemoteBinding,
+    SourceHistoryStore, SourceKind, SourceSessionDigest, SourceSessionDigestChange, UsageEventFact,
     UsageEventFactRecord,
 };
 use crate::source_identity::NodeId;
@@ -382,6 +384,16 @@ struct PlannerSourceEvidence {
     digests: Vec<SourceSessionDigest>,
 }
 
+struct ReplicaFactPlannerQuery<'a> {
+    history_store: &'a SourceHistoryStore,
+    selected: &'a RemoteSyncHostSnapshot,
+    local_source_id: &'a NodeId,
+    redaction_profile: RedactionProfile,
+    observed_at: chrono::DateTime<Utc>,
+    excluded_resource_candidates: &'a std::collections::BTreeSet<ReplicaFactCandidateKey>,
+    resume_after: Option<&'a ReplicaFactCandidateKey>,
+}
+
 /// Plans at most one content-free fact participant for an already committed
 /// and readable aggregate source. This function performs local reads only.
 /// It never resolves SSH configuration and never opens a network connection.
@@ -394,6 +406,34 @@ pub(crate) fn plan_next_replica_fact_sync(
     excluded_resource_candidates: &std::collections::BTreeSet<ReplicaFactCandidateKey>,
     resume_after: Option<&ReplicaFactCandidateKey>,
 ) -> io::Result<ReplicaFactSyncPlan> {
+    let mut read_budget = SourceHistoryReadBudget::for_query();
+    plan_next_replica_fact_sync_with_budget(
+        ReplicaFactPlannerQuery {
+            history_store,
+            selected,
+            local_source_id,
+            redaction_profile,
+            observed_at,
+            excluded_resource_candidates,
+            resume_after,
+        },
+        &mut read_budget,
+    )
+}
+
+fn plan_next_replica_fact_sync_with_budget(
+    query: ReplicaFactPlannerQuery<'_>,
+    read_budget: &mut SourceHistoryReadBudget,
+) -> io::Result<ReplicaFactSyncPlan> {
+    let ReplicaFactPlannerQuery {
+        history_store,
+        selected,
+        local_source_id,
+        redaction_profile,
+        observed_at,
+        excluded_resource_candidates,
+        resume_after,
+    } = query;
     let selected_source = selected
         .host()
         .expected_source()
@@ -431,10 +471,11 @@ pub(crate) fn plan_next_replica_fact_sync(
             "selected remote source metadata is not SSH",
         ));
     }
-    let selected_snapshot = history_store.load_remote_history_snapshot_since(
+    let selected_snapshot = history_store.load_remote_history_snapshot_since_with_budget(
         selected_metadata.source_id(),
         redaction_profile,
         since,
+        read_budget,
     )?;
     let Some(selected_active) = selected_snapshot.active_ref else {
         return Ok(ReplicaFactSyncPlan::NoWork);
@@ -469,18 +510,20 @@ pub(crate) fn plan_next_replica_fact_sync(
             SourceKind::Local => (
                 None,
                 history_store
-                    .load_source_session_digest_records_since(
+                    .load_source_session_digest_records_since_with_budget(
                         source.source_id(),
                         redaction_profile,
                         since,
+                        read_budget,
                     )?
                     .records,
             ),
             SourceKind::Ssh => {
-                let snapshot = history_store.load_remote_history_snapshot_since(
+                let snapshot = history_store.load_remote_history_snapshot_since_with_budget(
                     source.source_id(),
                     redaction_profile,
                     since,
+                    read_budget,
                 )?;
                 let Some(active) = snapshot.active_ref else {
                     continue;
@@ -581,10 +624,11 @@ pub(crate) fn plan_next_replica_fact_sync(
                 awaiting_exact_digest = true;
                 continue;
             }
-            let active = history_store.load_active_fact_set(
+            let active = history_store.load_active_fact_set_with_budget(
                 &source.source_id,
                 redaction_profile,
                 candidate.thread_id(),
+                read_budget,
             )?;
             let expected_binding = match source.kind {
                 SourceKind::Local => ExpectedReplicaFactBinding::Local,
@@ -1581,56 +1625,16 @@ fn convert_record(
                 fact.root_session_turn_id,
                 fact.model,
                 fact.service_tier,
-                TokenUsage {
-                    input_tokens: fact.digest_token_usage.input_tokens,
-                    cached_input_tokens: fact.digest_token_usage.cached_input_tokens,
-                    cache_write_input_tokens: fact.digest_token_usage.cache_write_input_tokens,
-                    output_tokens: fact.digest_token_usage.output_tokens,
-                    reasoning_output_tokens: fact.digest_token_usage.reasoning_output_tokens,
-                    total_tokens: fact.digest_token_usage.total_tokens,
-                },
+                local_token_usage(fact.digest_token_usage),
                 fact.request_usage_exact,
                 fact.exact_event_identity,
-                convert_metrics(fact.metrics),
+                local_session_usage_metrics(fact.metrics),
             )?;
             UsageEventFactRecord::upsert(revision, fact)
         }
         RemoteUsageEventFactMutation::Tombstone => {
             UsageEventFactRecord::tombstone(record.event_id, record.occurred_at, revision)
         }
-    }
-}
-
-fn convert_metrics(
-    metrics: crate::remote_protocol::RemoteSessionUsageMetrics,
-) -> SessionUsageMetrics {
-    SessionUsageMetrics {
-        token_usage: TokenUsage {
-            input_tokens: metrics.token_usage.input_tokens,
-            cached_input_tokens: metrics.token_usage.cached_input_tokens,
-            cache_write_input_tokens: metrics.token_usage.cache_write_input_tokens,
-            output_tokens: metrics.token_usage.output_tokens,
-            reasoning_output_tokens: metrics.token_usage.reasoning_output_tokens,
-            total_tokens: metrics.token_usage.total_tokens,
-        },
-        estimated_cost_units: metrics.estimated_cost_units.value(),
-        api_long_context_extra_cost_units: metrics
-            .api_long_context_extra_cost_units
-            .map(|value| value.value()),
-        api_equivalent_cost: ApiCostAmount {
-            minimum_pico_usd: PicoUsd::new(metrics.api_equivalent_cost.minimum_pico_usd.value()),
-            maximum_pico_usd: PicoUsd::new(metrics.api_equivalent_cost.maximum_pico_usd.value()),
-            observed_samples: metrics.api_equivalent_cost.observed_samples,
-            priced_samples: metrics.api_equivalent_cost.priced_samples,
-            observed_tokens: metrics.api_equivalent_cost.observed_tokens,
-            priced_tokens: metrics.api_equivalent_cost.priced_tokens,
-        },
-        call_count: metrics.call_count,
-        metric_revision: metrics.metric_revision.get(),
-        estimator_revision: metrics.estimator_revision.get(),
-        project_breakdown_revision: metrics.project_breakdown_revision.get(),
-        api_pricing_catalog_revision: metrics.api_pricing_catalog_revision.get(),
-        partial_reasons: metrics.partial_reasons,
     }
 }
 
@@ -1920,7 +1924,7 @@ mod tests {
                 true,
                 true,
                 Vec::new(),
-                convert_metrics(metrics(total)),
+                local_session_usage_metrics(metrics(total)),
             )
             .unwrap(),
         )
@@ -2039,6 +2043,46 @@ mod tests {
                 at(31, 12),
             )
         });
+    }
+
+    fn planner_with_budget(
+        fixture: &Fixture,
+        observed_at: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<ReplicaFactSyncPlan> {
+        plan_next_replica_fact_sync_with_budget(
+            ReplicaFactPlannerQuery {
+                history_store: fixture.runtime.source_history(),
+                selected: &fixture.selected,
+                local_source_id: fixture.runtime.source_identity().node_id(),
+                redaction_profile: RedactionProfile::Redacted,
+                observed_at,
+                excluded_resource_candidates: &BTreeSet::new(),
+                resume_after: None,
+            },
+            budget,
+        )
+    }
+
+    fn remote_snapshot_decoded_bytes(
+        fixture: &Fixture,
+        source_id: &str,
+        since: DateTime<Utc>,
+    ) -> u64 {
+        let initial_bytes = u64::MAX / 4;
+        let mut budget =
+            SourceHistoryReadBudget::with_limits(initial_bytes, usize::MAX, usize::MAX);
+        fixture
+            .runtime
+            .source_history()
+            .load_remote_history_snapshot_since_with_budget(
+                &source_id.parse().unwrap(),
+                RedactionProfile::Redacted,
+                since,
+                &mut budget,
+            )
+            .unwrap();
+        initial_bytes - budget.decoded_bytes_remaining_for_test()
     }
 
     #[derive(Clone, Debug)]
@@ -2339,6 +2383,57 @@ mod tests {
         };
         assert_eq!(next.thread_id().as_str(), older_thread);
         assert_eq!(next.target(), PlannedReplicaFactTarget::SelectedRemote);
+    }
+
+    #[test]
+    fn fact_planner_history_budget_is_cumulative_across_sources() {
+        let fixture = Fixture::new();
+        let observed_at = at(31, 13);
+        let range_start = at(30, 0);
+        install_remote_digests(
+            &fixture.runtime,
+            SOURCE,
+            "dev",
+            "ingest-gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &[digest_record(SOURCE, THREAD, range_start, 'a', 100)],
+        );
+        install_remote_digests(
+            &fixture.runtime,
+            OTHER_SOURCE,
+            "other",
+            "ingest-gen-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &[digest_record(OTHER_SOURCE, THREAD, range_start, 'b', 101)],
+        );
+
+        let mut source_limited = SourceHistoryReadBudget::with_limits(u64::MAX, usize::MAX, 1);
+        let source_error = planner_with_budget(&fixture, observed_at, &mut source_limited)
+            .expect_err("the second source must exhaust the shared source allowance");
+        assert!(SourceHistoryReadBudget::is_exhaustion(&source_error));
+        assert!(source_error.to_string().contains("source budget"));
+
+        let mut record_limited = SourceHistoryReadBudget::with_limits(u64::MAX, 1, usize::MAX);
+        let record_error = planner_with_budget(&fixture, observed_at, &mut record_limited)
+            .expect_err("the second digest must exhaust the shared record allowance");
+        assert!(SourceHistoryReadBudget::is_exhaustion(&record_error));
+        assert!(record_error.to_string().contains("record budget"));
+
+        let since = observed_at
+            .checked_sub_days(chrono::Days::new(u64::from(MAX_FACT_RETENTION_DAYS)))
+            .unwrap();
+        let selected_bytes = remote_snapshot_decoded_bytes(&fixture, SOURCE, since);
+        let other_bytes = remote_snapshot_decoded_bytes(&fixture, OTHER_SOURCE, since);
+        assert!(selected_bytes > 0);
+        assert!(other_bytes > 0);
+        let combined_bytes = selected_bytes.checked_add(other_bytes).unwrap();
+        let mut decoded_limited = SourceHistoryReadBudget::with_limits(
+            combined_bytes.checked_sub(1).unwrap(),
+            usize::MAX,
+            usize::MAX,
+        );
+        let decoded_error = planner_with_budget(&fixture, observed_at, &mut decoded_limited)
+            .expect_err("the second shard must exhaust the shared decoded-byte allowance");
+        assert!(SourceHistoryReadBudget::is_exhaustion(&decoded_error));
+        assert!(decoded_error.to_string().contains("decoded-byte budget"));
     }
 
     #[test]

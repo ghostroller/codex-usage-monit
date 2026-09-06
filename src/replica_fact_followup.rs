@@ -10,11 +10,11 @@ use std::io;
 use chrono::{DateTime, Days, Utc};
 
 use crate::config::CollectConfig;
-use crate::domain::{ApiCostAmount, PicoUsd, TokenUsage};
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus, TryWriterLease};
 use crate::history_runtime::HistoryRuntime;
 use crate::logical_replica::{ExpectedReplicaFactBinding, active_facts_cover_digest};
 use crate::remote_collection::{REMOTE_COLLECTION_MAX_LOOKBACK_DAYS, collect_remote_rollouts};
+use crate::remote_domain_mapping::{local_session_usage_metrics, local_token_usage};
 use crate::remote_fact_exporter::{
     RemoteFactPrepareError, materialize_complete_session_facts_from_normalized_observation,
 };
@@ -24,8 +24,7 @@ use crate::remote_fact_sync::{
     plan_next_replica_fact_sync, sync_remote_thread_facts_bounded,
 };
 use crate::remote_protocol::{
-    DeltaPayload, ExportRange, RemoteExportRequest, RemoteSessionFactPayload,
-    RemoteSessionUsageMetrics, RemoteUsageEventFact,
+    DeltaPayload, ExportRange, RemoteExportRequest, RemoteSessionFactPayload, RemoteUsageEventFact,
 };
 use crate::remote_sync::RemoteSyncHostSnapshot;
 use crate::remote_sync_health::{RemoteSyncErrorCategory, RemoteSyncHealthStore};
@@ -33,8 +32,7 @@ use crate::remotes_config::RemotesConfigStore;
 use crate::source_export::source_normalized_observation;
 use crate::source_history::{
     CompleteFactBatch, FactActivationReport, FactBatchId, FactBatchKind, FactCursor,
-    PrevalidatedFactPublication, SessionUsageMetrics, SourceKind, UsageEventFact,
-    UsageEventFactRecord,
+    PrevalidatedFactPublication, SourceKind, UsageEventFact, UsageEventFactRecord,
 };
 use crate::source_model::SessionReplicaKey;
 
@@ -933,49 +931,11 @@ fn convert_local_fact(
         fact.root_session_turn_id,
         fact.model,
         fact.service_tier,
-        TokenUsage {
-            input_tokens: fact.digest_token_usage.input_tokens,
-            cached_input_tokens: fact.digest_token_usage.cached_input_tokens,
-            cache_write_input_tokens: fact.digest_token_usage.cache_write_input_tokens,
-            output_tokens: fact.digest_token_usage.output_tokens,
-            reasoning_output_tokens: fact.digest_token_usage.reasoning_output_tokens,
-            total_tokens: fact.digest_token_usage.total_tokens,
-        },
+        local_token_usage(fact.digest_token_usage),
         fact.request_usage_exact,
         fact.exact_event_identity,
-        convert_metrics(fact.metrics),
+        local_session_usage_metrics(fact.metrics),
     )
-}
-
-fn convert_metrics(metrics: RemoteSessionUsageMetrics) -> SessionUsageMetrics {
-    SessionUsageMetrics {
-        token_usage: TokenUsage {
-            input_tokens: metrics.token_usage.input_tokens,
-            cached_input_tokens: metrics.token_usage.cached_input_tokens,
-            cache_write_input_tokens: metrics.token_usage.cache_write_input_tokens,
-            output_tokens: metrics.token_usage.output_tokens,
-            reasoning_output_tokens: metrics.token_usage.reasoning_output_tokens,
-            total_tokens: metrics.token_usage.total_tokens,
-        },
-        estimated_cost_units: metrics.estimated_cost_units.value(),
-        api_long_context_extra_cost_units: metrics
-            .api_long_context_extra_cost_units
-            .map(|value| value.value()),
-        api_equivalent_cost: ApiCostAmount {
-            minimum_pico_usd: PicoUsd::new(metrics.api_equivalent_cost.minimum_pico_usd.value()),
-            maximum_pico_usd: PicoUsd::new(metrics.api_equivalent_cost.maximum_pico_usd.value()),
-            observed_samples: metrics.api_equivalent_cost.observed_samples,
-            priced_samples: metrics.api_equivalent_cost.priced_samples,
-            observed_tokens: metrics.api_equivalent_cost.observed_tokens,
-            priced_tokens: metrics.api_equivalent_cost.priced_tokens,
-        },
-        call_count: metrics.call_count,
-        metric_revision: metrics.metric_revision.get(),
-        estimator_revision: metrics.estimator_revision.get(),
-        project_breakdown_revision: metrics.project_breakdown_revision.get(),
-        api_pricing_catalog_revision: metrics.api_pricing_catalog_revision.get(),
-        partial_reasons: metrics.partial_reasons,
-    }
 }
 
 fn local_error_category(error: &io::Error) -> RemoteSyncErrorCategory {

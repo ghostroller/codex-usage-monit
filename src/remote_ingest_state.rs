@@ -30,23 +30,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::atomic_file::replace_file;
-use crate::domain::{ApiCostAmount, PicoUsd, TokenUsage};
+use crate::domain::{ApiCostAmount, PicoUsd};
 use crate::history::{
     HISTORY_METRIC_REVISION, LocalHalfHourBucket, LocalProjectUsageGroup, LocalUsageGroup,
 };
+use crate::remote_domain_mapping::{
+    local_api_cost, local_session_usage_metrics_ref, local_token_usage,
+};
 use crate::remote_protocol::{
     DeltaCursor, DeltaPage, DeltaPayload, DeltaRequest, ExportRange, ProtocolRevisions,
-    RemoteApiCostAmount, RemoteDeltaPayloadContext, RemoteDeltaResponse, RemoteExportRequest,
-    RemoteExportRequestBody, RemoteExportResponseBody, RemotePagePayload, RemoteProjectDescriptor,
-    RemoteSessionDigest, RemoteSessionDigestMutation, RemoteSessionUsageMetrics, RemoteTokenUsage,
-    RemoteUsageBucket, RemoteUsageBucketMutation, SourceGeneration,
+    RemoteDeltaPayloadContext, RemoteDeltaResponse, RemoteExportRequest, RemoteExportRequestBody,
+    RemoteExportResponseBody, RemotePagePayload, RemoteProjectDescriptor, RemoteSessionDigest,
+    RemoteSessionDigestMutation, RemoteUsageBucket, RemoteUsageBucketMutation, SourceGeneration,
 };
 use crate::source_history::{
     HistoryProfileId, RedactionProfile, RemoteHistoryGenerationGcOutcome,
-    RemoteHistoryGenerationSweepReport, SessionDigestFingerprint, SessionUsageMetrics,
-    SourceBucketRecord, SourceHistoryRemoteActiveRef, SourceHistoryRemoteBinding,
-    SourceHistoryRemoteGenerationId, SourceHistoryStore, SourceHistoryWriter, SourceSessionDigest,
-    SourceSessionDigestRecord, sync_directory,
+    RemoteHistoryGenerationSweepReport, SessionDigestFingerprint, SourceBucketRecord,
+    SourceHistoryRemoteActiveRef, SourceHistoryRemoteBinding, SourceHistoryRemoteGenerationId,
+    SourceHistoryStore, SourceHistoryWriter, SourceSessionDigest, SourceSessionDigestRecord,
+    sync_directory,
 };
 use crate::source_identity::NodeId;
 #[cfg(windows)]
@@ -3115,47 +3117,8 @@ fn local_session_digest(
         digest.exact_event_identity,
         digest.coverage_complete,
         digest.observed_project_keys.clone(),
-        local_session_metrics(&digest.metrics),
+        local_session_usage_metrics_ref(&digest.metrics),
     )
-}
-
-fn local_session_metrics(metrics: &RemoteSessionUsageMetrics) -> SessionUsageMetrics {
-    SessionUsageMetrics {
-        token_usage: local_token_usage(metrics.token_usage),
-        estimated_cost_units: metrics.estimated_cost_units.value(),
-        api_long_context_extra_cost_units: metrics
-            .api_long_context_extra_cost_units
-            .map(|value| value.value()),
-        api_equivalent_cost: local_api_cost(metrics.api_equivalent_cost),
-        call_count: metrics.call_count,
-        metric_revision: metrics.metric_revision.get(),
-        estimator_revision: metrics.estimator_revision.get(),
-        project_breakdown_revision: metrics.project_breakdown_revision.get(),
-        api_pricing_catalog_revision: metrics.api_pricing_catalog_revision.get(),
-        partial_reasons: metrics.partial_reasons.clone(),
-    }
-}
-
-fn local_token_usage(usage: RemoteTokenUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: usage.input_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        cache_write_input_tokens: usage.cache_write_input_tokens,
-        output_tokens: usage.output_tokens,
-        reasoning_output_tokens: usage.reasoning_output_tokens,
-        total_tokens: usage.total_tokens,
-    }
-}
-
-fn local_api_cost(cost: RemoteApiCostAmount) -> ApiCostAmount {
-    ApiCostAmount {
-        minimum_pico_usd: PicoUsd::new(cost.minimum_pico_usd.value()),
-        maximum_pico_usd: PicoUsd::new(cost.maximum_pico_usd.value()),
-        observed_samples: cost.observed_samples,
-        priced_samples: cost.priced_samples,
-        observed_tokens: cost.observed_tokens,
-        priced_tokens: cost.priced_tokens,
-    }
 }
 
 fn checked_add_api_cost(left: ApiCostAmount, right: ApiCostAmount) -> io::Result<ApiCostAmount> {
@@ -3499,9 +3462,10 @@ mod tests {
     };
     use crate::remote_protocol::{
         AcceptedRevisionRange, AcceptedRevisions, BinaryVersion, MAX_REMOTE_FRAME_ENCODED_BYTES,
-        REMOTE_PROTOCOL_VERSION, RemoteDeltaCoverage, RemoteDeltaStats, RemoteDeltaWarning,
-        RemoteExportResponse, RemoteLiveSnapshot, RemoteLiveState, RemoteSessionDigestChange,
-        RemoteSessionDigestFingerprint, RemoteTiming, RemoteU128, RemoteUsageBucketChange,
+        REMOTE_PROTOCOL_VERSION, RemoteApiCostAmount, RemoteDeltaCoverage, RemoteDeltaStats,
+        RemoteDeltaWarning, RemoteExportResponse, RemoteLiveSnapshot, RemoteLiveState,
+        RemoteSessionDigestChange, RemoteSessionDigestFingerprint, RemoteSessionUsageMetrics,
+        RemoteTiming, RemoteTokenUsage, RemoteU128, RemoteUsageBucketChange,
     };
     use crate::source_history::{
         SourceBucketChange, SourceHistoryWriter, SourceKind, SourceMetadata,

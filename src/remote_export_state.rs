@@ -30,6 +30,7 @@ const EXPORT_LAYOUT_DIRECTORY: &str = "remote-export-v1";
 const DELTA_STATE_FILE: &str = "delta-state.json";
 const DELTA_ANCHOR_FILE: &str = "delta-state.anchor";
 const EXPORT_LOCK_FILE: &str = "remote-export.lock";
+const REVISION_FENCE_LOCK_FILE: &str = "remote-revision.lock";
 const STATE_FORMAT_VERSION: u32 = 3;
 const ANCHOR_FORMAT_VERSION: u32 = 1;
 const JOURNAL_RETENTION_DAYS: i64 = 35;
@@ -387,6 +388,100 @@ pub struct RemoteExportStateStore {
     source: SourceGeneration,
     redaction_profile: RedactionProfile,
     limits: RemoteExportLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RemoteRevisionFenceMode {
+    Shared,
+    Exclusive,
+}
+
+/// Fixed lock at a revision root. Every aggregate/fact request takes a shared
+/// lease before touching subordinate state; revision GC takes the exclusive
+/// lease before discovering child locks. This closes the create-after-scan
+/// race that per-thread/source locks alone cannot prevent.
+pub(crate) struct RemoteRevisionFence {
+    _lock: File,
+    #[cfg(windows)]
+    _directory: File,
+}
+
+pub(crate) fn try_acquire_revision_fence(
+    root: &Path,
+    mode: RemoteRevisionFenceMode,
+) -> io::Result<RemoteRevisionFence> {
+    prepare_private_root(root)?;
+    #[cfg(windows)]
+    let directory = open_revision_directory_fence(root)?;
+    let path = root.join(REVISION_FENCE_LOCK_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => validate_file_metadata(&path, &metadata, "remote revision fence")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    add_nofollow_flags(&mut options);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.share_mode(stable_lock_share_mode());
+    }
+    let lock = options
+        .open(&path)
+        .map_err(|error| map_nofollow_error(error, "remote revision fence"))?;
+    validate_opened_private_file(&path, &lock, "remote revision fence")?;
+    let result = match mode {
+        RemoteRevisionFenceMode::Shared => fs2::FileExt::try_lock_shared(&lock),
+        RemoteRevisionFenceMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock),
+    };
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote export revision is active",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    prepare_private_root(root)?;
+    validate_opened_private_file(&path, &lock, "remote revision fence")?;
+    Ok(RemoteRevisionFence {
+        _lock: lock,
+        #[cfg(windows)]
+        _directory: directory,
+    })
+}
+
+#[cfg(windows)]
+fn open_revision_directory_fence(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    crate::source_identity::validate_windows_private_directory(path, "remote revision fence root")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+        return Err(invalid_data(
+            "remote revision fence root must be a real directory",
+        ));
+    }
+    crate::source_identity::validate_windows_private_directory(path, "remote revision fence root")?;
+    Ok(directory)
 }
 
 impl RemoteExportStateStore {
@@ -3507,6 +3602,25 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         drop(export);
         assert!(preview.try_begin(at(1, 0)).is_ok());
+    }
+
+    #[test]
+    fn revision_fence_allows_readers_and_excludes_gc() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("revision");
+        let first = try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Shared).unwrap();
+        let second = try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Shared).unwrap();
+        let error = try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Exclusive)
+            .err()
+            .expect("an active request must exclude revision GC");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        drop(second);
+        assert!(
+            try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Exclusive).is_ok(),
+            "GC can acquire the revision after every request releases it"
+        );
     }
 
     #[cfg(unix)]

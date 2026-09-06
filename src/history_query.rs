@@ -5,35 +5,57 @@
 //! result. During cutover an exact manifest change causes a bounded retry, so
 //! a `Migrating -> V2Active` transition cannot return an accidental hybrid.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod aggregation;
+mod reconciliation;
+
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 
-use crate::domain::{ApiCostAmount, TokenUsage};
-use crate::history::{
-    HistoryData, HistoryStore, LocalHalfHourBucket, LocalProjectUsageGroup, LocalUsageGroup,
-    QuotaPoint, WeeklyLocalPoint,
-};
+#[cfg(test)]
+use crate::domain::TokenUsage;
+use crate::history::{HistoryData, HistoryStore, LocalHalfHourBucket, WeeklyLocalPoint};
+#[cfg(test)]
+use crate::history::{LocalProjectUsageGroup, LocalUsageGroup, QuotaPoint};
 use crate::history_ownership::{
     HistoryOwnershipManifest, HistoryOwnershipState, HistoryOwnershipStore, OwnershipManifestStatus,
 };
-use crate::logical_replica::{
-    ExpectedReplicaFactBinding, ReplicaCandidate, ReplicaCandidateKind, ReplicaDigestObservation,
-    active_facts_cover_digest, detect_replica_candidates,
-};
 use crate::project_mapping::PROJECT_MAPPING_REGISTRATION_FAILED_WARNING;
 use crate::project_mapping::{ProjectMappingProjection, ProjectMappingStore};
+#[cfg(test)]
+use crate::source_history::UsageEventFact;
 use crate::source_history::{
-    ActiveFactSet, RedactionProfile, SourceBucketChange, SourceHistoryRemoteActiveRef,
-    SourceHistoryStore, SourceKind, SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
-    UsageEventFact,
+    ActiveFactSet, RedactionProfile, SourceBucketChange, SourceHistoryReadBudget,
+    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
+    SourceSessionDigest, SourceSessionDigestChange,
 };
 use crate::source_identity::NodeId;
-use crate::source_model::{ObservedProjectKey, ThreadId};
+#[cfg(test)]
+use crate::source_model::ObservedProjectKey;
+use crate::source_model::ThreadId;
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
+
+#[cfg(test)]
+use aggregation::{
+    MAX_WEEKLY_RESET_CYCLES, WeeklyAggregationWork, WeeklySourceCursor, aggregate_source_buckets,
+    aggregate_source_weekly_points_with_work, assigned_canonical_reset,
+    source_weekly_cumulative_at,
+};
+use aggregation::{
+    aggregate_source_buckets_with_logical_threads, aggregate_source_weekly_points,
+    canonical_weekly_resets,
+};
+use reconciliation::{LogicalReplicaReport, resolve_logical_replicas};
+#[cfg(test)]
+use reconciliation::{
+    ReplicaBucketIndexWork, ReplicaParticipant, add_fact_group, build_source_bucket_indices,
+    digest_project_attribution_conflicts, replace_weekly_baselines_with_cycle_markers,
+};
 
 const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
@@ -325,6 +347,9 @@ fn load_unified_history_since_inner(
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
     validate_store_bindings(ownership, legacy, source_history)?;
+    // One allowance covers the complete logical query, including bounded
+    // retries when ownership or source metadata changes during the read.
+    let mut source_read_budget = SourceHistoryReadBudget::for_query();
 
     for _ in 0..MAX_STABLE_QUERY_ATTEMPTS {
         let before = initialized_manifest(ownership)?;
@@ -370,13 +395,16 @@ fn load_unified_history_since_inner(
             }
             HistoryOwnershipState::V2Active => {
                 let Some(v2) = load_v2_history_since(
-                    ownership.redaction_profile(),
-                    before.epoch(),
-                    source_history,
-                    project_mapping,
-                    bound_local_source_id,
-                    selection,
-                    since,
+                    &V2HistoryQuery {
+                        query_redaction: ownership.redaction_profile(),
+                        ownership_epoch: before.epoch(),
+                        store: source_history,
+                        project_mapping,
+                        bound_local_source_id,
+                        selection,
+                        since,
+                    },
+                    &mut source_read_budget,
                 )?
                 else {
                     // Source policy changed while it was being read. A
@@ -508,35 +536,33 @@ struct SourceReplicaEvidence {
     active_facts: BTreeMap<ThreadId, ActiveFactSet>,
 }
 
-/// Returns `None` when source policy changed during the read.
-fn load_v2_history_since(
+#[derive(Clone, Copy)]
+struct V2HistoryQuery<'a> {
     query_redaction: RedactionProfile,
     ownership_epoch: u64,
-    store: &SourceHistoryStore,
-    project_mapping: &LoadedProjectMappingProjection,
-    bound_local_source_id: Option<&NodeId>,
-    selection: &HistorySourceSelection,
+    store: &'a SourceHistoryStore,
+    project_mapping: &'a LoadedProjectMappingProjection,
+    bound_local_source_id: Option<&'a NodeId>,
+    selection: &'a HistorySourceSelection,
     since: DateTime<Utc>,
+}
+
+/// Returns `None` when source policy changed during the read.
+fn load_v2_history_since(
+    query: &V2HistoryQuery<'_>,
+    read_budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<Option<V2HistoryRead>> {
     let trace = process_trace_log().span_with("history.v2.query", || {
         TraceFields::new().label(
             "sourceScope",
-            match selection {
+            match query.selection {
                 HistorySourceSelection::AllIncluded => "all",
                 HistorySourceSelection::Local(_) => "local",
                 HistorySourceSelection::Remote(_) => "remote",
             },
         )
     });
-    let result = load_v2_history_since_inner(
-        query_redaction,
-        ownership_epoch,
-        store,
-        project_mapping,
-        bound_local_source_id,
-        selection,
-        since,
-    );
+    let result = load_v2_history_since_inner(query, read_budget);
     match &result {
         Ok(Some(read)) => trace.finish(
             TraceOutcome::Ok,
@@ -556,14 +582,18 @@ fn load_v2_history_since(
 }
 
 fn load_v2_history_since_inner(
-    query_redaction: RedactionProfile,
-    ownership_epoch: u64,
-    store: &SourceHistoryStore,
-    project_mapping: &LoadedProjectMappingProjection,
-    bound_local_source_id: Option<&NodeId>,
-    selection: &HistorySourceSelection,
-    since: DateTime<Utc>,
+    query: &V2HistoryQuery<'_>,
+    read_budget: &mut SourceHistoryReadBudget,
 ) -> io::Result<Option<V2HistoryRead>> {
+    let V2HistoryQuery {
+        query_redaction,
+        ownership_epoch,
+        store,
+        project_mapping,
+        bound_local_source_id,
+        selection,
+        since,
+    } = *query;
     let evidence_since = since
         .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
@@ -582,11 +612,10 @@ fn load_v2_history_since_inner(
     let mut metadata_before = metadata_result?;
     metadata_before
         .sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
-
     // Account quota is global and intentionally loaded once, independently
     // of how many local or SSH sources participate.
     let account_trace = process_trace_log().span("history.v2.account_load", TraceFields::new());
-    let account_result = store.load_account_since(evidence_since);
+    let account_result = store.load_account_since_with_budget(evidence_since, read_budget);
     match &account_result {
         Ok(account) => account_trace.finish(
             TraceOutcome::Ok,
@@ -679,11 +708,12 @@ fn load_v2_history_since_inner(
             let (buckets, weekly_local_points, digest_records, active_remote_ref) =
                 match metadata.kind() {
                     SourceKind::Local => {
-                        let snapshot = store.load_local_observation_snapshot_since(
+                        let snapshot = store.load_local_observation_snapshot_since_with_budget(
                             metadata.source_id(),
                             source_redaction,
                             evidence_since,
                             detect_replicas,
+                            read_budget,
                         )?;
                         if snapshot.source != *metadata {
                             return Ok(None);
@@ -701,10 +731,11 @@ fn load_v2_history_since_inner(
                         // families, so a generation switch cannot splice them. The
                         // current exporter has no remote weekly wire family; weekly
                         // cumulative points are derived from these source buckets.
-                        let snapshot = store.load_remote_history_snapshot_since(
+                        let snapshot = store.load_remote_history_snapshot_since_with_budget(
                             metadata.source_id(),
                             source_redaction,
                             evidence_since,
+                            read_budget,
                         )?;
                         let buckets = snapshot
                             .bucket_records
@@ -796,7 +827,7 @@ fn load_v2_history_since_inner(
         // Logical replica resolution clears cumulative baselines because they
         // cannot be decomposed per thread; canonicalizing first prevents each
         // rolling zero-usage estimate from becoming an anchored marker.
-        let weekly_cycle_resets = canonical_weekly_resets(&slices, &account.quota_points);
+        let weekly_cycle_resets = canonical_weekly_resets(&slices, &account.quota_points)?;
         let replica_trace = process_trace_log().span_with("history.v2.replica_resolve", || {
             TraceFields::new()
                 .usize("sourceCount", slices.len())
@@ -808,6 +839,7 @@ fn load_v2_history_since_inner(
             &mut replica_evidence,
             &project_mapping.projection,
             &weekly_cycle_resets,
+            read_budget,
         );
         match &replica_result {
             Ok(report) => replica_trace.finish(
@@ -821,7 +853,8 @@ fn load_v2_history_since_inner(
         replica_report = replica_result?;
     }
 
-    let weekly_local_points = aggregate_source_weekly_points(&slices, &account.quota_points, since);
+    let weekly_local_points =
+        aggregate_source_weekly_points(&slices, &account.quota_points, since)?;
     // The durable Summary backfill marker describes reconstruction of this
     // machine's local rollout history. It is meaningful for the all-source or
     // exact-current-local projections, but must not make a remote-only view
@@ -915,1948 +948,6 @@ fn load_v2_history_since_inner(
         redaction_skipped_sources,
         source_selection_status,
     }))
-}
-
-struct BucketProjection {
-    buckets: Vec<LocalHalfHourBucket>,
-    project_observations: bool,
-    unmapped_projects: bool,
-}
-
-type LogicalThreadProjection = BTreeMap<(String, String), String>;
-
-#[derive(Default)]
-struct LogicalReplicaReport {
-    logical_threads: LogicalThreadProjection,
-    warnings: Vec<String>,
-}
-
-#[derive(Clone)]
-struct ReplicaParticipant {
-    source_index: usize,
-    digest: SourceSessionDigest,
-    exact_fact_coverage: bool,
-}
-
-struct ReplicaResolution {
-    participants: Vec<ReplicaParticipant>,
-    authority_index: usize,
-    union_facts: Option<Vec<(usize, UsageEventFact)>>,
-    fact_conflict: bool,
-    project_conflict: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BucketProjectResidual {
-    token_usage: TokenUsage,
-    estimated_cost_units: u128,
-    api_long_context_extra_cost_units: Option<u128>,
-    call_count: u64,
-}
-
-fn resolve_logical_replicas(
-    store: &SourceHistoryStore,
-    slices: &mut [SourceSlice],
-    evidence: &mut [SourceReplicaEvidence],
-    project_mapping: &ProjectMappingProjection,
-    weekly_cycle_resets: &[DateTime<Utc>],
-) -> io::Result<LogicalReplicaReport> {
-    // Bucket project groups are an independent replica signal. In particular,
-    // a v1 -> v2 migration can persist buckets before its matching digest, so
-    // digest-only candidate detection is not sufficient to make an all-source
-    // query additive-safe.
-    let observed_thread_sources = observe_thread_sources(slices);
-    let candidates = detect_replica_candidates(evidence.iter().flat_map(|source| {
-        source
-            .digests
-            .iter()
-            .map(|digest| ReplicaDigestObservation {
-                source_id: &source.source_id,
-                digest,
-            })
-    }));
-    if candidates.is_empty()
-        && !observed_thread_sources
-            .values()
-            .any(|source_indices| source_indices.len() > 1)
-    {
-        return Ok(LogicalReplicaReport::default());
-    }
-
-    // Facts are a local persistence read. The query path never starts SSH or
-    // any other network operation. Only divergent candidates need this read.
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| candidate.kind() == ReplicaCandidateKind::NeedsFacts)
-    {
-        for source_id in candidate.source_ids() {
-            let Some(source) = evidence
-                .iter_mut()
-                .find(|source| &source.source_id == source_id)
-            else {
-                continue;
-            };
-            if source.active_facts.contains_key(candidate.thread_id()) {
-                continue;
-            }
-            if let Ok(Some(active)) = store.load_active_fact_set(
-                source_id,
-                source.redaction_profile,
-                candidate.thread_id(),
-            ) {
-                source
-                    .active_facts
-                    .insert(candidate.thread_id().clone(), active);
-            }
-        }
-    }
-
-    let mut report = LogicalReplicaReport::default();
-    let mut touched = BTreeMap::<(usize, DateTime<Utc>), BucketProjectResidual>::new();
-    let mut handled_ranges =
-        BTreeMap::<(String, usize), Vec<(DateTime<Utc>, DateTime<Utc>)>>::new();
-    let mut thread_authorities = BTreeMap::<String, usize>::new();
-    for candidate in &candidates {
-        let Some(resolution) = plan_replica_resolution(candidate, evidence, project_mapping) else {
-            continue;
-        };
-        let thread_id = candidate.thread_id();
-        let thread_key = thread_id.as_str().to_owned();
-        thread_authorities
-            .entry(thread_key.clone())
-            .or_insert(resolution.authority_index);
-        let mut candidate_source_indices = resolution
-            .participants
-            .iter()
-            .map(|participant| participant.source_index)
-            .collect::<BTreeSet<_>>();
-        if let Some(observed_sources) = observed_thread_sources.get(&thread_key) {
-            candidate_source_indices.extend(observed_sources.iter().copied().filter(
-                |source_index| {
-                    source_has_thread_group_in_range(
-                        &slices[*source_index],
-                        thread_id,
-                        candidate.range_start(),
-                        candidate.range_end(),
-                    )
-                },
-            ));
-        }
-        let logical_id = format!("logical-thread:{}", candidate.thread_id().as_str());
-        for source_index in &candidate_source_indices {
-            report.logical_threads.insert(
-                (
-                    evidence[*source_index].source_id.as_str().to_owned(),
-                    candidate.thread_id().as_str().to_owned(),
-                ),
-                logical_id.clone(),
-            );
-            handled_ranges
-                .entry((thread_key.clone(), *source_index))
-                .or_default()
-                .push((candidate.range_start(), candidate.range_end()));
-        }
-
-        let participant_coverage = resolution
-            .participants
-            .iter()
-            .map(|participant| {
-                (
-                    participant.source_index,
-                    replica_groups_cover_digest(
-                        &slices[participant.source_index],
-                        thread_id,
-                        &participant.digest,
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut conservative_lower_bound = candidate_source_indices
-            .iter()
-            .any(|source_index| !participant_coverage.contains_key(source_index));
-
-        match &resolution.union_facts {
-            Some(facts) => {
-                for participant in &resolution.participants {
-                    if participant_coverage[&participant.source_index] {
-                        remove_replica_groups(
-                            participant.source_index,
-                            &mut slices[participant.source_index],
-                            thread_id,
-                            participant.digest.range_start(),
-                            participant.digest.range_end(),
-                            &mut touched,
-                        );
-                    } else {
-                        conservative_lower_bound = true;
-                        preserve_unrelated_project_groups_in_replica_range(
-                            participant.source_index,
-                            &mut slices[participant.source_index],
-                            thread_id,
-                            participant.digest.range_start(),
-                            participant.digest.range_end(),
-                            &mut touched,
-                        );
-                    }
-                }
-                for source_index in candidate_source_indices
-                    .iter()
-                    .copied()
-                    .filter(|source_index| !participant_coverage.contains_key(source_index))
-                {
-                    suppress_unbound_replica_range(
-                        source_index,
-                        &mut slices[source_index],
-                        thread_id.as_str(),
-                        candidate.range_start(),
-                        candidate.range_end(),
-                        &mut touched,
-                    );
-                }
-                for (source_index, fact) in facts {
-                    add_fact_group(
-                        *source_index,
-                        &mut slices[*source_index],
-                        fact,
-                        &mut touched,
-                    )?;
-                }
-                if resolution.fact_conflict {
-                    report
-                        .warnings
-                        .push(DUPLICATE_SESSION_FACT_CONFLICT_WARNING.to_string());
-                }
-            }
-            None => {
-                if let Some(authority) = resolution
-                    .participants
-                    .iter()
-                    .find(|participant| participant.source_index == resolution.authority_index)
-                {
-                    ensure_authority_project_consistency(
-                        resolution.authority_index,
-                        &mut slices[resolution.authority_index],
-                        authority.digest.range_start(),
-                        authority.digest.range_end(),
-                        &mut touched,
-                    );
-                }
-                for participant in &resolution.participants {
-                    if participant.source_index == resolution.authority_index {
-                        continue;
-                    }
-                    if participant_coverage[&participant.source_index] {
-                        remove_replica_groups(
-                            participant.source_index,
-                            &mut slices[participant.source_index],
-                            thread_id,
-                            participant.digest.range_start(),
-                            participant.digest.range_end(),
-                            &mut touched,
-                        );
-                    } else {
-                        conservative_lower_bound = true;
-                        preserve_unrelated_project_groups_in_replica_range(
-                            participant.source_index,
-                            &mut slices[participant.source_index],
-                            thread_id,
-                            participant.digest.range_start(),
-                            participant.digest.range_end(),
-                            &mut touched,
-                        );
-                    }
-                }
-                for source_index in candidate_source_indices
-                    .iter()
-                    .copied()
-                    .filter(|source_index| !participant_coverage.contains_key(source_index))
-                {
-                    suppress_unbound_replica_range(
-                        source_index,
-                        &mut slices[source_index],
-                        thread_id.as_str(),
-                        candidate.range_start(),
-                        candidate.range_end(),
-                        &mut touched,
-                    );
-                }
-                if candidate.kind() == ReplicaCandidateKind::NeedsFacts {
-                    report
-                        .warnings
-                        .push(DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string());
-                }
-            }
-        }
-        if conservative_lower_bound {
-            report
-                .warnings
-                .push(DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string());
-        }
-        if resolution.project_conflict {
-            report
-                .warnings
-                .push(DUPLICATE_SESSION_PROJECT_CONFLICT_WARNING.to_string());
-        }
-    }
-
-    // Reconcile observations that were not backed by a cross-source digest
-    // candidate. This includes a source whose digest is temporarily missing
-    // and sessions imported from the v1 bucket family only. Keep one stable
-    // authority and remove all other physical copies. Fully decomposed buckets
-    // retain their provable non-session groups; an opaque bucket is zeroed so
-    // uncertainty can only make the aggregate a lower bound, never a double
-    // count.
-    for (thread_key, source_indices) in &observed_thread_sources {
-        if source_indices.len() < 2 {
-            continue;
-        }
-        let authority_index = thread_authorities
-            .get(thread_key)
-            .copied()
-            .unwrap_or_else(|| {
-                choose_observed_thread_authority(thread_key, source_indices, evidence)
-            });
-        let logical_id = format!("logical-thread:{thread_key}");
-        for source_index in source_indices {
-            report.logical_threads.insert(
-                (
-                    evidence[*source_index].source_id.as_str().to_owned(),
-                    thread_key.clone(),
-                ),
-                logical_id.clone(),
-            );
-        }
-
-        let mut suppressed_unbound_copy = false;
-        for source_index in source_indices
-            .iter()
-            .copied()
-            .filter(|source_index| *source_index != authority_index)
-        {
-            let ranges = handled_ranges
-                .get(&(thread_key.clone(), source_index))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if !source_has_unhandled_thread_group(&slices[source_index], thread_key, ranges) {
-                continue;
-            }
-            suppress_unbound_replica_outside_ranges(
-                source_index,
-                &mut slices[source_index],
-                thread_key,
-                ranges,
-                &mut touched,
-            );
-            suppressed_unbound_copy = true;
-        }
-        if suppressed_unbound_copy {
-            mark_unhandled_authority_lower_bound(
-                &mut slices[authority_index],
-                thread_key,
-                handled_ranges
-                    .get(&(thread_key.clone(), authority_index))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            );
-            report
-                .warnings
-                .push(DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string());
-        }
-    }
-
-    for ((source_index, starts_at), residual) in touched {
-        if let Some(bucket) = slices[source_index]
-            .buckets
-            .iter_mut()
-            .find(|bucket| bucket.starts_at == starts_at)
-        {
-            rebuild_bucket_from_project_groups(bucket, residual);
-        }
-    }
-    if !report.logical_threads.is_empty() {
-        // A persisted weekly baseline has no per-thread decomposition. The
-        // queried bucket window includes the preceding full cycle, so derive
-        // the logical projection from adjusted buckets instead of retaining a
-        // physically duplicated baseline.
-        replace_weekly_baselines_with_cycle_markers(slices, weekly_cycle_resets);
-    }
-    report.warnings.sort();
-    report.warnings.dedup();
-    Ok(report)
-}
-
-fn ensure_authority_project_consistency(
-    _source_index: usize,
-    source: &mut SourceSlice,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    _touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    for bucket in source
-        .buckets
-        .iter_mut()
-        .filter(|bucket| bucket.starts_at >= range_start && bucket.starts_at < range_end)
-    {
-        if project_groups_match_bucket(bucket) {
-            continue;
-        }
-        bucket
-            .partial_reasons
-            .push(DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string());
-        bucket
-            .partial_reasons
-            .push(DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND.to_string());
-    }
-}
-
-fn observe_thread_sources(slices: &[SourceSlice]) -> BTreeMap<String, BTreeSet<usize>> {
-    let mut observations = BTreeMap::<String, BTreeSet<usize>>::new();
-    for (source_index, source) in slices.iter().enumerate() {
-        for thread_id in source.buckets.iter().flat_map(|bucket| {
-            bucket
-                .project_groups
-                .iter()
-                .map(|group| group.thread_id.as_str())
-                .filter(|thread_id| !thread_id.is_empty())
-        }) {
-            observations
-                .entry(thread_id.to_owned())
-                .or_default()
-                .insert(source_index);
-        }
-    }
-    observations
-}
-
-fn source_has_thread_group_in_range(
-    source: &SourceSlice,
-    thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-) -> bool {
-    source.buckets.iter().any(|bucket| {
-        bucket.starts_at >= range_start
-            && bucket.starts_at < range_end
-            && bucket
-                .project_groups
-                .iter()
-                .any(|group| group.thread_id == thread_id.as_str())
-    })
-}
-
-fn choose_observed_thread_authority(
-    thread_id: &str,
-    source_indices: &BTreeSet<usize>,
-    evidence: &[SourceReplicaEvidence],
-) -> usize {
-    let mut digest_authority: Option<(usize, &SourceSessionDigest)> = None;
-    for source_index in source_indices {
-        for digest in evidence[*source_index]
-            .digests
-            .iter()
-            .filter(|digest| digest.replica().thread_id().as_str() == thread_id)
-        {
-            let replace = digest_authority.is_none_or(|(best_index, best_digest)| {
-                authority_is_better(
-                    &evidence[*source_index],
-                    digest,
-                    active_source_facts_cover_digest(&evidence[*source_index], digest),
-                    &evidence[best_index],
-                    best_digest,
-                    active_source_facts_cover_digest(&evidence[best_index], best_digest),
-                )
-            });
-            if replace {
-                digest_authority = Some((*source_index, digest));
-            }
-        }
-    }
-    digest_authority.map_or_else(
-        || {
-            *source_indices
-                .iter()
-                .min_by_key(|source_index| evidence[**source_index].source_id.as_str())
-                .expect("cross-source observation contains a source")
-        },
-        |(source_index, _)| source_index,
-    )
-}
-
-fn timestamp_in_ranges(
-    timestamp: DateTime<Utc>,
-    ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-) -> bool {
-    ranges
-        .iter()
-        .any(|(range_start, range_end)| timestamp >= *range_start && timestamp < *range_end)
-}
-
-fn source_has_unhandled_thread_group(
-    source: &SourceSlice,
-    thread_id: &str,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-) -> bool {
-    source.buckets.iter().any(|bucket| {
-        !timestamp_in_ranges(bucket.starts_at, handled_ranges)
-            && bucket
-                .project_groups
-                .iter()
-                .any(|group| group.thread_id == thread_id)
-    })
-}
-
-fn mark_unhandled_authority_lower_bound(
-    source: &mut SourceSlice,
-    thread_id: &str,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-) {
-    for bucket in &mut source.buckets {
-        if timestamp_in_ranges(bucket.starts_at, handled_ranges)
-            || !bucket
-                .project_groups
-                .iter()
-                .any(|group| group.thread_id == thread_id)
-        {
-            continue;
-        }
-        bucket
-            .partial_reasons
-            .push(DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND.to_string());
-    }
-}
-
-fn replace_weekly_baselines_with_cycle_markers(
-    slices: &mut [SourceSlice],
-    canonical_resets: &[DateTime<Utc>],
-) {
-    for source in slices.iter_mut() {
-        source.weekly_local_points.clear();
-    }
-    let Some(marker_source) = slices.first_mut() else {
-        return;
-    };
-    for &resets_at in canonical_resets {
-        let observed_at = resets_at
-            .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
-        marker_source.weekly_local_points.push(WeeklyLocalPoint {
-            observed_at,
-            resets_at,
-            token_usage: TokenUsage::default(),
-            estimated_cost_units: 0,
-            api_long_context_extra_cost_units: Some(0),
-            long_context_usage_unknown: false,
-            estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
-            call_count: 0,
-            partial_reasons: vec![DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS.to_string()],
-        });
-    }
-}
-
-fn plan_replica_resolution(
-    candidate: &ReplicaCandidate,
-    evidence: &[SourceReplicaEvidence],
-    project_mapping: &ProjectMappingProjection,
-) -> Option<ReplicaResolution> {
-    let mut participants = Vec::new();
-    for source_id in candidate.source_ids() {
-        let source_index = evidence
-            .iter()
-            .position(|source| &source.source_id == source_id)?;
-        let digest = evidence[source_index]
-            .digests
-            .iter()
-            .find(|digest| {
-                digest.replica().thread_id() == candidate.thread_id()
-                    && digest.range_start() == candidate.range_start()
-                    && digest.range_end() <= candidate.range_end()
-            })?
-            .clone();
-        let exact_fact_coverage =
-            active_source_facts_cover_digest(&evidence[source_index], &digest);
-        participants.push(ReplicaParticipant {
-            source_index,
-            digest,
-            exact_fact_coverage,
-        });
-    }
-    if participants.len() < 2 {
-        return None;
-    }
-    let authority_index = participants
-        .iter()
-        .map(|participant| participant.source_index)
-        .reduce(|best, candidate_index| {
-            let best_digest = participants
-                .iter()
-                .find(|participant| participant.source_index == best)
-                .expect("authority index belongs to a participant");
-            let candidate_digest = participants
-                .iter()
-                .find(|participant| participant.source_index == candidate_index)
-                .expect("authority index belongs to a participant");
-            if authority_is_better(
-                &evidence[candidate_index],
-                &candidate_digest.digest,
-                candidate_digest.exact_fact_coverage,
-                &evidence[best],
-                &best_digest.digest,
-                best_digest.exact_fact_coverage,
-            ) {
-                candidate_index
-            } else {
-                best
-            }
-        })?;
-
-    let mut union_facts = None;
-    let mut fact_conflict = false;
-    let mut project_conflict =
-        digest_project_attribution_conflicts(&participants, evidence, project_mapping);
-    if candidate.kind() == ReplicaCandidateKind::NeedsFacts {
-        let fact_sets = participants
-            .iter()
-            .map(|participant| {
-                complete_compatible_facts(&evidence[participant.source_index], &participant.digest)
-                    .map(|facts| (participant.source_index, facts))
-            })
-            .collect::<Option<Vec<_>>>();
-        if let Some(fact_sets) = fact_sets
-            && participant_revisions_compatible(&participants)
-        {
-            let mut events = BTreeMap::<String, (usize, UsageEventFact)>::new();
-            for (source_index, facts) in fact_sets {
-                for fact in facts {
-                    let key = fact.event_id().as_str().to_owned();
-                    match events.entry(key) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert((source_index, fact));
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let (existing_source, existing_fact) = entry.get();
-                            let conflict = !facts_semantically_equal(existing_fact, &fact);
-                            fact_conflict |= conflict;
-                            project_conflict |= fact_project_attribution_conflicts(
-                                project_mapping,
-                                &evidence[*existing_source].source_id,
-                                existing_fact,
-                                &evidence[source_index].source_id,
-                                &fact,
-                            );
-                            let existing_digest = participants
-                                .iter()
-                                .find(|participant| participant.source_index == *existing_source)
-                                .expect("fact owner is a participant");
-                            let incoming_digest = participants
-                                .iter()
-                                .find(|participant| participant.source_index == source_index)
-                                .expect("fact owner is a participant");
-                            if authority_is_better(
-                                &evidence[source_index],
-                                &incoming_digest.digest,
-                                incoming_digest.exact_fact_coverage,
-                                &evidence[*existing_source],
-                                &existing_digest.digest,
-                                existing_digest.exact_fact_coverage,
-                            ) {
-                                entry.insert((source_index, fact));
-                            }
-                        }
-                    }
-                }
-            }
-            union_facts = Some(events.into_values().collect());
-        }
-    }
-
-    Some(ReplicaResolution {
-        participants,
-        authority_index,
-        union_facts,
-        fact_conflict,
-        project_conflict,
-    })
-}
-
-fn fact_project_attribution_conflicts(
-    project_mapping: &ProjectMappingProjection,
-    left_source: &NodeId,
-    left: &UsageEventFact,
-    right_source: &NodeId,
-    right: &UsageEventFact,
-) -> bool {
-    let left = project_mapping.resolve(left_source, left.observed_project_key());
-    let right = project_mapping.resolve(right_source, right.observed_project_key());
-    match (left, right) {
-        (Some(left), Some(right)) => left.aggregate_id() != right.aggregate_id(),
-        _ => true,
-    }
-}
-
-fn digest_project_attribution_conflicts(
-    participants: &[ReplicaParticipant],
-    evidence: &[SourceReplicaEvidence],
-    project_mapping: &ProjectMappingProjection,
-) -> bool {
-    let mut expected: Option<BTreeSet<String>> = None;
-    for participant in participants {
-        let source_id = &evidence[participant.source_index].source_id;
-        let mut aggregate_ids = BTreeSet::new();
-        for observed_project_key in participant.digest.observed_project_keys() {
-            let Some(project) = project_mapping.resolve(source_id, observed_project_key) else {
-                return true;
-            };
-            aggregate_ids.insert(project.aggregate_id().as_str().to_owned());
-        }
-        if expected
-            .as_ref()
-            .is_some_and(|expected| expected != &aggregate_ids)
-        {
-            return true;
-        }
-        expected = Some(aggregate_ids);
-    }
-    false
-}
-
-fn participant_revisions_compatible(participants: &[ReplicaParticipant]) -> bool {
-    let Some(first) = participants
-        .first()
-        .map(|participant| participant.digest.metrics())
-    else {
-        return false;
-    };
-    participants.iter().all(|participant| {
-        let metrics = participant.digest.metrics();
-        participant.digest.range_start() == participants[0].digest.range_start()
-            && participant.digest.range_end() == participants[0].digest.range_end()
-            && metrics.metric_revision == first.metric_revision
-            && metrics.estimator_revision == first.estimator_revision
-            && metrics.project_breakdown_revision == first.project_breakdown_revision
-            && metrics.api_pricing_catalog_revision == first.api_pricing_catalog_revision
-    })
-}
-
-fn complete_compatible_facts(
-    source: &SourceReplicaEvidence,
-    digest: &SourceSessionDigest,
-) -> Option<Vec<UsageEventFact>> {
-    let active = source.active_facts.get(digest.replica().thread_id())?;
-    let expected_binding = source
-        .active_remote_ref
-        .as_ref()
-        .map_or(ExpectedReplicaFactBinding::Local, |active_history| {
-            ExpectedReplicaFactBinding::Remote(active_history.binding())
-        });
-    if !active_facts_cover_digest(digest, Some(active), expected_binding) {
-        return None;
-    }
-    let facts = active
-        .facts()
-        .into_iter()
-        .filter(|fact| {
-            fact.occurred_at() >= digest.range_start() && fact.occurred_at() < digest.range_end()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    Some(facts)
-}
-
-fn facts_semantically_equal(left: &UsageEventFact, right: &UsageEventFact) -> bool {
-    left.event_id() == right.event_id()
-        && left.occurred_at() == right.occurred_at()
-        && left.emitting_turn_id() == right.emitting_turn_id()
-        && left.parent_thread_id() == right.parent_thread_id()
-        && left.project_session_thread_id() == right.project_session_thread_id()
-        && left.root_session_thread_id() == right.root_session_thread_id()
-        && left.root_session_turn_id() == right.root_session_turn_id()
-        && left.model() == right.model()
-        && left.service_tier() == right.service_tier()
-        && left.digest_token_usage() == right.digest_token_usage()
-        && left.request_usage_exact() == right.request_usage_exact()
-        && left.exact_event_identity() == right.exact_event_identity()
-        && left.metrics() == right.metrics()
-}
-
-fn authority_is_better(
-    left_source: &SourceReplicaEvidence,
-    left: &SourceSessionDigest,
-    left_fact_coverage: bool,
-    right_source: &SourceReplicaEvidence,
-    right: &SourceSessionDigest,
-    right_fact_coverage: bool,
-) -> bool {
-    let left_revisions = authority_revisions(left_source, left);
-    let right_revisions = authority_revisions(right_source, right);
-    let current = crate::remote_agent::current_revisions();
-    let current_tuple = (
-        current.history_format.get(),
-        current.metric.get(),
-        current.estimator.get(),
-        current.project_breakdown.get(),
-        current.api_pricing_catalog.get(),
-    );
-    let left_key = (
-        left_revisions == current_tuple,
-        left_revisions,
-        left.exact_event_identity(),
-        left.coverage_complete(),
-        std::cmp::Reverse(hard_partial_count(left)),
-        left_fact_coverage,
-        left.covered_through(),
-        left.range_end(),
-    );
-    let right_key = (
-        right_revisions == current_tuple,
-        right_revisions,
-        right.exact_event_identity(),
-        right.coverage_complete(),
-        std::cmp::Reverse(hard_partial_count(right)),
-        right_fact_coverage,
-        right.covered_through(),
-        right.range_end(),
-    );
-    left_key > right_key
-        || (left_key == right_key
-            && left_source.source_id.as_str() < right_source.source_id.as_str())
-}
-
-fn active_source_facts_cover_digest(
-    source: &SourceReplicaEvidence,
-    digest: &SourceSessionDigest,
-) -> bool {
-    let expected_binding = source
-        .active_remote_ref
-        .as_ref()
-        .map_or(ExpectedReplicaFactBinding::Local, |active_history| {
-            ExpectedReplicaFactBinding::Remote(active_history.binding())
-        });
-    active_facts_cover_digest(
-        digest,
-        source.active_facts.get(digest.replica().thread_id()),
-        expected_binding,
-    )
-}
-
-fn authority_revisions(
-    source: &SourceReplicaEvidence,
-    digest: &SourceSessionDigest,
-) -> (u32, u32, u32, u32, u32) {
-    let current = crate::remote_agent::current_revisions();
-    let history = source
-        .active_remote_ref
-        .as_ref()
-        .map(|active| active.binding().revisions().history_format.get())
-        .unwrap_or_else(|| current.history_format.get());
-    let metrics = digest.metrics();
-    (
-        history,
-        metrics.metric_revision,
-        metrics.estimator_revision,
-        metrics.project_breakdown_revision,
-        metrics.api_pricing_catalog_revision,
-    )
-}
-
-fn hard_partial_count(digest: &SourceSessionDigest) -> usize {
-    digest
-        .metrics()
-        .partial_reasons
-        .iter()
-        .filter(|reason| {
-            matches!(
-                reason.as_str(),
-                "rollout_local_coverage_unverified"
-                    | "coverage_starts_within_local_bucket"
-                    | "rollout_scan_incomplete"
-                    | "rollout_scan_truncated"
-                    | "rollout_unreadable"
-                    | "rollout_lines_skipped"
-                    | "ambiguous_token_reset"
-            )
-        })
-        .count()
-}
-
-fn remove_replica_groups(
-    source_index: usize,
-    source: &mut SourceSlice,
-    thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    for bucket in source
-        .buckets
-        .iter_mut()
-        .filter(|bucket| bucket.starts_at >= range_start && bucket.starts_at < range_end)
-    {
-        if !bucket
-            .project_groups
-            .iter()
-            .any(|group| group.thread_id == thread_id.as_str())
-        {
-            continue;
-        }
-        let residual = bucket_project_residual(bucket)
-            .expect("replica coverage preflight proved a subtractable project breakdown");
-        touched
-            .entry((source_index, bucket.starts_at))
-            .or_insert(residual);
-        bucket
-            .project_groups
-            .retain(|group| group.thread_id != thread_id.as_str());
-        bucket
-            .partial_reasons
-            .push(DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string());
-        if !residual.token_usage.is_zero()
-            || residual.estimated_cost_units != 0
-            || residual.api_long_context_extra_cost_units != Some(0)
-            || residual.call_count != 0
-        {
-            bucket
-                .partial_reasons
-                .push(DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND.to_string());
-        }
-        // Keep the in-memory projection coherent for a second logical thread
-        // that may share this physical bucket. The final touched pass remains
-        // the canonical rebuild, but later conservative preflights must not
-        // mistake a scheduled subtraction for an opaque residual.
-        rebuild_bucket_from_project_groups(bucket, residual);
-    }
-}
-
-fn suppress_unbound_replica_range(
-    source_index: usize,
-    source: &mut SourceSlice,
-    thread_id: &str,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    suppress_unbound_replica_buckets(
-        source_index,
-        source,
-        thread_id,
-        |timestamp| timestamp >= range_start && timestamp < range_end,
-        touched,
-    );
-}
-
-fn suppress_unbound_replica_outside_ranges(
-    source_index: usize,
-    source: &mut SourceSlice,
-    thread_id: &str,
-    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    suppress_unbound_replica_buckets(
-        source_index,
-        source,
-        thread_id,
-        |timestamp| !timestamp_in_ranges(timestamp, handled_ranges),
-        touched,
-    );
-}
-
-fn suppress_unbound_replica_buckets(
-    source_index: usize,
-    source: &mut SourceSlice,
-    thread_id: &str,
-    include_bucket: impl Fn(DateTime<Utc>) -> bool,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    for bucket in source
-        .buckets
-        .iter_mut()
-        .filter(|bucket| include_bucket(bucket.starts_at))
-    {
-        let has_target_group = bucket
-            .project_groups
-            .iter()
-            .any(|group| group.thread_id == thread_id);
-        if has_target_group || !project_groups_match_bucket(bucket) {
-            preserve_unrelated_project_groups_in_bucket(source_index, bucket, thread_id, touched);
-        }
-    }
-}
-
-/// Removes only the replica being reconstructed while preserving every
-/// explicitly attributed, unrelated project group as a known lower bound.
-///
-/// A non-subtractable bucket cannot prove how much of its opaque residual came
-/// from the target replica, so that residual must be discarded before exact
-/// facts are injected. Explicit groups for other threads remain independently
-/// attributable and must not be erased with it.
-fn preserve_unrelated_project_groups_in_replica_range(
-    source_index: usize,
-    source: &mut SourceSlice,
-    thread_id: &ThreadId,
-    range_start: DateTime<Utc>,
-    range_end: DateTime<Utc>,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    suppress_unbound_replica_buckets(
-        source_index,
-        source,
-        thread_id.as_str(),
-        |timestamp| timestamp >= range_start && timestamp < range_end,
-        touched,
-    );
-}
-
-fn preserve_unrelated_project_groups_in_bucket(
-    source_index: usize,
-    bucket: &mut LocalHalfHourBucket,
-    thread_id: &str,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) {
-    let residual = BucketProjectResidual {
-        token_usage: TokenUsage::default(),
-        estimated_cost_units: 0,
-        api_long_context_extra_cost_units: Some(0),
-        call_count: 0,
-    };
-    touched.insert((source_index, bucket.starts_at), residual);
-    bucket.groups.clear();
-    bucket.long_context_usage_unknown = false;
-    bucket
-        .project_groups
-        .retain(|group| !group.thread_id.is_empty() && group.thread_id != thread_id);
-    bucket
-        .partial_reasons
-        .push(DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string());
-    bucket
-        .partial_reasons
-        .push(DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND.to_string());
-    rebuild_bucket_from_project_groups(bucket, residual);
-}
-
-fn add_fact_group(
-    source_index: usize,
-    source: &mut SourceSlice,
-    fact: &UsageEventFact,
-    touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
-) -> io::Result<()> {
-    let starts_at = quarter_hour_start(fact.occurred_at())?;
-    let ends_at = starts_at + Duration::minutes(15);
-    let metrics = fact.metrics();
-    let bucket_index = source
-        .buckets
-        .iter()
-        .position(|bucket| bucket.starts_at == starts_at)
-        .unwrap_or_else(|| {
-            source.buckets.push(LocalHalfHourBucket {
-                starts_at,
-                ends_at,
-                sampled_at: ends_at,
-                token_usage: TokenUsage::default(),
-                estimated_cost_units: 0,
-                api_long_context_extra_cost_units: Some(0),
-                long_context_usage_unknown: false,
-                estimator_revision: metrics.estimator_revision,
-                project_breakdown_revision: metrics.project_breakdown_revision,
-                api_pricing_catalog_revision: metrics.api_pricing_catalog_revision,
-                call_count: 0,
-                groups: Vec::new(),
-                project_groups: Vec::new(),
-                partial_reasons: vec![DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string()],
-            });
-            source.buckets.len() - 1
-        });
-    let bucket = &mut source.buckets[bucket_index];
-    let residual = bucket_project_residual(bucket).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replica fact target bucket has a non-subtractable project breakdown",
-        )
-    })?;
-    touched.entry((source_index, starts_at)).or_insert(residual);
-    bucket.project_groups.push(LocalProjectUsageGroup {
-        thread_id: fact.replica().thread_id().as_str().to_owned(),
-        turn_id: fact.emitting_turn_id().map(str::to_owned),
-        parent_thread_id: fact
-            .parent_thread_id()
-            .map(|thread| thread.as_str().to_owned()),
-        session_thread_id: Some(fact.root_session_thread_id().as_str().to_owned()),
-        session_turn_id: fact.root_session_turn_id().map(str::to_owned),
-        project_id: Some(fact.observed_project_key().as_str().to_owned()),
-        source: Some(source.metadata.display_label().to_owned()),
-        token_usage: metrics.token_usage,
-        estimated_cost_units: metrics.estimated_cost_units,
-        api_long_context_extra_cost_units: metrics.api_long_context_extra_cost_units,
-        api_equivalent_cost: metrics.api_equivalent_cost,
-        call_count: metrics.call_count,
-        ..LocalProjectUsageGroup::default()
-    });
-    bucket
-        .partial_reasons
-        .push(DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string());
-    rebuild_bucket_from_project_groups(bucket, residual);
-    Ok(())
-}
-
-fn quarter_hour_start(timestamp: DateTime<Utc>) -> io::Result<DateTime<Utc>> {
-    let seconds = timestamp.timestamp().div_euclid(15 * 60) * 15 * 60;
-    Utc.timestamp_opt(seconds, 0).single().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session fact timestamp cannot be assigned to a history bucket",
-        )
-    })
-}
-
-fn rebuild_bucket_from_project_groups(
-    bucket: &mut LocalHalfHourBucket,
-    residual: BucketProjectResidual,
-) {
-    let mut token_usage = residual.token_usage;
-    let mut estimated_cost_units = residual.estimated_cost_units;
-    let mut long_context = residual.api_long_context_extra_cost_units;
-    let mut call_count = residual.call_count;
-    for group in &bucket.project_groups {
-        token_usage.add_assign(group.token_usage);
-        estimated_cost_units = estimated_cost_units.saturating_add(group.estimated_cost_units);
-        long_context = add_optional_units(long_context, group.api_long_context_extra_cost_units);
-        call_count = call_count.saturating_add(group.call_count);
-    }
-    bucket.token_usage = token_usage;
-    bucket.estimated_cost_units = estimated_cost_units;
-    bucket.api_long_context_extra_cost_units = long_context;
-    bucket.long_context_usage_unknown |= long_context.is_none();
-    bucket.call_count = call_count;
-    bucket.groups.clear();
-    bucket
-        .partial_reasons
-        .push(DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL.to_string());
-    bucket.partial_reasons.sort();
-    bucket.partial_reasons.dedup();
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ProjectGroupTotals {
-    token_usage: TokenUsage,
-    estimated_cost_units: u128,
-    api_long_context_extra_cost_units: Option<u128>,
-    api_equivalent_cost: ApiCostAmount,
-    call_count: u64,
-}
-
-fn project_group_totals<'a>(
-    groups: impl IntoIterator<Item = &'a LocalProjectUsageGroup>,
-) -> ProjectGroupTotals {
-    let mut totals = ProjectGroupTotals {
-        api_long_context_extra_cost_units: Some(0),
-        ..ProjectGroupTotals::default()
-    };
-    for group in groups {
-        totals.token_usage.add_assign(group.token_usage);
-        totals.estimated_cost_units = totals
-            .estimated_cost_units
-            .saturating_add(group.estimated_cost_units);
-        totals.api_long_context_extra_cost_units = add_optional_units(
-            totals.api_long_context_extra_cost_units,
-            group.api_long_context_extra_cost_units,
-        );
-        totals
-            .api_equivalent_cost
-            .add_assign(group.api_equivalent_cost);
-        totals.call_count = totals.call_count.saturating_add(group.call_count);
-    }
-    totals
-}
-
-fn replica_groups_cover_digest(
-    source: &SourceSlice,
-    thread_id: &ThreadId,
-    digest: &SourceSessionDigest,
-) -> bool {
-    let buckets = source.buckets.iter().filter(|bucket| {
-        bucket.starts_at >= digest.range_start() && bucket.starts_at < digest.range_end()
-    });
-    let mut groups = Vec::new();
-    for bucket in buckets {
-        let target_groups = bucket
-            .project_groups
-            .iter()
-            .filter(|group| group.thread_id == thread_id.as_str())
-            .collect::<Vec<_>>();
-        if !target_groups.is_empty() && bucket_project_residual(bucket).is_none() {
-            return false;
-        }
-        groups.extend(target_groups);
-    }
-    let totals = project_group_totals(groups);
-    let expected = digest.metrics();
-    totals.token_usage == expected.token_usage
-        && totals.estimated_cost_units == expected.estimated_cost_units
-        && totals.api_long_context_extra_cost_units == expected.api_long_context_extra_cost_units
-        && totals.api_equivalent_cost == expected.api_equivalent_cost
-        && totals.call_count == expected.call_count
-}
-
-fn bucket_project_residual(bucket: &LocalHalfHourBucket) -> Option<BucketProjectResidual> {
-    let totals = project_group_totals(&bucket.project_groups);
-    let token_usage = bucket.token_usage.delta_from(totals.token_usage)?;
-    let estimated_cost_units = bucket
-        .estimated_cost_units
-        .checked_sub(totals.estimated_cost_units)?;
-    let api_long_context_extra_cost_units = match (
-        bucket.api_long_context_extra_cost_units,
-        totals.api_long_context_extra_cost_units,
-    ) {
-        (Some(bucket), Some(groups)) => Some(bucket.checked_sub(groups)?),
-        (None, _) => None,
-        (Some(_), None) => return None,
-    };
-    let call_count = bucket.call_count.checked_sub(totals.call_count)?;
-    Some(BucketProjectResidual {
-        token_usage,
-        estimated_cost_units,
-        api_long_context_extra_cost_units,
-        call_count,
-    })
-}
-
-fn project_groups_match_bucket(bucket: &LocalHalfHourBucket) -> bool {
-    let totals = project_group_totals(&bucket.project_groups);
-    totals.token_usage == bucket.token_usage
-        && totals.estimated_cost_units == bucket.estimated_cost_units
-        && totals.api_long_context_extra_cost_units == bucket.api_long_context_extra_cost_units
-        && totals.call_count == bucket.call_count
-}
-
-#[cfg(test)]
-fn aggregate_source_buckets(
-    sources: &[SourceSlice],
-    project_mapping: &ProjectMappingProjection,
-) -> BucketProjection {
-    aggregate_source_buckets_with_logical_threads(
-        sources,
-        project_mapping,
-        &LogicalThreadProjection::default(),
-    )
-}
-
-fn aggregate_source_buckets_with_logical_threads(
-    sources: &[SourceSlice],
-    project_mapping: &ProjectMappingProjection,
-    logical_threads: &LogicalThreadProjection,
-) -> BucketProjection {
-    let mut buckets = BTreeMap::<DateTime<Utc>, LocalHalfHourBucket>::new();
-    let mut project_observations = false;
-    let mut unmapped_projects = false;
-    for source in sources {
-        for bucket in &source.buckets {
-            let mut incoming = bucket.clone();
-            let scoped = scope_project_groups(
-                &mut incoming.project_groups,
-                &source.metadata,
-                project_mapping,
-                logical_threads,
-            );
-            project_observations |= scoped.project_observations;
-            unmapped_projects |= scoped.unmapped_projects;
-            match buckets.entry(incoming.starts_at) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(incoming);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    merge_additive_bucket(entry.get_mut(), incoming);
-                }
-            }
-        }
-    }
-    BucketProjection {
-        buckets: buckets.into_values().collect(),
-        project_observations,
-        unmapped_projects,
-    }
-}
-
-fn merge_additive_bucket(target: &mut LocalHalfHourBucket, incoming: LocalHalfHourBucket) {
-    target.ends_at = target.ends_at.min(incoming.ends_at);
-    // The aggregate is closed only when every contributing source is closed.
-    target.sampled_at = target.sampled_at.min(incoming.sampled_at);
-    target.token_usage.add_assign(incoming.token_usage);
-    target.estimated_cost_units = target
-        .estimated_cost_units
-        .saturating_add(incoming.estimated_cost_units);
-    target.api_long_context_extra_cost_units = add_optional_units(
-        target.api_long_context_extra_cost_units,
-        incoming.api_long_context_extra_cost_units,
-    );
-    target.long_context_usage_unknown |= incoming.long_context_usage_unknown;
-    if target.estimator_revision != incoming.estimator_revision {
-        target.estimator_revision = target.estimator_revision.max(incoming.estimator_revision);
-        target
-            .partial_reasons
-            .push("estimator_revision_changed".to_string());
-    }
-    target.project_breakdown_revision = target
-        .project_breakdown_revision
-        .min(incoming.project_breakdown_revision);
-    target.api_pricing_catalog_revision = target
-        .api_pricing_catalog_revision
-        .min(incoming.api_pricing_catalog_revision);
-    target.call_count = target.call_count.saturating_add(incoming.call_count);
-    merge_usage_groups(&mut target.groups, incoming.groups);
-    target.project_groups.extend(incoming.project_groups);
-    target.partial_reasons.extend(incoming.partial_reasons);
-    target.partial_reasons.sort();
-    target.partial_reasons.dedup();
-    target.project_groups.sort_by(|left, right| {
-        left.project_id
-            .cmp(&right.project_id)
-            .then_with(|| left.thread_id.cmp(&right.thread_id))
-            .then_with(|| left.turn_id.cmp(&right.turn_id))
-    });
-}
-
-fn merge_usage_groups(target: &mut Vec<LocalUsageGroup>, incoming: Vec<LocalUsageGroup>) {
-    let mut groups = BTreeMap::<(Option<String>, Option<String>), LocalUsageGroup>::new();
-    for group in target.drain(..).chain(incoming) {
-        let key = (group.model.clone(), group.service_tier.clone());
-        match groups.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(group);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                existing.token_usage.add_assign(group.token_usage);
-                existing.estimated_cost_units = existing
-                    .estimated_cost_units
-                    .saturating_add(group.estimated_cost_units);
-                existing.api_long_context_extra_cost_units = add_optional_units(
-                    existing.api_long_context_extra_cost_units,
-                    group.api_long_context_extra_cost_units,
-                );
-                existing.call_count = existing.call_count.saturating_add(group.call_count);
-                existing.used_model_fallback |= group.used_model_fallback;
-                existing.used_token_breakdown_fallback |= group.used_token_breakdown_fallback;
-                existing.used_long_context_pricing |= group.used_long_context_pricing;
-                existing.used_long_context_detection_fallback |=
-                    group.used_long_context_detection_fallback;
-                existing
-                    .api_equivalent_cost
-                    .add_assign(group.api_equivalent_cost);
-                existing.api_equivalent_cost_complete &= group.api_equivalent_cost_complete;
-            }
-        }
-    }
-    *target = groups.into_values().collect();
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ProjectScopeReport {
-    project_observations: bool,
-    unmapped_projects: bool,
-}
-
-fn scope_project_groups(
-    groups: &mut [LocalProjectUsageGroup],
-    source: &SourceMetadata,
-    project_mapping: &ProjectMappingProjection,
-    logical_threads: &LogicalThreadProjection,
-) -> ProjectScopeReport {
-    let mut report = ProjectScopeReport::default();
-    for group in groups {
-        let logicalized = logical_identity(&group.thread_id, source.source_id(), logical_threads);
-        group.thread_id = logicalized
-            .clone()
-            .unwrap_or_else(|| scoped_value(&group.thread_id, source.source_id()));
-        group.turn_id = group
-            .turn_id
-            .as_deref()
-            .map(|value| scoped_value(value, source.source_id()));
-        group.parent_thread_id = group.parent_thread_id.as_deref().map(|value| {
-            logical_identity(value, source.source_id(), logical_threads)
-                .unwrap_or_else(|| scoped_value(value, source.source_id()))
-        });
-        group.session_thread_id = group.session_thread_id.as_deref().map(|value| {
-            logical_identity(value, source.source_id(), logical_threads)
-                .unwrap_or_else(|| scoped_value(value, source.source_id()))
-        });
-        group.session_turn_id = group
-            .session_turn_id
-            .as_deref()
-            .map(|value| scoped_value(value, source.source_id()));
-        if logicalized.is_some() {
-            group.source = Some(source.display_label().to_owned());
-        }
-        let raw_project = group.project_id.clone();
-        let raw_label = group.project_label.clone();
-        let projection = raw_project
-            .as_deref()
-            .and_then(|value| value.parse::<ObservedProjectKey>().ok())
-            .and_then(|key| project_mapping.resolve(source.source_id(), &key));
-        if raw_project.is_some() {
-            report.project_observations = true;
-        }
-        if let Some(projection) = projection {
-            group.project_id = Some(projection.aggregate_id().as_str().to_owned());
-            group.project_label = projection
-                .display_label()
-                .map(|label| label.as_str().to_owned())
-                .or(raw_label);
-        } else {
-            report.unmapped_projects |= raw_project.is_some();
-            let raw_project = raw_project.as_deref().unwrap_or("unknown");
-            group.project_id = Some(scoped_value(raw_project, source.source_id()));
-            let raw_label = raw_label.as_deref().unwrap_or("unknown");
-            group.project_label = Some(format!("{raw_label} @ {}", source.display_label()));
-        }
-    }
-    report
-}
-
-fn logical_identity(
-    value: &str,
-    source_id: &NodeId,
-    logical_threads: &LogicalThreadProjection,
-) -> Option<String> {
-    logical_threads
-        .get(&(source_id.as_str().to_owned(), value.to_owned()))
-        .cloned()
-}
-
-fn scoped_value(value: &str, source_id: &NodeId) -> String {
-    format!("{value}@{}", source_id.as_str())
-}
-
-fn add_optional_units(left: Option<u128>, right: Option<u128>) -> Option<u128> {
-    Some(left?.saturating_add(right?))
-}
-
-fn aggregate_source_weekly_points(
-    sources: &[SourceSlice],
-    account_quota: &[QuotaPoint],
-    since: DateTime<Utc>,
-) -> Vec<WeeklyLocalPoint> {
-    let trace = process_trace_log().span_with("history.weekly_aggregate", || {
-        TraceFields::new()
-            .usize("sourceCount", sources.len())
-            .usize("quotaPointCount", account_quota.len())
-    });
-    let (points, work) = aggregate_source_weekly_points_with_work(sources, account_quota, since);
-    trace.finish_with(TraceOutcome::Ok, || {
-        TraceFields::new()
-            .usize("resetCycles", work.reset_cycles)
-            .usize("timelinePoints", work.timeline_points)
-            .usize("sourceEvaluations", work.source_evaluations)
-            .usize("weeklyAdvances", work.weekly_advances)
-            .usize("bucketAdvances", work.bucket_advances)
-            .usize("coverageAdvances", work.coverage_advances)
-            .usize("outputPoints", points.len())
-    });
-    points
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct WeeklyAggregationWork {
-    reset_cycles: usize,
-    timeline_points: usize,
-    source_evaluations: usize,
-    weekly_advances: usize,
-    bucket_advances: usize,
-    coverage_advances: usize,
-}
-
-fn aggregate_source_weekly_points_with_work(
-    sources: &[SourceSlice],
-    account_quota: &[QuotaPoint],
-    since: DateTime<Utc>,
-) -> (Vec<WeeklyLocalPoint>, WeeklyAggregationWork) {
-    let resets = canonical_weekly_resets(sources, account_quota);
-    let mut points = Vec::new();
-    let mut work = WeeklyAggregationWork {
-        reset_cycles: resets.len(),
-        ..WeeklyAggregationWork::default()
-    };
-    for resets_at in resets {
-        let cycle_starts_at = resets_at
-            .checked_sub_signed(Duration::minutes(WEEKLY_WINDOW_MINUTES))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
-        let mut timeline = BTreeSet::new();
-        for source in sources {
-            timeline.extend(
-                source
-                    .weekly_local_points
-                    .iter()
-                    .filter(|point| reset_matches(point.resets_at, resets_at))
-                    .filter(|point| point.observed_at >= cycle_starts_at)
-                    .filter(|point| point.observed_at < resets_at)
-                    .map(|point| point.observed_at),
-            );
-            timeline.extend(
-                source
-                    .buckets
-                    .iter()
-                    .filter(|bucket| {
-                        bucket.starts_at >= cycle_starts_at && bucket.ends_at <= resets_at
-                    })
-                    .map(|bucket| bucket.ends_at),
-            );
-        }
-
-        let mut cursors = sources
-            .iter()
-            .map(|source| WeeklySourceCursor::new(source, cycle_starts_at, resets_at))
-            .collect::<Vec<_>>();
-
-        for observed_at in timeline
-            .into_iter()
-            .filter(|observed_at| *observed_at >= since && *observed_at < resets_at)
-        {
-            work.timeline_points = work.timeline_points.saturating_add(1);
-            let mut aggregate = WeeklyAccumulator::default();
-            for cursor in &mut cursors {
-                work.source_evaluations = work.source_evaluations.saturating_add(1);
-                if let Some(component) = cursor.advance_to(observed_at, &mut work) {
-                    aggregate.add_assign(component);
-                }
-            }
-            if !aggregate.present {
-                continue;
-            }
-            if aggregate.estimator_revisions.len() > 1 {
-                aggregate
-                    .partial_reasons
-                    .insert("estimator_revision_changed".to_string());
-            }
-            points.push(WeeklyLocalPoint {
-                observed_at,
-                resets_at,
-                token_usage: aggregate.token_usage,
-                estimated_cost_units: aggregate.estimated_cost_units,
-                api_long_context_extra_cost_units: aggregate.api_long_context_extra_cost_units,
-                long_context_usage_unknown: aggregate.long_context_usage_unknown,
-                estimator_revision: aggregate
-                    .estimator_revisions
-                    .iter()
-                    .next_back()
-                    .copied()
-                    .unwrap_or_default(),
-                call_count: aggregate.call_count,
-                partial_reasons: aggregate.partial_reasons.into_iter().collect(),
-            });
-        }
-    }
-    points.sort_by_key(|point| (point.observed_at, point.resets_at));
-    (points, work)
-}
-
-fn canonical_weekly_resets(
-    sources: &[SourceSlice],
-    account_quota: &[QuotaPoint],
-) -> Vec<DateTime<Utc>> {
-    let mut resets = Vec::new();
-    // A server reports `observed_at + 7d` while a completely unused weekly
-    // window is not anchored yet. Persisted samples of that rolling estimate
-    // must not each become a distinct cycle. Non-zero account observations
-    // are authoritative; retain only the newest zero-evidence candidate so an
-    // actually idle current cycle can still be represented.
-    let latest_anchored_observation = account_quota
-        .iter()
-        .filter(|point| {
-            point.duration_mins == WEEKLY_WINDOW_MINUTES
-                && point.limit_id.trim().eq_ignore_ascii_case("codex")
-                && quota_point_establishes_weekly_cycle(point)
-        })
-        .map(|point| point.observed_at)
-        .chain(
-            sources
-                .iter()
-                .flat_map(|source| &source.weekly_local_points)
-                .filter(|point| weekly_point_establishes_cycle(point))
-                .map(|point| point.observed_at),
-        )
-        .max();
-    let mut account_resets = account_quota
-        .iter()
-        .filter(|point| {
-            point.duration_mins == WEEKLY_WINDOW_MINUTES
-                && point.limit_id.trim().eq_ignore_ascii_case("codex")
-                && quota_point_establishes_weekly_cycle(point)
-        })
-        .map(|point| point.resets_at)
-        .collect::<Vec<_>>();
-    account_resets.sort();
-    for candidate in account_resets {
-        push_reset_if_distinct(&mut resets, candidate);
-    }
-    let mut source_resets = sources
-        .iter()
-        .flat_map(|source| &source.weekly_local_points)
-        .filter(|point| weekly_point_establishes_cycle(point))
-        .map(|point| point.resets_at)
-        .collect::<Vec<_>>();
-    source_resets.sort();
-    for candidate in source_resets {
-        push_reset_if_distinct(&mut resets, candidate);
-    }
-    let latest_unanchored = account_quota
-        .iter()
-        .filter(|point| {
-            point.duration_mins == WEEKLY_WINDOW_MINUTES
-                && point.limit_id.trim().eq_ignore_ascii_case("codex")
-                && !quota_point_establishes_weekly_cycle(point)
-        })
-        .map(|point| (point.observed_at, true, point.resets_at))
-        .chain(
-            sources
-                .iter()
-                .flat_map(|source| &source.weekly_local_points)
-                .filter(|point| !weekly_point_establishes_cycle(point))
-                .map(|point| (point.observed_at, false, point.resets_at)),
-        )
-        // Prefer the account timestamp on an exact observation tie.
-        .max_by_key(|(observed_at, account, _)| (*observed_at, *account));
-    if let Some((observed_at, _, candidate)) = latest_unanchored
-        && latest_anchored_observation.is_none_or(|anchored| observed_at > anchored)
-    {
-        push_reset_if_distinct(&mut resets, candidate);
-    }
-    resets.sort();
-    resets
-}
-
-fn quota_point_establishes_weekly_cycle(point: &QuotaPoint) -> bool {
-    point.used_percent > 0.0 || point.remaining_percent < 100.0
-}
-
-fn weekly_point_establishes_cycle(point: &WeeklyLocalPoint) -> bool {
-    !point.token_usage.is_zero()
-        || point.estimated_cost_units > 0
-        || point.call_count > 0
-        || point
-            .partial_reasons
-            .iter()
-            .any(|reason| reason == DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS)
-}
-
-fn push_reset_if_distinct(resets: &mut Vec<DateTime<Utc>>, candidate: DateTime<Utc>) {
-    if !resets
-        .iter()
-        .any(|existing| reset_matches(*existing, candidate))
-    {
-        resets.push(candidate);
-    }
-}
-
-fn reset_matches(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
-    left.signed_duration_since(right)
-        .num_seconds()
-        .unsigned_abs()
-        <= RESET_DRIFT_SECONDS as u64
-}
-
-struct WeeklySourceCursor<'a> {
-    source_kind: SourceKind,
-    cycle_starts_at: DateTime<Utc>,
-    weekly: Vec<&'a WeeklyLocalPoint>,
-    buckets: Vec<&'a LocalHalfHourBucket>,
-    coverage_buckets: Vec<&'a LocalHalfHourBucket>,
-    weekly_index: usize,
-    bucket_index: usize,
-    coverage_index: usize,
-    base_observed_at: Option<DateTime<Utc>>,
-    aggregate: WeeklyAccumulator,
-    coverage_through: DateTime<Utc>,
-    coverage_gap: bool,
-}
-
-impl<'a> WeeklySourceCursor<'a> {
-    fn new(
-        source: &'a SourceSlice,
-        cycle_starts_at: DateTime<Utc>,
-        resets_at: DateTime<Utc>,
-    ) -> Self {
-        let mut weekly = source
-            .weekly_local_points
-            .iter()
-            .filter(|point| reset_matches(point.resets_at, resets_at))
-            .filter(|point| point.observed_at >= cycle_starts_at)
-            .filter(|point| point.observed_at < resets_at)
-            .collect::<Vec<_>>();
-        weekly.sort_by_key(|point| point.observed_at);
-        let mut buckets = source
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.starts_at >= cycle_starts_at && bucket.ends_at <= resets_at)
-            .collect::<Vec<_>>();
-        buckets.sort_by_key(|bucket| (bucket.ends_at, bucket.starts_at));
-        let mut coverage_buckets = source
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.ends_at > cycle_starts_at && bucket.starts_at < resets_at)
-            .collect::<Vec<_>>();
-        coverage_buckets.sort_by_key(|bucket| (bucket.starts_at, bucket.ends_at));
-        Self {
-            source_kind: source.metadata.kind(),
-            cycle_starts_at,
-            weekly,
-            buckets,
-            coverage_buckets,
-            weekly_index: 0,
-            bucket_index: 0,
-            coverage_index: 0,
-            base_observed_at: None,
-            aggregate: WeeklyAccumulator::default(),
-            coverage_through: cycle_starts_at,
-            coverage_gap: false,
-        }
-    }
-
-    fn advance_to(
-        &mut self,
-        observed_at: DateTime<Utc>,
-        work: &mut WeeklyAggregationWork,
-    ) -> Option<WeeklyAccumulator> {
-        while self
-            .weekly
-            .get(self.weekly_index)
-            .is_some_and(|point| point.observed_at <= observed_at)
-        {
-            let point = self.weekly[self.weekly_index];
-            self.aggregate = WeeklyAccumulator::default();
-            self.aggregate.add_weekly(point);
-            if point.observed_at.timestamp().rem_euclid(15 * 60) != 0 {
-                self.aggregate
-                    .partial_reasons
-                    .insert("weekly_source_boundary_excludes_partial_bucket".to_string());
-            }
-            self.base_observed_at = Some(point.observed_at);
-            self.weekly_index += 1;
-            work.weekly_advances = work.weekly_advances.saturating_add(1);
-        }
-
-        let bucket_cutoff = self.base_observed_at.unwrap_or(self.cycle_starts_at);
-        while self
-            .buckets
-            .get(self.bucket_index)
-            .is_some_and(|bucket| bucket.ends_at <= observed_at)
-        {
-            let bucket = self.buckets[self.bucket_index];
-            if bucket.starts_at >= bucket_cutoff {
-                self.aggregate.add_bucket(bucket);
-            }
-            self.bucket_index += 1;
-            work.bucket_advances = work.bucket_advances.saturating_add(1);
-        }
-
-        if !self.aggregate.present {
-            return None;
-        }
-        let mut aggregate = self.aggregate.clone();
-        if self.base_observed_at.is_none() {
-            if self.source_kind == SourceKind::Ssh {
-                aggregate
-                    .partial_reasons
-                    .insert("remote_weekly_from_buckets_lower_bound".to_string());
-            } else if !self.coverage_complete_through(observed_at, work) {
-                aggregate
-                    .partial_reasons
-                    .insert("local_weekly_from_buckets_lower_bound".to_string());
-            }
-        }
-        Some(aggregate)
-    }
-
-    fn coverage_complete_through(
-        &mut self,
-        observed_at: DateTime<Utc>,
-        work: &mut WeeklyAggregationWork,
-    ) -> bool {
-        let target = observed_at - Duration::seconds(observed_at.timestamp().rem_euclid(15 * 60));
-        if target <= self.cycle_starts_at {
-            return target == self.cycle_starts_at;
-        }
-        while self
-            .coverage_buckets
-            .get(self.coverage_index)
-            .is_some_and(|bucket| bucket.starts_at < target)
-        {
-            let bucket = self.coverage_buckets[self.coverage_index];
-            if !self.coverage_gap {
-                if bucket.starts_at > self.coverage_through {
-                    self.coverage_gap = true;
-                } else if bucket.ends_at > self.coverage_through {
-                    self.coverage_through = bucket.ends_at;
-                }
-            }
-            self.coverage_index += 1;
-            work.coverage_advances = work.coverage_advances.saturating_add(1);
-        }
-        !self.coverage_gap && self.coverage_through >= target
-    }
-}
-
-#[cfg(test)]
-fn source_weekly_cumulative_at(
-    source: &SourceSlice,
-    cycle_starts_at: DateTime<Utc>,
-    resets_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
-) -> Option<WeeklyAccumulator> {
-    let base = source
-        .weekly_local_points
-        .iter()
-        .filter(|point| reset_matches(point.resets_at, resets_at))
-        .filter(|point| point.observed_at <= observed_at)
-        .max_by_key(|point| point.observed_at);
-    let bucket_cutoff = base.map_or(cycle_starts_at, |point| point.observed_at);
-    let mut aggregate = WeeklyAccumulator::default();
-    if let Some(point) = base {
-        aggregate.add_weekly(point);
-        if point.observed_at.timestamp().rem_euclid(15 * 60) != 0 {
-            aggregate
-                .partial_reasons
-                .insert("weekly_source_boundary_excludes_partial_bucket".to_string());
-        }
-    }
-    for bucket in source.buckets.iter().filter(|bucket| {
-        bucket.starts_at >= cycle_starts_at
-            && bucket.starts_at >= bucket_cutoff
-            && bucket.ends_at <= observed_at
-            && bucket.ends_at <= resets_at
-    }) {
-        aggregate.add_bucket(bucket);
-    }
-    if aggregate.present && base.is_none() {
-        if source.metadata.kind() == SourceKind::Ssh {
-            aggregate
-                .partial_reasons
-                .insert("remote_weekly_from_buckets_lower_bound".to_string());
-        } else if !source_buckets_cover_cycle(
-            &source.buckets,
-            cycle_starts_at,
-            observed_at.min(resets_at),
-        ) {
-            aggregate
-                .partial_reasons
-                .insert("local_weekly_from_buckets_lower_bound".to_string());
-        }
-    }
-    aggregate.present.then_some(aggregate)
-}
-
-#[cfg(test)]
-fn source_buckets_cover_cycle(
-    buckets: &[LocalHalfHourBucket],
-    cycle_starts_at: DateTime<Utc>,
-    observed_through: DateTime<Utc>,
-) -> bool {
-    let target =
-        observed_through - Duration::seconds(observed_through.timestamp().rem_euclid(15 * 60));
-    if target <= cycle_starts_at {
-        return target == cycle_starts_at;
-    }
-    let mut covered_through = cycle_starts_at;
-    for bucket in buckets
-        .iter()
-        .filter(|bucket| bucket.ends_at > cycle_starts_at && bucket.starts_at < target)
-    {
-        if bucket.starts_at > covered_through {
-            return false;
-        }
-        if bucket.ends_at > covered_through {
-            covered_through = bucket.ends_at;
-        }
-        if covered_through >= target {
-            return true;
-        }
-    }
-    false
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct WeeklyAccumulator {
-    present: bool,
-    token_usage: TokenUsage,
-    estimated_cost_units: u128,
-    api_long_context_extra_cost_units: Option<u128>,
-    long_context_usage_unknown: bool,
-    estimator_revisions: BTreeSet<u32>,
-    call_count: u64,
-    partial_reasons: BTreeSet<String>,
-}
-
-impl WeeklyAccumulator {
-    fn add_weekly(&mut self, point: &WeeklyLocalPoint) {
-        self.add_values(
-            point.token_usage,
-            point.estimated_cost_units,
-            point.api_long_context_extra_cost_units,
-            point.long_context_usage_unknown,
-            point.estimator_revision,
-            point.call_count,
-            &point.partial_reasons,
-        );
-    }
-
-    fn add_bucket(&mut self, bucket: &LocalHalfHourBucket) {
-        self.add_values(
-            bucket.token_usage,
-            bucket.estimated_cost_units,
-            bucket.api_long_context_extra_cost_units,
-            bucket.long_context_usage_unknown,
-            bucket.estimator_revision,
-            bucket.call_count,
-            &bucket.partial_reasons,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn add_values(
-        &mut self,
-        token_usage: TokenUsage,
-        estimated_cost_units: u128,
-        api_long_context_extra_cost_units: Option<u128>,
-        long_context_usage_unknown: bool,
-        estimator_revision: u32,
-        call_count: u64,
-        partial_reasons: &[String],
-    ) {
-        if !self.present {
-            self.api_long_context_extra_cost_units = Some(0);
-        }
-        self.present = true;
-        self.token_usage.add_assign(token_usage);
-        self.estimated_cost_units = self
-            .estimated_cost_units
-            .saturating_add(estimated_cost_units);
-        self.api_long_context_extra_cost_units = add_optional_units(
-            self.api_long_context_extra_cost_units,
-            api_long_context_extra_cost_units,
-        );
-        self.long_context_usage_unknown |= long_context_usage_unknown;
-        self.estimator_revisions.insert(estimator_revision);
-        self.call_count = self.call_count.saturating_add(call_count);
-        self.partial_reasons.extend(partial_reasons.iter().cloned());
-    }
-
-    fn add_assign(&mut self, other: Self) {
-        if !other.present {
-            return;
-        }
-        if !self.present {
-            self.api_long_context_extra_cost_units = Some(0);
-        }
-        self.present = true;
-        self.token_usage.add_assign(other.token_usage);
-        self.estimated_cost_units = self
-            .estimated_cost_units
-            .saturating_add(other.estimated_cost_units);
-        self.api_long_context_extra_cost_units = add_optional_units(
-            self.api_long_context_extra_cost_units,
-            other.api_long_context_extra_cost_units,
-        );
-        self.long_context_usage_unknown |= other.long_context_usage_unknown;
-        self.estimator_revisions.extend(other.estimator_revisions);
-        self.call_count = self.call_count.saturating_add(other.call_count);
-        self.partial_reasons.extend(other.partial_reasons);
-    }
 }
 
 #[cfg(test)]
@@ -4444,6 +2535,100 @@ mod tests {
     }
 
     #[test]
+    fn replica_fact_bucket_index_preserves_first_duplicate_and_scales_with_fact_count() {
+        let starts_at = at(1, 0, 0);
+        let metadata = source(
+            SOURCE_A,
+            "local",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        let mut duplicate_source = SourceSlice {
+            metadata: metadata.clone(),
+            buckets: vec![
+                bucket(starts_at, 10, "first"),
+                bucket(starts_at, 20, "second"),
+            ],
+            weekly_local_points: Vec::new(),
+        };
+        let untouched_second = duplicate_source.buckets[1].clone();
+        let mut work = ReplicaBucketIndexWork::default();
+        let mut indices =
+            build_source_bucket_indices(std::slice::from_ref(&duplicate_source), &mut work)
+                .unwrap();
+        let record = usage_fact(
+            metadata.source_id(),
+            "event-first-match",
+            starts_at,
+            7,
+            observed('a'),
+        );
+        let crate::source_history::UsageEventFactChange::Upsert(fact) = record.change() else {
+            unreachable!();
+        };
+        let mut touched = BTreeMap::new();
+        add_fact_group(
+            0,
+            &mut duplicate_source,
+            &mut indices[0],
+            fact,
+            &mut touched,
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(duplicate_source.buckets[1], untouched_second);
+        assert_eq!(work.indexed_buckets, 2);
+        assert_eq!(work.fact_lookups, 1);
+
+        let bucket_count = 10_000_usize;
+        let mut large_source = SourceSlice {
+            metadata,
+            buckets: (0..bucket_count)
+                .map(|offset| {
+                    bucket(
+                        starts_at
+                            + Duration::minutes(i64::try_from(offset.saturating_mul(15)).unwrap()),
+                        10,
+                        "large",
+                    )
+                })
+                .collect(),
+            weekly_local_points: Vec::new(),
+        };
+        let mut large_work = ReplicaBucketIndexWork::default();
+        let mut large_indices =
+            build_source_bucket_indices(std::slice::from_ref(&large_source), &mut large_work)
+                .unwrap();
+        let mut large_touched = BTreeMap::new();
+        for offset in 0..bucket_count {
+            let occurred_at =
+                starts_at + Duration::minutes(i64::try_from(offset.saturating_mul(15)).unwrap());
+            let record = usage_fact(
+                large_source.metadata.source_id(),
+                &format!("event-indexed-{offset}"),
+                occurred_at,
+                1,
+                observed('a'),
+            );
+            let crate::source_history::UsageEventFactChange::Upsert(fact) = record.change() else {
+                unreachable!();
+            };
+            add_fact_group(
+                0,
+                &mut large_source,
+                &mut large_indices[0],
+                fact,
+                &mut large_touched,
+                &mut large_work,
+            )
+            .unwrap();
+        }
+        assert_eq!(large_work.indexed_buckets, bucket_count);
+        assert_eq!(large_work.fact_lookups, bucket_count);
+        assert_eq!(large_source.buckets.len(), bucket_count);
+    }
+
+    #[test]
     fn exact_fact_union_preserves_unrelated_groups_from_an_incomplete_bucket() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
@@ -4921,7 +3106,8 @@ mod tests {
         ];
 
         let result =
-            aggregate_source_weekly_points(&sources, &[quota(at(1, 0, 0), resets_at)], at(1, 0, 0));
+            aggregate_source_weekly_points(&sources, &[quota(at(1, 0, 0), resets_at)], at(1, 0, 0))
+                .unwrap();
         assert_eq!(result.first().unwrap().token_usage.total_tokens, 100);
         let latest = result.last().unwrap();
         assert_eq!(latest.observed_at, next_bucket + Duration::minutes(15));
@@ -4961,7 +3147,8 @@ mod tests {
             &sources,
             &[quota(cycle_starts_at, resets_at)],
             cycle_starts_at,
-        );
+        )
+        .unwrap();
 
         assert_eq!(work.reset_cycles, 1);
         assert_eq!(work.bucket_advances, 96);
@@ -4972,6 +3159,54 @@ mod tests {
         // of the 97 timeline points. The cursor bound is linear in inputs plus
         // emitted points, rather than their product.
         assert!(work.bucket_advances < work.timeline_points * 2);
+    }
+
+    #[test]
+    fn weekly_projection_partitions_large_multi_cycle_inputs_once() {
+        let first_cycle_start = at(1, 0, 0);
+        let mut quota_points = Vec::new();
+        let mut weekly_points = Vec::new();
+        let mut buckets = Vec::new();
+        for cycle in 0_i64..4 {
+            let cycle_start = first_cycle_start + Duration::days(cycle * 7);
+            let resets_at = cycle_start + Duration::days(7);
+            quota_points.push(quota(cycle_start, resets_at));
+            weekly_points.push(weekly(cycle_start, resets_at, 10));
+            for bucket_index in 0_i64..96 {
+                buckets.push(bucket(
+                    cycle_start + Duration::minutes(bucket_index * 15),
+                    1,
+                    "local",
+                ));
+            }
+        }
+        let expected_weekly_evaluations = weekly_points.len();
+        let expected_bucket_evaluations = buckets.len();
+        let source = SourceSlice {
+            metadata: source(
+                SOURCE_A,
+                "local",
+                SourceKind::Local,
+                RedactionProfile::Redacted,
+            ),
+            buckets,
+            weekly_local_points: weekly_points,
+        };
+
+        let (_, work) =
+            aggregate_source_weekly_points_with_work(&[source], &quota_points, first_cycle_start)
+                .unwrap();
+        assert_eq!(work.reset_cycles, 4);
+        assert_eq!(
+            work.weekly_partition_evaluations,
+            expected_weekly_evaluations
+        );
+        assert_eq!(
+            work.bucket_partition_evaluations,
+            expected_bucket_evaluations
+        );
+        assert_eq!(work.weekly_advances, expected_weekly_evaluations);
+        assert_eq!(work.bucket_advances, expected_bucket_evaluations);
     }
 
     #[test]
@@ -5033,7 +3268,7 @@ mod tests {
             quota_points.push(point);
         }
 
-        let resets = canonical_weekly_resets(&[], &quota_points);
+        let resets = canonical_weekly_resets(&[], &quota_points).unwrap();
         assert_eq!(resets.len(), 1);
         assert_eq!(
             resets[0],
@@ -5042,6 +3277,48 @@ mod tests {
                 .expect("latest rolling estimate")
                 .resets_at
         );
+    }
+
+    #[test]
+    fn weekly_reset_clustering_handles_large_duplicate_input_and_rejects_cycle_overflow() {
+        let observed_at = at(1, 0, 0);
+        let first_reset = observed_at + Duration::days(7);
+        let dense = (0_i64..100_000)
+            .map(|offset| quota(observed_at, first_reset + Duration::seconds(offset % 120)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_weekly_resets(&[], &dense).unwrap(),
+            vec![first_reset]
+        );
+
+        let at_limit = (0..MAX_WEEKLY_RESET_CYCLES)
+            .map(|offset| {
+                quota(
+                    observed_at,
+                    first_reset
+                        + Duration::seconds(
+                            i64::try_from(offset * (RESET_DRIFT_SECONDS as usize + 1)).unwrap(),
+                        ),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_weekly_resets(&[], &at_limit).unwrap().len(),
+            MAX_WEEKLY_RESET_CYCLES
+        );
+
+        let mut above_limit = at_limit;
+        above_limit.push(quota(
+            observed_at,
+            first_reset
+                + Duration::seconds(
+                    i64::try_from(MAX_WEEKLY_RESET_CYCLES * (RESET_DRIFT_SECONDS as usize + 1))
+                        .unwrap(),
+                ),
+        ));
+        let error = canonical_weekly_resets(&[], &above_limit).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("canonical reset cycles"));
     }
 
     #[test]
@@ -5070,7 +3347,7 @@ mod tests {
         account_point.remaining_percent = 100.0;
         let account_quota = vec![account_point];
 
-        let canonical = canonical_weekly_resets(&sources, &account_quota);
+        let canonical = canonical_weekly_resets(&sources, &account_quota).unwrap();
         assert_eq!(canonical, vec![account_observed + Duration::days(7)]);
 
         // Logical replica handling discards physical weekly baselines. It must
@@ -5078,9 +3355,13 @@ mod tests {
         // zero estimate into a durable-looking anchored cycle marker.
         replace_weekly_baselines_with_cycle_markers(&mut sources, &canonical);
         assert_eq!(sources[0].weekly_local_points.len(), 1);
-        assert_eq!(canonical_weekly_resets(&sources, &account_quota), canonical);
+        assert_eq!(
+            canonical_weekly_resets(&sources, &account_quota).unwrap(),
+            canonical
+        );
         let (_, work) =
-            aggregate_source_weekly_points_with_work(&sources, &account_quota, first_observed);
+            aggregate_source_weekly_points_with_work(&sources, &account_quota, first_observed)
+                .unwrap();
         assert_eq!(work.reset_cycles, 1);
     }
 
@@ -5095,7 +3376,7 @@ mod tests {
         idle.used_percent = 0.0;
         idle.remaining_percent = 100.0;
 
-        let resets = canonical_weekly_resets(&[], &[anchored, idle.clone()]);
+        let resets = canonical_weekly_resets(&[], &[anchored, idle.clone()]).unwrap();
         assert_eq!(resets, vec![anchored_reset, idle.resets_at]);
     }
 
@@ -5837,9 +4118,54 @@ mod tests {
             buckets: Vec::new(),
             weekly_local_points: vec![weekly(at(2, 0, 0), source_reset, 10)],
         };
-        let resets = canonical_weekly_resets(&[source], &[quota(at(1, 0, 0), account_reset)]);
+        let resets =
+            canonical_weekly_resets(&[source], &[quota(at(1, 0, 0), account_reset)]).unwrap();
         assert_eq!(resets, vec![account_reset]);
         assert_eq!(account_reset.minute(), 0);
+    }
+
+    #[test]
+    fn ambiguous_weekly_reset_is_assigned_to_only_one_canonical_cycle() {
+        let earlier_reset = at(8, 0, 0);
+        let later_reset = earlier_reset + Duration::seconds(200);
+        let reported_reset = earlier_reset + Duration::seconds(100);
+        let observed_at = at(2, 0, 0);
+        let source = SourceSlice {
+            metadata: source(
+                SOURCE_A,
+                "alpha",
+                SourceKind::Local,
+                RedactionProfile::Redacted,
+            ),
+            buckets: Vec::new(),
+            weekly_local_points: vec![weekly(observed_at, reported_reset, 10)],
+        };
+        let account = vec![
+            quota(at(1, 0, 0), earlier_reset),
+            quota(at(1, 0, 1), later_reset),
+        ];
+
+        let canonical = canonical_weekly_resets(std::slice::from_ref(&source), &account).unwrap();
+        assert_eq!(canonical, vec![earlier_reset, later_reset]);
+        assert_eq!(
+            assigned_canonical_reset(reported_reset, &canonical),
+            Some(earlier_reset),
+            "an exact-distance tie must prefer the earlier reset"
+        );
+        assert_eq!(
+            assigned_canonical_reset(
+                earlier_reset + Duration::seconds(RESET_DRIFT_SECONDS + 1),
+                &[earlier_reset],
+            ),
+            None
+        );
+
+        let (points, work) =
+            aggregate_source_weekly_points_with_work(&[source], &account, observed_at).unwrap();
+        assert_eq!(work.weekly_advances, 1);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].resets_at, earlier_reset);
+        assert_eq!(points[0].token_usage.total_tokens, 10);
     }
 
     #[test]

@@ -720,6 +720,7 @@ mod tests {
     impl FakeExecutor {
         fn complete_without_changes() -> Result<RemoteSyncReport, RemoteSyncError> {
             Ok(RemoteSyncReport {
+                exchanges: 0,
                 pages_committed: 0,
                 changes_committed: 0,
                 live_state_changed: false,
@@ -911,6 +912,7 @@ mod tests {
         let mut executor = FakeExecutor::default();
         for _ in 0..2 {
             executor.results.push_back(Ok(RemoteSyncReport {
+                exchanges: 1,
                 pages_committed: 1,
                 changes_committed: 1,
                 live_state_changed: false,
@@ -946,6 +948,7 @@ mod tests {
         let mut idle_scheduler = RemoteSyncScheduler::new(FakeClock::default());
         let mut idle_executor = FakeExecutor::default();
         idle_executor.results.push_back(Ok(RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 1,
             changes_committed: 0,
             live_state_changed: false,
@@ -959,6 +962,7 @@ mod tests {
         let mut data_scheduler = RemoteSyncScheduler::new(FakeClock::default());
         let mut data_executor = FakeExecutor::default();
         data_executor.results.push_back(Ok(RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 1,
             changes_committed: 1,
             live_state_changed: false,
@@ -974,6 +978,7 @@ mod tests {
         continuation_executor
             .results
             .push_back(Ok(RemoteSyncReport {
+                exchanges: 0,
                 pages_committed: 0,
                 changes_committed: 0,
                 live_state_changed: false,
@@ -1003,6 +1008,7 @@ mod tests {
         let mut scheduler = RemoteSyncScheduler::new(FakeClock::default());
         let mut executor = FakeExecutor::default();
         executor.results.push_back(Ok(RemoteSyncReport {
+            exchanges: 1,
             pages_committed: 1,
             changes_committed: 0,
             live_state_changed: true,

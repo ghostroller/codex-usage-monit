@@ -359,6 +359,25 @@ impl SourceHistoryStore {
         since: DateTime<Utc>,
         include_session_digests: bool,
     ) -> io::Result<LocalObservationSnapshot> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_local_observation_snapshot_since_with_budget(
+            source_id,
+            redaction_profile,
+            since,
+            include_session_digests,
+            &mut budget,
+        )
+    }
+
+    pub(crate) fn load_local_observation_snapshot_since_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        include_session_digests: bool,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<LocalObservationSnapshot> {
+        budget.charge_source()?;
         let lock_directory = self.source_directory(source_id);
         self.validate_private_path(&lock_directory)?;
         let state_lock = open_lock_file(&lock_directory, STATE_LOCK)?;
@@ -372,20 +391,26 @@ impl SourceHistoryStore {
                 ));
             }
 
-            let bucket_records = self.load_source_bucket_records_from_directory(
+            let bucket_records = self.load_source_bucket_records_from_directory_with_budget(
                 source_id,
                 redaction_profile,
                 since,
                 &self.source_buckets_directory(source_id, redaction_profile),
+                budget,
             )?;
-            let weekly_records =
-                self.load_source_weekly_records_since(source_id, redaction_profile, since)?;
+            let weekly_records = self.load_source_weekly_records_since_with_budget(
+                source_id,
+                redaction_profile,
+                since,
+                budget,
+            )?;
             let session_digest_records = if include_session_digests {
-                self.load_source_session_digest_records_from_directory(
+                self.load_source_session_digest_records_from_directory_with_budget(
                     source_id,
                     redaction_profile,
                     since,
                     &self.source_digests_directory(source_id, redaction_profile),
+                    budget,
                 )?
             } else {
                 Vec::new()

@@ -8,8 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -18,6 +16,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter};
 
 const TRACE_LOG_SCHEMA_VERSION: u32 = 1;
 const OPAQUE_ID_HEX_BYTES: usize = 8;
@@ -37,7 +37,7 @@ struct TraceInner {
 }
 
 struct TraceState {
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Option<JsonlWriter>,
     log_error: Option<String>,
     active_spans: BTreeMap<u64, ActiveSpan>,
 }
@@ -140,13 +140,21 @@ impl TraceLog {
     /// Creates or truncates a private JSONL trace. Initialization errors turn
     /// the logger into a disabled value and remain observable via `log_error`.
     pub fn enabled(path: &Path) -> Self {
-        match open_writer(path) {
-            Ok(writer) => Self::enabled_with_writer(writer),
+        match JsonlWriter::open_private(path, "trace log", DIAGNOSTIC_LOG_MAX_BYTES) {
+            Ok(writer) => Self::enabled_with_jsonl_writer(writer),
             Err(error) => Self::disabled_with_error(error.to_string()),
         }
     }
 
-    fn enabled_with_writer(writer: Box<dyn Write + Send>) -> Self {
+    #[cfg(test)]
+    fn enabled_with_limit(path: &Path, max_bytes: u64) -> Self {
+        match JsonlWriter::open_private(path, "trace log", max_bytes) {
+            Ok(writer) => Self::enabled_with_jsonl_writer(writer),
+            Err(error) => Self::disabled_with_error(error.to_string()),
+        }
+    }
+
+    fn enabled_with_jsonl_writer(writer: JsonlWriter) -> Self {
         let trace = Self {
             inner: Some(Arc::new(TraceInner {
                 origin: Instant::now(),
@@ -437,118 +445,12 @@ impl Drop for TraceSpan {
     }
 }
 
-fn open_writer(path: &Path) -> std::io::Result<Box<dyn Write + Send>> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut options = OpenOptions::new();
-        options.create(true).write(true);
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let file = options.open(path)?;
-        ensure_regular_file(&file)?;
-        lock_trace_file(&file)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.set_len(0)?;
-        return Ok(Box::new(BufWriter::new(file)));
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-        // OPEN_REPARSE_POINT makes CreateFile return a handle to the link or
-        // reparse point itself instead of following it. Deliberately omit
-        // `truncate(true)`: truncating as part of open would modify a link's
-        // target before the opened object can be checked. Once the handle and
-        // current path are both known to be ordinary files, set_len performs
-        // the requested truncation on that validated handle.
-        let mut options = OpenOptions::new();
-        options
-            .create(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let file = options.open(path)?;
-        ensure_regular_file(&file)?;
-        ensure_windows_non_reparse_trace_file(path, &file)?;
-        lock_trace_file(&file)?;
-        file.set_len(0)?;
-        return Ok(Box::new(BufWriter::new(file)));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let mut options = OpenOptions::new();
-        options.create(true).write(true);
-        let file = options.open(path)?;
-        ensure_regular_file(&file)?;
-        lock_trace_file(&file)?;
-        file.set_len(0)?;
-        Ok(Box::new(BufWriter::new(file)))
-    }
-}
-
-fn lock_trace_file(file: &File) -> std::io::Result<()> {
-    match fs2::FileExt::try_lock_exclusive(file) {
-        Ok(()) => Ok(()),
-        Err(error) if trace_lock_is_contended(&error) => Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "trace log is already in use by another process",
-        )),
-        Err(error) => Err(error),
-    }
-}
-
-fn trace_lock_is_contended(error: &std::io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
-}
-
-#[cfg(windows)]
-fn ensure_windows_non_reparse_trace_file(path: &Path, file: &File) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let opened = file.metadata()?;
-    let current = fs::symlink_metadata(path)?;
-    if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || current.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || !current.file_type().is_file()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "trace log must not be a symbolic link or reparse point",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_regular_file(file: &File) -> std::io::Result<()> {
-    if !file.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "trace log must be a regular file",
-        ));
-    }
-    Ok(())
-}
-
 fn write_json_line(state: &mut TraceState, value: &Value) -> bool {
     let Some(writer) = state.writer.as_mut() else {
         return false;
     };
     let result = (|| -> std::io::Result<()> {
-        serde_json::to_writer(&mut **writer, value).map_err(std::io::Error::other)?;
-        writer.write_all(b"\n")?;
+        writer.write_json_line(value)?;
         writer.flush()
     })();
     if let Err(error) = result {
@@ -673,6 +575,86 @@ mod tests {
         let replacement = TraceLog::enabled(&path);
         assert!(replacement.is_enabled());
         replacement.finish();
+    }
+
+    #[test]
+    fn trace_rotates_at_the_limit_and_continues_with_complete_records() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("trace.jsonl");
+        let backup = temp.path().join("trace.jsonl.1");
+        let max_bytes = 768;
+        let trace = TraceLog::enabled_with_limit(&path, max_bytes);
+        assert!(trace.is_enabled(), "{:?}", trace.log_error());
+
+        for _ in 0..24 {
+            trace
+                .span(
+                    "rotation.work",
+                    TraceFields::new().usize("requestBytes", 123),
+                )
+                .finish(
+                    TraceOutcome::Ok,
+                    TraceFields::new().usize("responseBytes", 456),
+                );
+        }
+        assert!(backup.is_file(), "trace did not cross its rotation limit");
+        trace
+            .span("after.rotation", TraceFields::new())
+            .finish(TraceOutcome::Ok, TraceFields::new());
+        trace.finish();
+        assert_eq!(trace.log_error(), None);
+
+        assert!(fs::metadata(&path).unwrap().len() <= max_bytes);
+        assert!(fs::metadata(&backup).unwrap().len() <= max_bytes);
+        let current = fs::read_to_string(&path).unwrap();
+        let previous = fs::read_to_string(&backup).unwrap();
+        assert!(format!("{previous}{current}").contains("after.rotation"));
+        for contents in [current, previous] {
+            assert!(
+                contents
+                    .lines()
+                    .all(|line| serde_json::from_str::<Value>(line).is_ok()),
+                "rotation split a JSONL record: {contents:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_rotation_backup_disables_trace_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("trace.jsonl");
+        let target = temp.path().join("target.jsonl");
+        fs::write(&target, b"do not truncate").unwrap();
+        symlink(&target, temp.path().join("trace.jsonl.1")).unwrap();
+        let trace = TraceLog::enabled_with_limit(&path, 768);
+        for _ in 0..24 {
+            trace
+                .span("rotation.work", TraceFields::new())
+                .finish(TraceOutcome::Ok, TraceFields::new());
+            if !trace.is_enabled() {
+                break;
+            }
+        }
+
+        assert!(!trace.is_enabled());
+        assert!(trace.log_error().is_some());
+        assert_eq!(fs::read(target).unwrap(), b"do not truncate");
     }
 
     #[cfg(unix)]

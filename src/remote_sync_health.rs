@@ -8,15 +8,15 @@
 //! message text.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::replace_file;
+#[cfg(test)]
+use crate::private_state_store::stable_lock_share_mode;
+use crate::private_state_store::{LockFilePolicy, LockMode, PrivateStoreLayout};
 use crate::remote_bandwidth_budget::RemoteBandwidthBudgetLevel;
 use crate::remote_fact_sync::{RemoteFactSyncError, ReplicaFactCandidateKey};
 use crate::remote_protocol::SourceGeneration;
@@ -24,8 +24,6 @@ use crate::remote_sync::{RemoteSyncCompletion, RemoteSyncError, RemoteSyncReport
 use crate::remotes_config::{RemoteHostConfig, RemotesConfig};
 use crate::source_history::RedactionProfile;
 use crate::source_identity::NodeId;
-#[cfg(windows)]
-use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
 
 pub const REMOTE_SYNC_HEALTH_SCHEMA_VERSION: u32 = 3;
 pub const REMOTE_SYNC_HARD_PAUSE_PROBE_INTERVAL_SECONDS: i64 = 30 * 60;
@@ -49,9 +47,17 @@ const REMOTE_HOST_FINGERPRINT_PREFIX: &str = "remote-host-sha256-v1-";
 const REMOTE_HOST_FINGERPRINT_HEX_BYTES: usize = 64;
 const MAX_PAGES_PER_ATTEMPT: u32 = 32;
 const MAX_RESPONSE_BYTES_PER_ATTEMPT: u64 = 128 * 1024 * 1024;
-const TEMP_FILE_ATTEMPTS: usize = 128;
 
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const PRIVATE_STORE: PrivateStoreLayout = PrivateStoreLayout {
+    store_name: "remote sync health",
+    data_file_name: HEALTH_FILE,
+    data_path_name: "remote sync health",
+    data_subject: "remote sync health file",
+    lock_file_name: HEALTH_LOCK_FILE,
+    lock_subject: "remote sync health lock",
+    temporary_subject: "remote sync health temporary file",
+    maximum_file_bytes: MAX_HEALTH_FILE_BYTES,
+};
 
 /// Sanitized outcome of the latest attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +137,7 @@ impl RemoteSyncErrorCategory {
             RemoteSyncError::HostNotPaired { .. }
             | RemoteSyncError::HostNotEnabledForAutomaticSync { .. }
             | RemoteSyncError::StaleHostSelection { .. }
+            | RemoteSyncError::PreTransportConfigurationChanged { .. }
             | RemoteSyncError::ConfigurationChanged { .. } => Self::Configuration,
             RemoteSyncError::InvalidLimits(_)
             | RemoteSyncError::InvalidStartedAt
@@ -1455,11 +1462,12 @@ impl RemoteSyncHealthStore {
     }
 
     fn load(&self) -> io::Result<StoredRemoteSyncHealth> {
-        if !private_directory_exists_beneath(&self.state_root, &self.health_directory())? {
+        if !PRIVATE_STORE.directory_exists_beneath(&self.state_root, &self.health_directory())? {
             return Ok(StoredRemoteSyncHealth::default());
         }
         let directory = self.health_directory();
-        let _lock = open_locked_lock_file(&directory, LockMode::Shared)?;
+        let _lock =
+            PRIVATE_STORE.open_lock(&directory, LockMode::Shared, LockFilePolicy::Create)?;
         read_optional_health(&self.health_path())
     }
 
@@ -1483,8 +1491,9 @@ impl RemoteSyncHealthStore {
         skip_unchanged: bool,
     ) -> io::Result<R> {
         let directory = self.health_directory();
-        create_private_directory_beneath(&self.state_root, &directory)?;
-        let _lock = open_locked_lock_file(&directory, LockMode::Exclusive)?;
+        PRIVATE_STORE.create_directory_beneath(&self.state_root, &directory)?;
+        let _lock =
+            PRIVATE_STORE.open_lock(&directory, LockMode::Exclusive, LockFilePolicy::Create)?;
         let original = read_optional_health(&self.health_path())?;
         let original_hosts = original.hosts.clone();
         let mut hosts = original.into_map();
@@ -1748,510 +1757,16 @@ fn deserialize_health(contents: &[u8]) -> io::Result<StoredRemoteSyncHealth> {
 }
 
 fn read_optional_health(path: &Path) -> io::Result<StoredRemoteSyncHealth> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(StoredRemoteSyncHealth::default());
-        }
-        Err(error) => return Err(error),
+    if !PRIVATE_STORE.data_path_exists(path)? {
+        return Ok(StoredRemoteSyncHealth::default());
     }
-    let contents = read_private_bounded(path, MAX_HEALTH_FILE_BYTES, "remote sync health file")?;
+    let contents = PRIVATE_STORE.read_bounded(path)?;
     deserialize_health(&contents)
 }
 
 fn write_health_atomically(path: &Path, state: &StoredRemoteSyncHealth) -> io::Result<()> {
     let contents = serialize_health(state)?;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote sync health path has no parent",
-        )
-    })?;
-    validate_private_directory(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_file_metadata(&metadata, "remote sync health file")?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let (temporary_path, mut temporary) = create_temporary_file(parent, HEALTH_FILE)?;
-    let result = (|| {
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        replace_file(&temporary_path, path)?;
-        validate_published_private_file(path, "remote sync health file")?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
-}
-
-fn read_private_bounded(path: &Path, maximum: u64, subject: &str) -> io::Result<Vec<u8>> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_private_file_metadata(&path_metadata, subject)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let mut file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    let metadata = file.metadata()?;
-    validate_private_file_metadata(&metadata, subject)?;
-    ensure_private_file(path, &file, &metadata, subject)?;
-    ensure_opened_file_matches_path(path, &file, &path_metadata, &metadata, subject)?;
-    if metadata.len() > maximum {
-        return Err(invalid_data(format!("{subject} is too large")));
-    }
-    let mut contents = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(maximum + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() as u64 > maximum {
-        return Err(invalid_data(format!("{subject} is too large")));
-    }
-    Ok(contents)
-}
-
-#[derive(Clone, Copy)]
-enum LockMode {
-    Shared,
-    Exclusive,
-}
-
-fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<File> {
-    validate_private_directory(directory)?;
-    let path = directory.join(HEALTH_LOCK_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => validate_private_file_metadata(&metadata, "remote sync health lock")?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    add_nofollow_flags(&mut options);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(stable_lock_share_mode());
-    }
-    let file = options
-        .open(&path)
-        .map_err(|error| map_nofollow_error(error, "remote sync health lock"))?;
-    validate_opened_private_file(&path, &file, "remote sync health lock")?;
-
-    match mode {
-        LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
-        LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
-    }
-
-    validate_private_directory(directory)?;
-    validate_opened_private_file(&path, &file, "remote sync health lock")?;
-    Ok(file)
-}
-
-fn validate_opened_private_file(path: &Path, file: &File, subject: &str) -> io::Result<()> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_private_file_metadata(&path_metadata, subject)?;
-    let opened_metadata = file.metadata()?;
-    validate_private_file_metadata(&opened_metadata, subject)?;
-    ensure_private_file(path, file, &opened_metadata, subject)?;
-    ensure_opened_file_matches_path(path, file, &path_metadata, &opened_metadata, subject)
-}
-
-fn create_temporary_file(parent: &Path, file_name: &str) -> io::Result<(PathBuf, File)> {
-    for _ in 0..TEMP_FILE_ATTEMPTS {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        add_nofollow_flags(&mut options);
-        match options.open(&path) {
-            Ok(file) => {
-                validate_opened_private_file(&path, &file, "remote sync health temporary file")?;
-                return Ok((path, file));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a remote sync health temporary file",
-    ))
-}
-
-fn validate_published_private_file(path: &Path, subject: &str) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    validate_opened_private_file(path, &file, subject)
-}
-
-fn create_private_directory_beneath(root: &Path, path: &Path) -> io::Result<()> {
-    if !root.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote sync health state root must be absolute",
-        ));
-    }
-    match validate_state_root(root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_state_root(root)?;
-        }
-        Err(error) => return Err(error),
-    }
-    let relative = path.strip_prefix(root).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote sync health path is outside its state root",
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "remote sync health path contains a non-normal component",
-            ));
-        };
-        current.push(name);
-        match validate_private_directory(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_private_child_directory(&current)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    validate_private_directory(path)
-}
-
-fn private_directory_exists_beneath(root: &Path, path: &Path) -> io::Result<bool> {
-    if !root.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote sync health state root must be absolute",
-        ));
-    }
-    match validate_state_root(root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    }
-    let relative = path.strip_prefix(root).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote sync health path is outside its state root",
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "remote sync health path contains a non-normal component",
-            ));
-        };
-        current.push(name);
-        match validate_private_directory(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(true)
-}
-
-fn create_state_root(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir_all(path)?;
-    validate_state_root(path)
-}
-
-fn create_private_child_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    #[cfg(not(unix))]
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    validate_private_directory(path)
-}
-
-fn validate_state_root(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
-        return Err(invalid_data(
-            "remote sync health state root must be a real directory",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // SAFETY: geteuid has no preconditions and retains no pointers.
-        let effective_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != effective_uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote sync health state root must be owned by the current user",
-            ));
-        }
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("remote sync health state root must have mode 0700 (found {mode:04o})"),
-            ));
-        }
-    }
-    #[cfg(windows)]
-    validate_windows_private_directory(path, "remote sync health state root")?;
-    Ok(())
-}
-
-fn validate_private_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata_is_link_or_reparse(&metadata) {
-        return Err(invalid_data(
-            "remote sync health directory must not be a symbolic link or reparse point",
-        ));
-    }
-    if !metadata.file_type().is_dir() {
-        return Err(invalid_data("remote sync health path must be a directory"));
-    }
-    ensure_private_path(&metadata, "remote sync health directory")?;
-    #[cfg(windows)]
-    validate_windows_private_directory(path, "remote sync health directory")?;
-    Ok(())
-}
-
-fn validate_private_file_metadata(metadata: &fs::Metadata, subject: &str) -> io::Result<()> {
-    if metadata_is_link_or_reparse(metadata) {
-        return Err(invalid_data(format!(
-            "{subject} must not be a symbolic link or reparse point"
-        )));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(invalid_data(format!("{subject} must be a regular file")));
-    }
-    ensure_private_path(metadata, subject)
-}
-
-#[cfg(unix)]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(unix)]
-fn ensure_private_path(metadata: &fs::Metadata, subject: &str) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    // SAFETY: geteuid has no preconditions and retains no pointers.
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{subject} must be owned by the current user"),
-        ));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{subject} must not be accessible by group or other users"),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_private_path(_metadata: &fs::Metadata, _subject: &str) -> io::Result<()> {
-    Ok(())
-}
-
-fn ensure_private_file(
-    path: &Path,
-    file: &File,
-    _metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    #[cfg(windows)]
-    validate_windows_private_file(path, file, subject)?;
-    #[cfg(not(windows))]
-    let _ = (path, file, subject);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_opened_file_matches_path(
-    _path: &Path,
-    _opened_file: &File,
-    path_metadata: &fs::Metadata,
-    opened_metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
-    {
-        Ok(())
-    } else {
-        Err(invalid_data(format!(
-            "{subject} changed while it was being opened"
-        )))
-    }
-}
-
-#[cfg(windows)]
-fn ensure_opened_file_matches_path(
-    path: &Path,
-    opened_file: &File,
-    _path_metadata: &fs::Metadata,
-    _opened_metadata: &fs::Metadata,
-    subject: &str,
-) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let current = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, subject))?;
-    if windows_file_identity(&current)? == windows_file_identity(opened_file)? {
-        Ok(())
-    } else {
-        Err(invalid_data(format!(
-            "{subject} changed while it was being opened"
-        )))
-    }
-}
-
-#[cfg(windows)]
-fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: the live handle and output pointer are valid for this call.
-    let success =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
-    if success == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the API reported that it initialized the output structure.
-    let information = unsafe { information.assume_init() };
-    Ok((
-        information.dwVolumeSerialNumber,
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_opened_file_matches_path(
-    _path: &Path,
-    _opened_file: &File,
-    _path_metadata: &fs::Metadata,
-    _opened_metadata: &fs::Metadata,
-    _subject: &str,
-) -> io::Result<()> {
-    Ok(())
-}
-
-fn add_nofollow_flags(options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-}
-
-#[cfg(any(windows, test))]
-fn stable_lock_share_mode() -> u32 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        FILE_SHARE_READ | FILE_SHARE_WRITE
-    }
-    #[cfg(not(windows))]
-    {
-        0x0000_0001 | 0x0000_0002
-    }
-}
-
-fn map_nofollow_error(error: io::Error, subject: &str) -> io::Error {
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        return invalid_data(format!("{subject} must not be a symbolic link"));
-    }
-    #[cfg(not(unix))]
-    let _ = subject;
-    error
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
+    PRIVATE_STORE.write_atomically(path, &contents)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -2261,6 +1776,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::num::NonZeroU64;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2347,6 +1863,7 @@ mod tests {
 
     fn report(completion: RemoteSyncCompletion) -> RemoteSyncReport {
         RemoteSyncReport {
+            exchanges: 2,
             pages_committed: 2,
             changes_committed: 17,
             live_state_changed: false,

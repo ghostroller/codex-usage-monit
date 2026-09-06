@@ -1214,12 +1214,27 @@ fn initial_worker_panic_completion_clears_loading_and_finishes_progress() {
     app.initial_bootstrap_pending = false;
     app.worker_running = true;
 
-    assert!(apply_refresh_completion(
-        &mut app,
-        initial_refresh_panic_completion(&config)
-    ));
+    let (sender, receiver) = mpsc::channel();
+    send_refresh_completion_catching_panics(
+        &sender,
+        || panic!("private initial panic payload"),
+        || initial_refresh_panic_completion(&config),
+    );
+    let completion = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("a caught initial-worker panic must still send completion");
+    assert_eq!(
+        completion.worker_failure,
+        Some(RefreshWorkerFailure::Initial)
+    );
+
+    assert!(apply_refresh_completion(&mut app, completion));
 
     assert!(!app.worker_running);
+    assert!(
+        app.initial_bootstrap_pending,
+        "a caught panic must preserve the complete deferred bootstrap for retry"
+    );
     assert!(!initial_collection_loading(&app.snapshot));
     assert!(
         app.snapshot
@@ -1228,6 +1243,159 @@ fn initial_worker_panic_completion_clears_loading_and_finishes_progress() {
             .any(|error| error.contains("background scan will retry"))
     );
     assert_eq!(tracker.snapshot().stage, StartupLoadStage::Complete);
+    assert!(
+        app.refresh_retry_wait(Instant::now()).is_some(),
+        "the retry must remain bounded by the shared panic backoff"
+    );
+    assert!(
+        app.snapshot
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("private initial panic payload"))
+    );
+}
+
+fn caught_refresh_worker_panic(failure: RefreshWorkerFailure) -> RefreshCompletion {
+    let (sender, receiver) = mpsc::channel();
+    send_refresh_completion_catching_panics(
+        &sender,
+        || panic!("private worker panic payload"),
+        || refresh_worker_panic_completion(failure),
+    );
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("a caught refresh-worker panic must still send completion")
+}
+
+#[test]
+fn history_source_query_worker_panic_clears_loading_and_can_be_retried() {
+    let mut app = mouse_test_app(1);
+    app.worker_running = true;
+    app.history_source_loading = true;
+    app.history_source_query_pending = false;
+    let now = Instant::now();
+
+    let completion = caught_refresh_worker_panic(RefreshWorkerFailure::HistorySourceQuery);
+    assert_eq!(
+        completion.worker_failure,
+        Some(RefreshWorkerFailure::HistorySourceQuery)
+    );
+    assert!(apply_refresh_completion_at(
+        &mut app,
+        completion,
+        now,
+        Utc::now()
+    ));
+
+    assert!(!app.worker_running);
+    assert!(!app.history_source_loading);
+    assert!(!app.history_source_query_pending);
+    assert_eq!(
+        app.history_source_query_error.as_deref(),
+        Some(RefreshWorkerFailure::HistorySourceQuery.warning())
+    );
+    assert_eq!(
+        app.refresh_retry_wait(now),
+        Some(REFRESH_WORKER_PANIC_RETRY)
+    );
+    assert!(
+        app.snapshot
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("private worker panic payload"))
+    );
+
+    let selection = app.history_source_selection.clone();
+    app.request_history_source(selection);
+    assert!(app.history_source_loading);
+    assert!(app.history_source_query_pending);
+}
+
+#[test]
+fn summary_backfill_worker_panic_clears_both_running_flags_and_sets_cooldown() {
+    let mut app = mouse_test_app(1);
+    app.worker_running = true;
+    app.summary_backfill_running = true;
+    app.summary_backfill_pending = false;
+    let now = Instant::now();
+    let observed_at = Utc::now();
+
+    let completion = caught_refresh_worker_panic(RefreshWorkerFailure::SummaryBackfill);
+    assert!(completion.summary_backfill);
+    assert!(apply_refresh_completion_at(
+        &mut app,
+        completion,
+        now,
+        observed_at
+    ));
+
+    assert!(!app.worker_running);
+    assert!(!app.summary_backfill_running);
+    assert!(!app.summary_backfill_pending);
+    assert_eq!(app.history.summary_backfill_attempted_at, Some(observed_at));
+    assert_eq!(app.history.summary_backfill_attempt_complete, Some(false));
+    assert!(!summary_history_backfill_needed(&app.history, observed_at));
+    assert!(summary_history_backfill_needed(
+        &app.history,
+        observed_at + ChronoDuration::days(SUMMARY_BACKFILL_RETRY_DAYS + 1)
+    ));
+}
+
+#[test]
+fn account_refresh_worker_panic_uses_account_and_worker_backoff() {
+    let mut app = mouse_test_app(1);
+    app.worker_running = true;
+    let now = Instant::now();
+
+    let completion = caught_refresh_worker_panic(RefreshWorkerFailure::AccountRefresh);
+    assert!(apply_refresh_completion_at(
+        &mut app,
+        completion,
+        now,
+        Utc::now()
+    ));
+
+    assert!(!app.worker_running);
+    assert_eq!(app.account_refresh_retry_count, 1);
+    assert_eq!(
+        app.next_account_refresh.saturating_duration_since(now),
+        ACCOUNT_REFRESH_RETRY_DELAYS[0]
+    );
+    assert_eq!(
+        app.refresh_retry_wait(now),
+        Some(REFRESH_WORKER_PANIC_RETRY)
+    );
+}
+
+#[test]
+fn local_refresh_worker_panic_is_bounded_by_the_shared_retry_deadline() {
+    let mut app = mouse_test_app(1);
+    app.worker_running = true;
+    let now = Instant::now();
+
+    let completion = caught_refresh_worker_panic(RefreshWorkerFailure::LocalRefresh);
+    assert!(apply_refresh_completion_at(
+        &mut app,
+        completion,
+        now,
+        Utc::now()
+    ));
+
+    assert!(!app.worker_running);
+    assert_eq!(
+        app.refresh_retry_wait(now),
+        Some(REFRESH_WORKER_PANIC_RETRY)
+    );
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, now, false),
+        REFRESH_WORKER_PANIC_RETRY
+    );
+    let retry_at = now + REFRESH_WORKER_PANIC_RETRY;
+    assert_eq!(app.refresh_retry_wait(retry_at), None);
+    assert_eq!(
+        next_run_loop_poll_timeout(&app, retry_at, false),
+        Duration::ZERO
+    );
 }
 
 #[test]
@@ -1275,6 +1443,105 @@ fn headless_initial_refresh_uses_the_deferred_data_ready_path() {
     let trace = std::fs::read_to_string(trace_path).unwrap();
     assert!(trace.contains("\"stage\":\"tui.initial_data_ready\""));
     assert!(trace.contains("\"sourceScope\":\"all\""));
+}
+
+#[test]
+fn deferred_history_activation_observes_the_completed_first_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let ownership = runtime.ownership().clone();
+    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let startup_trace = crate::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
+    let hook_trace = startup_trace.clone();
+    let first_frame_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_first_frame_observed = Arc::clone(&first_frame_observed);
+    let (activation_entered_tx, activation_entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (activation_resume_tx, activation_resume_rx) = std::sync::mpsc::sync_channel(0);
+    let mut store = TuiHistoryStore::deferred_runtime(runtime, profile_lease);
+    store.set_deferred_runtime_preparation_hook(move || {
+        hook_first_frame_observed.store(
+            hook_trace
+                .report()
+                .events
+                .iter()
+                .any(|event| event.stage == "tui.first_frame"),
+            std::sync::atomic::Ordering::Release,
+        );
+        activation_entered_tx.send(()).unwrap();
+        activation_resume_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    });
+    let history_store = Arc::new(Mutex::new(store));
+    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
+    let config = CollectConfig {
+        codex_home,
+        offline: true,
+        rollout_cache_dir: None,
+        startup_trace: startup_trace.clone(),
+        ..CollectConfig::default()
+    };
+    let mut app = App::new(initial_loading_result(&config), Theme::Dark);
+    app.initial_bootstrap_pending = true;
+    app.history_source_loading = true;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    let draw_span = startup_trace.span("tui.first_frame");
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    draw_span.finish("backend=test");
+
+    let worker_config = config.clone();
+    let worker_history = Arc::clone(&history_store);
+    let worker_cache = Arc::clone(&rollout_cache);
+    let worker = std::thread::spawn(move || {
+        collect_initial_refresh_completion(
+            &worker_config,
+            &worker_cache,
+            &worker_history,
+            0,
+            &HistorySourceSelection::AllIncluded,
+            None,
+        )
+    });
+    activation_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        first_frame_observed.load(std::sync::atomic::Ordering::Acquire),
+        "the activation hook must observe a completed first-frame metric"
+    );
+    assert_eq!(
+        ownership.load_manifest().unwrap(),
+        OwnershipManifestStatus::Uninitialized,
+        "the blocking hook runs before ownership initialization or migration"
+    );
+
+    activation_resume_tx.send(()).unwrap();
+    let completion = worker.join().unwrap();
+    assert!(completion.history.is_some());
+    assert!(matches!(
+        ownership.load_manifest().unwrap(),
+        OwnershipManifestStatus::Initialized(manifest)
+            if manifest.state() == HistoryOwnershipState::V2Active
+    ));
+    let stages = startup_trace
+        .report()
+        .events
+        .into_iter()
+        .map(|event| event.stage)
+        .collect::<Vec<_>>();
+    let first_frame = stages
+        .iter()
+        .position(|stage| stage == "tui.first_frame")
+        .unwrap();
+    let activation = stages
+        .iter()
+        .position(|stage| stage == "tui.history_activate")
+        .unwrap();
+    assert!(first_frame < activation);
 }
 
 #[test]
@@ -2422,6 +2689,7 @@ fn install_remote_sources_fixture(
             config.host("dev").unwrap().expected_source(),
             now,
             &RemoteSyncReport {
+                exchanges: 2,
                 pages_committed: 2,
                 changes_committed: 17,
                 live_state_changed: false,
@@ -10484,7 +10752,8 @@ fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
     let codex_home = directory.path().join("codex-home");
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
-    let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+    let ownership = runtime.ownership().clone();
     let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
     let _recorder_guard =
         match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
@@ -10492,19 +10761,25 @@ fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
             TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
         };
 
-    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => warnings,
-        TuiHistoryRuntimePreparation::Ready(warnings) => {
-            panic!("busy recorder must force legacy fallback: {warnings:?}")
-        }
-    };
+    let mut store = TuiHistoryStore::deferred_runtime(runtime, profile_lease);
+    assert_eq!(
+        store.prepare_deferred_runtime(&codex_home, false, Utc::now()),
+        DeferredTuiHistoryPreparation::LegacyFallback
+    );
     assert!(
-        warnings
+        store
+            .setup_warnings
             .iter()
             .any(|warning| { warning.contains("cutover deferred while the recorder is active") })
     );
+    assert!(matches!(
+        store.backend,
+        TuiHistoryBackend::LegacyFallback(_)
+    ));
+    assert!(store.profile_lease.is_none());
+    assert!(!store.write_permitted());
     assert_eq!(
-        runtime.ownership().load_manifest().unwrap(),
+        ownership.load_manifest().unwrap(),
         OwnershipManifestStatus::Uninitialized,
         "a busy current recorder must prevent even the start of migration"
     );
@@ -11958,6 +12233,37 @@ fn empty_remote_panel_is_keyboard_and_mouse_reachable_in_wide_and_compact_layout
 
 #[cfg(unix)]
 #[test]
+fn completed_remote_action_cleans_descendants_before_reaping_its_group_leader() {
+    let directory = tempfile::tempdir().unwrap();
+    let descendant_pid_file = directory.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .env("DESCENDANT_PID_FILE", &descendant_pid_file)
+        .args([
+            "-c",
+            "sleep 30 & echo $! > \"$DESCENDANT_PID_FILE\"; exit 0",
+        ]);
+
+    let output =
+        run_cancellable_remote_action_command(command, &RemoteActionCancellation::default())
+            .unwrap();
+    assert!(output.status.success());
+    let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && unsafe { libc::kill(descendant_pid, 0) } == 0 {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
+#[cfg(unix)]
+#[test]
 fn dropping_running_remote_action_worker_terminates_and_reaps_its_process_tree() {
     let directory = tempfile::tempdir().unwrap();
     let primary_pid_file = directory.path().join("primary.pid");
@@ -13025,6 +13331,33 @@ fn settings_remote_add_and_edit_stage_exact_single_host_cli_arguments() {
 }
 
 #[test]
+fn settings_remote_editor_uses_the_shared_field_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    app.begin_remote_add();
+    {
+        let editor = app.remote_editor.as_mut().unwrap();
+        editor.host_id = "_dev".to_owned();
+        editor.ssh_host = "dev-box".to_owned();
+    }
+
+    app.submit_remote_editor();
+
+    assert!(app.pending_remote_action.is_none());
+    assert_eq!(
+        app.remote_editor
+            .as_ref()
+            .and_then(|editor| editor.validation_error.as_deref()),
+        Some(
+            "Host ID must start with an ASCII letter or digit and use only letters, digits, '-' or '_'"
+        )
+    );
+}
+
+#[test]
 fn settings_remote_crud_mouse_controls_and_remove_confirmation_work_in_compact_layout() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
@@ -13338,6 +13671,40 @@ fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
         .unwrap();
     assert!(app.reload_remote_sources());
     assert!(!app.reload_remote_sources());
+}
+
+#[test]
+fn remote_config_busy_reload_keeps_snapshot_and_retries_without_blocking_actions() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, _) = install_remote_sources_fixture(&mut app, directory.path(), now);
+    let previous = app.remote_sources.config.clone().unwrap();
+    let request = RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Test,
+        host_id: "dev".to_owned(),
+        config_revision: previous.config_revision(),
+    };
+
+    let holder = config_store.lock_exclusive_for_test().unwrap();
+    assert!(app.reload_remote_sources());
+    assert_eq!(app.remote_sources.config.as_ref(), Some(&previous));
+    assert_eq!(
+        app.remote_sources.config_error.as_deref(),
+        Some("local-state/busy; retrying")
+    );
+    assert!(app.remote_config_retry_not_before.is_some());
+    assert_eq!(
+        validate_remote_ui_action_config(&config_store, &request),
+        Err("remote config busy".to_owned())
+    );
+
+    drop(holder);
+    app.remote_config_retry_not_before = Some(Instant::now());
+    assert!(app.retry_remote_config_if_due(Instant::now()));
+    assert_eq!(app.remote_sources.config.as_ref(), Some(&previous));
+    assert_eq!(app.remote_sources.config_error, None);
+    assert_eq!(app.remote_config_retry_not_before, None);
 }
 
 #[test]

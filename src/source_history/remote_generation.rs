@@ -479,20 +479,58 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
-        self.load_remote_history_snapshot_since_with_between_families(
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_remote_history_snapshot_since_with_budget(
+            source_id,
+            redaction_profile,
+            since,
+            &mut budget,
+        )
+    }
+
+    pub(crate) fn load_remote_history_snapshot_since_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceHistoryRemoteSnapshot> {
+        budget.charge_source()?;
+        self.load_remote_history_snapshot_since_with_between_families_and_budget(
             source_id,
             redaction_profile,
             since,
             || {},
+            budget,
         )
     }
 
+    #[cfg(test)]
     fn load_remote_history_snapshot_since_with_between_families(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
         between_families: impl FnOnce(),
+    ) -> io::Result<SourceHistoryRemoteSnapshot> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        budget.charge_source()?;
+        self.load_remote_history_snapshot_since_with_between_families_and_budget(
+            source_id,
+            redaction_profile,
+            since,
+            between_families,
+            &mut budget,
+        )
+    }
+
+    fn load_remote_history_snapshot_since_with_between_families_and_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        between_families: impl FnOnce(),
+        budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
         self.with_source_metadata_shared(source_id, |source| {
             require_ssh_source(source)?;
@@ -517,19 +555,22 @@ impl SourceHistoryStore {
                 generation: manifest.active_generation,
                 binding: manifest.binding,
             };
-            let bucket_records = self.load_source_bucket_records_from_directory(
+            let bucket_records = self.load_source_bucket_records_from_directory_with_budget(
                 source_id,
                 redaction_profile,
                 since,
                 &generation_directory.join(BUCKETS_DIRECTORY),
+                budget,
             )?;
             between_families();
-            let session_digest_records = self.load_source_session_digest_records_from_directory(
-                source_id,
-                redaction_profile,
-                since,
-                &generation_directory.join(DIGESTS_DIRECTORY),
-            )?;
+            let session_digest_records = self
+                .load_source_session_digest_records_from_directory_with_budget(
+                    source_id,
+                    redaction_profile,
+                    since,
+                    &generation_directory.join(DIGESTS_DIRECTORY),
+                    budget,
+                )?;
             Ok(SourceHistoryRemoteSnapshot {
                 active_ref: Some(active_ref),
                 bucket_records,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::atomic_file::replace_file;
 use crate::history::{
     HISTORY_METRIC_REVISION, LocalHalfHourBucket, QuotaPoint, WeeklyLocalPoint,
-    is_current_local_bucket, upsert_quota_point,
+    is_current_local_bucket,
 };
 use crate::history_ownership::HistoryWriteAuthority;
 use crate::source_identity::NodeId;
@@ -68,13 +68,130 @@ const RETENTION_CLOCK_CONFIRMATION_HOURS: i64 = 48;
 const RETENTION_CLOCK_MIN_CONFIRMATIONS: u32 = 3;
 const MAX_METADATA_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SHARD_FILE_BYTES: u64 = 128 * 1024 * 1024;
+// A normal query covers at most 35 daily shards per family. Keep the aggregate
+// decoded-byte ceiling aligned with the existing 512 MiB remote clone budget,
+// while bounding tiny-record amplification and accumulated detached sources.
+const MAX_HISTORY_QUERY_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_HISTORY_QUERY_RECORDS: usize = 1_000_000;
+const MAX_HISTORY_QUERY_SOURCES: usize = 512;
 const MAX_PROFILE_ID_LEN: usize = 64;
 const MAX_SOURCE_LABEL_CHARS: usize = 160;
 const MAX_SOURCE_LABEL_BYTES: usize = 512;
 const MAX_QUOTA_LIMIT_ID_CHARS: usize = 128;
+// Keep these in lockstep with the v1 quota-sample identity contract in
+// `history`: an observation belongs to a five-minute slot and reset times for
+// the same sample may drift by up to two minutes.
+const ACCOUNT_QUOTA_SAMPLE_SECONDS: i64 = 5 * 60;
+const ACCOUNT_QUOTA_RESET_DRIFT_SECONDS: i64 = 120;
+// Healthy server data has one reset candidate for a limit in each observation
+// slot. Bound a corrupt shard's same-key fan-out so range lookup and sorted
+// insertion cannot be turned back into unbounded quadratic work.
+const MAX_ACCOUNT_QUOTA_CANDIDATES_PER_KEY: usize = 64;
 const SOURCE_BUCKET_SECONDS: i64 = 15 * 60;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// One fail-closed allowance shared by every source and shard participating in
+/// a logical history query. Callers that compose source snapshots must retain
+/// the same value for the complete query rather than creating one per source.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceHistoryReadBudget {
+    decoded_bytes_remaining: u64,
+    records_remaining: usize,
+    sources_remaining: usize,
+}
+
+#[derive(Debug)]
+struct SourceHistoryReadBudgetExceeded(String);
+
+impl fmt::Display for SourceHistoryReadBudgetExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SourceHistoryReadBudgetExceeded {}
+
+fn history_query_budget_exceeded(detail: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        SourceHistoryReadBudgetExceeded(format!(
+            "source history query budget exceeded: {}",
+            detail.into()
+        )),
+    )
+}
+
+impl SourceHistoryReadBudget {
+    pub(crate) fn for_query() -> Self {
+        Self::with_limits(
+            MAX_HISTORY_QUERY_DECODED_BYTES,
+            MAX_HISTORY_QUERY_RECORDS,
+            MAX_HISTORY_QUERY_SOURCES,
+        )
+    }
+
+    pub(crate) fn with_limits(decoded_bytes: u64, records: usize, sources: usize) -> Self {
+        Self {
+            decoded_bytes_remaining: decoded_bytes,
+            records_remaining: records,
+            sources_remaining: sources,
+        }
+    }
+
+    pub(crate) fn charge_source(&mut self) -> io::Result<()> {
+        self.sources_remaining = self.sources_remaining.checked_sub(1).ok_or_else(|| {
+            history_query_budget_exceeded(format!(
+                "source budget of {MAX_HISTORY_QUERY_SOURCES} exceeded"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn shard_decoded_byte_allowance(&self, shard_limit: u64) -> io::Result<(u64, bool)> {
+        if self.decoded_bytes_remaining == 0 {
+            return Err(history_query_budget_exceeded(format!(
+                "decoded-byte budget of {MAX_HISTORY_QUERY_DECODED_BYTES} exhausted"
+            )));
+        }
+        Ok((
+            shard_limit.min(self.decoded_bytes_remaining),
+            self.decoded_bytes_remaining <= shard_limit,
+        ))
+    }
+
+    fn charge_decoded_bytes(&mut self, decoded_bytes: u64) -> io::Result<()> {
+        self.decoded_bytes_remaining = self
+            .decoded_bytes_remaining
+            .checked_sub(decoded_bytes)
+            .ok_or_else(|| {
+                history_query_budget_exceeded(format!(
+                    "decoded-byte budget of {MAX_HISTORY_QUERY_DECODED_BYTES} exceeded"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn charge_records(&mut self, records: usize) -> io::Result<()> {
+        self.records_remaining = self.records_remaining.checked_sub(records).ok_or_else(|| {
+            history_query_budget_exceeded(format!(
+                "record budget of {MAX_HISTORY_QUERY_RECORDS} exceeded"
+            ))
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn is_exhaustion(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SourceHistoryReadBudgetExceeded>())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decoded_bytes_remaining_for_test(&self) -> u64 {
+        self.decoded_bytes_remaining
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AtomicShardFileKind {
@@ -980,6 +1097,23 @@ impl SourceHistoryStore {
         self.with_source_metadata_shared(source_id, |metadata| Ok(metadata.clone()))
     }
 
+    pub(super) fn load_source_metadata_with_budget(
+        &self,
+        source_id: &NodeId,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceMetadata> {
+        let directory = self.source_directory(source_id);
+        self.validate_private_path(&directory)?;
+        let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
+        lock_shared(&lock, &directory, SOURCE_LOCK_FILE)?;
+        read_source_metadata_file_with_budget(
+            &directory.join(SOURCE_METADATA_FILE),
+            &self.profile_id,
+            source_id,
+            budget,
+        )
+    }
+
     /// Holds the stable source lock across a metadata-dependent read.
     ///
     /// Privacy namespace retirement takes the same lock exclusively before it
@@ -1029,6 +1163,11 @@ impl SourceHistoryStore {
                 continue;
             };
             self.validate_private_path(&entry.path())?;
+            if source_ids.len() >= MAX_HISTORY_QUERY_SOURCES {
+                return Err(history_query_budget_exceeded(format!(
+                    "source budget of {MAX_HISTORY_QUERY_SOURCES} exceeded"
+                )));
+            }
             source_ids.push(source_id);
         }
         source_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -1046,12 +1185,27 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
     ) -> io::Result<Vec<SourceHistoryData>> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_included_sources_since_with_budget(redaction_profile, since, &mut budget)
+    }
+
+    fn load_included_sources_since_with_budget(
+        &self,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<Vec<SourceHistoryData>> {
         let mut sources = Vec::new();
         for metadata in self.list_source_metadata()? {
             if !metadata.include_in_aggregates() {
                 continue;
             }
-            let data = self.load_source_since(metadata.source_id(), redaction_profile, since)?;
+            let data = self.load_source_since_with_budget(
+                metadata.source_id(),
+                redaction_profile,
+                since,
+                budget,
+            )?;
             if data.source.include_in_aggregates() {
                 sources.push(data);
             }
@@ -1255,9 +1409,11 @@ impl SourceHistoryStore {
                 Some(shard) => shard,
                 None => AccountShard::new(self.profile_id.clone(), day),
             };
+            let mut point_index = account_quota_point_index(&shard.quota_points)?;
             let mut changed = false;
             for point in points {
-                changed |= upsert_quota_point(&mut shard.quota_points, point);
+                changed |=
+                    apply_account_quota_point(&mut shard.quota_points, &mut point_index, point)?;
             }
             if !changed {
                 report.shards_skipped += 1;
@@ -1321,9 +1477,11 @@ impl SourceHistoryStore {
                     day,
                 ),
             };
+            let mut record_index = source_bucket_record_index(&shard.records)?;
             let mut changed = false;
             for record in records {
-                changed |= apply_source_bucket_record(&mut shard.records, record)?;
+                changed |=
+                    apply_source_bucket_record(&mut shard.records, &mut record_index, record)?;
             }
             if !changed {
                 report.shards_skipped += 1;
@@ -1370,9 +1528,11 @@ impl SourceHistoryStore {
                     day,
                 ),
             };
+            let mut record_index = source_weekly_record_index(&shard.records)?;
             let mut changed = false;
             for record in records {
-                changed |= apply_source_weekly_record(&mut shard.records, record)?;
+                changed |=
+                    apply_source_weekly_record(&mut shard.records, &mut record_index, record)?;
             }
             if !changed {
                 report.shards_skipped += 1;
@@ -1386,6 +1546,15 @@ impl SourceHistoryStore {
     }
 
     pub fn load_account_since(&self, since: DateTime<Utc>) -> io::Result<AccountHistoryData> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_account_since_with_budget(since, &mut budget)
+    }
+
+    pub(crate) fn load_account_since_with_budget(
+        &self,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<AccountHistoryData> {
         let directory = self.account_directory();
         if !self.private_directory_exists(&directory)? {
             return Ok(AccountHistoryData::default());
@@ -1393,8 +1562,10 @@ impl SourceHistoryStore {
         let lock = open_lock_file(&directory, ACCOUNT_LOCK_FILE)?;
         lock_shared(&lock, &directory, ACCOUNT_LOCK_FILE)?;
         let mut points = Vec::new();
+        let mut point_index = HashMap::new();
         for (day, path) in shard_entries_since(&directory, since)? {
-            let Some(shard) = read_account_shard(&path, &self.profile_id, day)? else {
+            let Some(shard) = read_account_shard_with_budget(&path, &self.profile_id, day, budget)?
+            else {
                 continue;
             };
             for point in shard
@@ -1402,7 +1573,7 @@ impl SourceHistoryStore {
                 .into_iter()
                 .filter(|point| point.observed_at >= since)
             {
-                let _ = upsert_quota_point(&mut points, point);
+                let _ = apply_account_quota_point(&mut points, &mut point_index, point)?;
             }
         }
         points.sort_by(|left, right| {
@@ -1424,6 +1595,33 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
     ) -> io::Result<SourceHistoryRecordsData> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_source_records_since_with_budget(source_id, redaction_profile, since, &mut budget)
+    }
+
+    pub(crate) fn load_source_records_since_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceHistoryRecordsData> {
+        budget.charge_source()?;
+        self.load_source_records_since_with_charged_budget(
+            source_id,
+            redaction_profile,
+            since,
+            budget,
+        )
+    }
+
+    fn load_source_records_since_with_charged_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceHistoryRecordsData> {
         self.with_source_metadata_shared(source_id, |source| {
             let records = if source.kind() == SourceKind::Ssh {
                 self.with_active_remote_history_generation(
@@ -1433,35 +1631,39 @@ impl SourceHistoryStore {
                         let Some(generation_directory) = generation_directory else {
                             return Ok(Vec::new());
                         };
-                        self.load_source_bucket_records_from_directory(
+                        self.load_source_bucket_records_from_directory_with_budget(
                             source_id,
                             redaction_profile,
                             since,
                             &generation_directory.join(BUCKETS_DIRECTORY),
+                            budget,
                         )
                     },
                 )?
             } else {
-                self.load_source_bucket_records_from_directory(
+                self.load_source_bucket_records_from_directory_with_budget(
                     source_id,
                     redaction_profile,
                     since,
                     &self.source_buckets_directory(source_id, redaction_profile),
+                    budget,
                 )?
             };
             Ok(SourceHistoryRecordsData {
                 source: source.clone(),
                 redaction_profile,
                 records,
-                weekly_records: self.load_source_weekly_records_since(
+                weekly_records: self.load_source_weekly_records_since_with_budget(
                     source_id,
                     redaction_profile,
                     since,
+                    budget,
                 )?,
             })
         })
     }
 
+    #[cfg(test)]
     pub(super) fn load_source_bucket_records_from_directory(
         &self,
         source_id: &NodeId,
@@ -1469,26 +1671,46 @@ impl SourceHistoryStore {
         since: DateTime<Utc>,
         directory: &Path,
     ) -> io::Result<Vec<SourceBucketRecord>> {
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_source_bucket_records_from_directory_with_budget(
+            source_id,
+            redaction_profile,
+            since,
+            directory,
+            &mut budget,
+        )
+    }
+
+    pub(super) fn load_source_bucket_records_from_directory_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        directory: &Path,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<Vec<SourceBucketRecord>> {
         if !self.private_directory_exists(directory)? {
             return Ok(Vec::new());
         }
         let lock = open_lock_file(directory, BUCKETS_LOCK_FILE)?;
         lock_shared(&lock, directory, BUCKETS_LOCK_FILE)?;
         let mut records = Vec::new();
+        let mut record_index = HashMap::new();
         for (day, path) in shard_entries_since(directory, since)? {
-            let Some(shard) = read_source_bucket_shard(
+            let Some(shard) = read_source_bucket_shard_with_budget(
                 &path,
                 &self.profile_id,
                 source_id,
                 redaction_profile,
                 day,
+                budget,
             )?
             else {
                 continue;
             };
             for record in shard.records {
                 if source_record_intersects_since(&record, since) {
-                    let _ = apply_source_bucket_record(&mut records, record)?;
+                    let _ = apply_source_bucket_record(&mut records, &mut record_index, record)?;
                 }
             }
         }
@@ -1496,11 +1718,12 @@ impl SourceHistoryStore {
         Ok(records)
     }
 
-    fn load_source_weekly_records_since(
+    fn load_source_weekly_records_since_with_budget(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceWeeklyRecord>> {
         let directory = self.source_weekly_directory(source_id, redaction_profile);
         if !self.private_directory_exists(&directory)? {
@@ -1509,20 +1732,22 @@ impl SourceHistoryStore {
         let lock = open_lock_file(&directory, WEEKLY_LOCK_FILE)?;
         lock_shared(&lock, &directory, WEEKLY_LOCK_FILE)?;
         let mut records = Vec::new();
+        let mut record_index = HashMap::new();
         for (day, path) in shard_entries_since(&directory, since)? {
-            let Some(shard) = read_source_weekly_shard(
+            let Some(shard) = read_source_weekly_shard_with_budget(
                 &path,
                 &self.profile_id,
                 source_id,
                 redaction_profile,
                 day,
+                budget,
             )?
             else {
                 continue;
             };
             for record in shard.records {
                 if record.observed_at >= since {
-                    let _ = apply_source_weekly_record(&mut records, record)?;
+                    let _ = apply_source_weekly_record(&mut records, &mut record_index, record)?;
                 }
             }
         }
@@ -1539,7 +1764,24 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
     ) -> io::Result<SourceHistoryData> {
-        let records = self.load_source_records_since(source_id, redaction_profile, since)?;
+        let mut budget = SourceHistoryReadBudget::for_query();
+        self.load_source_since_with_budget(source_id, redaction_profile, since, &mut budget)
+    }
+
+    pub(crate) fn load_source_since_with_budget(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<SourceHistoryData> {
+        budget.charge_source()?;
+        let records = self.load_source_records_since_with_charged_budget(
+            source_id,
+            redaction_profile,
+            since,
+            budget,
+        )?;
         let mut buckets = records
             .records
             .into_iter()
@@ -1807,7 +2049,28 @@ fn read_source_metadata_file(
     profile_id: &HistoryProfileId,
     expected: &NodeId,
 ) -> io::Result<SourceMetadata> {
-    let envelope: SourceMetadataEnvelope = read_json_file(path, MAX_METADATA_FILE_BYTES)?;
+    read_source_metadata_file_inner(path, profile_id, expected, None)
+}
+
+fn read_source_metadata_file_with_budget(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    expected: &NodeId,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<SourceMetadata> {
+    read_source_metadata_file_inner(path, profile_id, expected, Some(budget))
+}
+
+fn read_source_metadata_file_inner(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    expected: &NodeId,
+    budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<SourceMetadata> {
+    let envelope: SourceMetadataEnvelope = match budget {
+        Some(budget) => read_json_file_inner(path, MAX_METADATA_FILE_BYTES, Some(budget))?,
+        None => read_json_file(path, MAX_METADATA_FILE_BYTES)?,
+    };
     if envelope.format_version != SOURCE_METADATA_ENVELOPE_FORMAT_VERSION {
         return Err(envelope_mismatch(path, "source metadata format version"));
     }
@@ -1826,10 +2089,35 @@ fn read_account_shard(
     profile_id: &HistoryProfileId,
     day: NaiveDate,
 ) -> io::Result<Option<AccountShard>> {
-    let shard: AccountShard = match read_optional_json_file(path, MAX_SHARD_FILE_BYTES)? {
+    read_account_shard_inner(path, profile_id, day, None)
+}
+
+fn read_account_shard_with_budget(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    day: NaiveDate,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<AccountShard>> {
+    read_account_shard_inner(path, profile_id, day, Some(budget))
+}
+
+fn read_account_shard_inner(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    day: NaiveDate,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Option<AccountShard>> {
+    let shard = match budget.as_deref_mut() {
+        Some(budget) => read_optional_json_file_with_budget(path, MAX_SHARD_FILE_BYTES, budget)?,
+        None => read_optional_json_file(path, MAX_SHARD_FILE_BYTES)?,
+    };
+    let shard: AccountShard = match shard {
         Some(shard) => shard,
         None => return Ok(None),
     };
+    if let Some(budget) = budget.as_mut() {
+        budget.charge_records(shard.quota_points.len())?;
+    }
     if shard.format_version != ACCOUNT_SHARD_FORMAT_VERSION {
         return Err(envelope_mismatch(path, "account format version"));
     }
@@ -1862,10 +2150,46 @@ fn read_source_bucket_shard(
     redaction_profile: RedactionProfile,
     day: NaiveDate,
 ) -> io::Result<Option<SourceBucketShard>> {
-    let mut shard: SourceBucketShard = match read_optional_json_file(path, MAX_SHARD_FILE_BYTES)? {
+    read_source_bucket_shard_inner(path, profile_id, source_id, redaction_profile, day, None)
+}
+
+fn read_source_bucket_shard_with_budget(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<SourceBucketShard>> {
+    read_source_bucket_shard_inner(
+        path,
+        profile_id,
+        source_id,
+        redaction_profile,
+        day,
+        Some(budget),
+    )
+}
+
+fn read_source_bucket_shard_inner(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Option<SourceBucketShard>> {
+    let shard = match budget.as_deref_mut() {
+        Some(budget) => read_optional_json_file_with_budget(path, MAX_SHARD_FILE_BYTES, budget)?,
+        None => read_optional_json_file(path, MAX_SHARD_FILE_BYTES)?,
+    };
+    let mut shard: SourceBucketShard = match shard {
         Some(shard) => shard,
         None => return Ok(None),
     };
+    if let Some(budget) = budget.as_mut() {
+        budget.charge_records(shard.records.len())?;
+    }
     if shard.format_version != SOURCE_BUCKET_SHARD_FORMAT_VERSION {
         return Err(envelope_mismatch(path, "source bucket format version"));
     }
@@ -1884,13 +2208,14 @@ fn read_source_bucket_shard(
     if shard.utc_day != day {
         return Err(envelope_mismatch(path, "UTC day"));
     }
-    let mut unique_records = Vec::with_capacity(shard.records.len());
+    let mut unique_records = Vec::new();
+    let mut record_index = HashMap::new();
     for record in std::mem::take(&mut shard.records) {
         record.validate()?;
         if record.starts_at.date_naive() != day {
             return Err(envelope_mismatch(path, "source bucket record UTC day"));
         }
-        apply_source_bucket_record(&mut unique_records, record)?;
+        apply_source_bucket_record(&mut unique_records, &mut record_index, record)?;
     }
     shard.records = unique_records;
     if redaction_profile == RedactionProfile::Redacted {
@@ -1906,10 +2231,46 @@ fn read_source_weekly_shard(
     redaction_profile: RedactionProfile,
     day: NaiveDate,
 ) -> io::Result<Option<SourceWeeklyShard>> {
-    let mut shard: SourceWeeklyShard = match read_optional_json_file(path, MAX_SHARD_FILE_BYTES)? {
+    read_source_weekly_shard_inner(path, profile_id, source_id, redaction_profile, day, None)
+}
+
+fn read_source_weekly_shard_with_budget(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<SourceWeeklyShard>> {
+    read_source_weekly_shard_inner(
+        path,
+        profile_id,
+        source_id,
+        redaction_profile,
+        day,
+        Some(budget),
+    )
+}
+
+fn read_source_weekly_shard_inner(
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    day: NaiveDate,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Option<SourceWeeklyShard>> {
+    let shard = match budget.as_deref_mut() {
+        Some(budget) => read_optional_json_file_with_budget(path, MAX_SHARD_FILE_BYTES, budget)?,
+        None => read_optional_json_file(path, MAX_SHARD_FILE_BYTES)?,
+    };
+    let mut shard: SourceWeeklyShard = match shard {
         Some(shard) => shard,
         None => return Ok(None),
     };
+    if let Some(budget) = budget.as_mut() {
+        budget.charge_records(shard.records.len())?;
+    }
     if shard.format_version != SOURCE_WEEKLY_SHARD_FORMAT_VERSION
         || shard.metric_revision != HISTORY_METRIC_REVISION
         || &shard.profile_id != profile_id
@@ -1919,13 +2280,14 @@ fn read_source_weekly_shard(
     {
         return Err(envelope_mismatch(path, "source weekly envelope"));
     }
-    let mut unique = Vec::with_capacity(shard.records.len());
+    let mut unique = Vec::new();
+    let mut record_index = HashMap::new();
     for record in std::mem::take(&mut shard.records) {
         record.validate()?;
         if record.observed_at.date_naive() != day {
             return Err(envelope_mismatch(path, "source weekly record UTC day"));
         }
-        apply_source_weekly_record(&mut unique, record)?;
+        apply_source_weekly_record(&mut unique, &mut record_index, record)?;
     }
     shard.records = unique;
     Ok(Some(shard))
@@ -1945,16 +2307,240 @@ fn is_aligned_bucket_start(starts_at: DateTime<Utc>) -> bool {
         && starts_at.timestamp_subsec_nanos() == 0
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct AccountQuotaPointIndexKey {
+    duration_mins: i64,
+    observed_slot: i64,
+    ascii_lower_limit_id: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AccountQuotaResetCandidate {
+    resets_at: DateTime<Utc>,
+    position: usize,
+}
+
+type AccountQuotaPointIndex = HashMap<AccountQuotaPointIndexKey, Vec<AccountQuotaResetCandidate>>;
+
+fn account_quota_point_index_key(point: &QuotaPoint) -> io::Result<AccountQuotaPointIndexKey> {
+    let mut ascii_lower_limit_id = Vec::new();
+    ascii_lower_limit_id
+        .try_reserve(point.limit_id.len())
+        .map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate account quota limit index: {error}"
+            ))
+        })?;
+    ascii_lower_limit_id.extend(
+        point
+            .limit_id
+            .as_bytes()
+            .iter()
+            .map(|byte| byte.to_ascii_lowercase()),
+    );
+    Ok(AccountQuotaPointIndexKey {
+        duration_mins: point.duration_mins,
+        observed_slot: point
+            .observed_at
+            .timestamp()
+            .div_euclid(ACCOUNT_QUOTA_SAMPLE_SECONDS),
+        ascii_lower_limit_id,
+    })
+}
+
+fn account_quota_point_index(points: &[QuotaPoint]) -> io::Result<AccountQuotaPointIndex> {
+    let mut point_index = AccountQuotaPointIndex::new();
+    point_index.try_reserve(points.len()).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate account quota point index: {error}"
+        ))
+    })?;
+    for (position, point) in points.iter().enumerate() {
+        let key = account_quota_point_index_key(point)?;
+        let candidate = AccountQuotaResetCandidate {
+            resets_at: point.resets_at,
+            position,
+        };
+        if let Some(candidates) = point_index.get_mut(&key) {
+            insert_account_quota_reset_candidate(candidates, candidate)?;
+        } else {
+            let mut candidates = Vec::new();
+            insert_account_quota_reset_candidate(&mut candidates, candidate)?;
+            point_index.insert(key, candidates);
+        }
+    }
+    Ok(point_index)
+}
+
+fn insert_account_quota_reset_candidate(
+    candidates: &mut Vec<AccountQuotaResetCandidate>,
+    candidate: AccountQuotaResetCandidate,
+) -> io::Result<()> {
+    if candidates.len() >= MAX_ACCOUNT_QUOTA_CANDIDATES_PER_KEY {
+        return Err(invalid_data(format!(
+            "account quota point set exceeds the per-slot candidate bound of \
+             {MAX_ACCOUNT_QUOTA_CANDIDATES_PER_KEY}"
+        )));
+    }
+    candidates.try_reserve(1).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate account quota candidate index: {error}"
+        ))
+    })?;
+    let insertion = candidates
+        .binary_search(&candidate)
+        .unwrap_or_else(|position| position);
+    candidates.insert(insertion, candidate);
+    Ok(())
+}
+
+fn account_quota_payload_eq(left: &QuotaPoint, right: &QuotaPoint) -> bool {
+    left.limit_id.eq_ignore_ascii_case(&right.limit_id)
+        && left.duration_mins == right.duration_mins
+        && left.resets_at == right.resets_at
+        && left.used_percent == right.used_percent
+        && left.remaining_percent == right.remaining_percent
+        && left.provenance == right.provenance
+}
+
+/// Indexed equivalent of history v1's quota upsert contract.
+///
+/// When reset-tolerance windows overlap, the smallest stored position retains
+/// the original vector's first-match rule. Reset candidates stay sorted for
+/// bounded range lookup, and a replacement that moves `resets_at` updates that
+/// secondary index before the point becomes visible.
+fn apply_account_quota_point(
+    points: &mut Vec<QuotaPoint>,
+    point_index: &mut AccountQuotaPointIndex,
+    incoming: QuotaPoint,
+) -> io::Result<bool> {
+    validate_account_quota_point(&incoming)?;
+    let key = account_quota_point_index_key(&incoming)?;
+    let reset_floor = incoming
+        .resets_at
+        .checked_sub_signed(Duration::seconds(ACCOUNT_QUOTA_RESET_DRIFT_SECONDS))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let reset_ceiling = incoming
+        .resets_at
+        .checked_add_signed(Duration::seconds(ACCOUNT_QUOTA_RESET_DRIFT_SECONDS))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let existing = point_index.get(&key).and_then(|candidates| {
+        let start = candidates.partition_point(|candidate| candidate.resets_at < reset_floor);
+        let end = candidates.partition_point(|candidate| candidate.resets_at <= reset_ceiling);
+        candidates[start..end]
+            .iter()
+            .map(|candidate| candidate.position)
+            .min()
+    });
+    if let Some(position) = existing {
+        if account_quota_payload_eq(&incoming, &points[position]) {
+            return Ok(false);
+        }
+        let replace = incoming.observed_at > points[position].observed_at
+            || (incoming.observed_at == points[position].observed_at
+                && (incoming.used_percent, -incoming.remaining_percent)
+                    > (
+                        points[position].used_percent,
+                        -points[position].remaining_percent,
+                    ));
+        if replace {
+            let prior_reset = points[position].resets_at;
+            if prior_reset != incoming.resets_at {
+                let candidates = point_index.get_mut(&key).ok_or_else(|| {
+                    invalid_data("account quota point index lost its base-key candidate list")
+                })?;
+                let prior_candidate = AccountQuotaResetCandidate {
+                    resets_at: prior_reset,
+                    position,
+                };
+                let prior_index = candidates.binary_search(&prior_candidate).map_err(|_| {
+                    invalid_data("account quota point index lost a reset candidate")
+                })?;
+                candidates.remove(prior_index);
+                let replacement = AccountQuotaResetCandidate {
+                    resets_at: incoming.resets_at,
+                    position,
+                };
+                let insertion = candidates
+                    .binary_search(&replacement)
+                    .unwrap_or_else(|position| position);
+                // Removing one entry above retained enough capacity for this
+                // insertion; no allocation can occur after the old key moves.
+                candidates.insert(insertion, replacement);
+            }
+            points[position] = incoming;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    points.try_reserve(1).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate account quota point buffer: {error}"
+        ))
+    })?;
+    let position = points.len();
+    let candidate = AccountQuotaResetCandidate {
+        resets_at: incoming.resets_at,
+        position,
+    };
+    if let Some(candidates) = point_index.get_mut(&key) {
+        insert_account_quota_reset_candidate(candidates, candidate)?;
+        points.push(incoming);
+    } else {
+        point_index.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate account quota point index: {error}"
+            ))
+        })?;
+        let mut candidates = Vec::new();
+        insert_account_quota_reset_candidate(&mut candidates, candidate)?;
+        points.push(incoming);
+        point_index.insert(key, candidates);
+    }
+    Ok(true)
+}
+
+fn source_bucket_record_index(
+    records: &[SourceBucketRecord],
+) -> io::Result<HashMap<DateTime<Utc>, usize>> {
+    let mut index = HashMap::new();
+    index.try_reserve(records.len()).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate source bucket record index: {error}"
+        ))
+    })?;
+    for (position, record) in records.iter().enumerate() {
+        if index.insert(record.starts_at, position).is_some() {
+            return Err(invalid_data(
+                "source bucket record set contains duplicate startsAt keys",
+            ));
+        }
+    }
+    Ok(index)
+}
+
 fn apply_source_bucket_record(
     records: &mut Vec<SourceBucketRecord>,
+    record_index: &mut HashMap<DateTime<Utc>, usize>,
     incoming: SourceBucketRecord,
 ) -> io::Result<bool> {
     incoming.validate()?;
-    let Some(index) = records
-        .iter()
-        .position(|record| record.starts_at == incoming.starts_at)
-    else {
+    let key = incoming.starts_at;
+    let Some(index) = record_index.get(&key).copied() else {
+        records.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate source bucket record buffer: {error}"
+            ))
+        })?;
+        record_index.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate source bucket record index: {error}"
+            ))
+        })?;
+        let index = records.len();
         records.push(incoming);
+        record_index.insert(key, index);
         return Ok(true);
     };
     let existing = &records[index];
@@ -1976,15 +2562,50 @@ fn apply_source_bucket_record(
     }
 }
 
+type SourceWeeklyRecordKey = (DateTime<Utc>, DateTime<Utc>);
+type SourceWeeklyRecordIndex = HashMap<SourceWeeklyRecordKey, usize>;
+
+fn source_weekly_record_index(
+    records: &[SourceWeeklyRecord],
+) -> io::Result<SourceWeeklyRecordIndex> {
+    let mut index = HashMap::new();
+    index.try_reserve(records.len()).map_err(|error| {
+        io::Error::other(format!(
+            "could not allocate source weekly record index: {error}"
+        ))
+    })?;
+    for (position, record) in records.iter().enumerate() {
+        let key = (record.observed_at, record.resets_at);
+        if index.insert(key, position).is_some() {
+            return Err(invalid_data(
+                "source weekly record set contains duplicate observation/reset keys",
+            ));
+        }
+    }
+    Ok(index)
+}
+
 fn apply_source_weekly_record(
     records: &mut Vec<SourceWeeklyRecord>,
+    record_index: &mut SourceWeeklyRecordIndex,
     incoming: SourceWeeklyRecord,
 ) -> io::Result<bool> {
     incoming.validate()?;
-    let Some(index) = records.iter().position(|record| {
-        record.observed_at == incoming.observed_at && record.resets_at == incoming.resets_at
-    }) else {
+    let key = (incoming.observed_at, incoming.resets_at);
+    let Some(index) = record_index.get(&key).copied() else {
+        records.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate source weekly record buffer: {error}"
+            ))
+        })?;
+        record_index.try_reserve(1).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate source weekly record index: {error}"
+            ))
+        })?;
+        let index = records.len();
         records.push(incoming);
+        record_index.insert(key, index);
         return Ok(true);
     };
     let existing = &records[index];
@@ -2461,7 +3082,27 @@ fn read_optional_json_file<T: for<'de> Deserialize<'de>>(
     }
 }
 
+fn read_optional_json_file_with_budget<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum: u64,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Option<T>> {
+    match read_json_file_inner(path, maximum, Some(budget)) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path, maximum: u64) -> io::Result<T> {
+    read_json_file_inner(path, maximum, None)
+}
+
+fn read_json_file_inner<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum: u64,
+    mut budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<T> {
     let path_metadata = fs::symlink_metadata(path)?;
     validate_data_file_metadata(path, &path_metadata)?;
     let mut options = OpenOptions::new();
@@ -2486,15 +3127,63 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path, maximum: u64) -> io
             path.display()
         )));
     }
-    let mut contents = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(maximum + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() as u64 > maximum {
-        return Err(invalid_data(format!(
-            "source history file {} is too large",
-            path.display()
-        )));
+    let (read_limit, query_budget_is_binding) = if let Some(budget) = budget.as_deref_mut() {
+        let (remaining, is_binding) = budget.shard_decoded_byte_allowance(maximum)?;
+        if metadata.len() > remaining {
+            return Err(history_query_budget_exceeded(format!(
+                "decoded-byte budget exhausted before reading {}",
+                path.display()
+            )));
+        }
+        (remaining, is_binding)
+    } else {
+        (maximum, false)
+    };
+    let mut contents = Vec::new();
+    if let Some(budget) = budget.as_mut() {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let next_size = (contents.len() as u64)
+                .checked_add(count as u64)
+                .ok_or_else(|| invalid_data("source history decoded size overflowed"))?;
+            if next_size > read_limit {
+                if query_budget_is_binding {
+                    return Err(history_query_budget_exceeded(format!(
+                        "decoded-byte budget exhausted while reading {}",
+                        path.display()
+                    )));
+                } else {
+                    return Err(invalid_data(format!(
+                        "source history file {} is too large",
+                        path.display()
+                    )));
+                }
+            }
+            budget.charge_decoded_bytes(count as u64)?;
+            contents.try_reserve(count).map_err(|error| {
+                io::Error::other(format!("could not allocate source history buffer: {error}"))
+            })?;
+            contents.extend_from_slice(&buffer[..count]);
+        }
+    } else {
+        let capacity = usize::try_from(metadata.len())
+            .map_err(|_| invalid_data("source history file size does not fit this platform"))?;
+        contents.try_reserve(capacity).map_err(|error| {
+            io::Error::other(format!("could not allocate source history buffer: {error}"))
+        })?;
+        Read::by_ref(&mut file)
+            .take(read_limit.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > read_limit {
+            return Err(invalid_data(format!(
+                "source history file {} is too large",
+                path.display()
+            )));
+        }
     }
     serde_json::from_slice(&contents).map_err(|error| {
         invalid_data(format!(
@@ -3334,6 +4023,23 @@ mod tests {
         }
     }
 
+    fn quota_point_with_identity(
+        observed_at: DateTime<Utc>,
+        limit_id: &str,
+        resets_at: DateTime<Utc>,
+        used_percent: f64,
+    ) -> QuotaPoint {
+        QuotaPoint {
+            observed_at,
+            limit_id: limit_id.to_string(),
+            duration_mins: 10_080,
+            resets_at,
+            used_percent,
+            remaining_percent: 100.0 - used_percent,
+            provenance: Provenance::ServerSnapshot,
+        }
+    }
+
     fn weekly_point(observed_at: DateTime<Utc>, total: u64) -> WeeklyLocalPoint {
         WeeklyLocalPoint {
             observed_at,
@@ -3914,6 +4620,172 @@ mod tests {
                 .weekly_local_points,
             vec![weekly_point(observed_at, 30)]
         );
+    }
+
+    #[test]
+    fn indexed_bucket_and_weekly_application_handle_large_unique_sets() {
+        let start = at(30, 0, 0);
+        let mut buckets = Vec::new();
+        let mut bucket_index = HashMap::new();
+        for offset in 0_u64..96 {
+            let starts_at = start + Duration::minutes(i64::try_from(offset * 15).unwrap());
+            assert!(
+                apply_source_bucket_record(
+                    &mut buckets,
+                    &mut bucket_index,
+                    upsert_record(1, bucket(starts_at, offset + 1)),
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(buckets.len(), 96);
+        assert_eq!(bucket_index.len(), buckets.len());
+
+        let mut weekly = Vec::new();
+        let mut weekly_index = HashMap::new();
+        for offset in 0_u64..10_000 {
+            let observed_at = start + Duration::seconds(i64::try_from(offset).unwrap());
+            assert!(
+                apply_source_weekly_record(
+                    &mut weekly,
+                    &mut weekly_index,
+                    SourceWeeklyRecord::upsert(1, weekly_point(observed_at, offset + 1)).unwrap(),
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(weekly.len(), 10_000);
+        assert_eq!(weekly_index.len(), weekly.len());
+
+        let replaced_at = start + Duration::seconds(5_000);
+        assert!(
+            apply_source_weekly_record(
+                &mut weekly,
+                &mut weekly_index,
+                SourceWeeklyRecord::upsert(2, weekly_point(replaced_at, 99_999)).unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(weekly.len(), 10_000);
+        assert_eq!(
+            weekly[*weekly_index
+                .get(&(replaced_at, replaced_at + Duration::days(3)))
+                .unwrap()]
+            .revision,
+            2
+        );
+    }
+
+    #[test]
+    fn indexed_account_quota_application_preserves_v1_first_match_and_moving_reset_semantics() {
+        let observed_at = at(30, 0, 0);
+        let reset = observed_at + Duration::days(7);
+        let sequence = [
+            quota_point_with_identity(observed_at, "Codex", reset, 10.0),
+            quota_point_with_identity(
+                observed_at + Duration::seconds(10),
+                "codex",
+                reset + Duration::minutes(4),
+                20.0,
+            ),
+            // This reset overlaps both candidates. The original vector
+            // contract replaces the first candidate, not the nearest one.
+            quota_point_with_identity(
+                observed_at + Duration::seconds(20),
+                "CODEX",
+                reset + Duration::minutes(2),
+                30.0,
+            ),
+            // The first candidate's reset moved above. A stale reset index
+            // would now replace the second candidate instead.
+            quota_point_with_identity(
+                observed_at + Duration::seconds(30),
+                "CoDeX",
+                reset + Duration::minutes(4),
+                40.0,
+            ),
+            quota_point_with_identity(
+                observed_at + Duration::seconds(5),
+                "codex",
+                reset + Duration::minutes(4),
+                50.0,
+            ),
+        ];
+        let mut reference = Vec::new();
+        let mut indexed = Vec::new();
+        let mut point_index = HashMap::new();
+        for point in sequence {
+            let reference_changed =
+                crate::history::upsert_quota_point(&mut reference, point.clone());
+            let indexed_changed =
+                apply_account_quota_point(&mut indexed, &mut point_index, point).unwrap();
+            assert_eq!(indexed_changed, reference_changed);
+            assert_eq!(indexed, reference);
+        }
+        assert_eq!(indexed.len(), 2);
+        assert_eq!(indexed[0].used_percent, 40.0);
+        assert_eq!(indexed[1].used_percent, 20.0);
+    }
+
+    #[test]
+    fn indexed_account_quota_application_handles_a_normal_thirty_day_sample_volume() {
+        let start = at(1, 0, 0);
+        let mut points = Vec::new();
+        let mut point_index = HashMap::new();
+        let limits = ["codex", "codex_bengalfox", "base_model_inference", "other"];
+        let five_minute_slots = 30_u64 * 24 * 12;
+        for slot in 0..five_minute_slots {
+            let observed_at =
+                start + Duration::minutes(i64::try_from(slot.saturating_mul(5)).unwrap());
+            for limit_id in limits {
+                assert!(
+                    apply_account_quota_point(
+                        &mut points,
+                        &mut point_index,
+                        quota_point_with_identity(
+                            observed_at,
+                            limit_id,
+                            observed_at + Duration::days(7),
+                            25.0,
+                        ),
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        let expected = usize::try_from(five_minute_slots).unwrap() * limits.len();
+        assert_eq!(points.len(), expected);
+        assert_eq!(point_index.len(), expected);
+    }
+
+    #[test]
+    fn account_quota_index_fails_closed_above_the_same_slot_candidate_bound() {
+        let observed_at = at(30, 0, 0);
+        let reset = observed_at + Duration::days(7);
+        let mut points = (0..MAX_ACCOUNT_QUOTA_CANDIDATES_PER_KEY)
+            .map(|offset| {
+                quota_point_with_identity(
+                    observed_at,
+                    "codex",
+                    reset + Duration::minutes(i64::try_from(offset * 3).unwrap()),
+                    25.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(account_quota_point_index(&points).is_ok());
+
+        points.push(quota_point_with_identity(
+            observed_at,
+            "CODEX",
+            reset
+                + Duration::minutes(
+                    i64::try_from(MAX_ACCOUNT_QUOTA_CANDIDATES_PER_KEY * 3).unwrap(),
+                ),
+            25.0,
+        ));
+        let error = account_quota_point_index(&points).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("per-slot candidate bound"));
     }
 
     #[test]
@@ -4563,6 +5435,102 @@ mod tests {
             store.list_source_metadata().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn included_source_query_budget_is_cumulative_across_sources_and_shards() {
+        let directory = tempdir().unwrap();
+        let store = store(directory.path());
+        let source_a: NodeId = SOURCE_A.parse().unwrap();
+        let source_b: NodeId = SOURCE_B.parse().unwrap();
+        store
+            .save_source_metadata(&metadata(SOURCE_A, "server a"))
+            .unwrap();
+        store
+            .save_source_metadata(&metadata(SOURCE_B, "server b"))
+            .unwrap();
+
+        let first = at(29, 12, 0);
+        let second = at(30, 12, 0);
+        store
+            .record_source_bucket_changes(
+                &source_a,
+                RedactionProfile::Redacted,
+                &[
+                    upsert_record(1, bucket(first, 10)),
+                    upsert_record(1, bucket(second, 20)),
+                ],
+            )
+            .unwrap();
+        store
+            .record_source_bucket_changes(
+                &source_b,
+                RedactionProfile::Redacted,
+                &[upsert_record(1, bucket(second, 30))],
+            )
+            .unwrap();
+
+        let shard_bytes = [(&source_a, first), (&source_a, second), (&source_b, second)]
+            .into_iter()
+            .map(|(source, timestamp)| {
+                fs::metadata(shard_path(
+                    &store.source_buckets_directory(source, RedactionProfile::Redacted),
+                    timestamp.date_naive(),
+                ))
+                .unwrap()
+                .len()
+            })
+            .sum::<u64>();
+        let since = first - Duration::minutes(1);
+
+        let mut exact = SourceHistoryReadBudget::with_limits(shard_bytes, 3, 2);
+        let loaded = store
+            .load_included_sources_since_with_budget(RedactionProfile::Redacted, since, &mut exact)
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|source| source.buckets.len())
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(exact.decoded_bytes_remaining, 0);
+        assert_eq!(exact.records_remaining, 0);
+        assert_eq!(exact.sources_remaining, 0);
+
+        let mut byte_short = SourceHistoryReadBudget::with_limits(shard_bytes - 1, 3, 2);
+        let error = store
+            .load_included_sources_since_with_budget(
+                RedactionProfile::Redacted,
+                since,
+                &mut byte_short,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("decoded-byte budget"));
+
+        let mut record_short = SourceHistoryReadBudget::with_limits(shard_bytes, 2, 2);
+        let error = store
+            .load_included_sources_since_with_budget(
+                RedactionProfile::Redacted,
+                since,
+                &mut record_short,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("record budget"));
+
+        let mut source_short = SourceHistoryReadBudget::with_limits(shard_bytes, 3, 1);
+        let error = store
+            .load_included_sources_since_with_budget(
+                RedactionProfile::Redacted,
+                since,
+                &mut source_short,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("source budget"));
     }
 
     #[test]

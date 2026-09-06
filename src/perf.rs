@@ -1,6 +1,8 @@
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
+#[cfg(any(test, target_os = "linux"))]
+use std::fs;
+#[cfg(test)]
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,6 +11,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
+
+use crate::diagnostic_log::{DIAGNOSTIC_LOG_MAX_BYTES, JsonlWriter};
 
 const PERF_LOG_SCHEMA_VERSION: u32 = 6;
 pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
@@ -167,7 +171,7 @@ struct PerfInner {
 }
 
 struct PerfState {
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Option<JsonlWriter>,
     last_sample_us: u64,
     latest_refresh: Option<RefreshMetrics>,
     log_error: Option<String>,
@@ -188,9 +192,17 @@ impl PerfLog {
     /// disable logging and remain observable through `log_error`; they never
     /// prevent the application from starting.
     pub fn enabled(path: &Path) -> Self {
-        let writer = open_writer(path);
+        let writer = JsonlWriter::open_private(path, "performance log", DIAGNOSTIC_LOG_MAX_BYTES);
         match writer {
-            Ok(writer) => Self::enabled_with_writer(writer),
+            Ok(writer) => Self::enabled_with_jsonl_writer(writer),
+            Err(error) => Self::disabled_with_error(error.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_with_limit(path: &Path, max_bytes: u64) -> Self {
+        match JsonlWriter::open_private(path, "performance log", max_bytes) {
+            Ok(writer) => Self::enabled_with_jsonl_writer(writer),
             Err(error) => Self::disabled_with_error(error.to_string()),
         }
     }
@@ -366,7 +378,12 @@ impl PerfLog {
             .filter(|inner| inner.active.load(Ordering::Acquire))
     }
 
-    fn enabled_with_writer(mut writer: Box<dyn Write + Send>) -> Self {
+    #[cfg(test)]
+    fn enabled_with_writer(writer: Box<dyn Write + Send>) -> Self {
+        Self::enabled_with_jsonl_writer(JsonlWriter::from_stream(writer))
+    }
+
+    fn enabled_with_jsonl_writer(mut writer: JsonlWriter) -> Self {
         let origin = Instant::now();
         let started_at = Utc::now();
         let start = json!({
@@ -379,8 +396,7 @@ impl PerfLog {
             "sampleIntervalSeconds": PERF_SAMPLE_INTERVAL.as_secs(),
         });
         let start_result = (|| -> std::io::Result<()> {
-            serde_json::to_writer(&mut *writer, &start).map_err(std::io::Error::other)?;
-            writer.write_all(b"\n")?;
+            writer.write_json_line(&start)?;
             writer.flush()
         })();
         match start_result {
@@ -521,31 +537,11 @@ impl PerfLog {
     }
 }
 
-fn open_writer(path: &Path) -> std::io::Result<Box<dyn Write + Send>> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    Ok(Box::new(BufWriter::new(options.open(path)?)))
-}
-
 fn write_json_line(state: &mut PerfState, value: &Value) -> bool {
     let Some(writer) = state.writer.as_mut() else {
         return false;
     };
-    let result = (|| -> std::io::Result<()> {
-        serde_json::to_writer(&mut **writer, value).map_err(std::io::Error::other)?;
-        writer.write_all(b"\n")
-    })();
+    let result = writer.write_json_line(value);
     if let Err(error) = result {
         state.log_error = Some(error.to_string());
         state.writer = None;
@@ -861,6 +857,98 @@ mod tests {
         assert_eq!(log.log_error().as_deref(), Some("simulated full disk"));
         log.record_draw(Duration::from_secs(1));
         log.finish();
+    }
+
+    #[test]
+    fn performance_log_rotates_at_the_limit_and_continues_writing() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("perf.jsonl");
+        let backup = temp.path().join("perf.jsonl.1");
+        let max_bytes = 4_096;
+        let log = PerfLog::enabled_with_limit(&path, max_bytes);
+        assert!(log.is_enabled(), "{:?}", log.log_error());
+
+        for index in 0..24 {
+            let mut metrics = RefreshMetrics::with_duration(Duration::from_millis(index));
+            metrics.calls = index;
+            log.record_refresh(metrics);
+        }
+        assert!(backup.is_file(), "performance log did not rotate");
+        let mut marker = RefreshMetrics::with_duration(Duration::from_secs(1));
+        marker.calls = 777_777;
+        log.record_refresh(marker);
+        log.sample_now();
+        log.finish();
+        assert_eq!(log.log_error(), None);
+
+        assert!(fs::metadata(&path).unwrap().len() <= max_bytes);
+        assert!(fs::metadata(&backup).unwrap().len() <= max_bytes);
+        let current = fs::read_to_string(&path).unwrap();
+        let previous = fs::read_to_string(&backup).unwrap();
+        assert!(format!("{previous}{current}").contains("777777"));
+        for contents in [current, previous] {
+            assert!(
+                contents
+                    .lines()
+                    .all(|line| serde_json::from_str::<Value>(line).is_ok()),
+                "rotation split a JSONL record: {contents:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn active_performance_log_cannot_be_replaced_by_a_second_logger() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("perf.jsonl");
+        let first = PerfLog::enabled(&path);
+        assert!(first.is_enabled());
+        let refused = PerfLog::enabled(&path);
+        assert!(!refused.is_enabled());
+        assert!(
+            refused
+                .log_error()
+                .is_some_and(|error| error.contains("already in use"))
+        );
+        first.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn performance_log_is_private_and_rejects_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("perf.jsonl");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let log = PerfLog::enabled(&path);
+        assert!(log.is_enabled());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        log.finish();
+
+        let target = temp.path().join("target.jsonl");
+        fs::write(&target, b"do not truncate").unwrap();
+        let link = temp.path().join("link.jsonl");
+        symlink(&target, &link).unwrap();
+        let refused = PerfLog::enabled(&link);
+        assert!(!refused.is_enabled());
+        assert_eq!(fs::read(target).unwrap(), b"do not truncate");
     }
 
     #[test]
