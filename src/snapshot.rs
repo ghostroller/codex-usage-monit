@@ -22,6 +22,8 @@ use crate::source_export::{LocalSessionDigestEvidence, materialize_local_session
 use crate::trace::{TraceFields, TraceOutcome};
 
 const RESET_CREDIT_DETAILS_CACHE_TTL_MINUTES: i64 = 5;
+const ACCOUNT_WINDOW_CHANGED_WARNING: &str =
+    "account window changed; local usage projection is pending refresh";
 
 #[derive(Clone, Debug)]
 pub struct CollectionResult {
@@ -354,6 +356,288 @@ pub fn collect_limits_snapshot(
         false,
     )
     .expect("a forced limits collection always returns a result")
+}
+
+/// Refreshes only network-backed account state while retaining the current
+/// local rollout projection.
+///
+/// Interactive callers use this after their deferred local bootstrap and for
+/// periodic account refreshes. In particular, this path must not discover or
+/// parse rollout files: an account RPC that happens to become due at the same
+/// time as a local refresh must not turn a cheap quota update into a second
+/// full rollout scan.
+pub(crate) fn collect_account_refresh_for_snapshot(
+    config: &CollectConfig,
+    cached_snapshot: Snapshot,
+    cached_account: AccountSnapshot,
+) -> CollectionResult {
+    let previous_account = cached_account.clone();
+    let mut refreshed = collect_limits_snapshot(config, Some(cached_account), true);
+
+    // A limits-only collection intentionally has no local calls. Do not stage
+    // the synthetic zero weekly point that the general snapshot constructor
+    // emits for that case; only the fresh server quota samples belong in
+    // history during an account-only refresh.
+    refreshed.history_observation.half_hour_buckets.clear();
+    refreshed.history_observation.weekly_local_points.clear();
+    refreshed.local_session_digests = LocalSessionDigestEvidence::empty(refreshed.snapshot.as_of);
+
+    refreshed.snapshot = merge_account_refresh_into_snapshot(
+        cached_snapshot,
+        &previous_account,
+        &refreshed.snapshot,
+    );
+    refreshed
+}
+
+pub(crate) fn account_window_projection_pending(snapshot: &Snapshot) -> bool {
+    snapshot
+        .warnings
+        .iter()
+        .any(|warning| warning == ACCOUNT_WINDOW_CHANGED_WARNING)
+}
+
+fn merge_account_refresh_into_snapshot(
+    mut snapshot: Snapshot,
+    previous_account: &AccountSnapshot,
+    refreshed: &Snapshot,
+) -> Snapshot {
+    snapshot.as_of = refreshed.as_of;
+    snapshot.api_pricing = refreshed.api_pricing.clone();
+    snapshot.limits = refreshed.limits.clone();
+    snapshot.rate_limit_reset_credits = refreshed.rate_limit_reset_credits.clone();
+    snapshot.rate_limit_reset_credits_partial = refreshed.rate_limit_reset_credits_partial;
+    snapshot.account_usage = refreshed.account_usage.clone();
+
+    replace_source_status(&mut snapshot.sources, &refreshed.sources, "app_server");
+
+    // CollectionResult historically flattens account diagnostics into the
+    // snapshot. Remove diagnostics contributed by the previous account sample
+    // before inserting the current ones, while preserving rollout diagnostics.
+    snapshot.warnings.retain(|warning| {
+        !previous_account.warnings.contains(warning)
+            && !account_projection_warning(warning.as_str())
+    });
+    snapshot
+        .errors
+        .retain(|error| !previous_account.errors.contains(error));
+    snapshot.warnings.extend(refreshed.warnings.iter().cloned());
+    snapshot.errors.extend(refreshed.errors.iter().cloned());
+    snapshot.warnings.sort();
+    snapshot.warnings.dedup();
+    snapshot.errors.sort();
+    snapshot.errors.dedup();
+
+    let account_window_changed = reproject_cached_windows(&mut snapshot);
+    if account_window_changed {
+        snapshot
+            .warnings
+            .push(ACCOUNT_WINDOW_CHANGED_WARNING.to_string());
+        snapshot.warnings.sort();
+        snapshot.warnings.dedup();
+    }
+    snapshot.partial = account_window_changed || snapshot_requires_partial_status(&snapshot);
+    snapshot
+}
+
+fn account_projection_warning(warning: &str) -> bool {
+    warning.contains("cached account quota bucket")
+        || warning.starts_with("ignored cached reset-credit data")
+        || warning.starts_with("rollout quota snapshots disagree")
+        || warning == ACCOUNT_WINDOW_CHANGED_WARNING
+}
+
+fn replace_source_status(sources: &mut Vec<SourceStatus>, refreshed: &[SourceStatus], name: &str) {
+    let replacement = refreshed
+        .iter()
+        .find(|source| source.source == name)
+        .cloned();
+    if let Some(index) = sources.iter().position(|source| source.source == name) {
+        if let Some(replacement) = replacement {
+            sources[index] = replacement;
+        } else {
+            sources.remove(index);
+        }
+    } else if let Some(replacement) = replacement {
+        sources.push(replacement);
+    }
+}
+
+fn reproject_cached_windows(snapshot: &mut Snapshot) -> bool {
+    let mut account_window_changed = false;
+    snapshot.window_analyses.retain_mut(|analysis| {
+        let Some(previous_window) = analysis.attribution.window.as_ref() else {
+            return true;
+        };
+        let replacement = snapshot.limits.iter().find_map(|bucket| {
+            if !bucket
+                .limit_id
+                .trim()
+                .eq_ignore_ascii_case(previous_window.limit_id.trim())
+            {
+                return None;
+            }
+            [bucket.primary.as_ref(), bucket.secondary.as_ref()]
+                .into_iter()
+                .flatten()
+                .find(|window| window.window_duration_mins == Some(analysis.duration_mins))
+                .map(|window| (bucket.provenance, window.clone()))
+        });
+        let Some((provenance, replacement)) = replacement else {
+            mark_account_reprojection_pending(analysis);
+            return true;
+        };
+        let Some(resets_at) = replacement.resets_at else {
+            mark_account_reprojection_pending(analysis);
+            return true;
+        };
+        let starts_at = resets_at - Duration::minutes(analysis.duration_mins);
+        if starts_at != previous_window.starts_at || resets_at != previous_window.ends_at {
+            // Aggregated calls cannot be clipped safely without the cached
+            // rollout event set. Never attach the previous cycle's token/API
+            // totals to a fresh server window; temporarily omit this analysis
+            // and let the TUI schedule one forced in-memory materialization.
+            account_window_changed = true;
+            return false;
+        }
+        reproject_cached_window_usage(
+            analysis,
+            replacement.used_percent.clamp(0.0, 100.0),
+            provenance,
+        );
+        true
+    });
+
+    let (models, attribution) = project_five_hour_analysis(
+        &mut snapshot.tasks,
+        &mut snapshot.turns,
+        &snapshot.window_analyses,
+    );
+    snapshot.models = models;
+    snapshot.attribution = attribution;
+    snapshot.api_equivalent_cost = snapshot
+        .window_analyses
+        .iter()
+        .find(|analysis| analysis.duration_mins == 300)
+        .map(|analysis| analysis.api_equivalent_cost.clone());
+    account_window_changed
+}
+
+fn reproject_cached_window_usage(
+    analysis: &mut WindowAnalysis,
+    refreshed_used_percent: f64,
+    provenance: Provenance,
+) {
+    let previous_used_percent = analysis
+        .attribution
+        .window
+        .as_ref()
+        .map_or(0.0, |window| window.used_percent);
+    let rescale = |estimated: f64, token_share: f64| {
+        if previous_used_percent > f64::EPSILON {
+            estimated / previous_used_percent * refreshed_used_percent
+        } else if refreshed_used_percent <= f64::EPSILON {
+            0.0
+        } else {
+            // The previous zero gauge erased the credit-rate-weighted share.
+            // Token share is a transparent lower-quality fallback until the
+            // next local materialization reconstructs the exact estimator.
+            token_share * refreshed_used_percent / 100.0
+        }
+    };
+
+    for thread in &mut analysis.threads {
+        thread.usage.estimated_quota_percent = rescale(
+            thread.usage.estimated_quota_percent,
+            thread.usage.local_token_share_percent,
+        );
+    }
+    for turn in &mut analysis.turns {
+        turn.usage.estimated_quota_percent = rescale(
+            turn.usage.estimated_quota_percent,
+            turn.usage.local_token_share_percent,
+        );
+    }
+    for model in &mut analysis.models {
+        model.estimated_quota_percent = rescale(
+            model.estimated_quota_percent,
+            model.local_token_share_percent,
+        );
+    }
+    if let Some(window) = analysis.attribution.window.as_mut() {
+        window.used_percent = refreshed_used_percent;
+    }
+    analysis.attribution.proxy_projected_percent =
+        if analysis.attribution.local_token_usage.is_zero() {
+            0.0
+        } else {
+            refreshed_used_percent
+        };
+    analysis.attribution.unattributed_percent = refreshed_used_percent;
+    analysis.partial_reasons.retain(|reason| {
+        reason != "quota_window_stale"
+            && reason != "account_window_changed_pending_local_refresh"
+            && reason != "account_refresh_token_share_fallback"
+    });
+    if matches!(provenance, Provenance::Stale | Provenance::Unknown) {
+        analysis
+            .partial_reasons
+            .push("quota_window_stale".to_string());
+    }
+    if previous_used_percent <= f64::EPSILON
+        && refreshed_used_percent > f64::EPSILON
+        && !analysis.attribution.local_token_usage.is_zero()
+        && !analysis
+            .partial_reasons
+            .iter()
+            .any(|reason| reason == "account_refresh_token_share_fallback")
+    {
+        analysis
+            .partial_reasons
+            .push("account_refresh_token_share_fallback".to_string());
+    }
+    analysis.partial = !analysis.partial_reasons.is_empty();
+
+    if let Some(long_context) = analysis.api_long_context.as_mut() {
+        reproject_cached_window_usage(long_context, refreshed_used_percent, provenance);
+    }
+}
+
+fn mark_account_reprojection_pending(analysis: &mut WindowAnalysis) {
+    if !analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == "account_window_changed_pending_local_refresh")
+    {
+        analysis
+            .partial_reasons
+            .push("account_window_changed_pending_local_refresh".to_string());
+    }
+    analysis.partial = true;
+    if let Some(long_context) = analysis.api_long_context.as_mut() {
+        mark_account_reprojection_pending(long_context);
+    }
+}
+
+fn snapshot_requires_partial_status(snapshot: &Snapshot) -> bool {
+    !snapshot.errors.is_empty()
+        || snapshot.limits.is_empty()
+        || snapshot
+            .limits
+            .iter()
+            .any(|bucket| matches!(bucket.provenance, Provenance::Stale | Provenance::Unknown))
+        || snapshot.stats.skipped_lines > 0
+        || snapshot.stats.truncated_files > 0
+        || snapshot.stats.unreadable_files > 0
+        || snapshot.stats.ambiguous_token_resets > 0
+        || snapshot
+            .window_analyses
+            .iter()
+            .any(|analysis| analysis.partial)
+        || snapshot
+            .sources
+            .iter()
+            .any(|source| matches!(source.status.as_str(), "error" | "partial" | "stale"))
 }
 
 fn collect_snapshot_with_local(
@@ -1216,6 +1500,131 @@ mod tests {
             bucket.starts_at >= result.snapshot.as_of - Duration::minutes(15),
             "an empty directory must not manufacture zero buckets for the configured lookback"
         );
+    }
+
+    #[test]
+    fn account_only_refresh_preserves_local_projection_and_stages_no_local_zeroes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let mut cache = RolloutCache::new();
+        let mut local = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
+        local.stats.parsed_lines = 42;
+        local.warnings.push("local rollout warning".to_string());
+        let now = Utc::now();
+        let account = AccountSnapshot {
+            limits: vec![weekly_limit(
+                now - Duration::seconds(1),
+                now + Duration::days(2),
+                "codex",
+                25.0,
+            )],
+            ..AccountSnapshot::default()
+        };
+
+        let refreshed = collect_account_refresh_for_snapshot(&config, local, account);
+
+        assert_eq!(refreshed.snapshot.stats.parsed_lines, 42);
+        assert!(
+            refreshed
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning == "local rollout warning")
+        );
+        assert!(
+            refreshed
+                .snapshot
+                .sources
+                .iter()
+                .any(|source| source.source == "rollout_jsonl")
+        );
+        assert_eq!(refreshed.snapshot.limits.len(), 1);
+        assert!(!refreshed.history_observation.quota_points.is_empty());
+        assert!(refreshed.history_observation.half_hour_buckets.is_empty());
+        assert!(refreshed.history_observation.weekly_local_points.is_empty());
+        assert_eq!(refreshed.local_session_digests.digest_count(), 0);
+    }
+
+    #[test]
+    fn account_only_refresh_rescales_cached_window_without_losing_local_usage() {
+        let now = Utc::now();
+        let reset = now + Duration::days(2);
+        let old_limit = weekly_limit(now, reset, "codex", 20.0);
+        let calls = vec![usage_call(
+            now - Duration::minutes(1),
+            "thread",
+            "turn",
+            "gpt-5.6-sol",
+            100,
+        )];
+        let mut analyses = analyze_windows(&[], &[], &calls, &[], &[old_limit], now);
+        let analysis = analyses
+            .iter_mut()
+            .find(|analysis| analysis.duration_mins == 10_080)
+            .unwrap();
+        assert_close(analysis.threads[0].usage.estimated_quota_percent, 20.0);
+
+        reproject_cached_window_usage(analysis, 35.0, Provenance::ServerSnapshot);
+
+        assert_eq!(analysis.threads[0].usage.token_usage.total_tokens, 100);
+        assert_close(analysis.threads[0].usage.estimated_quota_percent, 35.0);
+        assert_close(
+            analysis.attribution.window.as_ref().unwrap().used_percent,
+            35.0,
+        );
+        assert!(
+            !analysis
+                .partial_reasons
+                .iter()
+                .any(|reason| reason == "quota_window_stale")
+        );
+    }
+
+    #[test]
+    fn account_only_refresh_never_attaches_old_usage_to_a_changed_window() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let now = Utc::now();
+        let old_reset = now + Duration::days(2);
+        let old_limit = weekly_limit(now, old_reset, "codex", 20.0);
+        let calls = vec![usage_call(
+            now - Duration::minutes(1),
+            "thread",
+            "turn",
+            "gpt-5.6-sol",
+            100,
+        )];
+        let mut cache = RolloutCache::new();
+        let mut local = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
+        local.window_analyses = analyze_windows(&[], &[], &calls, &[], &[old_limit], now);
+        assert_eq!(local.window_analyses.len(), 1);
+
+        let account = AccountSnapshot {
+            limits: vec![weekly_limit(
+                now,
+                old_reset + Duration::minutes(1),
+                "codex",
+                1.0,
+            )],
+            ..AccountSnapshot::default()
+        };
+        let refreshed = collect_account_refresh_for_snapshot(&config, local, account);
+
+        assert!(account_window_projection_pending(&refreshed.snapshot));
+        assert!(refreshed.snapshot.partial);
+        assert!(refreshed.snapshot.window_analyses.is_empty());
+        assert!(refreshed.snapshot.models.is_empty());
+        assert!(refreshed.snapshot.api_equivalent_cost.is_none());
     }
 
     #[test]

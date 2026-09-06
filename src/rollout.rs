@@ -23,12 +23,16 @@ use crate::domain::{
     UsageCall,
 };
 use crate::session_index::load_thread_titles;
+use crate::startup_progress::{StartupLoadProgressTracker, StartupLoadStage};
 use crate::trace::{TraceFields, TraceOutcome};
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 3;
 // Bump when the projected event schema or replay semantics change.
 const ROLLOUT_PARSER_REVISION: u32 = 13;
+// Keep the historical flat namespace as a read-only migration source. The
+// active cache lives below a format/parser generation so an incompatible old
+// entry can neither shadow a current entry nor consume the current budget.
 const ROLLOUT_CACHE_DIRECTORY: &str = "rollouts-v1";
 const MAX_PERSISTENT_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTENT_PREFIX_HASH_BYTES: u64 = 8 * 1024 * 1024;
@@ -614,6 +618,7 @@ pub struct RolloutCache {
     local_coverage_started_at: Option<DateTime<Utc>>,
     local_coverage_last_complete_at: Option<DateTime<Utc>>,
     materialization_pending: bool,
+    startup_progress: Option<StartupLoadProgressTracker>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,14 +670,22 @@ struct PersistentFileEntryRef<'a> {
     cached: &'a CachedFile,
 }
 
+#[derive(Clone, Copy)]
+enum PersistentEntryLocation {
+    Current,
+    Legacy,
+}
+
 enum PersistentLoad {
     Exact {
         cached: Box<CachedFile>,
         bounded_guards: bool,
+        needs_migration: bool,
     },
     AppendPrefix {
         cached: Box<CachedFile>,
         bounded_guards: bool,
+        needs_migration: bool,
     },
     Miss,
     Corrupt,
@@ -940,6 +953,10 @@ impl RolloutCache {
         self.metrics
     }
 
+    pub(crate) fn set_startup_progress(&mut self, progress: StartupLoadProgressTracker) {
+        self.startup_progress = Some(progress);
+    }
+
     /// Advances the in-process lower bound for continuous, complete local
     /// rollout observation. A single complete scan proves coverage only from
     /// the time this cache began observing; it cannot prove that older missing
@@ -1120,6 +1137,16 @@ impl RolloutCache {
         coalesce_materialization: bool,
         next_external_boundary: Option<DateTime<Utc>>,
     ) -> Result<Option<RolloutDataset>> {
+        if self
+            .startup_progress
+            .as_ref()
+            .is_some_and(|progress| progress.snapshot().stage == StartupLoadStage::Complete)
+        {
+            self.startup_progress = None;
+        }
+        if let Some(progress) = &self.startup_progress {
+            progress.begin();
+        }
         let operation_trace = config.trace_log.span_with("rollout.scan", || {
             TraceFields::new()
                 .bool("forceMaterialize", force_materialize)
@@ -1203,6 +1230,13 @@ impl RolloutCache {
             .fold((0_u64, 0_u64), |(total, largest), bytes| {
                 (total.saturating_add(bytes), largest.max(bytes))
             });
+        if let Some(progress) = &self.startup_progress {
+            progress.set_rollout_totals(
+                StartupLoadStage::LoadingRolloutCache,
+                files.len(),
+                selected_bytes,
+            );
+        }
         refresh.discover_us = elapsed_micros(discovery_started);
         discovery_span.finish_with(|| format!(
             "full={} cache_hit={} invalidated={} probed_files={} probed_dirs={} discovered={} selected={} truncated={} bytes={selected_bytes} largest_bytes={largest_file_bytes}",
@@ -1279,9 +1313,21 @@ impl RolloutCache {
             .trace_log
             .span_with("rollout.cache_load", TraceFields::new);
         let mut disk_tail_candidates = HashMap::new();
+        let mut cache_progress_files = 0_usize;
+        let mut cache_progress_bytes = 0_u64;
         if let Some(cache_root) = config.rollout_cache_dir.as_deref() {
             for file in &files {
                 if self.files.contains_key(&file.path) {
+                    cache_progress_files = cache_progress_files.saturating_add(1);
+                    cache_progress_bytes =
+                        cache_progress_bytes.saturating_add(file.fingerprint.len);
+                    if let Some(progress) = &self.startup_progress {
+                        progress.processed_files(
+                            StartupLoadStage::LoadingRolloutCache,
+                            cache_progress_files,
+                            cache_progress_bytes,
+                        );
+                    }
                     continue;
                 }
                 match load_persistent_file(
@@ -1295,8 +1341,12 @@ impl RolloutCache {
                     PersistentLoad::Exact {
                         cached,
                         bounded_guards,
+                        needs_migration,
                     } => {
                         self.files.insert(file.path.clone(), *cached);
+                        if needs_migration {
+                            self.dirty_files.insert(file.path.clone());
+                        }
                         refresh.disk_reused_files += 1;
                         refresh.disk_exact_reused_files += 1;
                         if bounded_guards {
@@ -1306,14 +1356,33 @@ impl RolloutCache {
                     PersistentLoad::AppendPrefix {
                         cached,
                         bounded_guards,
+                        needs_migration,
                     } => {
                         self.files.insert(file.path.clone(), *cached);
+                        if needs_migration {
+                            self.dirty_files.insert(file.path.clone());
+                        }
                         disk_tail_candidates.insert(file.path.clone(), bounded_guards);
                     }
                     PersistentLoad::Miss => refresh.disk_misses += 1,
                     PersistentLoad::Corrupt => refresh.disk_corrupt_files += 1,
                 }
+                cache_progress_files = cache_progress_files.saturating_add(1);
+                cache_progress_bytes = cache_progress_bytes.saturating_add(file.fingerprint.len);
+                if let Some(progress) = &self.startup_progress {
+                    progress.processed_files(
+                        StartupLoadStage::LoadingRolloutCache,
+                        cache_progress_files,
+                        cache_progress_bytes,
+                    );
+                }
             }
+        } else if let Some(progress) = &self.startup_progress {
+            progress.processed_files(
+                StartupLoadStage::LoadingRolloutCache,
+                files.len(),
+                selected_bytes,
+            );
         }
         refresh.cache_load_us = elapsed_micros(cache_load_started);
         cache_load_span.finish_with(|| {
@@ -1348,12 +1417,25 @@ impl RolloutCache {
         let mut slowest_file_bytes = 0_u64;
         let mut changed_thread_ids = HashSet::new();
         let mut changed_paths = HashSet::new();
+        let mut progress_files = 0_usize;
+        let mut progress_bytes = 0_u64;
+        if let Some(progress) = &self.startup_progress {
+            progress.set_stage(StartupLoadStage::ParsingRollouts);
+        }
         for file in &files {
+            if let Some(progress) = &self.startup_progress {
+                progress.parsing_file(progress_files, progress_bytes, file.fingerprint.len);
+            }
             let reusable = self.files.get(&file.path).is_some_and(|cached| {
                 cached.fingerprint == file.fingerprint && cached.parsed.complete
             });
             if reusable {
                 refresh.reused_files += 1;
+                progress_files = progress_files.saturating_add(1);
+                progress_bytes = progress_bytes.saturating_add(file.fingerprint.len);
+                if let Some(progress) = &self.startup_progress {
+                    progress.parsed_file(progress_files, progress_bytes);
+                }
                 continue;
             }
 
@@ -1417,6 +1499,11 @@ impl RolloutCache {
             }
             refresh.reparsed_files += 1;
             refresh.stability_retries += parsed.stability_retries;
+            progress_files = progress_files.saturating_add(1);
+            progress_bytes = progress_bytes.saturating_add(file.fingerprint.len);
+            if let Some(progress) = &self.startup_progress {
+                progress.parsed_file(progress_files, progress_bytes);
+            }
         }
         refresh.parse_us = elapsed_micros(parse_started);
         let (parsed_lines, cached_events, foreign_baseline_events) = files
@@ -1478,6 +1565,9 @@ impl RolloutCache {
         );
 
         let cache_save_started = perf_active.then(Instant::now);
+        if let Some(progress) = &self.startup_progress {
+            progress.set_stage(StartupLoadStage::SavingRolloutCache);
+        }
         let cache_save_span = config.startup_trace.span("rollout.cache_save");
         let cache_save_trace = config
             .trace_log
@@ -1620,6 +1710,9 @@ impl RolloutCache {
             || replay_plan_changed;
 
         let reduce_started = perf_active.then(Instant::now);
+        if let Some(progress) = &self.startup_progress {
+            progress.set_stage(StartupLoadStage::ReducingRollouts);
+        }
         let reduce_span = config.startup_trace.span("rollout.reduce");
         let reduce_trace = config.trace_log.span_with("rollout.reduce", || {
             TraceFields::new().bool("required", must_rebuild)
@@ -1764,6 +1857,9 @@ impl RolloutCache {
         }
 
         let materialize_started = perf_active.then(Instant::now);
+        if let Some(progress) = &self.startup_progress {
+            progress.set_stage(StartupLoadStage::MaterializingSnapshot);
+        }
         let materialize_span = config.startup_trace.span("rollout.materialize");
         let materialize_trace = config
             .trace_log
@@ -2015,6 +2111,7 @@ impl RolloutCache {
                 continue;
             }
             budget.commit(old_bytes, contents.len() as u64);
+            remove_legacy_persistent_entry(cache_root, key, &path);
             summary.written += 1;
             self.disk_last_write.insert(path, Instant::now());
         }
@@ -2138,14 +2235,54 @@ fn load_persistent_file(
     tail_guard_bytes: &mut u64,
 ) -> PersistentLoad {
     let entry_path = persistent_entry_path(cache_root, key, &file.path);
-    let contents = match read_persistent_entry_bounded(&entry_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return PersistentLoad::Miss,
+    let (contents, location) = match read_persistent_entry_bounded(&entry_path) {
+        Ok(contents) => (contents, PersistentEntryLocation::Current),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let legacy_path = legacy_persistent_entry_path(cache_root, key, &file.path);
+            match read_persistent_entry_bounded(&legacy_path) {
+                Ok(contents) => (contents, PersistentEntryLocation::Legacy),
+                // The flat namespace belongs to older releases. Missing,
+                // malformed, insecure, and incompatible legacy entries are
+                // all ordinary misses for the active generation, not active
+                // cache corruption.
+                Err(_) => return PersistentLoad::Miss,
+            }
+        }
         Err(_) => return PersistentLoad::Corrupt,
     };
-    let entry: PersistentFileEntry = match serde_json::from_slice(&contents) {
+
+    load_persistent_file_contents(
+        &contents,
+        location,
+        key,
+        file,
+        hash_bytes,
+        large_guard_bytes,
+        tail_guard_bytes,
+    )
+}
+
+fn load_persistent_file_contents(
+    contents: &[u8],
+    location: PersistentEntryLocation,
+    key: &CacheKey,
+    file: &RolloutFile,
+    hash_bytes: &mut u64,
+    large_guard_bytes: &mut u64,
+    tail_guard_bytes: &mut u64,
+) -> PersistentLoad {
+    // Decode exactly once on the hot path. The location already tells us how
+    // to classify schema failures: an active-generation decode failure is
+    // corruption, while any unreadable flat legacy entry is a compatibility
+    // miss that must be reparsed from its rollout source.
+    let entry: PersistentFileEntry = match serde_json::from_slice(contents) {
         Ok(entry) => entry,
-        Err(_) => return PersistentLoad::Corrupt,
+        Err(_) => {
+            return match location {
+                PersistentEntryLocation::Current => PersistentLoad::Corrupt,
+                PersistentEntryLocation::Legacy => PersistentLoad::Miss,
+            };
+        }
     };
     if entry.format_version != ROLLOUT_CACHE_FORMAT_VERSION
         || entry.parser_revision != ROLLOUT_PARSER_REVISION
@@ -2181,6 +2318,7 @@ fn load_persistent_file(
             PersistentLoad::Exact {
                 cached: Box::new(entry.cached),
                 bounded_guards,
+                needs_migration: matches!(location, PersistentEntryLocation::Legacy),
             }
         } else {
             PersistentLoad::Miss
@@ -2218,6 +2356,7 @@ fn load_persistent_file(
         PersistentLoad::AppendPrefix {
             cached: Box::new(entry.cached),
             bounded_guards,
+            needs_migration: matches!(location, PersistentEntryLocation::Legacy),
         }
     } else {
         PersistentLoad::Miss
@@ -2709,7 +2848,36 @@ fn persistent_entry_path(cache_root: &Path, key: &CacheKey, source_path: &Path) 
 fn persistent_namespace_path(cache_root: &Path, key: &CacheKey) -> PathBuf {
     cache_root
         .join(ROLLOUT_CACHE_DIRECTORY)
+        .join(persistent_cache_generation())
         .join(cache_namespace(key))
+}
+
+fn legacy_persistent_entry_path(cache_root: &Path, key: &CacheKey, source_path: &Path) -> PathBuf {
+    legacy_persistent_namespace_path(cache_root, key)
+        .join(format!("{:016x}.json", stable_path_hash(source_path)))
+}
+
+fn legacy_persistent_namespace_path(cache_root: &Path, key: &CacheKey) -> PathBuf {
+    cache_root
+        .join(ROLLOUT_CACHE_DIRECTORY)
+        .join(cache_namespace(key))
+}
+
+fn remove_legacy_persistent_entry(cache_root: &Path, key: &CacheKey, source_path: &Path) {
+    let path = legacy_persistent_entry_path(cache_root, key, source_path);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if validate_private_cache_directory(parent).is_err()
+        || !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return;
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn persistent_cache_generation() -> String {
+    format!("format-{ROLLOUT_CACHE_FORMAT_VERSION}-parser-{ROLLOUT_PARSER_REVISION}")
 }
 
 fn cache_namespace(key: &CacheKey) -> String {

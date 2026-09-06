@@ -873,6 +873,116 @@ fn persistent_exact_hit_uses_the_metadata_only_fast_path() {
 }
 
 #[test]
+fn compatible_flat_cache_entry_is_reused_and_migrated_to_the_current_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let source = sessions.join("rollout-legacy-compatible.jsonl");
+    let now = Utc::now();
+    fs::write(
+        &source,
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"legacy-compatible\"}}}}\n",
+            now.to_rfc3339()
+        ),
+    )
+    .unwrap();
+    let discovered = inspect_rollout_file(&source).unwrap();
+    let cache_root = temp.path().join("cache");
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        rollout_cache_dir: Some(cache_root.clone()),
+        ..CollectConfig::default()
+    };
+    let key = CacheKey {
+        codex_home: config.codex_home.clone(),
+        redact_content: false,
+    };
+    let (cached, _) = parse_stable_rollout_file(&discovered, &config);
+    let mut hash_bytes = 0;
+    let mut large_guard_bytes = 0;
+    let contents = serialize_persistent_entry(
+        &key,
+        &source,
+        &cached,
+        MAX_PERSISTENT_ENTRY_BYTES,
+        &mut hash_bytes,
+        &mut large_guard_bytes,
+    )
+    .unwrap();
+    let legacy_entry = legacy_persistent_entry_path(&cache_root, &key, &source);
+    let current_entry = persistent_entry_path(&cache_root, &key, &source);
+    write_private_atomically(&legacy_entry, &contents).unwrap();
+    assert!(!current_entry.exists());
+
+    let mut migrated = RolloutCache::new();
+    let dataset = migrated.scan(&config, now).unwrap();
+
+    assert_eq!(dataset.tasks[0].thread_id, "legacy-compatible");
+    assert_eq!(migrated.last_refresh().disk_exact_reused_files, 1);
+    assert_eq!(migrated.last_refresh().reparsed_files, 0);
+    assert_eq!(migrated.last_refresh().disk_written_files, 1);
+    assert!(current_entry.exists());
+    assert!(!legacy_entry.exists());
+
+    let mut reopened = RolloutCache::new();
+    reopened.scan(&config, now).unwrap();
+    assert_eq!(reopened.last_refresh().disk_exact_reused_files, 1);
+    assert_eq!(reopened.last_refresh().disk_written_files, 0);
+}
+
+#[test]
+fn incompatible_flat_cache_entry_is_a_miss_and_is_outside_the_current_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let source = sessions.join("rollout-legacy-incompatible.jsonl");
+    let now = Utc::now();
+    fs::write(
+        &source,
+        format!(
+            "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"legacy-incompatible\"}}}}\n",
+            now.to_rfc3339()
+        ),
+    )
+    .unwrap();
+    let cache_root = temp.path().join("cache");
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        rollout_cache_dir: Some(cache_root.clone()),
+        ..CollectConfig::default()
+    };
+    let key = CacheKey {
+        codex_home: config.codex_home.clone(),
+        redact_content: false,
+    };
+    let legacy_entry = legacy_persistent_entry_path(&cache_root, &key, &source);
+    write_private_atomically(
+        &legacy_entry,
+        br#"{"formatVersion":1,"parserRevision":2,"cached":{}}"#,
+    )
+    .unwrap();
+
+    let before = prune_persistent_files(&config, &key, None);
+    assert_eq!(before.usage.entries, 0);
+    assert_eq!(before.usage.bytes, 0);
+    assert!(legacy_entry.exists());
+
+    let mut cache = RolloutCache::new();
+    let dataset = cache.scan(&config, now).unwrap();
+
+    assert_eq!(dataset.tasks[0].thread_id, "legacy-incompatible");
+    assert_eq!(cache.last_refresh().disk_misses, 1);
+    assert_eq!(cache.last_refresh().disk_corrupt_files, 0);
+    assert_eq!(cache.last_refresh().reparsed_files, 1);
+    assert_eq!(cache.last_refresh().disk_written_files, 1);
+    let after = prune_persistent_files(&config, &key, None);
+    assert_eq!(after.usage.entries, 1);
+    assert!(after.usage.bytes > 0);
+    assert!(!legacy_entry.exists());
+}
+
+#[test]
 fn persistent_prefix_hash_refuses_io_above_the_limit() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("rollout.jsonl");

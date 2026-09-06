@@ -130,7 +130,8 @@ use crate::session_launch::{
     render_resume_command,
 };
 use crate::snapshot::{
-    CollectionResult, collect_snapshot_cached, collect_snapshot_cached_if_changed_coalesced,
+    CollectionResult, account_window_projection_pending, collect_account_refresh_for_snapshot,
+    collect_snapshot_cached, collect_snapshot_cached_if_changed_coalesced,
 };
 use crate::source_export::LocalSessionDigestEvidence;
 use crate::source_history::{
@@ -139,6 +140,7 @@ use crate::source_history::{
 };
 use crate::source_identity::NodeId;
 use crate::source_model::{LogicalProjectId, ProjectDisplayLabel, ProjectInstanceId};
+use crate::startup_progress::{StartupLoadProgress, StartupLoadProgressTracker, StartupLoadStage};
 #[cfg(test)]
 use crate::summary::SummaryWindow;
 use crate::summary::{
@@ -178,6 +180,7 @@ const ACCOUNT_REFRESH_RETRY_DELAYS: [Duration; 2] =
 const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_VIEW_DAYS: i64 = 8;
 const BACKGROUND_CHANNEL_POLL: Duration = Duration::from_millis(100);
+const STARTUP_PROGRESS_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const MOUSE_SCROLL_LINES: usize = 3;
 const PAGE_SCROLL_LINES: usize = 5;
 const OPEN_NOTICE_DURATION: Duration = Duration::from_secs(8);
@@ -2994,6 +2997,7 @@ impl RedrawReasons {
     const RESUME: u8 = 1 << 2;
     const NOTICE: u8 = 1 << 3;
     const RESIZE: u8 = 1 << 4;
+    const PROGRESS: u8 = 1 << 5;
 
     fn insert(&mut self, reason: u8) {
         self.0 |= reason;
@@ -3008,13 +3012,14 @@ impl RedrawReasons {
     }
 
     fn label(self) -> String {
-        let mut labels = Vec::with_capacity(5);
+        let mut labels = Vec::with_capacity(6);
         for (reason, label) in [
             (Self::INPUT, "input"),
             (Self::SNAPSHOT, "snapshot"),
             (Self::RESUME, "resume"),
             (Self::NOTICE, "notice"),
             (Self::RESIZE, "resize"),
+            (Self::PROGRESS, "progress"),
         ] {
             if self.0 & reason != 0 {
                 labels.push(label);
@@ -3267,6 +3272,9 @@ struct App {
     /// the terminal has already rendered.
     initial_bootstrap_pending: bool,
     worker_running: bool,
+    startup_progress_tracker: Option<StartupLoadProgressTracker>,
+    startup_progress: StartupLoadProgress,
+    startup_progress_last_redraw: Instant,
     last_local_refresh: Instant,
     next_account_refresh: Instant,
     account_refresh_retry_count: usize,
@@ -3397,6 +3405,9 @@ impl App {
             turn_reveal_pending: false,
             initial_bootstrap_pending: false,
             worker_running: false,
+            startup_progress_tracker: None,
+            startup_progress: StartupLoadProgress::default(),
+            startup_progress_last_redraw: Instant::now(),
             last_local_refresh: Instant::now(),
             next_account_refresh: Instant::now(),
             account_refresh_retry_count: 0,
@@ -3405,6 +3416,38 @@ impl App {
 
     fn account_refresh_due(&self, now: Instant) -> bool {
         now >= self.next_account_refresh
+    }
+
+    fn attach_startup_progress(&mut self, tracker: StartupLoadProgressTracker) {
+        self.startup_progress = tracker.snapshot();
+        self.startup_progress_tracker = Some(tracker);
+        self.startup_progress_last_redraw = Instant::now();
+    }
+
+    fn poll_startup_progress(&mut self, now: Instant) -> bool {
+        let Some(tracker) = self.startup_progress_tracker.as_ref() else {
+            return false;
+        };
+        let latest = tracker.snapshot();
+        if latest.revision == self.startup_progress.revision {
+            return false;
+        }
+        let stage_changed = latest.stage != self.startup_progress.stage;
+        if !stage_changed
+            && latest.active
+            && now.saturating_duration_since(self.startup_progress_last_redraw)
+                < STARTUP_PROGRESS_REDRAW_INTERVAL
+        {
+            return false;
+        }
+        self.startup_progress = latest;
+        self.startup_progress_last_redraw = now;
+        true
+    }
+
+    fn startup_progress_label(&self, compact: bool) -> Option<String> {
+        initial_collection_loading(&self.snapshot)
+            .then(|| format_startup_progress(self.startup_progress, compact))
     }
 
     fn reset_credit_fetch_status(&self, now: Instant) -> Option<&'static str> {
@@ -5866,6 +5909,8 @@ impl App {
     }
 
     fn replace(&mut self, mut result: CollectionResult, refreshed_account: bool) {
+        let completing_initial_load = initial_collection_loading(&self.snapshot);
+        let force_local_materialization = account_window_projection_pending(&result.snapshot);
         self.local_snapshot_partial = result.snapshot.partial;
         self.local_snapshot = result.snapshot.clone();
         self.trusted_remote_parent_edges = merge_remote_live_into_snapshot(
@@ -5929,8 +5974,17 @@ impl App {
         self.scroll_drag = None;
         self.resume_confirmation_hitbox = None;
         self.restore_overview_refresh_anchor(anchor);
+        if completing_initial_load && let Some(tracker) = self.startup_progress_tracker.take() {
+            tracker.finish();
+            self.startup_progress = tracker.snapshot();
+        }
         self.worker_running = false;
-        self.last_local_refresh = Instant::now();
+        let now = Instant::now();
+        self.last_local_refresh = if force_local_materialization {
+            now.checked_sub(LOCAL_REFRESH).unwrap_or(now)
+        } else {
+            now
+        };
     }
 
     fn replace_remote_live_states(&mut self, states: Vec<SourceRemoteLiveSnapshot>) -> bool {
@@ -8354,7 +8408,10 @@ fn prepare_deferred_initial_tui(
         }
     ));
     let cache_span = config.startup_trace.span("tui.cache_create");
-    let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
+    let startup_progress = StartupLoadProgressTracker::default();
+    let mut cache = RolloutCache::new();
+    cache.set_startup_progress(startup_progress.clone());
+    let rollout_cache = Arc::new(Mutex::new(cache));
     cache_span.finish(if config.rollout_cache_dir.is_some() {
         "kind=persistent"
     } else {
@@ -8380,6 +8437,7 @@ fn prepare_deferred_initial_tui(
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial_loading_result(config), initial_theme);
+    app.attach_startup_progress(startup_progress);
     app.history_local_source_id = local_source_id;
     app.history_remote_sources = remote_history_sources;
     app.remote_source_history_store = remote_source_history_store;
@@ -9071,6 +9129,7 @@ pub fn debug_startup(
     let data_ready_span = trace.span("tui.initial_data_ready");
     let history_source_generation = app.history_source_generation;
     let history_source_selection = app.history_source_selection.clone();
+    let startup_progress = app.startup_progress_tracker.clone();
     app.initial_bootstrap_pending = false;
     app.worker_running = true;
     let completion = collect_initial_refresh_completion(
@@ -9079,6 +9138,7 @@ pub fn debug_startup(
         &history_store,
         history_source_generation,
         &history_source_selection,
+        startup_progress.as_ref(),
     );
     let refreshed = apply_refresh_completion(&mut app, completion);
     let ready_draw_span = trace.span("tui.data_ready_frame");
@@ -9167,6 +9227,9 @@ fn run_loop(
         }
         if app.expire_open_notice_at(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::NOTICE);
+        }
+        if app.poll_startup_progress(Instant::now()) {
+            redraw_reasons.insert(RedrawReasons::PROGRESS);
         }
 
         if first_frame {
@@ -9288,6 +9351,7 @@ fn collect_initial_refresh_completion(
     history_store: &Arc<Mutex<TuiHistoryStore>>,
     history_source_generation: u64,
     history_source_selection: &HistorySourceSelection,
+    startup_progress: Option<&StartupLoadProgressTracker>,
 ) -> RefreshCompletion {
     let operation_trace = config.trace_log.span_with("tui.initial_data_ready", || {
         TraceFields::new().bool("offline", config.offline).label(
@@ -9326,6 +9390,9 @@ fn collect_initial_refresh_completion(
     });
 
     let history_observation = collection_history_observation(&result, config.offline);
+    if let Some(progress) = startup_progress {
+        progress.set_stage(StartupLoadStage::LoadingHistory);
+    }
     let history_span = config.startup_trace.span("tui.initial_history");
     let (projection, recorder_health, remote_live, remote_overview_history) = {
         let mut history_store = history_store
@@ -9407,6 +9474,44 @@ fn collect_initial_refresh_completion(
     }
 }
 
+fn initial_refresh_panic_completion(config: &CollectConfig) -> RefreshCompletion {
+    let now = Utc::now();
+    let mut result = initial_loading_result(config);
+    result.snapshot.as_of = now;
+    result.snapshot.errors.push(
+        "initial local usage collection panicked; the background scan will retry".to_string(),
+    );
+    for source in &mut result.snapshot.sources {
+        source.as_of = now;
+        match source.source.as_str() {
+            "rollout_jsonl" => {
+                source.status = "error".to_string();
+                source.message = Some("initial local usage collection failed".to_string());
+            }
+            "app_server" if !config.offline => {
+                source.status = "stale".to_string();
+                source.message = Some("no cached account snapshot".to_string());
+            }
+            _ => {}
+        }
+    }
+    let trace = config
+        .trace_log
+        .span_with("tui.initial_worker", TraceFields::new);
+    trace.finish_with(TraceOutcome::Error, || {
+        TraceFields::new().label("reason", "panic")
+    });
+    RefreshCompletion {
+        result: Some(result),
+        remote_live: None,
+        remote_overview_history: None,
+        history: None,
+        recorder_health: None,
+        refreshed_account: false,
+        summary_backfill: false,
+    }
+}
+
 fn start_refresh_if_due(
     app: &mut App,
     config: &CollectConfig,
@@ -9426,16 +9531,21 @@ fn start_refresh_if_due(
         let worker_history = Arc::clone(history_store);
         let history_source_generation = app.history_source_generation;
         let history_source_selection = app.history_source_selection.clone();
+        let startup_progress = app.startup_progress_tracker.clone();
         app.initial_bootstrap_pending = false;
         app.worker_running = true;
         refresh_worker.start(thread::spawn(move || {
-            let completion = collect_initial_refresh_completion(
-                &worker_config,
-                &worker_cache,
-                &worker_history,
-                history_source_generation,
-                &history_source_selection,
-            );
+            let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                collect_initial_refresh_completion(
+                    &worker_config,
+                    &worker_cache,
+                    &worker_history,
+                    history_source_generation,
+                    &history_source_selection,
+                    startup_progress.as_ref(),
+                )
+            }))
+            .unwrap_or_else(|_| initial_refresh_panic_completion(&worker_config));
             let _ = worker_sender.send(completion);
         }));
         return true;
@@ -9577,6 +9687,8 @@ fn start_refresh_if_due(
 
     let worker_config = config.clone();
     let cached_account = app.account.clone();
+    let cached_local_snapshot = app.local_snapshot.clone();
+    let force_local_materialization = account_window_projection_pending(&app.local_snapshot);
     let worker_sender = context.refresh_sender.clone();
     let worker_cache = Arc::clone(rollout_cache);
     let worker_history = Arc::clone(history_store);
@@ -9584,15 +9696,44 @@ fn start_refresh_if_due(
     let history_source_selection = app.history_source_selection.clone();
     app.worker_running = true;
     refresh_worker.start(thread::spawn(move || {
-        let result = {
+        let result = if account_refresh_due {
+            let trace = worker_config
+                .trace_log
+                .span_with("tui.account_refresh", || {
+                    TraceFields::new()
+                        .bool("reuseLocalSnapshot", true)
+                        .usize("cachedTasks", cached_local_snapshot.tasks.len())
+                        .usize("cachedTurns", cached_local_snapshot.turns.len())
+                });
+            let refreshed = collect_account_refresh_for_snapshot(
+                &worker_config,
+                cached_local_snapshot,
+                cached_account,
+            );
+            trace.finish_with(
+                if account_refresh_is_complete(&refreshed) {
+                    TraceOutcome::Ok
+                } else {
+                    TraceOutcome::Partial
+                },
+                || {
+                    TraceFields::new()
+                        .usize("limits", refreshed.snapshot.limits.len())
+                        .usize("tasks", refreshed.snapshot.tasks.len())
+                        .usize("turns", refreshed.snapshot.turns.len())
+                        .bool("rolloutScan", false)
+                },
+            );
+            Some(refreshed)
+        } else {
             let mut cache = worker_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if account_refresh_due {
+            if force_local_materialization {
                 Some(collect_snapshot_cached(
                     &worker_config,
                     Some(cached_account),
-                    true,
+                    false,
                     &mut cache,
                 ))
             } else {
@@ -11674,7 +11815,14 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .constraints(constraints)
         .split(area);
     let mut row_index = 0;
-    render_limits(frame, rows[row_index], &app.snapshot, app.theme);
+    let startup_progress_label = app.startup_progress_label(false);
+    render_limits(
+        frame,
+        rows[row_index],
+        &app.snapshot,
+        app.theme,
+        startup_progress_label.as_deref(),
+    );
     row_index += 1;
     let task_area = rows[row_index];
     row_index += 1;
@@ -16345,6 +16493,84 @@ fn initial_collection_loading(snapshot: &Snapshot) -> bool {
         .any(|source| source.status == "loading")
 }
 
+fn format_startup_progress(progress: StartupLoadProgress, compact: bool) -> String {
+    let file_progress = || {
+        format!(
+            "{}/{} · {}/{}",
+            progress.completed_files,
+            progress.total_files,
+            format_remote_bandwidth_bytes(progress.completed_bytes),
+            format_remote_bandwidth_bytes(progress.total_bytes)
+        )
+    };
+    match progress.stage {
+        StartupLoadStage::DiscoveringRollouts => {
+            if compact {
+                "discovering rollouts...".to_string()
+            } else {
+                "Discovering rollout files...".to_string()
+            }
+        }
+        StartupLoadStage::LoadingRolloutCache if progress.total_files > 0 => {
+            if compact {
+                format!("cache {}", file_progress())
+            } else {
+                format!("Checking rollout cache · {}", file_progress())
+            }
+        }
+        StartupLoadStage::LoadingRolloutCache => "Checking rollout cache...".to_string(),
+        StartupLoadStage::ParsingRollouts if progress.total_files > 0 => {
+            if compact {
+                format!("parse {}", file_progress())
+            } else if progress.current_file_bytes > 0 {
+                format!(
+                    "Parsing rollouts · {} · current {}",
+                    file_progress(),
+                    format_remote_bandwidth_bytes(progress.current_file_bytes)
+                )
+            } else {
+                format!("Parsing rollouts · {}", file_progress())
+            }
+        }
+        StartupLoadStage::ParsingRollouts => "Parsing rollouts...".to_string(),
+        StartupLoadStage::SavingRolloutCache => {
+            if compact {
+                "saving cache...".to_string()
+            } else {
+                "Saving rollout cache...".to_string()
+            }
+        }
+        StartupLoadStage::ReducingRollouts => {
+            if compact {
+                "building usage...".to_string()
+            } else {
+                "Building usage summary...".to_string()
+            }
+        }
+        StartupLoadStage::MaterializingSnapshot => {
+            if compact {
+                "finalizing usage...".to_string()
+            } else {
+                "Finalizing usage snapshot...".to_string()
+            }
+        }
+        StartupLoadStage::LoadingHistory => {
+            if compact {
+                "loading history...".to_string()
+            } else {
+                "Loading usage history...".to_string()
+            }
+        }
+        StartupLoadStage::Idle | StartupLoadStage::Complete => {
+            if compact {
+                "loading usage...".to_string()
+            } else {
+                "Loading quota and usage...".to_string()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppServerFailureNoticeKind {
     Timeout,
@@ -17042,7 +17268,13 @@ fn render_resets(
     );
 }
 
-fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: Theme) {
+fn render_limits(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &Snapshot,
+    theme: Theme,
+    startup_progress_label: Option<&str>,
+) {
     let palette = theme.palette();
     let reset_reminder = reset_expiry_reminder(snapshot);
     let mut reset_reminder_rendered = false;
@@ -17050,10 +17282,11 @@ fn render_limits(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, theme: 
 
     if windows.is_empty() {
         let message = if initial_collection_loading(snapshot) {
-            "Loading quota and usage..."
+            startup_progress_label.unwrap_or("Loading quota and usage...")
         } else {
             "Quota unavailable"
         };
+        let message = truncate_display_text(message, area.width.saturating_sub(2) as usize);
         frame.render_widget(
             Paragraph::new(message)
                 .alignment(Alignment::Center)
@@ -17886,12 +18119,12 @@ fn task_panel_block(
                 )
             })
             .unwrap_or_else(|| {
-                let label = if initial_collection_loading(&app.snapshot) {
-                    "loading usage..."
+                let label = if let Some(label) = app.startup_progress_label(true) {
+                    label
                 } else if app.snapshot.tasks.is_empty() {
-                    "no tasks"
+                    "no tasks".to_string()
                 } else {
-                    "no matches"
+                    "no matches".to_string()
                 };
                 format!(" 0/{} · {label} ", app.snapshot.tasks.len())
             });

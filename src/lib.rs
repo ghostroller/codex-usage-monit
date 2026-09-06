@@ -52,6 +52,7 @@ pub mod source_history;
 pub mod source_identity;
 pub mod source_model;
 pub mod startup;
+mod startup_progress;
 pub mod summary;
 pub mod summary_report;
 pub mod trace;

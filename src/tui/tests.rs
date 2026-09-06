@@ -1053,7 +1053,8 @@ fn redraw_reasons_are_coalesced_for_one_logged_frame() {
     reasons.insert(RedrawReasons::INPUT);
     reasons.insert(RedrawReasons::SNAPSHOT);
     reasons.insert(RedrawReasons::NOTICE);
-    assert_eq!(reasons.label(), "input+snapshot+notice");
+    reasons.insert(RedrawReasons::PROGRESS);
+    assert_eq!(reasons.label(), "input+snapshot+notice+progress");
 
     reasons.clear();
     assert!(reasons.is_empty());
@@ -1169,6 +1170,67 @@ fn initial_tui_placeholder_is_renderable_without_rollout_or_history_data() {
 }
 
 #[test]
+fn initial_tui_placeholder_reports_bounded_rollout_progress() {
+    let config = CollectConfig {
+        codex_home: PathBuf::from("/tmp/codex-home"),
+        offline: false,
+        ..CollectConfig::default()
+    };
+    let tracker = StartupLoadProgressTracker::default();
+    let mut app = App::new(initial_loading_result(&config), Theme::Dark);
+    app.initial_bootstrap_pending = true;
+    app.history_source_loading = true;
+    app.attach_startup_progress(tracker.clone());
+    tracker.begin();
+    tracker.set_rollout_totals(StartupLoadStage::ParsingRollouts, 2, 3 * 1024);
+    tracker.parsed_file(1, 1024);
+    assert!(app.poll_startup_progress(Instant::now()));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Parsing rollouts"));
+    assert!(content.contains("1/2"));
+    assert!(content.contains("1.0 KiB/3.0 KiB"));
+}
+
+#[test]
+fn initial_worker_panic_completion_clears_loading_and_finishes_progress() {
+    let config = CollectConfig {
+        codex_home: PathBuf::from("/tmp/codex-home"),
+        offline: false,
+        ..CollectConfig::default()
+    };
+    let tracker = StartupLoadProgressTracker::default();
+    tracker.begin();
+    let mut app = App::new(initial_loading_result(&config), Theme::Dark);
+    app.attach_startup_progress(tracker.clone());
+    app.initial_bootstrap_pending = false;
+    app.worker_running = true;
+
+    assert!(apply_refresh_completion(
+        &mut app,
+        initial_refresh_panic_completion(&config)
+    ));
+
+    assert!(!app.worker_running);
+    assert!(!initial_collection_loading(&app.snapshot));
+    assert!(
+        app.snapshot
+            .errors
+            .iter()
+            .any(|error| error.contains("background scan will retry"))
+    );
+    assert_eq!(tracker.snapshot().stage, StartupLoadStage::Complete);
+}
+
+#[test]
 fn headless_initial_refresh_uses_the_deferred_data_ready_path() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
@@ -1197,6 +1259,7 @@ fn headless_initial_refresh_uses_the_deferred_data_ready_path() {
         &history_store,
         app.history_source_generation,
         &app.history_source_selection,
+        None,
     );
     assert!(completion.result.is_some());
     assert!(completion.history.is_some());
@@ -1247,6 +1310,7 @@ fn online_initial_data_ready_defers_account_rpc_and_keeps_refresh_due() {
         &history_store,
         app.history_source_generation,
         &app.history_source_selection,
+        None,
     );
     assert!(completion.result.is_some());
     assert!(!completion.refreshed_account);
@@ -3633,7 +3697,7 @@ fn overview_orders_codex_quota_windows_before_other_buckets() {
     let height = 5;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
-        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme, None))
         .unwrap();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -3682,7 +3746,7 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
             let quota_height = overview_quota_height(&app.snapshot, width, 3);
             let mut terminal = Terminal::new(TestBackend::new(width, quota_height)).unwrap();
             terminal
-                .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme))
+                .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme, None))
                 .unwrap();
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
@@ -3756,7 +3820,7 @@ fn weekly_gauge_renders_exact_reset_expiry_reminder() {
     }];
     let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
     terminal
-        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme, None))
         .unwrap();
     let content = terminal
         .backend()
@@ -3796,7 +3860,7 @@ fn quota_labels_invert_inside_the_filled_gauge_including_reset_credit_warning() 
         let height = overview_quota_height(&app.snapshot, width, 3);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme))
+            .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, theme, None))
             .unwrap();
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -3905,7 +3969,7 @@ fn reset_expiry_reminder_only_marks_the_matching_codex_weekly_gauge() {
     let width = 120;
     let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
     terminal
-        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme))
+        .draw(|frame| render_limits(frame, frame.area(), &app.snapshot, app.theme, None))
         .unwrap();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
