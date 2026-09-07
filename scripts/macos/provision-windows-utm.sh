@@ -98,7 +98,8 @@ done
 [[ -n "$iso_path" ]] || fail "--iso is required. Download the ARM64 ISO to the external volume first."
 [[ -f "$iso_path" ]] || fail "Windows installer ISO does not exist: $iso_path"
 [[ -x "/Applications/UTM.app/Contents/MacOS/UTM" ]] || fail "UTM.app was not found in /Applications."
-[[ -n "$vm_name" ]] || fail "--vm-name must not be empty."
+[[ -n "$vm_name" && "$vm_name" != "." && "$vm_name" != ".." && "$vm_name" != *[/$'\n'$'\r']* ]] || fail "--vm-name must be a single nonempty directory name."
+[[ "$vm_name" != *\\* ]] || fail "--vm-name must not contain path separators."
 
 require_positive_integer "$memory_mib" "--memory-mib"
 require_positive_integer "$cpu_cores" "--cpu-cores"
@@ -107,9 +108,13 @@ require_positive_integer "$disk_mib" "--disk-mib"
 storage_root="${storage_root:A}"
 iso_path="${iso_path:A}"
 [[ "$storage_root" == /Volumes/* ]] || fail "--storage-root must be on a mounted external volume under /Volumes."
+volume_name="${${storage_root#/Volumes/}%%/*}"
+volume_root="/Volumes/$volume_name"
+[[ -d "$volume_root" ]] || fail "external volume is not mounted: $volume_root"
+[[ "$(/usr/bin/stat -f %d "$volume_root")" != "$(/usr/bin/stat -f %d /)" ]] || fail "--storage-root is on the system volume, not a mounted external volume."
 
 bundle_path="$storage_root/utm/$vm_name.utm"
-[[ ! -e "$bundle_path" ]] || fail "refusing to overwrite an existing VM bundle: $bundle_path"
+[[ ! -e "$bundle_path" ]] || fail "refusing to overwrite existing VM $bundle_path; use: utmctl start '$vm_name'"
 
 mkdir -p "$storage_root/utm" "$storage_root/logs"
 
@@ -119,7 +124,12 @@ fi
 if [[ ! -f "$guest_tools_iso" && "$guest_tools_explicit" == false ]]; then
     mkdir -p "$storage_root/iso"
     print "Downloading the official UTM Windows Guest Tools ISO to $guest_tools_iso"
-    curl --fail --location --retry 3 --output "$guest_tools_iso" https://getutm.app/downloads/utm-guest-tools-latest.iso
+    download_temporary="$(mktemp "$storage_root/iso/.guest-tools.XXXXXXXX")"
+    trap '[[ -z "${download_temporary:-}" ]] || rm -f -- "$download_temporary"' EXIT
+    curl --fail --location --retry 3 --connect-timeout 20 --max-time 900 --output "$download_temporary" https://getutm.app/downloads/utm-guest-tools-latest.iso
+    [[ -s "$download_temporary" ]] || fail "UTM Guest Tools download was empty."
+    mv -- "$download_temporary" "$guest_tools_iso"
+    download_temporary=""
 fi
 [[ -f "$guest_tools_iso" ]] || fail "UTM Windows Guest Tools ISO does not exist: $guest_tools_iso"
 guest_tools_iso="${guest_tools_iso:A}"
@@ -209,5 +219,5 @@ print "External UTM VM created: $bundle_path"
 if [[ "$start_after_provision" == true ]]; then
     print "UTM has started $vm_name. Complete Windows Setup in the VM window."
 else
-    print "UTM has registered $vm_name. Re-run with --start when ready to begin Windows Setup."
+    print "UTM has registered $vm_name. Start the existing VM with: utmctl start '$vm_name'"
 fi

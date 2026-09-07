@@ -63,7 +63,7 @@ done
 [[ -f "$iso_path" ]] || fail "Windows installer ISO does not exist: $iso_path"
 [[ -f "$guest_tools_iso" ]] || fail "UTM Windows Guest Tools ISO does not exist: $guest_tools_iso"
 [[ -x "/Applications/UTM.app/Contents/MacOS/UTM" ]] || fail "UTM.app was not found in /Applications."
-[[ -n "$vm_name" ]] || fail "--vm-name must not be empty."
+[[ -n "$vm_name" && "$vm_name" != *[$'\n'$'\r']* ]] || fail "--vm-name must not be empty or contain line breaks."
 
 iso_path="${iso_path:A}"
 guest_tools_iso="${guest_tools_iso:A}"

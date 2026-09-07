@@ -20,6 +20,8 @@ param(
 
     [string]$CargoTargetDir,
 
+    [string]$CargoBuildDir,
+
     [switch]$SkipBuildTools,
 
     [switch]$SkipRustup,
@@ -51,6 +53,9 @@ function Invoke-WingetInstall {
         [string[]]$AdditionalArguments = @()
     )
 
+    if ($null -eq (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "Installing $PackageId requires winget. Install Microsoft App Installer, then retry."
+    }
     Write-Host "==> Install $PackageId"
     & winget install `
         --id $PackageId `
@@ -150,10 +155,6 @@ if ($env:OS -ne "Windows_NT") {
     throw "This bootstrap script must run on Windows."
 }
 
-if ($null -eq (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw "winget was not found. Install Microsoft App Installer, then run this script again."
-}
-
 $repositoryRoot = (Resolve-Path -LiteralPath $RepositoryPath).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -PathType Leaf)) {
     throw "RepositoryPath does not contain Cargo.toml: $repositoryRoot"
@@ -163,6 +164,10 @@ if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
     $CargoTargetDir = Join-Path $localAppData "codex-usage-monit\cargo-target"
 }
 
+# Repeated bootstrap runs must discover tools installed by an earlier process
+# before deciding an installer is needed.
+Add-PathDirectory (Join-Path $env:ProgramFiles "Git\cmd")
+Add-PathDirectory (Join-Path $env:USERPROFILE ".cargo\bin")
 if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
     Invoke-WingetInstall "Git.Git"
 }
@@ -205,5 +210,5 @@ Assert-NativeSuccess "Install Rust toolchain"
 
 if (-not $SkipVerification) {
     $verifyScript = Join-Path $PSScriptRoot "verify.ps1"
-    & $verifyScript -RepositoryPath $repositoryRoot -CargoTargetDir $CargoTargetDir
+    & $verifyScript -RepositoryPath $repositoryRoot -CargoTargetDir $CargoTargetDir -CargoBuildDir $CargoBuildDir
 }

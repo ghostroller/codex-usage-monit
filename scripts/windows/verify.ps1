@@ -8,9 +8,9 @@ native Windows development machine.  It deliberately uses Cargo's locked
 dependency graph, verifies formatting and linting, runs all test targets, and
 then exercises the real executable against the deterministic offline fixture.
 
-When testing a repository exposed through a VM shared folder, pass
--CargoTargetDir with a guest-local directory. That keeps Windows artifacts and
-file locks out of the host checkout.
+Cargo target and intermediate build directories default to guest-local storage,
+including when the checkout comes from a VM shared folder. Explicit overrides
+must also use local fixed drives.
 #>
 
 [CmdletBinding()]
@@ -23,6 +23,8 @@ param(
     [string]$Target,
 
     [string]$CargoTargetDir,
+
+    [string]$CargoBuildDir,
 
     [string]$TestFilter,
 
@@ -297,10 +299,30 @@ $repositoryRoot = (Resolve-Path -LiteralPath $RepositoryPath).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -PathType Leaf)) {
     throw "RepositoryPath does not contain Cargo.toml: $repositoryRoot"
 }
-$originalCargoTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DIR", "Process")
-if (-not [string]::IsNullOrWhiteSpace($CargoTargetDir)) {
-    $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($CargoTargetDir)
+# Both directories must be guest-local. A shared checkout can contain a host's
+# ignored .cargo/config.toml build-dir even when CARGO_TARGET_DIR is overridden.
+$localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
+    $CargoTargetDir = Join-Path $localAppData "codex-usage-monit\cargo-target"
 }
+if ([string]::IsNullOrWhiteSpace($CargoBuildDir)) {
+    $CargoBuildDir = Join-Path $localAppData "codex-usage-monit\cargo-build"
+}
+foreach ($directory in @($CargoTargetDir, $CargoBuildDir)) {
+    $fullPath = [System.IO.Path]::GetFullPath($directory)
+    if ($fullPath -notmatch "^[A-Za-z]:\\") {
+        throw "Cargo directories must be on a guest-local fixed drive: $directory"
+    }
+    $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($fullPath))
+    if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) {
+        throw "Cargo directories must be on a guest-local fixed drive: $directory"
+    }
+    New-Item -ItemType Directory -Path $fullPath -Force | Out-Null
+}
+$originalCargoTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DIR", "Process")
+$originalCargoBuildDir = [Environment]::GetEnvironmentVariable("CARGO_BUILD_BUILD_DIR", "Process")
+$env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($CargoTargetDir)
+$env:CARGO_BUILD_BUILD_DIR = [System.IO.Path]::GetFullPath($CargoBuildDir)
 
 Push-Location $repositoryRoot
 try {
@@ -310,6 +332,8 @@ try {
     Assert-NativeSuccess "Read Rust host target"
     $hostTriple = ($rustcVersion | Where-Object { $_ -like "host: *" } | Select-Object -First 1) -replace "^host:\s*", ""
     Write-Host "Windows Rust host: $hostTriple"
+    Write-Host "Cargo target directory: $env:CARGO_TARGET_DIR"
+    Write-Host "Cargo build directory: $env:CARGO_BUILD_BUILD_DIR"
     if (-not [string]::IsNullOrWhiteSpace($Target)) {
         Write-Host "Requested Rust target: $Target"
     }
@@ -367,6 +391,12 @@ try {
 }
 finally {
     Pop-Location
+    if ($null -eq $originalCargoBuildDir) {
+        Remove-Item -Path "Env:CARGO_BUILD_BUILD_DIR" -ErrorAction SilentlyContinue
+    }
+    else {
+        Set-Item -Path "Env:CARGO_BUILD_BUILD_DIR" -Value $originalCargoBuildDir
+    }
     if ($null -eq $originalCargoTargetDir) {
         Remove-Item -Path "Env:CARGO_TARGET_DIR" -ErrorAction SilentlyContinue
     }
