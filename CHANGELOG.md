@@ -4,8 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## [0.4.0] - 2026-09-08
+
 ### Added
 
+- Added opt-in SSH usage aggregation with an explicit per-host allowlist, node/generation pairing, manual readiness checks and synchronization, and independent global/per-host switches for recorder-driven automatic collection.
+- Added source-aware history, bounded aggregate and session-fact synchronization, replica deduplication backed by digest/event evidence, read-only remote Overview rows, and All/Local/Node selection in Summary and Trends. Account quotas remain global and are not summed across machines.
+- Added TUI remote-source management, explicit project merge/split mappings, retained-source include/exclude/purge controls, and per-host health, stale, fact-attention and process-pause diagnostics.
+- Added recoverable remote cursors, live replacements and fact publication, per-source rolling bandwidth budgets, fair scheduling and retry backoff. Remote content previews remain redacted by default.
+- Added local Docker Linux and UTM Windows verification runners with isolated source snapshots and recorded results, plus real SSH loopback coverage for bootstrap, incremental sync, replica facts, source selection and offline retention.
 - Added GPT-6 Astra to the bundled Codex credit and API-equivalent pricing tables, including Standard/Fast and short/long-context rates.
 - Added an optional startup-loaded `model-catalog.json` so model IDs, aliases, Codex credit weights, API prices, long-context behavior, and pricing metadata can be updated without recompiling. A complete example catalog is included in `docs/model-catalog.example.json`.
 - Added history-backed `summary` and `trends` one-shot commands that use the same derived reports as the TUI, including Summary range/grain/metric selection, project/session/turn hierarchy and coverage, and Trends quota, weekly, and 15-minute series/readouts.
@@ -14,6 +21,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Hosted integration CI now runs on explicit manual checkpoints; version tags retain full release verification and weekly dependency auditing remains enabled. Local platform tests are the normal development path.
 - Prefer a validated external model catalog when present and fall back to the bundled catalog only when the file is absent. Invalid, oversized, non-regular, or unsafe catalog files fail rate-dependent commands explicitly instead of silently changing pricing semantics.
 - Shared Summary and Trends query derivation between CLI and TUI, including reset-cycle boundaries, partial/coverage semantics, local-wall-clock Summary buckets, and the namespace-scoped automatic 31-day backfill for incomplete `summary --range 30d` history.
 - Defined one-shot report exit semantics as `0` for complete, `2` for usable partial, and `1` when no requested data is usable; unified health reports use `0` or `2` during normal reporting.
@@ -21,8 +29,19 @@ All notable changes to this project are documented in this file.
 - Preserved the current Summary/Trends observation in memory when history persistence is unavailable, and limited `valueIsLowerBound` to selected values with omitted non-negative contributions instead of treating every partial diagnostic or clipped chart edge as a lower bound.
 - Hardened report-path handling for non-Unicode paths and output aliases, including actual macOS volume case semantics, Unicode-aware comparisons, and Windows 128-bit file identities.
 
+### Fixed
+
+- Recovered validated session-digest bindings on unchanged fact deltas, and stopped scheduling replica facts for sources excluded from aggregate queries.
+- Kept independent fact failures and persistent SSH cleanup pauses visible after aggregate success, during bandwidth pauses, and across host re-pairing.
+- Reclaimed SSH primary processes that leave their original Unix process group, accepted explicitly cache-free remote exporters, and allowed fresh history initialization on systems proven to have neither systemd nor an old recorder definition.
+- Improved redaction mismatch recovery guidance so users can preserve default remote privacy instead of being directed only toward enabling previews.
+- Bounded external service/terminal commands, preserved interrupted local history observations for replay, hardened recorder retries and quota projection, and updated dependencies to resolve audited advisories.
+
 ### Compatibility
 
+- Both SSH endpoints need compatible v0.4 protocol/data revisions and effective model catalogs. No remote is imported, paired or enabled automatically during upgrade.
+- History v1→v2 migration is one-way. Stop old collectors and replace/reinstall recorder services before cutover; existing legacy service definitions remain a migration blocker. Back up state before upgrading or attempting a rollback.
+- Center and remote history profiles must agree on content redaction. With the default redacted remote configuration, use `--redact-content` consistently for the center's sync, TUI, reports and recorder. See [SSH usage and upgrade instructions](docs/remote-usage.md).
 - Bumped the bundled estimator/API pricing revisions to 6/3 and remote protocol to v3. Remote negotiation and persisted remote projections now bind to the normalized model-catalog fingerprint so different mappings cannot be combined under matching numeric revisions.
 
 ## [0.3.1] - 2026-08-29
@@ -233,7 +252,8 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.8...v0.2.9

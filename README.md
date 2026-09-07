@@ -27,7 +27,7 @@ _Deterministically rendered from the integration-test fixture. Local and hosted 
 - **API-equivalent model cost** — Value locally observed model tokens at current API rates with exact fixed-point math, long-context ranges, and explicit priced coverage; non-model tool charges are excluded.
 - **Usage trends** — Record server remaining quota, weekly local tokens, low-confidence weekly estimates, and 15-minute token/estimate buckets in local state.
 - **Project usage summary** — Rank projects for the current cycle, last 7 days, or last 30 days; expand a compact project/session/user-turn tree and compare token, estimated credit-rate, or API-equivalent usage with ranked bars and a project-colored stacked-area chart from 1-day down to 1-hour buckets. Usage from an exactly linked subagent subtree is folded into the user turn that spawned it.
-- **Opt-in multi-machine history** — The v0.4 work in progress lets one central machine pull normalized usage deltas from individually allowlisted SSH hosts, retain source identity, and merge only explicitly mapped projects and evidence-backed session replicas.
+- **Opt-in multi-machine history** — v0.4 lets one central machine pull normalized usage deltas from individually allowlisted SSH hosts, retain source identity, and merge only explicitly mapped projects and evidence-backed session replicas.
 - **Optional background recorder** — Keep collecting while the TUI is closed with launchd, systemd user services, or Windows Task Scheduler; no administrator account is required.
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export the same Summary, Trends, and unified health data used by the TUI as human-readable text or stable camelCase JSON, select snapshot sections, and filter turns by thread.
@@ -153,7 +153,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, inspect, or remove the optional per-user recorder. |
-| `remote` | Configure, test, and synchronize explicitly allowlisted SSH machines. This is under development for v0.4. |
+| `remote` | Configure, test, and synchronize explicitly allowlisted SSH machines. Available in v0.4. |
 | `debug-startup` | Profile both the TUI's placeholder first frame and its initial data-ready work without entering interactive mode. |
 
 The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render. The snapshot-family commands (`snapshot`, `limits`, `tasks`, `turns`, `models`, `attribution`, and `windows`) plus `summary` and `trends` accept `--long-context` to select the optional Longx estimate for that invocation; the default remains the base estimate, and API-equivalent cost never changes.
@@ -205,28 +205,31 @@ codex-usage-monit service status --format json --compact
 
 The valid `snapshot --section` values are `limits`, `tasks`, `turns`, `models`, `attribution`, `windows`, and `health`. The snapshot `health` section covers collection health only; use the dedicated `health` command for the unified snapshot/history/recorder/service report. The TUI's top-level tabs are **Overview**, **Trends**, **Summary**, **Other**, and **Settings**.
 
-### Remote machine usage sync (v0.4, in development)
+### Remote machine usage sync (v0.4)
 
-The v0.4 branch can use a central machine to pull normalized aggregate history, bounded session facts, and a compact Overview snapshot from another machine over the system OpenSSH client. The remote runs the same executable as a short-lived exporter; it does not need a listening port, database, or resident remote service, and raw rollout JSONL is not copied to the center. Account quota gauges and reset credits still come only from the central machine.
+v0.4 can use a central machine to pull normalized aggregate history, bounded session facts, and a compact Overview snapshot from another machine over the system OpenSSH client. The remote runs the same executable as a short-lived exporter; it does not need a listening port, database, or resident remote service, and raw rollout JSONL is not copied to the center. Account quota gauges and reset credits still come only from the central machine.
 
 Remote sync is fail-closed and opt-in at two levels. The application never enumerates or connects every host in SSH config. `add` only creates one disabled, unpaired allowlist entry and does not connect; `pair`, `test`, and manual `sync` contact exactly the ID named by the user. Automatic sync starts only after that host is paired, its per-host switch is enabled, and the global switch is enabled:
 
 ```bash
 # Both machines need a compatible codex-usage-monit on PATH.
 # dev-server is an existing system OpenSSH config alias.
-codex-usage-monit remote add buildbox --ssh-host dev-server
-codex-usage-monit remote pair buildbox
-codex-usage-monit remote test buildbox
+codex-usage-monit --redact-content remote add buildbox --ssh-host dev-server
+codex-usage-monit --redact-content remote pair buildbox
+codex-usage-monit --redact-content remote test buildbox
 
 # A one-off pull does not change automatic-sync settings.
-codex-usage-monit remote sync buildbox
+codex-usage-monit --redact-content remote sync buildbox
 
 # These two explicit switches opt this one host into recorder scheduling.
 codex-usage-monit remote enable buildbox
 codex-usage-monit remote config --auto-sync true
+codex-usage-monit --redact-content record
 ```
 
-If the recorder uses a non-default history location, pass that same source-aware directory to stateful remote commands, for example `codex-usage-monit remote --history-dir /srv/codex-state/history-v1 sync buildbox`. Pairing, unpairing/removal, retained-source management, and manual sync then share the recorder's exact persistence domain instead of silently using the platform default.
+Remote previews are redacted by default; the center's TUI, reports and recorder must use the same policy, hence `--redact-content` above. Opening the TUI alone does not start automatic SSH collection. For prerequisites, background setup, preview opt-in, source selection and troubleshooting, follow the [SSH usage guide](docs/remote-usage.md).
+
+If the recorder uses a non-default history location, pass that same source-aware directory to stateful remote commands, for example `codex-usage-monit --redact-content remote --history-dir /srv/codex-state/history-v1 sync buildbox`. Pairing, unpairing/removal, retained-source management, and manual sync then share the recorder's exact persistence domain instead of silently using the platform default. The TUI and service commands use the state-root override described in the guide.
 
 The same per-host controls and explicit project mappings are available under **Settings**. Git evidence remains a suggestion that must be accepted; unmapped instances are listed separately and can be multi-selected for an explicit manual merge, while Split reverses logical membership. Overview uses two local layers after a sync: source-aware unified history supplies replica-deduplicated task/turn rows and 5-hour/weekly window usage, independently of the Summary/Trends source selector, while a bounded live snapshot supplies recent status and metadata. The live layer contains active/uncertain tasks plus terminal rows from the latest 24 hours; a semantic revision handshake sends at most 128 tasks, 512 turns, and 64 KiB of live content only when it changed. Unchanged polls carry the revision alone, and a missing local baseline forces a full replacement. Remote rows are read-only and become `STALE` after 15 minutes without a successful refresh. A live cumulative task/turn counter is never substituted for missing 5-hour or weekly history; incomplete historical coverage remains an explicit lower bound instead.
 
@@ -234,7 +237,7 @@ The rolling bandwidth budget is per configured source: automatic bulk transfer p
 
 If the application cannot prove that an SSH process tree and its inherited pipes were fully reclaimed, **Other** reports a `process-pause` and automatic sync for that exact host remains stopped across restarts. Editing that host or completing an explicit manual test/sync successfully clears the pause. On Unix, a user-defined `ProxyCommand` that deliberately escapes its process group may be impossible to kill from the parent; the monitor still bounds its own readers and does not keep retrying it automatically.
 
-Removing an SSH connection does not delete retained history; `remote source list/include/exclude/purge` manages detached source data separately. SSH authentication, host-key policy, `IdentityFile`, ports, and `ProxyJump` remain system OpenSSH responsibilities. Remote sync is not part of the v0.3 release binaries yet; see the [v0.4 design and implementation status](docs/v0.4-remote-usage-sync-design.md).
+Removing an SSH connection does not delete retained history; `remote source list/include/exclude/purge` manages detached source data separately. SSH authentication, host-key policy, `IdentityFile`, ports, and `ProxyJump` remain system OpenSSH responsibilities. Remote sync requires v0.4 endpoints; see the [SSH usage guide](docs/remote-usage.md) and [protocol design](docs/v0.4-remote-usage-sync-design.md).
 
 ### Continuous history recording
 
