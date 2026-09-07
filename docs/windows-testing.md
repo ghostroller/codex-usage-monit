@@ -1,11 +1,80 @@
 # Windows testing
 
-Windows runtime verification is configured for the following environments:
+Use the local Windows VM for routine Windows changes. Reserve hosted CI for
+consolidated verification of substantial changes and releases; a local guest
+failure is a diagnostic to investigate, not a reason to silently switch runners.
 
 | Surface | Architecture | Where it runs | Purpose |
 | --- | --- | --- | --- |
-| Pull requests and releases | `x86_64-pc-windows-msvc` | GitHub-hosted `windows-2025` | A fresh, repeatable x64 Windows environment and the released executable target. |
-| Local macOS development | `aarch64-pc-windows-msvc` | Windows 11 ARM64 in UTM | Native Windows-on-Arm compilation and runtime coverage for changes made on Apple Silicon. |
+| Daily development | Installed Windows MSVC host, recorded with each result | Existing Windows 11 VM in UTM | Focused regressions and the full Windows pipeline before consolidated checks. |
+| Consolidated CI and releases | `x86_64-pc-windows-msvc` | GitHub-hosted Windows runner | Repeatable validation of the release target. |
+
+## Daily host entry point
+
+First verify the existing guest and installed tools. This command does not install
+software, create a VM, or run project tests:
+
+```zsh
+python3 scripts/macos/test-windows-utm.py --doctor \
+  --toolchain-home 'C:\Users\user'
+```
+
+`--toolchain-home` identifies an existing guest profile containing `.cargo` and
+`.rustup`; replace it with the actual Windows profile or omit it when the guest
+execution account already has Rust on PATH. The Guest Agent can run as `SYSTEM`,
+so the result records the execution user, process/native architecture, Rust
+version, and effective target. The runner reuses that Rust installation without
+changing the execution identity or `USERPROFILE`; tests under `SYSTEM` do not
+establish standard-user service behavior.
+
+For the normal full pipeline, remove `--doctor`:
+
+```zsh
+python3 scripts/macos/test-windows-utm.py \
+  --toolchain-home 'C:\Users\user'
+```
+
+For a focused regression during development:
+
+```zsh
+python3 scripts/macos/test-windows-utm.py \
+  --toolchain-home 'C:\Users\user' \
+  --focused --test-filter bounded_process::tests
+```
+
+`--focused` runs filtered Rust tests and skips format, Clippy, and CLI smoke
+checks; it requires `--test-filter`. Without `--focused`, a test filter still
+runs the other pipeline stages. Use `--target` for an explicitly installed
+Windows MSVC target and `--profile release` for release-mode verification.
+`--start` may start the existing stopped VM; no invocation recreates or replaces
+it. The guest test deadline defaults to 1,800 seconds and can be set with
+`--timeout` (1–7,200 seconds).
+
+The host packages the current tracked and unignored untracked files, including
+working-tree changes and deletions, into a ZIP snapshot. It rejects symlinks and
+paths unsafe on Windows. Ignored state such as a host's `.cargo/config.toml`
+is excluded. The guest checks the archive SHA-256 and expands it into a unique
+local temporary directory, so compilation and tests do not depend on WebDAV
+locking or source files changing underneath them.
+
+The printed host artifact directory contains `request.json`, `result.json`,
+`verify.log` after a test run, and the exact source archive. Use `--output-dir`
+to choose a parent directory; each run still gets a unique subdirectory. Results
+include the HEAD revision, tracked/untracked dirty flags, archive SHA-256, a
+unique run ID, requested scope, toolchain, account, and completion status.
+Only a matching result file plus a retrieved verification log establishes a
+passing test run. An `utmctl` exit code of zero is insufficient: it may return
+before guest execution completes or even accompany a guest-file error.
+
+`ready` means the doctor round trip and Rust tool probe succeeded. `passed` or
+`failed` describes the requested native test run; `blocked` describes missing
+tools, unavailable guest transport, or an unverifiable result. Guest timeouts
+and host cancellation request termination of the verification process tree;
+cleanup's exit code is recorded. The guest also enforces its own deadline if
+the host transport disappears. Retain failed-run artifacts for diagnosis and
+remove only the identified run directories when they are no longer needed.
+
+## Cross-target checks and runtime evidence
 
 Native linking and runtime checks run on Windows. A non-Windows host can still
 type-check the Windows branches without linking or running the executable:
@@ -15,19 +84,30 @@ cargo check --locked --tests --target x86_64-pc-windows-msvc
 ```
 
 The Windows target must already be installed with `rustup`. Windows 11 on Arm
-can also run the x64 release executable under system emulation, but the local
-VM's primary test is the native ARM64 build.
+can also run the x64 release executable under system emulation. Without an
+explicit `--target`, the runner tests the installed Rust host target. Compare
+`effectiveTarget`, `rustHost`, and `nativeArchitecture` in `result.json` before
+describing a run as native ARM64 or emulated x64.
 
-For the 2026-09-08 review changes, local Windows validation was limited to the
-MSVC cross-target check above from macOS. The ConPTY tests are now enabled in
-the Windows test target; their native runtime result must come from a Windows
-CI or VM run. The cross-target check does not establish that result.
+During the 2026-09-08 review, the existing VM's Guest Agent file channel and a
+nonce-bearing diagnostic round trip were verified. The earlier MSVC
+cross-target check from macOS remains separate evidence; native test results
+must cite the corresponding runner `result.json` and transcript. Neither a
+doctor result nor cross-target compilation establishes ConPTY behavior.
 
 ## UTM setup on an Apple Silicon Mac
 
 The following configuration is sized for a Mac with 16 GiB RAM. It keeps all
 large VM state on an external APFS volume while the source checkout remains in
 its usual macOS location.
+
+Provision only when no existing test VM is available. First run `utmctl list`
+and `utmctl status codex-usage-monit-windows`. Use the existing VM's name or UUID
+with the runner's `--vm` option; add `--start` if it is stopped. If the VM is not
+registered, mount its external volume, locate the existing `.utm` bundle, and
+open that bundle in UTM. A missing external volume is a mount/recovery issue,
+not a reason to change the VM name or create another disk. The configuration
+below describes first-time setup; substitute the mounted volume's actual path.
 
 | Setting | Value |
 | --- | --- |
@@ -95,20 +175,22 @@ stored in this repository or in automation scripts.
 
 ### UTM CLI automation boundary
 
-`utmctl list`, `status`, `start`, and `stop` control this VM from macOS. Do not
-make the Windows-on-Arm test workflow depend on `utmctl exec`, `utmctl file`,
-or `utmctl ip-address`: those commands require the QEMU Guest Agent. The
-current UTM Windows Guest Tools package has no native ARM64 Agent. Its
-installer attempts to use the x64 Agent under Windows-on-Arm emulation, while
-UTM tracks a native ARM64 port as future work. Installing or repairing Guest
-Tools is therefore worth one probe with `utmctl exec`, but the guest-command
-channel remains best-effort rather than a pipeline dependency. Guest Tools is
-still useful for display integration and the WebDAV share.
+`utmctl list`, `status`, `start`, and `stop` manage the existing VM. The host
+runner uses `utmctl exec` and `utmctl file push/pull`, which require a functioning
+Guest Agent. Probe the installed guest with `--doctor`; do not infer agent
+availability from the guest CPU architecture or an installer version. The
+2026-09-08 local probe demonstrated working execution and file transfer while
+`utmctl exec` returned empty output and status zero even for a failing command.
+The runner therefore reads a unique result file and verifies its run ID and
+source hash instead of trusting that transport return value.
 
-Run the scripts below from the UTM console, or separately configure an
-authenticated remote-management channel such as OpenSSH or WinRM if
-unattended guest execution is required. Do not store its passwords or keys in
-the repository. Hosted GitHub Actions remains the unattended Windows pipeline.
+If the Guest Agent is unavailable, use the UTM console to run the PowerShell
+pipeline below, or repair the existing guest tools. Do not recreate the VM or
+store passwords or SSH keys in the repository. A mapped WebDAV drive belongs
+to a Windows logon session and may be absent from the Guest Agent account; the
+host runner's copied source snapshot avoids that dependency. For manual runs
+from a shared checkout, `verify.ps1` still forces both Cargo artifact directories
+onto a guest-local fixed drive.
 
 ## First guest run
 
@@ -124,9 +206,14 @@ The bootstrap script installs Git, the Microsoft C++ Build Tools workload with
 both ARM64 and x64 MSVC targets, `rustup`, and the pinned Rust toolchain with
 `rustfmt` and Clippy. Git is a test dependency because repository-evidence
 tests create temporary repositories. The script then calls
-`scripts\windows\verify.ps1`. Its Cargo target directory defaults to
-`%LOCALAPPDATA%\codex-usage-monit\cargo-target`, so the build cache and binary
-locks remain inside the guest rather than in the mounted macOS checkout.
+`scripts\windows\verify.ps1`. Its Cargo target and intermediate build directories default to
+`%LOCALAPPDATA%\codex-usage-monit\cargo-target` and
+`%LOCALAPPDATA%\codex-usage-monit\cargo-build`. Both are enforced by
+`verify.ps1`, including when it is called directly, so a host's ignored Cargo
+configuration cannot redirect Windows build locks onto the shared checkout.
+Explicit `-CargoTargetDir` and `-CargoBuildDir` overrides must also name local
+fixed drives. Bootstrap discovers already installed Git and Rust before
+requesting an installer; `winget` is required only when installation is needed.
 
 For later runs, invoke the shared verification pipeline directly:
 
@@ -155,7 +242,7 @@ The pipeline performs the following checks in order:
    CLI's usable-but-partial exit code (`2`); the script validates that JSON
    contract instead of treating it as a failure.
 
-The GitHub Actions Windows jobs invoke the same `verify.ps1` script. This keeps
+The consolidated Windows pipeline invokes the same `verify.ps1` script. This keeps
 local UTM validation and hosted x64 CI aligned. `tests/tui_pty.rs` uses ConPTY on
 Windows to exercise keyboard input, search focus, mouse clicks, compact resize,
 rendered styles, and normal exit. The same interaction test uses Unix PTYs in
