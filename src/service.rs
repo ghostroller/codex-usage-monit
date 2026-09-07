@@ -4981,24 +4981,36 @@ mod tests {
         first_options.service_coordination_root_override = Some(coordination_root.clone());
         let mut second_options = options(&directory.path().join("history-b"));
         second_options.service_coordination_root_override = Some(coordination_root.clone());
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let first_entered = entered.clone();
-        let first_resume = resume.clone();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+        let rendezvous_timeout = StdDuration::from_secs(10);
 
         let first = std::thread::spawn(move || {
-            replace_service_after_quiescence(
+            let result = replace_service_after_quiescence(
                 &first_options,
                 || {
-                    first_entered.wait();
-                    first_resume.wait();
+                    entered_sender.send(Ok(())).context(
+                        "could not report the first service mutation entering quiescence",
+                    )?;
+                    resume_receiver.recv_timeout(rendezvous_timeout).context(
+                        "first service mutation was not released after contention check",
+                    )?;
                     Ok(ManagedServiceQuiescence::NoRegistration)
                 },
                 || Ok(()),
                 || panic!("cleanup must not run after a successful registration"),
-            )
+            );
+            // An early filesystem or lock failure must reach the parent instead
+            // of leaving it waiting forever for a quiesce callback that cannot run.
+            if let Err(error) = result.as_ref() {
+                let _ = entered_sender.send(Err(format!("{error:#}")));
+            }
+            result
         });
-        entered.wait();
+        entered_receiver
+            .recv_timeout(rendezvous_timeout)
+            .expect("first service mutation did not report quiescence before the deadline")
+            .expect("first service mutation failed before entering quiescence");
 
         let quiesce_called = std::cell::Cell::new(false);
         let install_called = std::cell::Cell::new(false);
@@ -5028,7 +5040,7 @@ mod tests {
         assert!(!install_called.get());
         assert!(!cleanup_called.get());
 
-        resume.wait();
+        resume_sender.send(()).unwrap();
         first.join().unwrap().unwrap();
         assert!(
             !coordination_root
