@@ -413,31 +413,38 @@ fn reset_records(tasks: &mut [TaskRecord], turns: &mut [TurnRecord]) {
 
 fn select_windows(limits: &[LimitBucket], now: DateTime<Utc>) -> Vec<SelectedWindow<'_>> {
     let mut usable = Vec::new();
+    let mut invalid_windows = 0;
     for bucket in limits {
-        if let Some(window) = &bucket.primary
-            && let Some(selected) = usable_window(bucket, window)
-        {
-            usable.push(selected);
-        }
-        if let Some(window) = &bucket.secondary
-            && let Some(selected) = usable_window(bucket, window)
-        {
-            usable.push(selected);
-        }
-    }
-
-    usable.retain(|window| {
-        window
-            .bucket
+        if !bucket
             .limit_id
             .trim()
             .eq_ignore_ascii_case(DEFAULT_CODEX_BUCKET)
-            && window
-                .window
+        {
+            continue;
+        }
+        for window in [&bucket.primary, &bucket.secondary].into_iter().flatten() {
+            if !window
                 .window_duration_mins
                 .is_some_and(|duration| ANALYZED_WINDOW_DURATIONS.contains(&duration))
-            && is_current_window(window, now)
-    });
+            {
+                continue;
+            }
+            match usable_window(bucket, window) {
+                Some(selected) if is_current_window(&selected, now) => usable.push(selected),
+                Some(_) => {}
+                None => invalid_windows += 1,
+            }
+        }
+    }
+    if invalid_windows > 0 {
+        use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
+        process_trace_log()
+            .span("attribution.invalid_windows", TraceFields::new())
+            .finish(
+                TraceOutcome::Skipped,
+                TraceFields::new().usize("count", invalid_windows),
+            );
+    }
     usable.sort_by(|left, right| {
         left.window
             .window_duration_mins
@@ -475,7 +482,11 @@ pub(crate) fn is_spark_model(model: Option<&str>) -> bool {
 }
 
 fn is_current_window(window: &SelectedWindow<'_>, now: DateTime<Utc>) -> bool {
-    now >= window.starts_at - Duration::seconds(RESET_DRIFT_SECS) && now < window.ends_at
+    let earliest = window
+        .starts_at
+        .checked_sub_signed(Duration::seconds(RESET_DRIFT_SECS))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    now >= earliest && now < window.ends_at
 }
 
 fn usable_window<'a>(
@@ -487,7 +498,7 @@ fn usable_window<'a>(
     Some(SelectedWindow {
         bucket,
         window,
-        starts_at: ends_at - Duration::minutes(duration),
+        starts_at: ends_at.checked_sub_signed(Duration::try_minutes(duration)?)?,
         ends_at,
     })
 }
@@ -596,6 +607,45 @@ fn model_name(call: &UsageCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_windows_rejects_invalid_input_and_checks_datetime_boundaries() {
+        fn bucket(id: &str, duration: i64, reset: DateTime<Utc>) -> LimitBucket {
+            LimitBucket {
+                limit_id: id.to_owned(),
+                limit_name: None,
+                plan_type: None,
+                primary: Some(LimitWindow::new(10.0, Some(duration), Some(reset))),
+                secondary: None,
+                credits: None,
+                rate_limit_reached_type: None,
+                provenance: Provenance::ServerSnapshot,
+                as_of: reset,
+            }
+        }
+        let now = Utc::now();
+        for id in ["codex", "unrelated"] {
+            for duration in [i64::MAX, 0, -1, 301] {
+                assert!(select_windows(&[bucket(id, duration, now)], now).is_empty());
+            }
+        }
+        for duration in ANALYZED_WINDOW_DURATIONS {
+            let reset = now + Duration::minutes(60);
+            let limits = [bucket("codex", duration, reset)];
+            let selected = select_windows(&limits, now);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].starts_at, reset - Duration::minutes(duration));
+
+            let min = DateTime::<Utc>::MIN_UTC;
+            assert!(select_windows(&[bucket("codex", duration, min)], min).is_empty());
+            let limits = [bucket("codex", duration, min + Duration::minutes(duration))];
+            assert_eq!(select_windows(&limits, min).len(), 1);
+            let max = DateTime::<Utc>::MAX_UTC;
+            let limits = [bucket("codex", duration, max)];
+            assert_eq!(select_windows(&limits, max - Duration::seconds(1)).len(), 1);
+            assert!(select_windows(&limits, max).is_empty());
+        }
+    }
 
     fn rated_call(model: &str, fast: bool, tokens: TokenUsage) -> UsageCall {
         UsageCall {
