@@ -17198,9 +17198,17 @@ fn remote_health_entries(app: &App) -> Vec<(String, bool, Option<&RemoteSyncHost
             entries.insert(host.id().to_owned(), (true, None));
         }
         for health in &app.remote_sources.health {
+            // Pairing can change without a recorder or another sync running
+            // the durable health reconciliation. A reused allowlist ID is
+            // not evidence that the old source/generation is healthy now.
+            let current_health = config
+                .host(health.host_id())
+                .and_then(|host| host.expected_source())
+                .is_none_or(|source| health.source() == Some(source))
+                .then_some(health);
             entries
                 .entry(health.host_id().to_owned())
-                .and_modify(|entry| entry.1 = Some(health))
+                .and_modify(|entry| entry.1 = current_health)
                 .or_insert((false, Some(health)));
         }
     } else {
@@ -17217,6 +17225,36 @@ fn remote_health_entries(app: &App) -> Vec<(String, bool, Option<&RemoteSyncHost
         .collect()
 }
 
+fn remote_health_attention(
+    app: &App,
+    host_id: &str,
+    health: Option<&RemoteSyncHostHealth>,
+) -> Vec<String> {
+    let Some(health) = health else {
+        return Vec::new();
+    };
+    let mut attention = Vec::new();
+    if app
+        .remote_sources
+        .config
+        .as_ref()
+        .and_then(|config| config.host(host_id))
+        .is_some_and(|host| health.process_containment_paused_for(host))
+    {
+        attention.push(format!(
+            "{host_id}: automatic sync paused (SSH cleanup failed)"
+        ));
+        attention.push("  Recovery: successful Test or Sync".to_owned());
+    }
+    if let Some(error) = health.fact_sync_error_category() {
+        attention.push(format!(
+            "{host_id}: session facts: {}",
+            remote_sync_error_label(Some(error))
+        ));
+    }
+    attention
+}
+
 fn render_remote_sync_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.is_empty() {
         return;
@@ -17225,6 +17263,20 @@ fn render_remote_sync_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let entries = remote_health_entries(app);
     let mut lines = Vec::new();
     for (host_id, configured, health) in entries {
+        // Aggregate success does not establish that the independent fact
+        // follow-up succeeded, or that automatic connections remain allowed.
+        // Put these actionable states before the detailed counters so compact
+        // terminals cannot show a bare success while hiding a durable pause.
+        lines.extend(
+            remote_health_attention(app, &host_id, health)
+                .into_iter()
+                .map(|attention| {
+                    Line::from(Span::styled(
+                        terminal_safe_text(&attention),
+                        Style::default().fg(palette.error),
+                    ))
+                }),
+        );
         let (result, completion, pages, changes, bytes, failures, error) =
             health.map_or(("never", "-", 0, 0, 0, 0, "-"), |health| {
                 (
@@ -17330,11 +17382,19 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let remote_entries = remote_health_entries(app);
     let has_remote_health = !remote_entries.is_empty() || app.remote_sources.health_error.is_some();
     let remote_height = if has_remote_health {
-        u16::try_from(remote_entries.len())
-            .unwrap_or(u16::MAX)
-            .saturating_mul(3)
-            .saturating_add(2)
-            .clamp(5, 12)
+        let attention_lines = remote_entries
+            .iter()
+            .map(|(host_id, _, health)| remote_health_attention(app, host_id, *health).len())
+            .sum::<usize>();
+        u16::try_from(
+            remote_entries
+                .len()
+                .saturating_mul(3)
+                .saturating_add(attention_lines),
+        )
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .clamp(5, 12)
     } else {
         0
     };

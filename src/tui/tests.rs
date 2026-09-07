@@ -13729,6 +13729,164 @@ fn other_view_shows_sanitized_per_host_remote_sync_health_fields() {
 }
 
 #[test]
+fn remote_health_exposes_fact_containment_after_aggregate_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, health_store) =
+        install_remote_sources_fixture(&mut app, directory.path(), now);
+    let config = config_store.load().unwrap();
+    let host = config.host("dev").unwrap();
+    let source = host.expected_source().unwrap();
+    health_store
+        .record_fact_sync_process_containment("dev", source, now, host)
+        .unwrap();
+    health_store
+        .record_success_with_process_containment(
+            "dev",
+            source,
+            now,
+            &RemoteSyncReport {
+                exchanges: 1,
+                pages_committed: 1,
+                changes_committed: 17,
+                live_state_changed: false,
+                response_bytes: 4_096,
+                completion: RemoteSyncCompletion::Complete,
+            },
+            host,
+        )
+        .unwrap();
+    app.reload_remote_sources();
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(180, 16), (60, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_remote_sync_health(frame, frame.area(), &app))
+                .unwrap();
+            let content =
+                buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, width, height));
+            assert!(content.contains("automatic sync paused"), "{content}");
+            assert!(content.contains("Test or Sync"), "{content}");
+            assert!(
+                content.contains("session facts: process-pause"),
+                "{content}"
+            );
+            assert!(content.contains("result=success"), "{content}");
+        }
+    }
+
+    app.view = View::Health;
+    for (width, height) in [(180, 40), (60, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &mut app, now))
+            .unwrap();
+        let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, width, height));
+        assert!(content.contains("automatic sync paused"), "{content}");
+        assert!(content.contains("Test or Sync"), "{content}");
+    }
+
+    health_store
+        .clear_process_containment_pause("dev", Some(source), now)
+        .unwrap();
+    app.reload_remote_sources();
+    let mut terminal = Terminal::new(TestBackend::new(180, 16)).unwrap();
+    terminal
+        .draw(|frame| render_remote_sync_health(frame, frame.area(), &app))
+        .unwrap();
+    let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 180, 16));
+    assert!(!content.contains("automatic sync paused"));
+    assert!(content.contains("session facts: process-pause"));
+    assert!(content.contains("result=success"));
+}
+
+#[test]
+fn remote_health_exposes_independent_fact_failure_and_clears_it_after_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, health_store) =
+        install_remote_sources_fixture(&mut app, directory.path(), now);
+    let config = config_store.load().unwrap();
+    let source = config.host("dev").unwrap().expected_source().unwrap();
+    for (error, expected) in [
+        (Some(RemoteSyncErrorCategory::Protocol), true),
+        (None, false),
+    ] {
+        health_store
+            .record_fact_sync_outcome("dev", source, now, error)
+            .unwrap();
+        app.reload_remote_sources();
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal
+            .draw(|frame| render_remote_sync_health(frame, frame.area(), &app))
+            .unwrap();
+        let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 100, 14));
+        assert_eq!(
+            content.contains("session facts: protocol"),
+            expected,
+            "{content}"
+        );
+        assert!(!content.contains("automatic sync paused"));
+        assert!(content.contains("result=success"));
+    }
+}
+
+#[test]
+fn remote_health_does_not_reuse_an_old_pairing_before_durable_reconciliation() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut app = interaction_test_app(0, 0);
+    let (config_store, health_store) =
+        install_remote_sources_fixture(&mut app, directory.path(), now);
+    let config = config_store.load().unwrap();
+    let old_source = config.host("dev").unwrap().expected_source().unwrap();
+    health_store
+        .record_fact_sync_outcome(
+            "dev",
+            old_source,
+            now,
+            Some(RemoteSyncErrorCategory::Protocol),
+        )
+        .unwrap();
+    let mut new_source = old_source.clone();
+    new_source.generation = NonZeroU64::new(2).unwrap();
+    let unpaired = config_store
+        .update(
+            config.config_revision(),
+            RemotesConfigMutation::unpair_host("dev"),
+        )
+        .unwrap();
+    config_store
+        .update(
+            unpaired.config_revision(),
+            RemotesConfigMutation::pair_pin("dev", new_source),
+        )
+        .unwrap();
+    app.reload_remote_sources();
+
+    assert_eq!(
+        health_store.get("dev").unwrap().unwrap().source(),
+        Some(old_source)
+    );
+    let entries = remote_health_entries(&app);
+    let (_, configured, health) = entries.iter().find(|(id, _, _)| id == "dev").unwrap();
+    assert!(*configured);
+    assert!(health.is_none());
+    let mut terminal = Terminal::new(TestBackend::new(180, 16)).unwrap();
+    terminal
+        .draw(|frame| render_remote_sync_health(frame, frame.area(), &app))
+        .unwrap();
+    let content = buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, 180, 16));
+    assert!(content.contains("dev  configured=yes  result=never"));
+    assert!(!content.contains("result=success"));
+    assert!(!content.contains("session facts: protocol"));
+}
+
+#[test]
 fn remote_health_reload_detects_service_updates_without_snapshot_changes() {
     let directory = tempfile::tempdir().unwrap();
     let now = Utc::now();
