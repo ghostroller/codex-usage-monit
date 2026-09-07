@@ -2155,13 +2155,16 @@ impl ProcessTree {
             }
             return child.kill();
         };
-        // The child is created as the leader of a fresh process group above.
-        if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
-            return Ok(());
-        }
-        let group_error = io::Error::last_os_error();
-        if group_error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+        // The child starts in a fresh process group, but an SSH wrapper may
+        // move itself into another group. Even successful group cleanup (or
+        // ESRCH) must therefore be followed by checking the exact child.
+        let mut group_error = if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
+            None
+        } else {
+            Some(io::Error::last_os_error())
+        };
+        if group_error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::ESRCH) {
+            group_error = None;
         }
         // Darwin reports EPERM, rather than ESRCH, when the retained zombie
         // leader is the group's only remaining member. This case is safe only
@@ -2169,19 +2172,27 @@ impl ProcessTree {
         // unreaped PID keeps the numeric identity unavailable for reuse, and
         // any live same-user group member would make kill(2) succeed.
         #[cfg(target_vendor = "apple")]
-        if leader_exit_observed && group_error.raw_os_error() == Some(libc::EPERM) {
-            return Ok(());
+        if leader_exit_observed
+            && group_error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::EPERM)
+        {
+            group_error = None;
         }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = leader_exit_observed;
-        match child.kill() {
-            Ok(()) => Err(io::Error::new(
+        let primary_result =
+            if leader_exit_observed {
+                Ok(())
+            } else {
+                child_exited_without_reaping(child)
+                    .and_then(|exited| if exited { Ok(()) } else { child.kill() })
+            };
+        match (group_error, primary_result) {
+            (None, result) => result,
+            (Some(group_error), Ok(())) => Err(io::Error::new(
                 group_error.kind(),
                 format!(
                     "could not terminate SSH process group: {group_error}; the primary child was terminated separately"
                 ),
             )),
-            Err(child_error) => Err(io::Error::new(
+            (Some(group_error), Err(child_error)) => Err(io::Error::new(
                 group_error.kind(),
                 format!(
                     "could not terminate SSH process group: {group_error}; could not terminate primary child: {child_error}"
@@ -2876,6 +2887,45 @@ mod tests {
             .terminate_after_observed_exit(&mut child)
             .unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(23));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_terminates_primary_ssh_that_changed_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let parent_group = unsafe { libc::getpgrp() };
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        configure_process_tree(&mut command, true);
+        // Model an SSH wrapper which joins another group before running SSH.
+        // Keep it in our session so the fixture cannot strand an orphan group.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, parent_group) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut tree = attach_process_tree(&mut child, true).unwrap();
+        let termination = tree.terminate(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let survived = child.try_wait().unwrap().is_none();
+        if survived {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+
+        termination.unwrap();
+        assert!(
+            !survived,
+            "SSH primary survived successful process-tree cleanup"
+        );
     }
 
     #[cfg(unix)]
