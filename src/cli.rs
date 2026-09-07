@@ -1470,8 +1470,13 @@ fn execute_remote_sync_at_state_root_with_transports(
     let selected =
         RemoteSyncHostSnapshot::capture_manual(&config, &host).map_err(anyhow::Error::new)?;
     if host.redact_content() != collect_config.redact_content {
+        let preserve_redaction = if host.redact_content() {
+            "To keep remote previews redacted, run this command and the center's TUI/recorder/reports with --redact-content. Alternatively, explicitly permit remote previews: "
+        } else {
+            "To match the center's redacted profile, disable remote previews: "
+        };
         bail!(
-            "remote sync for {host_id:?} cannot safely activate a history namespace with redact-content={} while the local collector uses redact-content={}; run `codex-usage-monit remote edit {host_id} --redact-content {}` to make the policies match, then retry; no local history was changed and no SSH connection was opened",
+            "remote sync for {host_id:?} cannot safely activate a history namespace with redact-content={} while the local collector uses redact-content={}; {preserve_redaction}run `codex-usage-monit remote edit {host_id} --redact-content {}` to make the policies match, then retry; no local history was changed and no SSH connection was opened",
             host.redact_content(),
             collect_config.redact_content,
             collect_config.redact_content,
@@ -3742,13 +3747,29 @@ fn refresh_automatic_remote_sync_failures_from_health(
 ) -> io::Result<()> {
     let eligible = config
         .automatic_hosts()
-        .map(|host| host.id())
-        .collect::<BTreeSet<_>>();
+        .map(|host| (host.id(), host))
+        .collect::<BTreeMap<_, _>>();
     let host_failures = health_store
         .list()?
         .into_iter()
-        .filter(|health| eligible.contains(health.host_id()) && !health.budget_paused())
         .filter_map(|health| {
+            let configured_host = eligible.get(health.host_id())?;
+            if health.source() != configured_host.expected_source() {
+                return None;
+            }
+            // A fixed-size probe can fail process containment while the
+            // aggregate remains budget-paused. This durable connection pause
+            // needs attention even though bandwidth policy is not a failure.
+            if health.process_containment_paused_for(configured_host) {
+                return Some((
+                    health.host_id().to_owned(),
+                    remote_sync_health_error_category(RemoteSyncErrorCategory::ProcessContainment)
+                        .to_owned(),
+                ));
+            }
+            if health.budget_paused() {
+                return None;
+            }
             let aggregate_failure = (health.last_result()
                 == Some(RemoteSyncAttemptResult::Failure))
             .then(|| health.error_category())
@@ -5559,6 +5580,83 @@ mod tests {
         assert_eq!(health.last_result(), None);
         assert_eq!(health.consecutive_failures(), 0);
         assert_eq!(health.error_category(), None);
+        assert_eq!(automatic_remote_sync_diagnostic(&diagnostic), None);
+    }
+
+    #[test]
+    fn automatic_health_reports_containment_even_during_a_budget_pause() {
+        use crate::remote_bandwidth_budget::RemoteBandwidthBudgetLevel;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (config_store, paired) = paired_disabled_remote_config(directory.path());
+        let enabled = config_store
+            .update(
+                paired.config_revision(),
+                RemotesConfigMutation::enable_host("dev"),
+            )
+            .unwrap();
+        let config = config_store
+            .update(
+                enabled.config_revision(),
+                RemotesConfigMutation::set_auto_sync_enabled(true),
+            )
+            .unwrap();
+        let host = config.host("dev").unwrap();
+        let source = host.expected_source().unwrap();
+        let now = Utc::now();
+        let health_store = RemoteSyncHealthStore::new(directory.path().join("state"));
+        health_store
+            .record_pause(
+                "dev",
+                Some(source),
+                now,
+                RemoteBandwidthBudgetLevel::Hard,
+                None,
+            )
+            .unwrap();
+        let diagnostic = automatic_remote_sync_test_diagnostic();
+        let step = AutomaticRemoteSyncWorkerStep::Scheduled(RemoteSyncSchedulerTick::Waiting {
+            next_wake_in: Duration::from_secs(30),
+        });
+        observe_automatic_remote_sync_step_with_health(
+            &diagnostic,
+            &health_store,
+            &config_store,
+            &step,
+        );
+        assert_eq!(automatic_remote_sync_diagnostic(&diagnostic), None);
+
+        health_store
+            .record_process_containment_pause("dev", source, now, host)
+            .unwrap();
+        observe_automatic_remote_sync_step_with_health(
+            &diagnostic,
+            &health_store,
+            &config_store,
+            &step,
+        );
+        let message = automatic_remote_sync_diagnostic(&diagnostic).unwrap();
+        assert!(message.contains("dev"));
+        assert!(message.contains("automatic sync paused"));
+        assert!(!message.contains(host.ssh_host()));
+        assert_eq!(
+            health_store
+                .get("dev")
+                .unwrap()
+                .unwrap()
+                .consecutive_failures(),
+            0
+        );
+
+        health_store
+            .clear_process_containment_pause("dev", Some(source), now)
+            .unwrap();
+        observe_automatic_remote_sync_step_with_health(
+            &diagnostic,
+            &health_store,
+            &config_store,
+            &step,
+        );
         assert_eq!(automatic_remote_sync_diagnostic(&diagnostic), None);
     }
 
@@ -7521,6 +7619,8 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("cannot safely activate"));
+        assert!(message.contains("To keep remote previews redacted"));
+        assert!(message.contains("TUI/recorder/reports with --redact-content"));
         assert!(message.contains("remote edit dev --redact-content false"));
         assert!(message.contains("no SSH connection was opened"));
         assert!(!state_root.exists());
