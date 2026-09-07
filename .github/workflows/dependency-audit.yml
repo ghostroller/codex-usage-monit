@@ -1,0 +1,29 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Install pinned advisory checker
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Check all locked dependencies and advisory warnings
+        run: cargo audit --deny warnings

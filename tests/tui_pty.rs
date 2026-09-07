@@ -21,6 +21,7 @@ struct PtySession {
     writer: Box<dyn Write + Send>,
     output: Receiver<Vec<u8>>,
     parser: vt100::Parser,
+    cursor_query_progress: usize,
     _temp: tempfile::TempDir,
 }
 
@@ -76,6 +77,7 @@ impl PtySession {
             writer,
             output,
             parser: vt100::Parser::new(START_SIZE.rows, START_SIZE.cols, 0),
+            cursor_query_progress: 0,
             _temp: temp,
         }
     }
@@ -83,6 +85,26 @@ impl PtySession {
     fn send(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
+    }
+
+    fn process_output(&mut self, bytes: &[u8]) {
+        const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+        for byte in bytes {
+            self.parser.process(std::slice::from_ref(byte));
+            if *byte == CURSOR_POSITION_QUERY[self.cursor_query_progress] {
+                self.cursor_query_progress += 1;
+                if self.cursor_query_progress == CURSOR_POSITION_QUERY.len() {
+                    self.cursor_query_progress = 0;
+                    // The backend queries cursor position during terminal
+                    // initialization. vt100 parses output but does not send
+                    // device replies, so emulate the terminal's response.
+                    let (row, column) = self.parser.screen().cursor_position();
+                    self.send(format!("\x1b[{};{}R", row + 1, column + 1).as_bytes());
+                }
+            } else {
+                self.cursor_query_progress = usize::from(*byte == CURSOR_POSITION_QUERY[0]);
+            }
+        }
     }
 
     fn click(&mut self, column: u16, row: u16) {
@@ -93,7 +115,7 @@ impl PtySession {
 
     fn resize(&mut self, columns: u16, rows: u16) {
         while let Ok(bytes) = self.output.try_recv() {
-            self.parser.process(&bytes);
+            self.process_output(&bytes);
         }
         let size = PtySize {
             rows,
@@ -124,7 +146,7 @@ impl PtySession {
                 .recv_timeout((deadline - now).min(Duration::from_millis(100)))
             {
                 Ok(bytes) => {
-                    self.parser.process(&bytes);
+                    self.process_output(&bytes);
                     if predicate(self.parser.screen()) {
                         return;
                     }
@@ -157,7 +179,7 @@ impl PtySession {
                 .output
                 .recv_timeout((deadline - now).min(Duration::from_millis(100)))
             {
-                Ok(bytes) => self.parser.process(&bytes),
+                Ok(bytes) => self.process_output(&bytes),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!(
@@ -195,7 +217,7 @@ impl PtySession {
         loop {
             while let Ok(bytes) = self.output.try_recv() {
                 output.extend_from_slice(&bytes);
-                self.parser.process(&bytes);
+                self.process_output(&bytes);
             }
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success(), "signal-aware TUI exited with {status:?}");
@@ -208,7 +230,7 @@ impl PtySession {
             match self.output.recv_timeout(Duration::from_millis(20)) {
                 Ok(bytes) => {
                     output.extend_from_slice(&bytes);
-                    self.parser.process(&bytes);
+                    self.process_output(&bytes);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -219,7 +241,7 @@ impl PtySession {
             match self.output.recv_timeout(Duration::from_millis(50)) {
                 Ok(bytes) => {
                     output.extend_from_slice(&bytes);
-                    self.parser.process(&bytes);
+                    self.process_output(&bytes);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < drain_deadline => {}

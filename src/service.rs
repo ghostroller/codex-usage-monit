@@ -3164,7 +3164,10 @@ fn parse_windows_task_xml(document: &str) -> Result<ParsedWindowsTaskXml> {
                         .context("Task Scheduler XML attribute name is not UTF-8")?
                         .to_string();
                     let value = attribute
-                        .decode_and_unescape_value(reader.decoder())
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
                         .context("invalid Task Scheduler XML attribute value")?
                         .into_owned();
                     if element_attributes.insert(name.clone(), value).is_some() {
