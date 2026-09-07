@@ -441,8 +441,18 @@ fn plan_next_replica_fact_sync_with_budget(
     let since = observed_at
         .checked_sub_days(chrono::Days::new(u64::from(MAX_FACT_RETENTION_DAYS)))
         .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
-    let metadata = history_store
-        .list_source_metadata()?
+    let metadata = history_store.list_source_metadata()?;
+    if metadata.iter().any(|source| {
+        source.source_id() == &selected_source.node_id
+            && source.kind() == SourceKind::Ssh
+            && !source.include_in_aggregates()
+    }) {
+        // Aggregate exclusion does not disable source-only synchronization.
+        // It removes this source from replica reconciliation, so a successful
+        // aggregate sync needs no fact follow-up or unrelated history reads.
+        return Ok(ReplicaFactSyncPlan::NoWork);
+    }
+    let metadata = metadata
         .into_iter()
         .filter(|source| {
             source.include_in_aggregates()
@@ -2325,6 +2335,24 @@ mod tests {
     }
 
     #[test]
+    fn excluded_selected_source_needs_no_replica_facts_or_history_reads() {
+        let fixture = Fixture::new();
+        let source_id = SOURCE.parse().unwrap();
+        with_writer(&fixture.runtime, |writer| {
+            writer
+                .update_source_metadata(&source_id, |metadata| {
+                    metadata.set_include_in_aggregates(false);
+                    Ok(())
+                })
+                .map(|_| ())
+        });
+        let mut no_history_reads = SourceHistoryReadBudget::with_limits(0, 0, 0);
+        let plan = planner_with_budget(&fixture, at(31, 13), &mut no_history_reads).unwrap();
+        assert!(matches!(plan, ReplicaFactSyncPlan::NoWork));
+        assert!(fixture.active().is_none());
+    }
+
+    #[test]
     fn excluding_one_oversized_replica_advances_to_the_next_candidate() {
         let fixture = Fixture::new();
         let newest = at(30, 0);
@@ -2626,6 +2654,41 @@ mod tests {
             ensure_record_capacity(usize::MAX, 1),
             Err(RemoteFactSyncError::RecordBudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn empty_delta_publishes_new_digest_bindings_without_changing_facts_or_cursor() {
+        let fixture = Fixture::new();
+        let original = fixture.seed(1);
+        assert!(original.version.validated_digests().is_empty());
+        let reply = || FakeReply::Delta {
+            generation: 11,
+            watermark: 1,
+            changes: Vec::new(),
+            has_more: false,
+            token: None,
+        };
+        let mut transport = FakeTransport::new([reply()]);
+        let report = run(&fixture, &mut transport).unwrap();
+        assert!(report.activation.activated);
+        let refreshed = fixture.active().unwrap();
+        assert_eq!(refreshed.cursor, original.cursor);
+        assert_eq!(refreshed.facts(), original.facts());
+        assert_eq!(
+            refreshed.version.validated_digests(),
+            validated_digest_bindings()
+        );
+
+        // Once the exact bindings are durable, another unchanged response is
+        // a real no-op and must not replace the fact generation again.
+        let mut repeated_transport = FakeTransport::new([reply()]);
+        assert!(
+            !run(&fixture, &mut repeated_transport)
+                .unwrap()
+                .activation
+                .activated
+        );
+        assert_eq!(fixture.active().unwrap().version, refreshed.version);
     }
 
     #[test]

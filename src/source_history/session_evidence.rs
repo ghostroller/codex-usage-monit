@@ -1700,11 +1700,17 @@ impl SourceHistoryStore {
                 "active fact version changed before activation",
             ));
         }
+        // An empty journal delta can still revalidate a changed digest
+        // identity or populate bindings missing from an older manifest.
+        // Publish that metadata before treating future deltas as no-ops.
         if descriptor.kind == FactBatchKind::Delta
             && descriptor
                 .expected_active_version
                 .as_ref()
-                .is_some_and(|expected| expected.cursor == descriptor.activate_cursor)
+                .is_some_and(|expected| {
+                    expected.cursor == descriptor.activate_cursor
+                        && expected.validated_digests == descriptor.validated_digests
+                })
         {
             return Ok(PrevalidatedFactPublication {
                 descriptor,
@@ -1863,7 +1869,10 @@ impl SourceHistoryStore {
                     && descriptor
                         .expected_active_version
                         .as_ref()
-                        .is_some_and(|expected| expected.cursor == descriptor.activate_cursor);
+                        .is_some_and(|expected| {
+                            expected.cursor == descriptor.activate_cursor
+                                && expected.validated_digests == descriptor.validated_digests
+                        });
                 if !already_active && !empty_delta {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
