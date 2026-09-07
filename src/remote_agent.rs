@@ -93,12 +93,9 @@ where
             let state_writable = !probe.check_state_writable
                 || (identity_store.probe_state_directory_writable().is_ok()
                     && probe_remote_export_state_writable(identity_store, &revisions).is_ok()
-                    && config
-                        .rollout_cache_dir
-                        .as_deref()
-                        .is_some_and(|directory| {
-                            crate::cache::probe_private_directory_writable(directory).is_ok()
-                        }));
+                    && config.rollout_cache_dir.as_deref().is_none_or(|directory| {
+                        crate::cache::probe_private_directory_writable(directory).is_ok()
+                    }));
             let rollout_readable =
                 !probe.check_rollout_readable || rollout_roots_are_readable(&config.codex_home);
             write_response_body(
@@ -870,6 +867,48 @@ mod tests {
             panic!("expected probe response");
         };
         assert!(!probe.state_writable);
+    }
+
+    #[test]
+    fn probe_allows_export_when_optional_rollout_cache_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollectConfig {
+            codex_home: directory.path().join("codex"),
+            rollout_cache_dir: None,
+            ..CollectConfig::default()
+        };
+        fs::create_dir_all(config.codex_home.join("sessions")).unwrap();
+        let store =
+            SourceIdentityStore::at_path(directory.path().join("state/source-identity.json"));
+        let mut request = probe_request();
+        let probe_response = serve(&config, &store, &request);
+        let RemoteExportResponseBody::Probe(probe) = probe_response.result else {
+            panic!("expected probe response");
+        };
+
+        request.expected_source = Some(source_generation(&store.load_or_create().unwrap()));
+        let now = Utc::now();
+        request.request = RemoteExportRequestBody::Delta(DeltaRequest {
+            delta_cursor: None,
+            range: ExportRange {
+                from: now - Duration::hours(1),
+                to: now,
+            },
+            overlap_minutes: 60,
+            include_live: true,
+            known_live_revision: None,
+        });
+        let delta_response = serve(&config, &store, &request);
+        delta_response.validate_for_request(&request).unwrap();
+        assert!(matches!(
+            delta_response.result,
+            RemoteExportResponseBody::Delta { .. }
+        ));
+        assert!(probe.rollout_readable);
+        assert!(
+            probe.state_writable,
+            "probe rejected a working cache-free exporter"
+        );
     }
 
     #[test]
