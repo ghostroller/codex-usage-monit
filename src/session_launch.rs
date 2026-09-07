@@ -5,7 +5,8 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -17,6 +18,8 @@ const ENV_BIN: &str = "/usr/bin/env";
 const POWERSHELL_BIN: &str = "powershell.exe";
 const PANE_NAME_MAX_WIDTH: usize = 48;
 const PROCESS_MESSAGE_MAX_WIDTH: usize = 512;
+const ZELLIJ_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const ZELLIJ_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 /// Everything needed to decide whether a selected task can be resumed. The
 /// owned form is intentional: the TUI moves this value to a launch worker.
@@ -740,6 +743,14 @@ fn execute_command(
     plan: &CommandPlan,
     operation: ZellijOperation,
 ) -> Result<std::process::Output, ZellijError> {
+    execute_command_with_timeout(plan, operation, ZELLIJ_COMMAND_TIMEOUT)
+}
+
+fn execute_command_with_timeout(
+    plan: &CommandPlan,
+    operation: ZellijOperation,
+    timeout: Duration,
+) -> Result<std::process::Output, ZellijError> {
     let trace_span = process_trace_log().span_with("terminal.zellij.process", || {
         TraceFields::new().label(
             "operation",
@@ -750,19 +761,25 @@ fn execute_command(
             },
         )
     });
-    let result = Command::new(&plan.program)
-        .args(&plan.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|source| ZellijError::Spawn { operation, source });
+    let result = crate::bounded_process::output(
+        Command::new(&plan.program).args(&plan.args),
+        timeout,
+        ZELLIJ_OUTPUT_MAX_BYTES,
+    )
+    .map_err(|source| ZellijError::Spawn { operation, source });
     let output = match result {
         Ok(output) => output,
         Err(error) => {
-            trace_span.finish_with(TraceOutcome::Error, || {
-                TraceFields::new().label("errorKind", "spawn")
-            });
+            let timed_out = matches!(&error, ZellijError::Spawn { source, .. }
+                if source.kind() == io::ErrorKind::TimedOut);
+            trace_span.finish_with(
+                if timed_out {
+                    TraceOutcome::Timeout
+                } else {
+                    TraceOutcome::Error
+                },
+                || TraceFields::new().label("errorKind", if timed_out { "timeout" } else { "io" }),
+            );
             return Err(error);
         }
     };

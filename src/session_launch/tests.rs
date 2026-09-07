@@ -6,6 +6,31 @@ use super::*;
 
 const THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
 
+#[test]
+fn hung_zellij_actions_return_a_timeout_to_the_launch_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let program = executable_path(directory.path(), "zellij");
+    #[cfg(unix)]
+    executable_script(&program, "#!/bin/sh\nsleep 60\n");
+    #[cfg(windows)]
+    executable_script(&program, "@echo off\r\nping -n 60 127.0.0.1 >NUL\r\n");
+    let plan = CommandPlan {
+        program,
+        args: Vec::new(),
+    };
+    for operation in [
+        ZellijOperation::NewPane,
+        ZellijOperation::ListPanes,
+        ZellijOperation::FocusPane,
+    ] {
+        let error =
+            execute_command_with_timeout(&plan, operation, Duration::from_millis(100)).unwrap_err();
+        assert!(
+            matches!(error, ZellijError::Spawn { source, .. } if source.kind() == io::ErrorKind::TimedOut)
+        );
+    }
+}
+
 fn target(cwd: &Path) -> ResumeTarget {
     ResumeTarget {
         thread_id: THREAD_ID.to_owned(),

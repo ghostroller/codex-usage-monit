@@ -5,7 +5,6 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,6 +64,7 @@ const CURRENT_SERVICE_DEFINITION_FILE: &str = "current-service-definition.json";
 const CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION: u32 = 1;
 const SERVICE_TRUST_MARKER_MAX_BYTES: u64 = 8 * 1024;
 const SERVICE_DEFINITION_MAX_BYTES: u64 = 256 * 1024;
+const SERVICE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const SERVICE_CUTOVER_PROTOCOL: &str = "source-aware-v2";
 pub(crate) const SERVICE_DEFINITION_ID_ARGUMENT: &str = "--service-definition-id";
 const SERVICE_DEFINITION_ID_DOMAIN: &[u8] =
@@ -1242,16 +1242,14 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
                     ))
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let output = Command::new("systemctl")
-                        .args([
-                            "--user",
-                            "show",
-                            "--property=LoadState",
-                            "--value",
-                            SYSTEMD_UNIT,
-                        ])
-                        .output()
-                        .context("could not query the systemd service definition")?;
+                    let output = run_service_command(Command::new("systemctl").args([
+                        "--user",
+                        "show",
+                        "--property=LoadState",
+                        "--value",
+                        SYSTEMD_UNIT,
+                    ]))
+                    .context("could not query the systemd service definition")?;
                     let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if output.status.success() && load_state == "not-found" {
                         Ok(ServiceDefinitionObservation::Absent)
@@ -1294,30 +1292,11 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
 
 #[cfg(windows)]
 fn windows_task_xml_bounded(task_name: &str) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-    let mut child = Command::new("schtasks.exe")
-        .args(["/Query", "/TN", task_name, "/XML", "/HRESULT"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("could not export the Task Scheduler definition")?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Task Scheduler definition export had no stdout pipe"))?;
-    let mut contents = Vec::new();
-    Read::by_ref(&mut stdout)
-        .take(SERVICE_DEFINITION_MAX_BYTES.saturating_add(1))
-        .read_to_end(&mut contents)?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > SERVICE_DEFINITION_MAX_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!(
-            "Task Scheduler definition exceeds the {}-byte limit",
-            SERVICE_DEFINITION_MAX_BYTES
-        );
-    }
-    let status = child.wait()?;
-    Ok((status, contents))
+    run_command_stdout_bounded(
+        Command::new("schtasks.exe").args(["/Query", "/TN", task_name, "/XML", "/HRESULT"]),
+        SERVICE_DEFINITION_MAX_BYTES,
+    )
+    .context("could not export the Task Scheduler definition")
 }
 
 #[cfg(not(windows))]
@@ -1655,24 +1634,12 @@ fn run_command_stdout_bounded(
     command: &mut Command,
     limit: u64,
 ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("missing stdout pipe"))?;
-    let mut contents = Vec::new();
-    Read::by_ref(&mut stdout)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut contents)?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("manager definition output exceeds the {limit}-byte limit");
-    }
-    Ok((child.wait()?, contents))
+    let output = crate::bounded_process::output(
+        command,
+        SERVICE_COMMAND_TIMEOUT,
+        usize::try_from(limit).unwrap_or(usize::MAX),
+    )?;
+    Ok((output.status, output.stdout))
 }
 
 fn service_definition_fingerprint(contents: &[u8]) -> String {
@@ -1869,8 +1836,7 @@ fn run_launchd_operation(operation: LaunchdOperation) -> Result<LaunchdOperation
                 .to_string(),
         });
     }
-    let output = command
-        .output()
+    let output = run_service_command(&mut command)
         .with_context(|| format!("could not run {description}"))?;
     let success = output.status.success();
     Ok(LaunchdOperationResult {
@@ -2026,10 +1992,10 @@ fn launchd_status(
     let path = launchd_registration_path()?;
     let installed = path.is_file();
     let domain = launchd_domain();
-    let output = Command::new("launchctl")
-        .args(["print", &format!("{domain}/{SERVICE_LABEL}")])
-        .output()
-        .context("could not run launchctl print")?;
+    let output = run_service_command(
+        Command::new("launchctl").args(["print", &format!("{domain}/{SERVICE_LABEL}")]),
+    )
+    .context("could not run launchctl print")?;
     let manager_running = launchd_output_reports_running(&output);
     Ok(service_status(
         "macos-launchd",
@@ -2199,8 +2165,7 @@ fn run_systemd_quiesce_operation(
             command.args(["--user", "is-active", "--quiet", SYSTEMD_UNIT]);
         }
     }
-    let output = command
-        .output()
+    let output = run_service_command(&mut command)
         .with_context(|| format!("could not run systemd operation {operation:?}"))?;
     Ok(SystemdQuiesceOperationResult {
         success: output.status.success(),
@@ -2325,10 +2290,13 @@ fn run_systemd_cleanup_operation(operation: SystemdCleanupOperation) -> Result<(
             verify_systemd_definition_disabled(&definition).map(|_| ())
         }
         SystemdCleanupOperation::VerifyInactive => {
-            let output = Command::new("systemctl")
-                .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT])
-                .output()
-                .context("could not verify systemd recorder quiescence after cleanup")?;
+            let output = run_service_command(Command::new("systemctl").args([
+                "--user",
+                "is-active",
+                "--quiet",
+                SYSTEMD_UNIT,
+            ]))
+            .context("could not verify systemd recorder quiescence after cleanup")?;
             match output.status.code() {
                 Some(3 | 4) => Ok(()),
                 code => bail!(
@@ -2380,10 +2348,13 @@ fn systemd_status(
 ) -> Result<ServiceStatus> {
     let path = systemd_registration_path()?;
     let installed = path.is_file();
-    let output = Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT])
-        .output()
-        .context("could not run systemctl --user is-active")?;
+    let output = run_service_command(Command::new("systemctl").args([
+        "--user",
+        "is-active",
+        "--quiet",
+        SYSTEMD_UNIT,
+    ]))
+    .context("could not run systemctl --user is-active")?;
     let manager_running = output.status.success();
     Ok(service_status(
         "linux-systemd-user",
@@ -2489,8 +2460,7 @@ fn run_windows_task_operation(
             (command, "schtasks /Delete", false)
         }
     };
-    let output = command
-        .output()
+    let output = run_service_command(&mut command)
         .with_context(|| format!("could not run {description}"))?;
     let success = output.status.success();
     Ok(WindowsTaskOperationResult {
@@ -3452,10 +3422,17 @@ fn service_status(
     }
 }
 
+fn run_service_command(command: &mut Command) -> io::Result<Output> {
+    crate::bounded_process::output(
+        command,
+        SERVICE_COMMAND_TIMEOUT,
+        SERVICE_DEFINITION_MAX_BYTES as usize,
+    )
+}
+
 fn run_checked(command: &mut Command, description: &str) -> Result<()> {
-    let output = command
-        .output()
-        .with_context(|| format!("could not run {description}"))?;
+    let output =
+        run_service_command(command).with_context(|| format!("could not run {description}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -4974,6 +4951,69 @@ mod tests {
         assert!(!quiesce_called.get());
         assert!(!install_called.get());
         assert!(!cleanup_called.get());
+    }
+
+    #[test]
+    fn manager_timeout_releases_cutover_gate_and_only_clears_a_proven_cleanup_blocker() {
+        for cleanup_succeeds in [true, false] {
+            let directory = tempdir().unwrap();
+            let service_options = options(directory.path());
+            let cleanup_called = std::cell::Cell::new(false);
+            let error = replace_service_after_quiescence(
+                &service_options,
+                || {
+                    crate::bounded_process::output(
+                        &mut crate::bounded_process::tests::fixture_command(
+                            "hang",
+                            directory.path(),
+                        ),
+                        StdDuration::from_millis(100),
+                        4096,
+                    )?;
+                    panic!("hung manager command unexpectedly succeeded");
+                },
+                || panic!("install must not run after quiescence timed out"),
+                || {
+                    cleanup_called.set(true);
+                    if cleanup_succeeds {
+                        Ok(())
+                    } else {
+                        bail!("cleanup remains unproven")
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("execution timeout"));
+            assert!(cleanup_called.get());
+            let coordination_root =
+                service_coordination_root_for_options(&service_options).unwrap();
+            assert!(matches!(
+                try_acquire_service_cutover_exclusive_at(&coordination_root).unwrap(),
+                TryRecorderInstanceLock::Acquired(_)
+            ));
+            assert_eq!(
+                coordination_root
+                    .join(RECORDER_CUTOVER_BLOCKER_FILE)
+                    .is_file(),
+                !cleanup_succeeds,
+            );
+        }
+    }
+
+    #[test]
+    fn manager_definition_output_is_bounded_on_stdout_and_stderr() {
+        let directory = tempdir().unwrap();
+        for mode in ["flood_stdout", "flood_stderr"] {
+            let error = run_command_stdout_bounded(
+                &mut crate::bounded_process::tests::fixture_command(mode, directory.path()),
+                1024,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
