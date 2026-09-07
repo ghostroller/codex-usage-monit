@@ -15,11 +15,38 @@ use crate::source_identity::SourceIdentity;
 
 const STATE_FILE: &str = "local-observation-state.json";
 const STATE_LOCK: &str = "local-observation.lock";
+const JOURNAL_FILE: &str = "local-observation-pending.json";
+const MAX_JOURNAL_BYTES: u64 = MAX_SHARD_FILE_BYTES;
+pub const LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING: &str = "local_observation_recovery_pending";
 const MARKER_FILE: &str = "summary-backfill-attempt.json";
 const MARKER_LOCK: &str = "summary-backfill-attempt.lock";
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 16 * 1024;
 const WEEKLY_LIVE_TAIL_LOOKBACK_MINUTES: i64 = 30;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_LOCAL_OBSERVATION_STAGE: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_local_observation_failure_after(stage: &'static str) {
+    FAIL_AFTER_LOCAL_OBSERVATION_STAGE.with(|fail_after| fail_after.set(Some(stage)));
+}
+
+#[cfg(test)]
+fn fail_after_local_observation_stage(stage: &'static str) -> io::Result<()> {
+    FAIL_AFTER_LOCAL_OBSERVATION_STAGE.with(|fail_after| {
+        if fail_after.get() == Some(stage) {
+            fail_after.set(None);
+            Err(io::Error::other(format!("injected failure after {stage}")))
+        } else {
+            Ok(())
+        }
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalObservationMode {
@@ -33,6 +60,9 @@ pub enum LocalObservationMode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalObservationWriteReport {
     pub revision: u64,
+    /// Recovery can restore query visibility even when all family writes are
+    /// semantic no-ops. Readers must invalidate projections in either case.
+    pub recovered_pending: bool,
     pub account: SourceHistoryWriteReport,
     pub buckets: SourceHistoryWriteReport,
     pub weekly: SourceHistoryWriteReport,
@@ -50,12 +80,50 @@ pub struct LocalObservationWriteReport {
     pub garbage_collection: LocalObservationGarbageCollectionReport,
 }
 
+impl LocalObservationWriteReport {
+    fn include_recovery(&mut self, recovery: Self) {
+        self.recovered_pending |= recovery.recovered_pending;
+        for (current, recovered) in [
+            (&mut self.account, recovery.account),
+            (&mut self.buckets, recovery.buckets),
+            (&mut self.weekly, recovery.weekly),
+            (&mut self.session_digests, recovery.session_digests),
+        ] {
+            current.shards_written = current
+                .shards_written
+                .saturating_add(recovered.shards_written);
+            current.shards_skipped = current
+                .shards_skipped
+                .saturating_add(recovered.shards_skipped);
+        }
+        for (current, recovered) in [
+            (&mut self.account_records, recovery.account_records),
+            (&mut self.bucket_records, recovery.bucket_records),
+            (&mut self.weekly_records, recovery.weekly_records),
+            (
+                &mut self.session_digest_records,
+                recovery.session_digest_records,
+            ),
+            (&mut self.bucket_tombstones, recovery.bucket_tombstones),
+            (&mut self.weekly_tombstones, recovery.weekly_tombstones),
+            (
+                &mut self.session_digest_tombstones,
+                recovery.session_digest_tombstones,
+            ),
+        ] {
+            *current = current.saturating_add(recovered);
+        }
+    }
+}
+
 /// One revision-consistent read of every local observation family used by a
 /// history query. The local writer publishes buckets, weekly points, and
 /// session digests under one stable source-level state lock; readers must hold
 /// the shared side of that same lock so they cannot splice two observation
 /// revisions together, including while the first profile namespace is being
-/// created.
+/// created. After an interrupted write, combined reads remain unavailable
+/// until an authorized writer replays the durable batch. Individual account
+/// samples and raw family inspection APIs have independent read contracts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalObservationSnapshot {
     pub source: SourceMetadata,
@@ -96,6 +164,37 @@ struct LocalRevisionState {
     source_generation: u64,
     redaction_profile: RedactionProfile,
     last_reserved_revision: u64,
+}
+
+/// A redo batch contains only the validated differences for one observation.
+/// It is published before any family changes and retained until every family
+/// and the selected-profile metadata are durable.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingLocalObservation {
+    binding: LocalRevisionState,
+    display_label: String,
+    account_points: Vec<QuotaPoint>,
+    bucket_records: Vec<SourceBucketRecord>,
+    weekly_records: Vec<SourceWeeklyRecord>,
+    session_digest_records: Vec<SourceSessionDigestRecord>,
+}
+
+#[derive(Debug)]
+struct LocalObservationRecoveryPending;
+
+impl std::fmt::Display for LocalObservationRecoveryPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
+    }
+}
+
+impl std::error::Error for LocalObservationRecoveryPending {}
+
+pub(crate) fn is_local_observation_recovery_pending(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<LocalObservationRecoveryPending>())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,10 +268,78 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 local_state_directory(store, identity.node_id(), redaction_profile);
             store.prepare_private_directory(&state_directory)?;
             cleanup_state_temps(store, &state_directory, STATE_FILE)?;
+            cleanup_state_temps(store, &state_directory, JOURNAL_FILE)?;
+            let mut recovered = LocalObservationWriteReport::default();
+            if let Some(pending) = read_optional_json_file::<PendingLocalObservation>(
+                &state_directory.join(JOURNAL_FILE),
+                MAX_JOURNAL_BYTES,
+            )? {
+                validate_pending_observation(
+                    store,
+                    &state_directory,
+                    &identity,
+                    redaction_profile,
+                    &pending,
+                )?;
+                // Replay the original frozen records before inspecting the
+                // next input. An empty/partial observation cannot silently
+                // discard an older interrupted family's changes.
+                recovered.account =
+                    store.record_account_points_unfenced(&pending.account_points)?;
+                recovered.buckets = store.record_source_bucket_changes_unfenced(
+                    identity.node_id(),
+                    redaction_profile,
+                    &pending.bucket_records,
+                )?;
+                #[cfg(test)]
+                fail_after_local_observation_stage("recovery_buckets")?;
+                recovered.weekly = store.record_source_weekly_changes_unfenced(
+                    identity.node_id(),
+                    redaction_profile,
+                    &pending.weekly_records,
+                )?;
+                recovered.session_digests = store.record_source_session_digest_changes_unfenced(
+                    identity.node_id(),
+                    redaction_profile,
+                    &pending.session_digest_records,
+                )?;
+                self.validate()?;
+                publish_local_metadata(
+                    store,
+                    &identity,
+                    &pending.display_label,
+                    redaction_profile,
+                )?;
+                remove_pending_observation(store, &state_directory)?;
+                recovered.recovered_pending = true;
+                recovered.account_records = pending.account_points.len();
+                recovered.bucket_records = pending.bucket_records.len();
+                recovered.weekly_records = pending.weekly_records.len();
+                recovered.session_digest_records = pending.session_digest_records.len();
+                recovered.bucket_tombstones = pending
+                    .bucket_records
+                    .iter()
+                    .filter(|record| matches!(record.change(), SourceBucketChange::Tombstone))
+                    .count();
+                recovered.weekly_tombstones = pending
+                    .weekly_records
+                    .iter()
+                    .filter(|record| matches!(record.change(), SourceWeeklyChange::Tombstone))
+                    .count();
+                recovered.session_digest_tombstones = pending
+                    .session_digest_records
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.change(), SourceSessionDigestChange::Tombstone)
+                    })
+                    .count();
+            }
 
             // Reserve before touching any shard. A crash after this atomic publish
             // intentionally leaves a gap; the number is never issued again.
             let revision = reserve_revision(store, &state_directory, &identity, redaction_profile)?;
+            #[cfg(test)]
+            fail_after_local_observation_stage("revision")?;
             let (bucket_records, weekly_records, bucket_tombstones, weekly_tombstones) =
                 build_records(
                     store,
@@ -196,30 +363,76 @@ impl SourceHistoryWriter<'_, '_, '_> {
             let bucket_record_count = bucket_records.len();
             let weekly_record_count = weekly_records.len();
             let session_digest_record_count = session_digest_records.len();
+            let pending = PendingLocalObservation {
+                binding: LocalRevisionState {
+                    format_version: STATE_VERSION,
+                    profile_id: store.profile_id().clone(),
+                    source_id: identity.node_id().clone(),
+                    source_generation: identity.generation(),
+                    redaction_profile,
+                    last_reserved_revision: revision,
+                },
+                display_label: display_label.clone(),
+                account_points: observation.quota_points.clone(),
+                bucket_records,
+                weekly_records,
+                session_digest_records,
+            };
+            validate_pending_observation(
+                store,
+                &state_directory,
+                &identity,
+                redaction_profile,
+                &pending,
+            )?;
+            let has_changes = !pending.account_points.is_empty()
+                || !pending.bucket_records.is_empty()
+                || !pending.weekly_records.is_empty()
+                || !pending.session_digest_records.is_empty();
+            if has_changes {
+                write_private_atomically(
+                    &state_directory.join(JOURNAL_FILE),
+                    &encode_pretty_bounded(&pending, MAX_JOURNAL_BYTES)?,
+                )?;
+            }
             let account = store.record_account_points_unfenced(&observation.quota_points)?;
+            #[cfg(test)]
+            fail_after_local_observation_stage("account")?;
             let buckets = store.record_source_bucket_changes_unfenced(
                 identity.node_id(),
                 redaction_profile,
-                &bucket_records,
+                &pending.bucket_records,
             )?;
+            #[cfg(test)]
+            fail_after_local_observation_stage("buckets")?;
             let weekly = store.record_source_weekly_changes_unfenced(
                 identity.node_id(),
                 redaction_profile,
-                &weekly_records,
+                &pending.weekly_records,
             )?;
+            #[cfg(test)]
+            fail_after_local_observation_stage("weekly")?;
             let session_digests = store.record_source_session_digest_changes_unfenced(
                 identity.node_id(),
                 redaction_profile,
-                &session_digest_records,
+                &pending.session_digest_records,
             )?;
+            #[cfg(test)]
+            fail_after_local_observation_stage("session_digests")?;
             // Keep an existing source's selected profile visible until every
             // target-namespace write succeeds and the ownership fence is
             // freshly validated. A failed target write therefore cannot hide
             // the last known-good profile or expose a partial new one.
             self.validate()?;
             publish_local_metadata(store, &identity, &display_label, redaction_profile)?;
-            Ok(LocalObservationWriteReport {
+            #[cfg(test)]
+            fail_after_local_observation_stage("metadata")?;
+            if has_changes {
+                remove_pending_observation(store, &state_directory)?;
+            }
+            let mut report = LocalObservationWriteReport {
                 revision,
+                recovered_pending: false,
                 account,
                 buckets,
                 weekly,
@@ -232,7 +445,9 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 weekly_tombstones,
                 session_digest_tombstones,
                 garbage_collection: LocalObservationGarbageCollectionReport::default(),
-            })
+            };
+            report.include_recovery(recovered);
+            Ok(report)
         })
     }
 
@@ -382,6 +597,20 @@ impl SourceHistoryStore {
         self.validate_private_path(&lock_directory)?;
         let state_lock = open_lock_file(&lock_directory, STATE_LOCK)?;
         lock_shared(&state_lock, &lock_directory, STATE_LOCK)?;
+
+        let state_directory = local_state_directory(self, source_id, redaction_profile);
+        let pending_path = state_directory.join(JOURNAL_FILE);
+        if self.private_directory_exists(&state_directory)? {
+            self.validate_private_path(&state_directory)?;
+            match fs::symlink_metadata(&pending_path) {
+                Ok(_) => {
+                    validate_published_private_file(&pending_path)?;
+                    return Err(io::Error::other(LocalObservationRecoveryPending));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
 
         let snapshot = self.with_source_metadata_shared(source_id, |source| {
             if source.kind() != SourceKind::Local {
@@ -547,6 +776,87 @@ fn local_state_directory(
     store
         .source_directory(source_id)
         .join(redaction_profile.directory_name())
+}
+
+fn validate_pending_observation(
+    store: &SourceHistoryStore,
+    directory: &Path,
+    identity: &SourceIdentity,
+    redaction_profile: RedactionProfile,
+    pending: &PendingLocalObservation,
+) -> io::Result<()> {
+    let binding = &pending.binding;
+    let revision = binding.last_reserved_revision;
+    if binding.format_version != STATE_VERSION
+        || binding.profile_id != *store.profile_id()
+        || binding.source_id != *identity.node_id()
+        || binding.source_generation != identity.generation()
+        || binding.redaction_profile != redaction_profile
+        || revision == 0
+        || revision > load_last_reserved_revision(store, directory, identity, redaction_profile)?
+    {
+        return Err(invalid_data("local observation journal binding mismatch"));
+    }
+    SourceMetadata::new_with_redaction_profile(
+        identity.node_id().clone(),
+        SourceKind::Local,
+        &pending.display_label,
+        redaction_profile,
+    )?;
+    let metadata = store.load_source_metadata(identity.node_id())?;
+    if metadata.kind() != SourceKind::Local || metadata.display_label() != pending.display_label {
+        return Err(invalid_data("local observation journal metadata mismatch"));
+    }
+    for point in &pending.account_points {
+        validate_account_quota_point(point)?;
+    }
+    let mut buckets = BTreeSet::new();
+    for record in &pending.bucket_records {
+        record.validate()?;
+        if record.revision() != revision || !buckets.insert(record.starts_at()) {
+            return Err(invalid_data(
+                "local observation journal has conflicting bucket records",
+            ));
+        }
+    }
+    let mut weekly = BTreeSet::new();
+    for record in &pending.weekly_records {
+        record.validate()?;
+        if record.revision() != revision
+            || !weekly.insert((record.observed_at(), record.resets_at()))
+        {
+            return Err(invalid_data(
+                "local observation journal has conflicting weekly records",
+            ));
+        }
+    }
+    let mut digests = BTreeSet::new();
+    for record in &pending.session_digest_records {
+        record.validate()?;
+        if record.revision() != revision
+            || !digests.insert((record.thread_id(), record.range_start()))
+        {
+            return Err(invalid_data(
+                "local observation journal has conflicting digest records",
+            ));
+        }
+        if let SourceSessionDigestChange::Upsert(digest) = record.change()
+            && digest.replica().source_id() != identity.node_id()
+        {
+            return Err(invalid_data(
+                "local observation journal digest source mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_pending_observation(store: &SourceHistoryStore, directory: &Path) -> io::Result<()> {
+    store.validate_private_path(directory)?;
+    let path = directory.join(JOURNAL_FILE);
+    validate_published_private_file(&path)?;
+    fs::remove_file(path)?;
+    sync_directory(directory)
 }
 
 fn reserve_revision(
@@ -1566,6 +1876,433 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_local_observation_retries_each_family_without_duplicate_records() {
+        for (stage_index, stage) in [
+            "revision",
+            "account",
+            "buckets",
+            "weekly",
+            "session_digests",
+            "metadata",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            with_writer(|identity, history, writer| {
+                let starts_at = at(30, 12, 0);
+                let observation = |total| HistoryObservation {
+                    observed_at: starts_at + Duration::minutes(15),
+                    quota_points: vec![QuotaPoint {
+                        observed_at: starts_at,
+                        limit_id: "codex".to_string(),
+                        duration_mins: 10_080,
+                        resets_at: starts_at + Duration::days(7),
+                        used_percent: total as f64,
+                        remaining_percent: 100.0 - total as f64,
+                        provenance: crate::domain::Provenance::ServerSnapshot,
+                    }],
+                    half_hour_buckets: vec![bucket(starts_at, total)],
+                    weekly_local_points: vec![weekly(starts_at, total)],
+                };
+                let write = |total| {
+                    writer.record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation(total),
+                        LocalObservationMode::Incremental,
+                        &[session_digest(
+                            identity,
+                            "thread-one",
+                            starts_at,
+                            'a',
+                            total,
+                        )],
+                        true,
+                    )
+                };
+                assert_eq!(write(10).unwrap().revision, 1);
+
+                inject_local_observation_failure_after(stage);
+                let error = write(20).unwrap_err();
+                assert_eq!(error.to_string(), format!("injected failure after {stage}"));
+                let reopened = SourceHistoryStore::new(
+                    history.state_root().to_owned(),
+                    history.profile_id().clone(),
+                );
+                assert_eq!(
+                    reopened
+                        .load_local_observation_revision(identity, RedactionProfile::Redacted,)
+                        .unwrap(),
+                    2
+                );
+                let snapshot = reopened.load_local_observation_snapshot_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                    true,
+                );
+                if stage_index == 0 {
+                    // Reserving a number alone has not changed any family.
+                    assert_eq!(snapshot.unwrap().buckets[0].token_usage.total_tokens, 10);
+                } else {
+                    assert!(
+                        is_local_observation_recovery_pending(&snapshot.unwrap_err()),
+                        "{stage}"
+                    );
+                }
+                // Account samples are an independent global series; they
+                // remain readable even while the local combination is fenced.
+                let account = reopened.load_account_since(starts_at).unwrap();
+                assert_eq!(account.quota_points.len(), 1);
+                assert_eq!(
+                    account.quota_points[0].used_percent,
+                    if stage_index == 0 { 10.0 } else { 20.0 }
+                );
+
+                let retry = write(20).unwrap();
+                assert_eq!(retry.revision, 3);
+                assert_eq!(retry.recovered_pending, stage_index > 0);
+                assert_eq!(retry.buckets.shards_written, usize::from(stage_index < 2));
+                assert_eq!(retry.weekly.shards_written, usize::from(stage_index < 3));
+                assert_eq!(
+                    retry.session_digests.shards_written,
+                    usize::from(stage_index < 4)
+                );
+                let snapshot = reopened
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(snapshot.buckets.len(), 1);
+                assert_eq!(snapshot.buckets[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.weekly_local_points.len(), 1);
+                assert_eq!(snapshot.weekly_local_points[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.session_digest_records.len(), 1);
+                assert_eq!(
+                    snapshot.session_digest_records[0].revision(),
+                    if stage_index == 0 { 3 } else { 2 }
+                );
+                let SourceSessionDigestChange::Upsert(digest) =
+                    snapshot.session_digest_records[0].change()
+                else {
+                    panic!("retry must preserve the digest upsert");
+                };
+                assert_eq!(digest.metrics().token_usage.total_tokens, 20);
+                let replay = write(20).unwrap();
+                assert_eq!(replay.revision, 4);
+                assert!(!replay.recovered_pending);
+                assert_eq!(replay.buckets.shards_written, 0);
+                assert_eq!(replay.weekly.shards_written, 0);
+                assert_eq!(replay.session_digests.shards_written, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn pending_observation_recovers_before_empty_or_partial_new_input() {
+        for add_partial_bucket in [false, true] {
+            with_writer(|identity, history, writer| {
+                let starts_at = at(30, 12, 0);
+                let observation = HistoryObservation {
+                    observed_at: starts_at + Duration::minutes(15),
+                    half_hour_buckets: vec![bucket(starts_at, 20)],
+                    weekly_local_points: vec![weekly(starts_at, 20)],
+                    ..HistoryObservation::default()
+                };
+                inject_local_observation_failure_after("buckets");
+                assert!(
+                    writer
+                        .record_local_observation_with_session_digests(
+                            identity,
+                            "local",
+                            RedactionProfile::Redacted,
+                            &observation,
+                            LocalObservationMode::Incremental,
+                            &[session_digest(identity, "thread-one", starts_at, 'a', 20)],
+                            true,
+                        )
+                        .is_err()
+                );
+                let next = HistoryObservation {
+                    observed_at: starts_at + Duration::hours(1),
+                    half_hour_buckets: if add_partial_bucket {
+                        vec![bucket(starts_at + Duration::minutes(30), 5)]
+                    } else {
+                        Vec::new()
+                    },
+                    ..HistoryObservation::default()
+                };
+                let write_next = || {
+                    writer.record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &next,
+                        LocalObservationMode::Incremental,
+                    )
+                };
+                inject_local_observation_failure_after("recovery_buckets");
+                assert!(write_next().is_err());
+                assert!(is_local_observation_recovery_pending(
+                    &history
+                        .load_local_observation_snapshot_since(
+                            identity.node_id(),
+                            RedactionProfile::Redacted,
+                            starts_at,
+                            true,
+                        )
+                        .unwrap_err()
+                ));
+                assert_eq!(
+                    history
+                        .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                        .unwrap(),
+                    1
+                );
+
+                let report = write_next().unwrap();
+                assert_eq!(report.revision, 2);
+                assert!(report.recovered_pending);
+                let snapshot = history
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(snapshot.buckets.len(), 1 + usize::from(add_partial_bucket));
+                assert_eq!(snapshot.buckets[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.weekly_local_points[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.session_digest_records[0].revision(), 1);
+                let SourceSessionDigestChange::Upsert(digest) =
+                    snapshot.session_digest_records[0].change()
+                else {
+                    panic!("the original pending digest must be recovered");
+                };
+                assert_eq!(digest.metrics().token_usage.total_tokens, 20);
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_pending_observation_never_replays_an_earlier_family() {
+        for corruption in [
+            "version",
+            "profile",
+            "source",
+            "generation",
+            "redaction",
+            "revision",
+            "digest_source",
+            "digest_key",
+            "oversized",
+        ] {
+            with_writer(|identity, history, writer| {
+                let starts_at = at(30, 12, 0);
+                let write = |total| {
+                    writer.record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &HistoryObservation {
+                            observed_at: starts_at + Duration::minutes(15),
+                            quota_points: vec![QuotaPoint {
+                                observed_at: starts_at,
+                                limit_id: "codex".to_string(),
+                                duration_mins: 10_080,
+                                resets_at: starts_at + Duration::days(7),
+                                used_percent: total as f64,
+                                remaining_percent: 100.0 - total as f64,
+                                provenance: crate::domain::Provenance::ServerSnapshot,
+                            }],
+                            half_hour_buckets: vec![bucket(starts_at, total)],
+                            weekly_local_points: vec![weekly(starts_at, total)],
+                        },
+                        LocalObservationMode::Incremental,
+                        &[session_digest(
+                            identity,
+                            "thread-one",
+                            starts_at,
+                            'a',
+                            total,
+                        )],
+                        true,
+                    )
+                };
+                write(10).unwrap();
+                inject_local_observation_failure_after("account");
+                assert!(write(20).is_err());
+                let read_families = || {
+                    (
+                        history.load_account_since(starts_at).unwrap(),
+                        history
+                            .load_source_records_since(
+                                identity.node_id(),
+                                RedactionProfile::Redacted,
+                                starts_at,
+                            )
+                            .unwrap(),
+                        history
+                            .load_source_session_digest_records_since(
+                                identity.node_id(),
+                                RedactionProfile::Redacted,
+                                starts_at,
+                            )
+                            .unwrap(),
+                    )
+                };
+                let before = read_families();
+                let path =
+                    local_state_directory(history, identity.node_id(), RedactionProfile::Redacted)
+                        .join(JOURNAL_FILE);
+                let mut pending =
+                    read_optional_json_file::<PendingLocalObservation>(&path, MAX_JOURNAL_BYTES)
+                        .unwrap()
+                        .unwrap();
+                // A wrongly ordered replay would mutate this global account
+                // point before noticing the invalid final-family record.
+                pending.account_points[0].used_percent = 90.0;
+                pending.account_points[0].remaining_percent = 10.0;
+                match corruption {
+                    "version" => pending.binding.format_version += 1,
+                    "profile" => pending.binding.profile_id = "fedcba9876543210".parse().unwrap(),
+                    "source" => {
+                        pending.binding.source_id =
+                            "node-fedcba9876543210fedcba9876543210".parse().unwrap()
+                    }
+                    "generation" => pending.binding.source_generation += 1,
+                    "redaction" => {
+                        pending.binding.redaction_profile = RedactionProfile::PreviewEnabled
+                    }
+                    "revision" => pending.binding.last_reserved_revision += 1,
+                    "digest_source" => {
+                        let other = SourceIdentity::from_test_parts(
+                            "node-fedcba9876543210fedcba9876543210".parse().unwrap(),
+                            SECRET,
+                        );
+                        pending.session_digest_records[0] = SourceSessionDigestRecord::upsert(
+                            2,
+                            session_digest(&other, "thread-one", starts_at, 'a', 20),
+                        )
+                        .unwrap();
+                    }
+                    "digest_key" => pending.session_digest_records.push(
+                        SourceSessionDigestRecord::tombstone(
+                            "thread-one".parse().unwrap(),
+                            starts_at,
+                            starts_at + Duration::days(2),
+                            starts_at,
+                            2,
+                        )
+                        .unwrap(),
+                    ),
+                    "oversized" => {}
+                    _ => unreachable!(),
+                }
+                write_private_atomically(
+                    &path,
+                    &encode_pretty_bounded(&pending, MAX_JOURNAL_BYTES).unwrap(),
+                )
+                .unwrap();
+                if corruption == "oversized" {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(MAX_JOURNAL_BYTES + 1)
+                        .unwrap();
+                }
+                assert!(write(20).is_err(), "{corruption}");
+                assert_eq!(
+                    read_families(),
+                    before,
+                    "{corruption} must be rejected before replaying any family"
+                );
+                assert!(path.exists());
+            });
+        }
+    }
+
+    #[test]
+    fn interrupted_reconcile_replays_tombstones_before_new_incremental_input() {
+        with_writer(|identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            writer
+                .record_local_observation_with_session_digests(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: starts_at + Duration::minutes(15),
+                        half_hour_buckets: vec![bucket(starts_at, 20)],
+                        weekly_local_points: vec![weekly(starts_at, 20)],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                    &[session_digest(identity, "thread-one", starts_at, 'a', 20)],
+                    true,
+                )
+                .unwrap();
+            let empty = HistoryObservation {
+                observed_at: starts_at + Duration::days(1),
+                ..HistoryObservation::default()
+            };
+            inject_local_observation_failure_after("buckets");
+            assert!(
+                writer
+                    .record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &empty,
+                        LocalObservationMode::Reconcile {
+                            from: starts_at,
+                            to: empty.observed_at
+                        },
+                        &[],
+                        true,
+                    )
+                    .is_err()
+            );
+            let report = writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &empty,
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            assert!(report.recovered_pending);
+            assert_eq!(report.revision, 3);
+            assert_eq!(report.bucket_tombstones, 1);
+            assert_eq!(report.weekly_tombstones, 1);
+            assert_eq!(report.session_digest_tombstones, 1);
+            let snapshot = history
+                .load_local_observation_snapshot_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                    true,
+                )
+                .unwrap();
+            assert!(snapshot.buckets.is_empty());
+            assert!(snapshot.weekly_local_points.is_empty());
+            assert_eq!(snapshot.session_digest_records.len(), 1);
+            assert_eq!(snapshot.session_digest_records[0].revision(), 2);
+            assert!(matches!(
+                snapshot.session_digest_records[0].change(),
+                SourceSessionDigestChange::Tombstone
+            ));
+        });
+    }
+
+    #[test]
     fn combined_local_snapshot_locks_before_the_first_profile_observation() {
         with_writer(|identity, history, _writer| {
             prepare_local_metadata(history, identity, "local", RedactionProfile::Redacted).unwrap();
@@ -1962,6 +2699,33 @@ mod tests {
                 half_hour_buckets: vec![private_bucket],
                 ..HistoryObservation::default()
             };
+            inject_local_observation_failure_after("account");
+            assert!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                    )
+                    .is_err()
+            );
+            let journal_path =
+                local_state_directory(history, identity.node_id(), RedactionProfile::Redacted)
+                    .join(JOURNAL_FILE);
+            let journal = fs::read_to_string(&journal_path).unwrap();
+            assert!(journal.contains("[redacted]"));
+            assert!(!journal.contains("private customer title"));
+            assert!(!journal.contains("rotate the private credential"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&journal_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
             writer
                 .record_local_observation(
                     identity,
@@ -1971,6 +2735,7 @@ mod tests {
                     LocalObservationMode::Incremental,
                 )
                 .unwrap();
+            assert!(!journal_path.exists());
 
             // Sanitizing the persisted clone must not mutate the collector's
             // in-memory observation.

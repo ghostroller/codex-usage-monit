@@ -10667,6 +10667,13 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
         tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(gc_change)))),
         TuiHistoryCacheEffect::Invalidate
     );
+    let mut recovered_change = report.clone();
+    recovered_change.recovered_pending = true;
+    assert_eq!(
+        tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(recovered_change)))),
+        TuiHistoryCacheEffect::Invalidate,
+        "clearing a pending journal changes visibility even when every shard is a no-op"
+    );
 
     let mut mapping_changed = rebased_revision.clone();
     mapping_changed.project_mapping_revision =
@@ -10710,6 +10717,75 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
         store.projection_cache.is_none(),
         "a query whose revision changed before publication must not be cached"
     );
+}
+
+#[test]
+fn v2_projection_cache_reloads_after_metadata_only_journal_recovery() {
+    for exact_local in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let mut runtime = HistoryRuntime::new(
+            directory.path().join("state/history-v1"),
+            &codex_home,
+            false,
+        )
+        .unwrap();
+        let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+        let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+        let now = starts_at + ChronoDuration::minutes(20);
+        assert!(matches!(
+            prepare_tui_history_runtime(&mut runtime, &profile_lease, now),
+            TuiHistoryRuntimePreparation::Ready(_)
+        ));
+        let selection = if exact_local {
+            HistorySourceSelection::Local(runtime.source_identity().node_id().clone())
+        } else {
+            HistorySourceSelection::AllIncluded
+        };
+        let mut observation = tui_runtime_test_observation(starts_at, 20);
+        observation.half_hour_buckets[0].project_groups.clear();
+        // Every family is durable, but the journal still fences the combined
+        // read. Recovery will change visibility without rewriting any shard.
+        crate::source_history::inject_local_observation_failure_after("metadata");
+        runtime
+            .record_local_observation(&observation, LocalObservationMode::Incremental)
+            .unwrap_err();
+        let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
+        let since = history_view_since(now);
+        let pending = store.load_since_with_staged_selected(&selection, since);
+        assert!(pending.history.half_hour_buckets.is_empty());
+        assert!(pending.history.warnings.iter().any(|warning| {
+            warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
+        }));
+        assert!(store.projection_cache_valid(&selection, since, false));
+
+        let (recovered, _) = stage_and_load_history_selected_with_mode(
+            &mut store,
+            &observation,
+            &[],
+            &LocalSessionDigestEvidence::default(),
+            now,
+            &PerfLog::default(),
+            TuiHistoryStageMode::Incremental { force_flush: true },
+            &selection,
+        );
+        assert_eq!(recovered.history.half_hour_buckets.len(), 1);
+        assert_eq!(
+            recovered.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert!(recovered.status.is_some_and(|status| status.is_applied()));
+        assert!(recovered.history.warnings.iter().all(|warning| {
+            !warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
+        }));
+        assert_eq!(
+            store.projection_cache_delivery_clones, 0,
+            "recovery must reload immediately without serving the cached pending projection"
+        );
+    }
 }
 
 #[test]

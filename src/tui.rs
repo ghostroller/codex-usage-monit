@@ -9010,7 +9010,10 @@ fn tui_history_cache_effect(
                 .saturating_add(report.weekly.shards_written)
                 .saturating_add(report.session_digests.shards_written)
                 .saturating_add(report.garbage_collection.shards_pruned);
-            if shards_written == 0 && report.garbage_collection.warning.is_none() {
+            if shards_written == 0
+                && !report.recovered_pending
+                && report.garbage_collection.warning.is_none()
+            {
                 TuiHistoryCacheEffect::RebaseRevision
             } else {
                 TuiHistoryCacheEffect::Invalidate

@@ -31,9 +31,10 @@ use crate::project_mapping::{ProjectMappingProjection, ProjectMappingStore};
 #[cfg(test)]
 use crate::source_history::UsageEventFact;
 use crate::source_history::{
-    ActiveFactSet, RedactionProfile, SessionUsageMetrics, SourceBucketChange,
-    SourceHistoryReadBudget, SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind,
-    SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
+    ActiveFactSet, LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING, RedactionProfile,
+    SessionUsageMetrics, SourceBucketChange, SourceHistoryReadBudget, SourceHistoryRemoteActiveRef,
+    SourceHistoryStore, SourceKind, SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
+    is_local_observation_recovery_pending,
 };
 use crate::source_identity::NodeId;
 #[cfg(test)]
@@ -170,6 +171,7 @@ pub enum HistorySourceUnavailableReason {
     KindMismatch,
     LocalIdentityMismatch,
     UnsupportedByLegacy,
+    LocalObservationPending,
 }
 
 impl HistorySourceUnavailableReason {
@@ -180,6 +182,7 @@ impl HistorySourceUnavailableReason {
             Self::KindMismatch => "kind_mismatch",
             Self::LocalIdentityMismatch => "local_identity_mismatch",
             Self::UnsupportedByLegacy => "unsupported_by_legacy",
+            Self::LocalObservationPending => "local_observation_pending",
         }
     }
 }
@@ -723,6 +726,7 @@ fn load_v2_history_since_inner(
     let mut included_sources = Vec::new();
     let mut redaction_skipped_sources = Vec::new();
     let mut model_catalog_mismatch_sources = Vec::new();
+    let mut local_recovery_pending_sources = Vec::new();
     let mut source_selection_status = HistorySourceSelectionStatus::Applied;
     let detect_replicas = matches!(selection, HistorySourceSelection::AllIncluded);
 
@@ -803,13 +807,27 @@ fn load_v2_history_since_inner(
             let (mut buckets, weekly_local_points, digest_records, active_remote_ref) =
                 match metadata.kind() {
                     SourceKind::Local => {
-                        let snapshot = store.load_local_observation_snapshot_since_with_budget(
-                            metadata.source_id(),
-                            source_redaction,
-                            evidence_since,
-                            detect_replicas,
-                            read_budget,
-                        )?;
+                        let snapshot = match store
+                            .load_local_observation_snapshot_since_with_budget(
+                                metadata.source_id(),
+                                source_redaction,
+                                evidence_since,
+                                detect_replicas,
+                                read_budget,
+                            ) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) if is_local_observation_recovery_pending(&error) => {
+                                local_recovery_pending_sources.push(metadata.source_id().clone());
+                                if selection.source_id() == Some(metadata.source_id()) {
+                                    source_selection_status =
+                                        HistorySourceSelectionStatus::Unavailable(
+                                            HistorySourceUnavailableReason::LocalObservationPending,
+                                        );
+                                }
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         if snapshot.source != *metadata {
                             return Ok(None);
                         }
@@ -1016,6 +1034,12 @@ fn load_v2_history_since_inner(
         history.summary_backfill_attempt_complete = Some(marker.complete);
     }
     history.warnings.extend(replica_report.warnings);
+    for source_id in &local_recovery_pending_sources {
+        history.warnings.push(format!(
+            "{LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING}:{}",
+            source_id.as_str()
+        ));
+    }
     for source_id in &model_catalog_mismatch_sources {
         history.warnings.push(format!(
             "{REMOTE_MODEL_CATALOG_MISMATCH_WARNING}:{}",
@@ -4009,6 +4033,85 @@ mod tests {
         );
         assert!(stale_local.history.half_hour_buckets.is_empty());
         assert_eq!(stale_local.history.quota_points.len(), 1);
+    }
+
+    #[test]
+    fn pending_local_observation_keeps_other_sources_and_global_quota_readable() {
+        use crate::source_history::{LocalObservationMode, inject_local_observation_failure_after};
+        use crate::source_identity::SourceIdentity;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, source_history) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex-home"),
+            RedactionProfile::Redacted,
+        );
+        let active = activate_v2(&ownership);
+        let starts_at = at(2, 10, 0);
+        let remote = source(
+            SOURCE_B,
+            "remote",
+            SourceKind::Ssh,
+            RedactionProfile::Redacted,
+        );
+        install_remote_bucket(&ownership, &source_history, &active, &remote, starts_at, 30);
+        let identity = SourceIdentity::from_test_parts(
+            SOURCE_A.parse().unwrap(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        {
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+            let writer = source_history.writer(&authority).unwrap();
+            inject_local_observation_failure_after("buckets");
+            assert!(
+                writer
+                    .record_local_observation(
+                        &identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &HistoryObservation {
+                            observed_at: starts_at,
+                            quota_points: vec![quota(starts_at, at(8, 0, 0))],
+                            half_hour_buckets: vec![bucket(starts_at, 20, "local")],
+                            ..HistoryObservation::default()
+                        },
+                        LocalObservationMode::Incremental,
+                    )
+                    .is_err()
+            );
+        }
+        let all = load_unified_history_since(&ownership, &mut legacy, &source_history, starts_at)
+            .unwrap();
+        assert_eq!(all.included_sources, vec![remote.source_id().clone()]);
+        assert_eq!(
+            all.history.half_hour_buckets[0].token_usage.total_tokens,
+            30
+        );
+        assert_eq!(all.history.quota_points.len(), 1);
+        assert!(all.history.warnings.contains(&format!(
+            "{LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING}:{}",
+            identity.node_id()
+        )));
+
+        let selected = load_unified_history_since_selected(
+            &ownership,
+            &mut legacy,
+            &source_history,
+            identity.node_id(),
+            &HistorySourceSelection::Local(identity.node_id().clone()),
+            starts_at,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.source_selection_status,
+            HistorySourceSelectionStatus::Unavailable(
+                HistorySourceUnavailableReason::LocalObservationPending,
+            )
+        );
+        assert!(selected.included_sources.is_empty());
+        assert!(selected.history.half_hour_buckets.is_empty());
+        assert_eq!(selected.history.quota_points.len(), 1);
     }
 
     #[test]

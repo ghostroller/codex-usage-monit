@@ -630,7 +630,7 @@ impl SourceSessionDigestRecord {
         &self.change
     }
 
-    fn validate(&self) -> io::Result<()> {
+    pub(super) fn validate(&self) -> io::Result<()> {
         if self.revision == 0 {
             return Err(invalid_data("session digest revision must be nonzero"));
         }
@@ -4027,10 +4027,7 @@ mod tests {
         // One lookup per change plus one insertion per new ID. Count actual
         // hash computations, independent of wall time and machine speed.
         let hashes = hasher.0.load(Ordering::Relaxed);
-        assert!(
-            (COUNT * 3..=COUNT * 4).contains(&hashes),
-            "{hashes} hashes"
-        );
+        assert!((COUNT * 3..=COUNT * 4).contains(&hashes), "{hashes} hashes");
         assert!(records.iter().all(|record| record.revision == 2));
     }
 
