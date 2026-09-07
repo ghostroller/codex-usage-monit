@@ -507,7 +507,12 @@ fn reproject_cached_windows(snapshot: &mut Snapshot) -> bool {
             mark_account_reprojection_pending(analysis);
             return true;
         };
-        let starts_at = resets_at - Duration::minutes(analysis.duration_mins);
+        let Some(starts_at) = Duration::try_minutes(analysis.duration_mins)
+            .and_then(|duration| resets_at.checked_sub_signed(duration))
+        else {
+            mark_account_reprojection_pending(analysis);
+            return true;
+        };
         if starts_at != previous_window.starts_at || resets_at != previous_window.ends_at {
             // Aggregated calls cannot be clipped safely without the cached
             // rollout event set. Never attach the previous cycle's token/API
@@ -1754,6 +1759,56 @@ mod tests {
         assert!(refreshed.snapshot.window_analyses.is_empty());
         assert!(refreshed.snapshot.models.is_empty());
         assert!(refreshed.snapshot.api_equivalent_cost.is_none());
+    }
+
+    #[test]
+    fn account_only_refresh_rejects_unrepresentable_cached_window_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let now = Utc::now();
+        let reset = now + Duration::hours(2);
+        let calls = vec![usage_call(
+            now - Duration::minutes(1),
+            "thread",
+            "turn",
+            "gpt-5.6-sol",
+            100,
+        )];
+        let mut cache = RolloutCache::new();
+        let empty = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
+
+        for (duration_mins, invalid_reset) in [(300, DateTime::<Utc>::MIN_UTC), (i64::MAX, reset)] {
+            let mut local = empty.clone();
+            local.limits = vec![weekly_limit(now, reset, "codex", 20.0)];
+            local.window_analyses = analyze_windows(&[], &[], &calls, &[], &local.limits, now);
+            let previous_window = local.window_analyses[0].attribution.window.clone();
+            local.window_analyses[0].duration_mins = duration_mins;
+            local.limits[0].secondary = Some(LimitWindow::new(
+                35.0,
+                Some(duration_mins),
+                Some(invalid_reset),
+            ));
+
+            assert!(!reproject_cached_windows(&mut local));
+
+            let base = &local.window_analyses[0];
+            for analysis in [base, base.api_long_context.as_deref().unwrap()] {
+                assert!(analysis.partial);
+                assert!(
+                    analysis
+                        .partial_reasons
+                        .iter()
+                        .any(|reason| { reason == "account_window_changed_pending_local_refresh" })
+                );
+                assert_eq!(analysis.attribution.window, previous_window);
+                assert_close(analysis.threads[0].usage.estimated_quota_percent, 20.0);
+            }
+        }
     }
 
     #[test]
