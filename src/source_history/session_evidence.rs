@@ -1555,6 +1555,13 @@ impl SourceHistoryStore {
                 .transpose()?
                 .unwrap_or_default(),
         };
+        // Records only append or replace until the final sort; indices remain
+        // stable across the entire batch, including repeated incoming IDs.
+        let mut record_index = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.event_id.clone(), index))
+            .collect::<HashMap<_, _>>();
         for change in batch.changes.iter().cloned() {
             validate_fact_record_namespace(&change, &batch.replica)?;
             if retained_since.is_some_and(|cutoff| change.occurred_at() < cutoff) {
@@ -1564,7 +1571,7 @@ impl SourceHistoryStore {
                 // resurrect after its record was pruned.
                 continue;
             }
-            let _ = apply_fact_record(&mut records, change)?;
+            let _ = apply_fact_record(&mut records, &mut record_index, change)?;
         }
         sort_fact_records(&mut records);
         validate_fact_generation_limits(&records)?;
@@ -2524,15 +2531,14 @@ fn validate_fact_remote_binding(
     }
 }
 
-fn apply_fact_record(
+fn apply_fact_record<S: std::hash::BuildHasher>(
     records: &mut Vec<UsageEventFactRecord>,
+    record_index: &mut HashMap<UsageEventId, usize, S>,
     incoming: UsageEventFactRecord,
 ) -> io::Result<bool> {
     incoming.validate()?;
-    let Some(index) = records
-        .iter()
-        .position(|record| record.event_id == incoming.event_id)
-    else {
+    let Some(&index) = record_index.get(&incoming.event_id) else {
+        record_index.insert(incoming.event_id.clone(), records.len());
         records.push(incoming);
         return Ok(true);
     };
@@ -3938,6 +3944,94 @@ mod tests {
         total: u64,
     ) -> UsageEventFact {
         fact_with_project(thread_id, event_id, occurred_at, total, project('c'))
+    }
+
+    #[test]
+    fn indexed_fact_merge_preserves_revision_conflict_and_tombstone_rules() {
+        let occurred_at = at(8, 27, 1);
+        let initial =
+            UsageEventFactRecord::upsert(1, fact("thread-a", "event-1", occurred_at, 10)).unwrap();
+        let mut records = Vec::new();
+        let mut index = HashMap::new();
+        assert!(apply_fact_record(&mut records, &mut index, initial.clone()).unwrap());
+        assert!(!apply_fact_record(&mut records, &mut index, initial.clone()).unwrap());
+        let conflict =
+            UsageEventFactRecord::upsert(1, fact("thread-a", "event-1", occurred_at, 20)).unwrap();
+        assert!(apply_fact_record(&mut records, &mut index, conflict).is_err());
+        let updated =
+            UsageEventFactRecord::upsert(2, fact("thread-a", "event-1", occurred_at, 20)).unwrap();
+        assert!(apply_fact_record(&mut records, &mut index, updated.clone()).unwrap());
+        assert!(!apply_fact_record(&mut records, &mut index, initial).unwrap());
+        let moved = UsageEventFactRecord::tombstone(
+            "event-1".parse().unwrap(),
+            occurred_at + Duration::seconds(1),
+            3,
+        )
+        .unwrap();
+        assert!(apply_fact_record(&mut records, &mut index, moved).is_err());
+        let deleted =
+            UsageEventFactRecord::tombstone("event-1".parse().unwrap(), occurred_at, 3).unwrap();
+        assert!(apply_fact_record(&mut records, &mut index, deleted.clone()).unwrap());
+        assert!(!apply_fact_record(&mut records, &mut index, deleted.clone()).unwrap());
+        assert!(!apply_fact_record(&mut records, &mut index, updated).unwrap());
+        assert_eq!(records, vec![deleted]);
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn indexed_fact_merge_uses_linear_hash_lookups_for_large_batches() {
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Clone, Default)]
+        struct CountedBuildHasher(Arc<AtomicUsize>);
+        struct CountedHasher(std::collections::hash_map::DefaultHasher, Arc<AtomicUsize>);
+        impl Hasher for CountedHasher {
+            fn finish(&self) -> u64 {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.finish()
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.write(bytes);
+            }
+        }
+        impl BuildHasher for CountedBuildHasher {
+            type Hasher = CountedHasher;
+            fn build_hasher(&self) -> Self::Hasher {
+                CountedHasher(
+                    std::collections::hash_map::DefaultHasher::new(),
+                    self.0.clone(),
+                )
+            }
+        }
+        const COUNT: usize = 20_000;
+        let hasher = CountedBuildHasher::default();
+        let mut index = HashMap::with_capacity_and_hasher(COUNT, hasher.clone());
+        let mut records = Vec::new();
+        for (pass, revision) in [1, 2, 2].into_iter().enumerate() {
+            for event in 0..COUNT {
+                let record = UsageEventFactRecord::tombstone(
+                    format!("event-{event}").parse().unwrap(),
+                    at(8, 27, 1),
+                    revision,
+                )
+                .unwrap();
+                let changed = apply_fact_record(&mut records, &mut index, record).unwrap();
+                assert_eq!(changed, pass < 2);
+            }
+        }
+        assert_eq!(records.len(), COUNT);
+        // One lookup per change plus one insertion per new ID. Count actual
+        // hash computations, independent of wall time and machine speed.
+        let hashes = hasher.0.load(Ordering::Relaxed);
+        assert!(
+            hashes >= COUNT * 3 && hashes <= COUNT * 4,
+            "{hashes} hashes"
+        );
+        assert!(records.iter().all(|record| record.revision == 2));
     }
 
     fn fact_with_project(
