@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -27,6 +27,8 @@ struct PtySession {
 
 impl PtySession {
     fn spawn() -> Self {
+        // NativePtySystem uses ConPTY on Windows, so the same interaction
+        // contract is exercised by all three platform verification jobs.
         let system = NativePtySystem::default();
         let pair = system.openpty(START_SIZE).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_codex-usage-monit"));
@@ -203,6 +205,7 @@ impl PtySession {
         }
     }
 
+    #[cfg(unix)]
     fn signal_and_wait_for_exit(&mut self, signal: libc::c_int) -> Vec<u8> {
         let process_id = self
             .child
@@ -375,6 +378,7 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     session.wait_for_exit();
 }
 
+#[cfg(unix)]
 #[test]
 fn termination_signals_restore_terminal_modes_before_exiting() {
     for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
