@@ -631,8 +631,6 @@ pub(crate) fn sweep_old_revision_state(
             .to_str()
             .ok_or_else(|| invalid_revision_data("remote export revision name is not UTF-8"))?
             .to_owned();
-        #[cfg(test)]
-        eprintln!("revision GC candidate name: {name}");
         let retired = validate_revision_directory_name(&name)?;
         candidates.push(scan_old_revision_candidate(path, retired, now)?);
     }

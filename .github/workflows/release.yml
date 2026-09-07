@@ -53,13 +53,11 @@ jobs:
 
       - name: Install Rust toolchain
         shell: pwsh
-        run: rustup toolchain install 1.97.0 --profile minimal --component clippy
+        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
 
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run Rust tests
-        run: cargo test --locked --all-targets
+      - name: Run Windows verification pipeline
+        shell: pwsh
+        run: .\scripts\windows\verify.ps1
 
   build:
     name: Build ${{ matrix.target }}

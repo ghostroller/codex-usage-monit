@@ -3252,7 +3252,7 @@ fn parse_windows_task_xml(document: &str) -> Result<ParsedWindowsTaskXml> {
 
 fn decode_windows_task_xml(contents: &[u8]) -> Result<String> {
     if let Some(bytes) = contents.strip_prefix(&[0xff, 0xfe]) {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             bail!("Task Scheduler returned truncated UTF-16LE XML");
         }
         let units = bytes
@@ -3262,7 +3262,7 @@ fn decode_windows_task_xml(contents: &[u8]) -> Result<String> {
         return String::from_utf16(&units).context("Task Scheduler returned invalid UTF-16LE XML");
     }
     if let Some(bytes) = contents.strip_prefix(&[0xfe, 0xff]) {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             bail!("Task Scheduler returned truncated UTF-16BE XML");
         }
         let units = bytes
