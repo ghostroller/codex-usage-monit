@@ -4028,7 +4028,7 @@ mod tests {
         // hash computations, independent of wall time and machine speed.
         let hashes = hasher.0.load(Ordering::Relaxed);
         assert!(
-            hashes >= COUNT * 3 && hashes <= COUNT * 4,
+            (COUNT * 3..=COUNT * 4).contains(&hashes),
             "{hashes} hashes"
         );
         assert!(records.iter().all(|record| record.revision == 2));
