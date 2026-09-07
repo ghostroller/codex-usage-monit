@@ -1,81 +1,29 @@
 name: CI
+run-name: CI / ${{ inputs.expected_sha }}
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full commit SHA at the selected branch head
+        required: true
+        type: string
+      local_results:
+        description: Local Linux/Windows results and log paths, or explicit blockers
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  verify:
-    name: Verify Linux
-    runs-on: ubuntu-22.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run Rust tests
-        run: cargo test --locked --all-targets
-
-      - name: Verify published TUI preview
-        run: sh scripts/update-tui-preview.sh --check
-
-      - name: Upload TUI layout gallery
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tui-layout-gallery
-          path: target/tui-gallery/*.svg
-          if-no-files-found: warn
-
-      - name: Run installer tests
-        run: sh tests/install.sh
-
-  verify-macos:
-    name: Verify macOS
-    runs-on: macos-15
-    timeout-minutes: 25
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run native Rust and PTY tests
-        run: cargo test --locked --all-targets
-
-      - name: Run installer tests
-        run: sh tests/install.sh
-
-  verify-windows:
-    name: Verify Windows
-    runs-on: windows-2025
-    timeout-minutes: 25
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        shell: pwsh
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-
-      - name: Run Windows verification pipeline
-        shell: pwsh
-        run: .\scripts\windows\verify.ps1
+  verification:
+    name: Verify checkpoint
+    uses: ./.github/workflows/verify.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
+      local_results: ${{ inputs.local_results }}

@@ -13,16 +13,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify:
-    name: Verify release
+  validate-tag:
+    name: Validate release tag
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - name: Check out repository
+      - name: Check out tagged source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
+        with:
+          ref: ${{ github.sha }}
 
       - name: Match tag to Cargo package version
         shell: bash
@@ -31,60 +30,16 @@ jobs:
           test -n "$package_version"
           test "$GITHUB_REF_NAME" = "v$package_version"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run Rust tests
-        run: cargo test --locked --all-targets
-
-      - name: Run installer tests
-        run: sh tests/install.sh
-
-  verify-macos:
-    name: Verify release on macOS
-    runs-on: macos-15
-    timeout-minutes: 25
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run native Rust and PTY tests
-        run: cargo test --locked --all-targets
-
-      - name: Run installer tests
-        run: sh tests/install.sh
-
-  verify-windows:
-    name: Verify release on Windows
-    runs-on: windows-2025
-    timeout-minutes: 25
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust toolchain
-        shell: pwsh
-        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
-
-      - name: Run Windows verification pipeline
-        shell: pwsh
-        run: .\scripts\windows\verify.ps1
+  verify:
+    name: Verify release
+    needs: validate-tag
+    uses: ./.github/workflows/verify.yml
+    with:
+      expected_sha: ${{ github.sha }}
 
   build:
     name: Build ${{ matrix.target }}
-    needs:
-      - verify
-      - verify-macos
-      - verify-windows
+    needs: verify
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:

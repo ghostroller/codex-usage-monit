@@ -1,12 +1,14 @@
 name: Dependency audit
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   schedule:
     - cron: "23 6 * * 1"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      expected_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,8 +18,20 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
+      - name: Verify the requested commit when called by CI
+        if: inputs.expected_sha != ''
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$EXPECTED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::Dispatched branch moved or expected_sha is invalid."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal
