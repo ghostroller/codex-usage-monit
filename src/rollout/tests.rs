@@ -551,6 +551,57 @@ fn local_coverage_restarts_after_a_gap_longer_than_the_scan_lookback() {
 }
 
 #[test]
+fn nested_rollout_discovery_preserves_the_initial_cumulative_sample() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("08")
+        .join("30");
+    fs::create_dir_all(&sessions).unwrap();
+    let now = Utc::now();
+    let records = [
+        serde_json::json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "session_meta",
+            "payload": {"id": "nested-thread"}
+        }),
+        serde_json::json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 10
+            }}}
+        }),
+    ];
+    let contents = records.map(|record| record.to_string()).join("\n") + "\n";
+    fs::write(sessions.join("rollout.jsonl"), contents).unwrap();
+    let config = CollectConfig {
+        codex_home: temp.path().to_owned(),
+        ..CollectConfig::default()
+    };
+    let mut cache = RolloutCache::new();
+
+    let dataset = cache.scan(&config, now).unwrap();
+
+    assert!(cache.last_refresh().discovery_complete, "{dataset:#?}");
+    assert_eq!(dataset.calls.len(), 1);
+    assert_eq!(dataset.calls[0].tokens.total_tokens, 10);
+    assert_eq!(dataset.stats.ambiguous_token_resets, 0);
+
+    let repeated = cache.scan(&config, now).unwrap();
+    assert!(cache.last_refresh().discovery_cache_hit);
+    assert!(cache.last_refresh().discovery_complete, "{repeated:#?}");
+    assert_eq!(repeated.calls.len(), 1);
+    assert_eq!(repeated.calls[0].tokens.total_tokens, 10);
+}
+
+#[test]
 fn incomplete_discovery_inventory_retries_with_a_bounded_backoff() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");

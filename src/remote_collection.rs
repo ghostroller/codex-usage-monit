@@ -448,7 +448,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(collected.scan_complete);
+        assert!(
+            collected.scan_complete,
+            "collection incomplete: {:?}; warnings: {:?}",
+            collected.partial_reasons, collected.dataset.warnings
+        );
         assert!(collected.cache_refresh.discovery_complete);
         assert!(collected.partial_reasons.is_empty());
         assert_eq!(collected.dataset.tasks.len(), 1);

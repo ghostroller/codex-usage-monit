@@ -2050,8 +2050,11 @@ mod tests {
     #[test]
     fn noncanonical_state_root_is_rejected() {
         let directory = tempdir().unwrap();
-        let state = private_state_root(directory.path());
-        let noncanonical = state.join("..").join("state");
+        let canonical = private_state_root(directory.path());
+        // Build from the original temporary path: pushing `..` onto a Windows
+        // verbatim canonical path normalizes it away before validation.
+        let noncanonical = directory.path().join("state").join("..").join("state");
+        assert_ne!(noncanonical, canonical);
         let error =
             try_acquire_history_profile_lease(&noncanonical, profile(), RedactionProfile::Redacted)
                 .unwrap_err();

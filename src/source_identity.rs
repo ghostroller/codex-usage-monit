@@ -1262,9 +1262,12 @@ pub(crate) fn validate_windows_private_directory(path: &Path, subject: &str) -> 
 }
 
 #[cfg(windows)]
-fn reject_windows_reparse_components(path: &Path, subject: &str) -> io::Result<()> {
+pub(crate) fn reject_windows_reparse_components(path: &Path, subject: &str) -> io::Result<()> {
     use std::os::windows::fs::MetadataExt;
 
+    // Ancestors keep drive and UNC roots intact. Building a path one component
+    // at a time would query incomplete verbatim prefixes such as \\?\C:, which
+    // Windows rejects before the root separator has been appended.
     for component in path.ancestors() {
         if component.as_os_str().is_empty() {
             continue;
@@ -2358,6 +2361,26 @@ mod tests {
         assert!(windows_attributes_are_reparse(
             WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT | 0x10
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_checks_accept_missing_descendants_of_a_verbatim_root() {
+        let directory = tempdir().unwrap();
+        let canonical = fs::canonicalize(directory.path()).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+        let missing = canonical.join("new-state").join("nested");
+
+        reject_windows_reparse_components(&canonical, "test state root").unwrap();
+        reject_windows_reparse_components(&missing, "test state root").unwrap();
+
+        assert!(
+            !missing.exists(),
+            "validation must not create the state root"
+        );
     }
 
     #[test]

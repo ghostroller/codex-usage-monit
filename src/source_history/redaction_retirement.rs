@@ -455,23 +455,11 @@ fn rename_preview_namespace_to_trash(source: &Path, destination: &Path) -> io::R
 
 #[cfg(windows)]
 fn rename_preview_namespace_to_trash(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+    use crate::atomic_file::windows_wide_path;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
-    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
-        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if encoded.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows paths cannot contain NUL characters",
-            ));
-        }
-        encoded.push(0);
-        Ok(encoded)
-    }
-
-    let source = wide_path(source)?;
-    let destination = wide_path(destination)?;
+    let source = windows_wide_path(source)?;
+    let destination = windows_wide_path(destination)?;
     // SAFETY: both buffers are NUL-terminated and remain alive for the call.
     let moved = unsafe {
         MoveFileExW(

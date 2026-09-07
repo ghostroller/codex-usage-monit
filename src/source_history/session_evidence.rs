@@ -3260,12 +3260,20 @@ fn try_lock_exclusive_for_fact_publication(
 ) -> io::Result<()> {
     match fs2::FileExt::try_lock_exclusive(file) {
         Ok(()) => validate_locked_file(file, directory, name),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(
+        Err(error) if lock_is_contended(&error) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "fact publication lock is busy; retry later",
         )),
         Err(error) => Err(error),
     }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && (error.raw_os_error().is_none()
+            || expected.raw_os_error().is_none()
+            || error.raw_os_error() == expected.raw_os_error())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

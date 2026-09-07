@@ -912,11 +912,19 @@ fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<File>> {
     validate_open_revision_lock(path, &file, &before)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) if lock_is_contended(&error) => return Ok(None),
         Err(error) => return Err(error),
     }
     validate_open_revision_lock(path, &file, &before)?;
     Ok(Some(file))
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && (error.raw_os_error().is_none()
+            || expected.raw_os_error().is_none()
+            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn validate_open_revision_lock(path: &Path, file: &File, _before: &fs::Metadata) -> io::Result<()> {

@@ -313,18 +313,57 @@ impl ProcessTree {
         }
 
         let group_error = io::Error::last_os_error();
-        let child_running = child.try_wait()?.is_none();
-        if child_running {
-            child.kill()?;
+        // Darwin returns EPERM when an unreaped zombie leader is the group's
+        // only remaining member. Observe its exit without releasing the PID
+        // before accepting that case; real permission failures stay visible.
+        #[cfg(target_vendor = "apple")]
+        if group_error.raw_os_error() == Some(libc::EPERM) && child_exited_without_reaping(child)? {
+            return Ok(());
         }
-        // ESRCH plus an already-exited direct child means the process group no
-        // longer exists. Other group failures remain observable even when the
-        // direct-child fallback succeeded because descendants may have escaped
-        // cleanup.
-        if group_error.raw_os_error() == Some(libc::ESRCH) && !child_running {
+        if child.try_wait()?.is_none() {
+            // The child can finish between the status probe and this signal.
+            // ChildGuard still waits afterward to reap it in either case.
+            if let Err(error) = child.kill()
+                && error.raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err(error);
+            }
+        }
+        // ESRCH proves the group is gone; a successful direct-child fallback
+        // also covers a child whose exit was still in flight at the probe.
+        // Other group failures remain observable even when the direct-child
+        // fallback succeeded because descendants may have escaped cleanup.
+        if group_error.raw_os_error() == Some(libc::ESRCH) {
             Ok(())
         } else {
             Err(group_error)
+        }
+    }
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn child_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    loop {
+        // SAFETY: waitid initializes this buffer for the owned child. WNOWAIT
+        // retains its waitable exit and reserves the numeric PID until the
+        // caller has completed process-group cleanup and reaps it.
+        let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: si_pid is initialized for an exit event and remains
+            // zero when the nonblocking observation reports no event.
+            return Ok(unsafe { information.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -2465,6 +2504,91 @@ sleep 5
         reader.join().unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_cleanup_accepts_an_exited_unreaped_leader() {
+        use std::process::{Command, Stdio};
+
+        use crate::startup::StartupTrace;
+
+        use super::{ChildGuard, attach_process_tree, configure_process_tree};
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_tree = attach_process_tree(&mut child).unwrap();
+        let mut child = ChildGuard {
+            child,
+            process_tree,
+            startup_trace: StartupTrace::default(),
+            trace_log: TraceLog::default(),
+            reaped: false,
+        };
+
+        loop {
+            // SAFETY: waitid initializes the output for this owned child;
+            // WNOWAIT retains its PID until the cleanup under test reaps it.
+            let mut information = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.child.id(),
+                    &mut information,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+
+        child.terminate_and_reap().unwrap();
+
+        assert!(child.reaped);
+        assert!(child.child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_process_group_still_reaps_the_running_direct_child() {
+        use std::process::{Command, Stdio};
+
+        use crate::startup::StartupTrace;
+
+        use super::{ChildGuard, attach_process_tree};
+
+        // Inherit the parent's group so no process group exists at the child
+        // PID. Keep stdin open to hold the direct child alive for the fallback.
+        let mut child = Command::new("sh")
+            .args(["-c", "while IFS= read -r request; do :; done"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_tree = attach_process_tree(&mut child).unwrap();
+        let mut child = ChildGuard {
+            child,
+            process_tree,
+            startup_trace: StartupTrace::default(),
+            trace_log: TraceLog::default(),
+            reaped: false,
+        };
+        assert!(child.child.try_wait().unwrap().is_none());
+
+        child.terminate_and_reap().unwrap();
+
+        assert!(child.reaped);
+        assert!(child.child.try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]

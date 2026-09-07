@@ -517,25 +517,7 @@ fn invalid_recorder_lock_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(windows)]
 fn reject_windows_recorder_lock_reparse_components(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
-                return Err(invalid_recorder_lock_data(format!(
-                    "recorder state root must not traverse a reparse point ({})",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    crate::source_identity::reject_windows_reparse_components(path, "recorder state root")
 }
 
 fn try_acquire_named_private_root_lock(

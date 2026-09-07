@@ -2159,9 +2159,17 @@ fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Opt
             )?;
             Ok(Some(file))
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && (error.raw_os_error().is_none()
+            || expected.raw_os_error().is_none()
+            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn add_nofollow_flags(options: &mut OpenOptions) {

@@ -3739,7 +3739,12 @@ fn discover_rollout_inventory(
             };
 
             if entry.file_type().is_dir() {
-                match entry.metadata() {
+                // Windows directory entries can retain stale enumeration
+                // metadata. Query fresh metadata here so an unchanged nested
+                // directory does not make the inventory appear incomplete.
+                // Preserve WalkDir's no-follow semantics if the entry changes
+                // into a symlink between enumeration and this probe.
+                match fs::symlink_metadata(entry.path()) {
                     Ok(metadata) => {
                         match FileFingerprint::from_path_and_metadata(entry.path(), &metadata) {
                             Ok(fingerprint) => {

@@ -1851,25 +1851,7 @@ fn ensure_opened_file_matches_path(
 
 #[cfg(windows)]
 fn reject_windows_reparse_components_before_create(path: &Path, subject: &str) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
-                return Err(invalid_data(format!(
-                    "{subject} path must not traverse a reparse point ({})",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    crate::source_identity::reject_windows_reparse_components(path, subject)
 }
 
 #[cfg(windows)]

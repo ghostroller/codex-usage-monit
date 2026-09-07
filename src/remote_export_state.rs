@@ -444,7 +444,7 @@ pub(crate) fn try_acquire_revision_fence(
     };
     match result {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        Err(error) if lock_is_contended(&error) => {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "remote export revision is active",
@@ -2544,7 +2544,7 @@ fn try_open_source_lock(store: &RemoteExportStateStore, directory: &Path) -> io:
     validate_opened_private_file(&path, &file, "remote export lock")?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        Err(error) if lock_is_contended(&error) => {
             validate_opened_private_file(&path, &file, "remote export lock")?;
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -2556,6 +2556,14 @@ fn try_open_source_lock(store: &RemoteExportStateStore, directory: &Path) -> io:
     store.prepare_source_directory()?;
     validate_opened_private_file(&path, &file, "remote export lock")?;
     Ok(file)
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && (error.raw_os_error().is_none()
+            || expected.raw_os_error().is_none()
+            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn read_private_json_file<T: for<'de> Deserialize<'de>>(
