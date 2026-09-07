@@ -995,6 +995,106 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn production_local_digest_can_materialize_exact_rollout_fixture_facts() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex");
+        std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let anchor = Utc::now() - chrono::Duration::hours(2);
+        let original = DateTime::parse_from_rfc3339("2026-07-12T04:00:00.000Z").unwrap();
+        fn retime(value: &mut serde_json::Value, shift: chrono::Duration) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for value in fields.values_mut() {
+                        retime(value, shift);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        retime(value, shift);
+                    }
+                }
+                serde_json::Value::String(value) if value.starts_with("2026-07-12T") => {
+                    *value = (DateTime::parse_from_rfc3339(value).unwrap() + shift).to_rfc3339();
+                }
+                _ => {}
+            }
+        }
+        let fixture =
+            include_str!("../tests/fixtures/codex-home/normal/sessions/rollout-integration.jsonl")
+                .lines()
+                .map(|line| {
+                    let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    retime(&mut record, anchor.signed_duration_since(original));
+                    if record["type"] == "session_meta" {
+                        record["payload"]["cwd"] = serde_json::json!(project);
+                    }
+                    serde_json::to_string(&record).unwrap() + "\n"
+                })
+                .collect::<String>();
+        std::fs::write(codex_home.join("sessions/rollout.jsonl"), fixture).unwrap();
+        let config = CollectConfig {
+            codex_home: codex_home.clone(),
+            offline: true,
+            redact_content: true,
+            ..CollectConfig::default()
+        };
+        let mut runtime =
+            HistoryRuntime::new(directory.path().join("state/history-v1"), &codex_home, true)
+                .unwrap();
+        runtime.ensure_v2_active().unwrap();
+        let collected = crate::snapshot::collect_snapshot(&config, None, false);
+        assert_eq!(collected.local_session_digests.digest_count(), 1);
+        runtime
+            .stage_local_collection(
+                &collected.history_observation,
+                &collected.snapshot.tasks,
+                &collected.local_session_digests,
+            )
+            .unwrap();
+        runtime.flush_staged().unwrap();
+        let now = collected.snapshot.as_of;
+        let range = ExportRange {
+            from: now - chrono::Duration::days(35),
+            to: now,
+        };
+        let records = runtime
+            .source_history()
+            .load_source_session_digest_records_since(
+                runtime.source_identity().node_id(),
+                runtime.redaction_profile(),
+                range.from,
+            )
+            .unwrap();
+        let digests = records
+            .records
+            .iter()
+            .filter_map(|record| match record.change() {
+                crate::source_history::SourceSessionDigestChange::Upsert(digest) => {
+                    Some(digest.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let bindings = digests
+            .iter()
+            .map(|digest| crate::source_history::FactDigestBinding::from_digest(digest).unwrap())
+            .collect::<Vec<_>>();
+        let collection =
+            collect_remote_rollouts(&config, &range, now, runtime.redaction_profile()).unwrap();
+        let batch = materialize_local_thread_fact_batch(
+            &runtime,
+            digests[0].replica().thread_id(),
+            &bindings,
+            now,
+            collection,
+        )
+        .unwrap();
+        assert_eq!(batch.changes.len(), 1);
+    }
+
+    #[test]
     fn fact_response_budget_never_admits_a_partial_minimum_frame() {
         let minimum =
             crate::remote_protocol::MIN_REMOTE_RESPONSE_ENCODED_BYTES + REMOTE_FRAME_HEADER_BYTES;
