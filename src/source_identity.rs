@@ -1137,16 +1137,27 @@ struct WindowsAclEntryPolicy {
 }
 
 #[cfg(any(windows, test))]
+fn windows_private_owner_is_trusted(owner: WindowsAclTrustee, matches_token_owner: bool) -> bool {
+    // Elevated Windows processes can create files owned by Administrators.
+    // That group is already trusted by the DACL policy, but accept it as an
+    // owner only when it is this process's default object-creation owner.
+    owner == WindowsAclTrustee::CurrentUser
+        || (owner == WindowsAclTrustee::Administrators && matches_token_owner)
+}
+
+#[cfg(any(windows, test))]
 fn validate_windows_private_acl_policy(
-    owner_is_current_user: bool,
+    owner_is_trusted: bool,
     dacl_present: bool,
     entries: &[WindowsAclEntryPolicy],
     subject: &str,
 ) -> io::Result<()> {
-    if !owner_is_current_user {
+    if !owner_is_trusted {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{subject} must be owned by the current Windows user"),
+            format!(
+                "{subject} must be owned by the current Windows user or its default Administrators owner"
+            ),
         ));
     }
     if !dacl_present {
@@ -1286,7 +1297,7 @@ fn validate_windows_private_handle(file: &File, subject: &str) -> io::Result<()>
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, IsValidSid,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TokenOwner,
     };
 
     struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -1337,10 +1348,17 @@ fn validate_windows_private_handle(file: &File, subject: &str) -> io::Result<()>
     }
 
     let current_user = windows_current_user_sid()?;
-    // SAFETY: both pointers reference validated SIDs kept alive for the call.
-    let owner_is_current_user = unsafe { EqualSid(owner, current_user.as_psid()) } != 0;
+    let owner_trustee = windows_acl_trustee(owner, current_user.as_psid());
+    let matches_token_owner = if owner_trustee == WindowsAclTrustee::Administrators {
+        let token_owner = windows_token_sid(TokenOwner)?;
+        // SAFETY: both pointers reference validated SIDs kept alive for the call.
+        unsafe { EqualSid(owner, token_owner.as_psid()) != 0 }
+    } else {
+        false
+    };
+    let owner_is_trusted = windows_private_owner_is_trusted(owner_trustee, matches_token_owner);
     if dacl.is_null() {
-        return validate_windows_private_acl_policy(owner_is_current_user, false, &[], subject);
+        return validate_windows_private_acl_policy(owner_is_trusted, false, &[], subject);
     }
 
     let mut acl_information = ACL_SIZE_INFORMATION::default();
@@ -1440,7 +1458,7 @@ fn validate_windows_private_handle(file: &File, subject: &str) -> io::Result<()>
         }
     }
 
-    validate_windows_private_acl_policy(owner_is_current_user, true, &entries, subject)
+    validate_windows_private_acl_policy(owner_is_trusted, true, &entries, subject)
 }
 
 #[cfg(windows)]
@@ -1478,12 +1496,20 @@ impl WindowsSid {
 
 #[cfg(windows)]
 fn windows_current_user_sid() -> io::Result<WindowsSid> {
+    windows_token_sid(windows_sys::Win32::Security::TokenUser)
+}
+
+#[cfg(windows)]
+fn windows_token_sid(
+    information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> io::Result<WindowsSid> {
     use std::mem;
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
-        CopySid, GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        CopySid, GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_OWNER, TOKEN_QUERY,
+        TOKEN_USER, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1510,7 +1536,7 @@ fn windows_current_user_sid() -> io::Result<WindowsSid> {
     let mut required = 0_u32;
     // SAFETY: a zero-length query asks Windows for the required buffer size.
     unsafe {
-        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut required);
+        GetTokenInformation(token, information_class, ptr::null_mut(), 0, &mut required);
     }
     if required == 0 {
         return Err(io::Error::last_os_error());
@@ -1526,7 +1552,7 @@ fn windows_current_user_sid() -> io::Result<WindowsSid> {
     if unsafe {
         GetTokenInformation(
             token,
-            TokenUser,
+            information_class,
             token_buffer.as_mut_ptr().cast(),
             required,
             &mut required,
@@ -1535,17 +1561,24 @@ fn windows_current_user_sid() -> io::Result<WindowsSid> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the successful TokenUser query initialized TOKEN_USER at the
-    // start of the aligned buffer.
-    let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
-    // SAFETY: TOKEN_USER supplies a valid SID pointer on a successful query.
-    if token_user.User.Sid.is_null() || unsafe { IsValidSid(token_user.User.Sid) } == 0 {
+    let sid = if information_class == TokenUser {
+        // SAFETY: the successful query initialized the matching structure at
+        // the start of the aligned buffer.
+        unsafe { (*token_buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    } else if information_class == TokenOwner {
+        // SAFETY: the successful TokenOwner query initialized TOKEN_OWNER.
+        unsafe { (*token_buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner }
+    } else {
+        return Err(invalid_identity("unsupported Windows token SID class"));
+    };
+    // SAFETY: the successful query supplies a SID inside the live token buffer.
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
         return Err(invalid_identity(
-            "current Windows access token has no valid user SID",
+            "current Windows access token has no valid SID",
         ));
     }
     // SAFETY: the SID was validated immediately above.
-    let sid_bytes = unsafe { GetLengthSid(token_user.User.Sid) };
+    let sid_bytes = unsafe { GetLengthSid(sid) };
     if sid_bytes == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1556,7 +1589,7 @@ fn windows_current_user_sid() -> io::Result<WindowsSid> {
     let mut storage = vec![0_usize; sid_word_count];
     // SAFETY: storage is aligned and at least sid_bytes long; the source SID
     // remains alive in token_buffer for this call.
-    if unsafe { CopySid(sid_bytes, storage.as_mut_ptr().cast(), token_user.User.Sid) } == 0 {
+    if unsafe { CopySid(sid_bytes, storage.as_mut_ptr().cast(), sid) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(WindowsSid { storage })
@@ -2189,6 +2222,60 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert!(error.to_string().contains("stable file identity"));
         }
+    }
+
+    #[test]
+    fn windows_private_owner_accepts_only_user_or_default_administrators() {
+        for matches_token_owner in [false, true] {
+            assert!(windows_private_owner_is_trusted(
+                WindowsAclTrustee::CurrentUser,
+                matches_token_owner,
+            ));
+            for owner in [WindowsAclTrustee::LocalSystem, WindowsAclTrustee::Other] {
+                assert!(!windows_private_owner_is_trusted(
+                    owner,
+                    matches_token_owner
+                ));
+            }
+        }
+        assert!(windows_private_owner_is_trusted(
+            WindowsAclTrustee::Administrators,
+            true,
+        ));
+        assert!(!windows_private_owner_is_trusted(
+            WindowsAclTrustee::Administrators,
+            false,
+        ));
+    }
+
+    #[test]
+    fn windows_default_administrators_owner_still_requires_a_private_dacl() {
+        let trusted_owner =
+            windows_private_owner_is_trusted(WindowsAclTrustee::Administrators, true);
+        let private_entries = [WindowsAclEntryPolicy {
+            ace_type: WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+            mask: u32::MAX,
+            trustee: Some(WindowsAclTrustee::Administrators),
+        }];
+        validate_windows_private_acl_policy(trusted_owner, true, &private_entries, "test path")
+            .unwrap();
+        assert_eq!(
+            validate_windows_private_acl_policy(trusted_owner, false, &[], "test path")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        let public_entries = [WindowsAclEntryPolicy {
+            ace_type: WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+            mask: 1,
+            trustee: Some(WindowsAclTrustee::Other),
+        }];
+        assert_eq!(
+            validate_windows_private_acl_policy(trusted_owner, true, &public_entries, "test path")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+        );
     }
 
     #[test]

@@ -569,9 +569,17 @@ mod tests {
                 .log_error()
                 .is_some_and(|error| error.contains("already in use"))
         );
-        assert!(fs::read_to_string(&path).unwrap().contains("first.work"));
-
+        first
+            .span("after.refused.open", TraceFields::new())
+            .finish(TraceOutcome::Ok, TraceFields::new());
         first.finish();
+        assert_eq!(first.log_error(), None);
+        // Windows file locks also exclude readers using another handle. Inspect
+        // the preserved records after the first logger releases its lock.
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("first.work"));
+        assert!(contents.contains("after.refused.open"));
+
         let replacement = TraceLog::enabled(&path);
         assert!(replacement.is_enabled());
         replacement.finish();

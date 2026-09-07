@@ -2143,13 +2143,12 @@ mod diagnostic_tests {
     #[cfg(unix)]
     #[test]
     fn initialize_timeout_is_traced_as_timeout_through_parent_cleanup() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let trace_path = temp.path().join("trace.jsonl");
-        let fake_codex = temp.path().join("private-timeout-codex");
-        fs::write(&fake_codex, b"#!/bin/sh\nsleep 5\n").unwrap();
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        // Execute an existing fixture to avoid Linux ETXTBSY races when other
+        // tests fork while a newly written executable is still open.
+        let fake_codex =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock-codex-timeout.sh");
         let trace = TraceLog::enabled(&trace_path);
         let config = CollectConfig {
             codex_bin: Some(fake_codex.clone()),
@@ -2159,7 +2158,10 @@ mod diagnostic_tests {
         };
 
         let error = fetch_account_snapshot(&config).unwrap_err();
-        assert!(format!("{error:#}").contains("timed out waiting"));
+        assert!(
+            format!("{error:#}").contains("timed out waiting"),
+            "expected an initialize timeout, got: {error:#}"
+        );
         trace.finish();
 
         let contents = fs::read_to_string(&trace_path).unwrap();

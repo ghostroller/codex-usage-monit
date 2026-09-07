@@ -252,6 +252,8 @@ mod tests {
         assert!(backup.is_file());
         assert!(fs::metadata(&path).unwrap().len() <= 96);
         assert!(fs::metadata(&backup).unwrap().len() <= 96);
+        // Release the Windows byte-range lock before reading via new handles.
+        drop(writer);
         for contents in [
             fs::read_to_string(path).unwrap(),
             fs::read_to_string(backup).unwrap(),
