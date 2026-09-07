@@ -1711,10 +1711,15 @@ fn cache_preserves_foreign_parent_counter_baseline() {
 fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner() {
     let temp = TempDir::new().unwrap();
     let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
-    let path = temp.path().join("sessions/rollout-ownerless-rewrite.jsonl");
+    // Match the native path spelling emitted by WalkDir in diagnostics.
+    let path = temp
+        .path()
+        .join("sessions")
+        .join("rollout-ownerless-rewrite.jsonl");
     let retained_path = temp
         .path()
-        .join("sessions/rollout-ownerless-rewrite-control.jsonl");
+        .join("sessions")
+        .join("rollout-ownerless-rewrite-control.jsonl");
     write_jsonl(
         &path,
         &[
@@ -1780,12 +1785,17 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
         .scan(&scan_config, now + chrono::Duration::milliseconds(2))
         .unwrap();
     assert_eq!(owned.stats.ambiguous_token_resets, 2);
-    assert!(
-        owned
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("token counter reset"))
-    );
+    for expected_path in [&path, &retained_path] {
+        assert!(
+            owned.warnings.iter().any(|warning| {
+                warning.contains("token counter reset")
+                    && warning.contains(&expected_path.display().to_string())
+            }),
+            "missing initial reset warning for {}: {:?}",
+            expected_path.display(),
+            owned.warnings
+        );
+    }
 
     write_jsonl(
         &path,
@@ -1818,12 +1828,18 @@ fn cached_refresh_clears_replay_diagnostics_when_a_changed_file_loses_its_owner(
             .warnings
             .iter()
             .filter(|warning| warning.contains("token counter reset"))
-            .all(|warning| !warning.contains(&path.display().to_string()))
+            .all(|warning| !warning.contains(&path.display().to_string())),
+        "stale reset diagnostic survived the ownerless rewrite: {:?}",
+        ownerless.warnings
     );
-    assert!(ownerless.warnings.iter().any(|warning| {
-        warning.contains("token counter reset")
-            && warning.contains(&retained_path.display().to_string())
-    }));
+    assert!(
+        ownerless.warnings.iter().any(|warning| {
+            warning.contains("token counter reset")
+                && warning.contains(&retained_path.display().to_string())
+        }),
+        "missing retained reset diagnostic: {:?}",
+        ownerless.warnings
+    );
     assert_eq!(ownerless.tasks.len(), 1);
     assert_eq!(ownerless.tasks[0].thread_id, "unchanged-owner");
     assert!(ownerless.turns.is_empty());
