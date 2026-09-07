@@ -89,11 +89,25 @@ explicit `--target`, the runner tests the installed Rust host target. Compare
 `effectiveTarget`, `rustHost`, and `nativeArchitecture` in `result.json` before
 describing a run as native ARM64 or emulated x64.
 
-During the 2026-09-08 review, the existing VM's Guest Agent file channel and a
-nonce-bearing diagnostic round trip were verified. The earlier MSVC
-cross-target check from macOS remains separate evidence; native test results
-must cite the corresponding runner `result.json` and transcript. Neither a
-doctor result nor cross-target compilation establishes ConPTY behavior.
+During the 2026-09-08 review, a full local run passed on
+`aarch64-pc-windows-msvc` with Rust 1.97.0 under `SYSTEM`: **1,658 Rust tests
+passed**, with one existing manual history benchmark ignored. Format, Clippy,
+the real ConPTY interaction test, and both CLI smoke checks also passed.
+This establishes ARM64 guest execution; it does not establish standard-user
+service behavior or a separate x64 run.
+
+Evidence is in
+`/private/tmp/codex-utm-review/6faba9595f604aa590542d4ff1e6370b/`
+(`result.json`, `verify.log`, and `source.zip`). The source was commit
+`cd6b49ee372bad4903ddba8c03dba153352f3d84` plus tracked/untracked working changes;
+the archive SHA-256 was
+`d4f31358e7a46b078f63c00fe04be00d50b5b5dcf2ef8e3f70db844ee961ce54`.
+Later host result-validation refinements were covered by the Python contracts.
+An additional one-second deadline probe returned `timed_out`, a nonzero host
+exit status, and process-tree cleanup code 0; its artifacts are in the sibling
+run directory `2b3e6d82f642443d884102602e4479ba`.
+Neither a doctor result nor cross-target compilation alone establishes ConPTY
+behavior; cite the matching native result and transcript for subsequent runs.
 
 ## UTM setup on an Apple Silicon Mac
 
@@ -129,6 +143,7 @@ official UTM AppleScript interface:
 
 ```zsh
 ./scripts/macos/provision-windows-utm.sh \
+  --storage-root /Volumes/Drive/codex-usage-monit-windows \
   --iso /Volumes/Drive/codex-usage-monit-windows/iso/Windows11_Arm64.iso \
   --start
 ```
@@ -139,10 +154,17 @@ the downloaded ISO and start it without recreating its disk:
 ```zsh
 ./scripts/macos/attach-windows-iso-utm.sh \
   --iso /Volumes/Drive/codex-usage-monit-windows/iso/Windows11_Arm64.iso \
+  --guest-tools-iso /Volumes/Drive/codex-usage-monit-windows/iso/utm-guest-tools-latest.iso \
   --start
 ```
 
-The script creates the VM in UTM's required staging area, exports it to the
+When substituting another volume, update every path in the command. Provisioning
+uses `--storage-root` for the VM and default guest-tools location; changing only
+`--iso` does not change that root. Attaching media uses the explicit
+`--guest-tools-iso` path. Both setup scripts accept `--vm-name` for a nondefault
+VM name; the daily Python runner accepts `--vm` for a name or UUID.
+
+The provisioner creates the VM in UTM's required staging area, exports it to the
 external bundle path, verifies the bundle, removes only that just-created
 staging VM, and opens the external package in place. This avoids retaining a
 second virtual disk on the internal SSD. It uses UTM's documented `make`,
@@ -156,9 +178,9 @@ UTM's Windows wizard/settings to enable TPM and Secure Boot, or follow UTM's
 documented installer workaround. After installing SPICE guest tools, select the
 repository directory in UTM's sharing UI; the script has already selected the
 WebDAV sharing mode. The Windows installer, guest tools ISO, VM bundle, virtual
-disk, and UTM debug logs must stay under
-`/Volumes/Drive/codex-usage-monit-windows/`, not in the repository or on the
-internal disk.
+disk, and UTM debug logs must stay under the selected external storage root
+(`/Volumes/Drive/codex-usage-monit-windows/` in these examples), outside the
+repository and the internal disk.
 
 UTM's Windows guide explains the wizard and its current Windows 11 guest-tools
 workarounds. After Windows Setup, install the guest tools if they did not run

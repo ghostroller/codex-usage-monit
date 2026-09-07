@@ -93,3 +93,16 @@ produces the musl release artifacts. Native arm64 tests establish Linux runtime
 behavior; cross compilation alone cannot establish amd64 runtime behavior.
 Docker also does not exercise a real logged-in systemd user manager, a desktop
 terminal emulator, Windows ConPTY, or macOS launchd.
+
+## Validation recorded on 2026-09-08
+
+The full local Linux arm64 pipeline passed **1,743 Rust tests**, with one existing
+manual history benchmark ignored. Both real PTY tests, format, Clippy, preview
+comparison, installer checks, and CLI smoke passed. The retained log is
+`/Volumes/File/codex-usage-monit-docker-build/runs/20260907T165204Z-arm64-56982/verify.log`.
+This full run preceded the snapshot-manifest addition. After that addition,
+`--filter recorder_` passed 36 tests and produced a matching `result.json` under
+`runs/20260907T165733Z-arm64-62959/` in the same build root. It records commit
+`cd6b49ee372bad4903ddba8c03dba153352f3d84` plus working changes and the snapshot
+hash. Pipeline contracts were also run inside that Linux snapshot. No Rust
+product code changed between those runs.

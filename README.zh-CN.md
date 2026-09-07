@@ -16,7 +16,7 @@
 
 [![120 × 40 深色终端中的 Codex 用量监控 TUI](docs/assets/tui/overview-dark-120x40.svg)](docs/assets/tui/overview-dark-120x40.svg)
 
-_此图由集成测试夹具确定性生成；CI 同步校验会防止预览图与当前 TUI 实现发生漂移。_
+_此图由集成测试夹具确定性生成；本地与远程验证均会检查预览图是否与当前 TUI 实现一致。_
 
 ## 主要特点
 
@@ -527,9 +527,13 @@ trace 日志粒度更细并会增加少量诊断 I/O，因此默认关闭。启�
 
 ## 文档
 
-CI 和 release workflow 均配置了 Linux、macOS 和 Windows 原生测试任务。
+优先在本地验证：Linux 使用 Docker，Windows 使用 UTM 虚拟机，macOS 使用宿主机。
+积累一批较大修改、需要集中验证时，再手动触发远程 CI；普通 push 和 PR 不会自动运行测试。
+版本标签会在发布前执行完整验证。
 TUI 交互测试使用 Unix PTY 或 Windows ConPTY；跨目标编译检查不代表 Windows 运行验证已经通过。
 
+- [本地优先测试与手动 CI](docs/testing.md)
+- [Linux Docker 测试](docs/linux-testing.md)
 - [数据能力和限制](docs/codex-data-capabilities.md)
 - [终端任务恢复行为](docs/codex-terminal-resume.md)
 - [TUI 集成测试](docs/tui-integration-testing.md)

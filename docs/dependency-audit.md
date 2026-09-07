@@ -28,5 +28,8 @@ Validation: locked all-target compilation and the complete macOS test suite,
 including semantic TUI rendering and real PTY interaction, passed. The final
 lockfile passed `cargo audit --deny warnings` with zero vulnerabilities and
 zero advisory warnings. The dependency audit workflow checks all locked target
-dependencies on pushes, pull requests and a weekly schedule; it does not ignore
-advisories. These are point-in-time results, not a claim about future advisories.
+dependencies at manually requested CI checkpoints, before version-tag releases,
+and on a weekly schedule. It can also be dispatched independently; ordinary
+pushes and pull requests do not start it. See [testing policy](testing.md).
+The workflow does not ignore advisories. These are point-in-time results, not a
+claim about future advisories.

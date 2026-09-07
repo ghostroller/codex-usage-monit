@@ -16,7 +16,7 @@ It is local-first and terminal-native: no desktop application, browser, database
 
 [![Codex usage monitor TUI overview in a 120 by 40 dark terminal](docs/assets/tui/overview-dark-120x40.svg)](docs/assets/tui/overview-dark-120x40.svg)
 
-_Deterministically rendered from the integration-test fixture. The synchronization check in CI prevents this preview from drifting from the current TUI._
+_Deterministically rendered from the integration-test fixture. Local and hosted verification check that this preview matches the current TUI._
 
 ## Highlights
 
@@ -527,10 +527,15 @@ The trace log is more detailed and may add diagnostic I/O, so it is disabled by 
 
 ## Documentation
 
-CI and release workflows configure native Linux, macOS, and Windows test jobs.
+Run platform verification locally first: Linux in Docker, Windows in the UTM
+VM, and macOS on the host. Hosted CI is a manually dispatched checkpoint after
+a substantial batch of changes; ordinary pushes and pull requests do not run
+tests. Version tags run full release verification before publishing.
 The TUI interaction suite uses Unix PTYs or Windows ConPTY; cross-target
 compilation checks do not establish Windows runtime results.
 
+- [Local-first testing and manual CI](docs/testing.md)
+- [Linux Docker testing](docs/linux-testing.md)
 - [Data capabilities and limits](docs/codex-data-capabilities.md)
 - [Terminal resume behavior](docs/codex-terminal-resume.md)
 - [TUI integration testing](docs/tui-integration-testing.md)

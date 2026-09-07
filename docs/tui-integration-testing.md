@@ -4,7 +4,7 @@ The TUI test suite uses deterministic Codex-shaped fixtures and exercises the
 same rendering and input paths as the application. It deliberately avoids a
 developer's real Codex home, cache, configuration, and UI state.
 
-Run the complete verification suite with:
+Run the Rust test suite with:
 
 ```bash
 cargo test --locked --all-targets
@@ -28,9 +28,11 @@ cargo test --locked --all-targets
   `portable-pty`; the SIGTERM/SIGHUP/SIGINT terminal-restoration test remains
   Unix-only.
 
-The CI and release workflows configure native Linux, macOS (`macos-15`), and
-Windows (`windows-2025`) verification jobs. Each runs `cargo test --locked
---all-targets`, directly or through `scripts/windows/verify.ps1`, including the
+Follow [local-first testing](testing.md): use Docker Linux, the UTM Windows VM,
+and the macOS host before requesting a consolidated hosted checkpoint. Manual
+CI and version-tag releases share native Linux, macOS (`macos-15`), and Windows
+(`windows-2025`) verification jobs. Each runs `cargo test --locked --all-targets`
+through `scripts/verify-unix.sh` or `scripts/windows/verify.ps1`, including the
 platform's PTY interaction test. Cross-target `cargo check` can validate Windows
 code from macOS, but does not execute ConPTY or prove terminal behavior; see
 [Windows testing](windows-testing.md) for the runtime workflow and recorded
