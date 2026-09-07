@@ -85,6 +85,46 @@ fn persistent_config(home: &Path, cache_root: &Path) -> CollectConfig {
     config
 }
 
+#[cfg(unix)]
+fn stable_file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn stable_file_identity(path: &Path) -> (u64, [u8; 16]) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = File::options()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .unwrap();
+    let mut information: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+    (
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    )
+}
+
 fn cache_entries(cache_root: &Path) -> Vec<PathBuf> {
     let mut entries = walkdir::WalkDir::new(cache_root)
         .into_iter()
@@ -1074,7 +1114,7 @@ fn reopened_persistent_cache_rejects_a_rewritten_prefix() {
 }
 
 #[test]
-fn reopened_persistent_cache_rejects_an_equal_length_rewrite_with_restored_mtime() {
+fn reopened_persistent_cache_rejects_an_equal_length_replacement_with_restored_mtime() {
     let temp = TempDir::new().unwrap();
     let cache_root = temp.path().join("cache");
     let now = Utc::now();
@@ -1091,6 +1131,70 @@ fn reopened_persistent_cache_rejects_an_equal_length_rewrite_with_restored_mtime
     );
     let original_len = fs::metadata(&path).unwrap().len();
     let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let original_identity = stable_file_identity(&path);
+    let scan_config = persistent_config(temp.path(), &cache_root);
+    let original = RolloutCache::new().scan(&scan_config, now).unwrap();
+    assert_eq!(original.tasks[0].thread_id, "equal-thread-aaaa");
+
+    let replacement = temp.path().join("replacement.jsonl");
+    write_jsonl(
+        &replacement,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "equal-thread-bbbb"}
+        })],
+    );
+    let replacement_identity = stable_file_identity(&replacement);
+    assert_ne!(replacement_identity, original_identity);
+    File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(original_modified)
+        .unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        original_modified
+    );
+    assert_eq!(stable_file_identity(&path), replacement_identity);
+
+    let mut reopened = RolloutCache::new();
+    let rewritten = reopened
+        .scan(&scan_config, now + chrono::Duration::seconds(1))
+        .unwrap();
+
+    assert_eq!(reopened.last_refresh().disk_reused_files, 0);
+    assert_eq!(reopened.last_refresh().disk_misses, 1);
+    assert_eq!(reopened.last_refresh().full_parsed_files, 1);
+    assert_eq!(rewritten.tasks[0].thread_id, "equal-thread-bbbb");
+}
+
+#[cfg(unix)]
+#[test]
+fn reopened_persistent_cache_rejects_an_equal_length_in_place_rewrite_with_changed_ctime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = TempDir::new().unwrap();
+    let cache_root = temp.path().join("cache");
+    let now = Utc::now();
+    let path = temp
+        .path()
+        .join("sessions/rollout-persistent-in-place-rewrite.jsonl");
+    write_jsonl(
+        &path,
+        &[json!({
+            "timestamp": timestamp(now),
+            "type": "session_meta",
+            "payload": {"id": "equal-thread-aaaa"}
+        })],
+    );
+    let original_metadata = fs::metadata(&path).unwrap();
+    let original_modified = original_metadata.modified().unwrap();
+    let original_ctime = (original_metadata.ctime(), original_metadata.ctime_nsec());
+    let original_identity = stable_file_identity(&path);
     let scan_config = persistent_config(temp.path(), &cache_root);
     let original = RolloutCache::new().scan(&scan_config, now).unwrap();
     assert_eq!(original.tasks[0].thread_id, "equal-thread-aaaa");
@@ -1103,13 +1207,32 @@ fn reopened_persistent_cache_rejects_an_equal_length_rewrite_with_restored_mtime
             "payload": {"id": "equal-thread-bbbb"}
         })],
     );
-    assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(original_modified)
-        .unwrap();
+    let rewritten_file = File::options().write(true).open(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let rewritten_metadata = loop {
+        rewritten_file.set_modified(original_modified).unwrap();
+        let metadata = rewritten_file.metadata().unwrap();
+        let ctime = (metadata.ctime(), metadata.ctime_nsec());
+        if ctime != original_ctime {
+            break metadata;
+        }
+        // A filesystem can coalesce nearby writes into one ctime tick. The
+        // metadata-only contract requires an observable fingerprint change;
+        // retry until that condition holds instead of assuming clock precision.
+        assert!(
+            Instant::now() < deadline,
+            "filesystem ctime did not change after an in-place rewrite: original={original_ctime:?}, current={ctime:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(rewritten_file);
+    assert_eq!(rewritten_metadata.len(), original_metadata.len());
+    assert_eq!(rewritten_metadata.modified().unwrap(), original_modified);
+    assert_eq!(stable_file_identity(&path), original_identity);
+    assert_ne!(
+        (rewritten_metadata.ctime(), rewritten_metadata.ctime_nsec()),
+        original_ctime
+    );
 
     let mut reopened = RolloutCache::new();
     let rewritten = reopened
