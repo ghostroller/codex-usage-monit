@@ -2177,13 +2177,12 @@ impl ProcessTree {
         {
             group_error = None;
         }
-        let primary_result =
-            if leader_exit_observed {
-                Ok(())
-            } else {
-                child_exited_without_reaping(child)
-                    .and_then(|exited| if exited { Ok(()) } else { child.kill() })
-            };
+        let primary_result = if leader_exit_observed {
+            Ok(())
+        } else {
+            child_exited_without_reaping(child)
+                .and_then(|exited| if exited { Ok(()) } else { child.kill() })
+        };
         match (group_error, primary_result) {
             (None, result) => result,
             (Some(group_error), Ok(())) => Err(io::Error::new(
