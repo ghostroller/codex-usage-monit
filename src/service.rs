@@ -1242,6 +1242,9 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
                     ))
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if systemd_manager_and_unit_are_absent(&path)? {
+                        return Ok(ServiceDefinitionObservation::Absent);
+                    }
                     let output = run_service_command(Command::new("systemctl").args([
                         "--user",
                         "show",
@@ -1288,6 +1291,106 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
         }
         Platform::Unsupported => Ok(ServiceDefinitionObservation::Absent),
     }
+}
+
+/// Minimal containers and non-systemd distributions can run foreground
+/// recorders and remote sync without installing a service manager. Absence of
+/// `systemctl` alone is insufficient: a manager may still have a loaded unit,
+/// or a dormant unit could restart an old recorder later.
+#[cfg(unix)]
+fn systemd_manager_and_unit_are_absent(registration_path: &Path) -> io::Result<bool> {
+    let Some(home) = stable_current_user_home() else {
+        return Ok(false);
+    };
+    // SAFETY: geteuid has no arguments or preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let Some(mut evidence) = systemd_absence_evidence_paths(&home, uid, |name| env::var_os(name))
+    else {
+        return Ok(false);
+    };
+    evidence.push(registration_path.to_path_buf());
+    systemd_evidence_paths_are_absent(&evidence)
+}
+
+#[cfg(not(unix))]
+fn systemd_manager_and_unit_are_absent(_registration_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn systemd_absence_evidence_paths(
+    home: &Path,
+    uid: u32,
+    mut environment: impl FnMut(&str) -> Option<OsString>,
+) -> Option<Vec<PathBuf>> {
+    // A supplied bus address or nonstandard unit search path needs a live
+    // manager query. Never infer absence from a disconnected/inaccessible bus.
+    for name in [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DBUS_STARTER_ADDRESS",
+        "SYSTEMD_BUS_ADDRESS",
+        "SYSTEMD_UNIT_PATH",
+    ] {
+        if environment(name).is_some_and(|value| !value.is_empty()) {
+            return None;
+        }
+    }
+    let mut evidence = vec![
+        PathBuf::from("/run/systemd/system"),
+        PathBuf::from("/run/systemd/user"),
+        PathBuf::from(format!("/run/user/{uid}/systemd")),
+        PathBuf::from(format!("/run/user/{uid}/bus")),
+    ];
+    if let Some(runtime) = environment("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        let runtime = PathBuf::from(runtime);
+        evidence.extend([runtime.join("systemd"), runtime.join("bus")]);
+    }
+    let mut unit_roots = vec![
+        home.join(".config/systemd/user"),
+        home.join(".config/systemd/user.control"),
+        home.join(".local/share/systemd/user"),
+        PathBuf::from("/etc/systemd/user"),
+        PathBuf::from("/usr/local/lib/systemd/user"),
+        PathBuf::from("/usr/lib/systemd/user"),
+        PathBuf::from("/lib/systemd/user"),
+    ];
+    for name in ["XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+        if let Some(root) = environment(name).filter(|value| !value.is_empty()) {
+            let root = PathBuf::from(root);
+            unit_roots.push(root.join("systemd/user"));
+            if name == "XDG_CONFIG_HOME" {
+                unit_roots.push(root.join("systemd/user.control"));
+            }
+        }
+    }
+    for (name, default) in [
+        ("XDG_CONFIG_DIRS", "/etc/xdg"),
+        ("XDG_DATA_DIRS", "/usr/local/share:/usr/share"),
+    ] {
+        let roots = environment(name)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| OsString::from(default));
+        unit_roots.extend(env::split_paths(&roots).map(|root| root.join("systemd/user")));
+    }
+    for root in unit_roots {
+        evidence.push(root.join(SYSTEMD_UNIT));
+        evidence.push(root.join(format!("{SYSTEMD_UNIT}.d")));
+    }
+    Some(evidence)
+}
+
+#[cfg(unix)]
+fn systemd_evidence_paths_are_absent(paths: &[PathBuf]) -> io::Result<bool> {
+    for path in paths {
+        // A dangling link is still service evidence; inaccessible directories
+        // and malformed path components also must not be treated as absence.
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -3601,6 +3704,94 @@ mod tests {
 
     const RECORDER_LOCK_CHILD_HISTORY_ENV: &str = "CODEX_USAGE_MONIT_RECORDER_LOCK_TEST_HISTORY";
     const RECORDER_LOCK_CHILD_READY_ENV: &str = "CODEX_USAGE_MONIT_RECORDER_LOCK_TEST_READY";
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_absence_requires_no_unit_link_dropin_or_manager_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let unit = directory.path().join(SYSTEMD_UNIT);
+        let dropin = directory.path().join(format!("{SYSTEMD_UNIT}.d"));
+        let manager = directory.path().join("runtime-systemd");
+        let evidence = vec![unit.clone(), dropin.clone(), manager.clone()];
+        assert!(systemd_evidence_paths_are_absent(&evidence).unwrap());
+
+        for path in [&unit, &dropin, &manager] {
+            fs::write(path, b"existing service or manager evidence").unwrap();
+            assert!(!systemd_evidence_paths_are_absent(&evidence).unwrap());
+            fs::remove_file(path).unwrap();
+        }
+        symlink(directory.path().join("missing-legacy-unit"), &unit).unwrap();
+        assert!(!systemd_evidence_paths_are_absent(&evidence).unwrap());
+        fs::remove_file(&unit).unwrap();
+
+        fs::write(&manager, b"not a directory").unwrap();
+        assert!(systemd_evidence_paths_are_absent(&[manager.join("private")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_absence_covers_stable_home_runtime_and_xdg_unit_paths() {
+        let environment = HashMap::from([
+            ("XDG_RUNTIME_DIR", OsString::from("/custom/runtime")),
+            ("XDG_CONFIG_HOME", OsString::from("/custom/config")),
+            ("XDG_DATA_HOME", OsString::from("/custom/data")),
+            ("XDG_CONFIG_DIRS", OsString::from("/config/one:/config/two")),
+            ("XDG_DATA_DIRS", OsString::from("/data/one:/data/two")),
+        ]);
+        let evidence = systemd_absence_evidence_paths(Path::new("/stable/home"), 1234, |name| {
+            environment.get(name).cloned()
+        })
+        .unwrap();
+        for root in [
+            "/stable/home/.config/systemd/user",
+            "/stable/home/.config/systemd/user.control",
+            "/stable/home/.local/share/systemd/user",
+            "/custom/config/systemd/user",
+            "/custom/config/systemd/user.control",
+            "/custom/data/systemd/user",
+            "/config/one/systemd/user",
+            "/config/two/systemd/user",
+            "/data/one/systemd/user",
+            "/data/two/systemd/user",
+            "/etc/systemd/user",
+            "/usr/lib/systemd/user",
+        ] {
+            assert!(
+                evidence.contains(&Path::new(root).join(SYSTEMD_UNIT)),
+                "{root}"
+            );
+        }
+        for path in [
+            "/run/systemd/system",
+            "/run/user/1234/systemd",
+            "/run/user/1234/bus",
+            "/custom/runtime/systemd",
+            "/custom/runtime/bus",
+        ] {
+            assert!(evidence.contains(&PathBuf::from(path)), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_explicit_bus_or_search_path_requires_a_live_manager_query() {
+        for name in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DBUS_STARTER_ADDRESS",
+            "SYSTEMD_BUS_ADDRESS",
+            "SYSTEMD_UNIT_PATH",
+        ] {
+            assert!(
+                systemd_absence_evidence_paths(Path::new("/stable/home"), 1234, |key| {
+                    (key == name).then(|| OsString::from("custom-manager-configuration"))
+                })
+                .is_none(),
+                "{name} must keep service verification fail-closed"
+            );
+        }
+    }
 
     fn options(root: &Path) -> ServiceOptions {
         let mut options = ServiceOptions::new(
