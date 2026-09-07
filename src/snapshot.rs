@@ -24,6 +24,7 @@ use crate::trace::{TraceFields, TraceOutcome};
 const RESET_CREDIT_DETAILS_CACHE_TTL_MINUTES: i64 = 5;
 const ACCOUNT_WINDOW_CHANGED_WARNING: &str =
     "account window changed; local usage projection is pending refresh";
+const ACCOUNT_REFRESH_TOKEN_SHARE_FALLBACK: &str = "account_refresh_token_share_fallback";
 
 #[derive(Clone, Debug)]
 pub struct CollectionResult {
@@ -395,6 +396,21 @@ pub(crate) fn account_window_projection_pending(snapshot: &Snapshot) -> bool {
         .warnings
         .iter()
         .any(|warning| warning == ACCOUNT_WINDOW_CHANGED_WARNING)
+        || snapshot
+            .window_analyses
+            .iter()
+            .any(cached_window_uses_token_share_fallback)
+}
+
+fn cached_window_uses_token_share_fallback(analysis: &WindowAnalysis) -> bool {
+    analysis
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == ACCOUNT_REFRESH_TOKEN_SHARE_FALLBACK)
+        || analysis
+            .api_long_context
+            .as_deref()
+            .is_some_and(cached_window_uses_token_share_fallback)
 }
 
 fn merge_account_refresh_into_snapshot(
@@ -574,10 +590,12 @@ fn reproject_cached_window_usage(
             refreshed_used_percent
         };
     analysis.attribution.unattributed_percent = refreshed_used_percent;
+    // A later account sample only rescales the fallback; it cannot restore
+    // the model-rate weights erased by the zero gauge. Keep the marker (and
+    // the forced-local-refresh signal) until local materialization replaces
+    // this analysis with a freshly weighted one.
     analysis.partial_reasons.retain(|reason| {
-        reason != "quota_window_stale"
-            && reason != "account_window_changed_pending_local_refresh"
-            && reason != "account_refresh_token_share_fallback"
+        reason != "quota_window_stale" && reason != "account_window_changed_pending_local_refresh"
     });
     if matches!(provenance, Provenance::Stale | Provenance::Unknown) {
         analysis
@@ -590,11 +608,11 @@ fn reproject_cached_window_usage(
         && !analysis
             .partial_reasons
             .iter()
-            .any(|reason| reason == "account_refresh_token_share_fallback")
+            .any(|reason| reason == ACCOUNT_REFRESH_TOKEN_SHARE_FALLBACK)
     {
         analysis
             .partial_reasons
-            .push("account_refresh_token_share_fallback".to_string());
+            .push(ACCOUNT_REFRESH_TOKEN_SHARE_FALLBACK.to_string());
     }
     analysis.partial = !analysis.partial_reasons.is_empty();
 
@@ -1548,6 +1566,7 @@ mod tests {
         assert!(refreshed.history_observation.half_hour_buckets.is_empty());
         assert!(refreshed.history_observation.weekly_local_points.is_empty());
         assert_eq!(refreshed.local_session_digests.digest_count(), 0);
+        assert!(!account_window_projection_pending(&refreshed.snapshot));
     }
 
     #[test]
@@ -1583,6 +1602,116 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "quota_window_stale")
         );
+    }
+
+    #[test]
+    fn account_only_refresh_retains_zero_gauge_fallback_until_local_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sessions")).unwrap();
+        let config = CollectConfig {
+            codex_home: temp.path().to_owned(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let now = Utc::now();
+        let reset = now + Duration::hours(2);
+        let mut calls = vec![
+            usage_call(
+                now - Duration::minutes(2),
+                "a",
+                "a-turn",
+                "gpt-5.6-sol",
+                300_000,
+            ),
+            usage_call(
+                now - Duration::minutes(1),
+                "b",
+                "b-turn",
+                "gpt-5.5",
+                300_000,
+            ),
+        ];
+        // Equal token totals, different model rates and token breakdowns. Only
+        // the first request crosses the Longx input threshold.
+        calls[1].tokens.input_tokens = 0;
+        calls[1].tokens.output_tokens = 300_000;
+        let mut cache = RolloutCache::new();
+        let empty = collect_snapshot_cached(&config, None, false, &mut cache).snapshot;
+
+        for duration_mins in [300, 10_080] {
+            let mut local = empty.clone();
+            let mut limit = weekly_limit(now, reset, "codex", 0.0);
+            limit.secondary.as_mut().unwrap().window_duration_mins = Some(duration_mins);
+            local.limits = vec![limit.clone()];
+            local.window_analyses = analyze_windows(&[], &[], &calls, &[], &local.limits, now);
+            assert!(!account_window_projection_pending(&local));
+
+            for used_percent in [10.0, 20.0] {
+                limit.secondary.as_mut().unwrap().used_percent = used_percent;
+                let account = AccountSnapshot {
+                    limits: vec![limit.clone()],
+                    ..AccountSnapshot::default()
+                };
+                local = collect_account_refresh_for_snapshot(&config, local, account).snapshot;
+                let base = &local.window_analyses[0];
+                for analysis in [base, base.api_long_context.as_deref().unwrap()] {
+                    assert!(
+                        analysis
+                            .partial_reasons
+                            .iter()
+                            .any(|reason| reason == ACCOUNT_REFRESH_TOKEN_SHARE_FALLBACK)
+                    );
+                    assert!(analysis.partial);
+                    assert_close(analysis.attribution.proxy_projected_percent, used_percent);
+                    for usage in analysis
+                        .threads
+                        .iter()
+                        .map(|thread| &thread.usage)
+                        .chain(analysis.turns.iter().map(|turn| &turn.usage))
+                    {
+                        assert_eq!(usage.token_usage.total_tokens, 300_000);
+                        assert_close(usage.estimated_quota_percent, used_percent / 2.0);
+                    }
+                    for model in &analysis.models {
+                        assert_close(model.estimated_quota_percent, used_percent / 2.0);
+                    }
+                }
+                assert!(account_window_projection_pending(&local));
+            }
+            assert!(local.partial);
+
+            // The forced local pass uses the original calls even when they
+            // have not changed, replacing the fallback and its pending flag.
+            local.window_analyses = analyze_windows(&[], &[], &calls, &[], &local.limits, now);
+            assert!(!account_window_projection_pending(&local));
+            let base = &local.window_analyses[0];
+            let long_context = base.api_long_context.as_deref().unwrap();
+            assert!(
+                long_context.threads[0].usage.estimated_quota_percent
+                    > base.threads[0].usage.estimated_quota_percent
+            );
+            // The bundled input/output credit rates are 800/6000; Longx
+            // doubles only the first request's input weight to 1600.
+            for (analysis, first_weight) in [(base, 800.0), (long_context, 1600.0)] {
+                assert!(!analysis.partial);
+                assert!(analysis.threads[0].usage.estimated_quota_percent < 10.0);
+                let a = analysis.threads[0].usage.estimated_quota_percent;
+                let b = analysis.threads[1].usage.estimated_quota_percent;
+                assert_close(a, 20.0 * first_weight / (first_weight + 6000.0));
+                assert_close(a + b, 20.0);
+                for (turn, expected) in analysis.turns.iter().zip([a, b]) {
+                    assert_close(turn.usage.estimated_quota_percent, expected);
+                }
+                for (model, expected) in [("gpt-5.6-sol", a), ("gpt-5.5", b)] {
+                    let model = analysis
+                        .models
+                        .iter()
+                        .find(|usage| usage.model == model)
+                        .unwrap();
+                    assert_close(model.estimated_quota_percent, expected);
+                }
+            }
+        }
     }
 
     #[test]
