@@ -527,8 +527,12 @@ trace 日志粒度更细并会增加少量诊断 I/O，因此默认关闭。启�
 
 ## 文档
 
+CI 和 release workflow 均配置了 Linux、macOS 和 Windows 原生测试任务。
+TUI 交互测试使用 Unix PTY 或 Windows ConPTY；跨目标编译检查不代表 Windows 运行验证已经通过。
+
 - [数据能力和限制](docs/codex-data-capabilities.md)
 - [终端任务恢复行为](docs/codex-terminal-resume.md)
+- [TUI 集成测试](docs/tui-integration-testing.md)
 - [Windows 和 UTM 测试](docs/windows-testing.md)
 - [更新日志](CHANGELOG.md)
 

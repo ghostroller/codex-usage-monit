@@ -24,7 +24,17 @@ cargo test --locked --all-targets
   together without changing the user's `PATH`.
 - `tests/tui_pty.rs` runs the real TUI in a pseudo-terminal and verifies raw
   keyboard input, SGR mouse input, terminal resize, rendered styles, and clean
-  exit. This test is Unix-only.
+  exit. The interaction test runs on Unix PTYs and Windows ConPTY through
+  `portable-pty`; the SIGTERM/SIGHUP/SIGINT terminal-restoration test remains
+  Unix-only.
+
+The CI and release workflows configure native Linux, macOS (`macos-15`), and
+Windows (`windows-2025`) verification jobs. Each runs `cargo test --locked
+--all-targets`, directly or through `scripts/windows/verify.ps1`, including the
+platform's PTY interaction test. Cross-target `cargo check` can validate Windows
+code from macOS, but does not execute ConPTY or prove terminal behavior; see
+[Windows testing](windows-testing.md) for the runtime workflow and recorded
+validation limits.
 
 The source fixtures live under `tests/fixtures`. Their timestamps, identifiers,
 limits, task hierarchy, model metadata, Unicode text, and partial-data

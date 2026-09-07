@@ -527,6 +527,10 @@ The trace log is more detailed and may add diagnostic I/O, so it is disabled by 
 
 ## Documentation
 
+CI and release workflows configure native Linux, macOS, and Windows test jobs.
+The TUI interaction suite uses Unix PTYs or Windows ConPTY; cross-target
+compilation checks do not establish Windows runtime results.
+
 - [Data capabilities and limits](docs/codex-data-capabilities.md)
 - [Terminal resume behavior](docs/codex-terminal-resume.md)
 - [TUI integration testing](docs/tui-integration-testing.md)

@@ -1,17 +1,27 @@
 # Windows testing
 
-This project verifies Windows in two complementary places:
+Windows runtime verification is configured for the following environments:
 
 | Surface | Architecture | Where it runs | Purpose |
 | --- | --- | --- | --- |
 | Pull requests and releases | `x86_64-pc-windows-msvc` | GitHub-hosted `windows-2025` | A fresh, repeatable x64 Windows environment and the released executable target. |
 | Local macOS development | `aarch64-pc-windows-msvc` | Windows 11 ARM64 in UTM | Native Windows-on-Arm compilation and runtime coverage for changes made on Apple Silicon. |
 
-This division is intentional. Rust documents both Windows MSVC architectures as
-Tier 1 targets, but does not support cross-compiling an MSVC target from a
-non-Windows host. Test Windows code on Windows instead of trying to link it on
-macOS. Windows 11 on Arm can also run the x64 release executable under system
-emulation, but the local VM's primary test is the native ARM64 build.
+Native linking and runtime checks run on Windows. A non-Windows host can still
+type-check the Windows branches without linking or running the executable:
+
+```bash
+cargo check --locked --tests --target x86_64-pc-windows-msvc
+```
+
+The Windows target must already be installed with `rustup`. Windows 11 on Arm
+can also run the x64 release executable under system emulation, but the local
+VM's primary test is the native ARM64 build.
+
+For the 2026-09-08 review changes, local Windows validation was limited to the
+MSVC cross-target check above from macOS. The ConPTY tests are now enabled in
+the Windows test target; their native runtime result must come from a Windows
+CI or VM run. The cross-target check does not establish that result.
 
 ## UTM setup on an Apple Silicon Mac
 
@@ -146,8 +156,12 @@ The pipeline performs the following checks in order:
    contract instead of treating it as a failure.
 
 The GitHub Actions Windows jobs invoke the same `verify.ps1` script. This keeps
-local UTM validation and hosted x64 CI aligned while retaining the existing
-Linux-only pseudo-terminal coverage where its Unix APIs are available.
+local UTM validation and hosted x64 CI aligned. `tests/tui_pty.rs` uses ConPTY on
+Windows to exercise keyboard input, search focus, mouse clicks, compact resize,
+rendered styles, and normal exit. The same interaction test uses Unix PTYs in
+the Linux and macOS jobs. Signal-based terminal-restoration checks remain
+Unix-only; Windows console-close handling still needs separate native
+verification.
 
 ## References
 
