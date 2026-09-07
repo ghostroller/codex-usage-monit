@@ -20,7 +20,7 @@ use crate::automatic_remote_sync::{
     InterruptibleRemoteSyncSleeper,
 };
 use crate::config::CollectConfig;
-use crate::domain::Provenance;
+use crate::domain::{AccountSnapshot, Provenance};
 use crate::health_report::HealthReport;
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, default_history_root};
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
@@ -4039,6 +4039,119 @@ fn combine_recorder_diagnostics(local: Option<&str>, remote: Option<&str>) -> Op
     }
 }
 
+#[derive(Default)]
+struct RecorderLocalState {
+    cached_account: Option<AccountSnapshot>,
+    account_issue: Option<String>,
+    issue: Option<String>,
+    history_pending: bool,
+}
+
+impl RecorderLocalState {
+    /// Retry a failed history write at the next scheduled poll, even when the
+    /// rollout cache has advanced and its unchanged fast path would skip work.
+    /// Rematerialization uses the cached account unless its own refresh is due.
+    fn poll(
+        &mut self,
+        config: &CollectConfig,
+        history_runtime: &HistoryRuntime,
+        rollout_cache: &mut RolloutCache,
+        account_due: bool,
+    ) -> bool {
+        let result = if self.history_pending || account_due || self.cached_account.is_none() {
+            Some(collect_snapshot_cached(
+                config,
+                self.cached_account.clone(),
+                account_due,
+                rollout_cache,
+            ))
+        } else {
+            collect_snapshot_cached_if_changed(config, self.cached_account.clone(), rollout_cache)
+        };
+
+        if let Some(result) = result {
+            self.cached_account = Some(result.account.clone());
+            if account_due {
+                self.account_issue = recorder_account_issue(&result.snapshot);
+            }
+            let collection_issue = result
+                .snapshot
+                .errors
+                .first()
+                .map(|error| format!("collection failed: {error}"))
+                .or_else(|| self.account_issue.clone());
+            let history_started = Instant::now();
+            let history_result = history_runtime.record_local_collection_with_session_digests(
+                &result.history_observation,
+                &result.snapshot.tasks,
+                &result.local_session_digests,
+                LocalObservationMode::Incremental,
+            );
+            let history_elapsed = history_started.elapsed();
+            let mut history_metrics =
+                HistoryMetrics::with_durations(history_elapsed, history_elapsed, None);
+            history_metrics.record_performed = true;
+            history_metrics.quota_points =
+                u64::try_from(result.history_observation.quota_points.len()).unwrap_or(u64::MAX);
+            history_metrics.local_buckets =
+                u64::try_from(result.history_observation.half_hour_buckets.len())
+                    .unwrap_or(u64::MAX);
+            history_metrics.weekly_local_points =
+                u64::try_from(result.history_observation.weekly_local_points.len())
+                    .unwrap_or(u64::MAX);
+            if let Ok(report) = &history_result {
+                history_metrics.shards_written = u64::try_from(
+                    report
+                        .account
+                        .shards_written
+                        .saturating_add(report.buckets.shards_written)
+                        .saturating_add(report.weekly.shards_written)
+                        .saturating_add(report.session_digests.shards_written),
+                )
+                .unwrap_or(u64::MAX);
+                history_metrics.shards_skipped = u64::try_from(
+                    report
+                        .account
+                        .shards_skipped
+                        .saturating_add(report.buckets.shards_skipped)
+                        .saturating_add(report.weekly.shards_skipped)
+                        .saturating_add(report.session_digests.shards_skipped),
+                )
+                .unwrap_or(u64::MAX);
+            } else {
+                history_metrics.warnings = 1;
+            }
+            config.perf_log.record_history(history_metrics);
+            match history_result {
+                Ok(_) => {
+                    self.issue = collection_issue;
+                    self.history_pending = false;
+                }
+                Err(error) => {
+                    self.issue = Some(format!("history persistence failed: {error}"));
+                    self.history_pending = true;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_status(
+        &self,
+        status: &mut RecorderStatusFile,
+        attempt_at: DateTime<Utc>,
+        remote_issue: Option<&str>,
+    ) {
+        match combine_recorder_diagnostics(self.issue.as_deref(), remote_issue) {
+            Some(issue) if self.history_pending => status.record_error(attempt_at, issue),
+            Some(issue) => status.record_degraded(attempt_at, issue),
+            None => status.record_success(attempt_at),
+        }
+    }
+}
+
 fn run_recorder(
     config: CollectConfig,
     args: RecordArgs,
@@ -4149,12 +4262,10 @@ fn run_recorder(
         anyhow::anyhow!("could not revalidate the recorder history profile: {error}")
     })?;
     let mut rollout_cache = RolloutCache::new();
-    let mut cached_account = None;
     let local_interval = Duration::from_secs(args.local_interval_seconds);
     let account_interval = Duration::from_secs(args.account_interval_seconds);
     let mut next_local = Instant::now();
     let mut next_account = Instant::now();
-    let mut account_issue = None;
     let heartbeat_interval_seconds = if config.offline {
         args.local_interval_seconds
     } else {
@@ -4181,7 +4292,7 @@ fn run_recorder(
         project_mapping_store,
         recorder_stop.clone(),
     );
-    let mut local_recorder_issue = None;
+    let mut local_state = RecorderLocalState::default();
 
     loop {
         if recorder_stop.is_stop_requested() {
@@ -4200,107 +4311,19 @@ fn run_recorder(
                 let _ = write_recorder_status(&status_file, &recorder_status);
                 bail!("recorder history profile lease validation failed: {error}");
             }
-            let mut history_persistence_failed = false;
-            let result = if account_due || cached_account.is_none() {
-                Some(collect_snapshot_cached(
-                    &config,
-                    cached_account.clone(),
-                    account_due,
-                    &mut rollout_cache,
-                ))
-            } else {
-                collect_snapshot_cached_if_changed(
-                    &config,
-                    cached_account.clone(),
-                    &mut rollout_cache,
-                )
-            };
-
+            let history_attempted =
+                local_state.poll(&config, &history_runtime, &mut rollout_cache, account_due);
             let attempt_at = Utc::now();
-            if let Some(result) = result {
-                cached_account = Some(result.account.clone());
-                if account_due {
-                    account_issue = recorder_account_issue(&result.snapshot);
-                }
-                let collection_issue = result
-                    .snapshot
-                    .errors
-                    .first()
-                    .map(|error| format!("collection failed: {error}"))
-                    .or_else(|| account_issue.clone());
-                let history_started = Instant::now();
-                let history_result = history_runtime.record_local_collection_with_session_digests(
-                    &result.history_observation,
-                    &result.snapshot.tasks,
-                    &result.local_session_digests,
-                    LocalObservationMode::Incremental,
+            if history_attempted && let Err(error) = history_profile_lease.validate() {
+                recorder_status.record_error(
+                    Utc::now(),
+                    format!("history profile lease changed during persistence: {error}"),
                 );
-                let history_elapsed = history_started.elapsed();
-                let mut history_metrics =
-                    HistoryMetrics::with_durations(history_elapsed, history_elapsed, None);
-                history_metrics.record_performed = true;
-                history_metrics.quota_points =
-                    u64::try_from(result.history_observation.quota_points.len())
-                        .unwrap_or(u64::MAX);
-                history_metrics.local_buckets =
-                    u64::try_from(result.history_observation.half_hour_buckets.len())
-                        .unwrap_or(u64::MAX);
-                history_metrics.weekly_local_points =
-                    u64::try_from(result.history_observation.weekly_local_points.len())
-                        .unwrap_or(u64::MAX);
-                if let Ok(report) = &history_result {
-                    history_metrics.shards_written = u64::try_from(
-                        report
-                            .account
-                            .shards_written
-                            .saturating_add(report.buckets.shards_written)
-                            .saturating_add(report.weekly.shards_written)
-                            .saturating_add(report.session_digests.shards_written),
-                    )
-                    .unwrap_or(u64::MAX);
-                    history_metrics.shards_skipped = u64::try_from(
-                        report
-                            .account
-                            .shards_skipped
-                            .saturating_add(report.buckets.shards_skipped)
-                            .saturating_add(report.weekly.shards_skipped)
-                            .saturating_add(report.session_digests.shards_skipped),
-                    )
-                    .unwrap_or(u64::MAX);
-                } else {
-                    history_metrics.warnings = 1;
-                }
-                config.perf_log.record_history(history_metrics);
-                match history_result {
-                    Ok(_) => {
-                        local_recorder_issue = collection_issue;
-                    }
-                    Err(error) => {
-                        local_recorder_issue = Some(format!("history persistence failed: {error}"));
-                        history_persistence_failed = true;
-                    }
-                }
-                if let Err(error) = history_profile_lease.validate() {
-                    recorder_status.record_error(
-                        Utc::now(),
-                        format!("history profile lease changed during persistence: {error}"),
-                    );
-                    let _ = write_recorder_status(&status_file, &recorder_status);
-                    bail!("recorder history profile lease changed during persistence: {error}");
-                }
+                let _ = write_recorder_status(&status_file, &recorder_status);
+                bail!("recorder history profile lease changed during persistence: {error}");
             }
             let remote_issue = automatic_remote_sync_diagnostic(&remote_sync_diagnostic);
-            let combined_issue = combine_recorder_diagnostics(
-                local_recorder_issue.as_deref(),
-                remote_issue.as_deref(),
-            );
-            match combined_issue {
-                Some(issue) if history_persistence_failed => {
-                    recorder_status.record_error(attempt_at, issue);
-                }
-                Some(issue) => recorder_status.record_degraded(attempt_at, issue),
-                None => recorder_status.record_success(attempt_at),
-            }
+            local_state.update_status(&mut recorder_status, attempt_at, remote_issue.as_deref());
             if let Err(error) = write_recorder_status(&status_file, &recorder_status) {
                 let mut stderr = io::stderr().lock();
                 let _ = writeln!(stderr, "warning: recorder status write failed: {error}");
@@ -5699,6 +5722,113 @@ mod tests {
         assert_eq!(
             automatic_remote_sync_diagnostic(&diagnostic).as_deref(),
             Some("automatic remote sync health persistence failed")
+        );
+    }
+
+    #[test]
+    fn recorder_retries_failed_history_with_unchanged_rollouts_before_advancing_heartbeat() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let rollout_path = codex_home.join("sessions/rollout-recorder-retry.jsonl");
+        fs::create_dir_all(rollout_path.parent().unwrap()).unwrap();
+        let now = Utc::now();
+        let session = serde_json::json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "session_meta",
+            "payload": {"id": "recorder-retry", "timestamp": now.to_rfc3339()}
+        });
+        fs::write(&rollout_path, format!("{session}\n")).unwrap();
+        let config = CollectConfig {
+            codex_home: codex_home.clone(),
+            offline: true,
+            ..CollectConfig::default()
+        };
+        let mut runtime = HistoryRuntime::new_with_project_mapping_store(
+            temp.path().join("state/history-v1"),
+            &codex_home,
+            false,
+            ProjectMappingStore::new(temp.path().join("project-mappings.json")),
+        )
+        .unwrap();
+        runtime.ensure_v2_active().unwrap();
+        let mut cache = RolloutCache::new();
+        let mut local = RecorderLocalState::default();
+        let mut status =
+            RecorderStatusFile::started(now, runtime.legacy_history().namespace().to_owned());
+
+        assert!(local.poll(&config, &runtime, &mut cache, false));
+        local.update_status(&mut status, now, None);
+        assert!(
+            !local.history_pending,
+            "initial write failed: {:?}",
+            local.issue
+        );
+        assert_eq!(status.last_history_heartbeat, Some(now));
+
+        let usage = serde_json::json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 40, "output_tokens": 2, "total_tokens": 42}
+            }}
+        });
+        let mut rollout = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        writeln!(rollout, "{usage}").unwrap();
+        drop(rollout);
+
+        // A regular file in place of the v2 directory causes a real write
+        // failure on every platform without depending on permission semantics.
+        let layout = runtime.source_history().layout_root();
+        let saved_layout = temp.path().join("saved-history-v2");
+        fs::rename(&layout, &saved_layout).unwrap();
+        fs::write(&layout, b"temporarily unavailable").unwrap();
+        for seconds in [1, 2] {
+            assert!(local.poll(&config, &runtime, &mut cache, false));
+            let attempt_at = now + TimeDelta::seconds(seconds);
+            local.update_status(&mut status, attempt_at, Some("remote failure"));
+            assert!(local.history_pending);
+            assert_eq!(status.last_attempt_at, attempt_at);
+            assert_eq!(status.last_history_heartbeat, Some(now));
+            let error = status.last_error.as_deref().unwrap();
+            assert!(error.contains("history persistence failed:"));
+            assert!(error.contains("remote failure"));
+            assert!(
+                collect_snapshot_cached_if_changed(
+                    &config,
+                    local.cached_account.clone(),
+                    &mut cache,
+                )
+                .is_none(),
+                "unchanged rollout input should otherwise skip the next write"
+            );
+        }
+
+        fs::remove_file(&layout).unwrap();
+        fs::rename(saved_layout, &layout).unwrap();
+        assert!(local.poll(&config, &runtime, &mut cache, false));
+        let recovered_at = now + TimeDelta::seconds(3);
+        local.update_status(&mut status, recovered_at, None);
+        assert!(!local.history_pending);
+        assert_eq!(status.last_history_heartbeat, Some(recovered_at));
+        assert!(status.last_error.is_none());
+        let history = runtime
+            .load_unified_history_since(now - TimeDelta::hours(1))
+            .unwrap();
+        assert_eq!(
+            history
+                .history
+                .half_hour_buckets
+                .iter()
+                .map(|bucket| bucket.token_usage.total_tokens)
+                .sum::<u64>(),
+            42
+        );
+        assert!(
+            !local.poll(&config, &runtime, &mut cache, false),
+            "successful persistence should restore the unchanged fast path"
         );
     }
 
