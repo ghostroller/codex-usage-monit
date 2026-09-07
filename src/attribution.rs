@@ -8,6 +8,10 @@ use crate::domain::{
     RateObservation, TaskRecord, ThreadWindowUsage, TokenUsage, TurnRecord, TurnWindowUsage,
     UsageCall, WindowAnalysis, WindowDescriptor, WindowUsage,
 };
+use crate::model_catalog::{
+    CreditTokenRates as TokenRates, credit_rates, fallback_credit_rates,
+    long_context_input_threshold, model_supports_credit_long_context,
+};
 
 const FIVE_HOURS_MINS: i64 = 300;
 const WEEK_MINS: i64 = 10_080;
@@ -15,60 +19,14 @@ const ANALYZED_WINDOW_DURATIONS: [i64; 2] = [FIVE_HOURS_MINS, WEEK_MINS];
 const RESET_DRIFT_SECS: i64 = 120;
 const DEFAULT_CODEX_BUCKET: &str = "codex";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
-const LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
-pub(crate) const ESTIMATOR_REVISION: u32 = 5;
+pub(crate) const ESTIMATOR_REVISION: u32 = crate::model_catalog::BUNDLED_ESTIMATOR_REVISION;
 /// Raw estimator units that represent one published Codex credit-rate unit.
 /// Token rates are expressed in eighths of a credit per million tokens, so
 /// both scales must be removed before an absolute weight is shown to users.
 pub(crate) const ESTIMATED_COST_UNITS_PER_CREDIT: u128 = 8_000_000;
 
-// OpenAI Codex token-based credit rates as of 2026-08-27:
-// https://learn.chatgpt.com/docs/pricing
-// Published per-request long-context multipliers:
-// https://developers.openai.com/api/docs/pricing
-// Integer rates use 1/8 credit per million tokens. The credit and per-million
-// scales cancel when the values are converted into relative shares. Fast rates
-// apply the published family multipliers: GPT-5.6/GPT-5.5 2.5x, GPT-5.4 2x.
-#[derive(Clone, Copy)]
-struct TokenRates {
-    input: u128,
-    cached_input: u128,
-    output: u128,
-}
-
-const SOL_STANDARD: TokenRates = TokenRates::new(800, 80, 4_000);
-const SOL_FAST: TokenRates = TokenRates::new(2_000, 200, 10_000);
-const TERRA_STANDARD: TokenRates = TokenRates::new(400, 40, 2_400);
-const TERRA_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
-const LUNA_STANDARD: TokenRates = TokenRates::new(40, 4, 240);
-const LUNA_FAST: TokenRates = TokenRates::new(100, 10, 600);
-const GPT_5_5_STANDARD: TokenRates = TokenRates::new(1_000, 100, 6_000);
-const GPT_5_5_FAST: TokenRates = TokenRates::new(2_500, 250, 15_000);
-const DAYBREAK_RED_STANDARD: TokenRates = TokenRates::new(2_500, 250, 15_000);
-const DAYBREAK_RED_FAST: TokenRates = TokenRates::new(6_250, 625, 37_500);
-const GPT_5_4_STANDARD: TokenRates = TokenRates::new(500, 50, 3_000);
-const GPT_5_4_FAST: TokenRates = TokenRates::new(1_000, 100, 6_000);
-const GPT_5_4_MINI_STANDARD: TokenRates = TokenRates::new(150, 15, 904);
-const GPT_5_4_MINI_FAST: TokenRates = TokenRates::new(300, 30, 1_808);
-const GPT_5_3_CODEX_STANDARD: TokenRates = TokenRates::new(350, 35, 2_800);
-const GPT_5_2_STANDARD: TokenRates = TokenRates::new(350, 35, 2_800);
-
-impl TokenRates {
-    const fn new(input: u128, cached_input: u128, output: u128) -> Self {
-        Self {
-            input,
-            cached_input,
-            output,
-        }
-    }
-
-    fn long_context(self) -> Self {
-        Self {
-            input: self.input.saturating_mul(2),
-            cached_input: self.cached_input.saturating_mul(2),
-            output: self.output.saturating_mul(3) / 2,
-        }
-    }
+pub(crate) fn current_estimator_revision() -> u32 {
+    crate::model_catalog::estimator_revision()
 }
 
 #[derive(Clone, Copy)]
@@ -553,11 +511,7 @@ fn cost_share(estimated_cost_units: u128, total_estimated_cost_units: u128) -> f
 pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
     let published_rates = codex_credit_rates(call.model.as_deref(), call.is_fast());
     let used_model_fallback = published_rates.is_none() && !call.tokens.is_zero();
-    let base_rates = published_rates.unwrap_or(if call.is_fast() {
-        LUNA_FAST
-    } else {
-        LUNA_STANDARD
-    });
+    let base_rates = published_rates.unwrap_or_else(|| fallback_credit_rates(call.is_fast()));
 
     let tokens = call.tokens;
     let used_token_breakdown_fallback =
@@ -589,8 +543,8 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
         if !supports_long_context_pricing || tokens.is_zero() {
             (false, false)
         } else if let Some(request_input_tokens) = exact_request_input_tokens {
-            (request_input_tokens > LONG_CONTEXT_INPUT_THRESHOLD, false)
-        } else if aggregate_input_upper_bound <= LONG_CONTEXT_INPUT_THRESHOLD {
+            (request_input_tokens > long_context_input_threshold(), false)
+        } else if aggregate_input_upper_bound <= long_context_input_threshold() {
             (false, false)
         } else {
             (false, true)
@@ -623,50 +577,11 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
 }
 
 fn model_supports_long_context_pricing(model: Option<&str>) -> bool {
-    let Some(model) = model.map(str::trim) else {
-        return false;
-    };
-    model.eq_ignore_ascii_case("gpt-5.6")
-        || model.eq_ignore_ascii_case("gpt-5.6-sol")
-        || model.eq_ignore_ascii_case("daybreak-blue-latest")
-        || model.eq_ignore_ascii_case("gpt-5.6-terra")
-        || model.eq_ignore_ascii_case("gpt-5.6-luna")
-        || model.eq_ignore_ascii_case("gpt-5.5")
-        || model.eq_ignore_ascii_case("daybreak-red-latest")
-        || model.eq_ignore_ascii_case("gpt-5.6-cyber")
-        || model.eq_ignore_ascii_case("gpt-5.4")
+    model_supports_credit_long_context(model)
 }
 
 fn codex_credit_rates(model: Option<&str>, fast: bool) -> Option<TokenRates> {
-    let model = model?.trim();
-    let (standard, fast_rate) = if model.eq_ignore_ascii_case("gpt-5.6-sol")
-        || model.eq_ignore_ascii_case("gpt-5.6")
-        || model.eq_ignore_ascii_case("daybreak-blue-latest")
-    {
-        (SOL_STANDARD, SOL_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.6-terra") {
-        (TERRA_STANDARD, TERRA_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.6-luna") {
-        (LUNA_STANDARD, LUNA_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.5") {
-        (GPT_5_5_STANDARD, GPT_5_5_FAST)
-    } else if model.eq_ignore_ascii_case("daybreak-red-latest")
-        || model.eq_ignore_ascii_case("gpt-5.6-cyber")
-        || model.eq_ignore_ascii_case("gpt-5.5-cyber")
-    {
-        (DAYBREAK_RED_STANDARD, DAYBREAK_RED_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.4") {
-        (GPT_5_4_STANDARD, GPT_5_4_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.4-mini") {
-        (GPT_5_4_MINI_STANDARD, GPT_5_4_MINI_FAST)
-    } else if model.eq_ignore_ascii_case("gpt-5.3-codex") {
-        (GPT_5_3_CODEX_STANDARD, GPT_5_3_CODEX_STANDARD)
-    } else if model.eq_ignore_ascii_case("gpt-5.2") || model.eq_ignore_ascii_case("gpt-5.2-codex") {
-        (GPT_5_2_STANDARD, GPT_5_2_STANDARD)
-    } else {
-        return None;
-    };
-    Some(if fast { fast_rate } else { standard })
+    credit_rates(model, fast)
 }
 
 fn model_name(call: &UsageCall) -> String {
@@ -707,13 +622,16 @@ mod tests {
             total_tokens: 999,
         };
         let cases = [
+            ("gpt-6-astra", 40_600, 101_500),
             ("gpt-5.6-sol", 16_240, 40_600),
             ("gpt-5.6", 16_240, 40_600),
             ("daybreak-blue-latest", 16_240, 40_600),
+            ("gpt-daybreak-blue-latest", 16_240, 40_600),
             ("gpt-5.6-terra", 8_920, 22_300),
             ("gpt-5.6-luna", 892, 2_230),
             ("gpt-5.5", 22_300, 55_750),
             ("daybreak-red-latest", 55_750, 139_375),
+            ("gpt-daybreak-red-latest", 55_750, 139_375),
             ("gpt-5.6-cyber", 55_750, 139_375),
             ("gpt-5.5-cyber", 55_750, 139_375),
             ("gpt-5.4", 11_150, 22_300),
@@ -747,7 +665,9 @@ mod tests {
         };
         let cases = [
             ("  DAYBREAK-BLUE-LATEST  ", "gpt-5.6-sol"),
+            ("  GPT-DAYBREAK-BLUE-LATEST  ", "gpt-5.6-sol"),
             ("  DAYBREAK-RED-LATEST  ", "gpt-5.6-cyber"),
+            ("  GPT-DAYBREAK-RED-LATEST  ", "gpt-5.6-cyber"),
             ("  GPT-5.5-CYBER  ", "gpt-5.6-cyber"),
         ];
 

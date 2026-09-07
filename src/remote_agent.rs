@@ -10,11 +10,15 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
+#[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
+use crate::api_cost::current_api_pricing_catalog_revision;
 use crate::config::CollectConfig;
+#[cfg(test)]
+use crate::history::HISTORY_ESTIMATOR_REVISION;
 use crate::history::{
-    HISTORY_ESTIMATOR_REVISION, HISTORY_FORMAT_VERSION, HISTORY_METRIC_REVISION,
-    HISTORY_PROJECT_BREAKDOWN_REVISION,
+    HISTORY_FORMAT_VERSION, HISTORY_METRIC_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION,
+    current_history_estimator_revision,
 };
 use crate::remote_exporter::{
     PreparedRemoteDeltaPage, RemoteDeltaPrepareError, prepare_remote_delta_page,
@@ -547,9 +551,12 @@ pub(crate) fn current_revisions() -> ProtocolRevisions {
     ProtocolRevisions {
         history_format: nonzero_revision(HISTORY_FORMAT_VERSION),
         metric: nonzero_revision(HISTORY_METRIC_REVISION),
-        estimator: nonzero_revision(HISTORY_ESTIMATOR_REVISION),
+        estimator: nonzero_revision(current_history_estimator_revision()),
         project_breakdown: nonzero_revision(HISTORY_PROJECT_BREAKDOWN_REVISION),
-        api_pricing_catalog: nonzero_revision(API_PRICING_CATALOG_REVISION),
+        api_pricing_catalog: nonzero_revision(current_api_pricing_catalog_revision()),
+        model_catalog_fingerprint: crate::model_catalog::model_catalog_fingerprint()
+            .parse()
+            .expect("validated local model catalog has a canonical fingerprint"),
     }
 }
 
@@ -567,11 +574,12 @@ pub(crate) fn current_accepted_revisions() -> crate::remote_protocol::AcceptedRe
         estimator: exact(revisions.estimator),
         project_breakdown: exact(revisions.project_breakdown),
         api_pricing_catalog: exact(revisions.api_pricing_catalog),
+        model_catalog_fingerprint: revisions.model_catalog_fingerprint,
     }
 }
 
 fn nonzero_revision(revision: u32) -> NonZeroU32 {
-    NonZeroU32::new(revision).expect("compile-time protocol revisions must be non-zero")
+    NonZeroU32::new(revision).expect("validated protocol revisions must be non-zero")
 }
 
 fn rollout_roots_are_readable(codex_home: &Path) -> bool {
@@ -613,6 +621,9 @@ mod tests {
             estimator: exact(HISTORY_ESTIMATOR_REVISION),
             project_breakdown: exact(HISTORY_PROJECT_BREAKDOWN_REVISION),
             api_pricing_catalog: exact(API_PRICING_CATALOG_REVISION),
+            model_catalog_fingerprint: crate::model_catalog::model_catalog_fingerprint()
+                .parse()
+                .unwrap(),
         }
     }
 

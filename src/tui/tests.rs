@@ -5264,7 +5264,7 @@ fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
     assert!(wide.contains("API equivalent $1.2345"));
     assert!(wide.contains("model calls only"));
     assert!(wide.contains("coverage 75.0%"));
-    assert!(wide.contains("rates 2026-08-27"));
+    assert!(wide.contains("rates 2026-09-07"));
     assert!(wide.contains("API EQ."));
     assert!(wide.contains("$0.2500"));
 
@@ -5272,7 +5272,7 @@ fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
     assert!(compact.contains("API equivalent $1.2345"));
     assert!(compact.contains("model calls only"));
     assert!(compact.contains("coverage 75.0%"));
-    assert!(compact.contains("rates 2026-08-27"));
+    assert!(compact.contains("rates 2026-09-07"));
     assert!(compact.contains("API EQ."));
     assert!(compact.contains("$0.2500"));
 }
@@ -10479,6 +10479,9 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
                 estimator: one,
                 project_breakdown: one,
                 api_pricing_catalog: one,
+                model_catalog_fingerprint: crate::remote_protocol::test_model_catalog_fingerprint(
+                    1,
+                ),
             },
         )
         .unwrap();

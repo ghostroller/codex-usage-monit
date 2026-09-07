@@ -3492,6 +3492,7 @@ mod tests {
             estimator: nonzero32(estimator),
             project_breakdown: nonzero32(2),
             api_pricing_catalog: nonzero32(6),
+            model_catalog_fingerprint: crate::remote_protocol::test_model_catalog_fingerprint(1),
         }
     }
 
@@ -3508,6 +3509,7 @@ mod tests {
             estimator: exact(revisions.estimator),
             project_breakdown: exact(revisions.project_breakdown),
             api_pricing_catalog: exact(revisions.api_pricing_catalog),
+            model_catalog_fingerprint: revisions.model_catalog_fingerprint.clone(),
         }
     }
 

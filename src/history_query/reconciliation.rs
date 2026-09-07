@@ -9,7 +9,8 @@ use super::{
     DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING, DUPLICATE_SESSION_FACT_CONFLICT_WARNING,
     DUPLICATE_SESSION_MODEL_BREAKDOWN_PARTIAL, DUPLICATE_SESSION_PROJECT_BREAKDOWN_LOWER_BOUND,
     DUPLICATE_SESSION_PROJECT_CONFLICT_WARNING, DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS,
-    SourceReplicaEvidence, SourceSlice, WEEKLY_WINDOW_MINUTES,
+    REMOTE_MODEL_CATALOG_MISMATCH_WARNING, SourceReplicaEvidence, SourceSlice,
+    WEEKLY_WINDOW_MINUTES, mask_session_model_catalog_projection,
 };
 use crate::domain::{ApiCostAmount, TokenUsage};
 use crate::history::{LocalHalfHourBucket, LocalProjectUsageGroup, WeeklyLocalPoint};
@@ -887,6 +888,7 @@ pub(super) fn resolve_logical_replicas(
                         &slices[participant.source_index],
                         thread_id,
                         &participant.digest,
+                        evidence[participant.source_index].model_catalog_compatible,
                     ),
                 )
             })
@@ -937,27 +939,38 @@ pub(super) fn resolve_logical_replicas(
                     );
                 }
                 for (source_index, fact) in facts {
+                    let projected_metrics = if evidence[*source_index].model_catalog_compatible {
+                        fact.metrics().clone()
+                    } else {
+                        mask_session_model_catalog_projection(fact.metrics())
+                    };
                     let bucket_position = add_fact_group(
                         *source_index,
                         &mut slices[*source_index],
                         &mut source_bucket_indices[*source_index],
                         fact,
+                        &projected_metrics,
                         &mut touched,
                         &mut bucket_index_work,
                     )?;
+                    if !evidence[*source_index].model_catalog_compatible {
+                        push_partial_reason_once(
+                            &mut slices[*source_index].buckets[bucket_position],
+                            REMOTE_MODEL_CATALOG_MISMATCH_WARNING,
+                        );
+                    }
                     thread_bucket_index.record(
                         *source_index,
                         &slices[*source_index],
                         fact.replica().thread_id().as_str(),
                         bucket_position,
                         ProjectGroupTotals {
-                            token_usage: fact.metrics().token_usage,
-                            estimated_cost_units: fact.metrics().estimated_cost_units,
-                            api_long_context_extra_cost_units: fact
-                                .metrics()
+                            token_usage: projected_metrics.token_usage,
+                            estimated_cost_units: projected_metrics.estimated_cost_units,
+                            api_long_context_extra_cost_units: projected_metrics
                                 .api_long_context_extra_cost_units,
-                            api_equivalent_cost: fact.metrics().api_equivalent_cost,
-                            call_count: fact.metrics().call_count,
+                            api_equivalent_cost: projected_metrics.api_equivalent_cost,
+                            call_count: projected_metrics.call_count,
                         },
                     )?;
                 }
@@ -1353,7 +1366,7 @@ pub(super) fn replace_weekly_baselines_with_cycle_markers(
             estimated_cost_units: 0,
             api_long_context_extra_cost_units: Some(0),
             long_context_usage_unknown: false,
-            estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
+            estimator_revision: crate::history::current_history_estimator_revision(),
             call_count: 0,
             partial_reasons: vec![DUPLICATE_SESSION_WEEKLY_REBUILT_FROM_BUCKETS.to_string()],
         });
@@ -1619,6 +1632,7 @@ fn authority_is_better(
         current.api_pricing_catalog.get(),
     );
     let left_key = (
+        left_source.model_catalog_compatible,
         left_revisions == current_tuple,
         left_revisions,
         left.exact_event_identity(),
@@ -1629,6 +1643,7 @@ fn authority_is_better(
         left.range_end(),
     );
     let right_key = (
+        right_source.model_catalog_compatible,
         right_revisions == current_tuple,
         right_revisions,
         right.exact_event_identity(),
@@ -1950,12 +1965,12 @@ pub(super) fn add_fact_group(
     source: &mut SourceSlice,
     bucket_index: &mut SourceBucketIndex,
     fact: &UsageEventFact,
+    metrics: &crate::source_history::SessionUsageMetrics,
     touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
     work: &mut ReplicaBucketIndexWork,
 ) -> io::Result<usize> {
     let starts_at = quarter_hour_start(fact.occurred_at())?;
     let ends_at = starts_at + Duration::minutes(15);
-    let metrics = fact.metrics();
     work.fact_lookups = work.fact_lookups.saturating_add(1);
     let position = if let Some(position) = bucket_index.get(&starts_at).copied() {
         position
@@ -2231,6 +2246,7 @@ fn replica_groups_cover_digest(
     source: &SourceSlice,
     thread_id: &ThreadId,
     digest: &SourceSessionDigest,
+    model_catalog_compatible: bool,
 ) -> bool {
     let mut totals = ProjectGroupTotals::empty();
     for indexed in thread_bucket_positions_in_range(
@@ -2251,10 +2267,12 @@ fn replica_groups_cover_digest(
     }
     let expected = digest.metrics();
     totals.token_usage == expected.token_usage
-        && totals.estimated_cost_units == expected.estimated_cost_units
-        && totals.api_long_context_extra_cost_units == expected.api_long_context_extra_cost_units
-        && totals.api_equivalent_cost == expected.api_equivalent_cost
         && totals.call_count == expected.call_count
+        && (!model_catalog_compatible
+            || (totals.estimated_cost_units == expected.estimated_cost_units
+                && totals.api_long_context_extra_cost_units
+                    == expected.api_long_context_extra_cost_units
+                && totals.api_equivalent_cost == expected.api_equivalent_cost))
 }
 
 fn bucket_project_residual(bucket: &LocalHalfHourBucket) -> Option<BucketProjectResidual> {

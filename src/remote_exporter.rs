@@ -566,12 +566,13 @@ pub(crate) fn revision_bound_state_root(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     Ok(state_directory.join(REVISION_NAMESPACE).join(format!(
-        "h{}-m{}-e{}-p{}-a{}",
+        "h{}-m{}-e{}-p{}-a{}-{}",
         revisions.history_format,
         revisions.metric,
         revisions.estimator,
         revisions.project_breakdown,
         revisions.api_pricing_catalog,
+        revisions.model_catalog_fingerprint,
     )))
 }
 
@@ -630,6 +631,8 @@ pub(crate) fn sweep_old_revision_state(
             .to_str()
             .ok_or_else(|| invalid_revision_data("remote export revision name is not UTF-8"))?
             .to_owned();
+        #[cfg(test)]
+        eprintln!("revision GC candidate name: {name}");
         let retired = validate_revision_directory_name(&name)?;
         candidates.push(scan_old_revision_candidate(path, retired, now)?);
     }
@@ -802,7 +805,7 @@ fn validate_revision_directory_name(name: &str) -> io::Result<bool> {
         None => (name, false),
     };
     let mut parts = name.split('-');
-    let valid = [
+    let revisions_valid = [
         ("h", parts.next()),
         ("m", parts.next()),
         ("e", parts.next()),
@@ -814,7 +817,27 @@ fn validate_revision_directory_name(name: &str) -> io::Result<bool> {
         part.and_then(|part| part.strip_prefix(prefix))
             .and_then(|number| number.parse::<u32>().ok())
             .is_some_and(|number| number > 0)
-    }) && parts.next().is_none();
+    });
+    // Protocol v3 appends the normalized model-catalog fingerprint to the
+    // existing numeric tuple. Keep accepting the old five-part name so the
+    // bounded GC can retire pre-v3 state after its normal grace period.
+    let fingerprint_valid = match parts.next() {
+        None => true,
+        Some("model") => {
+            parts.next() == Some("catalog")
+                && parts.next() == Some("sha256")
+                && parts.next() == Some("v1")
+                && parts.next().is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+                && parts.next().is_none()
+        }
+        Some(_) => false,
+    };
+    let valid = revisions_valid && fingerprint_valid;
     if !valid {
         return Err(invalid_revision_data(
             "remote export revision directory name is invalid",
@@ -1683,6 +1706,11 @@ mod tests {
         let first_path = revision_bound_state_root(&store, &first).unwrap();
         let second_path = revision_bound_state_root(&store, &second).unwrap();
         assert_ne!(first_path, second_path);
+
+        let mut third = first.clone();
+        third.model_catalog_fingerprint = crate::remote_protocol::test_model_catalog_fingerprint(2);
+        let third_path = revision_bound_state_root(&store, &third).unwrap();
+        assert_ne!(first_path, third_path);
         assert!(
             first_path
                 .to_string_lossy()

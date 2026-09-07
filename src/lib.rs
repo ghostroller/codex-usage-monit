@@ -19,6 +19,7 @@ pub mod history_query;
 pub mod history_runtime;
 pub mod local_history_migration;
 pub(crate) mod logical_replica;
+mod model_catalog;
 mod open_config;
 pub mod output;
 pub mod perf;

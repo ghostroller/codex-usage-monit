@@ -22,7 +22,7 @@ use super::session_evidence::{
     validate_digest_shard_for_remote_clone,
 };
 use super::*;
-use crate::remote_protocol::{ProtocolRevisions, SourceGeneration};
+use crate::remote_protocol::{ModelCatalogFingerprint, ProtocolRevisions, SourceGeneration};
 
 const REMOTE_HISTORY_DIRECTORY: &str = "remote-history-v1";
 const REMOTE_GENERATIONS_DIRECTORY: &str = "generations";
@@ -117,11 +117,55 @@ impl std::error::Error for SourceHistoryRemoteGenerationIdParseError {}
 
 /// Exact exporter identity and data-domain revisions represented by one
 /// source-history generation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceHistoryRemoteBinding {
     source: SourceGeneration,
     revisions: ProtocolRevisions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedSourceHistoryRemoteBinding {
+    source: SourceGeneration,
+    revisions: PersistedProtocolRevisions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedProtocolRevisions {
+    history_format: std::num::NonZeroU32,
+    metric: std::num::NonZeroU32,
+    estimator: std::num::NonZeroU32,
+    project_breakdown: std::num::NonZeroU32,
+    api_pricing_catalog: std::num::NonZeroU32,
+    #[serde(default)]
+    model_catalog_fingerprint: Option<ModelCatalogFingerprint>,
+}
+
+impl<'de> Deserialize<'de> for SourceHistoryRemoteBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedSourceHistoryRemoteBinding::deserialize(deserializer)?;
+        let revisions = persisted.revisions;
+        let binding = Self {
+            source: persisted.source,
+            revisions: ProtocolRevisions {
+                history_format: revisions.history_format,
+                metric: revisions.metric,
+                estimator: revisions.estimator,
+                project_breakdown: revisions.project_breakdown,
+                api_pricing_catalog: revisions.api_pricing_catalog,
+                model_catalog_fingerprint: revisions.model_catalog_fingerprint.unwrap_or_else(
+                    crate::remote_protocol::legacy_unknown_model_catalog_fingerprint,
+                ),
+            },
+        };
+        binding.validate().map_err(serde::de::Error::custom)?;
+        Ok(binding)
+    }
 }
 
 impl SourceHistoryRemoteBinding {
@@ -2910,6 +2954,9 @@ mod tests {
                 estimator: NonZeroU32::new(revisions[2]).unwrap(),
                 project_breakdown: NonZeroU32::new(revisions[3]).unwrap(),
                 api_pricing_catalog: NonZeroU32::new(revisions[4]).unwrap(),
+                model_catalog_fingerprint: crate::remote_protocol::test_model_catalog_fingerprint(
+                    1,
+                ),
             },
         )
         .unwrap()
@@ -2917,6 +2964,28 @@ mod tests {
 
     fn default_binding() -> SourceHistoryRemoteBinding {
         binding(7, [1; 5])
+    }
+
+    #[test]
+    fn persisted_v2_binding_without_catalog_fingerprint_loads_as_legacy_unknown() {
+        let value = serde_json::json!({
+            "source": {
+                "nodeId": SOURCE,
+                "generation": 1
+            },
+            "revisions": {
+                "historyFormat": 1,
+                "metric": 1,
+                "estimator": 1,
+                "projectBreakdown": 1,
+                "apiPricingCatalog": 1
+            }
+        });
+        let binding: SourceHistoryRemoteBinding = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            binding.revisions().model_catalog_fingerprint,
+            crate::remote_protocol::legacy_unknown_model_catalog_fingerprint()
+        );
     }
 
     fn store(state_root: PathBuf, kind: SourceKind) -> SourceHistoryStore {

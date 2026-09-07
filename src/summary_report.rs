@@ -13,13 +13,18 @@ use chrono::FixedOffset;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
+use crate::api_cost::current_api_pricing_catalog_revision;
 use crate::config::CollectConfig;
 use crate::domain::{ApiCostAmount, Snapshot, TokenUsage, WindowAnalysis};
+#[cfg(test)]
+use crate::history::HISTORY_ESTIMATOR_REVISION;
 use crate::history::{
-    HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData,
-    HistoryObservation, LOCAL_BUCKET_MINUTES,
+    HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData, HistoryObservation, LOCAL_BUCKET_MINUTES,
+    current_history_estimator_revision,
 };
+use crate::history_query::REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX;
 use crate::summary::{
     ProjectSummary, SessionSummary, SummaryMetrics, SummarySample, SummaryTurnKey, SummaryWindow,
     TurnSummary, UsageSummary, summarize_samples_with_local_time,
@@ -578,9 +583,10 @@ pub fn summary_history_coverage_complete(history: &HistoryData, now: DateTime<Ut
         .filter(|bucket| {
             window.contains(bucket.starts_at)
                 && bucket.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
-                && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
-                && bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION
+                && bucket.api_pricing_catalog_revision == current_api_pricing_catalog_revision()
+                && bucket.estimator_revision == current_history_estimator_revision()
                 && bucket.api_long_context_extra_cost_units.is_some()
+                && remote_catalog_uncovered_tokens(bucket) == 0
         })
         .count();
     covered >= expected
@@ -688,21 +694,28 @@ pub fn prepare_summary_with_local_time(
         available_tokens = available_tokens.saturating_add(bucket.token_usage.total_tokens);
         partial_reasons.extend(bucket.partial_reasons.iter().cloned());
         long_context_breakdown_complete &= !bucket.long_context_usage_unknown;
-        if bucket.api_pricing_catalog_revision != API_PRICING_CATALOG_REVISION {
+        if bucket.api_pricing_catalog_revision != current_api_pricing_catalog_revision() {
             partial_reasons.push("api_pricing_catalog_outdated".to_string());
         }
 
-        let estimator_current = bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION;
+        let estimator_current = bucket.estimator_revision == current_history_estimator_revision();
+        let estimated_tokens = if estimator_current {
+            bucket
+                .token_usage
+                .total_tokens
+                .saturating_sub(remote_catalog_uncovered_tokens(bucket))
+        } else {
+            0
+        };
         if estimator_current {
-            estimated_covered_tokens =
-                estimated_covered_tokens.saturating_add(bucket.token_usage.total_tokens);
+            estimated_covered_tokens = estimated_covered_tokens.saturating_add(estimated_tokens);
             for coverage in [
                 daily_coverage.entry(local_date).or_default(),
                 hourly_coverage.entry(local_hour).or_default(),
             ] {
                 coverage.estimated_covered_tokens = coverage
                     .estimated_covered_tokens
-                    .saturating_add(bucket.token_usage.total_tokens);
+                    .saturating_add(estimated_tokens);
             }
         } else {
             partial_reasons.push("estimator_revision_changed".to_string());
@@ -830,6 +843,20 @@ pub fn prepare_summary_with_local_time(
         hourly_coverage,
         partial_reasons,
     }
+}
+
+fn remote_catalog_uncovered_tokens(bucket: &crate::history::LocalHalfHourBucket) -> u64 {
+    bucket
+        .partial_reasons
+        .iter()
+        .filter_map(|reason| {
+            let suffix = reason
+                .strip_prefix(REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX)?
+                .strip_prefix(':')?;
+            suffix.rsplit_once(':')?.1.parse::<u64>().ok()
+        })
+        .fold(0_u64, u64::saturating_add)
+        .min(bucket.token_usage.total_tokens)
 }
 
 /// Re-bucket a prepared summary without rescanning history.
@@ -1310,7 +1337,7 @@ pub(crate) fn summary_api_cost_for_catalog(
     amount: ApiCostAmount,
     catalog_revision: u32,
 ) -> ApiCostAmount {
-    if catalog_revision == API_PRICING_CATALOG_REVISION {
+    if catalog_revision == current_api_pricing_catalog_revision() {
         amount
     } else {
         ApiCostAmount {
@@ -1326,7 +1353,7 @@ fn summary_estimated_units_for_revision(
     long_context_extra_units: u128,
     estimator_revision: u32,
 ) -> (u128, u128) {
-    if estimator_revision == HISTORY_ESTIMATOR_REVISION {
+    if estimator_revision == current_history_estimator_revision() {
         (base_units, long_context_extra_units)
     } else {
         (0, 0)
@@ -2077,6 +2104,58 @@ mod tests {
                 .partial_reasons
                 .contains(&"estimator_revision_changed".to_string())
         );
+    }
+
+    #[test]
+    fn catalog_mismatch_tokens_do_not_count_as_estimated_or_api_coverage() {
+        let now = at(30, 10, 7);
+        let snapshot = snapshot(now);
+        let mut incompatible = project_group("remote", "remote", "turn-2", 50, 0, Some(0));
+        incompatible.api_equivalent_cost = ApiCostAmount {
+            observed_samples: 1,
+            observed_tokens: 50,
+            ..ApiCostAmount::default()
+        };
+        let mut mixed = bucket(
+            at(30, 8, 15),
+            150,
+            vec![
+                project_group("local", "local", "turn-1", 100, 500, Some(50)),
+                incompatible,
+            ],
+        );
+        mixed.estimated_cost_units = 500;
+        mixed.long_context_usage_unknown = true;
+        mixed.partial_reasons = vec![
+            crate::history_query::REMOTE_MODEL_CATALOG_MISMATCH_WARNING.to_string(),
+            format!(
+                "{}:node-fedcba9876543210fedcba9876543210:50",
+                REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX
+            ),
+        ];
+        let history = HistoryData {
+            half_hour_buckets: vec![mixed],
+            ..HistoryData::default()
+        };
+
+        let prepared = prepare_summary_with_local_time(
+            &snapshot,
+            &history,
+            SummaryRange::SevenDays,
+            now,
+            |timestamp| timestamp.naive_utc(),
+        );
+
+        assert_eq!(prepared.available_tokens, 150);
+        assert_eq!(prepared.estimated_covered_tokens, 100);
+        assert_eq!(prepared.usage.totals.estimated_cost_units, 500);
+        assert_eq!(
+            prepared.usage.totals.api_equivalent_cost.observed_tokens,
+            150
+        );
+        assert_eq!(prepared.usage.totals.api_equivalent_cost.priced_tokens, 100);
+        assert!(prepared.value_is_lower_bound(SummaryMetric::Estimated, false));
+        assert!(prepared.value_is_lower_bound(SummaryMetric::ApiEquivalent, false));
     }
 
     #[test]

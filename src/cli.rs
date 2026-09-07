@@ -836,6 +836,16 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     }
     let mut trace_log_guard = TraceLogGuard::new(trace_log.clone(), trace_log_path.clone());
     trace_log_guard.report_error();
+    let catalog_started = Instant::now();
+    let catalog_status = if command_uses_model_catalog(cli.command.as_ref()) {
+        let service_catalog_path = service_remotes_config
+            .as_deref()
+            .and_then(crate::model_catalog::catalog_path_beside);
+        Some(crate::model_catalog::initialize(service_catalog_path)?)
+    } else {
+        None
+    };
+    let catalog_finished = Instant::now();
     trace.record_interval(
         "cli.parse",
         process_started,
@@ -847,6 +857,27 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         trace_init_started,
         trace_initialized_at,
         format!("file={}", cli.startup_log.is_some()),
+    );
+    trace.record_interval(
+        "model_catalog.load",
+        catalog_started,
+        catalog_finished,
+        catalog_status.as_ref().map_or_else(
+            || "skipped=true".to_string(),
+            |status| {
+                format!(
+                    "external={} estimator_revision={} api_revision={} fingerprint={} path={}",
+                    status.external,
+                    status.estimator_revision,
+                    status.api_pricing_catalog_revision,
+                    status.fingerprint,
+                    status
+                        .configured_path
+                        .as_deref()
+                        .map_or_else(|| "-".to_string(), |path| path.display().to_string())
+                )
+            },
+        ),
     );
 
     let config_span = trace.span("cli.config");
@@ -4878,6 +4909,24 @@ fn macos_case_insensitive_paths_equal(left: &Path, right: &Path) -> bool {
     equal
 }
 
+fn command_uses_model_catalog(command: Option<&Command>) -> bool {
+    match command {
+        // `limits` renders only account-server data and never persists model
+        // attribution. Health collection, in contrast, stages a history
+        // observation and therefore must use the validated active catalog.
+        Some(Command::Limits(_)) => false,
+        Some(Command::Service(args)) => matches!(&args.action, ServiceAction::Install),
+        Some(Command::Remote(args)) => matches!(
+            &args.action,
+            RemoteAction::Pair(_) | RemoteAction::Test(_) | RemoteAction::Sync(_)
+        ),
+        Some(Command::RemoteAgent(args)) => {
+            matches!(&args.action, RemoteAgentAction::Export)
+        }
+        _ => true,
+    }
+}
+
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "tui",
@@ -6130,6 +6179,30 @@ mod tests {
                 history_dir: Some(path),
             })) if path == Path::new("state with spaces/history")
         ));
+    }
+
+    #[test]
+    fn rate_independent_commands_skip_model_catalog_loading() {
+        let cli = Cli::try_parse_from(["codex-usage-monit", "limits"]).unwrap();
+        assert!(
+            !command_uses_model_catalog(cli.command.as_ref()),
+            "limits should remain usable when an optional catalog is invalid"
+        );
+
+        for command in [
+            "snapshot",
+            "models",
+            "attribution",
+            "summary",
+            "trends",
+            "health",
+        ] {
+            let cli = Cli::try_parse_from(["codex-usage-monit", command]).unwrap();
+            assert!(
+                command_uses_model_catalog(cli.command.as_ref()),
+                "{command} depends on model mappings or pricing"
+            );
+        }
     }
 
     #[test]

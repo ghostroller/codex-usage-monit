@@ -1,6 +1,6 @@
 # 产品需求文档
 
-更新日期：2026-08-25
+更新日期：2026-09-07
 
 ## 1. 产品目标
 
@@ -22,6 +22,7 @@
 - 同时显示 exact/partial 的本地可观察 token 占比（`TOKEN%`）与基于当前 `codex` gauge 的 estimated quota；实体行以 `~` / `-` 表达估算可用性，估算方法、external activity risk 与 partial 状态在 scope 摘要中统一展示；
 - 所有任务结束后可以把 `settled` 标为 true，但 estimated quota 仍保持 Low，任何结果都不能标为 exact quota；
 - 5 小时和周窗口都按 `resetsAt - windowDurationMins` 计算，不使用简单的 `now - duration`。
+- Codex credit 映射和 API 价格共用一个启动时加载的模型目录；配置目录中存在合法的 `model-catalog.json` 时它完整替换内置目录，只有文件不存在时才回退到内置值。
 
 ## 3. v0.1 功能需求
 
@@ -87,15 +88,17 @@ task/thread -> turn -> model token events
 
 - 只选择当前普通 `codex` 窗口，并按该窗口的 `resetsAt - windowDurationMins` 边界筛选本地调用；
 - `local_share_percent = entity_non_spark_tokens / all_local_non_spark_tokens * 100`；
-- EST 使用 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 与 Daybreak Blue 的 `daybreak-blue-latest` `(100,10,500)`，`gpt-5.6-terra` `(50,5,300)`，`gpt-5.6-luna` `(5,.5,30)`，`gpt-5.5` `(125,12.5,750)`，Daybreak Red 的 `daybreak-red-latest`、`gpt-5.6-cyber` 与历史兼容 slug `gpt-5.5-cyber` `(312.5,31.25,1875)`，`gpt-5.4` `(62.5,6.25,375)`，`gpt-5.4-mini` `(18.75,1.875,113)`；该映射包含 2026-08-21 的 Sol 调价，官方说明其促销费率至少持续到 2026-11-21；
+- 内置 EST 目录使用 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)；Standard `(input, cached input, output)` credits / 1M tokens 分别为：`gpt-6-astra` `(250,25,1250)`，`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 与 Daybreak Blue 的 `daybreak-blue-latest` / `gpt-daybreak-blue-latest` `(100,10,500)`，`gpt-5.6-terra` `(50,5,300)`，`gpt-5.6-luna` `(5,.5,30)`，`gpt-5.5` `(125,12.5,750)`，Daybreak Red 的 `daybreak-red-latest` / `gpt-daybreak-red-latest`、`gpt-5.6-cyber` 与历史兼容 slug `gpt-5.5-cyber` `(312.5,31.25,1875)`，`gpt-5.4` `(62.5,6.25,375)`，`gpt-5.4-mini` `(18.75,1.875,113)`；该映射包含 2026-08-21 的 Sol 调价，官方说明其促销费率至少持续到 2026-11-21；
+- 内置 API pricing catalog revision 3 的费率日期为 2026-09-07，并必须对 `gpt-6-astra` 支持 Standard/Fast 与 short/long-context 四种组合。按 input/cached input/cache write/output 的每百万 token 美元价格，Standard short 为 `(10,1,12.5,50)`、Standard long 为 `(20,2,25,75)`、Fast short 为 `(20,2,25,100)`、Fast long 为 `(40,4,50,150)`；
 - 当前官方费率卡不再列出 GPT-5.3-Codex/GPT-5.2；为读取历史 rollout，`gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仍保留早期 `(43.75,4.375,350)` Standard 兼容权重，不得把它们描述为当前官方费率卡行；
-- `serviceTier=fast` 与本地登录态 rollout 的兼容 `serviceTier=priority` 值都按 ChatGPT Fast 识别；根据官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed)，GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard。这里的 `priority` 兼容行为不得解释为 API Priority 计费，后者在官方文档中是独立费率；
-- `cached = min(cached_input, input)`，`uncached = input - cached`；基础 EST 始终使用 Codex token-based credit rate，不自动套用 API 长上下文倍率。TUI 提供默认关闭的 `[L]EST Longx` 可选口径：对 GPT-5.6 Sol/Terra/Luna/Cyber（含当前 aliases）、GPT-5.5 和 GPT-5.4，只有与安全累计 delta 完全相等的单次 `last_token_usage.input_tokens > 272000` 时，才把 API 公布的 input/cached input `2x` 与 output `1.5x` 代理倍率应用到整次请求。判断必须逐调用进行，不能使用 turn/thread/bucket 累计值；可选口径开启且单次边界未知、聚合 input 超过阈值时保留基础费率并标 `long_context_usage_unknown`，关闭时不得仅因该假设标 partial；聚合不超过阈值可安全按短上下文处理。GPT-5.4 mini、旧 `gpt-5.5-cyber` 与 GPT-5.3/GPT-5.2 兼容映射，以及未知模型 Luna fallback 不得凭推断套用长上下文倍率；Codex credit 卡未公布相同公式，输出不得称为官方逐请求 credit 账单；
+- `serviceTier=fast` 与本地登录态 rollout 的兼容 `serviceTier=priority` 值都按 ChatGPT Fast 识别；根据官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed)，GPT-6 Astra、GPT-5.6/GPT-5.5 family 应用 `2.5x` Standard credit 倍率，GPT-5.4 family 应用 `2x`，GPT-5.3-Codex/GPT-5.2 不在支持范围时保留 Standard；其他 service tier 使用 Standard。这里的 `priority` 兼容行为不得解释为 API Priority 计费，后者在官方文档中是独立费率；
+- `cached = min(cached_input, input)`，`uncached = input - cached`；基础 EST 始终使用 Codex token-based credit rate，不自动套用 API 长上下文倍率。TUI 提供默认关闭的 `[L]EST Longx` 可选口径：对内置目录的 GPT-6 Astra、GPT-5.6 Sol/Terra/Luna/Cyber、GPT-5.5 与 GPT-5.4，或外部目录明确开启 `longContextPricing` 的模型，只有与安全累计 delta 完全相等的单次 `last_token_usage.input_tokens > longContextInputThreshold`（内置值 272000）时，才把 API 公布的 input/cached input `2x` 与 output `1.5x` 代理倍率应用到整次请求。历史兼容 slug `gpt-5.5-cyber` 不启用 Longx。判断必须逐调用进行，不能使用 turn/thread/bucket 累计值；可选口径开启且单次边界未知、聚合 input 超过阈值时保留基础费率并标 `long_context_usage_unknown`，关闭时不得仅因该假设标 partial；聚合不超过阈值可安全按短上下文处理。目录中未开启该能力的模型及未知模型的 credit fallback 不得凭推断套用长上下文倍率；Codex credit 卡未公布相同公式，输出不得称为官方逐请求 credit 账单；
 - reasoning 是 output 子集，cache-write 是 input 子集，两者都不得重复相加。rollout 必须保留 snake/camel case 的 cache-write 字段并用于累计 delta 与单次请求一致性校验；当前 Codex credit 卡没有 cache-write 行，因此 credit 代理不得额外增加 API cache-write charge；
-- 缺失或未映射的非 Spark 模型按 `gpt-5.6-luna` 对应 Standard/Fast credit 费率降级，并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；
+- 缺失或未映射的非 Spark 模型按激活目录的 `creditFallbackModel` 对应 Standard/Fast credit 费率降级（内置目录为 `gpt-5.6-luna`），并增加兼容的 `unpriced_model_rate_fallback` partial reason，不得从未知模型后缀猜测基础模型或从分母中静默删除；该 fallback 仅用于 EST，API 等价费用对未定义价格的模型仍保持未计价；
 - `estimated_quota_percent = codex_used_percent * entity_credit_units / all_credit_units`；task、turn、model 的 EST 使用同一 credit-rate 分母，`TOKEN%` 使用同一原始 token 分母；所有可用 EST 在数据模型/JSON 中保持 Low，TUI/text 仅以 `~` 表示近似，不显示独立 quota-confidence 标签或列；
 - `gpt-5.3-codex-spark` 的公开费率仍是 research preview，继续按精确模型名排除；不得为 Spark 虚构 credit 值；
-- token-based 双口径映射使用 estimator revision 5，历史 metric revision 3；每个新观察必须同时持久化基础 credit units 与可选 API 长上下文 extra，recorder 不得因 TUI 开关改变写入内容。不得假定任意持久化聚合都能直接重新定价，仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在 revision 5 新点的未加权 token/call/cache-write 证据不差于旧点时由 revision-aware upsert 替换。已发布的 revision 3 基础历史必须保留，但在重建前开启可选口径时标 `api_long_context_history_unavailable`；无法拆分基础与附加值的开发版 revision 4 历史必须丢弃。其他无法重建的旧 revision 继续隔离，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
+- 内置 token-based 双口径映射使用 estimator revision 6、API pricing catalog revision 3，历史 metric revision 3；外部目录必须声明分别高于 6 和 3 的 revision，且修改对应费率/映射时必须递增。每个新观察必须同时持久化基础 credit units 与可选 API 长上下文 extra，recorder 不得因 TUI 开关改变写入内容。不得假定任意持久化聚合都能直接重新定价，仅从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶/周数据点，并在当前激活 revision 新点的未加权 token/call/cache-write 证据不差于旧点时由 revision-aware upsert 替换。已发布的 revision 3 基础历史必须保留，但在重建前开启可选口径时标 `api_long_context_history_unavailable`；无法拆分基础与附加值的开发版 revision 4 历史必须丢弃。其他无法重建的旧 revision 继续隔离，混合 revision 不得合并 EST，必须让 `~EST` unavailable 并标记 `estimator_revision_changed` partial reason；
+- `model-catalog.json` 默认位于 macOS `~/Library/Application Support/codex-usage-monit`、Linux `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`、Windows `%LOCALAPPDATA%\codex-usage-monit`；`CODEX_USAGE_MONIT_CONFIG_DIR` 可覆盖目录。外部文件必须是完整目录，包含 aliases、credit 后备项、Standard/Fast、API short/long/cache-write、长上下文阈值和元数据；编辑后重启进程即生效，不需重新编译。存在但损坏、不可读或过大的文件必须让依赖费率的命令失败，不得静默使用内置费率；远程协议必须同时核对 revision 与规范化目录指纹，任一不一致都拒绝混合。已摄取 generation 的目录指纹失配时，查询必须保留其原始 token/call 证据，但将对应 EST/API 派生值降为未计价并给出 source-qualified partial warning。
 - Help Center 所述少量仍使用 legacy rate card 的 Enterprise workspace 无法从本地 rollout 自动识别；对这些 workspace，EST 不得声称代表其适用计费卡；
 - 每个 scope 的摘要统一说明估算方法、`external activity possible` 与 partial 状态；partial 时列出 `partialReasons`。partial、lookback 不完整或 stale 不得清空仍可由当前 gauge 与本地分母计算的 EST；
 - 没有当前 `codex` 窗口或没有本地非 Spark token 分母时显示 unavailable/`-`，不得把未知表达成 `0.0%`；
@@ -112,7 +115,7 @@ task/thread -> turn -> model token events
 - task 完成后迟到的最终 token 仍归入刚完成的 turn；
 - 用户消息有显式 `turn_id` 时按其归属；缺失时只归入当前 active turn，没有 active turn 时不猜测归属；
 - subagent rollout 内嵌的 parent 历史不得重复计入 parent 或 child；
-- 当前结构化的普通 ThreadSpawn subagent 可从经过 provenance gate 的 settings snapshot 还原 service tier，但必须同时满足 metadata 明确为 `agent_role=null` 且 child model 完全匹配；较新 snapshot 覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。旧版、自定义 role、model mismatch 及其他缺 tier 记录不得猜价；唯一策略例外是 `codex-auto-review` 的 `API EQ.` 固定使用 `gpt-5.6-luna` 价格 profile，缺失 tier 按 Standard，保留原始 model label，并加入 `api_price_codex_auto_review_luna_proxy`；
+- 当前结构化的普通 ThreadSpawn subagent 可从经过 provenance gate 的 settings snapshot 还原 service tier，但必须同时满足 metadata 明确为 `agent_role=null` 且 child model 完全匹配；较新 snapshot 覆盖旧状态，并且只有在这条路径中省略或 null tier 才规范化为 API `default`。旧版、自定义 role、model mismatch 及其他缺 tier 记录不得猜价；唯一策略例外是 `codex-auto-review` 的 `API EQ.`：内置目录为该独立 label 配置与 `gpt-5.6-luna` 完全相同的 API rate profile，外部完整目录若要保留该代理也必须显式定义相同费率；缺失 tier 按 Standard，保留原始 model label，并且仅在两者活动费率完全相同时加入 `api_price_codex_auto_review_luna_proxy`；
 - TUI 显示 total，JSON 同时显示 input、cached input、output、reasoning output 和 total。
 
 ### FR-5 一次性输出
@@ -232,6 +235,7 @@ Turns 可分页滚动；Recent tasks 和 Turns 以轻量背景色及单字符标
 - `windows` 与 `snapshot --section windows` 输出多窗口分析，旧 5h 字段保持兼容；
 - `summary` / `trends` 与 TUI 的共享报告在固定 snapshot/history fixture 下逐字段一致，覆盖 Longx、Summary 本地时间桶与 30 天回填、Trends day offset/readout，以及完整/partial/missing 退出码；
 - `health` text/JSON 同时覆盖 snapshot、history、recorder、service 和读取错误，`service status --format json --compact` 输出稳定单行结构；
+- 内置模型目录对 GPT-6 Astra、estimator revision 6 和 API catalog revision 3 的 credit/API 矩阵有测试；外部 `model-catalog.json` 覆盖、aliases、小数费率、未知模型 `creditFallbackModel`、revision 校验、文件缺失回退及已存在坏文件拒绝启动均有覆盖；
 - idle 后额度估算仍不声称 exact。
 
 ## 7. 后续增强，不属于 v0.1

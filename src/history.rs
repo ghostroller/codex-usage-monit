@@ -11,10 +11,12 @@ use chrono::{DateTime, Days, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-use crate::api_cost::ApiCostAggregation;
-use crate::api_cost::{API_PRICING_CATALOG_REVISION, ApiCostAccumulator};
+use crate::api_cost::{API_PRICING_CATALOG_REVISION, ApiCostAggregation};
+use crate::api_cost::{ApiCostAccumulator, current_api_pricing_catalog_revision};
 use crate::atomic_file::replace_file;
-use crate::attribution::{ESTIMATOR_REVISION, estimate_call_weight, is_spark_model};
+use crate::attribution::{
+    ESTIMATOR_REVISION, current_estimator_revision, estimate_call_weight, is_spark_model,
+};
 use crate::domain::{
     AgentInteraction, AgentInteractionKind, ApiCostAmount, LimitBucket, Provenance, TaskRecord,
     TokenUsage, TurnRecord, UsageCall,
@@ -27,6 +29,10 @@ pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
 pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 2;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;
 pub const LOCAL_BUCKET_MINUTES: i64 = 15;
+
+pub fn current_history_estimator_revision() -> u32 {
+    current_estimator_revision()
+}
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const HISTORY_DIRECTORY: &str = "history-v1";
@@ -2181,7 +2187,7 @@ fn weekly_local_points_from_sources(
                 estimated_cost_units,
                 api_long_context_extra_cost_units: Some(api_long_context_extra_cost_units),
                 long_context_usage_unknown,
-                estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                estimator_revision: current_history_estimator_revision(),
                 call_count,
                 partial_reasons: reasons.iter().cloned().collect(),
             }
@@ -2463,9 +2469,9 @@ fn local_buckets_from_calls(
                 estimated_cost_units: bucket.estimated_cost_units,
                 api_long_context_extra_cost_units: Some(bucket.api_long_context_extra_cost_units),
                 long_context_usage_unknown: bucket.long_context_usage_unknown,
-                estimator_revision: HISTORY_ESTIMATOR_REVISION,
+                estimator_revision: current_history_estimator_revision(),
                 project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
-                api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+                api_pricing_catalog_revision: current_api_pricing_catalog_revision(),
                 call_count: bucket.call_count,
                 groups,
                 project_groups,
@@ -2961,9 +2967,9 @@ impl SummaryBackfillMarker {
             completed_at,
             complete,
             history_metric_revision: HISTORY_METRIC_REVISION,
-            estimator_revision: HISTORY_ESTIMATOR_REVISION,
+            estimator_revision: current_history_estimator_revision(),
             project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
-            api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
+            api_pricing_catalog_revision: current_api_pricing_catalog_revision(),
             bucket_minutes: LOCAL_BUCKET_MINUTES,
         }
     }
@@ -2971,9 +2977,9 @@ impl SummaryBackfillMarker {
     fn revisions_are_current(&self) -> bool {
         self.schema_version == SUMMARY_BACKFILL_MARKER_VERSION
             && self.history_metric_revision == HISTORY_METRIC_REVISION
-            && self.estimator_revision == HISTORY_ESTIMATOR_REVISION
+            && self.estimator_revision == current_history_estimator_revision()
             && self.project_breakdown_revision == HISTORY_PROJECT_BREAKDOWN_REVISION
-            && self.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+            && self.api_pricing_catalog_revision == current_api_pricing_catalog_revision()
             && self.bucket_minutes == LOCAL_BUCKET_MINUTES
     }
 }
@@ -3210,7 +3216,7 @@ fn read_shard(path: &Path, namespace: &str, day: NaiveDate) -> ShardRead {
         // single, always-on API long-context value. Its base and optional
         // components cannot be separated after the fact. Keep released
         // revision-3 base history, but let retained rollouts rebuild rev-4
-        // development observations as revision 5 dual weights.
+        // development observations with the current dual-weight estimator.
         shard
             .half_hour_buckets
             .retain(|bucket| bucket.estimator_revision != 4);
@@ -3259,8 +3265,8 @@ fn local_bucket_has_call_evidence(bucket: &LocalHalfHourBucket) -> bool {
 /// buckets still require rollout-backed reconstruction.
 fn can_promote_closed_empty_project_bucket(bucket: &LocalHalfHourBucket) -> bool {
     bucket.project_breakdown_revision == 1
-        && bucket.estimator_revision == HISTORY_ESTIMATOR_REVISION
-        && bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION
+        && bucket.estimator_revision == current_history_estimator_revision()
+        && bucket.api_pricing_catalog_revision == current_api_pricing_catalog_revision()
         && is_current_local_bucket(bucket)
         && bucket.sampled_at == bucket.ends_at
         && bucket.token_usage.is_zero()
@@ -3353,9 +3359,11 @@ pub(crate) fn upsert_half_hour_bucket(
             || model_group_api_cost_can_upgrade_without_replacing(&incoming, &buckets[index]);
         if model_api_cost_upgraded {
             buckets[index].groups = incoming.groups.clone();
-        } else if (buckets[index].api_pricing_catalog_revision
-            > incoming.api_pricing_catalog_revision
-            && closed_bucket_model_group_non_api_evidence_eq(&buckets[index], &incoming))
+        } else if (revision_is_preferred(
+            buckets[index].api_pricing_catalog_revision,
+            incoming.api_pricing_catalog_revision,
+            current_api_pricing_catalog_revision(),
+        ) && closed_bucket_model_group_non_api_evidence_eq(&buckets[index], &incoming))
             || model_group_api_cost_can_upgrade_without_replacing(&buckets[index], &incoming)
         {
             // A fresher writer may still advance unrelated bucket metadata,
@@ -3371,8 +3379,11 @@ pub(crate) fn upsert_half_hour_bucket(
             // normally win the generic replacement ordering.
             incoming.groups = buckets[index].groups.clone();
         }
-        if incoming.api_pricing_catalog_revision > buckets[index].api_pricing_catalog_revision
-            && closed_bucket_model_group_non_api_evidence_eq(&incoming, &buckets[index])
+        if revision_is_preferred(
+            incoming.api_pricing_catalog_revision,
+            buckets[index].api_pricing_catalog_revision,
+            current_api_pricing_catalog_revision(),
+        ) && closed_bucket_model_group_non_api_evidence_eq(&incoming, &buckets[index])
             && !model_api_cost_repriced
         {
             // One revision covers both model and project API amounts. Do not
@@ -3462,15 +3473,28 @@ fn model_group_api_cost_can_upgrade_without_replacing(
     strictly_richer
 }
 
-/// A newer pricing catalog may legitimately change the amount for identical
-/// model-call evidence in either direction. Coverage and the explicit
-/// completeness bit must still retain every fact known by the older catalog.
+/// The active pricing catalog may legitimately change the amount for identical
+/// model-call evidence in either direction. This also permits returning from a
+/// higher-numbered external catalog to the lower-numbered bundled catalog.
+/// Coverage and the explicit completeness bit must still retain every fact
+/// known by the displaced catalog.
 fn model_group_api_cost_can_reprice_without_replacing(
     candidate: &LocalHalfHourBucket,
     existing: &LocalHalfHourBucket,
 ) -> bool {
-    if candidate.api_pricing_catalog_revision <= existing.api_pricing_catalog_revision
-        || !closed_bucket_model_group_non_api_evidence_eq(candidate, existing)
+    let rolls_back_to_active_catalog =
+        candidate.api_pricing_catalog_revision < existing.api_pricing_catalog_revision;
+    if !revision_is_preferred(
+        candidate.api_pricing_catalog_revision,
+        existing.api_pricing_catalog_revision,
+        current_api_pricing_catalog_revision(),
+    ) || !closed_bucket_model_group_non_api_evidence_eq(candidate, existing)
+        || (rolls_back_to_active_catalog
+            && (bucket_collection_issue_count(candidate) > bucket_collection_issue_count(existing)
+                || !project_groups_retain_api_cost_information_for_reprice(
+                    &candidate.project_groups,
+                    &existing.project_groups,
+                )))
     {
         return false;
     }
@@ -3487,6 +3511,36 @@ fn model_group_api_cost_can_reprice_without_replacing(
             .is_some_and(|candidate_group| {
                 model_group_api_coverage_and_completeness_retained(candidate_group, existing_group)
             })
+    })
+}
+
+/// API prices may move in either direction, but a reprice must not lose any
+/// per-session/turn attribution, token evidence, metadata, or priced coverage.
+fn project_groups_retain_api_cost_information_for_reprice(
+    candidate: &[LocalProjectUsageGroup],
+    existing: &[LocalProjectUsageGroup],
+) -> bool {
+    let candidate_by_turn = candidate
+        .iter()
+        .map(|group| ((group.thread_id.as_str(), group.turn_id.as_deref()), group))
+        .collect::<HashMap<_, _>>();
+    if candidate_by_turn.len() != candidate.len() {
+        return false;
+    }
+
+    existing.iter().all(|existing_group| {
+        let Some(candidate_group) = candidate_by_turn.get(&(
+            existing_group.thread_id.as_str(),
+            existing_group.turn_id.as_deref(),
+        )) else {
+            return false;
+        };
+        let mut comparable = (**candidate_group).clone();
+        comparable.api_equivalent_cost.minimum_pico_usd =
+            existing_group.api_equivalent_cost.minimum_pico_usd;
+        comparable.api_equivalent_cost.maximum_pico_usd =
+            existing_group.api_equivalent_cost.maximum_pico_usd;
+        project_group_information_dominates(&comparable, existing_group).is_some()
     })
 }
 
@@ -3645,15 +3699,23 @@ fn project_breakdown_can_upgrade_without_replacing(
     incoming: &LocalHalfHourBucket,
     existing: &LocalHalfHourBucket,
 ) -> bool {
+    let api_revision_is_preferred = revision_is_preferred(
+        incoming.api_pricing_catalog_revision,
+        existing.api_pricing_catalog_revision,
+        current_api_pricing_catalog_revision(),
+    );
+    let api_revision_is_not_older = incoming.api_pricing_catalog_revision
+        == existing.api_pricing_catalog_revision
+        || api_revision_is_preferred;
     let newer_breakdown = incoming.project_breakdown_revision > existing.project_breakdown_revision
-        || incoming.api_pricing_catalog_revision > existing.api_pricing_catalog_revision;
+        || api_revision_is_preferred;
     let richer_breakdown = incoming.project_breakdown_revision
         == existing.project_breakdown_revision
         && incoming.api_pricing_catalog_revision == existing.api_pricing_catalog_revision
         && project_groups_are_strictly_richer(&incoming.project_groups, &existing.project_groups);
     (newer_breakdown || richer_breakdown)
         && incoming.project_breakdown_revision >= existing.project_breakdown_revision
-        && incoming.api_pricing_catalog_revision >= existing.api_pricing_catalog_revision
+        && api_revision_is_not_older
         && incoming.estimator_revision == existing.estimator_revision
         && incoming.token_usage == existing.token_usage
         && incoming.estimated_cost_units == existing.estimated_cost_units
@@ -3960,8 +4022,11 @@ fn should_replace_half_hour_bucket(
         return incoming.sampled_at > existing.sampled_at;
     }
     if incoming.estimator_revision != existing.estimator_revision {
-        return incoming.estimator_revision > existing.estimator_revision
-            && bucket_unweighted_evidence_dominates(incoming, existing)
+        return revision_is_preferred(
+            incoming.estimator_revision,
+            existing.estimator_revision,
+            current_history_estimator_revision(),
+        ) && bucket_unweighted_evidence_dominates(incoming, existing)
             && bucket_collection_issue_count(incoming) <= bucket_collection_issue_count(existing)
             && incoming.sampled_at >= existing.sampled_at;
     }
@@ -3999,8 +4064,11 @@ fn should_replace_weekly_local_point(
         return incoming.observed_at > existing.observed_at;
     }
     if incoming.estimator_revision != existing.estimator_revision {
-        return incoming.estimator_revision > existing.estimator_revision
-            && weekly_unweighted_evidence_dominates(incoming, existing)
+        return revision_is_preferred(
+            incoming.estimator_revision,
+            existing.estimator_revision,
+            current_history_estimator_revision(),
+        ) && weekly_unweighted_evidence_dominates(incoming, existing)
             && collection_issue_count(&incoming.partial_reasons)
                 <= collection_issue_count(&existing.partial_reasons)
             && incoming.observed_at >= existing.observed_at;
@@ -4137,12 +4205,32 @@ fn weekly_point_can_suppress_later(candidate: &WeeklyLocalPoint, later: &WeeklyL
     if candidate.estimator_revision == later.estimator_revision {
         return weekly_evidence_dominates(candidate, later);
     }
-    if candidate.estimator_revision > later.estimator_revision {
+    if revision_is_preferred(
+        candidate.estimator_revision,
+        later.estimator_revision,
+        current_history_estimator_revision(),
+    ) {
         return weekly_unweighted_evidence_dominates(candidate, later);
+    }
+
+    if revision_is_preferred(
+        later.estimator_revision,
+        candidate.estimator_revision,
+        current_history_estimator_revision(),
+    ) {
+        return false;
     }
 
     weekly_unweighted_evidence_dominates(candidate, later)
         && !weekly_unweighted_evidence_dominates(later, candidate)
+}
+
+/// Orders persisted semantic revisions while treating the process's active
+/// revision as authoritative even when it is numerically lower. Numeric order
+/// remains the tie-break policy between two inactive revisions, preserving the
+/// existing upgrade behavior for legacy writers.
+fn revision_is_preferred(candidate: u32, existing: u32, current: u32) -> bool {
+    candidate != existing && (candidate == current || (existing != current && candidate > existing))
 }
 
 fn weekly_unweighted_evidence_dominates(
@@ -5871,7 +5959,10 @@ mod tests {
         );
 
         let local = observation.half_hour_buckets.last().unwrap();
-        assert_eq!(local.estimator_revision, 5);
+        assert_eq!(
+            local.estimator_revision,
+            current_history_estimator_revision()
+        );
         assert!(local.partial_reasons.is_empty());
         assert!(local.long_context_usage_unknown);
         assert_eq!(local.groups.len(), 1);
@@ -5879,7 +5970,10 @@ mod tests {
         assert!(local.groups[0].used_long_context_detection_fallback);
 
         let weekly = observation.weekly_local_points.last().unwrap();
-        assert_eq!(weekly.estimator_revision, 5);
+        assert_eq!(
+            weekly.estimator_revision,
+            current_history_estimator_revision()
+        );
         assert!(weekly.partial_reasons.is_empty());
         assert!(weekly.long_context_usage_unknown);
 
@@ -7414,6 +7508,8 @@ mod tests {
         let starts_at = at(2026, 7, 28, 12, 0, 0);
         let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
         let mut old_catalog = local_bucket(starts_at, sampled_at, 300, 3_000);
+        old_catalog.api_pricing_catalog_revision =
+            current_api_pricing_catalog_revision().saturating_add(1);
         old_catalog.call_count = 2;
         old_catalog.groups = vec![LocalUsageGroup {
             model: Some("gpt-5.6-sol".to_string()),
@@ -7463,6 +7559,80 @@ mod tests {
             incomplete_newer_catalog
         ));
         assert_eq!(buckets[0].groups, new_catalog.groups);
+    }
+
+    #[test]
+    fn active_lower_api_catalog_reprices_without_allowing_stale_or_sparse_writers() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let sampled_at = starts_at + Duration::minutes(LOCAL_BUCKET_MINUTES);
+        let current_catalog = current_api_pricing_catalog_revision();
+        let external_catalog = current_catalog.saturating_add(1);
+        let api_cost = |minimum, maximum, priced_samples| ApiCostAmount {
+            minimum_pico_usd: crate::domain::PicoUsd::new(minimum),
+            maximum_pico_usd: crate::domain::PicoUsd::new(maximum),
+            observed_samples: 2,
+            priced_samples,
+            observed_tokens: 300,
+            priced_tokens: if priced_samples == 2 { 300 } else { 150 },
+        };
+
+        let mut external = local_bucket(starts_at, sampled_at, 300, 3_000);
+        external.call_count = 2;
+        external.api_pricing_catalog_revision = external_catalog;
+        external.groups = vec![LocalUsageGroup {
+            model: Some("gpt-5.6-sol".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(0),
+            call_count: 2,
+            api_equivalent_cost: api_cost(300, 350, 2),
+            api_equivalent_cost_complete: true,
+            ..LocalUsageGroup::default()
+        }];
+        external.project_groups = vec![LocalProjectUsageGroup {
+            thread_id: "thread".to_string(),
+            turn_id: Some("turn".to_string()),
+            token_usage: usage(300),
+            estimated_cost_units: 3_000,
+            api_long_context_extra_cost_units: Some(0),
+            api_equivalent_cost: api_cost(300, 350, 2),
+            call_count: 2,
+            ..LocalProjectUsageGroup::default()
+        }];
+
+        let mut active = external.clone();
+        active.api_pricing_catalog_revision = current_catalog;
+        active.groups[0].api_equivalent_cost = api_cost(200, 250, 2);
+        active.project_groups[0].api_equivalent_cost = api_cost(200, 250, 2);
+
+        let mut buckets = vec![external.clone()];
+        assert!(upsert_half_hour_bucket(&mut buckets, active.clone()));
+        assert_eq!(buckets, vec![active.clone()]);
+
+        let mut stale_writer = external.clone();
+        stale_writer.groups[0].api_equivalent_cost = api_cost(400, 450, 2);
+        stale_writer.project_groups[0].api_equivalent_cost = api_cost(400, 450, 2);
+        assert!(!upsert_half_hour_bucket(&mut buckets, stale_writer));
+        assert_eq!(buckets, vec![active]);
+
+        let mut incomplete_active = external.clone();
+        incomplete_active.api_pricing_catalog_revision = current_catalog;
+        incomplete_active.groups[0].api_equivalent_cost = api_cost(200, 250, 1);
+        incomplete_active.project_groups[0].api_equivalent_cost = api_cost(200, 250, 1);
+        let mut incomplete_buckets = vec![external.clone()];
+        assert!(!upsert_half_hour_bucket(
+            &mut incomplete_buckets,
+            incomplete_active
+        ));
+        assert_eq!(incomplete_buckets, vec![external.clone()]);
+
+        let mut sparse_active = external.clone();
+        sparse_active.api_pricing_catalog_revision = current_catalog;
+        sparse_active.groups[0].api_equivalent_cost = api_cost(200, 250, 2);
+        sparse_active.project_groups.clear();
+        let mut sparse_buckets = vec![external.clone()];
+        assert!(!upsert_half_hour_bucket(&mut sparse_buckets, sparse_active));
+        assert_eq!(sparse_buckets, vec![external]);
     }
 
     #[test]
@@ -7841,6 +8011,57 @@ mod tests {
     }
 
     #[test]
+    fn active_lower_estimator_revision_replaces_external_half_hour_safely() {
+        let starts_at = at(2026, 7, 28, 12, 0, 0);
+        let current_estimator = current_history_estimator_revision();
+        let current_catalog = current_api_pricing_catalog_revision();
+        let external_estimator = current_estimator.saturating_add(1);
+        let external_catalog = current_catalog.saturating_add(1);
+
+        let mut external = local_bucket(starts_at, starts_at + Duration::minutes(10), 50, 500);
+        external.estimator_revision = external_estimator;
+        external.api_pricing_catalog_revision = external_catalog;
+        external.call_count = 5;
+        let mut active = local_bucket(starts_at, starts_at + Duration::minutes(12), 50, 100);
+        active.estimator_revision = current_estimator;
+        active.api_pricing_catalog_revision = current_catalog;
+        active.call_count = 5;
+        let mut buckets = vec![external.clone()];
+
+        assert!(upsert_half_hour_bucket(&mut buckets, active.clone()));
+        assert_eq!(buckets, vec![active.clone()]);
+
+        let mut stale_writer = local_bucket(starts_at, starts_at + Duration::minutes(14), 70, 700);
+        stale_writer.estimator_revision = external_estimator;
+        stale_writer.api_pricing_catalog_revision = external_catalog;
+        stale_writer.call_count = 7;
+        assert!(!upsert_half_hour_bucket(&mut buckets, stale_writer));
+        assert_eq!(buckets, vec![active]);
+
+        let mut lower_quality_active = external.clone();
+        lower_quality_active.sampled_at = starts_at + Duration::minutes(14);
+        lower_quality_active.estimator_revision = current_estimator;
+        lower_quality_active.api_pricing_catalog_revision = current_catalog;
+        lower_quality_active.estimated_cost_units = 100;
+        lower_quality_active.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut quality_buckets = vec![external.clone()];
+        assert!(!upsert_half_hour_bucket(
+            &mut quality_buckets,
+            lower_quality_active
+        ));
+        assert_eq!(quality_buckets, vec![external.clone()]);
+
+        let mut older_active = external.clone();
+        older_active.sampled_at = starts_at + Duration::minutes(8);
+        older_active.estimator_revision = current_estimator;
+        older_active.api_pricing_catalog_revision = current_catalog;
+        older_active.estimated_cost_units = 100;
+        let mut time_buckets = vec![external.clone()];
+        assert!(!upsert_half_hour_bucket(&mut time_buckets, older_active));
+        assert_eq!(time_buckets, vec![external]);
+    }
+
+    #[test]
     fn later_weekly_point_cannot_drop_on_a_lower_quality_scan() {
         let reset = at(2026, 7, 31, 12, 17, 0);
         let first_at = at(2026, 7, 28, 12, 5, 0);
@@ -7929,6 +8150,65 @@ mod tests {
         poorer_but_newer.call_count = 4;
         assert!(!upsert_weekly_local_point(&mut points, poorer_but_newer));
         assert_eq!(points, vec![newer]);
+    }
+
+    #[test]
+    fn active_lower_estimator_revision_replaces_external_weekly_safely() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let current_estimator = current_history_estimator_revision();
+        let external_estimator = current_estimator.saturating_add(1);
+        let first_at = at(2026, 7, 28, 12, 6, 0);
+        let mut external = weekly_point(first_at, reset, 50, 500);
+        external.estimator_revision = external_estimator;
+        external.call_count = 5;
+        let mut active = weekly_point(first_at + Duration::minutes(1), reset, 50, 100);
+        active.estimator_revision = current_estimator;
+        active.call_count = 5;
+        let mut points = vec![external.clone()];
+
+        assert!(upsert_weekly_local_point(&mut points, active.clone()));
+        assert_eq!(points, vec![active.clone()]);
+
+        let mut stale_writer = weekly_point(first_at + Duration::minutes(2), reset, 70, 700);
+        stale_writer.estimator_revision = external_estimator;
+        stale_writer.call_count = 7;
+        assert!(!upsert_weekly_local_point(&mut points, stale_writer));
+        assert_eq!(points, vec![active]);
+
+        let mut lower_quality_active = external.clone();
+        lower_quality_active.observed_at = first_at + Duration::minutes(2);
+        lower_quality_active.estimator_revision = current_estimator;
+        lower_quality_active.estimated_cost_units = 100;
+        lower_quality_active.partial_reasons = vec!["rollout_scan_incomplete".to_string()];
+        let mut quality_points = vec![external.clone()];
+        assert!(!upsert_weekly_local_point(
+            &mut quality_points,
+            lower_quality_active
+        ));
+        assert_eq!(quality_points, vec![external]);
+    }
+
+    #[test]
+    fn active_lower_estimator_revision_wins_cross_slot_weekly_plateaus() {
+        let reset = at(2026, 7, 31, 12, 17, 0);
+        let current_estimator = current_history_estimator_revision();
+        let external_estimator = current_estimator.saturating_add(1);
+        let mut external = weekly_point(at(2026, 7, 28, 12, 1, 0), reset, 50, 500);
+        external.estimator_revision = external_estimator;
+        external.call_count = 5;
+        let mut active = weekly_point(at(2026, 7, 28, 12, 7, 0), reset, 50, 100);
+        active.estimator_revision = current_estimator;
+        active.call_count = 5;
+        let mut points = vec![external.clone()];
+
+        assert!(upsert_weekly_local_point(&mut points, active.clone()));
+        assert_eq!(points, vec![external, active.clone()]);
+
+        let mut stale_writer = weekly_point(at(2026, 7, 28, 12, 12, 0), reset, 50, 500);
+        stale_writer.estimator_revision = external_estimator;
+        stale_writer.call_count = 5;
+        assert!(!upsert_weekly_local_point(&mut points, stale_writer));
+        assert_eq!(points.last(), Some(&active));
     }
 
     #[test]

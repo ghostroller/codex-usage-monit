@@ -2313,6 +2313,8 @@ mod tests {
                     estimator: one,
                     project_breakdown: one,
                     api_pricing_catalog: one,
+                    model_catalog_fingerprint:
+                        crate::remote_protocol::test_model_catalog_fingerprint(1),
                 },
             )
             .unwrap();

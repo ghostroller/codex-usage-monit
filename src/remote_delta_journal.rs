@@ -938,6 +938,7 @@ mod tests {
             estimator: nonzero32(4),
             project_breakdown: nonzero32(5),
             api_pricing_catalog: nonzero32(6),
+            model_catalog_fingerprint: crate::remote_protocol::test_model_catalog_fingerprint(1),
         }
     }
 

@@ -350,24 +350,30 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `TOKENS` | 本地观察到的 token 总量。在带周期范围的 TUI 视图中，它表示所选普通 `codex` 重置周期内符合条件的非 Spark 用量；在一次性 `tasks`/`turns` 及其 JSON `tokenUsage` 中，它覆盖配置的扫描范围。 |
 | `TOKEN5H%` / `TOKENWK%` / `TOKEN%` | 该实体在所选普通 `codex` 周期的本地可观察、符合条件的非 Spark token 中所占比例。它是 token 占比，不是账户额度百分比。 |
 | `EST.Q5H` / `EST.QWK` / `EST.Q` | 归因到该实体的低置信度额度消耗估算，单位为百分点。`~` 表示近似值；`-` 表示无法计算。 |
-| `API EQ.` / `API.EQ5H` | 按内置 OpenAI API 费率换算本地模型 token。TUI 中每个 Tasks 和 Turns 行都显示当前所选 5 小时或周 scope 内的独立值；它不是 lifetime 总额，窗口缺失时显示 `-`，且不随 `EST Longx` 切换。一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示这是下界，因为未计价 sample 或不完整的本地 rollout 覆盖可能遗漏额外费用；`-` 也表示没有可用本地数据或没有可应用的公开价格。 |
+| `API EQ.` / `API.EQ5H` | 按当前生效的 OpenAI API 费率目录换算本地模型 token。TUI 中每个 Tasks 和 Turns 行都显示当前所选 5 小时或周 scope 内的独立值；它不是 lifetime 总额，窗口缺失时显示 `-`，且不随 `EST Longx` 切换。一次性 task/turn 行固定使用当前 5 小时重置周期。区间表示请求边界可能是短或长上下文；末尾 `+` 表示这是下界，因为未计价 sample 或不完整的本地 rollout 覆盖可能遗漏额外费用；`-` 也表示没有可用本地数据或没有可应用的公开价格。 |
 | Summary 中的 `~EST CR.` | 所选任意时间区间内可累加的 Codex credit 费率等价值；从估算权重归一化后以 credits 显示，适合比较相对消耗，但不是账户额度百分比或订阅账单。 |
 | `EFFORT` | Codex 记录的 reasoning-effort 值。 |
 | `FAST` | rollout 使用了可识别的 Fast 服务层（`serviceTier=fast` 或兼容的 `priority`）；归因会应用官方 Fast credit 倍率。 |
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
 | `SOURCE` | 记录的任务来源。TUI 筛选器包括 All（不限制来源）、Desktop（包含 `vscode`）、Subagent 和 CLI。 |
 
-估算器依据 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)。按 2026-08-21 的调整，`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 和 Daybreak Blue 的 `daybreak-blue-latest` 别名使用每百万 token `(100, 10, 500)` 的 input/cached-input/output credits；OpenAI 说明该 Sol 促销费率至少持续到 2026-11-21。Daybreak Red 当前的 `daybreak-red-latest` 别名与 `gpt-5.6-cyber` ID 使用 `(312.5, 31.25, 1875)`，旧 `gpt-5.5-cyber` slug 仅为历史 rollout 兼容而继续映射到同一行。当前费率卡还提供 GPT-5.6 Terra/Luna、GPT-5.5、GPT-5.4 和 GPT-5.4 mini；GPT-5.3-Codex、GPT-5.2 与历史 `gpt-5.2-codex` slug 继续使用早期兼容权重，但不再表述为当前官方费率卡行。
+估算器依据 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)。GPT-6 Astra 使用每百万 token `(250, 25, 1250)` 的 input/cached-input/output credits。`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 和 Daybreak Blue 当前的 `daybreak-blue-latest` / `gpt-daybreak-blue-latest` 别名使用 `(100, 10, 500)`；OpenAI 说明该 Sol 促销费率至少持续到 2026-11-21。Daybreak Red 当前的 `daybreak-red-latest` / `gpt-daybreak-red-latest` 别名与 `gpt-5.6-cyber` ID 使用 `(312.5, 31.25, 1875)`，旧 `gpt-5.5-cyber` slug 仅为历史 rollout 兼容而继续映射到同一行。当前费率卡还提供 GPT-5.6 Terra/Luna、GPT-5.5、GPT-5.4 和 GPT-5.4 mini；GPT-5.3-Codex、GPT-5.2 与历史 `gpt-5.2-codex` slug 继续使用早期兼容权重，但不再表述为当前官方费率卡行。
 
-对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-5.6/GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用对应的 GPT-5.6 Luna 后备费率，并把 scope 标为 partial。
+对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-6 Astra、GPT-5.6 和 GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用当前目录显式配置的 credit 后备模型，并把 scope 标为 partial。
 
 可选 Longx 投影**默认关闭**。在 TUI 中可用 `[L]EST Longx` 持久开启，也可在某次 CLI 查询中传入 `--long-context`。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此 Longx 只是可选代理假设，不是订阅制计费事实。TUI 开关会随其他偏好保存；CLI 参数不会读取或改变该偏好。recorder 始终同时保存基础权重与可选附加权重，因此在任一界面切换都无需重装后台服务。
 
-`API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。程序按每个本地可观察模型请求分别计算普通 input、cached input、cache write 和 output；reasoning token 已包含在 output 中，不会重复相加。单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。对于当前结构化的普通 ThreadSpawn subagent，只有 spawn metadata 明确记录未使用自定义 role，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，parser 才还原其有效 tier；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才表示 API `default`。`codex-auto-review` 是应用明确采用的计价代理：使用 `gpt-5.6-luna` 费率，保留已记录的 Standard/Fast tier，tier 缺失时按 Standard，界面与 model breakdown 仍保留 `codex-auto-review`，并报告 `api_price_codex_auto_review_luna_proxy`。这是应用的路由假设，不是官方 API model alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知 tier、模型未知、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
+`API EQ.` 是独立计算，依据当前 [OpenAI API pricing 表](https://developers.openai.com/api/docs/pricing)。程序按每个本地可观察模型请求分别计算普通 input、cached input、cache write 和 output；reasoning token 已包含在 output 中，不会重复相加。单次准确请求的 input 超过 272K 且官方公布长上下文价格时应用该价格；只有一套平价费率的模型在其支持的上下文内继续使用同一价格。较大的累计增量如果无法还原请求边界，则显示短/长上下文费用区间。对于当前结构化的普通 ThreadSpawn subagent，只有 spawn metadata 明确记录未使用自定义 role，且 child model 与经过 provenance gate 的 settings snapshot 完全匹配时，parser 才还原其有效 tier；较新 snapshot 总会覆盖旧状态，并且只有在这条路径中省略或 null tier 才表示 API `default`。内置目录把 `codex-auto-review` 作为明确的应用计价代理：使用 `gpt-5.6-luna` 费率，保留已记录的 Standard/Fast tier，tier 缺失时按 Standard，界面与 model breakdown 仍保留 `codex-auto-review`；只有活动目录中两者的 API 费率仍完全相同时才报告 `api_price_codex_auto_review_luna_proxy`。这是应用的路由假设，不是官方 API model alias。旧版或自定义 role 的 spawn、model 不匹配、其他缺失或未知 tier、模型未知、缺少 Fast/long 价格行、token breakdown 缺失，以及存在 cache write 但没有公开费率时，会降低已计价覆盖率，而不会套用后备价格。按次收取的工具费用及其他非模型费用不在计算范围；工具执行前后进入模型 input/output 的 token 仍按模型价格换算。因此它表示按当前 API 费率换算的等价值，不是 API 账单，也不是 Codex 订阅实际扣费。
 
 GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列出 image 和 text 两种计费，而 rollout 用量没有提供足够的模态信息来可靠选择。若普通 token 调用中出现该模型名，它会使用带 partial 标记的未知模型后备，而不会假装 image 费率是精确值。
 
 任务树默认全部收起；可见的父任务行会汇总被隐藏后代的 token、占比、估算额度和 API 等价金额；展开后恢复各会话的独立行。
+
+### 覆盖模型费率目录
+
+每次进程启动时，程序会在常规配置目录查找 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`。`CODEX_USAGE_MONIT_CONFIG_DIR` 会和其他配置文件一样覆盖该目录。这个文件可选，程序不会自动创建：文件不存在时使用内置目录；文件存在但无法读取或校验失败时，需要计算价格或协商价格 revision 的命令会直接报错，不会静默切到另一套费率。
+
+可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 6 和 3）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v3 会在合并数据前拒绝任何不匹配。
 
 ### 状态标识
 
@@ -394,7 +400,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。当前双权重映射对应 revision 5：每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 6；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和值，而不是从图表坐标反推。对于 Trends 中的 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。Summary 的 Inspect 则显示当前 `1h` 到 `1d` 粒度下所选派生本地聚合桶的起点、区间和值；它不是原始事件时间戳。
 
@@ -403,7 +409,7 @@ Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和�
 - **Token 是 rollout 观察值。** Task/turn/模型计数来自单调累计计数器的增量。在相关日志完整、计数器没有发生歧义重置时，它们在每个已扫描的本机或显式同步来源内是准确值。
 - **账户用量指标是服务端数据。** 当前额度窗口百分比和重置时间来自 Codex App Server；离线或降级时则来自已过期（`stale`）的本地后备数据。
 - **实体额度始终是估算。** Codex 不提供官方的每 task 或每 turn 额度账单。`EST.Q*` 将当前普通 `codex` 用量指标映射到已观察模型/服务层 Codex credit 费率权重上。可选 API 长上下文倍率默认关闭；无论选择哪种口径，尚未同步的机器或客户端活动都可能使结果失真。
-- **API 等价费用只覆盖有观察证据的模型 token。** 它按内置的当前 API 价格换算本机观察到、或从显式 included 远程来源导入的模型调用。Models 面板会在 replica 去重后，按模型/服务层汇总全部来源；不会为单个 task、session 或 turn 猜测模型拆分。它不包含按次工具费、容器、存储、搜索调用、税费、区域加价或协商合同价格；未同步来源会保持缺失，不会被估算补齐。旧版远端历史尚未持久化逐模型 API 费用时，会明确保持为下限，直至通过回放或 bootstrap 补充更完整的数据。
+- **API 等价费用只覆盖有观察证据的模型 token。** 它按当前生效目录的 API 价格换算本机观察到、或从显式 included 远程来源导入的模型调用。Models 面板会在 replica 去重后，按模型/服务层汇总全部来源；不会为单个 task、session 或 turn 猜测模型拆分。它不包含按次工具费、容器、存储、搜索调用、税费、区域加价或协商合同价格；未同步来源会保持缺失，不会被估算补齐。旧版远端历史尚未持久化逐模型 API 费用时，会明确保持为下限，直至通过回放或 bootstrap 补充更完整的数据。已摄取远端 generation 的目录指纹若不同，原始 token/call 证据仍显示，但旧目录生成的 EST/API 派生值会被屏蔽并标为 partial，直到完成兼容目录的重新同步。
 - **需考虑 workspace 的费率卡迁移状态。** token-based 卡适用于绝大多数方案，但 OpenAI 说明仍有少量 Enterprise workspace 使用旧的按消息计费卡。监控器无法从本地 rollout 判断 workspace 是否已迁移，因此这些用户不应把 `~EST` 视为其适用计费卡的代表值。
 - **`partial` 表示可用但不完整。** 较短的回溯范围、`--max-files`、无法读取/损坏的行、计数器重置、已过期的数据源或缺少周期边界，都可能把快照/窗口标为 `partial`。此时仍可能显示估算值。
 - **归因只针对特定额度桶。** 所有额度桶都会显示，但 task/turn/模型归因目前使用普通 `codex` 桶。精确匹配的 `gpt-5.3-codex-spark` 用量不进入本地归因分母。
@@ -419,7 +425,7 @@ JSON 输出使用稳定的 camelCase 字段名。snapshot 系列输出目前报�
 | 字段 | 含义 |
 | --- | --- |
 | `asOf` | 快照时间。 |
-| `apiPricing` | 内置 API 价格目录的版本、费率日期、官方来源 URL，以及 `current_api_rates_model_tokens_only` 计算口径。 |
+| `apiPricing` | 当前生效的内置或外部 API 价格目录版本、费率日期、来源 URL，以及 `current_api_rates_model_tokens_only` 计算口径。 |
 | `apiEquivalentCost` | 首选当前 5 小时周期的纯 token 总额、覆盖率和 partial reasons；没有当前 5 小时分析时省略。 |
 | `partial` | 结果可用，但一个或多个数据源/周期不完整或处于降级状态。 |
 | `sources` | 数据源是否为最新、来源证据和采集详情。 |
@@ -523,6 +529,7 @@ trace 日志粒度更细并会增加少量诊断 I/O，因此默认关闭。启�
 
 - [数据能力和限制](docs/codex-data-capabilities.md)
 - [终端任务恢复行为](docs/codex-terminal-resume.md)
+- [Windows 和 UTM 测试](docs/windows-testing.md)
 - [更新日志](CHANGELOG.md)
 
 ## 许可证

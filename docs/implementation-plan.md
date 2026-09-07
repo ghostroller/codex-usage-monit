@@ -1,6 +1,6 @@
 # 实现路径
 
-更新日期：2026-08-25
+更新日期：2026-09-07
 
 ## 1. 技术选型
 
@@ -33,6 +33,7 @@ flowchart LR
 src/
   app_server.rs   JSON-RPC stdio 只读客户端
   rollout.rs      文件发现、规范化事件、缓存、全局 reducer
+  model_catalog.rs 内置/外部模型映射、credit 费率与 API 价格目录
   attribution.rs 当前 codex reset cycle 的 token 聚合与额度估算
   snapshot.rs    来源融合、partial 与账户快照历史
   domain.rs      统一 schema/provenance/confidence
@@ -67,7 +68,7 @@ CODEX_HOME/archived_sessions/**/*.jsonl
 
 保留的规范化语义包括 session metadata、subagent 的直接 parent thread id、title preview、最多 72 字符的 turn 用户消息摘要、turn context、task start/finish、token counter、rate snapshot 和 subagent foreign baseline。只有 `thread_source=subagent` 或结构化 `source.subagent` 确认身份后才建立 parent link，优先取 `source.subagent.thread_spawn.parent_thread_id`，再兼容顶层 `parent_thread_id` 与旧日志 `forked_from_id` 的 snake/camel 变体；普通 resume/fork 也会带 `forked_from_id`，不得被误归为 subagent。`session_id` 是根会话，不能用于直接父子关系。未知记录忽略，坏行/不可读文件计入 partial。缓存层另外检查 `$CODEX_HOME/session_index.jsonl` 的文件指纹，仅在创建、修改或替换时重新读取，并按 `updated_at` 为每个 thread 选择最新非空 `thread_name`；materialize 使用缓存标题覆盖 title preview。文件缺失、删除、不可读或记录损坏时保留 rollout 回退值，读取失败不缓存为成功结果并在后续刷新重试，redact 模式完全跳过标题索引。单独重命名会在 TUI 下一次刷新生效而无需重解析 rollout。
 
-subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。当前普通 ThreadSpawn 的官方实现从 parent turn config 启动 child；parser 只在结构化 metadata 明确带有 `agent_role=null` 时保存经过 provenance gate 的 settings snapshot，并且只在 child `turn_context.model` 完全匹配时还原服务层。较新 snapshot 总会覆盖旧状态；只有在这条路径中省略或 null tier 才规范化为 API `default`，损坏值会清空旧 tier 并保持未知。旧日志缺少该 gate、自定义 role 或 model override 时不继承，也不由 parser 猜测价格。API cost 层另有一个明确、可审计的产品策略例外：`codex-auto-review` 保持原始 label，但使用 Luna 价格 profile，tier 缺失时按 Standard，并附加 proxy partial reason。
+subagent 文件可能先声明 child，再嵌入 parent 全历史，最后继续 child。Reducer 只把 parent 累计 token 当作 child counter baseline，不发出 parent turns/calls/rate observations。当前普通 ThreadSpawn 的官方实现从 parent turn config 启动 child；parser 只在结构化 metadata 明确带有 `agent_role=null` 时保存经过 provenance gate 的 settings snapshot，并且只在 child `turn_context.model` 完全匹配时还原服务层。较新 snapshot 总会覆盖旧状态；只有在这条路径中省略或 null tier 才规范化为 API `default`，损坏值会清空旧 tier 并保持未知。旧日志缺少该 gate、自定义 role 或 model override 时不继承，也不由 parser 猜测价格。API cost 层另有一个明确、可审计的产品策略例外：`codex-auto-review` 保持原始 label，内置目录为它提供与 Luna 相同的独立 API 价格 profile，tier 缺失时按 Standard；只有两者活动费率完全相同时才附加 proxy assumption reason。外部完整目录要保留该策略时也必须显式提供同样的独立价格项。
 
 ## 4. Rollout 缓存
 
@@ -137,17 +138,19 @@ Snapshot 增加 `windowAnalyses`，每项携带 descriptor、summary、独立 `p
 
 Estimated 部分：
 
+费率计算前通过 `model_catalog` 初始化一次不可变的进程内目录。路径与用户配置目录一致：macOS `~/Library/Application Support/codex-usage-monit/model-catalog.json`、Linux `$XDG_CONFIG_HOME/codex-usage-monit/model-catalog.json` 或 `~/.config/codex-usage-monit/model-catalog.json`、Windows `%LOCALAPPDATA%\codex-usage-monit\model-catalog.json`，且统一支持 `CODEX_USAGE_MONIT_CONFIG_DIR`。外部文件不存在时使用内置目录；文件存在但不是普通文件、超过 1 MiB、JSON/schema/费率/revision 校验失败或读取失败时，费率相关命令应立即返回错误，不静默改用内置目录。外部目录是完整替换，要求唯一的模型 ID/alias、可用的 Standard/Fast `creditFallbackModel`、精确小数费率、API long mode（published/flat/unavailable）、长上下文阈值与可追溯元数据。修改文件后通过重启 TUI/recorder 重新加载，不需重新编译。
+
 1. 读取所选当前 `codex` 窗口的 `usedPercent`；
 2. `TOKEN%` 对 task/turn/model 分别计算原始 `entity_non_spark_tokens / all_local_non_spark_tokens`；
-3. EST 按 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing) 映射 input、cached input、output credits / 1M tokens；精确支持 `gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、Daybreak Blue 的 `daybreak-blue-latest`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、Daybreak Red 的 `daybreak-red-latest` 与 `gpt-5.6-cyber`、历史兼容 `gpt-5.5-cyber`、`gpt-5.4` 和 `gpt-5.4-mini`；Sol 使用 2026-08-21 起的 `(100,10,500)` 调整后费率，促销期按官方说明至少持续到 2026-11-21。当前官方卡不再列出的 `gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仅保留早期兼容权重；精确 Spark 模型因 research-preview 费率而排除，未知非 Spark 模型按 GPT-5.6 Luna 后备并标 partial；
-4. `fast` 与本地登录态 rollout 中兼容的 `priority` service tier 都作为 ChatGPT Fast；按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 对 GPT-5.6/GPT-5.5 family 应用 `2.5x`，对 GPT-5.4 family 应用 `2x`，不支持 Fast 的已知模型保持 Standard；该兼容行为不等同于官方另行计费的 API Priority；
-5. 每次调用先计算不含 API 长上下文倍率的基础 credit units；再对官方 API 明确支持的 GPT-5.6 Sol/Terra/Luna/Cyber、GPT-5.5 与 GPT-5.4 profile，只在 `last_token_usage` 与安全累计 delta 完全相等且单次 input 严格超过 272K 时，另算 input/cached `2x` 与 output `1.5x` 产生的 optional extra。recorder 同时保存基础值与 extra，TUI `[L]EST Longx` 关闭时选基础值、开启时选两者之和；多个短请求的累计值不得误触发。只有可选口径开启时，单次边界未知且累计 input 超过阈值才增加 `long_context_usage_unknown`；Codex credit 卡未公布相同逐请求公式，界面与文档不得把它称为官方 credit 账单；
+3. EST 按激活模型目录映射 input、cached input、output credits / 1M tokens。内置目录精确支持 `gpt-6-astra` `(250,25,1250)`、`gpt-5.6`（Sol 别名）、`gpt-5.6-sol`、Daybreak Blue 的 `daybreak-blue-latest` / `gpt-daybreak-blue-latest`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、Daybreak Red 的 `daybreak-red-latest` / `gpt-daybreak-red-latest` 与 `gpt-5.6-cyber`、历史兼容 `gpt-5.5-cyber`、`gpt-5.4` 和 `gpt-5.4-mini`；Sol 使用 2026-08-21 起的 `(100,10,500)` 调整后费率，促销期按官方说明至少持续到 2026-11-21。当前官方卡不再列出的 `gpt-5.3-codex`、`gpt-5.2` 与历史 `gpt-5.2-codex` slug 仅保留早期兼容权重；精确 Spark 模型因 research-preview 费率而排除，未知非 Spark 模型使用目录声明的 `creditFallbackModel`（内置为 GPT-5.6 Luna）并标 partial；
+4. `fast` 与本地登录态 rollout 中兼容的 `priority` service tier 都作为 ChatGPT Fast；按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 对 GPT-6 Astra、GPT-5.6/GPT-5.5 family 应用 `2.5x`，对 GPT-5.4 family 应用 `2x`，不支持 Fast 的已知模型保持 Standard；该兼容行为不等同于官方另行计费的 API Priority；
+5. 每次调用先计算不含 API 长上下文倍率的基础 credit units；再对内置目录中的 GPT-6 Astra、GPT-5.6 Sol/Terra/Luna/Cyber、GPT-5.5 与 GPT-5.4，或外部目录明确设置 `longContextPricing=true` 的模型，只在 `last_token_usage` 与安全累计 delta 完全相等且单次 input 严格超过目录 `longContextInputThreshold`（内置为 272K）时，另算 input/cached `2x` 与 output `1.5x` 产生的 optional extra。历史兼容 slug `gpt-5.5-cyber` 不启用 Longx。recorder 同时保存基础值与 extra，TUI `[L]EST Longx` 关闭时选基础值、开启时选两者之和；多个短请求的累计值不得误触发。只有可选口径开启时，单次边界未知且累计 input 超过阈值才增加 `long_context_usage_unknown`；Codex credit 卡未公布相同逐请求公式，界面与文档不得把它称为官方 credit 账单；
 6. 解析并累计 `cache_write_input_tokens`，但它是 input 子集，不重复计入 token 或 credit。当前 Codex credit 卡没有 cache-write 行，因此公式不增加 API cache-write charge；reasoning 仍是 output 子集；
 7. 将 rate card 按统一比例转为整数 credit units，计算 `estimatedQuotaPercent = usedPercent * entityCreditUnits / allCreditUnits`；
 8. 所有可用实体结果在 Snapshot/JSON 中标为 Low；TUI/text 只用 `~`/`-`，不显示独立 quota confidence；
 9. scope summary 统一显示方法、`externalActivityPossible` 与具体 partial reasons；partial、lookback 不完整与 stale 不清空仍可计算的 estimate；
 10. 当前 `codex` 窗口或本地非 Spark 分母不存在时保持 unavailable；
-11. 双口径 token-based 映射使用 estimator revision 5、history metric revision 3；只从仍在配置扫描范围内的 rollout 调用重建重叠本地桶/周数据点，并在新点的未加权 token/call/cache-write 证据不差于旧点时通过 revision-aware upsert 替换。保留已发布 revision 3 的基础历史，但可选 extra 缺失时开启倍率必须 unavailable/partial；无法安全拆分的开发版 revision 4 历史直接丢弃；其他无法重建的旧 revision 保留并隔离，混合 revision 不得合并。
+11. 内置双口径 token-based 映射使用 estimator revision 6、API pricing catalog revision 3、history metric revision 3；外部目录的两个费率 revision 必须分别高于内置值，且费率或映射变更时递增。只从仍在配置扫描范围内的 rollout 调用重建重叠本地桶/周数据点，并在新点的未加权 token/call/cache-write 证据不差于旧点时通过 revision-aware upsert 替换；当前激活目录即使从高 revision 外部表回退到低 revision 内置表，也按同一证据约束替换。保留已发布 revision 3 的基础历史，但可选 extra 缺失时开启倍率必须 unavailable/partial；无法安全拆分的开发版 revision 4 历史直接丢弃；其他无法重建的旧 revision 保留并隔离，混合 revision 不得合并。远程端必须使用相同 revision 和规范化目录指纹，否则协议协商拒绝混用。
 
 这不是官方逐 task/turn 配额账单。少量尚未迁移到 token-based 卡的 legacy Enterprise workspace 无法从本地 rollout 自动识别，其 EST 不能视为适用费率卡的代表值。
 
@@ -166,7 +169,8 @@ Estimated 部分：
 - App Server mock：多桶、legacy、nullable、错误、reset credits 的正数/零/缺值、`credits` 的 null/空/截断、`grantedAt` / `expiresAt`、未知状态、单条与汇总非法值的独立降级、可选 usage stall、timeout、child reap；
 - rollout：duplicate/reset、嵌套 turn、消息归属、archive、redact、stale、parent replay、final token、truncate；
 - cache：warm hit、单文件 append、fresh equivalence、foreign baseline、unreadable retry，以及账户刷新失败时 reset-credit 明细 stale 保留、成功 fresh null/空明细不回填旧数据；
-- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、含 `gpt-5.6` Sol 别名和当前 Daybreak aliases/IDs 的完整 token-based credit 费率矩阵、`fast`/`priority` 与 Standard、严格 `>272K` 的逐请求可选长上下文倍率、基础/optional-extra 双投影、关闭时不传播长上下文未知 partial、cache-write 子集、Spark 精确模型名大小写不敏感排除、缺失模型的 Luna 后备、task/turn/model 公式求和、estimator revision 5、history metric revision 3、扫描范围内 rollout 重建与 revision-aware upsert、released revision 3 保留、development revision 4 丢弃及混合 revision 隔离、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
+- model catalog：内置 GPT-6 Astra credit/API Standard/Fast short/long 费率、estimator revision 6、API catalog revision 3、外部完整 JSON 覆盖、alias 去空格后大小写不敏感精确匹配、小数精确转换、`creditFallbackModel`、published/flat/unavailable long mode、阈值、重复 alias/旧 revision/超限文件拒绝，以及缺失文件才回退内置值；
+- attribution：5h/Week reset-cycle 边界、排除滚动 `now-duration` 口径、reset drift、只选择 `codex`、含 GPT-6 Astra、`gpt-5.6` Sol 别名和当前 Daybreak aliases/IDs 的完整 token-based credit 费率矩阵、`fast`/`priority` 与 Standard、严格 `>longContextInputThreshold` 的逐请求可选长上下文倍率、基础/optional-extra 双投影、关闭时不传播长上下文未知 partial、cache-write 子集、Spark 精确模型名大小写不敏感排除、缺失模型的目录配置后备、task/turn/model 公式求和、激活 estimator revision（内置 6）、history metric revision 3、扫描范围内 rollout 重建与 revision-aware upsert、released revision 3 保留、development revision 4 丢弃及混合 revision 隔离、partial/stale 保留 Low estimate、无分母 unavailable，以及 `codex_bengalfox` gauge-only；
 - output/CLI：`windows`、`snapshot --section windows`、`windowAnalyses` camelCase、Limits 范围内的 `rateLimitResetCredits` camelCase/section scoping、旧 summary 无 `credits` 兼容、null/空数组区分、`expiresAt: null` 文本显示 never、可用 EST 的 `~`、不可用的 `-`、无独立 quota-confidence 文本、scope 级 method/external/partial reasons、旧 confidence/5h attribution schema 兼容、section partial/failure、broken pipe、help/usage；
 - TUI：dark/light 两套主题下状态背景色、图例、消息摘要和 turn 详情的 TestBackend；覆盖标题/项目名/source 组合筛选、非编辑态 `Delete` / `[Del]` 清空与编辑态按键隔离、Turns→Tasks 自动重置 Turns Filter、真实快捷键字符样式与直达键、四个顶层视图 tab 点击、Other 的多 bucket Resets、primary/secondary、完整本地 reset time 与缺失值、reset credits 的正数/零/unavailable/stale、null/空/截断明细、granted/reset time、never、未知状态与控制字符清洗、最顶栏 `[V]Turns` / `[M]Models` / `[5h]` / `[Week]` / `[L]EST Longx` 的键盘与整块鼠标 hitbox、默认 off 与状态 round-trip、Tasks/Turns 多会话逐行 API EQ 的 scope 切换与 Longx 独立性、扫描不完整的下界标识、折叠树 API 金额汇总、Settings 四个全局列开关在三张表中的实际效果及持久化、隐藏 Tokens 后状态标识、搜索输入优先消费可打印键、非 Overview 不误触发、scope/倍率切换同步 Tasks/Turns/Models/归因摘要和 Trends EST 图、原始 token 图不受倍率影响、Turns/Models 显隐与布局回收、Tasks 底部图例在 Turns 收起时仍可见、Models 无 CONF 列、turn 详情无 quota-confidence 文本、scope summary 在 compact/wide 下保留 method/external/partial reasons、scope 不可用、`codex_bengalfox` gauge-only、退出确认键鼠阻断、`E` 在 Collapse/Expand 间切换多层节点、折叠树隐藏后代 token/占比/额度汇总、Fast 位于模型名后、稳定菜单偏好 round-trip 与显式主题优先级、非连续绝对索引映射、空结果、Unicode 光标编辑、Tasks→Turns→Tasks 焦点转换、键盘 reveal、点击设置焦点、比例滚动条几何与 Down/Drag/Up、轨道点击、滚轮与选择独立、过滤后绝对索引映射、跨刷新 ID 保持、有效窗口无模型活动、模型按 token 排序与 `top N/M` 裁剪提示，以及极窄、60x24、80x24、100x30、120x40 顶栏 hitbox 和布局；并做真实 PTY smoke test。
 

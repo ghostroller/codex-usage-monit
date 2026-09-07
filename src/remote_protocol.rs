@@ -22,9 +22,9 @@ use crate::source_history::{RedactionProfile, UsageEventId};
 use crate::source_identity::NodeId;
 use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, ThreadId};
 
-/// Second remote export schema: project Git probe results are explicit and
-/// live snapshot limits are enforced symmetrically at both trust boundaries.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
+/// Third remote export schema: negotiated model catalogs carry an exact
+/// semantic content fingerprint in addition to their numeric revisions.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 /// First normalized per-event fact schema. It is intentionally independent
 /// from aggregate-history revisions so a center can reject an unknown fact
 /// shape without discarding otherwise compatible bucket data.
@@ -79,6 +79,7 @@ const MAX_PREVIEW_CHARS: usize = 1_024;
 const MAX_REPOSITORY_RELATIVE_ROOT_BYTES: usize = 2 * 1024;
 const GIT_FINGERPRINT_PREFIX: &str = "git-sha256-v1-";
 const SESSION_DIGEST_FINGERPRINT_PREFIX: &str = "session-digest-sha256-v1-";
+const MODEL_CATALOG_FINGERPRINT_PREFIX: &str = "model-catalog-sha256-v1-";
 const SHA256_HEX_BYTES: usize = 64;
 
 /// Limits applied before allocation and throughout frame decoding.
@@ -645,6 +646,7 @@ pub struct ProtocolRevisions {
     pub estimator: NonZeroU32,
     pub project_breakdown: NonZeroU32,
     pub api_pricing_catalog: NonZeroU32,
+    pub model_catalog_fingerprint: ModelCatalogFingerprint,
 }
 
 /// Inclusive accepted range for one independently versioned data domain.
@@ -679,6 +681,7 @@ pub struct AcceptedRevisions {
     pub estimator: AcceptedRevisionRange,
     pub project_breakdown: AcceptedRevisionRange,
     pub api_pricing_catalog: AcceptedRevisionRange,
+    pub model_catalog_fingerprint: ModelCatalogFingerprint,
 }
 
 impl AcceptedRevisions {
@@ -699,6 +702,7 @@ impl AcceptedRevisions {
             && self
                 .api_pricing_catalog
                 .accepts(revisions.api_pricing_catalog)
+            && self.model_catalog_fingerprint == revisions.model_catalog_fingerprint
     }
 }
 
@@ -1039,6 +1043,73 @@ impl ProbeResult {
 /// URLs, credentials, queries, and userinfo never cross this boundary.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GitRepositoryFingerprint(String);
+
+/// SHA-256 fingerprint of the validated model-catalog lookup semantics and
+/// metadata used for EST and API-equivalent calculations.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModelCatalogFingerprint(String);
+
+impl ModelCatalogFingerprint {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModelCatalogFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ModelCatalogFingerprint {
+    type Err = RemoteProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_prefixed_lower_hex(
+            value,
+            MODEL_CATALOG_FINGERPRINT_PREFIX,
+            SHA256_HEX_BYTES,
+            "model catalog fingerprint",
+        )?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for ModelCatalogFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelCatalogFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+pub(crate) fn legacy_unknown_model_catalog_fingerprint() -> ModelCatalogFingerprint {
+    format!(
+        "{MODEL_CATALOG_FINGERPRINT_PREFIX}{}",
+        "0".repeat(SHA256_HEX_BYTES)
+    )
+    .parse()
+    .expect("legacy model catalog fingerprint sentinel is valid")
+}
+
+#[cfg(test)]
+pub(crate) fn test_model_catalog_fingerprint(value: u64) -> ModelCatalogFingerprint {
+    format!("{MODEL_CATALOG_FINGERPRINT_PREFIX}{value:064x}")
+        .parse()
+        .expect("test model catalog fingerprint is valid")
+}
 
 impl GitRepositoryFingerprint {
     pub fn as_str(&self) -> &str {
@@ -3390,6 +3461,7 @@ mod tests {
             estimator: nonzero32(4),
             project_breakdown: nonzero32(5),
             api_pricing_catalog: nonzero32(6),
+            model_catalog_fingerprint: test_model_catalog_fingerprint(1),
         }
     }
 
@@ -3404,6 +3476,7 @@ mod tests {
             estimator: exact(4),
             project_breakdown: exact(5),
             api_pricing_catalog: exact(6),
+            model_catalog_fingerprint: test_model_catalog_fingerprint(1),
         }
     }
 
@@ -4035,6 +4108,21 @@ mod tests {
         let mut incompatible = revisions();
         incompatible.api_pricing_catalog = nonzero32(7);
         assert!(!accepted.accepts(&incompatible));
+
+        let mut same_revisions_different_catalog = revisions();
+        same_revisions_different_catalog.model_catalog_fingerprint =
+            test_model_catalog_fingerprint(2);
+        assert!(!accepted.accepts(&same_revisions_different_catalog));
+    }
+
+    #[test]
+    fn wire_protocol_revisions_require_catalog_fingerprint() {
+        let mut value = serde_json::to_value(revisions()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("modelCatalogFingerprint");
+        assert!(serde_json::from_value::<ProtocolRevisions>(value).is_err());
     }
 
     #[test]
@@ -4605,6 +4693,11 @@ mod tests {
         assert!(
             "session-digest-sha256-v1-00"
                 .parse::<RemoteSessionDigestFingerprint>()
+                .is_err()
+        );
+        assert!(
+            "model-catalog-sha256-v1-ABC"
+                .parse::<ModelCatalogFingerprint>()
                 .is_err()
         );
         assert!(

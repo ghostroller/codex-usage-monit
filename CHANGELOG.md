@@ -6,17 +6,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Added GPT-6 Astra to the bundled Codex credit and API-equivalent pricing tables, including Standard/Fast and short/long-context rates.
+- Added an optional startup-loaded `model-catalog.json` so model IDs, aliases, Codex credit weights, API prices, long-context behavior, and pricing metadata can be updated without recompiling. A complete example catalog is included in `docs/model-catalog.example.json`.
 - Added history-backed `summary` and `trends` one-shot commands that use the same derived reports as the TUI, including Summary range/grain/metric selection, project/session/turn hierarchy and coverage, and Trends quota, weekly, and 15-minute series/readouts.
 - Added a unified `health` command for snapshot, history, recorder, and service diagnostics, plus camelCase JSON output for `service status`. Text, pretty JSON, and compact single-line JSON are available without changing report contents.
 - Added `--long-context` to Summary, Trends, and the existing snapshot/limits/tasks/turns/models/attribution/windows commands so scripts can explicitly select the optional Longx estimate without changing the saved TUI preference.
 
 ### Changed
 
+- Prefer a validated external model catalog when present and fall back to the bundled catalog only when the file is absent. Invalid, oversized, non-regular, or unsafe catalog files fail rate-dependent commands explicitly instead of silently changing pricing semantics.
 - Shared Summary and Trends query derivation between CLI and TUI, including reset-cycle boundaries, partial/coverage semantics, local-wall-clock Summary buckets, and the namespace-scoped automatic 31-day backfill for incomplete `summary --range 30d` history.
 - Defined one-shot report exit semantics as `0` for complete, `2` for usable partial, and `1` when no requested data is usable; unified health reports use `0` or `2` during normal reporting.
 - Kept exact Summary metrics/values and Trends token readouts lossless in JSON with decimal strings, exposed Summary lower-bound state and recent service heartbeat explicitly, and persisted incomplete backfill cooldown markers after warning-bearing writes.
 - Preserved the current Summary/Trends observation in memory when history persistence is unavailable, and limited `valueIsLowerBound` to selected values with omitted non-negative contributions instead of treating every partial diagnostic or clipped chart edge as a lower bound.
 - Hardened report-path handling for non-Unicode paths and output aliases, including actual macOS volume case semantics, Unicode-aware comparisons, and Windows 128-bit file identities.
+
+### Compatibility
+
+- Bumped the bundled estimator/API pricing revisions to 6/3 and remote protocol to v3. Remote negotiation and persisted remote projections now bind to the normalized model-catalog fingerprint so different mappings cannot be combined under matching numeric revisions.
 
 ## [0.3.1] - 2026-08-29
 

@@ -537,6 +537,9 @@ mod tests {
                 estimator: NonZeroU32::new(1).unwrap(),
                 project_breakdown: NonZeroU32::new(1).unwrap(),
                 api_pricing_catalog: NonZeroU32::new(1).unwrap(),
+                model_catalog_fingerprint: crate::remote_protocol::test_model_catalog_fingerprint(
+                    1,
+                ),
             },
         )
         .unwrap();

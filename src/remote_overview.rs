@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
+#[cfg(test)]
 use crate::api_cost::API_PRICING_CATALOG_REVISION;
+use crate::api_cost::current_api_pricing_catalog_revision;
 use crate::domain::{
     ApiCostAmount, ApiEquivalentCost, ApiModelCost, Confidence, Provenance, TaskRecord, TaskStatus,
     ThreadWindowUsage, TokenUsage, TurnRecord, TurnStatus, TurnWindowUsage, WindowAnalysis,
@@ -18,7 +20,7 @@ use crate::domain::{
 };
 use crate::history::{
     HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryData, LocalHalfHourBucket, LocalProjectUsageGroup,
-    LocalUsageGroup,
+    LocalUsageGroup, current_history_estimator_revision,
 };
 use crate::source_identity::NodeId;
 
@@ -206,15 +208,22 @@ impl Default for ModelAggregate {
 }
 
 impl ModelAggregate {
-    fn add_group(&mut self, group: &LocalUsageGroup, pricing_catalog_current: bool) {
+    fn add_group(
+        &mut self,
+        group: &LocalUsageGroup,
+        estimator_current: bool,
+        pricing_catalog_current: bool,
+    ) {
         self.tokens.add_assign(group.token_usage);
-        self.estimated_cost_units = self
-            .estimated_cost_units
-            .saturating_add(group.estimated_cost_units);
-        self.api_long_context_extra_cost_units = add_optional_units(
-            self.api_long_context_extra_cost_units,
-            group.api_long_context_extra_cost_units,
-        );
+        if estimator_current {
+            self.estimated_cost_units = self
+                .estimated_cost_units
+                .saturating_add(group.estimated_cost_units);
+            self.api_long_context_extra_cost_units = add_optional_units(
+                self.api_long_context_extra_cost_units,
+                group.api_long_context_extra_cost_units,
+            );
+        }
         let mut api_cost = group.api_equivalent_cost;
         let complete = pricing_catalog_current && group.api_equivalent_cost_complete;
         if !complete {
@@ -316,17 +325,29 @@ impl Default for UnifiedModelAggregate {
 impl UnifiedModelAggregate {
     fn add_bucket(&mut self, bucket: &LocalHalfHourBucket) {
         self.tokens.add_assign(bucket.token_usage);
-        self.estimated_cost_units = self
-            .estimated_cost_units
-            .saturating_add(bucket.estimated_cost_units);
-        self.api_long_context_extra_cost_units = add_optional_units(
-            self.api_long_context_extra_cost_units,
-            bucket.api_long_context_extra_cost_units,
-        );
-        self.long_context_usage_unknown |= bucket.long_context_usage_unknown;
+        let estimator_current = bucket.estimator_revision == current_history_estimator_revision();
+        if estimator_current {
+            self.estimated_cost_units = self
+                .estimated_cost_units
+                .saturating_add(bucket.estimated_cost_units);
+            self.api_long_context_extra_cost_units = add_optional_units(
+                self.api_long_context_extra_cost_units,
+                bucket.api_long_context_extra_cost_units,
+            );
+            self.long_context_usage_unknown |= bucket.long_context_usage_unknown;
+        } else if !bucket.token_usage.is_zero()
+            || bucket.estimated_cost_units > 0
+            || bucket
+                .api_long_context_extra_cost_units
+                .is_some_and(|units| units > 0)
+            || bucket.call_count > 0
+        {
+            self.partial_reasons
+                .insert("remote_estimator_revision_mismatch".to_owned());
+        }
         self.call_count = self.call_count.saturating_add(bucket.call_count);
         let pricing_catalog_current =
-            bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION;
+            bucket.api_pricing_catalog_revision == current_api_pricing_catalog_revision();
 
         let mut bucket_api_cost = ApiCostAmount::default();
         let mut project_tokens = TokenUsage::default();
@@ -362,10 +383,11 @@ impl UnifiedModelAggregate {
 
         for group in &bucket.groups {
             let model = normalized_model_name(group.model.as_deref()).to_owned();
-            self.models
-                .entry(model)
-                .or_default()
-                .add_group(group, pricing_catalog_current);
+            self.models.entry(model).or_default().add_group(
+                group,
+                estimator_current,
+                pricing_catalog_current,
+            );
             if group.used_model_fallback {
                 self.partial_reasons
                     .insert("unpriced_model_rate_fallback".to_owned());
@@ -711,7 +733,7 @@ pub(crate) fn project_remote_overview_history(
                 merge_task_metadata(task, group, bucket, parent.clone(), session.clone());
                 task.usage.add_group(
                     group,
-                    bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION,
+                    bucket.api_pricing_catalog_revision == current_api_pricing_catalog_revision(),
                 );
                 if let Some(turn_id) = turn_id.as_ref() {
                     task.turns.insert(turn_id.clone());
@@ -741,7 +763,7 @@ pub(crate) fn project_remote_overview_history(
                 merge_turn_metadata(turn, group, delegated);
                 turn.usage.add_group(
                     group,
-                    bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION,
+                    bucket.api_pricing_catalog_revision == current_api_pricing_catalog_revision(),
                 );
             }
 
@@ -753,7 +775,8 @@ pub(crate) fn project_remote_overview_history(
                     .or_default()
                     .add_group(
                         group,
-                        bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION,
+                        bucket.api_pricing_catalog_revision
+                            == current_api_pricing_catalog_revision(),
                     );
                 if classified.logical {
                     replaced_local_threads
@@ -769,7 +792,8 @@ pub(crate) fn project_remote_overview_history(
                         .or_default()
                         .add_group(
                             group,
-                            bucket.api_pricing_catalog_revision == API_PRICING_CATALOG_REVISION,
+                            bucket.api_pricing_catalog_revision
+                                == current_api_pricing_catalog_revision(),
                         );
                 }
             }
@@ -781,7 +805,7 @@ pub(crate) fn project_remote_overview_history(
                     .or_default()
                     .insert("remote_project_breakdown_revision_mismatch".to_string());
             }
-            if bucket.api_pricing_catalog_revision != API_PRICING_CATALOG_REVISION
+            if bucket.api_pricing_catalog_revision != current_api_pricing_catalog_revision()
                 && bucket.project_groups.iter().any(|group| {
                     !group.token_usage.is_zero()
                         || group.api_equivalent_cost.observed_samples > 0
@@ -1238,7 +1262,7 @@ mod tests {
             estimated_cost_units: u128::from(token_usage.total_tokens),
             api_long_context_extra_cost_units: Some(0),
             long_context_usage_unknown: false,
-            estimator_revision: 1,
+            estimator_revision: current_history_estimator_revision(),
             project_breakdown_revision: HISTORY_PROJECT_BREAKDOWN_REVISION,
             api_pricing_catalog_revision: API_PRICING_CATALOG_REVISION,
             call_count: groups.len() as u64,
@@ -1648,6 +1672,80 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(!project_warning_api.is_partial());
+    }
+
+    #[test]
+    fn external_estimator_revision_is_excluded_from_all_source_est_and_longx() {
+        let node = "node-0123456789abcdef0123456789abcdef";
+        let model_group = |tokens, estimated_cost_units, long_extra| LocalUsageGroup {
+            model: Some("gpt-5.6-sol".to_owned()),
+            token_usage: usage(tokens),
+            estimated_cost_units,
+            api_long_context_extra_cost_units: Some(long_extra),
+            api_equivalent_cost: ApiCostAmount {
+                observed_samples: 1,
+                priced_samples: 1,
+                observed_tokens: tokens,
+                priced_tokens: tokens,
+                ..ApiCostAmount::default()
+            },
+            api_equivalent_cost_complete: true,
+            call_count: 1,
+            ..LocalUsageGroup::default()
+        };
+
+        let mut current_bucket = bucket(
+            at(10, 30),
+            vec![group("local-thread", "local-turn", None, 40)],
+        );
+        current_bucket.estimated_cost_units = 400;
+        current_bucket.api_long_context_extra_cost_units = Some(40);
+        current_bucket.groups = vec![model_group(40, 400, 40)];
+
+        let mut external_bucket = bucket(
+            at(11, 0),
+            vec![group(
+                &format!("remote-thread@{node}"),
+                &format!("remote-turn@{node}"),
+                None,
+                60,
+            )],
+        );
+        external_bucket.estimator_revision = current_history_estimator_revision().saturating_add(1);
+        external_bucket.estimated_cost_units = 60_000;
+        external_bucket.api_long_context_extra_cost_units = Some(6_000);
+        external_bucket.groups = vec![model_group(60, 60_000, 6_000)];
+
+        let history = RemoteOverviewHistory::from_unified(
+            &HistoryData {
+                half_hour_buckets: vec![current_bucket, external_bucket],
+                ..HistoryData::default()
+            },
+            [(node.parse().unwrap(), "remote-a".to_owned())],
+            at(12, 0),
+        );
+        let projection =
+            project_remote_overview_history(&history, &[analysis(300, at(10, 0))], at(12, 0));
+        let window = &projection.windows[0];
+        let model = window
+            .models
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|model| model.model == "gpt-5.6-sol")
+            .unwrap();
+
+        assert_eq!(window.model_token_usage.total_tokens, 100);
+        assert_eq!(window.estimated_cost_units, 400);
+        assert_eq!(window.api_long_context_extra_cost_units, Some(40));
+        assert_eq!(model.token_usage.total_tokens, 100);
+        assert_eq!(model.estimated_cost_units, 400);
+        assert_eq!(model.api_long_context_extra_cost_units, Some(40));
+        assert!(
+            window
+                .partial_reasons
+                .contains(&"remote_estimator_revision_mismatch".to_owned())
+        );
     }
 
     #[test]

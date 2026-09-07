@@ -4,12 +4,17 @@ use crate::domain::{
     ApiCostAmount, ApiEquivalentCost, ApiModelCost, ApiPricingMetadata, PicoUsd, TokenUsage,
     UsageCall,
 };
+use crate::model_catalog::{
+    ApiLongContextRates as LongContextRates, ApiModelRates as ModelRates,
+    ApiTokenRates as TokenRates, api_model_rates, api_pricing_catalog_revision,
+    api_pricing_rates_as_of, api_pricing_source_url, long_context_input_threshold,
+};
 
-pub const API_PRICING_CATALOG_REVISION: u32 = 2;
-pub const API_PRICING_RATES_AS_OF: &str = "2026-08-27";
-pub const API_PRICING_SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing";
+pub const API_PRICING_CATALOG_REVISION: u32 =
+    crate::model_catalog::BUNDLED_API_PRICING_CATALOG_REVISION;
+pub const API_PRICING_RATES_AS_OF: &str = crate::model_catalog::BUNDLED_API_PRICING_RATES_AS_OF;
+pub const API_PRICING_SOURCE_URL: &str = crate::model_catalog::BUNDLED_API_PRICING_SOURCE_URL;
 
-const LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
 const PICO_USD_PER_USD: u128 = 1_000_000_000_000;
 
 const MODEL_UNKNOWN: &str = "api_price_model_unknown";
@@ -22,46 +27,8 @@ const CACHE_WRITE_RATE_UNAVAILABLE: &str = "api_price_cache_write_rate_unavailab
 const LONG_CONTEXT_UNAVAILABLE: &str = "api_price_long_context_unavailable";
 const LONG_CONTEXT_AMBIGUOUS: &str = "api_price_long_context_ambiguous";
 
-/// Prices in micro-US-dollars per one million tokens. Multiplying this rate by
-/// a token count yields pico-US-dollars exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TokenRates {
-    input: u128,
-    cached_input: u128,
-    cache_write: Option<u128>,
-    output: u128,
-}
-
-impl TokenRates {
-    const fn new(input: u128, cached_input: u128, cache_write: Option<u128>, output: u128) -> Self {
-        Self {
-            input,
-            cached_input,
-            cache_write,
-            output,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum LongContextRates {
-    Published(TokenRates),
-    /// This model has one published price across its full context window.
-    Flat,
-    /// The relevant public table has no usable long-context row.
-    Unavailable,
-}
-
-#[derive(Clone, Copy)]
-struct TierRates {
-    short: TokenRates,
-    long: LongContextRates,
-}
-
-#[derive(Clone, Copy)]
-struct ModelRates {
-    standard: TierRates,
-    fast: Option<TierRates>,
+pub fn current_api_pricing_catalog_revision() -> u32 {
+    api_pricing_catalog_revision()
 }
 
 #[derive(Clone, Copy)]
@@ -198,9 +165,9 @@ impl ApiCostAggregation {
 
 pub fn pricing_metadata() -> ApiPricingMetadata {
     ApiPricingMetadata {
-        catalog_revision: API_PRICING_CATALOG_REVISION,
-        rates_as_of: API_PRICING_RATES_AS_OF.to_string(),
-        source_url: API_PRICING_SOURCE_URL.to_string(),
+        catalog_revision: api_pricing_catalog_revision(),
+        rates_as_of: api_pricing_rates_as_of().to_string(),
+        source_url: api_pricing_source_url().to_string(),
         basis: "current_api_rates_model_tokens_only".to_string(),
     }
 }
@@ -250,7 +217,7 @@ pub fn format_pico_usd(value: PicoUsd) -> String {
 
 fn price_call(call: &UsageCall) -> CallCost {
     let mut cost = price_call_inner(call);
-    if is_codex_auto_review(call.model.as_deref()) {
+    if auto_review_uses_luna_api_rates(call.model.as_deref()) {
         cost.assumption_reason = Some(AUTO_REVIEW_LUNA_PROXY);
     }
     cost
@@ -299,7 +266,7 @@ fn price_call_inner(call: &UsageCall) -> CallCost {
     ) else {
         return unpriced(observed_tokens, CACHE_WRITE_RATE_UNAVAILABLE);
     };
-    if tokens.input_tokens <= LONG_CONTEXT_INPUT_THRESHOLD {
+    if tokens.input_tokens <= long_context_input_threshold() {
         return priced(observed_tokens, short_cost, short_cost, None);
     }
 
@@ -423,156 +390,26 @@ fn is_codex_auto_review(model: Option<&str>) -> bool {
     model.is_some_and(|model| model.trim().eq_ignore_ascii_case("codex-auto-review"))
 }
 
+fn auto_review_uses_luna_api_rates(model: Option<&str>) -> bool {
+    is_codex_auto_review(model)
+        && api_rates_match_luna_proxy(
+            model_rates(Some("codex-auto-review")),
+            model_rates(Some("gpt-5.6-luna")),
+        )
+}
+
+fn api_rates_match_luna_proxy(
+    auto_review_rates: Option<ModelRates>,
+    luna_rates: Option<ModelRates>,
+) -> bool {
+    matches!(
+        (auto_review_rates, luna_rates),
+        (Some(auto_review_rates), Some(luna_rates)) if auto_review_rates == luna_rates
+    )
+}
+
 fn model_rates(model: Option<&str>) -> Option<ModelRates> {
-    let model = model?.trim();
-    if model.eq_ignore_ascii_case("gpt-5.6")
-        || model.eq_ignore_ascii_case("gpt-5.6-sol")
-        || model.eq_ignore_ascii_case("daybreak-blue-latest")
-    {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(4_000_000, 400_000, Some(5_000_000), 20_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    8_000_000,
-                    800_000,
-                    Some(10_000_000),
-                    30_000_000,
-                )),
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(8_000_000, 800_000, Some(10_000_000), 40_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    16_000_000,
-                    1_600_000,
-                    Some(20_000_000),
-                    60_000_000,
-                )),
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.6-terra") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(2_000_000, 200_000, Some(2_500_000), 12_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    4_000_000,
-                    400_000,
-                    Some(5_000_000),
-                    18_000_000,
-                )),
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(4_000_000, 400_000, Some(5_000_000), 24_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    8_000_000,
-                    800_000,
-                    Some(10_000_000),
-                    36_000_000,
-                )),
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.6-luna")
-        || model.eq_ignore_ascii_case("codex-auto-review")
-    {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(200_000, 20_000, Some(250_000), 1_200_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    400_000,
-                    40_000,
-                    Some(500_000),
-                    1_800_000,
-                )),
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(400_000, 40_000, Some(500_000), 2_400_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    800_000,
-                    80_000,
-                    Some(1_000_000),
-                    3_600_000,
-                )),
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.5") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(5_000_000, 500_000, None, 30_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    10_000_000, 1_000_000, None, 45_000_000,
-                )),
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(12_500_000, 1_250_000, None, 75_000_000),
-                long: LongContextRates::Unavailable,
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.4") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(2_500_000, 250_000, None, 15_000_000),
-                long: LongContextRates::Published(TokenRates::new(
-                    5_000_000, 500_000, None, 22_500_000,
-                )),
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(5_000_000, 500_000, None, 30_000_000),
-                long: LongContextRates::Unavailable,
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.4-mini") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(750_000, 75_000, None, 4_500_000),
-                long: LongContextRates::Flat,
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(1_500_000, 150_000, None, 9_000_000),
-                long: LongContextRates::Flat,
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.3-codex") || model.eq_ignore_ascii_case("gpt-5.2") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(1_750_000, 175_000, None, 14_000_000),
-                long: LongContextRates::Flat,
-            },
-            fast: Some(TierRates {
-                short: TokenRates::new(3_500_000, 350_000, None, 28_000_000),
-                long: LongContextRates::Flat,
-            }),
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.2-codex") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(1_750_000, 175_000, None, 14_000_000),
-                long: LongContextRates::Flat,
-            },
-            fast: None,
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.6-cyber")
-        || model.eq_ignore_ascii_case("daybreak-red-latest")
-    {
-        // The catalog source's Cyber table currently publishes dashes for all
-        // long-context cells. A model-page multiplier note conflicts with that
-        // table, so long calls remain explicitly unpriced rather than guessed.
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(12_500_000, 1_250_000, Some(15_625_000), 75_000_000),
-                long: LongContextRates::Unavailable,
-            },
-            fast: None,
-        })
-    } else if model.eq_ignore_ascii_case("gpt-5.5-cyber") {
-        Some(ModelRates {
-            standard: TierRates {
-                short: TokenRates::new(12_500_000, 1_250_000, None, 75_000_000),
-                long: LongContextRates::Unavailable,
-            },
-            fast: None,
-        })
-    } else {
-        None
-    }
+    api_model_rates(model)
 }
 
 #[cfg(test)]
@@ -650,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_family_short_and_long_prices_match_the_published_matrix() {
+    fn current_models_short_and_long_prices_match_the_published_matrix() {
         let short = TokenUsage {
             input_tokens: 100_000,
             cached_input_tokens: 20_000,
@@ -668,6 +505,13 @@ mod tests {
             ..TokenUsage::default()
         };
         let cases = [
+            (
+                "gpt-6-astra",
+                1_095_000_000_000,
+                2_190_000_000_000,
+                5_950_000_000_000,
+                11_900_000_000_000,
+            ),
             (
                 "gpt-5.6-sol",
                 438_000_000_000,
@@ -823,7 +667,11 @@ mod tests {
             total_tokens: 105_000,
             ..TokenUsage::default()
         };
-        for alias in ["  GPT-5.6  ", "  DAYBREAK-BLUE-LATEST  "] {
+        for alias in [
+            "  GPT-5.6  ",
+            "  DAYBREAK-BLUE-LATEST  ",
+            "  GPT-DAYBREAK-BLUE-LATEST  ",
+        ] {
             assert_exact_price(alias, None, sol_tokens, 438_000_000_000);
             assert_exact_price(alias, Some("FAST"), sol_tokens, 876_000_000_000);
         }
@@ -838,6 +686,12 @@ mod tests {
         };
         assert_exact_price(
             "  DAYBREAK-RED-LATEST  ",
+            None,
+            cyber_tokens,
+            3_656_250_000_000,
+        );
+        assert_exact_price(
+            "  GPT-DAYBREAK-RED-LATEST  ",
             None,
             cyber_tokens,
             3_656_250_000_000,
@@ -990,6 +844,25 @@ mod tests {
                 LONG_CONTEXT_AMBIGUOUS.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn auto_review_luna_proxy_assumption_requires_matching_active_rates() {
+        let luna = model_rates(Some("gpt-5.6-luna")).expect("bundled Luna API rates");
+        let auto_review =
+            model_rates(Some("codex-auto-review")).expect("bundled auto-review API rates");
+        assert!(api_rates_match_luna_proxy(Some(auto_review), Some(luna)));
+
+        let mut different_auto_review = auto_review;
+        different_auto_review.standard.short.input =
+            different_auto_review.standard.short.input.saturating_add(1);
+        assert!(!api_rates_match_luna_proxy(
+            Some(different_auto_review),
+            Some(luna)
+        ));
+        assert!(!api_rates_match_luna_proxy(None, Some(luna)));
+        assert!(!api_rates_match_luna_proxy(Some(auto_review), None));
+        assert!(!api_rates_match_luna_proxy(None, None));
     }
 
     #[test]

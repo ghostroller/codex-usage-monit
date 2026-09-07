@@ -1,0 +1,239 @@
+{
+  "version": 1,
+  "estimatorRevision": 7,
+  "apiPricingCatalogRevision": 4,
+  "ratesAsOf": "2026-09-07",
+  "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+  "longContextInputThreshold": 272000,
+  "creditFallbackModel": "gpt-5.6-luna",
+  "models": [
+    {
+      "id": "gpt-6-astra",
+      "credit": {
+        "standard": { "input": 250, "cachedInput": 25, "output": 1250 },
+        "fast": { "input": 625, "cachedInput": "62.5", "output": 3125 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 10, "cachedInput": 1, "cacheWrite": "12.5", "output": 50 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 20, "cachedInput": 2, "cacheWrite": 25, "output": 75 }
+          }
+        },
+        "fast": {
+          "short": { "input": 20, "cachedInput": 2, "cacheWrite": 25, "output": 100 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 40, "cachedInput": 4, "cacheWrite": 50, "output": 150 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6", "daybreak-blue-latest", "gpt-daybreak-blue-latest"],
+      "credit": {
+        "standard": { "input": 100, "cachedInput": 10, "output": 500 },
+        "fast": { "input": 250, "cachedInput": 25, "output": 1250 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 4, "cachedInput": "0.4", "cacheWrite": 5, "output": 20 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 8, "cachedInput": "0.8", "cacheWrite": 10, "output": 30 }
+          }
+        },
+        "fast": {
+          "short": { "input": 8, "cachedInput": "0.8", "cacheWrite": 10, "output": 40 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 16, "cachedInput": "1.6", "cacheWrite": 20, "output": 60 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "credit": {
+        "standard": { "input": 50, "cachedInput": 5, "output": 300 },
+        "fast": { "input": 125, "cachedInput": "12.5", "output": 750 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 2, "cachedInput": "0.2", "cacheWrite": "2.5", "output": 12 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 4, "cachedInput": "0.4", "cacheWrite": 5, "output": 18 }
+          }
+        },
+        "fast": {
+          "short": { "input": 4, "cachedInput": "0.4", "cacheWrite": 5, "output": 24 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 8, "cachedInput": "0.8", "cacheWrite": 10, "output": 36 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "credit": {
+        "standard": { "input": 5, "cachedInput": "0.5", "output": 30 },
+        "fast": { "input": "12.5", "cachedInput": "1.25", "output": 75 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "0.2", "cachedInput": "0.02", "cacheWrite": "0.25", "output": "1.2" },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.4", "cachedInput": "0.04", "cacheWrite": "0.5", "output": "1.8" }
+          }
+        },
+        "fast": {
+          "short": { "input": "0.4", "cachedInput": "0.04", "cacheWrite": "0.5", "output": "2.4" },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.8", "cachedInput": "0.08", "cacheWrite": 1, "output": "3.6" }
+          }
+        }
+      }
+    },
+    {
+      "id": "codex-auto-review",
+      "api": {
+        "standard": {
+          "short": { "input": "0.2", "cachedInput": "0.02", "cacheWrite": "0.25", "output": "1.2" },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.4", "cachedInput": "0.04", "cacheWrite": "0.5", "output": "1.8" }
+          }
+        },
+        "fast": {
+          "short": { "input": "0.4", "cachedInput": "0.04", "cacheWrite": "0.5", "output": "2.4" },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.8", "cachedInput": "0.08", "cacheWrite": 1, "output": "3.6" }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.5",
+      "credit": {
+        "standard": { "input": 125, "cachedInput": "12.5", "output": 750 },
+        "fast": { "input": "312.5", "cachedInput": "31.25", "output": 1875 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 5, "cachedInput": "0.5", "output": 30 },
+          "long": { "mode": "published", "rates": { "input": 10, "cachedInput": 1, "output": 45 } }
+        },
+        "fast": {
+          "short": { "input": "12.5", "cachedInput": "1.25", "output": 75 },
+          "long": { "mode": "unavailable" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4",
+      "credit": {
+        "standard": { "input": "62.5", "cachedInput": "6.25", "output": 375 },
+        "fast": { "input": 125, "cachedInput": "12.5", "output": 750 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "2.5", "cachedInput": "0.25", "output": 15 },
+          "long": { "mode": "published", "rates": { "input": 5, "cachedInput": "0.5", "output": "22.5" } }
+        },
+        "fast": {
+          "short": { "input": 5, "cachedInput": "0.5", "output": 30 },
+          "long": { "mode": "unavailable" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "credit": {
+        "standard": { "input": "18.75", "cachedInput": "1.875", "output": 113 },
+        "fast": { "input": "37.5", "cachedInput": "3.75", "output": 226 }
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "0.75", "cachedInput": "0.075", "output": "4.5" },
+          "long": { "mode": "flat" }
+        },
+        "fast": {
+          "short": { "input": "1.5", "cachedInput": "0.15", "output": 9 },
+          "long": { "mode": "flat" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "aliases": ["gpt-5.2"],
+      "credit": {
+        "standard": { "input": "43.75", "cachedInput": "4.375", "output": 350 },
+        "fast": { "input": "43.75", "cachedInput": "4.375", "output": 350 }
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "1.75", "cachedInput": "0.175", "output": 14 },
+          "long": { "mode": "flat" }
+        },
+        "fast": {
+          "short": { "input": "3.5", "cachedInput": "0.35", "output": 28 },
+          "long": { "mode": "flat" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.2-codex",
+      "credit": {
+        "standard": { "input": "43.75", "cachedInput": "4.375", "output": 350 },
+        "fast": { "input": "43.75", "cachedInput": "4.375", "output": 350 }
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "1.75", "cachedInput": "0.175", "output": 14 },
+          "long": { "mode": "flat" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.6-cyber",
+      "aliases": ["daybreak-red-latest", "gpt-daybreak-red-latest"],
+      "credit": {
+        "standard": { "input": "312.5", "cachedInput": "31.25", "output": 1875 },
+        "fast": { "input": "781.25", "cachedInput": "78.125", "output": "4687.5" },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "12.5", "cachedInput": "1.25", "cacheWrite": "15.625", "output": 75 },
+          "long": { "mode": "unavailable" }
+        }
+      }
+    },
+    {
+      "id": "gpt-5.5-cyber",
+      "credit": {
+        "standard": { "input": "312.5", "cachedInput": "31.25", "output": 1875 },
+        "fast": { "input": "781.25", "cachedInput": "78.125", "output": "4687.5" }
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "12.5", "cachedInput": "1.25", "output": 75 },
+          "long": { "mode": "unavailable" }
+        }
+      }
+    }
+  ]
+}

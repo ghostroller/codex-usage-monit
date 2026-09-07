@@ -19,6 +19,7 @@ use chrono::{DateTime, Duration, Utc};
 
 #[cfg(test)]
 use crate::domain::TokenUsage;
+use crate::domain::{ApiCostAmount, PicoUsd};
 use crate::history::{HistoryData, HistoryStore, LocalHalfHourBucket, WeeklyLocalPoint};
 #[cfg(test)]
 use crate::history::{LocalProjectUsageGroup, LocalUsageGroup, QuotaPoint};
@@ -30,9 +31,9 @@ use crate::project_mapping::{ProjectMappingProjection, ProjectMappingStore};
 #[cfg(test)]
 use crate::source_history::UsageEventFact;
 use crate::source_history::{
-    ActiveFactSet, RedactionProfile, SourceBucketChange, SourceHistoryReadBudget,
-    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
-    SourceSessionDigest, SourceSessionDigestChange,
+    ActiveFactSet, RedactionProfile, SessionUsageMetrics, SourceBucketChange,
+    SourceHistoryReadBudget, SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind,
+    SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
 };
 use crate::source_identity::NodeId;
 #[cfg(test)]
@@ -70,6 +71,9 @@ pub const SOURCE_SELECTION_UNAVAILABLE_WARNING: &str = "source_selection_unavail
 pub const SOURCE_SELECTION_EXCLUDED_WARNING: &str = "source_selection_excluded_from_aggregates";
 pub const PROJECT_MAPPING_PARTIAL_WARNING: &str = "project_mapping_partial";
 pub const PROJECT_MAPPING_UNAVAILABLE_WARNING: &str = "project_mapping_unavailable";
+pub const REMOTE_MODEL_CATALOG_MISMATCH_WARNING: &str = "remote_model_catalog_fingerprint_mismatch";
+pub(crate) const REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX: &str =
+    "remote_model_catalog_uncovered_tokens";
 pub const DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING: &str = "duplicate_session_dedup_unavailable";
 pub const DUPLICATE_SESSION_FACT_CONFLICT_WARNING: &str = "duplicate_session_fact_conflict";
 pub const DUPLICATE_SESSION_PROJECT_CONFLICT_WARNING: &str = "replica_project_conflict";
@@ -534,6 +538,96 @@ struct SourceReplicaEvidence {
     digests: Vec<SourceSessionDigest>,
     active_remote_ref: Option<SourceHistoryRemoteActiveRef>,
     active_facts: BTreeMap<ThreadId, ActiveFactSet>,
+    model_catalog_compatible: bool,
+}
+
+fn mask_api_cost_projection(cost: &mut ApiCostAmount, observed_tokens: u64, observed_calls: u64) {
+    cost.minimum_pico_usd = PicoUsd::default();
+    cost.maximum_pico_usd = PicoUsd::default();
+    cost.observed_samples = cost.observed_samples.max(observed_calls);
+    cost.observed_tokens = cost.observed_tokens.max(observed_tokens);
+    cost.priced_samples = 0;
+    cost.priced_tokens = 0;
+}
+
+fn mask_session_model_catalog_projection(metrics: &SessionUsageMetrics) -> SessionUsageMetrics {
+    let mut projected = metrics.clone();
+    projected.estimated_cost_units = 0;
+    projected.api_long_context_extra_cost_units = Some(0);
+    mask_api_cost_projection(
+        &mut projected.api_equivalent_cost,
+        projected.token_usage.total_tokens,
+        projected.call_count,
+    );
+    projected.estimator_revision = crate::history::current_history_estimator_revision();
+    projected.api_pricing_catalog_revision =
+        crate::api_cost::current_api_pricing_catalog_revision();
+    if !projected
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == REMOTE_MODEL_CATALOG_MISMATCH_WARNING)
+    {
+        projected
+            .partial_reasons
+            .push(REMOTE_MODEL_CATALOG_MISMATCH_WARNING.to_string());
+    }
+    projected
+}
+
+fn mask_bucket_model_catalog_projection(bucket: &mut LocalHalfHourBucket) {
+    bucket.estimated_cost_units = 0;
+    bucket.api_long_context_extra_cost_units = Some(0);
+    bucket.long_context_usage_unknown = true;
+    bucket.estimator_revision = crate::history::current_history_estimator_revision();
+    bucket.api_pricing_catalog_revision = crate::api_cost::current_api_pricing_catalog_revision();
+    for group in &mut bucket.groups {
+        group.estimated_cost_units = 0;
+        group.api_long_context_extra_cost_units = Some(0);
+        mask_api_cost_projection(
+            &mut group.api_equivalent_cost,
+            group.token_usage.total_tokens,
+            group.call_count,
+        );
+        group.api_equivalent_cost_complete = false;
+    }
+    for group in &mut bucket.project_groups {
+        group.estimated_cost_units = 0;
+        group.api_long_context_extra_cost_units = Some(0);
+        mask_api_cost_projection(
+            &mut group.api_equivalent_cost,
+            group.token_usage.total_tokens,
+            group.call_count,
+        );
+    }
+    if !bucket
+        .partial_reasons
+        .iter()
+        .any(|reason| reason == REMOTE_MODEL_CATALOG_MISMATCH_WARNING)
+    {
+        bucket
+            .partial_reasons
+            .push(REMOTE_MODEL_CATALOG_MISMATCH_WARNING.to_string());
+    }
+}
+
+fn annotate_model_catalog_uncovered_tokens(
+    slices: &mut [SourceSlice],
+    evidence: &[SourceReplicaEvidence],
+) {
+    for (slice, source) in slices.iter_mut().zip(evidence) {
+        if source.model_catalog_compatible {
+            continue;
+        }
+        for bucket in &mut slice.buckets {
+            bucket.partial_reasons.push(format!(
+                "{REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX}:{}:{}",
+                source.source_id.as_str(),
+                bucket.token_usage.total_tokens
+            ));
+            bucket.partial_reasons.sort();
+            bucket.partial_reasons.dedup();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -628,6 +722,7 @@ fn load_v2_history_since_inner(
     let mut replica_evidence = Vec::new();
     let mut included_sources = Vec::new();
     let mut redaction_skipped_sources = Vec::new();
+    let mut model_catalog_mismatch_sources = Vec::new();
     let mut source_selection_status = HistorySourceSelectionStatus::Applied;
     let detect_replicas = matches!(selection, HistorySourceSelection::AllIncluded);
 
@@ -705,7 +800,7 @@ fn load_v2_history_since_inner(
                 continue;
             }
 
-            let (buckets, weekly_local_points, digest_records, active_remote_ref) =
+            let (mut buckets, weekly_local_points, digest_records, active_remote_ref) =
                 match metadata.kind() {
                     SourceKind::Local => {
                         let snapshot = store.load_local_observation_snapshot_since_with_budget(
@@ -753,6 +848,20 @@ fn load_v2_history_since_inner(
                         )
                     }
                 };
+            let model_catalog_compatible = active_remote_ref.as_ref().is_none_or(|active| {
+                active
+                    .binding()
+                    .revisions()
+                    .model_catalog_fingerprint
+                    .as_str()
+                    == crate::model_catalog::model_catalog_fingerprint()
+            });
+            if !model_catalog_compatible {
+                for bucket in &mut buckets {
+                    mask_bucket_model_catalog_projection(bucket);
+                }
+                model_catalog_mismatch_sources.push(metadata.source_id().clone());
+            }
             let digests = digest_records
                 .into_iter()
                 .filter_map(|record| match record.change() {
@@ -772,6 +881,7 @@ fn load_v2_history_since_inner(
                 digests,
                 active_remote_ref,
                 active_facts: BTreeMap::new(),
+                model_catalog_compatible,
             });
         }
         Ok(Some(()))
@@ -853,6 +963,11 @@ fn load_v2_history_since_inner(
         replica_report = replica_result?;
     }
 
+    // Replica reconciliation can remove duplicated remote groups or rebuild
+    // buckets from exact facts. Record the uncovered token count only after
+    // that projection so Summary does not over- or under-subtract coverage.
+    annotate_model_catalog_uncovered_tokens(&mut slices, &replica_evidence);
+
     let weekly_local_points =
         aggregate_source_weekly_points(&slices, &account.quota_points, since)?;
     // The durable Summary backfill marker describes reconstruction of this
@@ -901,6 +1016,12 @@ fn load_v2_history_since_inner(
         history.summary_backfill_attempt_complete = Some(marker.complete);
     }
     history.warnings.extend(replica_report.warnings);
+    for source_id in &model_catalog_mismatch_sources {
+        history.warnings.push(format!(
+            "{REMOTE_MODEL_CATALOG_MISMATCH_WARNING}:{}",
+            source_id.as_str()
+        ));
+    }
     if bucket_projection.unmapped_projects {
         history
             .warnings
@@ -1464,6 +1585,28 @@ mod tests {
         starts_at: DateTime<Utc>,
         total: u64,
     ) {
+        install_remote_bucket_with_catalog(
+            ownership,
+            store,
+            active,
+            metadata,
+            starts_at,
+            total,
+            crate::model_catalog::model_catalog_fingerprint()
+                .parse()
+                .unwrap(),
+        );
+    }
+
+    fn install_remote_bucket_with_catalog(
+        ownership: &HistoryOwnershipStore,
+        store: &SourceHistoryStore,
+        active: &HistoryOwnershipManifest,
+        metadata: &SourceMetadata,
+        starts_at: DateTime<Utc>,
+        total: u64,
+        model_catalog_fingerprint: crate::remote_protocol::ModelCatalogFingerprint,
+    ) {
         let lease = ownership.acquire_writer_lease().unwrap();
         let authority = ownership.authorize_v2_write(&lease, active).unwrap();
         let writer = store.writer(&authority).unwrap();
@@ -1484,6 +1627,7 @@ mod tests {
                 estimator: one,
                 project_breakdown: one,
                 api_pricing_catalog: one,
+                model_catalog_fingerprint,
             },
         )
         .unwrap();
@@ -1703,6 +1847,7 @@ mod tests {
                 digests: vec![digest_a.clone()],
                 active_remote_ref: None,
                 active_facts: BTreeMap::new(),
+                model_catalog_compatible: true,
             },
             SourceReplicaEvidence {
                 source_id: source_b,
@@ -1710,6 +1855,7 @@ mod tests {
                 digests: vec![digest_b.clone()],
                 active_remote_ref: None,
                 active_facts: BTreeMap::new(),
+                model_catalog_compatible: true,
             },
         ];
         let participants = vec![
@@ -2572,6 +2718,7 @@ mod tests {
             &mut duplicate_source,
             &mut indices[0],
             fact,
+            fact.metrics(),
             &mut touched,
             &mut work,
         )
@@ -2618,6 +2765,7 @@ mod tests {
                 &mut large_source,
                 &mut large_indices[0],
                 fact,
+                fact.metrics(),
                 &mut large_touched,
                 &mut large_work,
             )
@@ -3699,6 +3847,83 @@ mod tests {
                 .warnings
                 .contains(&CROSS_SOURCE_DUPLICATE_WARNING.to_string())
         );
+    }
+
+    #[test]
+    fn remote_catalog_mismatch_keeps_tokens_and_masks_derived_costs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (mut legacy, ownership, source_history) =
+            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
+        let starts_at = at(2, 10, 0);
+        let remote = source(
+            SOURCE_B,
+            "remote",
+            SourceKind::Ssh,
+            RedactionProfile::PreviewEnabled,
+        );
+        let active = activate_v2(&ownership);
+        let incompatible = crate::remote_protocol::test_model_catalog_fingerprint(u64::MAX);
+        assert_ne!(
+            incompatible.as_str(),
+            crate::model_catalog::model_catalog_fingerprint()
+        );
+        install_remote_bucket_with_catalog(
+            &ownership,
+            &source_history,
+            &active,
+            &remote,
+            starts_at,
+            20,
+            incompatible,
+        );
+
+        let remote_id = remote.source_id().clone();
+        let result = load_unified_history_since_selected(
+            &ownership,
+            &mut legacy,
+            &source_history,
+            &SOURCE_A.parse().unwrap(),
+            &HistorySourceSelection::Remote(remote_id.clone()),
+            at(2, 0, 0),
+        )
+        .unwrap();
+
+        let bucket = &result.history.half_hour_buckets[0];
+        assert_eq!(bucket.token_usage.total_tokens, 20);
+        assert_eq!(bucket.call_count, 1);
+        assert_eq!(bucket.estimated_cost_units, 0);
+        assert_eq!(bucket.api_long_context_extra_cost_units, Some(0));
+        assert!(bucket.long_context_usage_unknown);
+        assert_eq!(bucket.project_groups[0].token_usage.total_tokens, 20);
+        assert_eq!(bucket.project_groups[0].estimated_cost_units, 0);
+        assert_eq!(
+            bucket.project_groups[0]
+                .api_equivalent_cost
+                .minimum_pico_usd
+                .value(),
+            0
+        );
+        assert_eq!(
+            bucket.project_groups[0].api_equivalent_cost.observed_tokens,
+            20
+        );
+        assert_eq!(
+            bucket.project_groups[0].api_equivalent_cost.priced_tokens,
+            0
+        );
+        assert!(
+            bucket
+                .partial_reasons
+                .contains(&REMOTE_MODEL_CATALOG_MISMATCH_WARNING.to_string())
+        );
+        assert!(bucket.partial_reasons.contains(&format!(
+            "{REMOTE_MODEL_CATALOG_UNCOVERED_TOKENS_PREFIX}:{remote_id}:20"
+        )));
+        assert!(result.history.warnings.contains(&format!(
+            "{REMOTE_MODEL_CATALOG_MISMATCH_WARNING}:{remote_id}"
+        )));
     }
 
     #[test]

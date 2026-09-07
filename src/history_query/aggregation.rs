@@ -81,7 +81,9 @@ pub(super) fn aggregate_source_buckets_with_logical_threads(
     }
 }
 
-fn merge_additive_bucket(target: &mut LocalHalfHourBucket, incoming: LocalHalfHourBucket) {
+fn merge_additive_bucket(target: &mut LocalHalfHourBucket, mut incoming: LocalHalfHourBucket) {
+    reconcile_estimator_revision(target, &mut incoming);
+    reconcile_api_catalog_revision(target, &mut incoming);
     target.ends_at = target.ends_at.min(incoming.ends_at);
     // The aggregate is closed only when every contributing source is closed.
     target.sampled_at = target.sampled_at.min(incoming.sampled_at);
@@ -94,18 +96,9 @@ fn merge_additive_bucket(target: &mut LocalHalfHourBucket, incoming: LocalHalfHo
         incoming.api_long_context_extra_cost_units,
     );
     target.long_context_usage_unknown |= incoming.long_context_usage_unknown;
-    if target.estimator_revision != incoming.estimator_revision {
-        target.estimator_revision = target.estimator_revision.max(incoming.estimator_revision);
-        target
-            .partial_reasons
-            .push("estimator_revision_changed".to_string());
-    }
     target.project_breakdown_revision = target
         .project_breakdown_revision
         .min(incoming.project_breakdown_revision);
-    target.api_pricing_catalog_revision = target
-        .api_pricing_catalog_revision
-        .min(incoming.api_pricing_catalog_revision);
     target.call_count = target.call_count.saturating_add(incoming.call_count);
     merge_usage_groups(&mut target.groups, incoming.groups);
     target.project_groups.extend(incoming.project_groups);
@@ -118,6 +111,256 @@ fn merge_additive_bucket(target: &mut LocalHalfHourBucket, incoming: LocalHalfHo
             .then_with(|| left.thread_id.cmp(&right.thread_id))
             .then_with(|| left.turn_id.cmp(&right.turn_id))
     });
+}
+
+fn reconcile_estimator_revision(
+    target: &mut LocalHalfHourBucket,
+    incoming: &mut LocalHalfHourBucket,
+) {
+    if target.estimator_revision == incoming.estimator_revision {
+        return;
+    }
+
+    let current = crate::history::current_history_estimator_revision();
+    let target_is_current = target.estimator_revision == current;
+    let incoming_is_current = incoming.estimator_revision == current;
+    if !target_is_current {
+        mask_bucket_estimator_projection(target);
+    }
+    if !incoming_is_current {
+        mask_bucket_estimator_projection(incoming);
+    }
+    // When one contributor is current, the remaining non-zero values use the
+    // active estimator. If neither is current, zero is an explicit sentinel;
+    // downstream readers will keep the raw token evidence but reject all
+    // derived values for this mixed slot.
+    target.estimator_revision = if target_is_current || incoming_is_current {
+        current
+    } else {
+        0
+    };
+    target
+        .partial_reasons
+        .push("estimator_revision_changed".to_string());
+}
+
+fn mask_bucket_estimator_projection(bucket: &mut LocalHalfHourBucket) {
+    if !bucket.token_usage.is_zero()
+        || bucket.call_count > 0
+        || bucket.estimated_cost_units > 0
+        || bucket
+            .api_long_context_extra_cost_units
+            .is_some_and(|value| value > 0)
+    {
+        bucket.long_context_usage_unknown = true;
+    }
+    bucket.estimated_cost_units = 0;
+    bucket.api_long_context_extra_cost_units = Some(0);
+    for group in &mut bucket.groups {
+        group.estimated_cost_units = 0;
+        group.api_long_context_extra_cost_units = Some(0);
+    }
+    for group in &mut bucket.project_groups {
+        group.estimated_cost_units = 0;
+        group.api_long_context_extra_cost_units = Some(0);
+    }
+}
+
+fn reconcile_api_catalog_revision(
+    target: &mut LocalHalfHourBucket,
+    incoming: &mut LocalHalfHourBucket,
+) {
+    if target.api_pricing_catalog_revision == incoming.api_pricing_catalog_revision {
+        return;
+    }
+
+    let current = crate::api_cost::current_api_pricing_catalog_revision();
+    let target_is_current = target.api_pricing_catalog_revision == current;
+    let incoming_is_current = incoming.api_pricing_catalog_revision == current;
+    if !target_is_current {
+        mask_bucket_api_projection(target);
+    }
+    if !incoming_is_current {
+        mask_bucket_api_projection(incoming);
+    }
+    target.api_pricing_catalog_revision = if target_is_current || incoming_is_current {
+        current
+    } else {
+        0
+    };
+    target
+        .partial_reasons
+        .push("api_pricing_catalog_changed".to_string());
+}
+
+fn mask_bucket_api_projection(bucket: &mut LocalHalfHourBucket) {
+    for group in &mut bucket.groups {
+        mask_api_cost_projection(
+            &mut group.api_equivalent_cost,
+            group.token_usage.total_tokens,
+            group.call_count,
+        );
+        group.api_equivalent_cost_complete = false;
+    }
+    for group in &mut bucket.project_groups {
+        mask_api_cost_projection(
+            &mut group.api_equivalent_cost,
+            group.token_usage.total_tokens,
+            group.call_count,
+        );
+    }
+}
+
+fn mask_api_cost_projection(
+    amount: &mut crate::domain::ApiCostAmount,
+    observed_tokens: u64,
+    observed_calls: u64,
+) {
+    amount.minimum_pico_usd = Default::default();
+    amount.maximum_pico_usd = Default::default();
+    amount.observed_samples = amount.observed_samples.max(observed_calls);
+    amount.priced_samples = 0;
+    amount.observed_tokens = amount.observed_tokens.max(observed_tokens);
+    amount.priced_tokens = 0;
+}
+
+#[cfg(test)]
+mod revision_merge_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::domain::{ApiCostAmount, PicoUsd};
+    use crate::history::LocalProjectUsageGroup;
+
+    fn api_amount(value: u128, tokens: u64) -> ApiCostAmount {
+        ApiCostAmount {
+            minimum_pico_usd: PicoUsd::new(value),
+            maximum_pico_usd: PicoUsd::new(value),
+            observed_samples: 1,
+            priced_samples: 1,
+            observed_tokens: tokens,
+            priced_tokens: tokens,
+        }
+    }
+
+    fn bucket(
+        tokens: u64,
+        estimated_cost_units: u128,
+        api_cost: u128,
+        estimator_revision: u32,
+        api_pricing_catalog_revision: u32,
+        thread_id: &str,
+    ) -> LocalHalfHourBucket {
+        let starts_at = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+        let token_usage = TokenUsage {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..TokenUsage::default()
+        };
+        let usage_group = LocalUsageGroup {
+            model: Some("gpt-test".to_string()),
+            token_usage,
+            estimated_cost_units,
+            api_long_context_extra_cost_units: Some(estimated_cost_units / 2),
+            call_count: 1,
+            api_equivalent_cost: api_amount(api_cost, tokens),
+            api_equivalent_cost_complete: true,
+            ..LocalUsageGroup::default()
+        };
+        let project_group = LocalProjectUsageGroup {
+            thread_id: thread_id.to_string(),
+            token_usage,
+            estimated_cost_units,
+            api_long_context_extra_cost_units: Some(estimated_cost_units / 2),
+            api_equivalent_cost: api_amount(api_cost, tokens),
+            call_count: 1,
+            ..LocalProjectUsageGroup::default()
+        };
+        LocalHalfHourBucket {
+            starts_at,
+            ends_at: starts_at + Duration::minutes(15),
+            sampled_at: starts_at + Duration::minutes(15),
+            token_usage,
+            estimated_cost_units,
+            api_long_context_extra_cost_units: Some(estimated_cost_units / 2),
+            long_context_usage_unknown: false,
+            estimator_revision,
+            project_breakdown_revision: 1,
+            api_pricing_catalog_revision,
+            call_count: 1,
+            groups: vec![usage_group],
+            project_groups: vec![project_group],
+            partial_reasons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mixed_revisions_keep_only_current_derived_values_in_either_source_order() {
+        let estimator = crate::history::current_history_estimator_revision();
+        let api_catalog = crate::api_cost::current_api_pricing_catalog_revision();
+        let current = bucket(10, 100, 1_000, estimator, api_catalog, "current");
+        let outdated = bucket(
+            20,
+            900,
+            9_000,
+            estimator.saturating_add(1),
+            api_catalog.saturating_add(1),
+            "outdated",
+        );
+
+        for (mut target, incoming) in [
+            (current.clone(), outdated.clone()),
+            (outdated.clone(), current.clone()),
+        ] {
+            merge_additive_bucket(&mut target, incoming);
+            assert_eq!(target.token_usage.total_tokens, 30);
+            assert_eq!(target.estimator_revision, estimator);
+            assert_eq!(target.estimated_cost_units, 100);
+            assert_eq!(target.api_long_context_extra_cost_units, Some(50));
+            assert!(target.long_context_usage_unknown);
+            assert_eq!(target.api_pricing_catalog_revision, api_catalog);
+            assert!(
+                target
+                    .partial_reasons
+                    .iter()
+                    .any(|reason| reason == "estimator_revision_changed")
+            );
+            assert!(
+                target
+                    .partial_reasons
+                    .iter()
+                    .any(|reason| reason == "api_pricing_catalog_changed")
+            );
+
+            assert_eq!(target.groups.len(), 1);
+            let model = &target.groups[0];
+            assert_eq!(model.estimated_cost_units, 100);
+            assert_eq!(model.api_equivalent_cost.minimum_pico_usd.0, 1_000);
+            assert_eq!(model.api_equivalent_cost.observed_tokens, 30);
+            assert_eq!(model.api_equivalent_cost.priced_tokens, 10);
+            assert!(!model.api_equivalent_cost_complete);
+
+            let current_project = target
+                .project_groups
+                .iter()
+                .find(|group| group.thread_id == "current")
+                .unwrap();
+            let outdated_project = target
+                .project_groups
+                .iter()
+                .find(|group| group.thread_id == "outdated")
+                .unwrap();
+            assert_eq!(current_project.estimated_cost_units, 100);
+            assert_eq!(
+                current_project.api_equivalent_cost.minimum_pico_usd.0,
+                1_000
+            );
+            assert_eq!(outdated_project.estimated_cost_units, 0);
+            assert_eq!(outdated_project.api_equivalent_cost.minimum_pico_usd.0, 0);
+            assert_eq!(outdated_project.api_equivalent_cost.priced_tokens, 0);
+            assert_eq!(outdated_project.api_equivalent_cost.observed_tokens, 20);
+        }
+    }
 }
 
 fn merge_usage_groups(target: &mut Vec<LocalUsageGroup>, incoming: Vec<LocalUsageGroup>) {
