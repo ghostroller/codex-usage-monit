@@ -28,7 +28,7 @@ use crate::remote_delta_journal::{
 use crate::remote_export_plan::plan_remote_export_records;
 use crate::remote_export_state::{
     RemoteDeltaCursorExpired, RemoteDeltaPageRead, RemoteExportDeltaPage, RemoteExportLivePage,
-    RemoteExportStateStore, RemoteRevisionFenceMode, try_acquire_revision_fence,
+    RemoteExportLock, RemoteExportStateStore, RemoteRevisionFenceMode, try_acquire_revision_fence,
 };
 use crate::remote_protocol::{
     DeltaCursor, DeltaPage, DeltaPayload, DeltaRequest, MAX_LIVE_SERIALIZED_BYTES, MAX_LIVE_TASKS,
@@ -844,7 +844,7 @@ fn validate_revision_directory_name(name: &str) -> io::Result<bool> {
     Ok(retired)
 }
 
-fn try_lock_revision_exporters(paths: &[PathBuf]) -> io::Result<Option<Vec<File>>> {
+fn try_lock_revision_exporters(paths: &[PathBuf]) -> io::Result<Option<Vec<RemoteExportLock>>> {
     let mut locks = Vec::with_capacity(paths.len());
     for path in paths {
         let Some(lock) = try_lock_existing_exporter(path)? else {
@@ -861,7 +861,7 @@ fn try_lock_revision_exporters(paths: &[PathBuf]) -> io::Result<Option<Vec<File>
 /// Windows they drop it immediately before rename, where the existing lock
 /// handles' lack of DELETE sharing provides the atomic activity fence.
 pub(crate) struct RemoteExporterTreeLocks {
-    _locks: Vec<File>,
+    _locks: Vec<RemoteExportLock>,
 }
 
 pub(crate) fn try_lock_exporter_tree(
@@ -911,7 +911,7 @@ fn scan_exporter_lock_paths(
     Ok(Some(paths))
 }
 
-fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<File>> {
+fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<RemoteExportLock>> {
     let before = fs::symlink_metadata(path)?;
     validate_revision_storage_entry(path, &before)?;
     if !before.file_type().is_file() {
@@ -936,8 +936,9 @@ fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<File>> {
         Err(error) if lock_is_contended(&error) => return Ok(None),
         Err(error) => return Err(error),
     }
-    validate_open_revision_lock(path, &file, &before)?;
-    Ok(Some(file))
+    let lock = RemoteExportLock::from_locked(file);
+    validate_open_revision_lock(path, lock.as_file(), &before)?;
+    Ok(Some(lock))
 }
 
 fn lock_is_contended(error: &io::Error) -> bool {
@@ -1367,6 +1368,41 @@ mod tests {
 
         assert!(old.exists());
         drop(active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporter_tree_drop_releases_an_inherited_lock() {
+        let (_directory, _config, store, identity, now) = fixture();
+        let revisions = current_revisions();
+        let root = create_revision_state(&store, &identity, &revisions, now);
+        let state = RemoteExportStateStore::new(
+            root.clone(),
+            source_generation(&identity),
+            RedactionProfile::Redacted,
+        );
+        let locks = try_lock_exporter_tree(&root, MAX_REVISION_DIRECTORY_ENTRIES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(locks._locks.len(), 1);
+        let inherited = locks._locks[0].as_file().try_clone().unwrap();
+        assert_eq!(
+            state.try_begin(now).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            try_lock_exporter_tree(&root, MAX_REVISION_DIRECTORY_ENTRIES)
+                .unwrap()
+                .is_none()
+        );
+        drop(locks);
+        let resumed = state.try_begin(now);
+        drop(inherited);
+        assert!(
+            resumed.is_ok(),
+            "completed exporter-tree scan left its inherited lock held: {:?}",
+            resumed.err()
+        );
     }
 
     #[test]

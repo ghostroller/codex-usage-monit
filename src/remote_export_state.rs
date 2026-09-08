@@ -390,6 +390,30 @@ pub struct RemoteExportStateStore {
     limits: RemoteExportLimits,
 }
 
+/// Owns an acquired exporter lock, including during post-acquisition checks.
+/// Explicit unlock releases Unix flock even if a concurrent fork retained a
+/// descriptor for the same open-file description. Construct only after the OS
+/// lock succeeds so failed contenders never unlock an active owner's lock.
+pub(crate) struct RemoteExportLock {
+    file: File,
+}
+
+impl RemoteExportLock {
+    pub(crate) fn from_locked(file: File) -> Self {
+        Self { file }
+    }
+
+    pub(crate) fn as_file(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Drop for RemoteExportLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RemoteRevisionFenceMode {
     Shared,
@@ -401,7 +425,7 @@ pub(crate) enum RemoteRevisionFenceMode {
 /// lease before discovering child locks. This closes the create-after-scan
 /// race that per-thread/source locks alone cannot prevent.
 pub(crate) struct RemoteRevisionFence {
-    _lock: File,
+    _lock: RemoteExportLock,
     #[cfg(windows)]
     _directory: File,
 }
@@ -452,8 +476,9 @@ pub(crate) fn try_acquire_revision_fence(
         }
         Err(error) => return Err(error),
     }
+    let lock = RemoteExportLock::from_locked(lock);
     prepare_private_root(root)?;
-    validate_opened_private_file(&path, &lock, "remote revision fence")?;
+    validate_opened_private_file(&path, lock.as_file(), "remote revision fence")?;
     Ok(RemoteRevisionFence {
         _lock: lock,
         #[cfg(windows)]
@@ -677,7 +702,7 @@ impl RemoteExportStateStore {
 /// Holds the source-wide OS lock for one exporter transaction/session.
 pub struct RemoteExportSession<'a> {
     store: &'a RemoteExportStateStore,
-    lock: File,
+    lock: RemoteExportLock,
     state: Option<StoredExportState>,
     encoded_bytes: u64,
 }
@@ -1198,7 +1223,7 @@ impl RemoteExportSession<'_> {
         self.store.validate_namespace()?;
         validate_opened_private_file(
             &self.store.source_directory().join(EXPORT_LOCK_FILE),
-            &self.lock,
+            self.lock.as_file(),
             "remote export lock",
         )
     }
@@ -2514,7 +2539,10 @@ fn validate_private_directory(path: &Path, subject: &str) -> io::Result<()> {
     ensure_private_directory(path, &metadata, subject)
 }
 
-fn try_open_source_lock(store: &RemoteExportStateStore, directory: &Path) -> io::Result<File> {
+fn try_open_source_lock(
+    store: &RemoteExportStateStore,
+    directory: &Path,
+) -> io::Result<RemoteExportLock> {
     validate_private_directory(directory, "remote export source directory")?;
     let path = directory.join(EXPORT_LOCK_FILE);
     match fs::symlink_metadata(&path) {
@@ -2553,9 +2581,10 @@ fn try_open_source_lock(store: &RemoteExportStateStore, directory: &Path) -> io:
         }
         Err(error) => return Err(error),
     }
+    let lock = RemoteExportLock::from_locked(file);
     store.prepare_source_directory()?;
-    validate_opened_private_file(&path, &file, "remote export lock")?;
-    Ok(file)
+    validate_opened_private_file(&path, lock.as_file(), "remote export lock")?;
+    Ok(lock)
 }
 
 fn lock_is_contended(error: &io::Error) -> bool {
@@ -3612,6 +3641,33 @@ mod tests {
         assert!(preview.try_begin(at(1, 0)).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exporter_session_drop_releases_an_inherited_lock() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("state");
+        let redacted = RemoteExportStateStore::new(&root, source(1), RedactionProfile::Redacted);
+        let preview =
+            RemoteExportStateStore::new(&root, source(1), RedactionProfile::PreviewEnabled);
+        let export = redacted.try_begin(at(1, 0)).unwrap();
+        // A concurrent fork inherits the same open-file description as dup.
+        let inherited = export.lock.as_file().try_clone().unwrap();
+        for store in [&preview, &redacted] {
+            assert_eq!(
+                store.try_begin(at(1, 0)).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drop(export);
+        let reopened = preview.try_begin(at(1, 1));
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "completed exporter left its inherited lock held: {:?}",
+            reopened.err()
+        );
+    }
+
     #[test]
     fn revision_fence_allows_readers_and_excludes_gc() {
         let directory = tempfile::tempdir().unwrap();
@@ -3629,6 +3685,35 @@ mod tests {
             try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Exclusive).is_ok(),
             "GC can acquire the revision after every request releases it"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_fence_drop_releases_an_inherited_lock() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("revision");
+        for mode in [
+            RemoteRevisionFenceMode::Shared,
+            RemoteRevisionFenceMode::Exclusive,
+        ] {
+            let fence = try_acquire_revision_fence(&root, mode).unwrap();
+            let inherited = fence._lock.as_file().try_clone().unwrap();
+            assert_eq!(
+                try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Exclusive)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(fence);
+            let reopened = try_acquire_revision_fence(&root, RemoteRevisionFenceMode::Exclusive);
+            drop(inherited);
+            assert!(
+                reopened.is_ok(),
+                "released {mode:?} revision fence left its inherited lock held: {:?}",
+                reopened.err()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3665,12 +3750,18 @@ mod tests {
         );
         drop(store.try_begin(at(1, 0)).unwrap());
         let state_path = store.state_path();
+        let valid_state = fs::read(&state_path).unwrap();
         fs::write(&state_path, b"{\"formatVersion\":999}\n").unwrap();
         #[cfg(unix)]
         set_mode(&state_path, 0o600);
         let error = store.try_begin(at(1, 1)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&state_path).unwrap(), b"{\"formatVersion\":999}\n");
+        fs::write(&state_path, valid_state).unwrap();
+        assert!(
+            store.try_begin(at(1, 1)).is_ok(),
+            "failed session initialization must release the source lock"
+        );
 
         // Restore a valid namespace, then prove its durable anchor prevents an
         // absent state file from being mistaken for first initialization.
