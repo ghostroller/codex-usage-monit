@@ -26,9 +26,40 @@ enum JsonlSink {
 struct RotatingPrivateFile {
     path: PathBuf,
     description: &'static str,
-    writer: BufWriter<File>,
+    writer: BufWriter<LockedPrivateFile>,
     written_bytes: u64,
     max_bytes: u64,
+}
+
+/// Release the flock explicitly: closing just this descriptor is insufficient
+/// while a concurrent fork still holds a reference to its open-file description.
+/// BufWriter owns this guard so its pending bytes are flushed before unlocking.
+struct LockedPrivateFile {
+    file: File,
+}
+
+impl LockedPrivateFile {
+    fn open(path: &Path, description: &str) -> io::Result<Self> {
+        let file = open_private_regular_file(path, description)?;
+        lock_file(&file, description)?;
+        Ok(Self { file })
+    }
+}
+
+impl Write for LockedPrivateFile {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for LockedPrivateFile {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl JsonlWriter {
@@ -49,10 +80,9 @@ impl JsonlWriter {
         {
             fs::create_dir_all(parent)?;
         }
-        let mut file = open_private_regular_file(path, description)?;
-        lock_file(&file, description)?;
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
+        let mut file = LockedPrivateFile::open(path, description)?;
+        file.file.set_len(0)?;
+        file.file.seek(SeekFrom::Start(0))?;
         Ok(Self {
             sink: JsonlSink::File(RotatingPrivateFile {
                 path: path.to_path_buf(),
@@ -115,19 +145,18 @@ impl RotatingPrivateFile {
         self.writer.flush()?;
 
         let backup_path = rotated_path(&self.path);
-        let mut backup = open_private_regular_file(&backup_path, self.description)?;
-        lock_file(&backup, self.description)?;
-        backup.set_len(0)?;
-        backup.seek(SeekFrom::Start(0))?;
+        let mut backup = LockedPrivateFile::open(&backup_path, self.description)?;
+        backup.file.set_len(0)?;
+        backup.file.seek(SeekFrom::Start(0))?;
 
-        let live = self.writer.get_mut();
+        let live = &mut self.writer.get_mut().file;
         live.seek(SeekFrom::Start(0))?;
-        io::copy(&mut Read::by_ref(live), &mut backup)?;
+        io::copy(&mut Read::by_ref(live), &mut backup.file)?;
         backup.flush()?;
         // The retained copy must be durable before the live file is truncated.
         // This runs only once per several MiB, so the sync cost is bounded and
         // does not affect the normal per-record path.
-        backup.sync_data()?;
+        backup.file.sync_data()?;
 
         live.set_len(0)?;
         live.seek(SeekFrom::Start(0))?;
@@ -235,6 +264,88 @@ fn ensure_regular_file(file: &File, description: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_drop_flushes_and_unlocks_with_an_inherited_descriptor() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("diagnostic.jsonl");
+        let mut writer = JsonlWriter::open_private(&path, "test log", 96).unwrap();
+        writer
+            .write_json_line(&serde_json::json!({ "event": "buffered" }))
+            .unwrap();
+        let JsonlSink::File(file) = &writer.sink else {
+            unreachable!();
+        };
+        // dup and fork share the same open-file description and flock. Keep
+        // that inherited reference alive beyond the actual writer's lifetime.
+        let inherited = file.writer.get_ref().file.try_clone().unwrap();
+        assert_eq!(
+            JsonlWriter::open_private(&path, "test log", 96)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(writer);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"event\":\"buffered\"}\n"
+        );
+        let reopened = JsonlWriter::open_private(&path, "test log", 96);
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "writer left its flock held: {:?}",
+            reopened.err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_releases_backup_lock_but_preserves_live_writer_exclusivity() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("diagnostic.jsonl");
+        let mut writer = JsonlWriter::open_private(&path, "test log", 32).unwrap();
+        let first = serde_json::json!({ "event": "first" });
+        writer.write_json_line(&first).unwrap();
+        writer.flush().unwrap();
+
+        let backup_path = rotated_path(&path);
+        let backup = LockedPrivateFile::open(&backup_path, "test backup").unwrap();
+        let inherited = backup.file.try_clone().unwrap();
+        let second = serde_json::json!({ "event": "second" });
+        assert_eq!(
+            writer.write_json_line(&second).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // A failed rotation must preserve the live record and its writer lock.
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{first}\n"));
+        drop(backup);
+
+        // Keep the inherited backup descriptor open across several rotations.
+        // A close-only release would leave its old flock held and fail here.
+        for index in 0..8 {
+            assert_eq!(
+                JsonlWriter::open_private(&path, "test log", 32)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            writer
+                .write_json_line(&serde_json::json!({ "index": index }))
+                .unwrap();
+        }
+        drop(writer);
+        let reopened = LockedPrivateFile::open(&backup_path, "test backup");
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "backup left its flock held: {:?}",
+            reopened.err()
+        );
+    }
 
     #[test]
     fn bounded_writer_rotates_complete_json_lines_and_keeps_writing() {
