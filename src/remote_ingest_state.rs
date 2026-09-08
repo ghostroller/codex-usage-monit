@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::atomic_file::replace_file;
 use crate::domain::{ApiCostAmount, PicoUsd};
+use crate::file_lock::FileLock;
 use crate::history::{
     HISTORY_METRIC_REVISION, LocalHalfHourBucket, LocalProjectUsageGroup, LocalUsageGroup,
 };
@@ -550,12 +551,12 @@ pub(crate) fn queue_remote_preview_ingest_retirement(
 
     history_store.prepare_private_directory(&paths.marker_directory)?;
     let marker_lock = open_private_lock(&paths.marker_lock)?;
-    try_lock_private_lock(&paths.marker_lock, &marker_lock)?;
+    let _marker_lock = try_lock_private_lock(&paths.marker_lock, marker_lock)?;
     cleanup_remote_ingest_temporary_files(&paths.marker_directory)?;
 
     let ingest_lock = if source_exists {
         let lock = open_private_lock(&paths.preview_lock)?;
-        try_lock_private_lock(&paths.preview_lock, &lock)?;
+        let lock = try_lock_private_lock(&paths.preview_lock, lock)?;
         Some(lock)
     } else {
         None
@@ -597,7 +598,7 @@ pub(crate) fn retry_remote_preview_ingest_retirement(
 
     history_store.prepare_private_directory(&paths.marker_directory)?;
     let marker_lock = open_private_lock(&paths.marker_lock)?;
-    try_lock_private_lock(&paths.marker_lock, &marker_lock)?;
+    let _marker_lock = try_lock_private_lock(&paths.marker_lock, marker_lock)?;
     cleanup_remote_ingest_temporary_files(&paths.marker_directory)?;
     ensure_remote_ingest_retirement_marker(&paths)?;
 
@@ -691,9 +692,9 @@ fn purge_ingest_namespace(
             ));
         }
         let lock = open_private_lock(&lock_path)?;
-        try_lock_private_lock(&lock_path, &lock)?;
+        let lock = try_lock_private_lock(&lock_path, lock)?;
         validate_purge_ingest_source(history_store, source, source_id, redaction_profile, true)?;
-        FileExt::unlock(&lock)?;
+        FileExt::unlock(lock.as_file())?;
         drop(lock);
         history_store.validate_private_path(source)?;
         rename_ingest_purge_namespace(source, trash)?;
@@ -900,9 +901,9 @@ fn purge_ingest_retirement_namespace(
             ));
         }
         let lock = open_private_lock(&lock_path)?;
-        try_lock_private_lock(&lock_path, &lock)?;
+        let lock = try_lock_private_lock(&lock_path, lock)?;
         validate_purge_retirement_directory(history_store, source, source_id, true)?;
-        FileExt::unlock(&lock)?;
+        FileExt::unlock(lock.as_file())?;
         drop(lock);
         rename_ingest_purge_namespace(source, trash)?;
         sync_directory(parent)?;
@@ -1064,7 +1065,7 @@ impl RemoteDeltaIngestStateStore {
         self.prepare_source_namespace()?;
         let lock_path = self.lock_path();
         let lock = open_private_lock(&lock_path)?;
-        try_lock_private_lock(&lock_path, &lock)?;
+        let lock = try_lock_private_lock(&lock_path, lock)?;
         self.prepare_binding_namespace_locked()?;
         self.validate_namespace()?;
         cleanup_remote_ingest_temporary_files(&self.namespace_directory())?;
@@ -1237,7 +1238,7 @@ impl RemoteDeltaIngestStateStore {
 /// this lock; prepare/acknowledge are short local persistence sections.
 pub struct RemoteDeltaIngestSession<'a> {
     store: &'a RemoteDeltaIngestStateStore,
-    lock: File,
+    lock: FileLock,
     state: StoredRemoteDeltaIngestState,
 }
 
@@ -1791,12 +1792,6 @@ impl RemoteDeltaIngestSession<'_> {
     fn validate_fence(&self) -> io::Result<()> {
         self.store.validate_namespace()?;
         validate_private_file(&self.store.lock_path(), &self.lock, "remote ingest lock")
-    }
-}
-
-impl Drop for RemoteDeltaIngestSession<'_> {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.lock);
     }
 }
 
@@ -2671,7 +2666,7 @@ fn remove_remote_preview_ingest_source_bounded(
 ) -> io::Result<bool> {
     history_store.validate_private_path(&paths.preview_source)?;
     let lock = open_private_lock(&paths.preview_lock)?;
-    try_lock_private_lock(&paths.preview_lock, &lock)?;
+    let lock = try_lock_private_lock(&paths.preview_lock, lock)?;
     // The external retirement marker remains until explicit source purge, so
     // every partial or rolled-back deletion stays replayable on Windows.
     sync_directory(&paths.preview_source)?;
@@ -2732,7 +2727,7 @@ fn remove_remote_preview_ingest_source_bounded(
     // to remove the stable lock and its parent directory.
     drop(entries);
     validate_private_file(&paths.preview_lock, &lock, "remote ingest lock")?;
-    FileExt::unlock(&lock)?;
+    FileExt::unlock(lock.as_file())?;
     drop(lock);
 
     let lock = open_existing_private_file(&paths.preview_lock, "remote ingest lock")?;
@@ -3198,7 +3193,7 @@ fn open_private_lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn try_lock_private_lock(path: &Path, file: &File) -> io::Result<()> {
+fn try_lock_private_lock(path: &Path, file: File) -> io::Result<FileLock> {
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if lock_is_contended(&error) => {
@@ -3209,11 +3204,13 @@ fn try_lock_private_lock(path: &Path, file: &File) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     }
+    let lock = FileLock::from_locked(file);
 
     // The pathname may have been displaced after open but before the OS lock
     // was acquired. Revalidate only after acquisition so a session can never
     // coordinate through an unlinked/replaced lock-file identity.
-    validate_private_file(path, file, "remote ingest lock")
+    validate_private_file(path, &lock, "remote ingest lock")?;
+    Ok(lock)
 }
 
 #[cfg(any(test, windows))]
@@ -5517,6 +5514,7 @@ mod tests {
         ingest.prepare_source_namespace().unwrap();
         let lock_path = ingest.lock_path();
         let displaced = open_private_lock(&lock_path).unwrap();
+        let inherited = displaced.try_clone().unwrap();
         let displaced_path = ingest
             .source_namespace_directory()
             .join("displaced-ingest.lock");
@@ -5524,11 +5522,15 @@ mod tests {
         fs::rename(&lock_path, &displaced_path).unwrap();
         drop(open_private_lock(&lock_path).unwrap());
 
-        let error = try_lock_private_lock(&lock_path, &displaced).unwrap_err();
+        let error = try_lock_private_lock(&lock_path, displaced).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("changed while open"));
 
-        drop(displaced);
+        let released = open_private_lock(&displaced_path).unwrap();
+        let acquired = released.try_lock_exclusive();
+        drop(inherited);
+        acquired.expect("post-lock validation must release the inherited lock on error");
+        drop(FileLock::from_locked(released));
         fs::remove_file(displaced_path).unwrap();
         ingest.try_begin().unwrap();
     }

@@ -187,11 +187,9 @@ pub fn try_acquire_remote_host_sync_lease(
     let file = open_remote_host_sync_lock(&path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
-            validate_opened_remote_host_sync_lock(&path, &file)?;
-            Ok(TryRemoteHostSyncLease::Acquired(RemoteHostSyncLease {
-                file,
-                path,
-            }))
+            let lease = RemoteHostSyncLease { file, path };
+            validate_opened_remote_host_sync_lock(&lease.path, &lease.file)?;
+            Ok(TryRemoteHostSyncLease::Acquired(lease))
         }
         Err(error) if remote_host_sync_lock_is_contended(&error) => {
             validate_opened_remote_host_sync_lock(&path, &file)?;

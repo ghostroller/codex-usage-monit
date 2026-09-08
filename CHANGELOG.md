@@ -31,6 +31,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Release diagnostic and state-file locks explicitly when their owners finish, including error paths, so inherited subprocess handles cannot leave log rotation, remote export or fact publication falsely busy.
 - Recovered validated session-digest bindings on unchanged fact deltas, and stopped scheduling replica facts for sources excluded from aggregate queries.
 - Kept independent fact failures and persistent SSH cleanup pauses visible after aggregate success, during bandwidth pauses, and across host re-pairing.
 - Reclaimed SSH primary processes that leave their original Unix process group, accepted explicitly cache-free remote exporters, and allowed fresh history initialization on systems proven to have neither systemd nor an old recorder definition.
