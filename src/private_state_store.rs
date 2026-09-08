@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::atomic_file::replace_file;
+use crate::file_lock::FileLock;
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
 
@@ -143,7 +144,7 @@ impl PrivateStoreLayout {
         directory: &Path,
         mode: LockMode,
         policy: LockFilePolicy,
-    ) -> io::Result<File> {
+    ) -> io::Result<FileLock> {
         self.validate_private_directory(directory)?;
         let path = directory.join(self.lock_file_name);
         match fs::symlink_metadata(&path) {
@@ -183,13 +184,14 @@ impl PrivateStoreLayout {
             LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
             LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
         }
+        let file = FileLock::from_locked(file);
 
         // Revalidate both the containing directory and the opened path after
         // lock acquisition. This ordering is intentional: a replacement that
         // raced the open must not be trusted merely because the old inode was
         // successfully locked.
         self.validate_private_directory(directory)?;
-        validate_opened_private_file(&path, &file, self.lock_subject)?;
+        validate_opened_private_file(&path, file.as_file(), self.lock_subject)?;
         Ok(file)
     }
 
@@ -607,6 +609,34 @@ mod tests {
         temporary_subject: "test private state temporary file",
         maximum_file_bytes: 64,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn private_store_locks_release_inherited_descriptors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("state");
+        let directory = root.join("test-v1");
+        TEST_LAYOUT
+            .create_directory_beneath(&root, &directory)
+            .unwrap();
+        for mode in [LockMode::Shared, LockMode::Exclusive] {
+            let owner = TEST_LAYOUT
+                .open_lock(&directory, mode, LockFilePolicy::Create)
+                .unwrap();
+            let inherited = owner.try_clone().unwrap();
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join(TEST_LAYOUT.lock_file_name))
+                .unwrap();
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            drop(owner);
+            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            drop(inherited);
+            acquired.expect("completed private-store operation left its inherited lock held");
+            drop(FileLock::from_locked(contender));
+        }
+    }
 
     #[test]
     fn existing_lock_policy_never_creates_a_missing_lock() {

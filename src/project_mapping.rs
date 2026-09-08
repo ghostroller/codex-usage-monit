@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::atomic_file::replace_file;
+use crate::file_lock::FileLock;
 use crate::remote_protocol::{
     GitRepositoryFingerprint, RemoteGitRepositoryEvidence, RemoteProjectDescriptor,
 };
@@ -2112,12 +2113,13 @@ fn open_lock_file(directory: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<File> {
+fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<FileLock> {
     let file = open_lock_file(directory)?;
     match mode {
         LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
         LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
     }
+    let file = FileLock::from_locked(file);
     validate_private_directory(directory)?;
     let path = directory.join(LOCK_FILE);
     let path_metadata = fs::symlink_metadata(&path)?;
@@ -2135,7 +2137,7 @@ fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<File> {
     Ok(file)
 }
 
-fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<File>> {
+fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<FileLock>> {
     let file = open_lock_file(directory)?;
     let result = match mode {
         LockMode::Shared => fs2::FileExt::try_lock_shared(&file),
@@ -2143,6 +2145,7 @@ fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Opt
     };
     match result {
         Ok(()) => {
+            let file = FileLock::from_locked(file);
             validate_private_directory(directory)?;
             let path = directory.join(LOCK_FILE);
             let path_metadata = fs::symlink_metadata(&path)?;
@@ -2327,6 +2330,38 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_helpers_release_inherited_descriptors_and_preserve_active_owners() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        create_private_directory(&directory).unwrap();
+        for mode in [LockMode::Shared, LockMode::Exclusive] {
+            for nonblocking in [false, true] {
+                let owner = if nonblocking {
+                    try_open_locked_lock_file(&directory, mode)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    open_locked_lock_file(&directory, mode).unwrap()
+                };
+                let inherited = owner.try_clone().unwrap();
+                assert!(
+                    try_open_locked_lock_file(&directory, LockMode::Exclusive)
+                        .unwrap()
+                        .is_none()
+                );
+                drop(owner);
+                let acquired = try_open_locked_lock_file(&directory, LockMode::Exclusive).unwrap();
+                drop(inherited);
+                assert!(
+                    acquired.is_some(),
+                    "completed operation left its inherited lock held"
+                );
+            }
+        }
+    }
 
     const NODE_ONE: &str = "node-0123456789abcdef0123456789abcdef";
     const NODE_TWO: &str = "node-fedcba9876543210fedcba9876543210";

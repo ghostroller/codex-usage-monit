@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::atomic_file::replace_file;
+use crate::file_lock::FileLock;
 use crate::remote_protocol::SourceGeneration;
 
 pub const REMOTES_CONFIG_VERSION: u32 = 1;
@@ -1004,7 +1005,7 @@ impl RemotesConfigStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn lock_exclusive_for_test(&self) -> io::Result<File> {
+    pub(crate) fn lock_exclusive_for_test(&self) -> io::Result<FileLock> {
         let path = self.required_path()?;
         open_locked_lock_file(config_parent(path), LockMode::Exclusive)
     }
@@ -1682,19 +1683,19 @@ fn open_lock_file(directory: &Path) -> io::Result<File> {
 /// entry after the potentially blocking lock acquisition. Without the second
 /// inode check, a waiter could acquire an unlinked old lock while newer
 /// processes coordinate through its replacement.
-fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<File> {
+fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<FileLock> {
     let file = open_lock_file(directory)?;
     lock_opened_lock_file(directory, file, mode)
 }
 
-fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<File>> {
+fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<FileLock>> {
     let file = open_lock_file(directory)?;
     let result = match mode {
         LockMode::Shared => fs2::FileExt::try_lock_shared(&file),
         LockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&file),
     };
     match result {
-        Ok(()) => validate_locked_lock_file(directory, file).map(Some),
+        Ok(()) => validate_locked_lock_file(directory, FileLock::from_locked(file)).map(Some),
         Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(error),
     }
@@ -1708,16 +1709,16 @@ fn lock_is_contended(error: &io::Error) -> bool {
             || error.raw_os_error() == expected.raw_os_error())
 }
 
-fn lock_opened_lock_file(directory: &Path, file: File, mode: LockMode) -> io::Result<File> {
+fn lock_opened_lock_file(directory: &Path, file: File, mode: LockMode) -> io::Result<FileLock> {
     match mode {
         LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
         LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
     }
 
-    validate_locked_lock_file(directory, file)
+    validate_locked_lock_file(directory, FileLock::from_locked(file))
 }
 
-fn validate_locked_lock_file(directory: &Path, file: File) -> io::Result<File> {
+fn validate_locked_lock_file(directory: &Path, file: FileLock) -> io::Result<FileLock> {
     validate_private_directory(directory)?;
     let path = directory.join(LOCK_FILE);
     let path_metadata = fs::symlink_metadata(&path)?;
@@ -1910,6 +1911,38 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn lock_helpers_release_inherited_descriptors_and_preserve_active_owners() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        create_private_directory(&directory).unwrap();
+        for mode in [LockMode::Shared, LockMode::Exclusive] {
+            for nonblocking in [false, true] {
+                let owner = if nonblocking {
+                    try_open_locked_lock_file(&directory, mode)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    open_locked_lock_file(&directory, mode).unwrap()
+                };
+                let inherited = owner.try_clone().unwrap();
+                assert!(
+                    try_open_locked_lock_file(&directory, LockMode::Exclusive)
+                        .unwrap()
+                        .is_none()
+                );
+                drop(owner);
+                let acquired = try_open_locked_lock_file(&directory, LockMode::Exclusive).unwrap();
+                drop(inherited);
+                assert!(
+                    acquired.is_some(),
+                    "completed operation left its inherited lock held"
+                );
+            }
+        }
+    }
+
     const NODE_ONE: &str = "node-0123456789abcdef0123456789abcdef";
     const NODE_TWO: &str = "node-fedcba9876543210fedcba9876543210";
 
@@ -1949,6 +1982,7 @@ mod tests {
         // wait and must not publish the default through the shared path.
         let holder = open_lock_file(directory.path()).unwrap();
         fs2::FileExt::lock_exclusive(&holder).unwrap();
+        let holder = FileLock::from_locked(holder);
         assert_eq!(store.try_load().unwrap(), TryLoadRemotesConfig::Busy);
         assert_eq!(
             store.try_load_or_create().unwrap(),
@@ -2961,6 +2995,7 @@ mod tests {
 
         let holder = open_lock_file(&config_directory).unwrap();
         fs2::FileExt::lock_exclusive(&holder).unwrap();
+        let holder = FileLock::from_locked(holder);
 
         let (opened_sender, opened_receiver) = mpsc::channel();
         let waiter_directory = config_directory.clone();

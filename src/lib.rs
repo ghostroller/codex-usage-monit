@@ -11,6 +11,7 @@ pub mod config;
 mod diagnostic_log;
 pub mod domain;
 mod exact_json;
+mod file_lock;
 mod git_repository;
 pub mod health_report;
 pub mod history;
