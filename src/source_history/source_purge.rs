@@ -102,7 +102,7 @@ impl SourceHistoryStore {
             return Ok(());
         }
         let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-        lock_shared(&lock, &source, SOURCE_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &source, SOURCE_LOCK_FILE)?;
         reject_source_metadata_update_during_purge(self, &source, source_id)
     }
 
@@ -117,7 +117,7 @@ impl SourceHistoryStore {
             )),
             (true, false) => {
                 let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-                lock_exclusive(&lock, &source, SOURCE_LOCK_FILE)?;
+                let _lock = lock_exclusive(lock, &source, SOURCE_LOCK_FILE)?;
                 let metadata = read_source_metadata_file(
                     &source.join(SOURCE_METADATA_FILE),
                     self.profile_id(),
@@ -198,7 +198,7 @@ impl SourceHistoryStore {
         }
 
         let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &source, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &source, SOURCE_LOCK_FILE)?;
         let metadata = read_source_metadata_file(
             &source.join(SOURCE_METADATA_FILE),
             self.profile_id(),
@@ -234,8 +234,8 @@ impl SourceHistoryStore {
         // the lock before the same-parent rename; config + writer fencing keeps
         // cooperative writers out, and a racing reader can only make rename
         // fail without deleting anything.
-        fs2::FileExt::unlock(&lock)?;
-        drop(lock);
+        fs2::FileExt::unlock(_lock.as_file())?;
+        drop(_lock);
         self.validate_private_path(&source)?;
         rename_purge_namespace(&source, &trash)?;
         sync_directory(&self.sources_directory())?;

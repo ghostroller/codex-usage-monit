@@ -1034,7 +1034,7 @@ impl SourceHistoryStore {
         let directory = self.source_directory(metadata.source_id());
         self.prepare_private_directory(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &directory, SOURCE_LOCK_FILE)?;
         let path = directory.join(SOURCE_METADATA_FILE);
 
         if let Some(existing) =
@@ -1073,7 +1073,7 @@ impl SourceHistoryStore {
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &directory, SOURCE_LOCK_FILE)?;
         source_purge::reject_source_metadata_update_during_purge(self, &directory, source_id)?;
         let path = directory.join(SOURCE_METADATA_FILE);
         let mut metadata = read_source_metadata_file(&path, &self.profile_id, source_id)?;
@@ -1105,7 +1105,7 @@ impl SourceHistoryStore {
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        lock_shared(&lock, &directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &directory, SOURCE_LOCK_FILE)?;
         read_source_metadata_file_with_budget(
             &directory.join(SOURCE_METADATA_FILE),
             &self.profile_id,
@@ -1129,7 +1129,7 @@ impl SourceHistoryStore {
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        lock_shared(&lock, &directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &directory, SOURCE_LOCK_FILE)?;
         let metadata = read_source_metadata_file(
             &directory.join(SOURCE_METADATA_FILE),
             &self.profile_id,
@@ -1247,8 +1247,8 @@ impl SourceHistoryStore {
         self.prepare_private_directory(&schedule_directory)?;
         let schedule_lock =
             open_lock_file(&schedule_directory, GARBAGE_COLLECTION_SCHEDULE_LOCK_FILE)?;
-        lock_exclusive(
-            &schedule_lock,
+        let _schedule_lock = lock_exclusive(
+            schedule_lock,
             &schedule_directory,
             GARBAGE_COLLECTION_SCHEDULE_LOCK_FILE,
         )?;
@@ -1289,7 +1289,8 @@ impl SourceHistoryStore {
         let profile_directory = self.profile_directory();
         self.prepare_private_directory(&profile_directory)?;
         let retention_lock = open_lock_file(&profile_directory, RETENTION_LOCK_FILE)?;
-        lock_exclusive(&retention_lock, &profile_directory, RETENTION_LOCK_FILE)?;
+        let _retention_lock =
+            lock_exclusive(retention_lock, &profile_directory, RETENTION_LOCK_FILE)?;
 
         let sources = self.list_source_metadata()?;
         let current = read_retention_clock(&profile_directory, &self.profile_id)?;
@@ -1399,7 +1400,7 @@ impl SourceHistoryStore {
         let directory = self.account_directory();
         self.prepare_private_directory(&directory)?;
         let lock = open_lock_file(&directory, ACCOUNT_LOCK_FILE)?;
-        lock_exclusive(&lock, &directory, ACCOUNT_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &directory, ACCOUNT_LOCK_FILE)?;
         cleanup_atomic_shard_temporary_files(self, &directory, AtomicShardFileKind::Json)?;
         let mut report = SourceHistoryWriteReport::default();
 
@@ -1456,7 +1457,7 @@ impl SourceHistoryStore {
         }
         self.prepare_private_directory(directory)?;
         let lock = open_lock_file(directory, BUCKETS_LOCK_FILE)?;
-        lock_exclusive(&lock, directory, BUCKETS_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, directory, BUCKETS_LOCK_FILE)?;
         cleanup_atomic_shard_temporary_files(self, directory, AtomicShardFileKind::Json)?;
         let mut report = SourceHistoryWriteReport::default();
 
@@ -1508,7 +1509,7 @@ impl SourceHistoryStore {
         let directory = self.source_weekly_directory(source_id, redaction_profile);
         self.prepare_private_directory(&directory)?;
         let lock = open_lock_file(&directory, WEEKLY_LOCK_FILE)?;
-        lock_exclusive(&lock, &directory, WEEKLY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &directory, WEEKLY_LOCK_FILE)?;
         cleanup_atomic_shard_temporary_files(self, &directory, AtomicShardFileKind::Json)?;
         let mut report = SourceHistoryWriteReport::default();
         for (day, records) in additions {
@@ -1560,7 +1561,7 @@ impl SourceHistoryStore {
             return Ok(AccountHistoryData::default());
         }
         let lock = open_lock_file(&directory, ACCOUNT_LOCK_FILE)?;
-        lock_shared(&lock, &directory, ACCOUNT_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &directory, ACCOUNT_LOCK_FILE)?;
         let mut points = Vec::new();
         let mut point_index = HashMap::new();
         for (day, path) in shard_entries_since(&directory, since)? {
@@ -1693,7 +1694,7 @@ impl SourceHistoryStore {
             return Ok(Vec::new());
         }
         let lock = open_lock_file(directory, BUCKETS_LOCK_FILE)?;
-        lock_shared(&lock, directory, BUCKETS_LOCK_FILE)?;
+        let _lock = lock_shared(lock, directory, BUCKETS_LOCK_FILE)?;
         let mut records = Vec::new();
         let mut record_index = HashMap::new();
         for (day, path) in shard_entries_since(directory, since)? {
@@ -1730,7 +1731,7 @@ impl SourceHistoryStore {
             return Ok(Vec::new());
         }
         let lock = open_lock_file(&directory, WEEKLY_LOCK_FILE)?;
-        lock_shared(&lock, &directory, WEEKLY_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &directory, WEEKLY_LOCK_FILE)?;
         let mut records = Vec::new();
         let mut record_index = HashMap::new();
         for (day, path) in shard_entries_since(&directory, since)? {
@@ -2885,7 +2886,7 @@ fn prune_account_shards(
         return Ok(0);
     }
     let lock = open_lock_file(directory, ACCOUNT_LOCK_FILE)?;
-    lock_exclusive(&lock, directory, ACCOUNT_LOCK_FILE)?;
+    let _lock = lock_exclusive(lock, directory, ACCOUNT_LOCK_FILE)?;
     cleanup_atomic_shard_temporary_files(store, directory, AtomicShardFileKind::Json)?;
     let mut pruned = 0;
     for (day, path) in shard_entries(store, directory)? {
@@ -2918,7 +2919,7 @@ fn prune_source_shards(
         return Ok(0);
     }
     let lock = open_lock_file(directory, BUCKETS_LOCK_FILE)?;
-    lock_exclusive(&lock, directory, BUCKETS_LOCK_FILE)?;
+    let _lock = lock_exclusive(lock, directory, BUCKETS_LOCK_FILE)?;
     cleanup_atomic_shard_temporary_files(store, directory, AtomicShardFileKind::Json)?;
     let mut pruned = 0;
     for (day, path) in shard_entries(store, directory)? {
@@ -2953,7 +2954,7 @@ fn prune_source_weekly_shards(
         return Ok(0);
     }
     let lock = open_lock_file(directory, WEEKLY_LOCK_FILE)?;
-    lock_exclusive(&lock, directory, WEEKLY_LOCK_FILE)?;
+    let _lock = lock_exclusive(lock, directory, WEEKLY_LOCK_FILE)?;
     cleanup_atomic_shard_temporary_files(store, directory, AtomicShardFileKind::Json)?;
     let mut pruned = 0;
     for (day, path) in shard_entries(store, directory)? {
@@ -3234,14 +3235,22 @@ fn open_lock_file(directory: &Path, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
-fn lock_exclusive(file: &File, directory: &Path, name: &str) -> io::Result<()> {
-    fs2::FileExt::lock_exclusive(file)?;
-    validate_locked_file(file, directory, name)
+fn lock_exclusive(
+    file: File,
+    directory: &Path,
+    name: &str,
+) -> io::Result<crate::file_lock::FileLock> {
+    fs2::FileExt::lock_exclusive(&file)?;
+    let lock = crate::file_lock::FileLock::from_locked(file);
+    validate_locked_file(&lock, directory, name)?;
+    Ok(lock)
 }
 
-fn lock_shared(file: &File, directory: &Path, name: &str) -> io::Result<()> {
-    fs2::FileExt::lock_shared(file)?;
-    validate_locked_file(file, directory, name)
+fn lock_shared(file: File, directory: &Path, name: &str) -> io::Result<crate::file_lock::FileLock> {
+    fs2::FileExt::lock_shared(&file)?;
+    let lock = crate::file_lock::FileLock::from_locked(file);
+    validate_locked_file(&lock, directory, name)?;
+    Ok(lock)
 }
 
 fn validate_locked_file(file: &File, directory: &Path, name: &str) -> io::Result<()> {
@@ -6298,7 +6307,7 @@ mod tests {
             let account_directory = store.account_directory();
 
             let holder = open_lock_file(&account_directory, ACCOUNT_LOCK_FILE).unwrap();
-            fs2::FileExt::lock_exclusive(&holder).unwrap();
+            let holder = lock_exclusive(holder, &account_directory, ACCOUNT_LOCK_FILE).unwrap();
 
             let (opened_sender, opened_receiver) = mpsc::channel();
             let waiter_directory = account_directory.clone();
@@ -6306,9 +6315,9 @@ mod tests {
                 let opened = open_lock_file(&waiter_directory, ACCOUNT_LOCK_FILE).unwrap();
                 opened_sender.send(()).unwrap();
                 if exclusive_waiter {
-                    lock_exclusive(&opened, &waiter_directory, ACCOUNT_LOCK_FILE)
+                    lock_exclusive(opened, &waiter_directory, ACCOUNT_LOCK_FILE)
                 } else {
-                    lock_shared(&opened, &waiter_directory, ACCOUNT_LOCK_FILE)
+                    lock_shared(opened, &waiter_directory, ACCOUNT_LOCK_FILE)
                 }
             });
             opened_receiver

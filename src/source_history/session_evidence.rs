@@ -1307,12 +1307,11 @@ impl SourceHistoryStore {
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
-    ) -> io::Result<std::fs::File> {
+    ) -> io::Result<crate::file_lock::FileLock> {
         let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
         self.prepare_private_directory(&staging_root)?;
         let lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        lock_exclusive(&lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
-        Ok(lock)
+        lock_exclusive(lock, &staging_root, FACT_STAGING_LOCK_FILE)
     }
 
     #[cfg(test)]
@@ -1373,7 +1372,7 @@ impl SourceHistoryStore {
         }
         self.prepare_private_directory(directory)?;
         let lock = open_lock_file(directory, DIGESTS_LOCK_FILE)?;
-        lock_exclusive(&lock, directory, DIGESTS_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, directory, DIGESTS_LOCK_FILE)?;
         cleanup_atomic_shard_temporary_files(self, directory, AtomicShardFileKind::GzipJson)?;
         let mut report = SourceHistoryWriteReport::default();
         for (day, additions) in additions {
@@ -1479,7 +1478,7 @@ impl SourceHistoryStore {
             return Ok(Vec::new());
         }
         let lock = open_lock_file(directory, DIGESTS_LOCK_FILE)?;
-        lock_shared(&lock, directory, DIGESTS_LOCK_FILE)?;
+        let _lock = lock_shared(lock, directory, DIGESTS_LOCK_FILE)?;
         let mut records = Vec::new();
         let mut record_index = HashMap::new();
         for (day, path) in evidence_shard_entries_since(self, directory, since)? {
@@ -1522,13 +1521,13 @@ impl SourceHistoryStore {
         let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
         self.prepare_private_directory(&staging_root)?;
         let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        lock_exclusive(&staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
+        let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
         ensure_fact_namespace_within_cap(self, source_id, redaction_profile)?;
         let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
         self.prepare_private_directory(&manifests)?;
         let lock_name = fact_lock_name(&shard_key);
         let lock = open_lock_file(&manifests, &lock_name)?;
-        lock_exclusive(&lock, &manifests, &lock_name)?;
+        let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
         let current = self.read_active_fact_manifest_unlocked(
             source_id,
             redaction_profile,
@@ -1660,7 +1659,7 @@ impl SourceHistoryStore {
         let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
         self.validate_private_path(&staging_root)?;
         let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        lock_exclusive(&staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
+        let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
         let staging = staging_root.join(batch_id.as_str());
         self.validate_private_path(&staging)?;
         let descriptor = read_staged_batch(
@@ -1676,7 +1675,7 @@ impl SourceHistoryStore {
         let lock_name = fact_lock_name(&descriptor.thread_shard_key);
         let current = {
             let lock = open_lock_file(&manifests, &lock_name)?;
-            lock_exclusive(&lock, &manifests, &lock_name)?;
+            let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
             self.read_active_fact_manifest_unlocked(
                 source_id,
                 redaction_profile,
@@ -1823,8 +1822,8 @@ impl SourceHistoryStore {
         let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
         self.validate_private_path(&staging_root)?;
         let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        try_lock_exclusive_for_fact_publication(
-            &staging_lock,
+        let _staging_lock = try_lock_exclusive_for_fact_publication(
+            staging_lock,
             &staging_root,
             FACT_STAGING_LOCK_FILE,
         )?;
@@ -1848,7 +1847,8 @@ impl SourceHistoryStore {
         self.prepare_private_directory(&manifests)?;
         let lock_name = fact_lock_name(&descriptor.thread_shard_key);
         let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-        try_lock_exclusive_for_fact_publication(&manifest_lock, &manifests, &lock_name)?;
+        let _manifest_lock =
+            try_lock_exclusive_for_fact_publication(manifest_lock, &manifests, &lock_name)?;
         let current = self.read_active_fact_manifest_unlocked(
             source_id,
             redaction_profile,
@@ -1958,12 +1958,13 @@ impl SourceHistoryStore {
             let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
             self.prepare_private_directory(&staging_root)?;
             let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-            lock_exclusive(&staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
+            let _staging_lock =
+                lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
             let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
             self.prepare_private_directory(&manifests)?;
             let lock_name = fact_lock_name(&descriptor.thread_shard_key);
             let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-            lock_exclusive(&manifest_lock, &manifests, &lock_name)?;
+            let _manifest_lock = lock_exclusive(manifest_lock, &manifests, &lock_name)?;
             let current = self.read_active_fact_manifest_unlocked(
                 source_id,
                 redaction_profile,
@@ -2023,7 +2024,7 @@ impl SourceHistoryStore {
         }
         let lock_name = fact_lock_name(&shard_key);
         let lock = open_lock_file(&manifests, &lock_name)?;
-        lock_shared(&lock, &manifests, &lock_name)?;
+        let _lock = lock_shared(lock, &manifests, &lock_name)?;
         let Some(manifest) = self.read_active_fact_manifest_unlocked_with_budget(
             source_id,
             redaction_profile,
@@ -3269,12 +3270,16 @@ fn ensure_fact_namespace_within_cap(
 }
 
 fn try_lock_exclusive_for_fact_publication(
-    file: &std::fs::File,
+    file: std::fs::File,
     directory: &Path,
     name: &str,
-) -> io::Result<()> {
-    match fs2::FileExt::try_lock_exclusive(file) {
-        Ok(()) => validate_locked_file(file, directory, name),
+) -> io::Result<crate::file_lock::FileLock> {
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let lock = crate::file_lock::FileLock::from_locked(file);
+            validate_locked_file(&lock, directory, name)?;
+            Ok(lock)
+        }
         Err(error) if lock_is_contended(&error) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "fact publication lock is busy; retry later",
@@ -3406,7 +3411,7 @@ pub(super) fn earliest_session_evidence_time(
             let digests = store.source_digests_directory(source.source_id(), redaction_profile);
             if store.private_directory_exists(&digests)? {
                 let lock = open_lock_file(&digests, DIGESTS_LOCK_FILE)?;
-                lock_shared(&lock, &digests, DIGESTS_LOCK_FILE)?;
+                let _lock = lock_shared(lock, &digests, DIGESTS_LOCK_FILE)?;
                 if let Some(day) = evidence_shard_entries_ignoring_lock(store, &digests)?
                     .into_iter()
                     .map(|(day, _)| day)
@@ -3475,7 +3480,7 @@ fn prune_digest_evidence(
         return Ok(0);
     }
     let lock = open_lock_file(&directory, DIGESTS_LOCK_FILE)?;
-    lock_exclusive(&lock, &directory, DIGESTS_LOCK_FILE)?;
+    let _lock = lock_exclusive(lock, &directory, DIGESTS_LOCK_FILE)?;
     remove_atomic_evidence_temporary_files(store, &directory)?;
     let cutoff = cutoff_day
         .and_hms_opt(0, 0, 0)
@@ -3531,7 +3536,7 @@ fn prune_active_fact_evidence(
     for (shard_key, _) in fact_manifest_entries(store, &manifests)? {
         let lock_name = fact_lock_name(&shard_key);
         let lock = open_lock_file(&manifests, &lock_name)?;
-        lock_exclusive(&lock, &manifests, &lock_name)?;
+        let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
         let path = fact_manifest_path(&manifests, &shard_key);
         let manifest: ActiveFactManifest = read_json_file(&path, MAX_FACT_MANIFEST_BYTES)?;
         validate_active_manifest(
@@ -3632,7 +3637,7 @@ fn garbage_collect_fact_artifacts(
     }
     store.prepare_private_directory(&staging_root)?;
     let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-    lock_exclusive(&staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
+    let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
     let staged_references = garbage_collect_fact_staging_unlocked(
         store,
         source_id,
@@ -3725,7 +3730,7 @@ fn garbage_collect_orphan_fact_generations_unlocked(
             .map_err(|error| invalid_data(error.to_string()))?;
         let lock_name = fact_lock_name(&shard_key);
         let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-        lock_exclusive(&manifest_lock, &manifests, &lock_name)?;
+        let _manifest_lock = lock_exclusive(manifest_lock, &manifests, &lock_name)?;
 
         let manifest_path = fact_manifest_path(&manifests, &shard_key);
         let active_generation = match read_optional_json_file::<ActiveFactManifest>(
@@ -4569,6 +4574,82 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_fact_publication_releases_inherited_lock(staging_lock: bool) {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let cursor = FactCursor::new(7, 10).unwrap();
+        let batch_id = FactBatchId::generate().unwrap();
+        let snapshot = batch(
+            batch_id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-inherited-lock",
+            None,
+            cursor,
+            at(8, 28, 2),
+            vec![
+                UsageEventFactRecord::upsert(
+                    1,
+                    fact("thread-inherited-lock", "event-1", at(8, 28, 1), 10),
+                )
+                .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &snapshot)
+            .unwrap();
+        let publication = store
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &batch_id,
+            )
+            .unwrap();
+        let (directory, name) = if staging_lock {
+            (
+                store.source_fact_staging_directory(&source_id(), RedactionProfile::Redacted),
+                FACT_STAGING_LOCK_FILE.to_owned(),
+            )
+        } else {
+            (
+                store.source_fact_manifests_directory(&source_id(), RedactionProfile::Redacted),
+                fact_lock_name(&publication.descriptor.thread_shard_key),
+            )
+        };
+
+        // Model a prevalidation descriptor inherited by a concurrent fork.
+        // Its duplicate must not prolong the original owner's lock lifetime.
+        let owner = open_lock_file(&directory, &name).unwrap();
+        let owner = lock_exclusive(owner, &directory, &name).unwrap();
+        let inherited = owner.try_clone().unwrap();
+        drop(owner);
+        let published = store.publish_prevalidated_fact_batch_unfenced(&publication);
+        drop(inherited);
+        assert!(published.unwrap().activated);
+        let active = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-inherited-lock"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.cursor, cursor);
+        assert_eq!(active.facts().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fact_publication_releases_inherited_staging_lock() {
+        assert_fact_publication_releases_inherited_lock(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fact_publication_releases_inherited_manifest_lock() {
+        assert_fact_publication_releases_inherited_lock(false);
     }
 
     #[test]

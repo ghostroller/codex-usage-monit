@@ -117,7 +117,7 @@ impl SourceHistoryStore {
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &source_directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &source_directory, SOURCE_LOCK_FILE)?;
         cleanup_retirement_marker_temporaries(self, &source_directory)?;
 
         let metadata_path = source_directory.join(SOURCE_METADATA_FILE);
@@ -157,7 +157,7 @@ impl SourceHistoryStore {
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &source_directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &source_directory, SOURCE_LOCK_FILE)?;
         cleanup_retirement_marker_temporaries(self, &source_directory)?;
         let metadata = read_source_metadata_file(
             &source_directory.join(SOURCE_METADATA_FILE),
@@ -182,7 +182,7 @@ impl SourceHistoryStore {
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &source_directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &source_directory, SOURCE_LOCK_FILE)?;
         ensure_retirement_marker_locked(self, source_id, &source_directory)
     }
 }

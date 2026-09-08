@@ -262,7 +262,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
             let lock_directory = store.source_directory(identity.node_id());
             store.prepare_private_directory(&lock_directory)?;
             let lock = open_lock_file(&lock_directory, STATE_LOCK)?;
-            lock_exclusive(&lock, &lock_directory, STATE_LOCK)?;
+            let _lock = lock_exclusive(lock, &lock_directory, STATE_LOCK)?;
             prepare_local_metadata(store, &identity, &display_label, redaction_profile)?;
             let state_directory =
                 local_state_directory(store, identity.node_id(), redaction_profile);
@@ -476,7 +476,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
             let lock_directory = store.source_directory(identity.node_id());
             store.prepare_private_directory(&lock_directory)?;
             let lock = open_lock_file(&lock_directory, STATE_LOCK)?;
-            lock_exclusive(&lock, &lock_directory, STATE_LOCK)?;
+            let _lock = lock_exclusive(lock, &lock_directory, STATE_LOCK)?;
             store.prepare_private_directory(&state_directory)?;
             cleanup_state_temps(store, &state_directory, STATE_FILE)?;
             raise_revision_floor(store, &state_directory, &identity, redaction_profile, floor)
@@ -494,7 +494,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 .join(self.redaction_profile().directory_name());
             store.prepare_private_directory(&directory)?;
             let lock = open_lock_file(&directory, MARKER_LOCK)?;
-            lock_exclusive(&lock, &directory, MARKER_LOCK)?;
+            let _lock = lock_exclusive(lock, &directory, MARKER_LOCK)?;
             cleanup_state_temps(store, &directory, MARKER_FILE)?;
             let path = directory.join(MARKER_FILE);
             let epoch = self.authority.expected_manifest().epoch();
@@ -556,7 +556,7 @@ impl SourceHistoryStore {
         }
         self.validate_private_path(&lock_directory)?;
         let state_lock = open_lock_file(&lock_directory, STATE_LOCK)?;
-        lock_shared(&state_lock, &lock_directory, STATE_LOCK)?;
+        let state_lock = lock_shared(state_lock, &lock_directory, STATE_LOCK)?;
         let directory = local_state_directory(self, identity.node_id(), redaction_profile);
         let revision = load_last_reserved_revision(self, &directory, identity, redaction_profile);
         drop(state_lock);
@@ -596,7 +596,7 @@ impl SourceHistoryStore {
         let lock_directory = self.source_directory(source_id);
         self.validate_private_path(&lock_directory)?;
         let state_lock = open_lock_file(&lock_directory, STATE_LOCK)?;
-        lock_shared(&state_lock, &lock_directory, STATE_LOCK)?;
+        let state_lock = lock_shared(state_lock, &lock_directory, STATE_LOCK)?;
 
         let state_directory = local_state_directory(self, source_id, redaction_profile);
         let pending_path = state_directory.join(JOURNAL_FILE);
@@ -696,7 +696,7 @@ impl SourceHistoryStore {
         }
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, MARKER_LOCK)?;
-        lock_shared(&lock, &directory, MARKER_LOCK)?;
+        let _lock = lock_shared(lock, &directory, MARKER_LOCK)?;
         let Some(marker) = read_optional_json_file::<BackfillMarker>(
             &directory.join(MARKER_FILE),
             MAX_STATE_BYTES,
@@ -1813,7 +1813,7 @@ mod tests {
 
             let lock_directory = history.source_directory(identity.node_id());
             let state_lock = open_lock_file(&lock_directory, STATE_LOCK).unwrap();
-            lock_exclusive(&state_lock, &lock_directory, STATE_LOCK).unwrap();
+            let state_lock = lock_exclusive(state_lock, &lock_directory, STATE_LOCK).unwrap();
 
             history
                 .record_source_bucket_changes_unfenced(
@@ -2309,7 +2309,7 @@ mod tests {
             let starts_at = at(30, 12, 0);
             let lock_directory = history.source_directory(identity.node_id());
             let state_lock = open_lock_file(&lock_directory, STATE_LOCK).unwrap();
-            lock_exclusive(&state_lock, &lock_directory, STATE_LOCK).unwrap();
+            let state_lock = lock_exclusive(state_lock, &lock_directory, STATE_LOCK).unwrap();
 
             let reader_store = history.clone();
             let reader_source = identity.node_id().clone();
@@ -2380,7 +2380,7 @@ mod tests {
             let (inspected_tx, inspected_rx) = mpsc::channel();
             let lock_holder = thread::spawn(move || {
                 let state_lock = open_lock_file(&lock_directory, STATE_LOCK).unwrap();
-                lock_exclusive(&state_lock, &lock_directory, STATE_LOCK).unwrap();
+                let state_lock = lock_exclusive(state_lock, &lock_directory, STATE_LOCK).unwrap();
                 locked_tx.send(()).unwrap();
                 inspected_rx
                     .recv_timeout(StdDuration::from_secs(1))

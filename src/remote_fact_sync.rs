@@ -2929,14 +2929,14 @@ mod tests {
             });
             let changed = changed_rx.recv_timeout(StdDuration::from_secs(1));
             if changed.is_err() {
-                let _ = fs2::FileExt::unlock(&staging_guard);
+                let _ = fs2::FileExt::unlock(staging_guard.as_file());
                 let _ = worker.join();
                 let _ = mutator.join();
                 panic!("{change} was blocked by real fact staging");
             }
             changed.unwrap().unwrap();
             mutator.join().unwrap();
-            fs2::FileExt::unlock(&staging_guard).unwrap();
+            fs2::FileExt::unlock(staging_guard.as_file()).unwrap();
 
             assert!(matches!(
                 worker.join().unwrap(),

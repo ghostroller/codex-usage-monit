@@ -236,7 +236,7 @@ impl SourceHistoryStore {
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        lock_exclusive(&lock, &directory, SOURCE_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &directory, SOURCE_LOCK_FILE)?;
         let metadata = super::read_source_metadata_file(
             &directory.join(super::SOURCE_METADATA_FILE),
             &self.profile_id,

@@ -494,7 +494,7 @@ impl SourceHistoryStore {
             return Ok(None);
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_shared(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         let Some(manifest) =
             self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
         else {
@@ -583,7 +583,7 @@ impl SourceHistoryStore {
                 return Ok(SourceHistoryRemoteSnapshot::default());
             }
             let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-            lock_shared(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+            let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
             let Some(manifest) =
                 self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
             else {
@@ -634,7 +634,7 @@ impl SourceHistoryStore {
             return operation(None);
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_shared(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         let manifest =
             self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
         let generation_directory = manifest
@@ -665,7 +665,7 @@ impl SourceHistoryStore {
         let root = self.source_remote_history_directory(source_id, redaction_profile);
         self.prepare_private_directory(&root)?;
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         validate_remote_generation_capacity_locked(
             self,
@@ -745,7 +745,7 @@ impl SourceHistoryStore {
             ));
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         let candidate_directory = self.source_remote_history_generation_directory(
             source_id,
@@ -837,7 +837,7 @@ impl SourceHistoryStore {
             ));
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         let active_manifest = self
             .read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
@@ -952,7 +952,7 @@ impl SourceHistoryStore {
             ));
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         let candidate_directory = self.source_remote_history_generation_directory(
             source_id,
@@ -1059,7 +1059,7 @@ impl SourceHistoryStore {
             ));
         }
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_shared(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         let manifest = self
             .read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
             .ok_or_else(|| {
@@ -1102,7 +1102,7 @@ impl SourceHistoryStore {
         }
 
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         validate_remote_gc_root_namespace(self, &root)?;
 
@@ -1212,7 +1212,7 @@ impl SourceHistoryStore {
         }
 
         let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        lock_exclusive(&lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
         cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
         let active_manifest =
             self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
@@ -2628,10 +2628,11 @@ fn clone_remote_generation_family(
         .to_str()
         .expect("remote family lock names are ASCII");
     let source_lock = open_lock_file(source_directory, source_lock_name)?;
-    lock_exclusive(&source_lock, source_directory, source_lock_name)?;
+    let _source_lock = lock_exclusive(source_lock, source_directory, source_lock_name)?;
     cleanup_atomic_shard_temporary_files(store, source_directory, family.atomic_shard_kind())?;
     let destination_lock = open_lock_file(destination_directory, source_lock_name)?;
-    lock_exclusive(&destination_lock, destination_directory, source_lock_name)?;
+    let _destination_lock =
+        lock_exclusive(destination_lock, destination_directory, source_lock_name)?;
     cleanup_atomic_shard_temporary_files(store, destination_directory, family.atomic_shard_kind())?;
 
     let source_entries = remote_clone_shard_entries(store, source_directory, family, true)?;
