@@ -60,7 +60,8 @@ def checkpoint_runs(repository, sha):
         # Keep the scope explicit even though the API query applies filters.
         if run.get("head_sha") != sha or run.get("event") != "workflow_dispatch":
             continue
-        if run.get("path") != ".github/workflows/ci.yml":
+        path = run.get("path")
+        if not isinstance(path, str) or path.partition("@")[0] != ".github/workflows/ci.yml":
             continue
         origin = run.get("repository")
         if not isinstance(origin, dict) or not isinstance(origin.get("full_name"), str):

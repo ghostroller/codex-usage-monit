@@ -150,6 +150,11 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("Reusing complete successful checkpoint", self.messages())
         self.assertIn("runs/123", self.messages())
 
+    def test_ref_qualified_path_does_not_hide_existing_ci(self):
+        for status, conclusion in [("completed", "success"), ("queued", None)]:
+            self.invoke(runs=[run(path=".github/workflows/ci.yml@main", status=status, conclusion=conclusion)])
+            self.assertEqual(self.dispatches(), [])
+
     def test_explicit_reason_can_recheck_success_and_is_recorded_literally(self):
         reason = "Updated external dependency advisory; $(touch bad) `echo bad`"
         self.invoke(["--rerun-reason", reason], runs=[run()])

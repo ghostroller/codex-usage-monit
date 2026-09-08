@@ -17,6 +17,11 @@ jobs:
     name: Validate release tag
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.evidence.outputs.reuse }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -30,16 +35,58 @@ jobs:
           test -n "$package_version"
           test "$GITHUB_REF_NAME" = "v$package_version"
 
+      - name: Look up complete verification for this commit
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: python3 scripts/release_verification.py --repo "$RELEASE_REPOSITORY" --sha "$RELEASE_SHA"
+
   verify:
     name: Verify release
     needs: validate-tag
+    if: needs.validate-tag.outputs.reuse == 'false'
     uses: ./.github/workflows/verify.yml
     with:
       expected_sha: ${{ github.sha }}
 
+  audit-reused-verification:
+    name: Refresh dependency audit
+    needs: validate-tag
+    if: needs.validate-tag.outputs.reuse == 'true'
+    uses: ./.github/workflows/dependency-audit.yml
+    with:
+      expected_sha: ${{ github.sha }}
+
+  verification-gate:
+    name: Require complete release verification
+    needs: [validate-tag, verify, audit-reused-verification]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Accept only a complete verification path
+        env:
+          TAG_RESULT: ${{ needs.validate-tag.result }}
+          REUSE: ${{ needs.validate-tag.outputs.reuse }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          AUDIT_RESULT: ${{ needs.audit-reused-verification.result }}
+        run: |
+          test "$TAG_RESULT" = success
+          if [ "$REUSE" = true ]; then
+            test "$VERIFY_RESULT" = skipped
+            test "$AUDIT_RESULT" = success
+          else
+            test "$REUSE" = false
+            test "$VERIFY_RESULT" = success
+            test "$AUDIT_RESULT" = skipped
+          fi
+
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs: verification-gate
+    if: ${{ always() && !cancelled() && needs.verification-gate.result == 'success' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -94,6 +141,15 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $binary "dist/codex-usage-monit-$env:TARGET.exe"
 
+      - name: Check the Unix release binary
+        if: runner.os != 'Windows'
+        run: python3 scripts/check-release-binary.py "target/$TARGET/release/codex-usage-monit"
+
+      - name: Check the Windows release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/check-release-binary.py "dist/codex-usage-monit-$env:TARGET.exe"
+
       - name: Upload packaged binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -107,6 +163,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build
+    if: ${{ always() && !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:

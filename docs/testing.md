@@ -49,6 +49,64 @@ usually need the full platform coverage. A Docker container does not by itself
 test a live systemd user service, and a Windows type-check on macOS does not test
 ConPTY or the Windows executable.
 
+## Spend tests where they provide new evidence
+
+Choose scope from the changed behavior, not the number of commits. In particular:
+
+| Change or failure | Useful next check | Full checkpoint |
+| --- | --- | --- |
+| Documentation only | Links and command examples | No Rust rebuild |
+| CI dispatch/reuse logic | Python contracts, actionlint, read-only lookup of existing runs | No hosted run just to test dispatch |
+| PowerShell invocation/exit handling | Local shell contracts in both 5.1 and 7, including the GitHub outer wrapper | Windows suite once after the batch settles |
+| Timing/process/lock behavior | Deterministic failing regression, then adjacent owners/callers | Relevant native platform suites once after all related fixes |
+| Broad product or dependency changes | Affected tests while editing | Local platform suites, then one hosted checkpoint |
+
+A successful full run stays useful for unchanged source. Do not repeat it after
+every documentation edit or intermediate commit. Record which tested files are
+unchanged and run checks affected by subsequent edits. Before the final hosted
+checkpoint, reconcile the evidence with the committed source. Never turn a
+focused pass into a claim of a new full-platform pass.
+
+After a hosted failure, read its exact job/step log and classify it before
+requesting more compute:
+
+1. **Product defect:** reproduce locally, add a regression that fails before the
+   fix, and inspect other users of the same mechanism. For inherited locks, audit
+   every lock owner/error path in the batch rather than fixing one CI symptom at
+   a time.
+2. **Fragile test:** replace millisecond sleeps with explicit expired deadlines,
+   readiness handshakes or controlled descriptors. Use bounded repeated runs of
+   the affected test only while a timing concern remains. Raising timeouts or
+   repeating the entire suite until green is not a diagnosis.
+3. **Runner/script mismatch:** reproduce the outer invocation, exit-code rules,
+   shell version and execution identity locally. The same inner script alone
+   does not establish equivalent execution. Record ARM64 versus x64 separately;
+   request x64 coverage when the change depends on that architecture.
+4. **Infrastructure failure with unchanged source:** repair/confirm the external
+   cause, then rerun the failed jobs of the exact run instead of dispatching all
+   platforms again. Check that it still targets the intended SHA:
+
+   ```sh
+   gh run view RUN_ID --json headSha,conclusion,jobs,url
+   gh run rerun RUN_ID --failed
+   gh run watch RUN_ID --exit-status
+   ```
+
+A rerun uses the original commit; it cannot validate a subsequent code fix.
+Group related fixes locally and request a new checkpoint for the new SHA only
+after the affected checks pass. Record the prior run, root cause, local
+reproduction, related-code audit and remaining coverage gap in `--local-results`.
+An unexplained second hosted failure in the same batch is a reason to return to
+local diagnosis, not to queue a third run automatically.
+
+The v0.4 review exposed a Git test that assumed fixed timing, a Windows wrapper
+that leaked a valid partial-result exit code, and inherited Unix locks that
+outlived their owners. The first two needed better test/runner coverage; the last
+needed a product fix and a family-wide lock audit. Linux/Windows architecture
+differences alone did not explain those failures. Tagging the already-green
+commit also repeated a whole verification matrix; the release policy below now
+avoids that duplicate work.
+
 ## Keep evidence tied to the source
 
 Record the commit, whether the source was dirty, the snapshot/archive identity,
@@ -81,7 +139,19 @@ python3 scripts/run-ci.py \
 ```
 
 The helper checks that the working tree is clean and that the remote branch head
-matches local `HEAD`. It does not push, create a tag, or retry a dispatch. For a
+matches local `HEAD`. It looks up existing manual CI for that exact commit before
+dispatching: an active run is monitored instead of duplicated, and a complete
+successful run is reused. A new full run after an existing result requires a
+specific `--rerun-reason`; this never overrides a run that is still active.
+Prefer `gh run rerun RUN_ID --failed` for an unchanged commit whose failure was
+external. A newer failed attempt must not be hidden by an older success.
+
+```sh
+python3 scripts/run-ci.py --dry-run --rerun-reason 'Specific unresolved concern' \
+  --local-results 'Prior run: ...; root cause: ...; local reproduction and fix: ...; remaining gap: ...'
+```
+
+The helper does not push, create a tag, or retry a dispatch. For a
 detached checkout, explicitly supply `--ref BRANCH`. `--repo OWNER/REPO` can
 override GitHub CLI's repository selection. The equivalent direct command is:
 
@@ -120,9 +190,29 @@ needs permission to run Actions. This document does not authorize publishing a
 release merely to validate workflow changes.
 
 The release workflow remains triggered by `v*.*.*` tags and verifies that the tag
-matches `Cargo.toml`. Its build depends on the shared verification workflow,
-including the audit; publication depends on every build. Do not bypass these
-dependencies or create test-only version tags.
+matches `Cargo.toml`. The release preflight can reuse the most recently updated
+manual `ci.yml` run for the **identical full commit SHA in this repository**.
+All four named jobs (Linux, macOS, Windows and audit), their SHA guards and their
+actual verification steps must have succeeded in the inspected run attempt
+within the last seven days. A green top-level run with skipped/missing checks,
+a fork/PR run, another SHA, or an old result is not sufficient.
+
+When that evidence is complete, the release runs a **fresh dependency audit**
+and reuses the platform tests. Without eligible evidence, it runs the complete
+shared verification workflow, including its audit. API errors and an active
+same-commit CI stop the cheap preflight; finish/inspect the existing run and retry
+the failed release job when ready, rather than launch a duplicate matrix.
+Preflight records the reused run URL and attempt in the Actions summary.
+
+Both paths meet at an explicit verification gate. Failure, cancellation or an
+unexpected skip blocks all builds. Every platform then builds and smoke-tests
+its actual release binary before uploading; publication depends on every build.
+Preserve this complete evidence/audit/build chain when editing workflows. Do not
+create test-only version tags or treat successful compilation as runtime proof.
+
+Settle version, code, scripts and documentation before requesting the final CI,
+then tag that exact green commit after release approval. A commit made after CI,
+even for a version bump, has a different SHA and cannot reuse the earlier result.
 
 The dependency audit remains weekly and manually callable, and is included in
 every hosted checkpoint/release. The weekly default-branch audit is the deliberate
@@ -140,3 +230,5 @@ workflows need a separate `merge_group`/ruleset design before enabling them.
 - [GitHub: manually running a workflow](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 - [GitHub CLI: workflow run and branch selection](https://cli.github.com/manual/gh_workflow_run)
 - [GitHub: troubleshooting required checks, including skipped jobs](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)
+- [GitHub: inspecting workflow runs](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow)
+- [GitHub: inspecting jobs of a specific run attempt](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)

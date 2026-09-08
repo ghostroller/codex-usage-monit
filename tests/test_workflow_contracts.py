@@ -168,16 +168,54 @@ class WorkflowContracts(unittest.TestCase):
         push = mapping_block(events, "push", 2)
         self.assertEqual(mapping_keys(push, 4), ["tags"])
         self.assertEqual(mapping_block(push, "tags", 4).strip(), '- "v*.*.*"')
-        for name, dependency in (("verify", "validate-tag"), ("build", "verify"), ("publish", "build")):
+        for name, dependency in (("build", "verification-gate"), ("publish", "build")):
             with self.subTest(job=name):
                 job = mapping_block(self.jobs("release"), name, 2)
                 self.assertEqual(scalar(job, "needs", 4), dependency)
-                self.assertNotIn("if", mapping_keys(job, 4))
+                self.assertEqual(scalar(job, "if", 4),
+                                 "${{ always() && !cancelled() && needs." + dependency + ".result == 'success' }}")
         verify = mapping_block(self.jobs("release"), "verify", 2)
+        self.assertEqual(scalar(verify, "needs", 4), "validate-tag")
+        self.assertEqual(scalar(verify, "if", 4), "needs.validate-tag.outputs.reuse == 'false'")
         self.assertEqual(scalar(verify, "uses", 4), "./.github/workflows/verify.yml")
         self.assertEqual(scalar(mapping_block(verify, "with", 4), "expected_sha", 6), "${{ github.sha }}")
         tag_check = mapping_block(self.jobs("release"), "validate-tag", 2)
         self.assertIn('test "$GITHUB_REF_NAME" = "v$package_version"', tag_check)
+        self.assertIn('python3 scripts/release_verification.py', tag_check)
+        self.assertEqual(scalar(mapping_block(tag_check, "permissions", 4), "actions", 6), "read")
+        audit = mapping_block(self.jobs("release"), "audit-reused-verification", 2)
+        self.assertEqual(scalar(audit, "needs", 4), "validate-tag")
+        self.assertEqual(scalar(audit, "if", 4), "needs.validate-tag.outputs.reuse == 'true'")
+        self.assertEqual(scalar(audit, "uses", 4), "./.github/workflows/dependency-audit.yml")
+        self.assertEqual(scalar(mapping_block(audit, "with", 4), "expected_sha", 6), "${{ github.sha }}")
+        gate = mapping_block(self.jobs("release"), "verification-gate", 2)
+        self.assertEqual(scalar(gate, "needs", 4), "[validate-tag, verify, audit-reused-verification]")
+        self.assertEqual(scalar(gate, "if", 4), "${{ always() && !cancelled() }}")
+        build = mapping_block(self.jobs("release"), "build", 2)
+        self.assertIn('python3 scripts/check-release-binary.py', build)
+        self.assertIn('python scripts/check-release-binary.py', build)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required to execute the release gate")
+    def test_release_gate_rejects_every_incomplete_dependency_combination(self):
+        gate = mapping_block(self.jobs("release"), "verification-gate", 2)
+        script = literal_run(job_steps(gate)[0])
+        # Execute the actual gate script for failed/skipped dependency results.
+        # The structural checks above separately require always() on downstream
+        # jobs so GitHub traverses the intentionally skipped verification branch.
+        outcomes = ["success", "failure", "cancelled", "skipped"]
+        for tag in outcomes:
+            for reuse in ["true", "false", ""]:
+                for verify in outcomes:
+                    for audit in outcomes:
+                        expected = tag == "success" and (
+                            (reuse == "true" and verify == "skipped" and audit == "success")
+                            or (reuse == "false" and verify == "success" and audit == "skipped"))
+                        environment = {**os.environ, "TAG_RESULT": tag, "REUSE": reuse,
+                                       "VERIFY_RESULT": verify, "AUDIT_RESULT": audit}
+                        result = subprocess.run([shutil.which("bash"), "-e", "-c", script],
+                                                env=environment, capture_output=True, timeout=5)
+                        self.assertEqual(result.returncode == 0, expected,
+                                         (tag, reuse, verify, audit))
 
     def test_user_inputs_are_not_interpolated_into_shell_scripts(self):
         linux = mapping_block(self.jobs("verify"), "verify", 2)
