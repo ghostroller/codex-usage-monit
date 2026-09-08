@@ -39,6 +39,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Native exit codes are checked explicitly below, including the snapshot's
+# usable-but-partial code 2 and retryable Visual Studio discovery failures.
+# Keep this preference local to this script so PowerShell 7 callers can opt in
+# to native-command errors without changing the verification contract.
+$PSNativeCommandUseErrorActionPreference = $false
 
 function Assert-NativeSuccess {
     param(
@@ -229,6 +234,7 @@ function Invoke-SmokeTest {
         "CODEX_USAGE_MONIT_CACHE_DIR"
     )
     $previousEnvironment = @{}
+    $snapshotText = $null
 
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
     try {
@@ -266,13 +272,30 @@ function Invoke-SmokeTest {
         if ([string]::IsNullOrWhiteSpace($snapshotText)) {
             throw "The Windows binary returned an empty snapshot."
         }
-        $parsedSnapshot = $snapshotText | ConvertFrom-Json
+        try {
+            $parsedSnapshot = $snapshotText | ConvertFrom-Json
+        }
+        catch {
+            throw "The Windows binary returned invalid snapshot JSON: $($_.Exception.Message)"
+        }
         if ($null -eq $parsedSnapshot) {
             throw "The Windows binary did not return a JSON snapshot."
         }
-        if ($null -eq $parsedSnapshot.PSObject.Properties["partial"] -or -not $parsedSnapshot.partial) {
+        if ($null -eq $parsedSnapshot.PSObject.Properties["partial"] -or
+            $parsedSnapshot.partial -isnot [bool] -or -not $parsedSnapshot.partial) {
             throw "The offline Windows smoke snapshot must be explicitly marked partial."
         }
+        if ($null -eq $parsedSnapshot.PSObject.Properties["tasks"] -or
+            $null -eq $parsedSnapshot.tasks -or @($parsedSnapshot.tasks).Count -eq 0) {
+            throw "The offline Windows smoke snapshot must contain fixture tasks."
+        }
+    }
+    catch {
+        if (-not [string]::IsNullOrWhiteSpace($snapshotText)) {
+            Write-Host ("Snapshot stdout (up to 4096 characters):`n" +
+                $snapshotText.Substring(0, [Math]::Min(4096, $snapshotText.Length)))
+        }
+        throw
     }
     finally {
         foreach ($name in $environmentNames) {
@@ -351,6 +374,11 @@ try {
     }
 
     if (-not $SkipTests) {
+        if (-not $SkipSmoke) {
+            Write-Host "==> Test Windows verification exit-code and diagnostic handling"
+            & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
+        }
+
         $testArguments = @("test", "--locked", "--all-targets")
         if ($Profile -eq "release") {
             $testArguments += "--release"
@@ -389,6 +417,12 @@ try {
         Invoke-SmokeTest $repositoryRoot $targetRoot $Profile $Target
     }
 }
+catch {
+    # Keep the exception visible even when a calling shell only reports its
+    # process exit code. Rethrow so the UTM supervisor also records failure.
+    Write-Host ("Windows verification failed:`n" + ($_ | Out-String))
+    throw
+}
 finally {
     Pop-Location
     if ($null -eq $originalCargoBuildDir) {
@@ -404,3 +438,9 @@ finally {
         Set-Item -Path "Env:CARGO_TARGET_DIR" -Value $originalCargoTargetDir
     }
 }
+
+# GitHub's PowerShell wrapper forwards LASTEXITCODE. A validated partial
+# snapshot leaves it at 2; publish success only after every check and cleanup
+# above has completed. Failures must continue to throw before reaching here.
+Write-Host "Windows verification passed, including all requested checks."
+exit 0

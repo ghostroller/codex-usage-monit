@@ -257,12 +257,33 @@ The pipeline performs the following checks in order:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --locked --all-targets -- -D warnings`
-3. `cargo test --locked --all-targets`
-4. A real `codex-usage-monit.exe` smoke test: `--version` plus a compact JSON
+3. Native exit-code and JSON-contract regressions through GitHub-style,
+   `-File`, and UTM-style PowerShell wrappers.
+4. `cargo test --locked --all-targets`
+5. A real `codex-usage-monit.exe` smoke test: `--version` plus a compact JSON
    snapshot using the checked-in offline fixture and isolated temporary state.
    The offline snapshot is intentionally marked `partial` and may return the
    CLI's usable-but-partial exit code (`2`); the script validates that JSON
-   contract instead of treating it as a failure.
+   contract, including nonempty fixture tasks, before returning success to
+   its caller.
+
+The UTM Guest Agent normally uses Windows PowerShell 5.1; hosted CI invokes
+PowerShell 7 (`pwsh`) through a `-Command` wrapper. When changing native-command
+or verification-script handling, record the PowerShell version and exercise
+both launch paths locally. An accepted native exit code such as `2` must be
+normalized after validation so it does not become the wrapper's failure status.
+Keep genuine command failures and invalid JSON visible and failing under both
+shells, including when `PSNativeCommandUseErrorActionPreference` is enabled.
+The full pipeline runs these shell regressions automatically. They can also be
+run from a Windows developer shell with Rust/MSVC available:
+
+```powershell
+& .\scripts\windows\tests\verify-smoke.ps1
+```
+
+For changes to PowerShell handling, run that command in both Windows PowerShell
+5.1 and PowerShell 7 and record each result. Focused Rust-only runs skip these
+shell cases along with the real CLI smoke stage.
 
 The consolidated Windows pipeline invokes the same `verify.ps1` script. This keeps
 local UTM validation and hosted x64 CI aligned. `tests/tui_pty.rs` uses ConPTY on
@@ -282,4 +303,5 @@ verification.
 - [Microsoft: Windows 11 Arm64 ISO overview](https://learn.microsoft.com/windows/arm/iso)
 - [Microsoft: Visual Studio Build Tools component IDs](https://learn.microsoft.com/visualstudio/install/workload-component-id-vs-build-tools)
 - [Rust: Windows MSVC platform support](https://doc.rust-lang.org/rustc/platform-support/windows-msvc.html)
-- [GitHub Actions: matrix workflow syntax](https://docs.github.com/actions/reference/workflows-and-actions/workflow-syntax)
+- [GitHub Actions: workflow syntax and shell exit-code handling](https://docs.github.com/actions/reference/workflows-and-actions/workflow-syntax)
+- [PowerShell: native-command error preferences](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_preference_variables#psnativecommanduseerroractionpreference)

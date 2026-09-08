@@ -35,9 +35,10 @@ still builds a release binary; a successful build is not a Linux test pass.
 
 The full Unix entry point runs format, Clippy, all Rust test targets, the PTY
 suite, the preview comparison, installer checks, pipeline contract tests and CLI
-smoke checks. The full Windows entry point runs format, Clippy, all Rust test
-targets including ConPTY, and CLI smoke checks. Local and hosted jobs call these
-same entry points. A filtered run is intentionally narrower and must be reported
+smoke checks. The full Windows entry point runs format, Clippy, native PowerShell
+exit-code/JSON regressions, all Rust test targets including ConPTY, and CLI smoke
+checks. Local and hosted jobs call these same entry points. A filtered run is
+intentionally narrower and must be reported
 as such. The manual real-user-history benchmark remains opt-in.
 
 For platform-sensitive changes, run the affected platform locally during
