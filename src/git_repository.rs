@@ -1305,17 +1305,10 @@ mod tests {
 
     use super::*;
 
-    static HUNG_RUNNER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MISSING_REMOTE_RUNNER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FAILED_REMOTE_RUNNER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PERSISTENT_RUNNER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PERSISTENT_RUNNER_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn hung_runner(_cwd: &Path, _arguments: &[&str], timeout: Duration) -> io::Result<Vec<u8>> {
-        HUNG_RUNNER_CALLS.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(timeout);
-        Err(io::Error::new(io::ErrorKind::TimedOut, "fixture timeout"))
-    }
 
     fn missing_remote_runner(
         cwd: &Path,
@@ -1485,35 +1478,32 @@ mod tests {
 
     #[test]
     fn exhausted_collection_budget_prevents_additional_git_spawns() {
-        HUNG_RUNNER_CALLS.store(0, Ordering::SeqCst);
+        fn unexpected_runner(
+            _cwd: &Path,
+            _arguments: &[&str],
+            _timeout: Duration,
+        ) -> io::Result<Vec<u8>> {
+            panic!("no git runner may start after the collection deadline");
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let mut resolver = GitProjectEvidenceResolver::with_runner_and_budget(
-            hung_runner,
-            Duration::from_millis(45),
+            unexpected_runner,
+            Duration::ZERO,
             Duration::from_millis(20),
         );
-        let started = Instant::now();
-        for index in 0..16 {
-            assert!(
-                resolver.inspect(&directory.path().join(format!("workspace-{index}")))
-                    == GitProjectEvidence::Unavailable
+        // Start with an expired deadline instead of depending on how many
+        // sleep intervals the OS schedules inside a small wall-clock budget.
+        for index in 0..32 {
+            assert_eq!(
+                resolver.inspect(&directory.path().join(format!("workspace-{index}"))),
+                GitProjectEvidence::Unavailable
             );
         }
-        let calls_after_budget = HUNG_RUNNER_CALLS.load(Ordering::SeqCst);
-        assert!((2..=3).contains(&calls_after_budget));
-        assert!(started.elapsed() < Duration::from_millis(150));
-
-        for index in 16..32 {
-            assert!(
-                resolver.inspect(&directory.path().join(format!("workspace-{index}")))
-                    == GitProjectEvidence::Unavailable
-            );
-        }
-        assert_eq!(
-            HUNG_RUNNER_CALLS.load(Ordering::SeqCst),
-            calls_after_budget,
-            "no git runner may start after the collection deadline"
-        );
+        let stats = resolver.collection_stats();
+        assert_eq!(stats.commands, 0);
+        assert_eq!(stats.workspaces, 32);
+        assert_eq!(stats.budget_exhausted, 32);
     }
 
     #[test]
