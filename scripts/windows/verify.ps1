@@ -28,6 +28,8 @@ param(
 
     [string]$TestFilter,
 
+    [switch]$ScriptContractsOnly,
+
     [switch]$SkipFormat,
 
     [switch]$SkipClippy,
@@ -314,6 +316,12 @@ if ($env:OS -ne "Windows_NT") {
     throw "This verification script must run on Windows."
 }
 
+if ($ScriptContractsOnly -and ($SkipFormat -or $SkipClippy -or $SkipTests -or $SkipSmoke -or
+    -not [string]::IsNullOrWhiteSpace($TestFilter) -or -not [string]::IsNullOrWhiteSpace($Target) -or
+    $Profile -ne "debug")) {
+    throw "ScriptContractsOnly cannot be combined with skip switches, TestFilter, Target, or release Profile."
+}
+
 if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo was not found. Run scripts\\windows\\bootstrap.ps1 first."
 }
@@ -361,11 +369,16 @@ try {
         Write-Host "Requested Rust target: $Target"
     }
 
-    if (-not $SkipFormat) {
+    if ($ScriptContractsOnly) {
+        Write-Host "==> Test only Windows verification exit-code and diagnostic handling"
+        & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
+    }
+
+    if (-not $ScriptContractsOnly -and -not $SkipFormat) {
         Invoke-Cargo "Check Rust formatting" @("fmt", "--all", "--", "--check")
     }
 
-    if (-not $SkipClippy) {
+    if (-not $ScriptContractsOnly -and -not $SkipClippy) {
         $clippyArguments = @("clippy", "--locked", "--all-targets", "--", "-D", "warnings")
         if (-not [string]::IsNullOrWhiteSpace($Target)) {
             $clippyArguments = @("clippy", "--locked", "--target", $Target, "--all-targets", "--", "-D", "warnings")
@@ -373,7 +386,7 @@ try {
         Invoke-Cargo "Run Clippy" $clippyArguments
     }
 
-    if (-not $SkipTests) {
+    if (-not $ScriptContractsOnly -and -not $SkipTests) {
         if (-not $SkipSmoke) {
             Write-Host "==> Test Windows verification exit-code and diagnostic handling"
             & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
@@ -395,7 +408,7 @@ try {
         Invoke-Cargo "Run Rust tests" $testArguments
     }
 
-    if (-not $SkipSmoke) {
+    if (-not $ScriptContractsOnly -and -not $SkipSmoke) {
         $buildArguments = @("build", "--locked", "--bin", "codex-usage-monit")
         if ($Profile -eq "release") {
             $buildArguments += "--release"
@@ -442,5 +455,10 @@ finally {
 # GitHub's PowerShell wrapper forwards LASTEXITCODE. A validated partial
 # snapshot leaves it at 2; publish success only after every check and cleanup
 # above has completed. Failures must continue to throw before reaching here.
-Write-Host "Windows verification passed, including all requested checks."
+if ($ScriptContractsOnly) {
+    Write-Host "Windows script contracts passed; project Rust tests, lint, build, and CLI smoke were not requested."
+}
+else {
+    Write-Host "Windows verification passed, including all requested checks."
+}
 exit 0

@@ -61,7 +61,7 @@ def source_archive(repository, destination):
     return hashlib.sha256(destination.read_bytes()).hexdigest()
 
 
-def parse_result(data, run_id, source_hash):
+def parse_result(data, run_id, source_hash, expected_scope=None):
     try:
         result = json.loads(data.decode("utf-8-sig"))
     except (UnicodeError, ValueError) as error:
@@ -73,6 +73,25 @@ def parse_result(data, run_id, source_hash):
         raise GuestError("Guest result does not match this run and source snapshot")
     if result.get("status") not in {"ready", "passed", "failed", "blocked", "timed_out", "cancelled"}:
         raise GuestError("Guest returned an unknown verification status")
+    if expected_scope is not None and result.get("scope") != expected_scope:
+        raise GuestError("Guest result does not match the requested verification scope")
+    if expected_scope is not None and ((result.get("status") == "ready" and expected_scope != "doctor")
+                                       or (result.get("status") == "passed" and expected_scope == "doctor")):
+        raise GuestError("Guest readiness and verification-pass statuses cannot substitute for each other")
+    if expected_scope == "shell-contracts" and result.get("status") == "passed":
+        engines = result.get("engines")
+        if not isinstance(engines, list) or len(engines) != 2:
+            raise GuestError("Passing shell contracts require both PowerShell engines")
+        expected = {"windows-powershell": "5.1.", "powershell-7": "7."}
+        for engine in engines:
+            if not isinstance(engine, dict):
+                raise GuestError("Guest returned invalid PowerShell engine evidence")
+            prefix = expected.pop(engine.get("engine"), None)
+            version = engine.get("version")
+            if (prefix is None or not isinstance(version, str) or not version.startswith(prefix)
+                    or engine.get("status") != "passed" or engine.get("casesPassed") != 60
+                    or not isinstance(engine.get("executable"), str) or not engine["executable"].strip()):
+                raise GuestError("Passing shell contracts require 60 cases on PowerShell 5.1 and 7")
     return result
 
 
@@ -104,6 +123,8 @@ def main(argv=None):
     parser.add_argument("--profile", choices=("debug", "release"), default="debug")
     parser.add_argument("--test-filter", default="")
     parser.add_argument("--focused", action="store_true", help="run filtered Rust tests only; requires --test-filter")
+    parser.add_argument("--shell-contracts", action="store_true", help="run only the 60 PowerShell wrapper contracts on each of Windows PowerShell 5.1 and PowerShell 7")
+    parser.add_argument("--pwsh-path", default="", help="existing guest PowerShell 7 executable; required with --shell-contracts")
     parser.add_argument("--timeout", type=int, default=1800, help="guest verification limit in seconds")
     parser.add_argument("--output-dir", type=Path, help="host results directory; defaults to a unique temporary directory")
     args = parser.parse_args(argv)
@@ -111,6 +132,12 @@ def main(argv=None):
         parser.error("--timeout must be between 1 and 7200 seconds")
     if args.focused and not args.test_filter:
         parser.error("--focused requires --test-filter")
+    if args.shell_contracts and (args.doctor or args.focused or args.test_filter or args.target or args.profile != "debug"):
+        parser.error("--shell-contracts cannot be combined with --doctor, --focused, --test-filter, --target, or --profile release")
+    if args.shell_contracts and not args.pwsh_path.strip():
+        parser.error("--shell-contracts requires --pwsh-path pointing to an existing guest PowerShell 7 executable")
+    if args.pwsh_path and not args.shell_contracts:
+        parser.error("--pwsh-path is only used with --shell-contracts")
     executable = shutil.which("utmctl")
     if not executable:
         raise GuestError("utmctl is unavailable. Install UTM and its command-line tool first.")
@@ -157,10 +184,13 @@ def run_guest(args, executable, run_id, run_dir):
     toolchain_match = re.search(r'^channel\s*=\s*"([^"\n]+)"', (REPOSITORY / "rust-toolchain.toml").read_text(), re.MULTILINE)
     if not toolchain_match:
         raise GuestError("Could not read the repository's pinned Rust toolchain")
+    scope = ("doctor" if args.doctor else "shell-contracts" if args.shell_contracts else
+             "rust-focused" if args.focused else "filtered" if args.test_filter else "full")
     config = dict(vm=args.vm, rustToolchain=toolchain_match.group(1), runId=run_id, mode="doctor" if args.doctor else "verify",
                   toolchainHome=args.toolchain_home, sourceRevision=revision, sourceDirty=source_dirty,
                   sourceArchiveSha256=source_hash, profile=args.profile, target=args.target,
-                  testFilter=args.test_filter, focused=args.focused, timeoutSeconds=args.timeout)
+                  testFilter=args.test_filter, focused=args.focused, scope=scope, pwshPath=args.pwsh_path,
+                  timeoutSeconds=args.timeout)
     config_bytes = json.dumps(config).encode()
     (run_dir / "request.json").write_bytes(config_bytes)
     guest_prefix = "C:\\Windows\\Temp\\codex-usage-monit-" + run_id
@@ -186,7 +216,7 @@ def run_guest(args, executable, run_id, run_dir):
             continue
         # Guest publication is atomic. A published malformed or mismatched
         # result is a hard verification failure, not a reason to wait again.
-        result = parse_result(data, run_id, source_hash)
+        result = parse_result(data, run_id, source_hash, scope)
         break
     else:
         raise GuestError(f"No verified guest result before deadline. {last_error} Artifacts: {run_dir}")

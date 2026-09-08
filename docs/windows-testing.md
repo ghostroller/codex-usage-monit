@@ -50,6 +50,44 @@ Windows MSVC target and `--profile release` for release-mode verification.
 it. The guest test deadline defaults to 1,800 seconds and can be set with
 `--timeout` (1–7,200 seconds).
 
+For PowerShell verification-script changes, run the existing 60 wrapper contracts
+under both Windows PowerShell 5.1 and an already installed PowerShell 7:
+
+```zsh
+python3 scripts/macos/test-windows-utm.py \
+  --toolchain-home 'C:\Users\user' \
+  --shell-contracts \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe'
+```
+
+Use the actual guest path to `pwsh.exe`; the runner does not install PowerShell or
+change the guest account. A missing or wrong-version engine is `blocked`, never
+a passing single-engine substitute. The ordinary `--doctor` probes Rust and the
+guest transport; it does not establish PowerShell 7 availability.
+
+The shared UTM guest retains portable PowerShell **7.6.5 ARM64** at the path
+above. It was extracted from the [official release archive](https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.zip),
+with SHA256 `20514a755d16428dc4355c85e0883c859531e71cc3e122670aa1fccdbf96ba7e`
+verified before and after transfer. Keep this directory as a reusable test tool;
+clean only the identified per-run and fixture temporary directories after saving
+their evidence. It does not change PATH and is not installed through MSI or a
+package manager. The runner does not download, update or delete this runtime.
+
+This mode prepares the same MSVC environment and compiles only the small native
+fixture used by `verify-smoke.ps1`. Each engine checks both native-error preferences
+through GitHub-style `-Command`, `-File`, and UTM wrappers: **60 cases per engine,
+120 total**. It skips project Cargo tests, format, Clippy, application builds and
+the real CLI smoke. It cannot be combined with focused/test-filter, target,
+release-profile or doctor options. Results explicitly record `scope: shell-contracts`
+and each engine's executable, actual version, architecture, status and case count,
+alongside the usual source identity and combined transcript. This is a script
+regression pass, not a full Windows or ConPTY pass.
+
+From an existing Windows developer shell, the corresponding single-engine entry
+is `& .\scripts\windows\verify.ps1 -ScriptContractsOnly`; invoke it separately
+under each engine when not using the host runner. The normal full pipeline and
+`--focused` behavior are unchanged.
+
 The host packages the current tracked and unignored untracked files, including
 working-tree changes and deletions, into a ZIP snapshot. It rejects symlinks and
 paths unsafe on Windows. Ignored state such as a host's `.cargo/config.toml`
