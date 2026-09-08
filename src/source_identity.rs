@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::atomic_file::replace_file;
+use crate::file_lock::FileLock;
 
 pub const SOURCE_IDENTITY_VERSION: u32 = 2;
 const LEGACY_SOURCE_IDENTITY_VERSION: u32 = 1;
@@ -852,15 +853,16 @@ fn open_lock_file(directory: &Path) -> io::Result<File> {
 }
 
 /// Opens and locks the stable lock-file inode, then verifies that the directory
-/// entry still names that inode. Keeping the returned file alive holds the
+/// entry still names that inode. Keeping the returned guard alive holds the
 /// process lock for the caller's complete read/modify/write operation.
-fn open_locked_lock_file(directory: &Path) -> io::Result<File> {
+fn open_locked_lock_file(directory: &Path) -> io::Result<FileLock> {
     let file = open_lock_file(directory)?;
     lock_opened_lock_file(directory, file)
 }
 
-fn lock_opened_lock_file(directory: &Path, file: File) -> io::Result<File> {
+fn lock_opened_lock_file(directory: &Path, file: File) -> io::Result<FileLock> {
     fs2::FileExt::lock_exclusive(&file)?;
+    let file = FileLock::from_locked(file);
 
     // A lock path replaced between open and lock acquisition would otherwise
     // let two processes lock different inodes. Re-check after the blocking
@@ -2399,6 +2401,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn identity_guard_releases_an_inherited_lock() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        create_private_directory(&directory).unwrap();
+        let file = open_lock_file(&directory).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let guard = lock_opened_lock_file(&directory, file).unwrap();
+        let contender = open_lock_file(&directory).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+
+        drop(guard);
+        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        drop(inherited);
+        acquired.expect("completed identity operations must release inherited locks");
+        drop(FileLock::from_locked(contender));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_inode_validation_errors_release_an_inherited_lock() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        create_private_directory(&directory).unwrap();
+        let file = open_lock_file(&directory).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let lock_path = directory.join(LOCK_FILE);
+        let displaced = directory.join("displaced-source-identity.lock");
+        fs::rename(&lock_path, &displaced).unwrap();
+        write_private_test_file(&lock_path, b"");
+
+        let error = lock_opened_lock_file(&directory, file).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed while"));
+
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(displaced)
+            .unwrap();
+        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        drop(inherited);
+        acquired.expect("identity validation errors must release inherited locks");
+        drop(FileLock::from_locked(contender));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn waiter_rejects_a_lock_inode_replaced_while_it_was_blocked() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -2410,6 +2459,7 @@ mod tests {
 
         let holder = open_lock_file(&state_directory).unwrap();
         fs2::FileExt::lock_exclusive(&holder).unwrap();
+        let holder = FileLock::from_locked(holder);
 
         let (opened_sender, opened_receiver) = mpsc::channel();
         let waiter_directory = state_directory.clone();

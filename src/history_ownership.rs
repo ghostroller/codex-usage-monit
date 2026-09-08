@@ -633,17 +633,9 @@ impl HistoryOwnershipStore {
         let identity = stable_file_identity(&file, "history writer lock")?;
 
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => {
-                validate_locked_file(
-                    &directory,
-                    WRITER_LOCK_FILE,
-                    &file,
-                    identity,
-                    "history writer lock",
-                )?;
-                self.finish_writer_lease_acquisition(&directory, path, file, identity, diagnostic)
-                    .map(TryWriterLease::Acquired)
-            }
+            Ok(()) => self
+                .finish_writer_lease_acquisition(&directory, path, file, identity, diagnostic)
+                .map(TryWriterLease::Acquired),
             Err(error) if lock_is_contended(&error) => {
                 // Returning Busy for a displaced inode would let a caller
                 // trust the wrong coordination domain, so revalidate even on
@@ -692,13 +684,6 @@ impl HistoryOwnershipStore {
         let file = open_stable_lock_file(&directory, WRITER_LOCK_FILE, "history writer lock")?;
         let identity = stable_file_identity(&file, "history writer lock")?;
         fs2::FileExt::lock_exclusive(&file)?;
-        validate_locked_file(
-            &directory,
-            WRITER_LOCK_FILE,
-            &file,
-            identity,
-            "history writer lock",
-        )?;
         self.finish_writer_lease_acquisition(&directory, path, file, identity, diagnostic)
     }
 
@@ -710,6 +695,21 @@ impl HistoryOwnershipStore {
         identity: StableFileIdentity,
         diagnostic: Option<&WriterLeaseDiagnostic>,
     ) -> io::Result<HistoryWriterLease> {
+        let lease = HistoryWriterLease {
+            file,
+            lock_path: path,
+            identity,
+            profile_id: self.profile_id.clone(),
+            redaction_profile: self.redaction_profile,
+            _not_sync: PhantomData,
+        };
+        validate_locked_file(
+            directory,
+            WRITER_LOCK_FILE,
+            &lease.file,
+            identity,
+            "history writer lock",
+        )?;
         // A corrupt, future, or mismatched manifest refuses ownership even
         // though the caller won the OS lock. Missing state is allowed only so
         // initialize_v1_active can publish it.
@@ -722,18 +722,11 @@ impl HistoryOwnershipStore {
         validate_locked_file(
             directory,
             WRITER_LOCK_FILE,
-            &file,
+            &lease.file,
             identity,
             "history writer lock",
         )?;
-        Ok(HistoryWriterLease {
-            file,
-            lock_path: path,
-            identity,
-            profile_id: self.profile_id.clone(),
-            redaction_profile: self.redaction_profile,
-            _not_sync: PhantomData,
-        })
+        Ok(lease)
     }
 
     /// Revalidates that this guard still names the store's stable writer-lock
@@ -908,14 +901,15 @@ impl HistoryOwnershipStore {
             open_stable_lock_file(&directory, TRANSITION_LOCK_FILE, "history transition lock")?;
         let identity = stable_file_identity(&file, "history transition lock")?;
         fs2::FileExt::lock_exclusive(&file)?;
+        let lock = LockedFile { file };
         validate_locked_file(
             &directory,
             TRANSITION_LOCK_FILE,
-            &file,
+            &lock.file,
             identity,
             "history transition lock",
         )?;
-        Ok(LockedFile { file })
+        Ok(lock)
     }
 
     fn prepare_namespace_directory(&self) -> io::Result<PathBuf> {
@@ -1840,6 +1834,34 @@ mod tests {
             store.try_acquire_writer_lease().unwrap(),
             TryWriterLease::Acquired(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_writer_lease_initialization_releases_an_inherited_lock() {
+        let temp = tempdir().unwrap();
+        let store = store(temp.path());
+        let lease = acquire(&store);
+        initialize(&store, &lease);
+        drop(lease);
+        fs::remove_file(store.manifest_path()).unwrap();
+
+        let directory = store.ownership_directory();
+        let path = directory.join(WRITER_LOCK_FILE);
+        let file = open_stable_lock_file(&directory, WRITER_LOCK_FILE, "test writer lock").unwrap();
+        let identity = stable_file_identity(&file, "test writer lock").unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let result = store.finish_writer_lease_acquisition(&directory, path, file, identity, None);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(!store.manifest_path().exists());
+
+        let contender =
+            open_stable_lock_file(&directory, WRITER_LOCK_FILE, "test writer lock").unwrap();
+        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        drop(inherited);
+        acquired.expect("failed writer initialization must release its inherited lock");
+        drop(crate::file_lock::FileLock::from_locked(contender));
     }
 
     #[test]

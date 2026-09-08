@@ -21,6 +21,7 @@ use crate::domain::{
     AgentInteraction, AgentInteractionKind, ApiCostAmount, LimitBucket, Provenance, TaskRecord,
     TokenUsage, TurnRecord, UsageCall,
 };
+use crate::file_lock::FileLock;
 use crate::history_ownership::HistoryWriteAuthority;
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
@@ -1150,6 +1151,7 @@ impl HistoryStore {
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        let _lock = FileLock::from_locked(lock);
         self.validate_v1_authority_if_present(authority)?;
 
         if !self.namespace_checked {
@@ -1407,6 +1409,7 @@ impl HistoryStore {
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        let _lock = FileLock::from_locked(lock);
         self.validate_v1_authority_if_present(authority)?;
 
         let requested = SummaryBackfillMarker::current(completed_at, complete);
@@ -1599,6 +1602,7 @@ impl HistoryStore {
             ));
             return data;
         }
+        let _lock = FileLock::from_locked(lock);
 
         let data = self.load_since_locked(&directory, since);
         self.cached_since = Some(since);
@@ -1628,6 +1632,7 @@ impl HistoryStore {
         create_private_directory(&directory)?;
         let lock = open_lock_file(&directory)?;
         fs2::FileExt::lock_exclusive(&lock)?;
+        let _lock = FileLock::from_locked(lock);
         let data = self.load_since_locked(&directory, since);
         consume(&data)
     }

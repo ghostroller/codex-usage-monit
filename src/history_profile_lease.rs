@@ -206,9 +206,19 @@ pub fn try_acquire_history_profile_lease(
 
     match fs2::FileExt::try_lock_shared(&file) {
         Ok(()) => {
-            validate_opened_lock(&directory, &file, identity)?;
-            let initialization = read_lock_initialization(&file, &profile_id)?;
-            let active = read_active_profile(&directory, &profile_id)?;
+            let observed = (|| {
+                validate_opened_lock(&directory, &file, identity)?;
+                let initialization = read_lock_initialization(&file, &profile_id)?;
+                let active = read_active_profile(&directory, &profile_id)?;
+                Ok((initialization, active))
+            })();
+            let (initialization, active) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    let _ = fs2::FileExt::unlock(&file);
+                    return Err(error);
+                }
+            };
             match (initialization, active) {
                 (LockInitialization::Initialized, Some(active))
                     if active.redaction_profile == redaction_profile =>
@@ -381,7 +391,10 @@ fn try_switch_profile(
     })();
     match shared_result {
         Ok(None) => {
-            transition.finish_with_shared(redaction_profile)?;
+            if let Err(error) = transition.finish_with_shared(redaction_profile) {
+                let _ = fs2::FileExt::unlock(&file);
+                return Err(error);
+            }
             Ok(TryHistoryProfileLease::Acquired(HistoryProfileLeaseGuard {
                 state_root,
                 lock_path: directory.join(PROFILE_LOCK_FILE),
@@ -426,10 +439,13 @@ fn finish_shared_acquisition(
             fs2::FileExt::unlock(&file)?;
             return Ok(TryHistoryProfileLease::Busy { active_profile });
         }
-        let next_count = state
-            .shared_count
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("process-local history profile lease count overflowed"))?;
+        let Some(next_count) = state.shared_count.checked_add(1) else {
+            drop(leases);
+            let _ = fs2::FileExt::unlock(&file);
+            return Err(invalid_data(
+                "process-local history profile lease count overflowed",
+            ));
+        };
         state.shared_profile = Some(redaction_profile);
         state.shared_count = next_count;
     }

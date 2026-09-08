@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::atomic_file::replace_file;
+use crate::file_lock::FileLock;
 use crate::history::{HISTORY_RETENTION_DAYS, HistoryData, HistoryStore};
 use crate::history_ownership::{
     HistoryOwnershipManifest, HistoryOwnershipState, HistoryOwnershipStore, HistoryWriterLease,
@@ -471,7 +472,7 @@ pub fn migrate_local_v1_history(
     let imports_directory = imports_directory(target);
     target.prepare_private_directory(&imports_directory)?;
     let lock = open_lock_file(&imports_directory)?;
-    lock_exclusive(&lock, &imports_directory)?;
+    let _lock = lock_exclusive(lock, &imports_directory)?;
     let state_path = migration_state_path(target, options.redaction_profile);
 
     let mut state = match read_optional_state(&state_path)? {
@@ -720,7 +721,7 @@ pub fn inspect_local_v1_migration_recovery(
         Ok(_) => {
             target.validate_private_path(&imports)?;
             let lock = open_lock_file(&imports)?;
-            lock_shared(&lock, &imports)?;
+            let _lock = lock_shared(lock, &imports)?;
             match read_optional_state(&state_path)? {
                 Some(state) => {
                     state.validate_binding(target, options, &v1_namespace)?;
@@ -780,7 +781,7 @@ pub fn verify_local_v1_migration_for_activation(
     let imports = imports_directory(target);
     target.validate_private_path(&imports)?;
     let lock = open_existing_lock_file(&imports)?;
-    lock_exclusive(&lock, &imports)?;
+    let _lock = lock_exclusive(lock, &imports)?;
     let state = read_state(&migration_state_path(target, options.redaction_profile))?;
     state.validate_binding(target, options, &v1_namespace)?;
     verify_complete_state_with_legacy(
@@ -820,7 +821,7 @@ pub fn activate_local_v2_history(
     let imports = imports_directory(target);
     target.validate_private_path(&imports)?;
     let lock = open_existing_lock_file(&imports)?;
-    lock_exclusive(&lock, &imports)?;
+    let _lock = lock_exclusive(lock, &imports)?;
     let state = read_state(&migration_state_path(target, options.redaction_profile))?;
     state.validate_binding(target, options, &v1_namespace)?;
     let write_authority = ownership.authorize_v2_write(writer_lease, expected_ownership)?;
@@ -1003,7 +1004,7 @@ pub fn load_migrated_local_history_since(
     let imports_directory = imports_directory(target);
     target.validate_private_path(&imports_directory)?;
     let lock = open_existing_lock_file(&imports_directory)?;
-    lock_shared(&lock, &imports_directory)?;
+    let _lock = lock_shared(lock, &imports_directory)?;
     let state = read_state(&migration_state_path(target, redaction_profile))?;
     state.validate_query_binding(
         target,
@@ -1660,14 +1661,18 @@ fn open_lock_file_with_create(directory: &Path, create: bool) -> io::Result<File
     Ok(file)
 }
 
-fn lock_exclusive(file: &File, directory: &Path) -> io::Result<()> {
-    fs2::FileExt::lock_exclusive(file)?;
-    validate_locked_file(file, directory)
+fn lock_exclusive(file: File, directory: &Path) -> io::Result<FileLock> {
+    fs2::FileExt::lock_exclusive(&file)?;
+    let lock = FileLock::from_locked(file);
+    validate_locked_file(lock.as_file(), directory)?;
+    Ok(lock)
 }
 
-fn lock_shared(file: &File, directory: &Path) -> io::Result<()> {
-    fs2::FileExt::lock_shared(file)?;
-    validate_locked_file(file, directory)
+fn lock_shared(file: File, directory: &Path) -> io::Result<FileLock> {
+    fs2::FileExt::lock_shared(&file)?;
+    let lock = FileLock::from_locked(file);
+    validate_locked_file(lock.as_file(), directory)?;
+    Ok(lock)
 }
 
 fn validate_locked_file(file: &File, directory: &Path) -> io::Result<()> {
@@ -1937,6 +1942,64 @@ mod tests {
     use crate::source_identity::SourceIdentityStore;
 
     const MIGRATION_EPOCH: u64 = 2;
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_guards_release_inherited_shared_and_exclusive_locks() {
+        for shared in [false, true] {
+            let temporary = tempdir().unwrap();
+            let directory = temporary.path().join("private");
+            create_private_directory(&directory).unwrap();
+            let file = open_lock_file(&directory).unwrap();
+            let inherited = file.try_clone().unwrap();
+            let guard = if shared {
+                lock_shared(file, &directory).unwrap()
+            } else {
+                lock_exclusive(file, &directory).unwrap()
+            };
+            let contender = open_lock_file(&directory).unwrap();
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+
+            drop(guard);
+            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            drop(inherited);
+            acquired.expect("completed migration operations must release inherited locks");
+            drop(FileLock::from_locked(contender));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_inode_validation_errors_release_inherited_locks() {
+        for shared in [false, true] {
+            let temporary = tempdir().unwrap();
+            let directory = temporary.path().join("private");
+            create_private_directory(&directory).unwrap();
+            let file = open_lock_file(&directory).unwrap();
+            let inherited = file.try_clone().unwrap();
+            let displaced = directory.join("displaced-migration.lock");
+            fs::rename(directory.join(MIGRATION_LOCK_FILE), &displaced).unwrap();
+            drop(open_lock_file(&directory).unwrap());
+
+            let error = if shared {
+                lock_shared(file, &directory).unwrap_err()
+            } else {
+                lock_exclusive(file, &directory).unwrap_err()
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("changed while"));
+
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(displaced)
+                .unwrap();
+            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            drop(inherited);
+            acquired.expect("migration validation errors must release inherited locks");
+            drop(FileLock::from_locked(contender));
+        }
+    }
 
     fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, day, hour, minute, 0)
