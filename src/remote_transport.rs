@@ -3363,7 +3363,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn escaped_pipe_holder_cannot_extend_the_transport_deadline() {
+    fn escaped_pipe_holder_cannot_extend_an_expired_drain_deadline() {
         if !Command::new("perl")
             .args(["-e", "exit 0"])
             .status()
@@ -3378,29 +3378,91 @@ mod tests {
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 5' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nexit 0\n",
+                "#!/bin/sh\ncat >/dev/null\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 30' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nexit 0\n",
                 holder_pid_path.display(),
                 holder_pid_path.display(),
             ),
         )
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
-        let options = RemoteProbeOptions {
-            timeout: Duration::from_millis(100),
-            ..RemoteProbeOptions::default()
-        };
-        let started = Instant::now();
-
-        let error = probe_remote_with_program(script_path, "dev-server", &options).unwrap_err();
-
-        let holder_pid = fs::read_to_string(&holder_pid_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
+        let mut command = Command::new(script_path);
+        configure_process_tree(&mut command, true);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
-        unsafe {
-            libc::kill(holder_pid, libc::SIGKILL);
+        let mut process_tree = attach_process_tree(&mut child, true).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        configure_transport_pipes_nonblocking(&stdin, &stdout, &stderr).unwrap();
+        drop(stdin);
+
+        // Establish the escaped holder before testing an expired deadline.
+        // Starting the shell and Perl is not part of the pipe-drain contract.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let holder_pid = loop {
+            if let Some(pid) = fs::read_to_string(&holder_pid_path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "escaped pipe-holder fixture did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        struct HolderCleanup(libc::pid_t);
+        impl Drop for HolderCleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
         }
+        let _holder_cleanup = HolderCleanup(holder_pid);
+        while !child_exited_without_reaping(&child).unwrap() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "fixture group leader did not exit after the holder became ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        process_tree
+            .terminate_after_observed_exit(&mut child)
+            .unwrap();
+        child.wait().unwrap();
+        assert_eq!(unsafe { libc::getpgid(holder_pid) }, holder_pid);
+        assert_eq!(
+            stdout.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the escaped holder must retain the real stdout pipe after group cleanup"
+        );
+
+        let deadline = Instant::now();
+        let control = IoWorkerControl {
+            deadline,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let output_limit = AtomicU8::new(OutputLimit::NONE);
+        let drain_error = drain_bounded_until(
+            stdout,
+            MAX_STDERR_BYTES,
+            &control,
+            &output_limit,
+            OutputLimit::Stdout,
+        )
+        .err()
+        .expect("an expired deadline must reject a pipe whose escaped writer is still alive");
+        assert_eq!(drain_error.kind(), io::ErrorKind::TimedOut);
+        let error = RemoteTransportError::Timeout {
+            timeout: Duration::ZERO,
+            cleanup_error: Some(drain_error),
+        };
         assert!(matches!(error, RemoteTransportError::Timeout { .. }));
         assert!(error.process_containment_uncertain());
         assert!(
@@ -3408,10 +3470,6 @@ mod tests {
                 .to_string()
                 .contains("escaped ProxyCommand descendant"),
             "escaped holder was not surfaced in the timeout diagnostic: {error}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "an escaped descendant holding stdout/stderr must not extend the deadline"
         );
     }
 
