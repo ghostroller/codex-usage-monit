@@ -450,6 +450,12 @@ fn validate_decoded_record(
         .map_err(|error| invalid_data(format!("invalid remote delta journal record: {error}")))
 }
 
+pub(crate) fn validated_journal_record(
+    change: &RemoteExportChange,
+) -> io::Result<RemoteDeltaJournalRecord> {
+    Ok(decode_remote_delta_journal_change(change)?.record)
+}
+
 fn decode_remote_delta_journal_entry(
     entry: &RemoteExportJournalEntry,
 ) -> io::Result<RemoteDeltaJournalRecordV1> {
@@ -956,6 +962,7 @@ mod tests {
 
     fn tokens() -> RemoteTokenUsage {
         RemoteTokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 100,
             cached_input_tokens: 20,
             cache_write_input_tokens: 5,

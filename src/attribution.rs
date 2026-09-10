@@ -525,18 +525,11 @@ pub(crate) fn estimate_call_weight(call: &UsageCall) -> EstimatedUsageWeight {
     let base_rates = published_rates.unwrap_or_else(|| fallback_credit_rates(call.is_fast()));
 
     let tokens = call.tokens;
-    let used_token_breakdown_fallback =
-        tokens.total_tokens > 0 && tokens.input_tokens == 0 && tokens.output_tokens == 0;
-    let (input_tokens, cached_input_tokens, output_tokens) = if used_token_breakdown_fallback {
-        (tokens.total_tokens, 0, 0)
-    } else {
-        let cached_input_tokens = tokens.cached_input_tokens.min(tokens.input_tokens);
-        (
-            tokens.input_tokens - cached_input_tokens,
-            cached_input_tokens,
-            tokens.output_tokens,
-        )
-    };
+    let used_token_breakdown_fallback = tokens.unclassified() > 0;
+    let cached_input_tokens = tokens.cached_input_tokens.min(tokens.input_tokens);
+    let input_tokens =
+        (tokens.input_tokens - cached_input_tokens).saturating_add(tokens.unclassified());
+    let output_tokens = tokens.output_tokens;
 
     // The surcharge is decided per model request, never from a turn/thread
     // aggregate. A missing request sample is still provably short when its
@@ -664,6 +657,7 @@ mod tests {
     #[test]
     fn published_codex_credit_rate_matrix_uses_each_model_and_tier() {
         let tokens = TokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 13,
             cached_input_tokens: 3,
             cache_write_input_tokens: 0,

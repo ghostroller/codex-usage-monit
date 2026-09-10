@@ -134,6 +134,11 @@ pauses can also permit infrequent bounded automatic readiness probes. The ledger
 is a conservative admission estimate, not an OS network-byte counter.
 
 An unreachable remote does not erase retained history or stop local collection.
+An incomplete rollout scan can publish new lower-bound aggregates and monotonic
+updates to already-partial keys. It cannot replace a more complete key, lower
+any retained metric/group, or delete an omitted key. Exact session-fact export
+still requires a complete scan, so aggregate completion is not proof of complete
+usage coverage or replica reconciliation.
 For `facts=attention`, inspect Other and retry after addressing its category;
 already committed aggregate pages remain usable. A process-cleanup pause stops
 automatic connections for that exact host across restarts. A successful explicit
@@ -149,6 +154,33 @@ If identity changes, verify the intended remote, then explicitly unpair and pair
 again. Do not copy another machine's monitor state directory as an installation
 method: the persistent identity belongs to that source. A version/catalog
 mismatch needs compatible installations, not repeated sync attempts.
+
+## Rebuilding incompatible derived data
+
+The current implementation uses remote protocol v4, history metric revision 5,
+and parser cache revision 14. Protocol v4 carries an explicit
+`unclassifiedTokens` component: input + output + unclassified must equal total.
+Both endpoints must use this implementation before synchronizing.
+
+When discarding incompatible development aggregates is acceptable, stop the
+recorder and other monitor writers on both endpoints, back up their state and
+installed executables, and move the affected derived source history, remote
+ingest cursors, exporter journals/facts and parser caches outside the active
+state roots. Clear the affected summary-backfill marker as well. Do not copy
+old cursors or remote live projections into the rebuilt store.
+
+Preserve raw Codex rollout logs, monitor source identity/anchor, remote pairing
+and automatic-sync settings, project mappings, and account quota observations.
+Quota samples and usage whose raw logs are no longer retained cannot be
+reconstructed by rescanning. Do not erase the entire state directory as a cache.
+
+Install matching binaries, restart/reinstall the recorder with its existing
+profile and collection options, and run a local `summary --range 30d` to trigger
+the bounded backfill. Test the paired remote, then perform manual sync rounds
+until the aggregate bootstrap completes. Keep the existing content-redaction
+policy consistent throughout; rebuilding must not silently enable previews or
+automatic synchronization. Retain the backup until both local and remote
+queries have been checked.
 
 ## Upgrading from v0.3
 

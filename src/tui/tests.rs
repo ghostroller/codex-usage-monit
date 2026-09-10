@@ -1935,6 +1935,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                 duration_ms: Some(2_000),
                 status: TurnStatus::Completed,
                 token_usage: TokenUsage {
+                    unclassified_tokens: 0,
                     input_tokens: token_base / 2,
                     cached_input_tokens: token_base / 5,
                     cache_write_input_tokens: 0,
@@ -1943,6 +1944,7 @@ fn interaction_test_app(task_count: usize, turns_per_task: usize) -> App {
                     total_tokens: token_base,
                 },
                 window_token_usage: TokenUsage {
+                    unclassified_tokens: 0,
                     input_tokens: token_base / 4,
                     cached_input_tokens: token_base / 10,
                     cache_write_input_tokens: 0,
@@ -5743,6 +5745,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
     set_task_parent(&mut app, 1, 0);
     let totals = [
         TokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 11,
             cached_input_tokens: 2,
             cache_write_input_tokens: 0,
@@ -5751,6 +5754,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             total_tokens: 20,
         },
         TokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 13,
             cached_input_tokens: 3,
             cache_write_input_tokens: 0,
@@ -5759,6 +5763,7 @@ fn collapsed_tree_rows_aggregate_the_hidden_subtree_for_each_scope() {
             total_tokens: 30,
         },
         TokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 4,
             cached_input_tokens: 1,
             cache_write_input_tokens: 0,

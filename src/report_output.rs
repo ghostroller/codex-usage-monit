@@ -571,8 +571,13 @@ fn format_summary_metrics(metrics: SummaryReportMetrics) -> String {
 }
 
 fn format_token_usage(usage: TokenUsage) -> String {
+    let unknown = if usage.unclassified() > 0 {
+        format!(", unclassified {}", format_exact_u64(usage.unclassified()))
+    } else {
+        String::new()
+    };
     format!(
-        "{} (input {}, cached {}, cache-write {}, output {}, reasoning {})",
+        "{} (input {}, cached {}, cache-write {}, output {}, reasoning {}{unknown})",
         format_exact_u64(usage.total_tokens),
         format_exact_u64(usage.input_tokens),
         format_exact_u64(usage.cached_input_tokens),

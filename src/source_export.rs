@@ -117,6 +117,7 @@ pub struct LocalSessionDigestEvidence {
     observed_at: DateTime<Utc>,
     scan_complete: bool,
     digests: Vec<RemoteSessionDigest>,
+    failed_sessions: Vec<String>,
 }
 
 impl LocalSessionDigestEvidence {
@@ -125,6 +126,7 @@ impl LocalSessionDigestEvidence {
             observed_at,
             scan_complete: false,
             digests: Vec::new(),
+            failed_sessions: Vec::new(),
         }
     }
 
@@ -139,6 +141,10 @@ impl LocalSessionDigestEvidence {
     pub fn digest_count(&self) -> usize {
         self.digests.len()
     }
+
+    pub fn failed_sessions(&self) -> &[String] {
+        &self.failed_sessions
+    }
 }
 
 /// Collapses retained usage calls into one digest per physical thread/UTC day
@@ -151,7 +157,8 @@ pub fn materialize_local_session_digest_evidence(
     observed_at: DateTime<Utc>,
     scan_complete: bool,
 ) -> io::Result<LocalSessionDigestEvidence> {
-    let (digests, _, _) = materialize_session_digests(calls, buckets, observed_at, scan_complete)?;
+    let batch = materialize_session_digest_batch(calls, buckets, observed_at, scan_complete)?;
+    let digests = batch.digests;
     if digests.len() > MAX_LOCAL_SESSION_DIGESTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -160,8 +167,10 @@ pub fn materialize_local_session_digest_evidence(
     }
     Ok(LocalSessionDigestEvidence {
         observed_at,
-        scan_complete,
+        // A missing failed digest must never be reconciled as a tombstone.
+        scan_complete: scan_complete && batch.failed_sessions.is_empty(),
         digests,
+        failed_sessions: batch.failed_sessions,
     })
 }
 
@@ -1366,16 +1375,14 @@ fn remote_token_usage(usage: TokenUsage) -> io::Result<RemoteTokenUsage> {
             "token detail exceeds its containing input or output total",
         ));
     }
-    let breakdown_total = usage.input_tokens.checked_add(usage.output_tokens);
-    if breakdown_total.is_none()
-        || breakdown_total.is_some_and(|total| total != 0 && total != usage.total_tokens)
-    {
+    if !usage.has_valid_breakdown() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "token total does not match its input/output breakdown",
         ));
     }
     Ok(RemoteTokenUsage {
+        unclassified_tokens: usage.unclassified(),
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
@@ -1422,6 +1429,31 @@ fn materialize_session_digests(
     observed_at: DateTime<Utc>,
     scan_complete: bool,
 ) -> io::Result<(Vec<RemoteSessionDigest>, usize, usize)> {
+    let batch = materialize_session_digest_batch(calls, buckets, observed_at, scan_complete)?;
+    if let Some(failure) = batch.failed_sessions.first() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, failure.clone()));
+    }
+    Ok((
+        batch.digests,
+        batch.missing_event_identities,
+        batch.invalid_threads,
+    ))
+}
+
+#[derive(Default)]
+struct SessionDigestBatch {
+    digests: Vec<RemoteSessionDigest>,
+    missing_event_identities: usize,
+    invalid_threads: usize,
+    failed_sessions: Vec<String>,
+}
+
+fn materialize_session_digest_batch(
+    calls: &[UsageCall],
+    buckets: &[LocalHalfHourBucket],
+    observed_at: DateTime<Utc>,
+    scan_complete: bool,
+) -> io::Result<SessionDigestBatch> {
     let trace = process_trace_log();
     let bucket_trace = trace.span_with("source_export.session_digest.bucket_index", || {
         TraceFields::new().usize("buckets", buckets.len())
@@ -1573,8 +1605,17 @@ fn materialize_session_digests(
     });
     let revisions = current_revisions();
     let mut digests = Vec::with_capacity(accumulators.len());
+    let mut failed_sessions = Vec::new();
     let mut coverage_by_day = BTreeMap::<NaiveDate, DigestCoverage>::new();
     for ((thread_id, day), mut accumulator) in accumulators {
+        if let Some(error) = accumulator
+            .events
+            .values()
+            .find_map(|event| remote_token_usage(event.call.tokens).err())
+        {
+            failed_sessions.push(format!("{thread_id}/{day}: {error}"));
+            continue;
+        }
         let thread_id = ThreadId::from_str(thread_id)
             .expect("session digest accumulators contain validated thread IDs");
         let range_start = utc_day_start(day)?;
@@ -1654,6 +1695,13 @@ fn materialize_session_digests(
                 .remove(&(thread_id.clone(), day))
                 .unwrap_or_default(),
         )?;
+        let digest_tokens = match remote_token_usage(token_usage) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                failed_sessions.push(format!("{thread_id}/{day}: {error}"));
+                continue;
+            }
+        };
         digests.push(RemoteSessionDigest {
             thread_id,
             range_start,
@@ -1666,7 +1714,7 @@ fn materialize_session_digests(
             coverage_complete: coverage.complete,
             observed_project_keys: accumulator.observed_project_keys.into_iter().collect(),
             metrics: RemoteSessionUsageMetrics {
-                token_usage: remote_token_usage(token_usage)?,
+                token_usage: digest_tokens,
                 estimated_cost_units: RemoteU128::new(estimated_cost_units),
                 api_long_context_extra_cost_units: Some(RemoteU128::new(
                     api_long_context_extra_cost_units,
@@ -1694,7 +1742,13 @@ fn materialize_session_digests(
             .usize("digests", digests.len())
             .usize("coverageDays", coverage_by_day.len())
     });
-    Ok((digests, missing_event_identities, invalid_threads))
+    failed_sessions.sort();
+    Ok(SessionDigestBatch {
+        digests,
+        missing_event_identities,
+        invalid_threads,
+        failed_sessions,
+    })
 }
 
 fn replace_digest_project_attribution(
@@ -1784,6 +1838,7 @@ fn local_source_session_digest(
         digest.observed_project_keys,
         SessionUsageMetrics {
             token_usage: TokenUsage {
+                unclassified_tokens: digest.metrics.token_usage.unclassified_tokens,
                 input_tokens: digest.metrics.token_usage.input_tokens,
                 cached_input_tokens: digest.metrics.token_usage.cached_input_tokens,
                 cache_write_input_tokens: digest.metrics.token_usage.cache_write_input_tokens,
@@ -1929,6 +1984,7 @@ fn digest_event_semantic_hash_fields(
         tokens.cache_write_input_tokens,
         tokens.output_tokens,
         tokens.reasoning_output_tokens,
+        tokens.unclassified(),
         tokens.total_tokens,
     ] {
         digest.update(value.to_be_bytes());
@@ -2621,6 +2677,7 @@ mod tests {
             model: Some(model.to_owned()),
             service_tier: Some("standard".to_owned()),
             tokens: TokenUsage {
+                unclassified_tokens: 0,
                 input_tokens: total_tokens - output_tokens,
                 cached_input_tokens: (total_tokens - output_tokens) / 4,
                 cache_write_input_tokens: 0,
@@ -2630,6 +2687,56 @@ mod tests {
             },
             request_usage_exact: true,
         }
+    }
+
+    #[test]
+    fn partial_token_evidence_preserves_known_detail_and_isolates_bad_sessions() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap();
+        let good = usage_call(at, Some("known"), "gpt-5.6-luna", 100);
+        let mut missing = usage_call(at, Some("missing"), "gpt-5.6-luna", 50);
+        missing.tokens = TokenUsage {
+            total_tokens: 50,
+            ..Default::default()
+        };
+        missing.request_usage_exact = false;
+        let evidence = materialize_local_session_digest_evidence(
+            &[good.clone(), missing.clone()],
+            &[],
+            at + Duration::minutes(1),
+            true,
+        )
+        .unwrap();
+        assert!(evidence.scan_complete());
+        let tokens = evidence.digests[0].metrics.token_usage;
+        assert_eq!(tokens.input_tokens, 90);
+        assert_eq!(tokens.output_tokens, 10);
+        assert_eq!(tokens.unclassified_tokens, 50);
+        assert_eq!(tokens.total_tokens, 150);
+        assert!(
+            evidence.digests[0]
+                .metrics
+                .partial_reasons
+                .contains(&TOKEN_BREAKDOWN_REASON.to_owned())
+        );
+
+        let mut bad = good.clone();
+        bad.thread_id = "broken".to_owned();
+        bad.tokens.total_tokens = 101;
+        let evidence = materialize_local_session_digest_evidence(
+            &[good, missing, bad],
+            &[],
+            at + Duration::minutes(1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(evidence.digest_count(), 1);
+        assert_eq!(evidence.digests[0].metrics.token_usage.total_tokens, 150);
+        assert_eq!(evidence.failed_sessions.len(), 1);
+        assert!(evidence.failed_sessions[0].starts_with("broken/2026-09-06:"));
+        assert!(
+            !evidence.scan_complete(),
+            "failed sessions cannot authorize deletion reconciliation"
+        );
     }
 
     fn turn(thread_id: &str, message: &str, captured_at: DateTime<Utc>) -> TurnRecord {

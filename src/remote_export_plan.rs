@@ -1,10 +1,9 @@
 //! Pure planning from one normalized source observation to the durable
 //! materialized export set.
 //!
-//! This layer accepts only an observation that the collection boundary has
-//! already approved for publication. A partial scan must never enter this
-//! planner: even `UpsertOnly` could replace an existing complete key with a
-//! smaller partial aggregate. Published one-shot scans currently reconcile as
+//! Complete observations can be planned directly. Partial observations must
+//! pass the per-key lower-bound filter before publication: `UpsertOnly` alone
+//! could replace a complete key with a smaller aggregate. One-shot scans use
 //! `UpsertOnly`; `Authoritative` additionally requires durable continuous
 //! coverage that the short-lived exporter does not yet claim.
 
@@ -21,6 +20,9 @@ use crate::remote_protocol::{
 };
 use crate::source_export::MaterializedSourceObservation;
 use crate::source_model::ObservedProjectKey;
+
+mod partial;
+pub(crate) use partial::filter_partial_export_records;
 
 const SESSION_DIGEST_RETENTION_DAYS: u64 = 35;
 const USAGE_BUCKET_RETENTION_DAYS: u64 = 35;
@@ -304,6 +306,70 @@ mod tests {
                 partial_reasons: vec!["session_range_open".to_owned()],
             },
         }
+    }
+
+    #[test]
+    fn partial_export_records_preserve_components_groups_and_coverage() {
+        fn bucket_record(value: RemoteUsageBucket) -> RemoteDeltaJournalRecord {
+            RemoteDeltaJournalRecord::UsageBucket {
+                starts_at: value.starts_at,
+                mutation: RemoteUsageBucketMutation::Upsert(Box::new(value)),
+            }
+        }
+        let mut old = bucket(project_key(0x11));
+        old.partial_reasons.push("rollout_scan_incomplete".into());
+        let old_record = bucket_record(old.clone());
+        assert!(partial::record_at_least(&old_record, &old_record));
+        let mut larger = old.clone();
+        larger.token_usage.input_tokens += 10;
+        larger.token_usage.total_tokens += 10;
+        larger.project_groups[0].token_usage = larger.token_usage;
+        assert!(partial::record_at_least(
+            &bucket_record(larger.clone()),
+            &old_record
+        ));
+        for mutate in [
+            |value: &mut RemoteUsageBucket| value.project_groups.clear(),
+            |value: &mut RemoteUsageBucket| value.project_groups[0].token_usage = token_usage(1),
+            |value: &mut RemoteUsageBucket| value.api_equivalent_cost.priced_tokens = 0,
+            |value: &mut RemoteUsageBucket| value.api_long_context_extra_cost_units = None,
+            |value: &mut RemoteUsageBucket| {
+                value.project_groups[0].root_session_turn_id = Some("other".into())
+            },
+        ] {
+            let mut next = larger.clone();
+            mutate(&mut next);
+            assert!(!partial::record_at_least(&bucket_record(next), &old_record));
+        }
+        old.partial_reasons.clear();
+        assert!(!partial::record_at_least(
+            &bucket_record(larger),
+            &bucket_record(old)
+        ));
+
+        let old = digest(project_key(0x11));
+        let record = |value: RemoteSessionDigest| RemoteDeltaJournalRecord::SessionDigest {
+            thread_id: value.thread_id.clone(),
+            range_start: value.range_start,
+            range_end: value.range_end,
+            changed_at: value.covered_through,
+            retention_through: value.range_end + chrono::Duration::days(35),
+            mutation: RemoteSessionDigestMutation::Upsert(Box::new(value)),
+        };
+        assert!(partial::record_at_least(
+            &record(old.clone()),
+            &record(old.clone())
+        ));
+        let mut less = old.clone();
+        less.exact_event_identity = false;
+        assert!(!partial::record_at_least(
+            &record(less),
+            &record(old.clone())
+        ));
+        let mut complete = old.clone();
+        complete.coverage_complete = true;
+        complete.covered_through = complete.range_end;
+        assert!(!partial::record_at_least(&record(old), &record(complete)));
     }
 
     #[test]

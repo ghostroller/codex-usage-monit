@@ -19320,8 +19320,13 @@ fn render_turn_detail(
 }
 
 fn format_token_breakdown(label: &str, usage: TokenUsage, width: usize) -> String {
+    let unknown = if usage.unclassified() > 0 {
+        format!(" unknown={}", usage.unclassified())
+    } else {
+        String::new()
+    };
     let exact = format!(
-        "{label} total={} in={} cache={} out={} reason={}",
+        "{label} total={} in={} cache={} out={} reason={}{unknown}",
         usage.total_tokens,
         usage.input_tokens,
         usage.cached_input_tokens,
@@ -19332,7 +19337,7 @@ fn format_token_breakdown(label: &str, usage: TokenUsage, width: usize) -> Strin
         exact
     } else {
         format!(
-            "{label} total={} in={} cache={} out={} reason={}",
+            "{label} total={} in={} cache={} out={} reason={}{unknown}",
             format_tokens(usage),
             format_tokens(TokenUsage {
                 total_tokens: usage.input_tokens,
@@ -21067,6 +21072,7 @@ fn remote_live_thread_id(node_id: &str, thread_id: &str) -> String {
 
 fn local_token_usage(usage: RemoteTokenUsage) -> TokenUsage {
     TokenUsage {
+        unclassified_tokens: usage.unclassified_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,

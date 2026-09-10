@@ -1838,6 +1838,7 @@ mod tests {
         let revisions = current_revisions();
         RemoteSessionUsageMetrics {
             token_usage: RemoteTokenUsage {
+                unclassified_tokens: 0,
                 input_tokens: total.saturating_sub(1),
                 cached_input_tokens: 1.min(total.saturating_sub(1)),
                 cache_write_input_tokens: 0,

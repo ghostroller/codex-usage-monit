@@ -24,7 +24,7 @@ use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, ThreadId};
 
 /// Third remote export schema: negotiated model catalogs carry an exact
 /// semantic content fingerprint in addition to their numeric revisions.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
 /// First normalized per-event fact schema. It is intentionally independent
 /// from aggregate-history revisions so a center can reject an unknown fact
 /// shape without discarding otherwise compatible bucket data.
@@ -1261,6 +1261,7 @@ pub struct RemoteTokenUsage {
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
+    pub unclassified_tokens: u64,
     pub total_tokens: u64,
 }
 
@@ -1277,8 +1278,9 @@ impl RemoteTokenUsage {
         let breakdown_total = self
             .input_tokens
             .checked_add(self.output_tokens)
+            .and_then(|known| known.checked_add(self.unclassified_tokens))
             .ok_or_else(|| invalid_message("remote token breakdown overflows"))?;
-        if breakdown_total != 0 && self.total_tokens != breakdown_total {
+        if self.total_tokens != breakdown_total {
             return Err(invalid_message(
                 "remote token total does not match its input/output breakdown",
             ));
@@ -1304,6 +1306,7 @@ impl RemoteTokenUsage {
             && self.cache_write_input_tokens == 0
             && self.output_tokens == 0
             && self.reasoning_output_tokens == 0
+            && self.unclassified_tokens == 0
     }
 }
 
@@ -3560,6 +3563,7 @@ mod tests {
 
     fn remote_tokens() -> RemoteTokenUsage {
         RemoteTokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 100,
             cached_input_tokens: 20,
             cache_write_input_tokens: 5,
@@ -3567,6 +3571,23 @@ mod tests {
             reasoning_output_tokens: 4,
             total_tokens: 110,
         }
+    }
+
+    #[test]
+    fn partial_token_evidence_requires_explicit_unknown_and_preserves_invariants() {
+        let mut tokens = remote_tokens();
+        tokens.total_tokens += 50;
+        assert!(tokens.validate().is_err());
+        tokens.unclassified_tokens = 50;
+        tokens.validate().unwrap();
+        let decoded: RemoteTokenUsage =
+            serde_json::from_str(&serde_json::to_string(&tokens).unwrap()).unwrap();
+        assert_eq!(tokens, decoded);
+        tokens.cached_input_tokens = tokens.input_tokens + 1;
+        assert!(tokens.validate().is_err());
+        tokens.cached_input_tokens = 0;
+        tokens.unclassified_tokens = u64::MAX;
+        assert!(tokens.validate().is_err());
     }
 
     fn remote_api_cost() -> RemoteApiCostAmount {

@@ -128,11 +128,34 @@ pub struct TokenUsage {
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
+    /// Observed tokens for which the source did not report input/output detail.
+    #[serde(default)]
+    pub unclassified_tokens: u64,
     pub total_tokens: u64,
 }
 
 impl TokenUsage {
+    pub fn unclassified(self) -> u64 {
+        if self.input_tokens == 0 && self.output_tokens == 0 && self.unclassified_tokens == 0 {
+            self.total_tokens
+        } else {
+            self.unclassified_tokens
+        }
+    }
+
+    pub fn has_valid_breakdown(self) -> bool {
+        self.cached_input_tokens <= self.input_tokens
+            && self.cache_write_input_tokens <= self.input_tokens
+            && self.reasoning_output_tokens <= self.output_tokens
+            && self
+                .input_tokens
+                .checked_add(self.output_tokens)
+                .and_then(|known| known.checked_add(self.unclassified()))
+                == Some(self.total_tokens)
+    }
+
     pub fn add_assign(&mut self, other: Self) {
+        self.unclassified_tokens = self.unclassified().saturating_add(other.unclassified());
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
@@ -154,6 +177,7 @@ impl TokenUsage {
             && self.cache_write_input_tokens == 0
             && self.output_tokens == 0
             && self.reasoning_output_tokens == 0
+            && self.unclassified_tokens == 0
     }
 
     pub fn delta_from(self, previous: Self) -> Option<Self> {
@@ -163,6 +187,7 @@ impl TokenUsage {
             || self.output_tokens < previous.output_tokens
             || self.reasoning_output_tokens < previous.reasoning_output_tokens
             || self.total_tokens < previous.total_tokens
+            || self.unclassified() < previous.unclassified()
         {
             return None;
         }
@@ -176,6 +201,7 @@ impl TokenUsage {
             reasoning_output_tokens: self.reasoning_output_tokens
                 - previous.reasoning_output_tokens,
             total_tokens: self.total_tokens - previous.total_tokens,
+            unclassified_tokens: self.unclassified() - previous.unclassified(),
         })
     }
 }

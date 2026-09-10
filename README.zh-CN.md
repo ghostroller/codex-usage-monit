@@ -376,7 +376,7 @@ GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列
 
 每次进程启动时，程序会在常规配置目录查找 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`。`CODEX_USAGE_MONIT_CONFIG_DIR` 会和其他配置文件一样覆盖该目录。这个文件可选，程序不会自动创建：文件不存在时使用内置目录；文件存在但无法读取或校验失败时，需要计算价格或协商价格 revision 的命令会直接报错，不会静默切到另一套费率。
 
-可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 6 和 3）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v3 会在合并数据前拒绝任何不匹配。
+可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 6 和 3）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v4 会在合并数据前拒绝任何不匹配。
 
 ### 状态标识
 

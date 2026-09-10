@@ -82,6 +82,12 @@ impl RemoteAggregatePublication<'_> {
 }
 
 impl RemoteCollection {
+    /// Observed lower bounds only. The exporter must compare each candidate
+    /// with its durable key before publishing an incomplete scan.
+    pub(crate) fn partial_observation(&self) -> &HistoryObservation {
+        &self.history_observation
+    }
+
     /// Returns aggregates only when the fixed-domain rollout inventory is
     /// complete.
     ///

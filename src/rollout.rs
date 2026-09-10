@@ -26,10 +26,13 @@ use crate::session_index::load_thread_titles;
 use crate::startup_progress::{StartupLoadProgressTracker, StartupLoadStage};
 use crate::trace::{TraceFields, TraceOutcome};
 
+mod request_evidence;
+use request_evidence::{deduplicate_native_calls, request_covered_counters};
+
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 3;
 // Bump when the projected event schema or replay semantics change.
-const ROLLOUT_PARSER_REVISION: u32 = 13;
+const ROLLOUT_PARSER_REVISION: u32 = 14;
 // Keep the historical flat namespace as a read-only migration source. The
 // active cache lives below a format/parser generation so an incompatible old
 // entry can neither shadow a current entry nor consume the current budget.
@@ -64,6 +67,7 @@ const ROLLOUT_MAX_WARNINGS_PER_FILE: usize = 64;
 const ROLLOUT_MAX_WARNINGS: usize = 128;
 const USAGE_EVENT_ID_DOMAIN: &[u8] = b"codex-usage-monit/usage-event/fallback/v1\0";
 const USAGE_EVENT_ID_PREFIX: &str = "usage-sha256-v1-";
+const NATIVE_USAGE_EVENT_ID_PREFIX: &str = "usage-native-sha256-v1-";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RolloutFile {
@@ -260,6 +264,13 @@ struct SelectedFile {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum ParsedEvent {
+    RequestUsage {
+        timestamp: DateTime<Utc>,
+        turn_id: String,
+        response_id: String,
+        usage: TokenUsage,
+        turn_usage: Option<TokenUsage>,
+    },
     SessionMeta {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
@@ -3047,11 +3058,13 @@ fn build_replay_plan(
     }
     let selected_filenames_are_trustworthy = !selected_threads.is_empty()
         && selected_threads.iter().all(|thread_id| {
-            files_by_thread.get(thread_id).is_some_and(|thread_files| {
-                thread_files.iter().any(|(file, _)| {
-                    rollout_filename_thread_id(&file.path) == Some(thread_id.as_str())
+            uuid_text(thread_id)
+                && files_by_thread.get(thread_id).is_some_and(|thread_files| {
+                    thread_files.iter().all(|(file, _)| {
+                        rollout_filename_thread_id(&file.path)
+                            .is_none_or(|owner| owner == thread_id)
+                    })
                 })
-            })
         });
     let mut owner_uncertain = false;
     let mut owner_probe_reads = 0_usize;
@@ -3136,6 +3149,11 @@ fn build_replay_plan(
         // If an omitted file cannot be identified, no selected thread can
         // safely claim its first cumulative counter started at zero.
         plan.incomplete_counter_threads.extend(selected_threads);
+        if let Some(file) = files.first() {
+            plan.replay_order_warnings.entry(file.path.clone()).or_default().push(
+                "rollout owner evidence is incomplete: an omitted file could not be identified within the bounded owner probe; initial cumulative counters are not assumed to start at zero".to_owned()
+            );
+        }
     }
     plan
 }
@@ -3183,20 +3201,29 @@ fn rollout_filename_thread_id(path: &Path) -> Option<&str> {
     let stem = path.file_stem()?.to_str()?;
     let start = stem.len().checked_sub(36)?;
     let candidate = stem.get(start..)?;
+    // Copy names append another UUID. Their owner comes from session_meta,
+    // not from the copy suffix. Only these ambiguous files need a head probe.
+    if start > 0 && stem.as_bytes()[start - 1] == b'_' {
+        return None;
+    }
+    uuid_text(candidate).then_some(candidate)
+}
+
+fn uuid_text(candidate: &str) -> bool {
     let bytes = candidate.as_bytes();
     if bytes.len() != 36 {
-        return None;
+        return false;
     }
     for (index, byte) in bytes.iter().copied().enumerate() {
         if matches!(index, 8 | 13 | 18 | 23) {
             if byte != b'-' {
-                return None;
+                return false;
             }
         } else if !byte.is_ascii_hexdigit() {
-            return None;
+            return false;
         }
     }
-    Some(candidate)
+    true
 }
 
 fn probe_rollout_owner(file: &RolloutFile) -> OwnerProbe {
@@ -4442,12 +4469,15 @@ fn parse_rollout_reader_with_limit<R: BufRead>(
         };
 
         if replaying_foreign_history {
-            if starts_owning_segment(
-                record_type,
-                object_at(&record, &["payload"]),
-                thread_id,
-                owning_created_at,
-            ) {
+            if (record_type == Some("token_usage_record")
+                && string_field(&record, &["payload", "thread_id"]) == Some(thread_id))
+                || starts_owning_segment(
+                    record_type,
+                    object_at(&record, &["payload"]),
+                    thread_id,
+                    owning_created_at,
+                )
+            {
                 replaying_foreign_history = false;
             } else {
                 // The child counter normally continues from the embedded
@@ -4494,6 +4524,46 @@ fn parse_rollout_reader_with_limit<R: BufRead>(
         let event_count_before = parsed.events.len();
 
         match record_type {
+            Some("token_usage_record") => {
+                let Some(payload) = object_at(&record, &["payload"]) else {
+                    continue;
+                };
+                if string_field_in(payload, &["thread_id"]) != Some(thread_id) {
+                    continue;
+                }
+                let request = (|| {
+                    let turn_id = string_field_in(payload, &["turn_id"])?;
+                    let response_id = string_field_in(payload, &["response_id"])?;
+                    if turn_id.is_empty() || response_id.is_empty() || response_id.len() > 1024 {
+                        return None;
+                    }
+                    let usage = parse_token_usage(payload.get("usage")?)?;
+                    usage
+                        .has_valid_breakdown()
+                        .then(|| ParsedEvent::RequestUsage {
+                            timestamp,
+                            turn_id: turn_id.to_owned(),
+                            response_id: response_id.to_owned(),
+                            usage,
+                            turn_usage: payload
+                                .get("turn_token_usage")
+                                .and_then(parse_token_usage)
+                                .filter(|usage| usage.has_valid_breakdown()),
+                        })
+                })();
+                if let Some(request) = request {
+                    parsed.events.push(request);
+                } else {
+                    parsed.skipped_lines += 1;
+                    push_parsed_warning(
+                        &mut parsed,
+                        format!(
+                            "invalid native request usage at {} line {line_number}",
+                            file.path.display()
+                        ),
+                    );
+                }
+            }
             Some("turn_context") => {
                 if let Some(payload) = object_at(&record, &["payload"]) {
                     parsed.events.push(ParsedEvent::TurnContext {
@@ -5023,7 +5093,8 @@ fn replay_rollout_file(
         }
     }
 
-    for event in &parsed.events {
+    let covered_counters = request_covered_counters(&parsed.events, as_of);
+    for (event_index, event) in parsed.events.iter().enumerate() {
         if !event_is_visible(event) {
             if matches!(event, ParsedEvent::ForeignCounterBaseline { .. })
                 || matches!(
@@ -5049,6 +5120,35 @@ fn replay_rollout_file(
             set_max_timestamp(&mut thread.updated_at, activity_at);
         }
         match event {
+            ParsedEvent::RequestUsage {
+                timestamp,
+                turn_id,
+                response_id,
+                usage,
+                ..
+            } => {
+                let turn = ensure_turn(thread, turn_id);
+                let model = turn.model.clone();
+                let service_tier = turn.service_tier.clone();
+                let mut identity = Sha256::new();
+                identity.update(thread_id.as_bytes());
+                identity.update([0]);
+                identity.update(response_id.as_bytes());
+                dataset.calls.push(UsageCall {
+                    timestamp: *timestamp,
+                    thread_id: thread_id.to_owned(),
+                    turn_id: Some(turn_id.clone()),
+                    usage_event_id: Some(format!(
+                        "{NATIVE_USAGE_EVENT_ID_PREFIX}{:x}",
+                        identity.finalize()
+                    )),
+                    usage_event_identity_exact: true,
+                    model,
+                    service_tier,
+                    tokens: *usage,
+                    request_usage_exact: usage.unclassified() == 0,
+                });
+            }
             ParsedEvent::SessionMeta { timestamp, payload } => {
                 apply_session_meta(thread, payload, *timestamp);
             }
@@ -5144,18 +5244,25 @@ fn replay_rollout_file(
                 total_usage,
                 last_usage,
                 rate_limits,
-            } => apply_token_count(
-                thread,
-                TokenCounterSample {
-                    total: *total_usage,
-                    last: *last_usage,
-                },
-                rate_limits.as_ref(),
-                *timestamp,
-                path,
-                *line_number,
-                dataset,
-            ),
+            } => {
+                let covered = covered_counters.contains(&event_index);
+                apply_token_count(
+                    thread,
+                    TokenCounterSample {
+                        total: if covered { None } else { *total_usage },
+                        last: *last_usage,
+                    },
+                    rate_limits.as_ref(),
+                    *timestamp,
+                    path,
+                    *line_number,
+                    dataset,
+                );
+                if covered && let Some(total) = total_usage {
+                    thread.previous_cumulative = Some(*total);
+                    thread.incomplete_counter_boundary = false;
+                }
+            }
         }
     }
     if as_of.is_none()
@@ -5168,6 +5275,7 @@ fn replay_rollout_file(
 fn parsed_event_available_at(event: &ParsedEvent) -> Option<DateTime<Utc>> {
     match event {
         ParsedEvent::SessionMeta { timestamp, .. }
+        | ParsedEvent::RequestUsage { timestamp, .. }
         | ParsedEvent::ForeignCounterBaseline { timestamp, .. }
         | ParsedEvent::ForeignThreadSettingsBaseline { timestamp, .. }
         | ParsedEvent::UserMessage { timestamp, .. }
@@ -5208,6 +5316,9 @@ fn apply_session_meta(
     payload: &Map<String, Value>,
     timestamp: DateTime<Utc>,
 ) {
+    if is_subagent_session(payload) && thread.previous_cumulative.is_none() {
+        thread.incomplete_counter_boundary = true;
+    }
     set_max_timestamp(&mut thread.session_metadata_updated_at, timestamp);
     if let Some((parent_thread_id, rank)) =
         session_parent_thread_id(payload, Some(&thread.thread_id))
@@ -5406,6 +5517,22 @@ fn apply_token_count(
     let Some(total_usage) = usage.total else {
         return;
     };
+    if !total_usage.has_valid_breakdown()
+        || usage.last.is_some_and(|last| !last.has_valid_breakdown())
+    {
+        push_replay_warning(
+            dataset,
+            format!(
+                "invalid token breakdown for thread {} at {} line {line_number}; counter baseline is unknown",
+                thread.thread_id,
+                path.display()
+            ),
+        );
+        thread.previous_cumulative = None;
+        thread.incomplete_counter_boundary = true;
+        dataset.stats.ambiguous_token_resets += 1;
+        return;
+    }
 
     let delta = match thread.previous_cumulative {
         None if thread.incomplete_counter_boundary => {
@@ -5423,10 +5550,11 @@ fn apply_token_count(
                     ),
                 );
                 dataset.stats.ambiguous_token_resets += 1;
-                let Some(last_usage) = usage
-                    .last
-                    .filter(|last_usage| total_usage.delta_from(*last_usage).is_some())
-                else {
+                let Some(last_usage) = usage.last.filter(|last_usage| {
+                    last_usage.total_tokens <= total_usage.total_tokens
+                        && (last_usage.unclassified() == last_usage.total_tokens
+                            || total_usage.delta_from(*last_usage).is_some())
+                }) else {
                     return;
                 };
                 last_usage
@@ -5457,8 +5585,7 @@ fn apply_token_count(
         return;
     }
     let request_usage_exact = usage.last.is_some_and(|last| {
-        let breakdown_missing =
-            last.total_tokens > 0 && last.input_tokens == 0 && last.output_tokens == 0;
+        let breakdown_missing = last.unclassified() > 0;
         last == delta && !breakdown_missing
     });
 
@@ -5707,6 +5834,11 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
 
     Some(TokenUsage {
+        unclassified_tokens: if input_tokens == 0 && output_tokens == 0 {
+            total_tokens
+        } else {
+            0
+        },
         input_tokens,
         cached_input_tokens,
         cache_write_input_tokens,
@@ -5729,6 +5861,7 @@ fn finish_dataset(
     // boundary: future evidence must not leak into the current snapshot or its
     // token/quota calculations.
     dataset.calls.retain(|call| call.timestamp <= now);
+    deduplicate_native_calls(dataset, threads);
     dataset
         .rate_observations
         .retain(|observation| observation.timestamp <= now);

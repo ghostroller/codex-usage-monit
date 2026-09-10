@@ -317,23 +317,37 @@ pub fn prepare_remote_delta_page(
         live_project_descriptors,
     };
 
-    if let Some(publication) = collection.aggregate_publication() {
+    {
+        let publication = collection.aggregate_publication();
+        let observation = publication.as_ref().map_or_else(
+            || collection.partial_observation(),
+            |value| value.observation(),
+        );
         let materialized = materialize_source_observation_with_git_resolver(
             identity,
             redaction_profile,
             &collection.dataset.tasks,
             &collection.dataset.calls,
-            publication.observation().clone(),
-            true,
+            observation.clone(),
+            collection.scan_complete,
             &mut git_project_evidence,
         )
         .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
-        let desired = plan_remote_export_records(&materialized)
+        let mut desired = plan_remote_export_records(&materialized)
             .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
         validate_remote_delta_desired_records(&desired, &inputs)
             .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
+        if !collection.scan_complete {
+            let previous = session.materialized_upserts().map_err(map_state_error)?;
+            desired = crate::remote_export_plan::filter_partial_export_records(desired, &previous)
+                .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
+        }
         session
-            .reconcile_materialized_records(observed_at, &desired, publication.reconcile_mode())
+            .reconcile_materialized_records(
+                observed_at,
+                &desired,
+                crate::remote_export_state::RemoteExportReconcileMode::UpsertOnly,
+            )
             .map_err(map_state_error)?;
     }
 
@@ -1462,6 +1476,105 @@ mod tests {
         assert_eq!(roots.iter().filter(|root| root.exists()).count(), 2);
         sweep_old_revision_state(&store, &current, future).unwrap();
         assert!(roots.iter().all(|root| !root.exists()));
+    }
+
+    #[test]
+    fn partial_export_records_publish_lower_bounds_without_regression_and_recover() {
+        let (_directory, config, store, identity, now) = fixture();
+        let path = config
+            .codex_home
+            .join("sessions/2026/08/30/rollout-remote.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let reset = json!({"timestamp": now.to_rfc3339(), "type":"event_msg", "payload": {
+            "type":"token_count", "info":{"total_token_usage": {
+                "input_tokens":40,"cached_input_tokens":20,"output_tokens":10,
+                "reasoning_output_tokens":5,"total_tokens":50
+            }}
+        }})
+        .to_string()
+            + "\n";
+        fs::write(&path, original.clone() + &reset).unwrap();
+        let revisions = current_revisions();
+        let mut req = request(now);
+        let first = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &revisions,
+            RedactionProfile::Redacted,
+            &req,
+            now,
+        )
+        .unwrap();
+        let (page, payload) = first.decode().unwrap();
+        assert!(
+            payload
+                .coverage
+                .partial_reasons
+                .contains(&"rollout_token_resets_ambiguous".to_owned())
+        );
+        assert!(!payload.bucket_changes.is_empty());
+        assert!(!payload.session_digest_changes.is_empty());
+        assert!(payload.session_digest_changes.iter().all(|change| matches!(&change.mutation,
+            crate::remote_protocol::RemoteSessionDigestMutation::Upsert(digest) if !digest.coverage_complete)));
+        req.delta_cursor = Some(page.next_delta_cursor);
+        let retry = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &revisions,
+            RedactionProfile::Redacted,
+            &req,
+            now,
+        )
+        .unwrap();
+        assert!(retry.is_empty());
+
+        let mut records = original
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        records.last_mut().unwrap()["payload"]["info"]["total_token_usage"] = json!({
+            "input_tokens":50,"cached_input_tokens":20,"output_tokens":10,
+            "reasoning_output_tokens":5,"total_tokens":60
+        });
+        let smaller = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, smaller + &reset).unwrap();
+        let smaller = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &revisions,
+            RedactionProfile::Redacted,
+            &req,
+            now,
+        )
+        .unwrap();
+        assert!(
+            smaller.is_empty(),
+            "a smaller partial scan must not replace or tombstone existing evidence"
+        );
+
+        fs::write(&path, original).unwrap();
+        let recovered = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &revisions,
+            RedactionProfile::Redacted,
+            &req,
+            now,
+        )
+        .unwrap();
+        assert!(
+            !recovered.is_empty(),
+            "complete scan must upgrade partial evidence"
+        );
     }
 
     #[test]

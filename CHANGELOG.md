@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Read source-owned `token_usage_record` request evidence, deduplicate response identities across rollout copies, and suppress legacy counter mirrors only when coverage is proven. Subagent counters without a trustworthy baseline no longer attribute inherited cumulative usage.
+- Preserve total-only usage explicitly as `unclassifiedTokens` when it is mixed with known input/output breakdowns. Invalid local session digests no longer discard healthy sessions or authorize deletion of their previous evidence.
+- Resolve copied rollout filenames through session metadata without making unrelated canonical filenames exhaust the bounded owner probe budget.
+- Publish safe remote lower bounds even when isolated rollout counters are incomplete. Partial scans cannot lower existing token/price/group evidence, degrade complete coverage, or delete omitted keys; exact session-fact publication remains gated on complete scans.
+
+### Compatibility
+
+- Remote protocol is now v4, history metric revision is 5, and rollout parser cache revision is 14. Upgrade both SSH endpoints together. For pre-release incompatible derived state, back it up and regenerate from retained source logs rather than migrating old aggregates; preserve source identities, configuration and account quota observations. See [rebuild guidance](docs/remote-usage.md#rebuilding-incompatible-derived-data).
+
 ## [0.4.0] - 2026-09-08
 
 ### Added

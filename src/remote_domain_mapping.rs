@@ -11,6 +11,7 @@ use crate::source_history::SessionUsageMetrics;
 
 pub(crate) fn local_token_usage(usage: RemoteTokenUsage) -> TokenUsage {
     TokenUsage {
+        unclassified_tokens: usage.unclassified_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
@@ -67,6 +68,7 @@ mod tests {
     fn session_metrics_mapping_preserves_every_accounting_field() {
         let remote = RemoteSessionUsageMetrics {
             token_usage: RemoteTokenUsage {
+                unclassified_tokens: 0,
                 input_tokens: 11,
                 cached_input_tokens: 7,
                 cache_write_input_tokens: 3,

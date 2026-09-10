@@ -119,7 +119,7 @@ Cyber 长上下文目前存在官方来源冲突：GPT-5.6 Cyber 模型页写有
 
 启动时程序会在常规配置目录中查找可选的 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`；`CODEX_USAGE_MONIT_CONFIG_DIR` 会覆盖该目录。文件不存在时才使用内置目录；文件存在但无法读取、过大或校验失败时，需要费率的命令直接报错，不得静默回退到内置值。
 
-外部文件是完整替换而非局部 patch，需同时定义模型 ID / aliases、Codex Standard/Fast credit 费率、`creditFallbackModel`、API Standard/Fast 短/长上下文费率、cache-write 支持、长上下文阈值和目录元数据。首次外部覆盖的 `estimatorRevision` 和 `apiPricingCatalogRevision` 必须分别大于内置的 6 和 3；后续修改对应口径时也必须递增。编辑后重启 TUI/recorder 即可生效，无需重新编译。远程协议 v3 同时比较 revision 与规范化目录 SHA-256 指纹；参与同步的各机器只要任一不一致就拒绝混用。完整示例见 [`model-catalog.example.json`](model-catalog.example.json)。
+外部文件是完整替换而非局部 patch，需同时定义模型 ID / aliases、Codex Standard/Fast credit 费率、`creditFallbackModel`、API Standard/Fast 短/长上下文费率、cache-write 支持、长上下文阈值和目录元数据。首次外部覆盖的 `estimatorRevision` 和 `apiPricingCatalogRevision` 必须分别大于内置的 6 和 3；后续修改对应口径时也必须递增。编辑后重启 TUI/recorder 即可生效，无需重新编译。远程协议 v4 同时比较 revision 与规范化目录 SHA-256 指纹；参与同步的各机器只要任一不一致就拒绝混用。完整示例见 [`model-catalog.example.json`](model-catalog.example.json)。
 
 Rollout JSONL 中可利用以下事件重建历史：
 
@@ -127,6 +127,7 @@ Rollout JSONL 中可利用以下事件重建历史：
 - `user_message`：用户消息正文，以及部分版本可选的 turn id；
 - `turn_context`：turn id、模型、reasoning effort；
 - `token_count`：last/total token 和额度快照；
+- `token_usage_record`：带有 owner thread、turn 与 response id 的逐请求 token，以及可选的 turn 累计值；
 - `task_complete`：完成时间和耗时；
 - `turn_aborted`：中断原因和时间。
 
@@ -138,7 +139,9 @@ Summary 的用户轮次归属采用更严格的事件外键：父 rollout 中 `s
 
 工具最多保留每个 turn 首条用户消息的 72 字符摘要。有显式 `turn_id` 时直接归属；没有时只归入当前 active turn，若当前没有 active turn，则不猜测归属。部分 subagent turn 没有明文 `user_message`，摘要显示 `-`，不会从注入上下文反推。
 
-对每个 turn 的 token 统计应使用累计计数的单调增量，避免重复的 `token_count` 通知被重复相加。
+优先使用 owner thread 一致且 breakdown 有效的 `token_usage_record`，按 thread + response id 去重，包括重复 rollout 文件；同一请求身份出现冲突时排除该请求并报告 partial。只有原生请求的 turn 累计值证明完整前缀覆盖，或明确匹配紧随其后的 last usage 时，才跳过对应的旧 `token_count` 镜像。未覆盖的旧格式仍使用累计计数的安全单调增量。子代理没有可信父计数基线时，只计入明确报告且有效的 last request，不把继承的未知累计差额归给子代理。
+
+只有 total 而没有 input/output 的用量保存为 `unclassifiedTokens`。它与已知 breakdown 混合后仍满足 input + output + unclassified = total，不再使整批会话摘要校验失败；单个会话/日期的坏摘要也不会丢弃其他有效摘要。此类扫描保持 incomplete，不能据此删除暂未生成的历史证据。EST 对 unknown 部分保留既有 uncached-input 降级与 partial 标记，API 等价费用不猜测 unknown 的价格。
 
 ## 当前窗口归因的硬边界
 
@@ -221,7 +224,7 @@ estimated_quota_percent = codex_used_percent * entity_selected_units / all_selec
 
 缺失或不在费率映射中的非 Spark 模型仍保留 `TOKENS` / `TOKEN%`，并按激活目录的 `creditFallbackModel` 对应 Standard/Fast credit profile 降级（内置目录指向 `gpt-5.6-luna`），以免静默丢出分母；不会仅因为 fallback 选择了某个模型就推断未知模型适用长上下文加价。该窗口增加兼容的 `unpriced_model_rate_fallback` partial reason，不能把 fallback 解释为已识别实际基础模型。API 等价费用不使用该 credit fallback；外部目录未明确定义 API 费率的模型仍然未计价。原始 token 与 `TOKEN%` 应用同一个未加权分母，EST 则对 task、turn 和 model 使用同一个 credit-rate 分母；task/model EST 合计等于当前 `codex` 的 `usedPercent`，缺少 turn id 的调用会使 turn 行合计低于该值。所有可计算结果在数据模型/JSON 中仍标记为 Low；TUI/text 的实体行只用 `~` 表示近似、用 `-` 表示不可用，不再重复 confidence 标签。估算方法、`externalActivityPossible` 与具体 partial reasons 在每个 scope 摘要中统一展示。扫描不完整、lookback 不足、费率后备或状态 stale 只会降低可信度并标记 partial/stale，不会清空仍有分母的 EST。
 
-内置双口径 token-based credit 映射定义为 estimator revision 6，API 价格目录为 revision 3，历史文件使用 metric revision 3；外部目录使用其声明的更高 revision。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用当前激活的 estimator revision，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]EST Longx` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。已摄取远端 generation 的目录指纹若与当前目录不一致，查询仍保留其 token、call 和 observed coverage，但屏蔽旧目录生成的 EST/API 金额与 priced coverage，并报告 `remote_model_catalog_fingerprint_mismatch:<source-id>`，直到使用一致目录重新同步。
+内置双口径 token-based credit 映射定义为 estimator revision 6，API 价格目录为 revision 3，历史文件使用 metric revision 5；外部目录使用其声明的更高 revision。程序不会对任意持久化聚合直接重新定价；它只从仍处于配置扫描范围内的 rollout 调用重建重叠的本地桶与周数据点。revision-aware upsert 在新点的未加权 token/call/cache-write 证据不差于旧点时优先使用当前激活的 estimator revision，避免旧 `estimated_cost_units` 的大小阻止替换。已发布的 estimator revision 3 基础历史继续保留，但在重建前没有可选 API extra；短暂开发版本的 revision 4 把倍率混在单一值中，无法安全拆分，因此升级时丢弃。其他无法重建的旧 revision 继续隔离；包含混合 estimator revision 的窗口不得合并 EST，而是让 `~EST` unavailable 并报告 `estimator_revision_changed` partial reason。开启 `[L]EST Longx` 时，缺少 optional extra 的旧点还会报告 `api_long_context_history_unavailable`，不会把缺值当成零。已摄取远端 generation 的目录指纹若与当前目录不一致，查询仍保留其 token、call 和 observed coverage，但屏蔽旧目录生成的 EST/API 金额与 priced coverage，并报告 `remote_model_catalog_fingerprint_mismatch:<source-id>`，直到使用一致目录重新同步。
 
 该公式仍隐含“本机看到了足够多的账户活动”这一强假设。其他设备或云 task、特殊工具、服务端取整、窗口重置与缺失日志都可能让 EST 偏离真实贡献，所以它只能称为 `estimated quota share`，不能称为官方逐任务 credit 账单。Help Center 还说明少量 Enterprise workspace 尚未从 legacy 按消息费率迁移到 token-based 卡；工具无法从 rollout 判断 workspace 的迁移状态，这些 workspace 的 EST 不代表其适用费率卡。JSON v2 为兼容旧消费者保留既有 attribution 汇总字段，同时新增 `apiPricing` 和各窗口/实体的 `apiEquivalentCost`；后两者不会驱动当前实体 EST。
 

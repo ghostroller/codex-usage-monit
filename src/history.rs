@@ -25,7 +25,7 @@ use crate::file_lock::FileLock;
 use crate::history_ownership::HistoryWriteAuthority;
 
 pub const HISTORY_FORMAT_VERSION: u32 = 2;
-pub const HISTORY_METRIC_REVISION: u32 = 4;
+pub const HISTORY_METRIC_REVISION: u32 = 5;
 pub const HISTORY_ESTIMATOR_REVISION: u32 = ESTIMATOR_REVISION;
 pub const HISTORY_PROJECT_BREAKDOWN_REVISION: u32 = 2;
 pub const HISTORY_RETENTION_DAYS: i64 = 90;

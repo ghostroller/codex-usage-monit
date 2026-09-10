@@ -241,7 +241,7 @@ fn price_call_inner(call: &UsageCall) -> CallCost {
         }
     };
     let tokens = call.tokens;
-    if tokens.total_tokens > 0 && tokens.input_tokens == 0 && tokens.output_tokens == 0 {
+    if tokens.unclassified() > 0 {
         return unpriced(observed_tokens, TOKEN_BREAKDOWN_MISSING);
     }
     if tokens.total_tokens > 0
@@ -472,6 +472,7 @@ mod tests {
             "gpt-5.6-sol",
             None,
             TokenUsage {
+                unclassified_tokens: 0,
                 input_tokens: 100_000,
                 cached_input_tokens: 20_000,
                 cache_write_input_tokens: 10_000,

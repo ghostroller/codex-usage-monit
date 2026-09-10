@@ -1042,9 +1042,22 @@ fn collect_snapshot_with_local(
         session_digest_scan_complete,
     ) {
         Ok(evidence) => {
-            digest_trace.finish_with(TraceOutcome::Ok, || {
-                TraceFields::new().usize("digests", evidence.digest_count())
-            });
+            if !evidence.failed_sessions().is_empty() {
+                partial = true;
+                for failure in evidence.failed_sessions().iter().take(16) {
+                    warnings.push(format!(
+                        "local session digest evidence is incomplete: {failure}"
+                    ));
+                }
+            }
+            digest_trace.finish_with(
+                if evidence.failed_sessions().is_empty() {
+                    TraceOutcome::Ok
+                } else {
+                    TraceOutcome::Partial
+                },
+                || TraceFields::new().usize("digests", evidence.digest_count()),
+            );
             evidence
         }
         Err(error) => {

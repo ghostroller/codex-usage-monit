@@ -3903,6 +3903,7 @@ mod tests {
     fn metrics(total: u64) -> SessionUsageMetrics {
         SessionUsageMetrics {
             token_usage: TokenUsage {
+                unclassified_tokens: 0,
                 input_tokens: total.saturating_sub(1),
                 cached_input_tokens: 0,
                 cache_write_input_tokens: 0,

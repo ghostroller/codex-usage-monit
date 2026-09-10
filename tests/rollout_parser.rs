@@ -297,6 +297,7 @@ fn reconstructs_turn_deltas_ignores_duplicates_and_starts_a_new_epoch_on_reset()
     assert_eq!(
         task.token_usage,
         TokenUsage {
+            unclassified_tokens: 0,
             input_tokens: 12,
             cached_input_tokens: 4,
             cache_write_input_tokens: 0,
