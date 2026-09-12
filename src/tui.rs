@@ -3456,6 +3456,8 @@ struct App {
     /// rollout scan and history projection start in the refresh worker after
     /// the terminal has already rendered.
     initial_bootstrap_pending: bool,
+    /// Remains true while the deferred initial worker is running or retrying.
+    history_initialization_pending: bool,
     worker_running: bool,
     refresh_retry_not_before: Option<Instant>,
     startup_progress_tracker: Option<StartupLoadProgressTracker>,
@@ -3600,6 +3602,7 @@ impl App {
             quit_requested: false,
             turn_reveal_pending: false,
             initial_bootstrap_pending: false,
+            history_initialization_pending: false,
             worker_running: false,
             refresh_retry_not_before: None,
             startup_progress_tracker: None,
@@ -4948,7 +4951,11 @@ impl App {
         );
         self.remote_config_retry_not_before =
             config_busy.then(|| now.checked_add(REMOTE_CONFIG_BUSY_RETRY).unwrap_or(now));
-        if refresh_history {
+        if self.history_initialization_pending {
+            // A missing store before the first worker completion means loading.
+            // Do not publish an unavailable warning to either the UI or log.
+            reloaded.history_error = None;
+        } else if refresh_history {
             (reloaded.history_sources, reloaded.history_error) =
                 load_remote_history_sources(self.remote_source_history_store.as_ref());
             self.last_remote_source_metadata_reload = Some(now);
@@ -8632,6 +8639,11 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     let (ui_state_store, rollout_cache, history_store, mut app) =
         prepare_deferred_initial_tui(&config, theme_override);
     app.event_log = config.event_log.clone();
+    app.event_log.lifecycle(
+        "tui.initializing",
+        "started",
+        "first frame pending; history initialization deferred to refresh worker",
+    );
     app.observe_diagnostics();
     let termination = TerminationSignal::install()?;
     let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
@@ -8785,6 +8797,7 @@ fn prepare_deferred_initial_tui(
     let app_span = config.startup_trace.span("tui.app_create");
     let initial_theme = theme_override.unwrap_or_else(|| ui_state.theme.into());
     let mut app = App::new(initial_loading_result(config), initial_theme);
+    app.history_initialization_pending = true;
     app.attach_startup_progress(startup_progress);
     app.local_redact_content = config.redact_content;
     app.reload_remote_sources();
@@ -9502,6 +9515,8 @@ fn apply_refresh_completion_at(
     now: Instant,
     observed_at: DateTime<Utc>,
 ) -> bool {
+    let initialization_completed =
+        app.history_initialization_pending && completion.history_source_state.is_some();
     let mut refresh_changed = false;
     if completion.summary_backfill {
         app.summary_backfill_running = false;
@@ -9521,6 +9536,7 @@ fn apply_refresh_completion_at(
         app.history_local_source_id = source_state.local_source_id;
         app.history_remote_sources = source_state.remote_sources;
         app.remote_source_history_store = source_state.source_history_store;
+        app.history_initialization_pending = false;
         app.last_remote_source_metadata_reload = None;
         refresh_changed = true;
     }
@@ -9544,6 +9560,20 @@ fn apply_refresh_completion_at(
         refresh_changed |= app.record_refresh_worker_failure(failure, now, observed_at);
     }
     refresh_changed |= app.reload_remote_sources();
+    if initialization_completed {
+        let source_aware = app.remote_source_history_store.is_some();
+        app.event_log.lifecycle(
+            "tui.initialized",
+            if source_aware { "ready" } else { "degraded" },
+            &format!(
+                "initial data loaded; historyBackend={} snapshotErrors={} snapshotWarnings={} historyWarnings={}",
+                if source_aware { "source-aware" } else { "legacy" },
+                app.snapshot.errors.len(),
+                app.snapshot.warnings.len(),
+                app.history.warnings.len(),
+            ),
+        );
+    }
     refresh_changed
 }
 
@@ -9654,6 +9684,69 @@ impl App {
             }
         }
         self.event_log.observe("tui", &issues);
+        self.observe_remote_states();
+    }
+
+    fn observe_remote_states(&self) {
+        if self.history_initialization_pending {
+            return;
+        }
+        let mut states = Vec::new();
+        if !self.remote_live_states.is_empty() {
+            states.push((
+                LogLevel::Info,
+                "remote.live_overlay",
+                "remote live is a bounded status overlay; Overview window usage comes from synced history"
+                    .to_owned(),
+            ));
+        }
+        if let Some(config) = &self.remote_sources.config {
+            let recorder = if self.recorder_health.error.is_some() {
+                "unknown"
+            } else {
+                self.recorder_health
+                    .status
+                    .as_ref()
+                    .map_or("not-observed", |status| {
+                        if status.heartbeat_is_recent(Utc::now()) {
+                            "heartbeat-recent"
+                        } else {
+                            "heartbeat-stale"
+                        }
+                    })
+            };
+            states.push((
+                LogLevel::Info,
+                "remote.auto_sync",
+                format!(
+                    "globalEnabled={} hosts={} recorder={recorder}; automatic synchronization requires the recorder; opening the TUI does not start it",
+                    config.auto_sync_enabled(),
+                    config.hosts().len(),
+                ),
+            ));
+            for host in config.hosts() {
+                let reason = if !config.auto_sync_enabled() {
+                    "global-disabled"
+                } else if !host.sync_enabled() {
+                    "host-disabled"
+                } else if !host.is_paired() {
+                    "unpaired"
+                } else if recorder != "heartbeat-recent" {
+                    "recorder-not-confirmed"
+                } else {
+                    "eligible"
+                };
+                states.push((
+                    LogLevel::Info,
+                    "remote.auto_sync_host",
+                    format!(
+                        "host={} globalEnabled={} hostEnabled={} paired={} recorder={recorder} reason={reason}; eligibility does not confirm a sync attempt",
+                        host.id(), config.auto_sync_enabled(), host.sync_enabled(), host.is_paired(),
+                    ),
+                ));
+            }
+        }
+        self.event_log.observe("tui.remote_state", &states);
     }
 }
 
@@ -9685,9 +9778,11 @@ fn run_loop(
                 LogLevel::Debug,
                 "tui.refresh",
                 &format!(
-                    "changed={refresh_changed} errors={} warnings={}",
+                    "changed={refresh_changed} snapshotErrors={} snapshotWarnings={} historyWarnings={} initializing={}",
                     app.snapshot.errors.len(),
-                    app.snapshot.warnings.len()
+                    app.snapshot.warnings.len(),
+                    app.history.warnings.len(),
+                    app.history_initialization_pending,
                 ),
             );
             app.observe_diagnostics();
@@ -9726,6 +9821,11 @@ fn run_loop(
             terminal.draw(|frame| render(frame, app))?;
             config.perf_log.record_draw(draw_started.elapsed());
             draw_span.finish("backend=crossterm");
+            app.event_log.lifecycle(
+                "tui.ready",
+                "rendered",
+                "first frame rendered; initial data may still be loading",
+            );
             config
                 .startup_trace
                 .finish("startup.ready", "mode=tui backend=crossterm");
@@ -20840,7 +20940,7 @@ fn merge_remote_live_into_snapshot_at(
         quality_parts.sort();
         quality_parts.dedup();
         let message = format!(
-            "live revision {}; active + recent 24h cumulative task/turn tokens{}",
+            "live revision {}; active + recent 24h cumulative task/turn tokens{}; bounded status overlay; Overview window usage comes from synced history",
             state.live_revision,
             if quality_parts.is_empty() {
                 String::new()
@@ -20861,9 +20961,6 @@ fn merge_remote_live_into_snapshot_at(
                 state.received_at.to_rfc3339()
             ));
         }
-        snapshot.warnings.push(format!(
-            "remote live {origin} is a bounded status overlay; Overview window usage comes from synced history"
-        ));
 
         let project_labels = state
             .project_descriptors

@@ -13949,6 +13949,158 @@ fn remote_ui_action_error_details_are_not_written_to_trace() {
 }
 
 #[test]
+fn event_log_tui_initialization_distinguishes_loading_ready_and_unavailable() {
+    for source_aware in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let mut app = interaction_test_app(0, 0);
+        install_empty_remote_sources_fixture(&mut app, temp.path());
+        app.event_log = EventLog::open(Some(path.clone()), LogLevel::Debug, false);
+        app.history_initialization_pending = true;
+        app.reload_remote_sources();
+        app.observe_diagnostics();
+        assert!(app.remote_sources.history_error.is_none());
+        // Retry remains loading, while the actual worker failure stays visible.
+        apply_refresh_completion(
+            &mut app,
+            refresh_worker_panic_completion(RefreshWorkerFailure::Initial),
+        );
+        app.observe_diagnostics();
+        assert!(app.history_initialization_pending);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("source-aware history is unavailable")
+        );
+
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let runtime =
+            HistoryRuntime::new(temp.path().join("state/history-v1"), &codex_home, false).unwrap();
+        let completion = RefreshCompletion {
+            result: None,
+            remote_live: None,
+            remote_overview_history: None,
+            history: None,
+            history_source_state: Some(TuiHistorySourceState {
+                local_source_id: None,
+                remote_sources: Vec::new(),
+                source_history_store: source_aware.then(|| runtime.source_history().clone()),
+            }),
+            recorder_health: None,
+            refreshed_account: false,
+            summary_backfill: false,
+            worker_failure: None,
+        };
+        apply_refresh_completion(&mut app, completion);
+        app.observe_diagnostics();
+        app.observe_diagnostics();
+        assert!(!app.history_initialization_pending);
+        let contents = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let initialized: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "tui.initialized")
+            .collect();
+        assert_eq!(initialized.len(), 1);
+        assert_eq!(initialized[0]["kind"], "lifecycle");
+        assert_eq!(
+            initialized[0]["status"],
+            if source_aware { "ready" } else { "degraded" }
+        );
+        assert_eq!(
+            contents.contains("source-aware history is unavailable"),
+            !source_aware
+        );
+    }
+}
+
+#[test]
+fn event_log_tui_distinguishes_remote_state_from_stale_data_and_records_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.jsonl");
+    let mut app = interaction_test_app(0, 0);
+    let now = Utc::now();
+    let (store, _) = install_remote_sources_fixture(&mut app, temp.path(), now);
+    let config = app.remote_sources.config.as_ref().unwrap();
+    app.remote_sources.config = Some(
+        store
+            .update(
+                config.config_revision(),
+                RemotesConfigMutation::set_auto_sync_enabled(false),
+            )
+            .unwrap(),
+    );
+    app.event_log = EventLog::open(Some(path.clone()), LogLevel::Debug, false);
+    let stale = remote_live_fixture(now - ChronoDuration::hours(10), true);
+    app.replace_remote_live_states_at(vec![stale], now);
+    app.observe_diagnostics();
+    app.observe_diagnostics();
+    assert!(
+        app.snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("is stale"))
+    );
+    assert!(
+        !app.snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("bounded status overlay"))
+    );
+
+    let fresh = remote_live_fixture(now, true);
+    app.replace_remote_live_states_at(vec![fresh], now);
+    app.observe_diagnostics();
+    let contents = std::fs::read_to_string(path).unwrap();
+    let rows: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let overlay: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "remote.live_overlay")
+        .collect();
+    assert_eq!(overlay.len(), 1);
+    assert_eq!(overlay[0]["level"], "info");
+    assert_eq!(overlay[0]["kind"], "state");
+    let state = rows
+        .iter()
+        .find(|row| {
+            row["event"] == "remote.auto_sync_host"
+                && row["message"].as_str().unwrap().contains("host=dev ")
+        })
+        .unwrap();
+    assert!(
+        state["message"]
+            .as_str()
+            .unwrap()
+            .contains("globalEnabled=false hostEnabled=true paired=true")
+    );
+    assert!(
+        state["message"]
+            .as_str()
+            .unwrap()
+            .contains("reason=global-disabled")
+    );
+    let stale = rows
+        .iter()
+        .find(|row| {
+            row["event"] == "collection.warning"
+                && row["message"].as_str().unwrap().contains("is stale")
+        })
+        .unwrap();
+    assert_eq!(stale["level"], "warn");
+    assert!(
+        rows.iter().any(|row| row["event"] == "diagnostic.resolved"
+            && row["diagnosticId"] == stale["diagnosticId"])
+    );
+}
+
+#[test]
 fn event_log_tui_captures_diagnostics_and_failed_settings_save() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("events.jsonl");

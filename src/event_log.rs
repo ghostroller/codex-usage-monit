@@ -1,5 +1,5 @@
 //! Persistent application diagnostics, separate from content-free timing traces.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,8 +41,19 @@ struct Inner {
 struct State {
     writer: Option<JsonlWriter>,
     error: Option<String>,
-    previous: BTreeMap<&'static str, BTreeSet<String>>,
+    previous: BTreeMap<&'static str, BTreeMap<String, (LogLevel, &'static str)>>,
     sequence: u64,
+}
+
+#[derive(Default)]
+struct RecordContext<'a> {
+    kind: Option<&'static str>,
+    status: Option<&'static str>,
+    operation: Option<&'a str>,
+    subject: Option<&'a str>,
+    diagnostic: Option<(&'a str, &'static str)>,
+    // A recovery closes an already visible diagnostic even at warn/error level.
+    filter_level: Option<LogLevel>,
 }
 
 impl fmt::Debug for EventLog {
@@ -146,6 +157,7 @@ impl EventLog {
             &mut state,
             json!({
                 "schemaVersion": 1, "event": "session_start", "at": Utc::now(),
+                "level": "info", "kind": "lifecycle", "status": "started", "sequence": 0,
                 "runId": inner.run_id, "pid": std::process::id(),
                 "version": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH, "logLevel": inner.level,
@@ -155,7 +167,20 @@ impl EventLog {
     }
 
     pub fn record(&self, level: LogLevel, event: &'static str, message: &str) {
-        self.record_context(level, event, message, None, None);
+        self.record_context(level, event, message, RecordContext::default());
+    }
+
+    pub fn lifecycle(&self, event: &'static str, status: &'static str, message: &str) {
+        self.record_context(
+            LogLevel::Info,
+            event,
+            message,
+            RecordContext {
+                kind: Some("lifecycle"),
+                status: Some(status),
+                ..RecordContext::default()
+            },
+        );
     }
 
     fn record_context(
@@ -163,11 +188,10 @@ impl EventLog {
         level: LogLevel,
         event: &'static str,
         message: &str,
-        operation: Option<&str>,
-        subject: Option<&str>,
+        context: RecordContext<'_>,
     ) {
         let Some(inner) = &self.inner else { return };
-        if level == LogLevel::Off || level > inner.level {
+        if level == LogLevel::Off || context.filter_level.unwrap_or(level) > inner.level {
             return;
         }
         let mut message = sanitize_message(message);
@@ -176,7 +200,7 @@ impl EventLog {
                 .replace(home, "<home>")
                 .replace(&home.replace('\\', "/"), "<home>");
         }
-        if let Some(subject) = subject.filter(|value| !value.is_empty()) {
+        if let Some(subject) = context.subject.filter(|value| !value.is_empty()) {
             message = message.replace(subject, "<source>");
         }
         let mut state = inner
@@ -190,19 +214,29 @@ impl EventLog {
             json!({
                 "schemaVersion": 1, "at": Utc::now(), "runId": inner.run_id,
                 "pid": std::process::id(), "sequence": sequence, "level": level,
-                "event": event, "message": message, "operationId": operation,
-                "sourceId": subject.map(fingerprint),
+                "event": event, "message": message, "operationId": context.operation,
+                "sourceId": context.subject.map(fingerprint),
+                "kind": context.kind.unwrap_or(match level {
+                    LogLevel::Error | LogLevel::Warn => "diagnostic",
+                    LogLevel::Debug => "telemetry",
+                    _ => "state",
+                }),
+                "status": context.status,
+                "diagnosticId": context.diagnostic.map(|(id, _)| id),
+                "diagnosticEvent": context.diagnostic.map(|(_, event)| event),
                 "managedSession": inner.managed_session,
             }),
         );
     }
 
-    /// Emit only newly present issues. A resolved issue is eligible again on
-    /// recurrence; snapshots never cause one record per terminal redraw.
+    /// Emit state changes only. Diagnostics carry a stable ID and a recovery
+    /// when absent from the next complete observation. Info states do not emit
+    /// recoveries. Absence means no longer observed, not independently verified.
     pub fn observe(&self, scope: &'static str, issues: &[(LogLevel, &'static str, String)]) {
         let Some(inner) = &self.inner else { return };
-        let mut current = BTreeSet::new();
+        let mut current = BTreeMap::new();
         let mut new = Vec::new();
+        let mut resolved = Vec::new();
         {
             let mut state = inner
                 .state
@@ -213,15 +247,55 @@ impl EventLog {
             }
             let previous = state.previous.entry(scope).or_default();
             for (level, event, message) in issues.iter().take(1024) {
-                let key = fingerprint(&format!("{level:?}:{event}:{message}"));
-                if current.insert(key.clone()) && !previous.contains(&key) {
-                    new.push((*level, *event, message));
+                if *level == LogLevel::Off || *level > inner.level {
+                    continue;
+                }
+                let key = fingerprint(&format!("{scope}:{level:?}:{event}:{message}"));
+                if current.insert(key.clone(), (*level, *event)).is_none()
+                    && !previous.contains_key(&key)
+                {
+                    new.push((key, *level, *event, message));
+                }
+            }
+            // A truncated observation cannot establish that omitted issues ended.
+            if issues.len() <= 1024 {
+                for (key, (level, event)) in previous.iter() {
+                    if *level <= LogLevel::Warn && !current.contains_key(key) {
+                        resolved.push((key.clone(), *level, *event));
+                    }
                 }
             }
             *previous = current;
         }
-        for (level, event, message) in new {
-            self.record(level, event, message);
+        for (key, level, event, message) in new {
+            self.record_context(
+                level,
+                event,
+                message,
+                RecordContext {
+                    status: Some(if level <= LogLevel::Warn {
+                        "active"
+                    } else {
+                        "observed"
+                    }),
+                    diagnostic: (level <= LogLevel::Warn).then_some((key.as_str(), event)),
+                    ..RecordContext::default()
+                },
+            );
+        }
+        for (key, original_level, event) in resolved {
+            self.record_context(
+                LogLevel::Info,
+                "diagnostic.resolved",
+                &format!("{event}: diagnostic no longer present in observed state"),
+                RecordContext {
+                    kind: Some("diagnostic"),
+                    status: Some("resolved"),
+                    diagnostic: Some((&key, event)),
+                    filter_level: Some(original_level),
+                    ..RecordContext::default()
+                },
+            );
         }
     }
 
@@ -241,8 +315,13 @@ impl EventLog {
             LogLevel::Info,
             event,
             "started",
-            Some(&operation.id),
-            Some(subject),
+            RecordContext {
+                kind: Some("operation"),
+                status: Some("started"),
+                operation: Some(&operation.id),
+                subject: Some(subject),
+                ..RecordContext::default()
+            },
         );
         operation
     }
@@ -275,8 +354,17 @@ impl OperationLog {
                 "{message} (durationMs={})",
                 self.started.elapsed().as_millis()
             ),
-            Some(&self.id),
-            Some(&self.subject),
+            RecordContext {
+                kind: Some("operation"),
+                status: Some(if level <= LogLevel::Warn {
+                    "failed"
+                } else {
+                    "completed"
+                }),
+                operation: Some(&self.id),
+                subject: Some(&self.subject),
+                ..RecordContext::default()
+            },
         );
     }
 }
@@ -439,11 +527,58 @@ mod tests {
         assert_eq!(operations[0]["operationId"], operations[1]["operationId"]);
         assert_ne!(operations[1]["operationId"], operations[2]["operationId"]);
         assert_eq!(operations[0]["sourceId"], operations[3]["sourceId"]);
+        assert_eq!(operations[0]["kind"], "operation");
+        assert_eq!(operations[0]["status"], "started");
+        assert_eq!(operations[1]["status"], "failed");
+        let recovery = records
+            .iter()
+            .find(|row| row["event"] == "diagnostic.resolved")
+            .unwrap();
+        assert_eq!(recovery["diagnosticId"], records[1]["diagnosticId"]);
+        assert_eq!(recovery["diagnosticEvent"], "history.warning");
+        assert_eq!(recovery["status"], "resolved");
         assert!(
             !std::fs::read_to_string(path)
                 .unwrap()
                 .contains("private-host")
         );
+    }
+
+    #[test]
+    fn event_log_recovery_closes_visible_diagnostics_without_promoting_filtered_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let log = EventLog::open(Some(path.clone()), LogLevel::Warn, false);
+        let issues = [
+            (LogLevel::Warn, "remote.history", "unavailable".to_owned()),
+            (
+                LogLevel::Info,
+                "remote.auto_sync",
+                "global-disabled".to_owned(),
+            ),
+        ];
+        log.observe("tui", &issues);
+        log.observe("tui", &[]);
+        log.observe("tui", &[]);
+        log.observe("tui", &issues);
+        let rows = records(&path);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1]["status"], "active");
+        assert_eq!(rows[2]["level"], "info");
+        assert_eq!(rows[2]["event"], "diagnostic.resolved");
+        assert_eq!(rows[1]["diagnosticId"], rows[2]["diagnosticId"]);
+        assert_eq!(rows[1]["diagnosticId"], rows[3]["diagnosticId"]);
+
+        let path = temp.path().join("info.jsonl");
+        let info = EventLog::open(Some(path.clone()), LogLevel::Info, false);
+        info.observe("states", &issues[1..]);
+        info.observe("states", &[]);
+        assert_eq!(
+            records(&path).len(),
+            2,
+            "normal state changes are not recoveries"
+        );
+        assert_eq!(records(&path)[1]["kind"], "state");
     }
 
     #[test]

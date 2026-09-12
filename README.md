@@ -540,6 +540,30 @@ error details to the parent, which writes the operation result to its own log.
 `--startup-log`, `--perf-log`, and `--trace-log` remain separate timing/performance
 streams and can be enabled alongside the application log using distinct paths.
 
+Application event records distinguish their purpose with `kind` and `status`:
+
+| Kind | Events and meaning |
+| --- | --- |
+| `lifecycle` | `tui.initializing`, `tui.ready` (first frame), and `tui.initialized` (initial data and history backend available, or legacy fallback marked `degraded`). |
+| `state` | Info-level `remote.auto_sync`, `remote.auto_sync_host`, and `remote.live_overlay`. They explain configuration/recorder eligibility and the live-versus-history display without raising a warning. Unchanged states are deduplicated. |
+| `diagnostic` | Observed TUI warnings/errors have `status: active` and a `diagnosticId`. `diagnostic.resolved` refers to the same ID and original `diagnosticEvent` when that specific issue is no longer observed. One-shot CLI failures are reported without an active/recovered state. |
+| `operation` | Manual operations carry `status: started`, `completed`, or `failed`, linked by `operationId`. |
+| `telemetry` | Debug-level `tui.refresh` counts explicitly distinguish `snapshotErrors`, `snapshotWarnings`, and `historyWarnings`; they are not a total of every diagnostic component. |
+
+Loading deferred history does not emit an unavailable warning. Actual legacy
+fallback and state-access failures remain diagnostics after initialization. Stale
+remote data remains a warning; the bounded live-overlay explanation is info.
+Auto-sync state reports observed switches and recorder heartbeat, not proof that
+an SSH attempt occurred. It does not change configuration or start the recorder.
+
+Use `--log-level info` or `debug` for lifecycle and state events. A recovery for
+an already logged warning/error is retained even at `warn`/`error` level, with
+`level: info`, so the original diagnostic can be closed. Recovery means the
+specific diagnostic disappeared from the observed state, not that connectivity
+was independently retested. If it recurs, another active record uses the same
+ID within the run. Existing log files retain their original contents and schema
+fields; these additional fields apply to new records.
+
 For Windows development, the PowerShell launcher enables all four streams and
 sets the application log level to `debug`:
 

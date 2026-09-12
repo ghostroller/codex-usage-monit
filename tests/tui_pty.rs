@@ -58,6 +58,7 @@ impl PtySession {
         command.env("CODEX_USAGE_MONIT_CACHE_DIR", temp.path().join("cache"));
         #[cfg(windows)]
         if mock_ssh {
+            command.args(["--log-level", "debug"]);
             // A real native process that rejects SSH arguments and writes to
             // stderr. Never start OpenSSH or contact any host in this test.
             let bin = temp.path().join("mock-ssh");
@@ -343,7 +344,16 @@ fn remote_setup_errors_are_visible_in_the_real_windows_tui() {
             .contains("system SSH exited")
     );
     assert!(failure["operationId"].is_string());
+    assert_eq!(failure["kind"], "operation");
+    assert_eq!(failure["status"], "failed");
     assert_ne!(failure["sourceId"], "mock-host");
+    for event in ["tui.initializing", "tui.ready"] {
+        assert!(
+            rows.iter()
+                .any(|row| row["event"] == event && row["kind"] == "lifecycle")
+        );
+    }
+    assert!(!rows.iter().any(|row| row["event"] == "remote.history"));
     session.send(b"3");
     session.wait_for("diagnostic details", |screen| {
         label_is_bold(screen, "Other") && screen.contents().contains("system SSH exited")
