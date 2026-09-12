@@ -3480,6 +3480,14 @@ fn render_models_content_for_scope(
         .collect()
 }
 
+fn models_details_content(app: &App) -> String {
+    models_details_lines(app)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn model_usage(model: &str, total_tokens: u64) -> ModelUsage {
     ModelUsage {
         model: model.to_string(),
@@ -5096,9 +5104,14 @@ fn models_panel_prioritizes_token_usage_and_reports_clipping() {
     assert!(compact.contains("Models · 5h · TOTAL"));
     assert!(compact.contains("TOTAL"));
     assert!(compact.contains("1.1K"));
-    assert!(!compact.contains("largest-model"));
-    assert!(!compact.contains("small-model"));
-    assert!(!compact.contains("medium-model"));
+    assert!(compact.contains("largest-model"));
+    assert!(compact.contains("small-model"));
+    assert!(compact.contains("medium-model"));
+
+    let clipped = render_models_content(&app.snapshot, 100, 5);
+    assert!(clipped.contains("grouped 3 models"));
+    assert!(clipped.contains("Attributed (3)"));
+    assert!(clipped.contains("TOTAL"));
 
     let expanded = render_models_content(&app.snapshot, 100, 10);
     let largest = expanded.find("largest-model").unwrap();
@@ -5201,7 +5214,7 @@ fn models_panel_exposes_tokens_that_cannot_be_attributed_to_a_model() {
 }
 
 #[test]
-fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
+fn models_panel_moves_explanations_to_diagnostics_and_keeps_rows_at_eighty_columns() {
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
     app.snapshot.window_analyses[0].partial = true;
@@ -5211,15 +5224,20 @@ fn models_panel_keeps_the_codex_share_formula_visible_at_eighty_columns() {
 
     let content = render_models_content(&app.snapshot, 80, 8);
 
-    assert!(content.contains("EST ~23.00pp"));
-    assert!(content.contains("codex gauge × credit-rate share"));
-    assert!(content.contains("Credit-rate-weighted quota proxy"));
-    assert!(content.contains("not server accounting"));
-    assert!(!content.contains("confidence"));
-    assert!(content.contains("external"));
-    assert!(content.contains("settled"));
-    assert!(content.contains("partial"));
-    assert!(content.contains("rollout_scan_incomplete"));
+    assert!(content.contains("gpt-window"));
+    assert!(content.contains("TOTAL"));
+    assert!(content.contains("partial (1)"));
+    assert!(content.contains("[I]Details"));
+    assert!(!content.contains("codex gauge"));
+    assert!(!content.contains("rollout_scan_incomplete"));
+    let details = models_details_content(&app);
+    assert!(details.contains("~23.00pp estimated"));
+    assert!(details.contains("codex gauge × credit-rate share"));
+    assert!(details.contains("Credit-rate-weighted quota proxy"));
+    assert!(details.contains("not server per-task accounting"));
+    assert!(details.contains("external possible"));
+    assert!(details.contains("settled"));
+    assert!(details.contains("rollout_scan_incomplete"));
     assert!(!content.contains("CONF"));
     assert!(!content.contains("evidence"));
     assert!(!content.contains("gap"));
@@ -5243,7 +5261,130 @@ fn compact_models_table_prioritizes_tokens_estimate_and_api_cost_without_confide
 }
 
 #[test]
-fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
+fn models_details_control_supports_keyboard_mouse_search_and_compact_themes() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for width in [40, 60, 120] {
+            let mut app = interaction_test_app(1, 1);
+            app.theme = theme;
+            add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
+            add_window_analysis(&mut app, WindowScope::Week, 222, 100.0);
+            app.snapshot.errors = vec!["Earlier diagnostic 中文 👩‍💻 ".repeat(100)];
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for scope in [WindowScope::FiveHours, WindowScope::Week] {
+                app.window_scope = scope;
+                app.set_view(View::Overview);
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let control = app.models_details_hitbox;
+                assert!(!control.is_empty());
+                let label = (control.x..control.right())
+                    .map(|x| terminal.backend().buffer()[(x, control.y)].symbol())
+                    .collect::<String>();
+                assert_eq!(label, "[I]Details");
+                let shortcut = &terminal.backend().buffer()[(control.x + 1, control.y)];
+                assert_eq!(shortcut.fg, theme.palette().accent);
+                assert!(shortcut.modifier.contains(Modifier::BOLD));
+                let suffix = &terminal.backend().buffer()[(control.x + 3, control.y)];
+                assert_eq!(suffix.fg, theme.palette().muted);
+
+                handle_key_event(&mut app, key_event(KeyCode::Char('I')));
+                assert_eq!(app.view, View::Health);
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                assert!(app.diagnostics_offset > 0);
+                assert!(!app.models_details_reveal_pending);
+                let content = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    content.contains(&format!("Models details · {}", scope.label())),
+                    "{content}"
+                );
+                assert_eq!(app.window_scope, scope);
+
+                // Every cell of the label activates the same destination.
+                for column in control.x..control.right() {
+                    app.set_view(View::Overview);
+                    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                    assert_eq!(app.models_details_hitbox, control);
+                    assert!(handle_mouse_event(
+                        &mut app,
+                        mouse_event(MouseEventKind::Down(MouseButton::Left), column, control.y)
+                    ));
+                    assert_eq!(app.view, View::Health);
+                }
+                app.set_view(View::Overview);
+                app.begin_task_search();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                assert_eq!(app.models_details_hitbox, control);
+                let shortcut = &terminal.backend().buffer()[(control.x + 1, control.y)];
+                assert_eq!(shortcut.fg, theme.palette().muted);
+                assert!(!shortcut.modifier.contains(Modifier::BOLD));
+                handle_key_event(&mut app, key_event(KeyCode::Char('I')));
+                assert_eq!(app.view, View::Overview);
+                assert!(app.task_search.ends_with('I'));
+                app.accept_active_search();
+            }
+            app.models_visible = false;
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(app.models_details_hitbox.is_empty());
+            handle_key_event(&mut app, key_event(KeyCode::Char('I')));
+            assert_eq!(app.view, View::Overview);
+        }
+    }
+}
+
+#[test]
+fn models_details_keep_long_partial_reasons_out_of_the_model_rows() {
+    let mut app = interaction_test_app(1, 1);
+    add_window_analysis(&mut app, WindowScope::Week, 1_110, 100.0);
+    app.window_scope = WindowScope::Week;
+    let analysis = &mut app.snapshot.window_analyses[0];
+    analysis.models = vec![
+        model_usage("largest-model", 1_000),
+        model_usage("medium-model", 100),
+        model_usage("small-model", 10),
+    ];
+    analysis.partial = true;
+    analysis.partial_reasons = vec![
+        "remote_api_model_breakdown_partial".to_string(),
+        "remote_history_bucket_partial".to_string(),
+        "remote_model_api_cost_partial".to_string(),
+        "remote_model_breakdown_partial".to_string(),
+        "remote_quota_estimate_partial".to_string(),
+        "remote_window_boundary_lower_bound".to_string(),
+        "unpriced_model_rate_fallback".to_string(),
+        "future_reason_中文\u{1b}[31m".to_string(),
+    ];
+    let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 80, 7);
+    for label in [
+        "largest-model",
+        "medium-model",
+        "small-model",
+        "TOTAL",
+        "partial (8)",
+    ] {
+        assert!(content.contains(label), "{content}");
+    }
+    assert!(!content.contains("remote_"));
+    let lines = models_details_lines(&app);
+    for reason in &app.snapshot.window_analyses[0].partial_reasons {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.to_string().contains(&terminal_safe_text(reason)))
+                .count(),
+            1
+        );
+    }
+    assert!(models_details_content(&app).contains("fallback weight used"));
+    assert!(!models_details_content(&app).contains('\u{1b}'));
+}
+
+#[test]
+fn models_panel_keeps_cost_column_and_moves_api_summary_to_details() {
     let mut app = interaction_test_app(1, 1);
     add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
     let analysis = &mut app.snapshot.window_analyses[0];
@@ -5263,20 +5404,19 @@ fn models_panel_shows_api_equivalent_summary_and_wide_cost_column() {
     analysis.models[0].api_equivalent_cost = exact_api_cost(250_000_000_000);
 
     let wide = render_models_content(&app.snapshot, 120, 12);
-    assert!(wide.contains("API equivalent $1.2345"));
-    assert!(wide.contains("model calls only"));
-    assert!(wide.contains("coverage 75.0%"));
-    assert!(wide.contains("rates 2026-09-07"));
+    assert!(!wide.contains("API equivalent"));
     assert!(wide.contains("API EQ."));
     assert!(wide.contains("$0.2500"));
 
     let compact = render_models_content(&app.snapshot, 80, 12);
-    assert!(compact.contains("API equivalent $1.2345"));
-    assert!(compact.contains("model calls only"));
-    assert!(compact.contains("coverage 75.0%"));
-    assert!(compact.contains("rates 2026-09-07"));
+    assert!(!compact.contains("coverage"));
     assert!(compact.contains("API EQ."));
     assert!(compact.contains("$0.2500"));
+    let details = models_details_content(&app);
+    assert!(details.contains("API equivalent $1.2345"));
+    assert!(details.contains("model calls only"));
+    assert!(details.contains("coverage 75.0%"));
+    assert!(details.contains("rates 2026-09-07"));
 }
 
 #[test]
@@ -5356,7 +5496,8 @@ fn models_panel_reports_missing_token_denominator_without_a_fake_estimate() {
     analysis.models.clear();
 
     let content = render_models_content_for_scope(&app.snapshot, WindowScope::Week, 120, 10);
-    assert!(content.contains("token denominator"));
+    app.window_scope = WindowScope::Week;
+    assert!(models_details_content(&app).contains("token denominator"));
     assert!(content.contains("No token usage in the current week window"));
     assert!(!content.contains("EST ~"));
 }
@@ -6740,7 +6881,7 @@ fn window_scope_shortcuts_and_mouse_switch_reset_cycle_data() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(content.contains("week reset cycle"));
+    assert!(models_details_content(&app).contains("week reset cycle"));
     assert!(content.contains("Week-cycle tasks"));
     assert!(content.contains("TOKENWK%"));
     assert!(content.contains("777"));
@@ -6986,7 +7127,7 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(initial_content.contains("[L]EST Longx"));
-    assert!(initial_content.contains("API equivalent $1.2345"));
+    assert!(models_details_content(&app).contains("API equivalent $1.2345"));
     assert!(initial_content.contains("$0.2500"));
     assert!(initial_content.contains("share="));
     assert!(initial_content.contains(" · est="));
@@ -7008,7 +7149,7 @@ fn api_long_context_toggle_uses_paired_estimates_and_keyboard_mouse_search_rules
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(content.contains("Models · 5h · EST Longx ON"));
-    assert!(content.contains("API equivalent $1.2345"));
+    assert!(models_details_content(&app).contains("API equivalent $1.2345"));
     assert!(content.contains("$0.2500"));
     assert!(content.contains("share="));
     assert!(content.contains(" · est="));
@@ -7527,7 +7668,8 @@ fn models_panel_visibility_uses_keyboard_mouse_and_search_priority() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(visible.contains("Attribution"));
+    assert!(visible.contains("[I]Details"));
+    assert!(!visible.contains("Attribution"));
 
     app.begin_task_search();
     handle_key_event(&mut app, key_event(KeyCode::Char('m')));
@@ -7567,7 +7709,7 @@ fn missing_selected_reset_cycle_is_explicitly_unavailable() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(content.contains("Week reset cycle unavailable"));
+    assert!(models_details_content(&app).contains("Week reset cycle unavailable"));
     assert!(content.contains("Models · Week unavailable"));
     assert!(!content.contains("No token usage in the current Week window"));
 }
@@ -7611,7 +7753,7 @@ fn window_partial_marker_follows_the_selected_scope() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(weekly.contains(" · partial"));
-    assert!(weekly.contains("~23.00pp estimated"));
+    assert!(models_details_content(&app).contains("~23.00pp estimated"));
     assert!(weekly.contains("~23.0%"));
 }
 
@@ -14780,7 +14922,9 @@ fn other_view_lists_every_reset_time_and_available_reset_credits() {
     ];
     for theme in [Theme::Dark, Theme::Light] {
         app.theme = theme;
-        for (width, height) in [(60, 24), (80, 24), (120, 40)] {
+        // Diagnostics now always includes scrollable model details, reserving
+        // two body rows; one extra terminal row fits every reset and credit.
+        for (width, height) in [(60, 25), (80, 25), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let content = terminal
@@ -14870,6 +15014,9 @@ fn other_diagnostics_scrollbar_reaches_wrapped_messages_with_mouse_and_keyboard(
             app.snapshot.warnings = vec!["WARNING_END".to_owned()];
             app.history.warnings = vec!["HISTORY_END".to_owned()];
             app.recorder_health.error = Some("RECORDER_END".to_owned());
+            add_window_analysis(&mut app, WindowScope::FiveHours, 111, 100.0);
+            app.snapshot.window_analyses[0].partial = true;
+            app.snapshot.window_analyses[0].partial_reasons = vec!["DETAILS_END".to_owned()];
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -14928,7 +15075,7 @@ fn other_diagnostics_scrollbar_reaches_wrapped_messages_with_mouse_and_keyboard(
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(
-                content.contains("recorder: RECORDER_END"),
+                content.contains("DETAILS_END"),
                 "{width}x{height}: {content}"
             );
             let bottom = app.diagnostics_scrollbar_hitbox.unwrap();
@@ -14995,10 +15142,19 @@ fn other_diagnostics_scrollbar_clamps_after_resize_and_issues_clear() {
             .saturating_sub(usize::from(app.diagnostics_viewport.height))
     );
 
+    let previous_offset = app.diagnostics_offset;
     app.snapshot.errors.clear();
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(
+        app.diagnostics_offset,
+        previous_offset.min(
+            app.diagnostics_line_count
+                .saturating_sub(usize::from(app.diagnostics_viewport.height))
+        )
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Home));
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
     assert_eq!(app.diagnostics_offset, 0);
-    assert!(app.diagnostics_scrollbar_hitbox.is_none());
     let content = terminal
         .backend()
         .buffer()
@@ -15008,7 +15164,11 @@ fn other_diagnostics_scrollbar_clamps_after_resize_and_issues_clear() {
         .collect::<String>();
     assert!(content.contains("No collection issues"));
     handle_key_event(&mut app, key_event(KeyCode::End));
-    assert_eq!(app.diagnostics_offset, 0);
+    assert_eq!(
+        app.diagnostics_offset,
+        app.diagnostics_line_count
+            .saturating_sub(usize::from(app.diagnostics_viewport.height))
+    );
     for (width, height) in [(8, 3), (1, 1)] {
         let mut tiny = Terminal::new(TestBackend::new(width, height)).unwrap();
         tiny.draw(|frame| render(frame, &mut app)).unwrap();
@@ -15104,9 +15264,9 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
         .map(|cell| cell.symbol())
         .collect::<String>();
 
-    assert!(content.contains("SHOWING 4/8"));
+    assert!(content.contains("SHOWING 3/8"));
     assert!(content.contains("WINDOWS 3/4"));
-    for (index, (granted_at, expires_at)) in credit_times.iter().take(4).enumerate() {
+    for (index, (granted_at, expires_at)) in credit_times.iter().take(3).enumerate() {
         assert!(content.contains(&format!("credit-{index}")));
         assert!(
             content.contains(
@@ -15125,7 +15285,7 @@ fn other_view_caps_many_credit_rows_and_keeps_diagnostics_intact() {
             )
         );
     }
-    for index in 4..8 {
+    for index in 3..8 {
         assert!(!content.contains(&format!("credit-{index}")));
     }
     for reset in [primary_reset, secondary_reset, review_primary_reset] {

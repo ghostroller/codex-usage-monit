@@ -34,13 +34,13 @@ rows:
 27|│                                                            ││turn=turn-main-2                                        │
 28|│                                                            ││message=Add deterministic TUI scenarios and snapshots   │
 29|└  R RUN   W WAIT   D DONE   X STOP   F FAIL   ? STALE  ─────┘└ gpt-5.3-codex · high ──────────────────────────────────┘
-30|┌ Models · 5h · TOTAL──────────────────────────────────────────────────────────────────────────────────────────────────┐
-31|│Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 │
-32|│10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              │
-33|│Credit-rate-weighted quota proxy, not server per-task accounting                                                      │
-34|│MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ.│
-35|│gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000│
-36|│TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000│
+30|┌ Models · 5h · TOTAL────────────────────────────────────────────────────────────────────────────────────────[I]Details┐
+31|│MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ.│
+32|│gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000│
+33|│TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000│
+34|│                                                                                                                      │
+35|│                                                                                                                      │
+36|│                                                                                                                      │
 37|│                                                                                                                      │
 38|│                                                                                                                      │
 39|└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -240,24 +240,25 @@ styles:
 30:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 30:001+007 fg=#f4f6f8 bg=#121417 mods=bold text=" Models"
 30:008+013 fg=#7e8691 bg=#121417 mods=none text=" · 5h · TOTAL"
-30:021+099 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────────────────────────────────────────────────────────────────────────┐"
+30:021+088 fg=#4b525c bg=#121417 mods=none text="────────────────────────────────────────────────────────────────────────────────────────"
+30:109+001 fg=#7e8691 bg=#121417 mods=none text="["
+30:110+001 fg=#3fb9c0 bg=#121417 mods=bold text="I"
+30:111+008 fg=#7e8691 bg=#121417 mods=none text="]Details"
+30:119+001 fg=#4b525c bg=#121417 mods=none text="┐"
 31:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-31:001+118 fg=#7e8691 bg=#121417 mods=none text="Attribution  5h reset cycle · 37.5% used · 07-12 01:30 to 07-12 06:30                                                 "
+31:001+118 fg=#3fb9c0 bg=#121417 mods=bold text="MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ."
 31:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 32:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-32:001+118 fg=#7e8691 bg=#121417 mods=none text="10.0K token total · ~37.50pp estimated · codex gauge × credit-rate share                                              "
+32:001+118 fg=#dadee4 bg=#121417 mods=none text="gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000"
 32:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 33:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-33:001+118 fg=#7e8691 bg=#121417 mods=none text="Credit-rate-weighted quota proxy, not server per-task accounting                                                      "
+33:001+118 fg=#f4f6f8 bg=#121417 mods=bold text="TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000"
 33:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 34:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-34:001+118 fg=#3fb9c0 bg=#121417 mods=bold text="MODEL                                                                   TOKENS       TOKEN SHARE  EST. QUOTA   API EQ."
 34:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 35:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-35:001+118 fg=#dadee4 bg=#121417 mods=none text="gpt-5.3-codex                                                           10.0K        100.0%       ~37.5%       $0.0000"
 35:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 36:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-36:001+118 fg=#f4f6f8 bg=#121417 mods=bold text="TOTAL                                                                   10.0K        100.0%       ~37.5%       $0.0000"
 36:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 37:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 37:119+001 fg=#4b525c bg=#121417 mods=none text="│"

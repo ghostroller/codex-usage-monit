@@ -291,6 +291,8 @@ The **Overview** tab combines account limits with Tasks, Turns, Models, and the 
 
 The default scan covers the last 7 days and at most 500 rollout files. The TUI refreshes changing local rollouts incrementally and refreshes remote account state less frequently.
 
+Models reserves its body for per-model usage and the `TOTAL` row. Click `[I]Details` in its title or press `i` on Overview to jump to **Other → Diagnostics → Models details** for the selected 5-hour or weekly cycle. This scrollable group contains the reset period, quota-estimation method, API pricing coverage/date, and individual partial-data reasons; Overview keeps a compact partial indicator and the table's estimate markers.
+
 ### Keyboard controls
 
 | Keys | Action |
@@ -315,6 +317,7 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 | `r`, `E`, `-`, `+` | Toggle flat/tree mode, collapse/expand all, or collapse/expand one parent. |
 | `a`, `d`, `s`, `c`, `[` / `]` | Filter All, Desktop, Subagent, or CLI sources, or cycle source filters. |
 | `v`, `m` | Show/hide Turns or Models. |
+| `i` on Overview | Open Models details in Other → Diagnostics when the Models details control is visible. |
 | `l` on Overview | Toggle the optional long-context multiplier for TUI quota `~EST` values (`EST Longx`). |
 | `↑` / `↓`, `Enter`, or the highlighted letter on Settings | Select or toggle a display/column preference. |
 | `o` | Open the selected stopped root task in a new Zellij pane, or offer a resume command for other terminals. |

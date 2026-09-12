@@ -23,9 +23,9 @@ rows:
 16|│rollout scan was incomplete                                                   │
 17|│app-server refresh failed                                                     │
 18|│                                                                              │
-19|│                                                                              │
-20|│                                                                              │
-21|│                                                                              │
+19|│Models details · 5h                                                           │
+20|│Attribution  5h reset cycle unavailable                                       │
+21|│No active quota window with duration and reset time                           │
 22|│                                                                              │
 23|└──────────────────────────────────────────────────────────────────────────────┘
 styles:
@@ -88,10 +88,13 @@ styles:
 18:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 18:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 19:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+19:001+019 fg=#3fb9c0 bg=#121417 mods=bold text="Models details · 5h"
 19:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 20:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+20:001+078 fg=#dadee4 bg=#121417 mods=none text="Attribution  5h reset cycle unavailable                                       "
 20:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 21:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+21:001+078 fg=#dadee4 bg=#121417 mods=none text="No active quota window with duration and reset time                           "
 21:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 22:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 22:079+001 fg=#4b525c bg=#121417 mods=none text="│"

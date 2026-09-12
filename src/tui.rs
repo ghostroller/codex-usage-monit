@@ -3444,6 +3444,8 @@ struct App {
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
     diagnostics_offset: usize,
+    models_details_hitbox: Rect,
+    models_details_reveal_pending: bool,
     diagnostics_viewport: Rect,
     diagnostics_line_count: usize,
     diagnostics_scrollbar_hitbox: Option<ScrollbarHitbox>,
@@ -3593,6 +3595,8 @@ impl App {
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
             diagnostics_offset: 0,
+            models_details_hitbox: Rect::default(),
+            models_details_reveal_pending: false,
             diagnostics_viewport: Rect::default(),
             diagnostics_line_count: 0,
             diagnostics_scrollbar_hitbox: None,
@@ -6186,6 +6190,7 @@ impl App {
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
         self.diagnostics_viewport = Rect::default();
+        self.models_details_hitbox = Rect::default();
         self.diagnostics_scrollbar_hitbox = None;
         self.scroll_drag = None;
         self.resume_confirmation_hitbox = None;
@@ -6816,6 +6821,9 @@ impl App {
     }
 
     fn set_view(&mut self, view: View) {
+        if view != View::Health {
+            self.models_details_reveal_pending = false;
+        }
         if self.view != view && self.turns_temporarily_visible {
             self.close_temporary_turns();
         }
@@ -7533,6 +7541,24 @@ impl App {
         );
     }
 
+    fn open_models_details(&mut self) {
+        self.accept_active_search();
+        self.set_view(View::Health);
+        self.models_details_reveal_pending = true;
+        self.scroll_drag = None;
+    }
+
+    fn activate_models_details_at(&mut self, column: u16, row: u16) -> bool {
+        if self.view != View::Overview
+            || !self.models_visible
+            || !rect_contains(self.models_details_hitbox, column, row)
+        {
+            return false;
+        }
+        self.open_models_details();
+        true
+    }
+
     fn scrollbar_hitbox(&self, target: ScrollTarget) -> Option<ScrollbarHitbox> {
         match target {
             ScrollTarget::Tasks => self.task_scrollbar_hitbox,
@@ -7842,6 +7868,7 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
             if app.activate_view_at(event.column, event.row)
                 || app.activate_setting_at(event.column, event.row)
                 || app.activate_window_control_at(event.column, event.row)
+                || app.activate_models_details_at(event.column, event.row)
                 || app.activate_trend_control_at(event.column, event.row)
                 || app.activate_summary_control_at(event.column, event.row)
                 || app.begin_trend_drag_at(event.column, event.row)
@@ -8484,6 +8511,13 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 && app.trend_section_control_visible(TrendSection::HalfHour) =>
         {
             app.set_trend_section(TrendSection::HalfHour);
+        }
+        KeyCode::Char('i' | 'I')
+            if app.view == View::Overview
+                && app.models_visible
+                && !app.models_details_hitbox.is_empty() =>
+        {
+            app.open_models_details();
         }
         KeyCode::Char('i' | 'I')
             if app.view == View::Trends && app.trend_inspect_control_visible() =>
@@ -11445,6 +11479,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
     app.diagnostics_viewport = Rect::default();
+    app.models_details_hitbox = Rect::default();
     app.diagnostics_scrollbar_hitbox = None;
     app.quit_confirmation_hitbox = None;
     app.resume_confirmation_hitbox = None;
@@ -17986,6 +18021,12 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.diagnostics_viewport = viewport;
     app.diagnostics_line_count = diagnostics.line_count(viewport.width);
     let capacity = usize::from(viewport.height);
+    if !viewport.is_empty() && std::mem::take(&mut app.models_details_reveal_pending) {
+        app.diagnostics_offset = Paragraph::new(diagnostics_issue_lines(app))
+            .wrap(Wrap { trim: true })
+            .line_count(viewport.width)
+            .saturating_add(1);
+    }
     app.diagnostics_offset = app
         .diagnostics_offset
         .min(app.diagnostics_line_count.saturating_sub(capacity));
@@ -18014,6 +18055,13 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
+    let mut lines = diagnostics_issue_lines(app);
+    lines.push(Line::default());
+    lines.extend(models_details_lines(app));
+    Paragraph::new(lines).wrap(Wrap { trim: true })
+}
+
+fn diagnostics_issue_lines(app: &App) -> Vec<Line<'static>> {
     let palette = app.theme.palette();
     let issues = app
         .remote_action_diagnostic
@@ -18081,7 +18129,7 @@ fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
             terminal_safe_text(&path.display().to_string())
         )));
     }
-    Paragraph::new(issues).wrap(Wrap { trim: true })
+    issues
 }
 
 fn recorder_panel_status(app: &App) -> String {
@@ -20056,6 +20104,78 @@ fn api_equivalent_summary_line(analysis: &WindowAnalysis) -> Option<String> {
     ))
 }
 
+fn models_details_lines(app: &App) -> Vec<Line<'static>> {
+    let scope = app.window_scope;
+    let analysis = window_analysis_with_api_long_context(
+        &app.snapshot,
+        scope,
+        app.api_long_context_multiplier,
+    );
+    let attribution = attribution_for_scope_with_api_long_context(
+        &app.snapshot,
+        scope,
+        app.api_long_context_multiplier,
+    );
+    let partial = analysis
+        .map(|value| value.partial)
+        .unwrap_or(scope == WindowScope::FiveHours && app.snapshot.partial);
+    // Keep each reason on its own line, including unknown future reason codes.
+    let mut summaries = attribution_summary_lines(attribution, scope, partial, &[], false);
+    if let Some(api_summary) =
+        window_analysis(&app.snapshot, scope).and_then(api_equivalent_summary_line)
+    {
+        summaries.insert(summaries.len().min(2), api_summary);
+    }
+    let palette = app.theme.palette();
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "Models details · {}{}",
+            scope.label(),
+            if app.api_long_context_multiplier {
+                " · EST Longx ON"
+            } else {
+                ""
+            }
+        ),
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(summaries.into_iter().map(Line::from));
+    if let Some(analysis) = analysis {
+        for reason in &analysis.partial_reasons {
+            let explanation = match reason.as_str() {
+                "remote_api_model_breakdown_partial" => {
+                    "Some remote API cost cannot be assigned to the listed models"
+                }
+                "remote_history_bucket_partial" => "Remote history contains incomplete buckets",
+                "remote_model_api_cost_partial" => "Some remote model API costs are incomplete",
+                "remote_model_breakdown_partial" => {
+                    "Some remote usage lacks a complete model breakdown"
+                }
+                "remote_quota_estimate_partial" => {
+                    "Some remote usage lacks data for quota estimates"
+                }
+                "remote_window_boundary_lower_bound" => {
+                    "History buckets cross the reset boundary; usage may be understated"
+                }
+                "unpriced_model_rate_fallback" => "Unknown Codex credit rate; fallback weight used",
+                "quota_window_stale" => "Quota window data is stale or unverified",
+                "token_breakdown_missing" => {
+                    "Token categories are incomplete; fallback weight used"
+                }
+                "long_context_usage_unknown" => "Long-context usage could not be determined",
+                _ => "Incomplete data or estimate",
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {explanation} ({})", terminal_safe_text(reason)),
+                Style::default().fg(palette.warning),
+            )));
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 fn models_for_scope(snapshot: &Snapshot, scope: WindowScope) -> Vec<ModelUsage> {
     models_for_scope_with_api_long_context(snapshot, scope, false)
@@ -20075,16 +20195,6 @@ fn models_for_scope_with_api_long_context(
                 Vec::new()
             }
         })
-}
-
-fn wrapped_text_height(lines: &[String], width: usize) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    lines
-        .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()).max(1).div_ceil(width))
-        .sum()
 }
 
 fn model_visible_columns(
@@ -20421,36 +20531,13 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .then_with(|| left.model.cmp(&right.model))
     });
 
-    let panel_inner = Block::default().borders(Borders::ALL).inner(area);
-    let compact = panel_inner.width < 100;
-    let api_summary_line = api_cost_analysis.and_then(api_equivalent_summary_line);
+    let model_area = Block::default().borders(Borders::ALL).inner(area);
     let selected_partial = analysis
         .map(|analysis| analysis.partial)
         .unwrap_or(window_scope == WindowScope::FiveHours && app.snapshot.partial);
     let partial_reasons = analysis
         .map(|analysis| analysis.partial_reasons.as_slice())
         .unwrap_or_default();
-    let mut attribution_lines = attribution_summary_lines(
-        attribution,
-        window_scope,
-        selected_partial,
-        partial_reasons,
-        compact,
-    );
-    if let Some(api_summary_line) = api_summary_line {
-        attribution_lines.insert(attribution_lines.len().min(2), api_summary_line);
-    }
-    let attribution_height = u16::try_from(wrapped_text_height(
-        &attribution_lines,
-        usize::from(panel_inner.width),
-    ))
-    .unwrap_or(u16::MAX)
-    .min(panel_inner.height);
-    let regions = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(attribution_height), Constraint::Min(0)])
-        .split(panel_inner);
-    let model_area = regions[1];
     let visible_capacity = usize::from(model_area.height.saturating_sub(1));
     let (display_rows, display_projection) = model_table_display_rows(
         &models,
@@ -20480,6 +20567,12 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if attribution.is_none() {
         title_suffix.push_str(" unavailable");
     }
+    if selected_partial {
+        title_suffix.push_str(" · partial");
+        if !partial_reasons.is_empty() {
+            title_suffix.push_str(&format!(" ({})", partial_reasons.len()));
+        }
+    }
     if display_projection.aggregated_models > 0 {
         if display_projection.direct_models == 0 {
             title_suffix.push_str(&format!(
@@ -20507,19 +20600,7 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     } else if display_projection.has_unattributed_api_cost {
         title_suffix.push_str(" · unattributed API EQ.");
     }
-    frame.render_widget(models_panel_block(app, &title_suffix), area);
-
-    frame.render_widget(
-        Paragraph::new(
-            attribution_lines
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        )
-        .style(Style::default().fg(theme.palette().muted))
-        .wrap(Wrap { trim: true }),
-        regions[0],
-    );
+    app.models_details_hitbox = render_models_panel(frame, area, app, &title_suffix);
 
     if model_area.is_empty() {
         return;
@@ -20622,8 +20703,22 @@ fn has_active_window(snapshot: &Snapshot, duration_mins: i64) -> bool {
         })
 }
 
-fn models_panel_block(app: &App, suffix: &str) -> Block<'static> {
+fn render_models_panel(frame: &mut Frame<'_>, area: Rect, app: &App, suffix: &str) -> Rect {
     let palette = app.theme.palette();
+    let control_label = "[I]Details";
+    let control_width = UnicodeWidthStr::width(control_label) as u16;
+    let control = if area.height > 0 && area.width >= control_width + 16 {
+        Rect::new(area.right() - 1 - control_width, area.y, control_width, 1)
+    } else {
+        Rect::default()
+    };
+    let suffix_width = usize::from(area.width.saturating_sub(
+        12 + if control.is_empty() {
+            0
+        } else {
+            control_width + 1
+        },
+    ));
     let spans = vec![
         Span::styled(
             " Models",
@@ -20632,14 +20727,39 @@ fn models_panel_block(app: &App, suffix: &str) -> Block<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" · {}", terminal_safe_text(suffix)),
+            format!(
+                " · {}",
+                truncate_display_text(&terminal_safe_text(suffix), suffix_width)
+            ),
             Style::default().fg(palette.muted),
         ),
     ];
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.border))
-        .title(Line::from(spans))
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(Line::from(spans)),
+        area,
+    );
+    if !control.is_empty() {
+        let style = Style::default().fg(palette.muted);
+        let shortcut = if app.shortcuts_active() {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[", style),
+                Span::styled("I", shortcut),
+                Span::styled("]Details", style),
+            ])),
+            control,
+        );
+    }
+    control
 }
 
 fn panel(title: &str, theme: Theme) -> Block<'_> {

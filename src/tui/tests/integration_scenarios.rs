@@ -2629,6 +2629,15 @@ fn svg_gallery_is_generated_from_the_same_semantic_frames() {
     other.key(KeyCode::Char('3'));
     scenarios.push(("other-normal-80x24", other));
 
+    for (name, width, height, theme) in [
+        ("models-details-dark-120x40", 120, 40, Theme::Dark),
+        ("models-details-compact-60x24", 60, 24, Theme::Light),
+    ] {
+        let mut details = TuiHarness::from_fixture("normal", width, height, theme);
+        details.key(KeyCode::Char('I'));
+        scenarios.push((name, details));
+    }
+
     scenarios.push((
         "overview-empty-80x24",
         TuiHarness::from_fixture("empty", 80, 24, Theme::Dark),
