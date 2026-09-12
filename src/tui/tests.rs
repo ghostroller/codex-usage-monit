@@ -11827,6 +11827,151 @@ fn install_project_mapping_fixture(app: &mut App, directory: &Path) -> ProjectMa
 }
 
 #[test]
+fn settings_project_mapping_scrollbar_supports_mouse_and_keyboard_navigation() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(60, 14), (80, 24), (120, 40)] {
+            let mut app = interaction_test_app(0, 0);
+            app.view = View::Settings;
+            app.theme = theme;
+            app.project_mappings.rows = (0..40)
+                .map(|index| ProjectMappingSettingsRow::Suggestion {
+                    key: format!("suggestion-{index}"),
+                    instance_ids: Vec::new(),
+                    proposed_label: format!("project-{index:02}").parse().unwrap(),
+                    evidence: "matching repository".to_owned(),
+                })
+                .collect();
+            let base = app.project_mapping_selection_base();
+            app.selected_setting = base;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let controls = app.settings_controls_hitbox.clone().unwrap();
+            let scrollbar = controls.project_scrollbar.expect("overflow scrollbar");
+            let table = controls.project_table.unwrap();
+            assert_eq!(scrollbar.thumb.y, scrollbar.track.y);
+            assert_eq!(scrollbar.track.x, table.rows.right());
+            assert_eq!(scrollbar.track.bottom(), controls.project_accept.y);
+            let thumb = &terminal.backend().buffer()[(scrollbar.thumb.x, scrollbar.thumb.y)];
+            assert_eq!(thumb.symbol(), "█");
+            assert_eq!(thumb.fg, theme.palette().accent);
+
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::ScrollDown, table.rows.x, table.rows.y),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, MOUSE_SCROLL_LINES);
+            assert_eq!(app.selected_setting, base);
+
+            // Clicking the track and dragging the thumb reach both endpoints
+            // without changing the selected mapping or snapping back on redraw.
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    scrollbar.track.x,
+                    scrollbar.track.bottom() - 1,
+                ),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, scrollbar.max_offset);
+            let bottom = app
+                .settings_controls_hitbox
+                .as_ref()
+                .unwrap()
+                .project_scrollbar
+                .unwrap();
+            assert_eq!(bottom.thumb.bottom(), bottom.track.bottom());
+            assert_eq!(app.selected_setting, base);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            ));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    bottom.thumb.x,
+                    bottom.thumb.y
+                ),
+            ));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            ));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, 0);
+
+            handle_key_event(&mut app, key_event(KeyCode::End));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, scrollbar.max_offset);
+            assert_eq!(app.selected_setting, base + 39);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::ScrollUp,
+                    scrollbar.track.x,
+                    scrollbar.track.y
+                ),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(
+                app.project_mapping_offset,
+                scrollbar.max_offset - MOUSE_SCROLL_LINES
+            );
+
+            let controls = app.settings_controls_hitbox.as_ref().unwrap();
+            let first_visible = controls
+                .project_rows
+                .iter()
+                .position(|row| !row.is_empty())
+                .unwrap();
+            let row = controls.project_rows[first_visible];
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    row.right() - 1,
+                    row.y
+                ),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.selected_setting, base + first_visible);
+            assert_eq!(app.project_mapping_offset, first_visible);
+            handle_key_event(&mut app, key_event(KeyCode::Up));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, first_visible - 1);
+
+            // Shrinking the data clears obsolete scrollbars and clamps the view.
+            app.project_mappings.rows.truncate(1);
+            app.selected_setting = base;
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.project_mapping_offset, 0);
+            assert!(
+                app.settings_controls_hitbox
+                    .as_ref()
+                    .unwrap()
+                    .project_scrollbar
+                    .is_none()
+            );
+            app.project_mappings.rows.clear();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(
+                app.settings_controls_hitbox
+                    .as_ref()
+                    .unwrap()
+                    .project_scrollbar
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn settings_project_mappings_render_and_keyboard_actions_use_explicit_cas() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = interaction_test_app(0, 0);
@@ -14315,6 +14460,169 @@ fn other_view_lists_every_reset_time_and_available_reset_credits() {
                 assert!(content.matches("secondary").count() >= 2);
             }
         }
+    }
+}
+
+#[test]
+fn other_diagnostics_scrollbar_reaches_wrapped_messages_with_mouse_and_keyboard() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(40, 10), (60, 14), (80, 24), (120, 40)] {
+            let mut app = interaction_test_app(3, 3);
+            app.view = View::Health;
+            app.theme = theme;
+            app.snapshot.errors = vec![
+                "REMOTE_START".to_owned(),
+                format!(
+                    "ERROR_START {} ERROR_END",
+                    "long diagnostic 中文 👩‍💻 ".repeat(200)
+                ),
+            ];
+            app.snapshot.warnings = vec!["WARNING_END".to_owned()];
+            app.history.warnings = vec!["HISTORY_END".to_owned()];
+            app.recorder_health.error = Some("RECORDER_END".to_owned());
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+            let viewport = app.diagnostics_viewport;
+            let scrollbar = app.diagnostics_scrollbar_hitbox.unwrap_or_else(|| {
+                panic!(
+                    "{width}x{height}: viewport={viewport:?}, wrapped lines={}",
+                    app.diagnostics_line_count
+                )
+            });
+            assert!(viewport.height >= 2);
+            assert!(app.diagnostics_line_count > 5);
+            assert_eq!(scrollbar.track.x, viewport.right());
+            assert_eq!(scrollbar.track.y, viewport.y);
+            assert_eq!(scrollbar.track.height, viewport.height);
+            assert_eq!(scrollbar.thumb.y, scrollbar.track.y);
+            let thumb = &terminal.backend().buffer()[(scrollbar.thumb.x, scrollbar.thumb.y)];
+            assert_eq!(thumb.symbol(), "█");
+            assert_eq!(thumb.fg, theme.palette().accent);
+            assert!(thumb.modifier.contains(Modifier::BOLD));
+
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::ScrollDown, viewport.x, viewport.y),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.diagnostics_offset, MOUSE_SCROLL_LINES);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::ScrollUp,
+                    scrollbar.track.x,
+                    scrollbar.track.y
+                ),
+            ));
+            assert_eq!(app.diagnostics_offset, 0);
+            handle_key_event(&mut app, key_event(KeyCode::Down));
+            assert_eq!(app.diagnostics_offset, 1);
+            handle_key_event(&mut app, key_event(KeyCode::Up));
+            assert_eq!(app.diagnostics_offset, 0);
+            handle_key_event(&mut app, key_event(KeyCode::PageDown));
+            assert_eq!(
+                app.diagnostics_offset,
+                usize::from(viewport.height).min(scrollbar.max_offset)
+            );
+            handle_key_event(&mut app, key_event(KeyCode::PageUp));
+            assert_eq!(app.diagnostics_offset, 0);
+            handle_key_event(&mut app, key_event(KeyCode::End));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.diagnostics_offset, scrollbar.max_offset);
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                content.contains("recorder: RECORDER_END"),
+                "{width}x{height}: {content}"
+            );
+            let bottom = app.diagnostics_scrollbar_hitbox.unwrap();
+            assert_eq!(bottom.thumb.bottom(), bottom.track.bottom());
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    bottom.thumb.x,
+                    bottom.thumb.y
+                ),
+            ));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            ));
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.diagnostics_offset, 0);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    scrollbar.track.x,
+                    scrollbar.track.bottom() - 1
+                ),
+            ));
+            assert_eq!(app.diagnostics_offset, scrollbar.max_offset);
+            handle_mouse_event(
+                &mut app,
+                mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            );
+            handle_key_event(&mut app, key_event(KeyCode::Home));
+            assert_eq!(app.diagnostics_offset, 0);
+            assert_eq!(app.selected_task, 0);
+            assert_eq!(app.selected_turn, 0);
+
+            app.view = View::Overview;
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(app.diagnostics_viewport.is_empty());
+            assert!(app.diagnostics_scrollbar_hitbox.is_none());
+        }
+    }
+}
+
+#[test]
+fn other_diagnostics_scrollbar_clamps_after_resize_and_issues_clear() {
+    let mut app = interaction_test_app(0, 0);
+    app.view = View::Health;
+    app.snapshot.errors = vec!["wrapped error ".repeat(80)];
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    handle_key_event(&mut app, key_event(KeyCode::End));
+    let narrow_offset = app.diagnostics_offset;
+    let mut wide = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    wide.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(app.diagnostics_offset < narrow_offset);
+    assert_eq!(
+        app.diagnostics_offset,
+        app.diagnostics_line_count
+            .saturating_sub(usize::from(app.diagnostics_viewport.height))
+    );
+
+    app.snapshot.errors.clear();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(app.diagnostics_offset, 0);
+    assert!(app.diagnostics_scrollbar_hitbox.is_none());
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("No collection issues"));
+    handle_key_event(&mut app, key_event(KeyCode::End));
+    assert_eq!(app.diagnostics_offset, 0);
+    for (width, height) in [(8, 3), (1, 1)] {
+        let mut tiny = Terminal::new(TestBackend::new(width, height)).unwrap();
+        tiny.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.diagnostics_scrollbar_hitbox.is_none());
     }
 }
 

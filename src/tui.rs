@@ -2495,6 +2495,8 @@ struct SettingsControlsHitbox {
     remote_sync_enabled: bool,
     remote_include_enabled: bool,
     project_rows: Vec<Rect>,
+    project_table: Option<TableHitbox>,
+    project_scrollbar: Option<ScrollbarHitbox>,
     project_accept: Rect,
     project_toggle: Rect,
     project_merge: Rect,
@@ -3204,6 +3206,8 @@ enum ScrollTarget {
     Tasks,
     Turns,
     Summary,
+    ProjectMappings,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3358,6 +3362,8 @@ struct App {
     remote_sources: RemoteSourcesState,
     remote_config_store: RemotesConfigStore,
     project_mappings: ProjectMappingsSettingsState,
+    project_mapping_offset: usize,
+    project_mapping_reveal_pending: bool,
     project_mapping_store: ProjectMappingStore,
     remote_source_history_store: Option<SourceHistoryStore>,
     remote_live_states: Vec<SourceRemoteLiveSnapshot>,
@@ -3433,6 +3439,10 @@ struct App {
     view_tabs_hitbox: Option<ViewTabsHitbox>,
     task_scrollbar_hitbox: Option<ScrollbarHitbox>,
     turn_scrollbar_hitbox: Option<ScrollbarHitbox>,
+    diagnostics_offset: usize,
+    diagnostics_viewport: Rect,
+    diagnostics_line_count: usize,
+    diagnostics_scrollbar_hitbox: Option<ScrollbarHitbox>,
     scroll_drag: Option<ScrollDrag>,
     quit_confirmation_visible: bool,
     quit_confirmation_hitbox: Option<QuitConfirmationHitbox>,
@@ -3501,6 +3511,8 @@ impl App {
             remote_sources: RemoteSourcesState::default(),
             remote_config_store: RemotesConfigStore::discover(),
             project_mappings: ProjectMappingsSettingsState::default(),
+            project_mapping_offset: 0,
+            project_mapping_reveal_pending: true,
             project_mapping_store: ProjectMappingStore::discover(),
             remote_source_history_store: None,
             remote_live_states: Vec::new(),
@@ -3571,6 +3583,10 @@ impl App {
             view_tabs_hitbox: None,
             task_scrollbar_hitbox: None,
             turn_scrollbar_hitbox: None,
+            diagnostics_offset: 0,
+            diagnostics_viewport: Rect::default(),
+            diagnostics_line_count: 0,
+            diagnostics_scrollbar_hitbox: None,
             scroll_drag: None,
             quit_confirmation_visible: false,
             quit_confirmation_hitbox: None,
@@ -4715,6 +4731,7 @@ impl App {
     }
 
     fn move_setting_selection(&mut self, forward: bool) {
+        self.project_mapping_reveal_pending = true;
         let last = self.settings_selection_count().saturating_sub(1);
         self.selected_setting = if forward {
             (self.selected_setting + 1).min(last)
@@ -4760,7 +4777,11 @@ impl App {
                 .selected_setting
                 .min(self.settings_selection_count().saturating_sub(1));
         }
-        self.project_mappings != previous
+        let changed = self.project_mappings != previous;
+        if self.project_mappings.rows != previous.rows {
+            self.project_mapping_reveal_pending = true;
+        }
+        changed
     }
 
     fn accept_selected_project_merge(&mut self) {
@@ -6137,6 +6158,8 @@ impl App {
         self.view_tabs_hitbox = None;
         self.task_scrollbar_hitbox = None;
         self.turn_scrollbar_hitbox = None;
+        self.diagnostics_viewport = Rect::default();
+        self.diagnostics_scrollbar_hitbox = None;
         self.scroll_drag = None;
         self.resume_confirmation_hitbox = None;
         self.restore_overview_refresh_anchor(anchor);
@@ -6743,6 +6766,7 @@ impl App {
             .position(|area| rect_contains(*area, column, row))
         {
             self.selected_setting = self.project_mapping_selection_base() + index;
+            self.project_mapping_reveal_pending = true;
             return true;
         }
         if hitbox.project_accept_enabled && rect_contains(hitbox.project_accept, column, row) {
@@ -6778,6 +6802,7 @@ impl App {
         }
         self.view = view;
         if view == View::Settings {
+            self.project_mapping_reveal_pending = true;
             self.reload_project_mappings();
         }
     }
@@ -7468,16 +7493,36 @@ impl App {
         self.select_turn(index, false)
     }
 
+    fn scroll_diagnostics(&mut self, down: bool, lines: usize) {
+        if self.diagnostics_viewport.is_empty() {
+            return;
+        }
+        self.diagnostics_offset = scroll_offset(
+            self.diagnostics_offset,
+            self.diagnostics_line_count,
+            usize::from(self.diagnostics_viewport.height),
+            down,
+            lines,
+        );
+    }
+
     fn scrollbar_hitbox(&self, target: ScrollTarget) -> Option<ScrollbarHitbox> {
         match target {
             ScrollTarget::Tasks => self.task_scrollbar_hitbox,
             ScrollTarget::Turns => self.turn_scrollbar_hitbox,
             ScrollTarget::Summary => self.summary_scrollbar_hitbox,
+            ScrollTarget::Diagnostics => self.diagnostics_scrollbar_hitbox,
+            ScrollTarget::ProjectMappings => self
+                .settings_controls_hitbox
+                .as_ref()
+                .and_then(|hitbox| hitbox.project_scrollbar),
         }
     }
 
     fn begin_scrollbar_drag_at(&mut self, column: u16, row: u16) -> bool {
         let Some((target, hitbox)) = [
+            ScrollTarget::Diagnostics,
+            ScrollTarget::ProjectMappings,
             ScrollTarget::Summary,
             ScrollTarget::Turns,
             ScrollTarget::Tasks,
@@ -7494,7 +7539,7 @@ impl App {
         match target {
             ScrollTarget::Tasks => self.transition_to_tasks(),
             ScrollTarget::Turns => self.focus = Focus::Turns,
-            ScrollTarget::Summary => {}
+            ScrollTarget::Summary | ScrollTarget::ProjectMappings | ScrollTarget::Diagnostics => {}
         }
         let on_thumb = rect_contains(hitbox.thumb, column, row);
         self.scroll_drag = Some(ScrollDrag {
@@ -7543,6 +7588,11 @@ impl App {
                 self.turn_offset = offset;
             }
             ScrollTarget::Summary => self.summary_offset = offset,
+            ScrollTarget::Diagnostics => self.diagnostics_offset = offset,
+            ScrollTarget::ProjectMappings => {
+                self.project_mapping_reveal_pending = false;
+                self.project_mapping_offset = offset;
+            }
         }
         true
     }
@@ -7816,7 +7866,36 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = matches!(event.kind, MouseEventKind::ScrollDown);
-            if app
+            if rect_contains(app.diagnostics_viewport, event.column, event.row)
+                || app
+                    .diagnostics_scrollbar_hitbox
+                    .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
+            {
+                app.scroll_diagnostics(down, MOUSE_SCROLL_LINES);
+                true
+            } else if let Some(hitbox) = app
+                .settings_controls_hitbox
+                .as_ref()
+                .filter(|hitbox| {
+                    hitbox
+                        .project_table
+                        .is_some_and(|table| table.contains_viewport(event.column, event.row))
+                        || hitbox.project_scrollbar.is_some_and(|scrollbar| {
+                            rect_contains(scrollbar.track, event.column, event.row)
+                        })
+                })
+                .and_then(|hitbox| hitbox.project_table)
+            {
+                app.project_mapping_reveal_pending = false;
+                app.project_mapping_offset = scroll_offset(
+                    app.project_mapping_offset,
+                    app.project_mappings.rows.len(),
+                    hitbox.capacity,
+                    down,
+                    MOUSE_SCROLL_LINES,
+                );
+                true
+            } else if app
                 .summary_scrollbar_hitbox
                 .is_some_and(|hitbox| rect_contains(hitbox.track, event.column, event.row))
                 || app
@@ -8334,11 +8413,26 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 app.toggle_setting(item);
             }
         }
+        KeyCode::Down if app.view == View::Health => app.scroll_diagnostics(true, 1),
+        KeyCode::Up if app.view == View::Health => app.scroll_diagnostics(false, 1),
+        KeyCode::PageDown if app.view == View::Health => {
+            app.scroll_diagnostics(true, usize::from(app.diagnostics_viewport.height));
+        }
+        KeyCode::PageUp if app.view == View::Health => {
+            app.scroll_diagnostics(false, usize::from(app.diagnostics_viewport.height));
+        }
+        KeyCode::Home if app.view == View::Health => app.scroll_diagnostics(false, usize::MAX),
+        KeyCode::End if app.view == View::Health => app.scroll_diagnostics(true, usize::MAX),
         KeyCode::Down if app.view == View::Settings => app.move_setting_selection(true),
         KeyCode::Up if app.view == View::Settings => app.move_setting_selection(false),
-        KeyCode::Home if app.view == View::Settings => app.selected_setting = 0,
+        KeyCode::Home if app.view == View::Settings => {
+            app.selected_setting = 0;
+            app.project_mapping_offset = 0;
+            app.project_mapping_reveal_pending = true;
+        }
         KeyCode::End if app.view == View::Settings => {
             app.selected_setting = app.settings_selection_count().saturating_sub(1);
+            app.project_mapping_reveal_pending = true;
         }
         KeyCode::Char('5') if app.view == View::Overview => {
             app.set_window_scope(WindowScope::FiveHours);
@@ -11024,6 +11118,8 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.view_tabs_hitbox = None;
     app.task_scrollbar_hitbox = None;
     app.turn_scrollbar_hitbox = None;
+    app.diagnostics_viewport = Rect::default();
+    app.diagnostics_scrollbar_hitbox = None;
     app.quit_confirmation_hitbox = None;
     app.resume_confirmation_hitbox = None;
     let palette = app.theme.palette();
@@ -12813,7 +12909,7 @@ fn render_remote_sources_settings(
 fn render_project_mapping_settings(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     hitbox: &mut SettingsControlsHitbox,
 ) {
     if area.is_empty() {
@@ -12840,11 +12936,18 @@ fn render_project_mapping_settings(
         .checked_sub(base)
         .filter(|index| *index < app.project_mappings.rows.len());
     let capacity = usize::from(rows_area.height.saturating_sub(1));
-    let start = selected
-        .unwrap_or(0)
-        .saturating_add(1)
-        .saturating_sub(capacity)
-        .min(app.project_mappings.rows.len().saturating_sub(capacity));
+    let item_count = app.project_mappings.rows.len();
+    app.project_mapping_offset = app
+        .project_mapping_offset
+        .min(item_count.saturating_sub(capacity));
+    if app.project_mapping_reveal_pending && capacity > 0 {
+        if let Some(selected) = selected {
+            app.project_mapping_offset =
+                reveal_offset(app.project_mapping_offset, selected, item_count, capacity);
+        }
+        app.project_mapping_reveal_pending = false;
+    }
+    let start = app.project_mapping_offset;
     let end = app
         .project_mappings
         .rows
@@ -12971,6 +13074,41 @@ fn render_project_mapping_settings(
         frame.render_widget(
             Paragraph::new(terminal_safe_text(message)).style(Style::default().fg(tone)),
             rows_area,
+        );
+    }
+
+    let data_area = Rect::new(
+        rows_area.x,
+        rows_area.y.saturating_add(1),
+        rows_area.width,
+        rows_area.height.saturating_sub(1),
+    );
+    hitbox.project_table = (!data_area.is_empty() && item_count > 0).then_some(TableHitbox {
+        viewport: rows_area,
+        rows: data_area,
+        offset: start,
+        capacity,
+    });
+    hitbox.project_scrollbar = scrollbar_geometry(
+        Rect::new(
+            area.right().saturating_sub(1),
+            data_area.y,
+            1,
+            data_area.height,
+        ),
+        item_count,
+        capacity,
+        start,
+    );
+    if let Some(scrollbar) = hitbox.project_scrollbar {
+        render_scrollbar(
+            frame,
+            scrollbar,
+            app.theme,
+            app.project_settings_focused()
+                || app
+                    .scroll_drag
+                    .is_some_and(|drag| drag.target == ScrollTarget::ProjectMappings),
         );
     }
 
@@ -17360,8 +17498,15 @@ fn render_remote_sync_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let palette = app.theme.palette();
+fn render_health(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let diagnostics = diagnostics_paragraph(app);
+    // Two visible text rows give an overflowing Diagnostics panel a usable
+    // scrollbar, even when the reset/remote panels have many entries.
+    let diagnostics_min_height = if diagnostics.line_count(area.width.saturating_sub(2)) > 1 {
+        4
+    } else {
+        3
+    };
     let source_height = u16::try_from(app.snapshot.sources.len())
         .unwrap_or(u16::MAX)
         .saturating_add(3)
@@ -17402,11 +17547,22 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .height
         .saturating_sub(
             source_height
-                .saturating_add(8)
+                .saturating_add(5 + diagnostics_min_height)
                 .saturating_add(remote_height),
         )
         .max(3);
     let reset_height = desired_reset_height.min(available_reset_height);
+    let diagnostics_height = area
+        .height
+        .saturating_sub(source_height + 5 + remote_height + reset_height)
+        .max(diagnostics_min_height)
+        .min(area.height);
+    let diagnostics_area = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(diagnostics_height),
+        area.width,
+        diagnostics_height,
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -17414,9 +17570,13 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(5),
             Constraint::Length(remote_height),
             Constraint::Length(reset_height),
-            Constraint::Min(3),
         ])
-        .split(area);
+        .split(Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(diagnostics_height),
+        ));
 
     let source_rows = app
         .snapshot
@@ -17487,6 +17647,41 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.theme,
     );
 
+    let block = panel("Diagnostics", app.theme);
+    let viewport = block.inner(diagnostics_area);
+    frame.render_widget(block, diagnostics_area);
+    app.diagnostics_viewport = viewport;
+    app.diagnostics_line_count = diagnostics.line_count(viewport.width);
+    let capacity = usize::from(viewport.height);
+    app.diagnostics_offset = app
+        .diagnostics_offset
+        .min(app.diagnostics_line_count.saturating_sub(capacity));
+    frame.render_widget(
+        diagnostics.scroll((u16::try_from(app.diagnostics_offset).unwrap_or(u16::MAX), 0)),
+        viewport,
+    );
+    app.diagnostics_scrollbar_hitbox = scrollbar_geometry(
+        Rect::new(
+            diagnostics_area.right().saturating_sub(1),
+            viewport.y,
+            1,
+            viewport.height,
+        ),
+        app.diagnostics_line_count,
+        capacity,
+        app.diagnostics_offset,
+    );
+    if let Some(scrollbar) = app.diagnostics_scrollbar_hitbox {
+        render_scrollbar(frame, scrollbar, app.theme, app.shortcuts_active());
+    }
+
+    if remote_height > 0 {
+        render_remote_sync_health(frame, rows[2], app);
+    }
+}
+
+fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
+    let palette = app.theme.palette();
     let issues = app
         .snapshot
         .errors
@@ -17524,16 +17719,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         issues
     };
-    frame.render_widget(
-        Paragraph::new(issues)
-            .block(panel("Diagnostics", app.theme))
-            .wrap(Wrap { trim: true }),
-        rows[4],
-    );
-
-    if remote_height > 0 {
-        render_remote_sync_health(frame, rows[2], app);
-    }
+    Paragraph::new(issues).wrap(Wrap { trim: true })
 }
 
 fn recorder_panel_status(app: &App) -> String {
