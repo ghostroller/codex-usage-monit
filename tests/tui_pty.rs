@@ -27,6 +27,10 @@ struct PtySession {
 
 impl PtySession {
     fn spawn() -> Self {
+        Self::spawn_with_mock_ssh(false)
+    }
+
+    fn spawn_with_mock_ssh(mock_ssh: bool) -> Self {
         // NativePtySystem uses ConPTY on Windows, so the same interaction
         // contract is exercised by all three platform verification jobs.
         let system = NativePtySystem::default();
@@ -52,6 +56,22 @@ impl PtySession {
         command.env("CODEX_USAGE_MONIT_STATE_DIR", temp.path().join("state"));
         command.env("CODEX_USAGE_MONIT_CONFIG_DIR", temp.path().join("config"));
         command.env("CODEX_USAGE_MONIT_CACHE_DIR", temp.path().join("cache"));
+        #[cfg(windows)]
+        if mock_ssh {
+            // A real native process that rejects SSH arguments and writes to
+            // stderr. Never start OpenSSH or contact any host in this test.
+            let bin = temp.path().join("mock-ssh");
+            std::fs::create_dir(&bin).unwrap();
+            let system_root = std::env::var_os("SystemRoot").unwrap();
+            std::fs::copy(
+                PathBuf::from(system_root).join("System32/where.exe"),
+                bin.join("ssh.exe"),
+            )
+            .unwrap();
+            command.env("PATH", bin);
+        }
+        #[cfg(not(windows))]
+        let _ = mock_ssh;
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
 
@@ -261,6 +281,75 @@ impl PtySession {
     fn label_is_bold(&self, label: &str) -> bool {
         label_is_bold(self.parser.screen(), label)
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn remote_setup_errors_are_visible_in_the_real_windows_tui() {
+    let mut session = PtySession::spawn_with_mock_ssh(true);
+    session.wait_for("initial screen", |screen| {
+        // Source setup is available while the deferred history scan is still
+        // running. This test needs the navigation controls, not task data.
+        label_is_bold(screen, "Overview") && screen.contents().contains("Settings")
+    });
+    session.send(b"4");
+    session.wait_for("new remote control", |screen| {
+        screen
+            .rows(0, START_SIZE.cols)
+            .any(|row| row.contains("[N]New"))
+    });
+    let (row, column) = session
+        .parser
+        .screen()
+        .rows(0, START_SIZE.cols)
+        .enumerate()
+        .find_map(|(row, line)| {
+            line.find("[N]New")
+                .map(|index| (row as u16, line[..index].chars().count() as u16))
+        })
+        .expect("new remote control is visible");
+    session.click(column + 1, row);
+    session.wait_for("new remote editor", |screen| {
+        screen.contents().contains("Agent exe:")
+    });
+    session.send(b"mock-host\tmock-host\r");
+    session.wait_for("saved remote", |screen| {
+        screen.contents().contains("completed for mock-host")
+    });
+    session.send(b"C");
+    session.wait_for("SSH failure details", |screen| {
+        screen.contents().contains("system SSH exited")
+    });
+    let log_directory = session._temp.path().join("state/logs");
+    let logs = std::fs::read_dir(&log_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1, "default TUI log should be created once");
+    // Verify persistence during the live ConPTY session, before shutdown.
+    let contents = std::fs::read_to_string(&logs[0]).unwrap();
+    let rows = contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = rows
+        .iter()
+        .find(|row| row["event"] == "remote.test" && row["level"] == "error")
+        .expect("remote failure must be logged");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("system SSH exited")
+    );
+    assert!(failure["operationId"].is_string());
+    assert_ne!(failure["sourceId"], "mock-host");
+    session.send(b"3");
+    session.wait_for("diagnostic details", |screen| {
+        label_is_bold(screen, "Other") && screen.contents().contains("system SSH exited")
+    });
+    session.send(b"q");
+    session.wait_for_exit();
 }
 
 impl Drop for PtySession {

@@ -1,5 +1,8 @@
 # Windows testing
 
+For `local-state/permission-denied` / source identity DACL failures in an actual
+installation, see [Windows state directory permissions](windows-permissions.md).
+
 Use the local Windows VM for routine Windows changes. Reserve hosted CI for
 consolidated verification of substantial changes and releases; a local guest
 failure is a diagnostic to investigate, not a reason to silently switch runners.
@@ -10,6 +13,23 @@ failure is a diagnostic to investigate, not a reason to silently switch runners.
 | Consolidated CI and releases | `x86_64-pc-windows-msvc` | GitHub-hosted Windows runner | Repeatable validation of the release target. |
 
 ## Daily host entry point
+
+To start the development TUI on a native Windows machine with comprehensive
+application logging, run `& .\scripts\windows\dev.ps1`. See the
+[Windows TUI logging instructions](../README.md#tui-warnings-and-errors-on-windows)
+for log locations and options. The launcher does not run the test pipeline.
+
+Its focused native argument/exit-code contracts can be run without a project
+build or access to user application state:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tests\dev-smoke.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tests\dev-smoke.ps1
+```
+
+These contracts compile a small Rust Cargo substitute and run 16 cases per shell;
+the normal full Windows pipeline also includes them under its current shell.
+They are separate from the 60 verification-wrapper contracts described below.
 
 First verify the existing guest and installed tools. This command does not install
 software, create a VM, or run project tests:

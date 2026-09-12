@@ -6,6 +6,13 @@
 //! redacted and preview journals remain physically and cryptographically
 //! independent beneath that lock.
 
+#[cfg(windows)]
+use crate::windows_private_directory::{
+    create_dir as private_create_dir, create_dir_all as private_create_dir_all,
+};
+#[cfg(not(any(unix, windows)))]
+use std::fs::{create_dir as private_create_dir, create_dir_all as private_create_dir_all};
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
@@ -2501,7 +2508,7 @@ fn prepare_private_root(path: &Path) -> io::Result<()> {
             .create(path)?;
     }
     #[cfg(not(unix))]
-    fs::create_dir_all(path)?;
+    private_create_dir_all(path)?;
     validate_private_directory(path, "remote export state root")
 }
 
@@ -2517,7 +2524,7 @@ fn create_private_child_directory(parent: &Path, path: &Path) -> io::Result<()> 
                 fs::DirBuilder::new().mode(0o700).create(path)?;
             }
             #[cfg(not(unix))]
-            fs::create_dir(path)?;
+            private_create_dir(path)?;
             validate_private_directory(path, "remote export state directory")?;
             sync_directory(parent)?;
         }

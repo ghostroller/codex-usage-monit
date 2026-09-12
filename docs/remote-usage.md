@@ -15,8 +15,14 @@ remain the center's account information, counted once.
 2. Configure one system OpenSSH alias and verify the remote host key through your
    normal SSH setup. The application uses batch authentication and strict host
    key checking; it cannot answer password, key-passphrase or host-key prompts.
-3. Make the remote binary available in the SSH login's **non-interactive** PATH,
-   or specify `--agent-executable /absolute/path/codex-usage-monit` when adding it.
+3. Leave `Agent exe` at `codex-usage-monit` for automatic setup, or specify
+   `--agent-executable /absolute/path/codex-usage-monit` when adding it.
+   Test and Pair first try the SSH login's **non-interactive** PATH. If a Unix
+   shell reports that this default command is missing, they probe `~/.local/bin`,
+   `~/.cargo/bin`, `/opt/homebrew/bin`, then `/usr/local/bin`. A valid protocol
+   response saves the working executable path for subsequent syncs. Explicit
+   custom paths are used exactly as entered. Discovery does not explicitly load
+   shell startup files.
    This is an executable token, not a shell command: spaces, quoting and extra
    arguments are rejected. Windows can use a path such as
    `C:/Tools/codex-usage-monit.exe`; `~` expansion is Unix-shell-specific.
@@ -87,7 +93,13 @@ about every 60 seconds and idle hosts about every 300 seconds, with backoff on
 failure. Both automatic switches are off for a newly added configuration.
 
 Settings → Remote sources provides host creation/editing, pairing, readiness
-tests, manual sync and enable/disable controls. Project mapping provides explicit
+tests, manual sync and enable/disable controls. For a new host,
+Save → Test → Pair → Sync now completes
+manual setup. Test can save an automatically discovered executable; it does not
+pair the host or enable automatic sync. Manual failures show bounded, terminal-safe
+CLI/SSH details in Remote sources and Other → Diagnostics for the current TUI
+session. These details are not written into trace or sync-health records.
+Project mapping provides explicit
 merge/split actions. Git evidence suggests mappings; it never silently merges
 projects. Other shows per-host aggregate status, session-fact attention,
 bandwidth pauses and SSH process-cleanup pauses.

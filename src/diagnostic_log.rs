@@ -29,6 +29,7 @@ struct RotatingPrivateFile {
     writer: BufWriter<LockedPrivateFile>,
     written_bytes: u64,
     max_bytes: u64,
+    confidential: bool,
 }
 
 /// Release the flock explicitly: closing just this descriptor is insufficient
@@ -39,9 +40,23 @@ struct LockedPrivateFile {
 }
 
 impl LockedPrivateFile {
+    #[cfg(all(test, unix))]
     fn open(path: &Path, description: &str) -> io::Result<Self> {
-        let file = open_private_regular_file(path, description)?;
-        lock_file(&file, description)?;
+        Self::open_with_policy(path, description, false)
+    }
+
+    fn open_with_policy(path: &Path, description: &str, confidential: bool) -> io::Result<Self> {
+        let file = if confidential {
+            open_confidential_file(path, description)?
+        } else {
+            open_private_regular_file(path, description)?
+        };
+        // On Windows confidential files deny other writers through sharing
+        // modes, leaving readers free to tail the live log. Trace/perf retain
+        // their existing byte-range locking contract.
+        if !cfg!(windows) || !confidential {
+            lock_file(&file, description)?;
+        }
         Ok(Self { file })
     }
 }
@@ -68,6 +83,20 @@ impl JsonlWriter {
         description: &'static str,
         max_bytes: u64,
     ) -> io::Result<Self> {
+        Self::open_with_policy(path, description, max_bytes, false)
+    }
+
+    /// Event logs retain previous runs and may contain sanitized error details.
+    pub(crate) fn open_events(path: &Path, max_bytes: u64) -> io::Result<Self> {
+        Self::open_with_policy(path, "event log", max_bytes, true)
+    }
+
+    fn open_with_policy(
+        path: &Path,
+        description: &'static str,
+        max_bytes: u64,
+        confidential: bool,
+    ) -> io::Result<Self> {
         if max_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -78,18 +107,43 @@ impl JsonlWriter {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent)?;
+            if confidential && !parent.exists() {
+                #[cfg(windows)]
+                crate::windows_private_directory::create_dir_all(parent)?;
+                #[cfg(not(windows))]
+                fs::create_dir_all(parent)?;
+            } else {
+                fs::create_dir_all(parent)?;
+            }
         }
-        let mut file = LockedPrivateFile::open(path, description)?;
-        file.file.set_len(0)?;
-        file.file.seek(SeekFrom::Start(0))?;
+        let mut file = LockedPrivateFile::open_with_policy(path, description, confidential)?;
+        let written_bytes = if confidential {
+            let length = file.file.seek(SeekFrom::End(0))?;
+            if length > 0 {
+                file.file.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                file.file.read_exact(&mut last)?;
+                if last[0] != b'\n' {
+                    file.file.write_all(b"\n")?;
+                    length.saturating_add(1)
+                } else {
+                    length
+                }
+            } else {
+                0
+            }
+        } else {
+            file.file.set_len(0)?;
+            file.file.seek(SeekFrom::Start(0))?
+        };
         Ok(Self {
             sink: JsonlSink::File(RotatingPrivateFile {
                 path: path.to_path_buf(),
                 description,
                 writer: BufWriter::new(file),
-                written_bytes: 0,
+                written_bytes,
                 max_bytes,
+                confidential,
             }),
         })
     }
@@ -145,7 +199,8 @@ impl RotatingPrivateFile {
         self.writer.flush()?;
 
         let backup_path = rotated_path(&self.path);
-        let mut backup = LockedPrivateFile::open(&backup_path, self.description)?;
+        let mut backup =
+            LockedPrivateFile::open_with_policy(&backup_path, self.description, self.confidential)?;
         backup.file.set_len(0)?;
         backup.file.seek(SeekFrom::Start(0))?;
 
@@ -169,6 +224,71 @@ fn rotated_path(path: &Path) -> PathBuf {
     let mut value = OsString::from(path.as_os_str());
     value.push(".1");
     PathBuf::from(value)
+}
+
+fn open_confidential_file(path: &Path, description: &str) -> io::Result<File> {
+    #[cfg(windows)]
+    let file = crate::windows_private_directory::open_private_file(path)?;
+    #[cfg(not(windows))]
+    let file = open_private_regular_file(path, description)?;
+    ensure_regular_file(&file, description)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata()?.nlink() != 1 {
+            return Err(io::Error::other("event log must not have hard links"));
+        }
+    }
+    Ok(file)
+}
+
+/// Only remove our generated session names, and skip files held by live TUIs.
+pub(crate) fn prune_event_sessions(directory: &Path, keep: usize) -> io::Result<()> {
+    let mut paths = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.strip_prefix("tui-")
+                        .and_then(|value| value.strip_suffix(".jsonl"))
+                        .is_some_and(|value| {
+                            !value.is_empty()
+                                && value
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_digit() || byte == b'-')
+                        })
+                })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let remove = paths.len().saturating_sub(keep);
+    for path in paths.into_iter().take(remove) {
+        if let Ok(mut file) = LockedPrivateFile::open_with_policy(&path, "event log", true) {
+            let mut first_line = String::new();
+            let mut reader = io::BufReader::new(Read::by_ref(&mut file.file).take(4096));
+            if io::BufRead::read_line(&mut reader, &mut first_line).is_err()
+                || !serde_json::from_str::<Value>(&first_line)
+                    .is_ok_and(|value| value["managedSession"] == true)
+            {
+                continue;
+            }
+            drop(file);
+            if fs::remove_file(&path).is_ok() {
+                let backup = rotated_path(&path);
+                if backup.exists()
+                    && let Ok(file) =
+                        LockedPrivateFile::open_with_policy(&backup, "event log", true)
+                {
+                    drop(file);
+                    let _ = fs::remove_file(backup);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_private_regular_file(path: &Path, description: &str) -> io::Result<File> {
@@ -264,6 +384,72 @@ fn ensure_regular_file(file: &File, description: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn event_log_rotation_keeps_private_complete_records() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let mut writer = JsonlWriter::open_events(&path, 64).unwrap();
+        for index in 0..10 {
+            writer
+                .write_json_line(&serde_json::json!({"event": "failure", "index": index}))
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        for path in [&path, &rotated_path(&path)] {
+            assert!(std::fs::metadata(path).unwrap().len() <= 64);
+            assert!(
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .all(|line| serde_json::from_str::<Value>(line).is_ok())
+            );
+            #[cfg(windows)]
+            crate::source_identity::validate_windows_private_file(
+                path,
+                &File::open(path).unwrap(),
+                "test event log",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn event_log_append_separates_an_existing_record_without_final_newline() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        drop(JsonlWriter::open_events(&path, 1024).unwrap());
+        std::fs::write(&path, b"{\"event\":\"previous\"}").unwrap();
+        let mut writer = JsonlWriter::open_events(&path, 1024).unwrap();
+        writer
+            .write_json_line(&serde_json::json!({"event":"next"}))
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let contents = std::fs::read_to_string(path).unwrap();
+        let records: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "previous");
+        assert_eq!(records[1]["event"], "next");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn event_log_rejects_hard_links_without_altering_the_target() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let writer = JsonlWriter::open_events(&path, 1024).unwrap();
+        drop(writer);
+        std::fs::write(&path, "sentinel").unwrap();
+        let alias = temp.path().join("alias.jsonl");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(JsonlWriter::open_events(&alias, 1024).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
+    }
 
     #[cfg(unix)]
     #[test]

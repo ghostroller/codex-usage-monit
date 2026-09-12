@@ -11,6 +11,11 @@
 //! protocol only fences versions that participate in it; callers must retain
 //! their recorder-status check when cutting over a pre-v0.4 process.
 
+#[cfg(windows)]
+use crate::windows_private_directory::create_dir as private_create_dir;
+#[cfg(not(any(unix, windows)))]
+use std::fs::create_dir as private_create_dir;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1106,7 +1111,7 @@ fn create_private_child(parent: &Path, name: &str) -> io::Result<PathBuf> {
                 fs::DirBuilder::new().mode(0o700).create(&path)
             };
             #[cfg(not(unix))]
-            let create_result = fs::create_dir(&path);
+            let create_result = private_create_dir(&path);
             match create_result {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

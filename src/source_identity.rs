@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use crate::windows_private_directory::create_dir_all as private_create_dir_all;
+#[cfg(not(any(unix, windows)))]
+use std::fs::create_dir_all as private_create_dir_all;
+
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
@@ -946,7 +951,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
     }
     validate_private_directory(path)
 }
@@ -1233,7 +1238,7 @@ pub(crate) fn validate_windows_private_file(
             "{subject} must not be a reparse point"
         )));
     }
-    validate_windows_private_handle(file, subject)?;
+    validate_windows_private_handle(file, &format!("{subject} ({})", path.display()))?;
     reject_windows_reparse_components(path, subject)
 }
 
@@ -1259,7 +1264,7 @@ pub(crate) fn validate_windows_private_directory(path: &Path, subject: &str) -> 
     if !metadata.file_type().is_dir() {
         return Err(invalid_identity(format!("{subject} must be a directory")));
     }
-    validate_windows_private_handle(&directory, subject)?;
+    validate_windows_private_handle(&directory, &format!("{subject} ({})", path.display()))?;
     reject_windows_reparse_components(path, subject)
 }
 
@@ -1449,6 +1454,19 @@ fn validate_windows_private_handle(file: &File, subject: &str) -> io::Result<()>
                 )));
             }
             let trustee = windows_acl_trustee(sid, current_user.as_psid());
+            if owner_is_trusted && allowed.Mask != 0 && trustee == WindowsAclTrustee::Other {
+                // SAFETY: the SID was bounds-checked and validated above and
+                // remains owned by the live security descriptor.
+                let sid = unsafe { crate::windows_private_directory::sid_string(sid) }?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{subject} DACL grants access to an untrusted principal: SID={sid}, mask=0x{:08x}, inherited={}; expected only the current user, SYSTEM or Administrators. Inspect/repair this application's directory with scripts/windows/repair-state-permissions.ps1",
+                        allowed.Mask,
+                        header.AceFlags & 0x10 != 0,
+                    ),
+                ));
+            }
             entries.push(WindowsAclEntryPolicy {
                 ace_type,
                 mask: allowed.Mask,
@@ -1488,19 +1506,19 @@ fn windows_acl_trustee(
 }
 
 #[cfg(windows)]
-struct WindowsSid {
+pub(crate) struct WindowsSid {
     storage: Vec<usize>,
 }
 
 #[cfg(windows)]
 impl WindowsSid {
-    fn as_psid(&self) -> windows_sys::Win32::Security::PSID {
+    pub(crate) fn as_psid(&self) -> windows_sys::Win32::Security::PSID {
         self.storage.as_ptr().cast_mut().cast()
     }
 }
 
 #[cfg(windows)]
-fn windows_current_user_sid() -> io::Result<WindowsSid> {
+pub(crate) fn windows_current_user_sid() -> io::Result<WindowsSid> {
     windows_token_sid(windows_sys::Win32::Security::TokenUser)
 }
 

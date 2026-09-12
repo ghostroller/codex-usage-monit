@@ -88,6 +88,7 @@ use crate::domain::{
     Provenance, Snapshot, SourceStatus, TaskRecord, TaskStatus, TokenUsage, TurnRecord, TurnStatus,
     WindowAnalysis, WindowUsage, terminal_safe_text,
 };
+use crate::event_log::{EventLog, LogLevel};
 #[cfg(test)]
 use crate::history::{HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION};
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
@@ -2948,10 +2949,10 @@ struct RemoteUiActionRequest {
     config_revision: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RemoteUiActionOutcome {
     Complete,
-    NeedsAttention,
+    NeedsAttention(String),
 }
 
 #[derive(Debug)]
@@ -3380,6 +3381,9 @@ struct App {
     pending_remote_action: Option<RemoteUiActionRequest>,
     remote_action_running: Option<RemoteUiActionRequest>,
     remote_action_status: Option<String>,
+    remote_action_diagnostic: Option<String>,
+    event_log: EventLog,
+    ui_save_error: Option<String>,
     remote_editor: Option<RemoteEditorState>,
     remote_editor_hitbox: Option<RemoteEditorHitbox>,
     remote_remove_confirmation: Option<RemoteRemoveConfirmation>,
@@ -3526,6 +3530,9 @@ impl App {
             pending_remote_action: None,
             remote_action_running: None,
             remote_action_status: None,
+            remote_action_diagnostic: None,
+            event_log: EventLog::default(),
+            ui_save_error: None,
             remote_editor: None,
             remote_editor_hitbox: None,
             remote_remove_confirmation: None,
@@ -3782,8 +3789,15 @@ impl App {
     }
 
     fn set_open_notice(&mut self, message: impl Into<String>, tone: OpenNoticeTone) {
+        let message = message.into();
+        let level = match tone {
+            OpenNoticeTone::Error => LogLevel::Error,
+            OpenNoticeTone::Warning => LogLevel::Warn,
+            _ => LogLevel::Info,
+        };
+        self.event_log.record(level, "tui.notice", &message);
         self.open_notice = Some(OpenNotice {
-            message: message.into(),
+            message,
             tone,
             created_at: Instant::now(),
         });
@@ -5555,14 +5569,15 @@ impl App {
         {
             self.selected_setting = SettingItem::ALL.len() + index;
         }
+        let succeeded = matches!(&completion.result, Ok(RemoteUiActionOutcome::Complete));
         self.remote_action_status = Some(match completion.result {
             Ok(RemoteUiActionOutcome::Complete) => format!(
                 "Remote {} completed for {}",
                 completion.request.kind.label(),
                 completion.request.host_id
             ),
-            Ok(RemoteUiActionOutcome::NeedsAttention) => format!(
-                "Remote {} for {} needs attention; run the same CLI command for details",
+            Ok(RemoteUiActionOutcome::NeedsAttention(detail)) => format!(
+                "Remote {} for {} needs attention: {detail}",
                 completion.request.kind.label(),
                 completion.request.host_id
             ),
@@ -5572,6 +5587,11 @@ impl App {
                 completion.request.host_id
             ),
         });
+        self.remote_action_diagnostic = if succeeded {
+            None
+        } else {
+            self.remote_action_status.clone()
+        };
         if refresh_history {
             self.force_history_source_refresh();
         }
@@ -8611,6 +8631,8 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     let terminal_input = TerminalInputMonitor::open()?;
     let (ui_state_store, rollout_cache, history_store, mut app) =
         prepare_deferred_initial_tui(&config, theme_override);
+    app.event_log = config.event_log.clone();
+    app.observe_diagnostics();
     let termination = TerminationSignal::install()?;
     let terminal_enter_span = config.startup_trace.span("tui.terminal_enter");
     let guard = TerminalGuard::enter()?;
@@ -8648,8 +8670,8 @@ fn run_with_theme_override(config: CollectConfig, theme_override: Option<Theme>)
     let cursor_result = terminal.show_cursor();
     drop(guard);
     termination.mark_terminal_restored();
-    flush_staged_history_on_exit(&history_store, &config.perf_log);
-    let _ = ui_state_store.save(&app.ui_state());
+    flush_staged_history_on_exit(&history_store, &config.perf_log, &config.event_log);
+    app.save_ui_state(&ui_state_store);
     config.perf_log.finish();
     cursor_result?;
     result
@@ -9353,7 +9375,11 @@ fn flush_or_reload_history_if_due(
     Some((projection, recorder_health))
 }
 
-fn flush_staged_history_on_exit(history_store: &Arc<Mutex<TuiHistoryStore>>, perf_log: &PerfLog) {
+fn flush_staged_history_on_exit(
+    history_store: &Arc<Mutex<TuiHistoryStore>>,
+    perf_log: &PerfLog,
+    event_log: &EventLog,
+) {
     let total_started = Instant::now();
     let mut store = match history_store.try_lock() {
         Ok(store) => store,
@@ -9366,6 +9392,9 @@ fn flush_staged_history_on_exit(history_store: &Arc<Mutex<TuiHistoryStore>>, per
     };
     let record_started = Instant::now();
     let write_result = store.flush_staged();
+    if let Err(error) = &write_result {
+        event_log.record(LogLevel::Warn, "history.flush_on_exit", &error.to_string());
+    }
     if matches!(&write_result, Ok(None)) {
         return;
     }
@@ -9527,6 +9556,107 @@ struct RunLoopResources<'a> {
     terminal_input: &'a TerminalInputMonitor,
 }
 
+impl App {
+    fn save_ui_state(&mut self, store: &UiStateStore) {
+        self.ui_save_error = store
+            .save(&self.ui_state())
+            .err()
+            .map(|error| error.to_string());
+        self.observe_diagnostics();
+    }
+
+    fn observe_diagnostics(&self) {
+        if !self.event_log.is_active() {
+            return;
+        }
+        let mut issues = Vec::new();
+        for (level, event, values) in [
+            (LogLevel::Error, "collection.error", &self.snapshot.errors),
+            (
+                LogLevel::Warn,
+                "collection.warning",
+                &self.snapshot.warnings,
+            ),
+            (LogLevel::Warn, "history.warning", &self.history.warnings),
+        ] {
+            issues.extend(values.iter().map(|value| (level, event, value.clone())));
+        }
+        for (event, value) in [
+            ("recorder.warning", self.recorder_health.error.as_ref()),
+            (
+                "recorder.last_error",
+                self.recorder_health
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.last_error.as_ref()),
+            ),
+            ("remote.config", self.remote_sources.config_error.as_ref()),
+            ("remote.history", self.remote_sources.history_error.as_ref()),
+            ("remote.health", self.remote_sources.health_error.as_ref()),
+            ("history.query", self.history_source_query_error.as_ref()),
+            ("project.config", self.project_mappings.error.as_ref()),
+            ("open.config", self.open_config_error.as_ref()),
+            ("ui.save", self.ui_save_error.as_ref()),
+            (
+                "remote.editor",
+                self.remote_editor
+                    .as_ref()
+                    .and_then(|editor| editor.validation_error.as_ref()),
+            ),
+            (
+                "clipboard.write",
+                self.resume_confirmation
+                    .as_ref()
+                    .and_then(|confirmation| confirmation.copy_error.as_ref()),
+            ),
+        ] {
+            if let Some(value) = value {
+                issues.push((LogLevel::Warn, event, value.clone()));
+            }
+        }
+        if let Some(status) = &self.project_mappings.status
+            && (status.contains("failed") || status.contains("unavailable"))
+        {
+            issues.push((LogLevel::Warn, "project.save", status.clone()));
+        }
+        // Rejected actions never start a helper, so they need their own event.
+        if let Some(status) = &self.remote_action_status
+            && self.remote_action_diagnostic.as_ref() != Some(status)
+            && !status.contains("started")
+            && !status.contains("completed")
+        {
+            issues.push((LogLevel::Warn, "remote.action_rejected", status.clone()));
+        }
+        for health in &self.remote_sources.health {
+            for (event, category, at) in [
+                (
+                    "remote.background_sync",
+                    health.error_category(),
+                    health.last_attempt_at(),
+                ),
+                (
+                    "remote.background_facts",
+                    health.fact_sync_error_category(),
+                    health.last_fact_sync_at(),
+                ),
+            ] {
+                if category.is_some() {
+                    issues.push((
+                        LogLevel::Warn,
+                        event,
+                        format!(
+                            "source={} category={} attemptAt={at:?}",
+                            crate::event_log::fingerprint(health.host_id()),
+                            remote_sync_error_label(category)
+                        ),
+                    ));
+                }
+            }
+        }
+        self.event_log.observe("tui", &issues);
+    }
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -9551,6 +9681,16 @@ fn run_loop(
         }
         while let Ok(completion) = context.refresh_receiver.try_recv() {
             let refresh_changed = apply_refresh_completion(app, completion);
+            config.event_log.record(
+                LogLevel::Debug,
+                "tui.refresh",
+                &format!(
+                    "changed={refresh_changed} errors={} warnings={}",
+                    app.snapshot.errors.len(),
+                    app.snapshot.warnings.len()
+                ),
+            );
+            app.observe_diagnostics();
             if refresh_changed {
                 redraw_reasons.insert(RedrawReasons::SNAPSHOT);
             }
@@ -9558,6 +9698,7 @@ fn run_loop(
         }
         while let Ok(completion) = context.resume_receiver.try_recv() {
             app.apply_resume_completion(completion);
+            app.observe_diagnostics();
             redraw_reasons.insert(RedrawReasons::RESUME);
         }
         while let Ok(completion) = context.remote_receiver.try_recv() {
@@ -9565,6 +9706,7 @@ fn run_loop(
                 worker.finish();
             }
             app.apply_remote_action_completion(completion);
+            app.observe_diagnostics();
             redraw_reasons.insert(RedrawReasons::NOTICE);
         }
         if app.expire_open_notice_at(Instant::now()) {
@@ -9577,6 +9719,7 @@ fn run_loop(
             redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
 
+        app.observe_diagnostics();
         if first_frame {
             let draw_span = config.startup_trace.span("tui.first_frame");
             let draw_started = Instant::now();
@@ -9643,8 +9786,9 @@ fn run_loop(
                 }
                 let current_ui_state = app.ui_state();
                 if current_ui_state != previous_ui_state {
-                    let _ = ui_state_store.save(&current_ui_state);
+                    app.save_ui_state(ui_state_store);
                 }
+                app.observe_diagnostics();
                 if should_quit {
                     refresh_worker.detach();
                     return Ok(());
@@ -9685,6 +9829,7 @@ fn run_loop(
         if let Some(request) = app.pending_clipboard.take() {
             let result = write_osc52_clipboard(terminal.backend_mut(), &request.text);
             app.apply_clipboard_result(request, result);
+            app.observe_diagnostics();
         }
         config.perf_log.maybe_sample();
     }
@@ -10919,6 +11064,9 @@ fn execute_remote_ui_action(
     config: &CollectConfig,
     cancellation: &RemoteActionCancellation,
 ) -> RemoteUiActionCompletion {
+    let operation = config
+        .event_log
+        .operation(remote_action_event(&request.kind), &request.host_id);
     let result = trace_remote_ui_action(
         &request,
         &config.trace_log,
@@ -10945,15 +11093,32 @@ fn execute_remote_ui_action(
             // to the child because a second TraceLog would truncate it.
             let output = run_cancellable_remote_action_command(command, cancellation)
                 .map_err(|_| "launcher unavailable".to_owned())?;
-            match output.status.code() {
-                Some(0) => Ok(RemoteUiActionOutcome::Complete),
-                Some(2) => Ok(RemoteUiActionOutcome::NeedsAttention),
-                Some(_) => Err("command failed".to_owned()),
-                None => Err("command terminated".to_owned()),
-            }
+            remote_ui_action_output(&output)
         },
     );
+    match &result {
+        Ok(RemoteUiActionOutcome::Complete) => operation.finish(LogLevel::Info, "completed"),
+        Ok(RemoteUiActionOutcome::NeedsAttention(detail)) => {
+            operation.finish(LogLevel::Warn, detail)
+        }
+        Err(_) if cancellation.is_cancelled() => operation.finish(LogLevel::Info, "cancelled"),
+        Err(error) => operation.finish(LogLevel::Error, error),
+    }
     RemoteUiActionCompletion { request, result }
+}
+
+fn remote_action_event(kind: &RemoteUiActionKind) -> &'static str {
+    match kind {
+        RemoteUiActionKind::Add { .. } => "remote.add",
+        RemoteUiActionKind::Edit { .. } => "remote.edit",
+        RemoteUiActionKind::Pair => "remote.pair",
+        RemoteUiActionKind::Test => "remote.test",
+        RemoteUiActionKind::Sync => "remote.sync",
+        RemoteUiActionKind::Remove => "remote.remove",
+        RemoteUiActionKind::Include => "remote.include",
+        RemoteUiActionKind::Exclude => "remote.exclude",
+        RemoteUiActionKind::Purge => "remote.purge",
+    }
 }
 
 fn validate_remote_ui_action_config(
@@ -10969,6 +11134,65 @@ fn validate_remote_ui_action_config(
         return Err("configuration changed".to_owned());
     }
     Ok(())
+}
+
+fn remote_ui_action_output(output: &Output) -> Result<RemoteUiActionOutcome, String> {
+    // Details are for this user's interactive view only. Trace and persisted
+    // sync-health records retain fixed categories, never raw SSH diagnostics.
+    let diagnostic = |bytes: &[u8]| {
+        let bounded = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]);
+        let safe = terminal_safe_text(&bounded);
+        let compact = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut text = compact.chars().take(1200).collect::<String>();
+        if compact.chars().count() > 1200 {
+            text.push('…');
+        }
+        text
+    };
+    match output.status.code() {
+        Some(0) => Ok(RemoteUiActionOutcome::Complete),
+        Some(2) => {
+            let mut detail = diagnostic(&output.stderr);
+            if detail.is_empty() {
+                detail = diagnostic(&output.stdout);
+            }
+            if detail.is_empty() {
+                detail = "Operation incomplete; retry after checking the remote source".to_owned();
+            }
+            Ok(RemoteUiActionOutcome::NeedsAttention(detail))
+        }
+        Some(code) => {
+            let detail = diagnostic(&output.stderr);
+            let hint = if detail.contains("command not found")
+                || detail.contains("No such file or directory")
+                || detail.contains("not found in SSH PATH")
+            {
+                " Check the remote installation and Edit > Agent exe."
+            } else if detail.contains("Permission denied") && detail.contains("publickey") {
+                " Check SSH key authentication; password prompts are disabled."
+            } else if detail.contains("Host key verification failed")
+                || detail.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+            {
+                " Verify the remote host key in system SSH."
+            } else if detail.contains("timed out")
+                || detail.contains("Connection refused")
+                || detail.contains("Could not resolve hostname")
+            {
+                " Check the SSH alias, network and remote SSH service."
+            } else {
+                ""
+            };
+            Err(format!(
+                "command failed (exit {code}): {}{hint}",
+                if detail.is_empty() {
+                    "No error details returned"
+                } else {
+                    &detail
+                }
+            ))
+        }
+        None => Err("command terminated".to_owned()),
+    }
 }
 
 fn trace_remote_ui_action(
@@ -10989,6 +11213,7 @@ fn trace_remote_ui_action(
                     RemoteUiActionKind::Add { .. }
                         | RemoteUiActionKind::Edit { .. }
                         | RemoteUiActionKind::Pair
+                        | RemoteUiActionKind::Test
                         | RemoteUiActionKind::Remove
                         | RemoteUiActionKind::Include
                         | RemoteUiActionKind::Exclude
@@ -10999,7 +11224,7 @@ fn trace_remote_ui_action(
     let result = action();
     match &result {
         Ok(RemoteUiActionOutcome::Complete) => span.finish(TraceOutcome::Ok, TraceFields::new()),
-        Ok(RemoteUiActionOutcome::NeedsAttention) => {
+        Ok(RemoteUiActionOutcome::NeedsAttention(_)) => {
             span.finish(TraceOutcome::Partial, TraceFields::new())
         }
         Err(_) if cancellation.is_cancelled() => span.finish(
@@ -11021,6 +11246,7 @@ fn remote_ui_action_error_kind(error: &str) -> &'static str {
         "configuration changed" => "config_changed",
         "launcher unavailable" => "launcher_unavailable",
         "command failed" => "command_failed",
+        value if value.starts_with("command failed (") => "command_failed",
         "command terminated" => "command_terminated",
         _ => "action_failed",
     }
@@ -11946,7 +12172,7 @@ fn render_remote_editor(frame: &mut Frame<'_>, area: Rect, app: &App) -> RemoteE
 
     if inner.height > 5 {
         let message = editor.validation_error.as_deref().unwrap_or(
-            "Only this SSH alias and agent executable are used; no SSH hosts are discovered.",
+            "Agent exe is a REMOTE path. Default: Test/Pair searches PATH and common install dirs.",
         );
         frame.render_widget(
             Paragraph::new(truncate_display_text(message, usize::from(inner.width))).style(
@@ -12603,7 +12829,10 @@ fn render_remote_sources_settings(
     if inner.height <= 1 {
         return;
     }
-    let controls_y = inner.bottom().saturating_sub(1);
+    // Reserve status rows even while idle so host and button hitboxes do not
+    // move when a long SSH failure arrives. Details also remain in Diagnostics.
+    let status_height = inner.height.saturating_sub(5).min(3);
+    let controls_y = inner.bottom().saturating_sub(1 + status_height);
     let manage_y = (inner.height >= 5).then_some(controls_y.saturating_sub(1));
     let hosts_y = inner.y.saturating_add(1);
     let hosts_bottom = manage_y.unwrap_or(controls_y);
@@ -12894,14 +13123,18 @@ fn render_remote_sources_settings(
         app.theme,
     );
     if let Some(status) = app.remote_action_status.as_deref() {
-        spans.push(Span::styled(
-            format!("  {}", terminal_safe_text(status)),
-            Style::default().fg(if app.remote_action_running.is_some() {
-                palette.warning
-            } else {
-                palette.muted
-            }),
-        ));
+        let status_area = Rect::new(
+            inner.x,
+            controls_y.saturating_add(1),
+            inner.width,
+            status_height,
+        );
+        frame.render_widget(
+            Paragraph::new(terminal_safe_text(status))
+                .style(Style::default().fg(palette.warning))
+                .wrap(Wrap { trim: true }),
+            status_area,
+        );
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), controls_area);
 }
@@ -17683,8 +17916,7 @@ fn render_health(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
     let palette = app.theme.palette();
     let issues = app
-        .snapshot
-        .errors
+        .remote_action_diagnostic
         .iter()
         .map(|value| {
             Line::from(Span::styled(
@@ -17692,6 +17924,12 @@ fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
                 Style::default().fg(palette.error),
             ))
         })
+        .chain(app.snapshot.errors.iter().map(|value| {
+            Line::from(Span::styled(
+                terminal_safe_text(value),
+                Style::default().fg(palette.error),
+            ))
+        }))
         .chain(app.snapshot.warnings.iter().map(|value| {
             Line::from(Span::styled(
                 terminal_safe_text(value),
@@ -17711,7 +17949,7 @@ fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
             ))
         }))
         .collect::<Vec<_>>();
-    let issues = if issues.is_empty() {
+    let mut issues = if issues.is_empty() {
         vec![Line::from(Span::styled(
             "No collection issues",
             Style::default().fg(palette.success),
@@ -17719,6 +17957,30 @@ fn diagnostics_paragraph(app: &App) -> Paragraph<'static> {
     } else {
         issues
     };
+    if let Some(error) = app.ui_save_error.as_ref() {
+        issues.insert(
+            0,
+            Line::from(Span::styled(
+                format!("Settings save failed: {}", terminal_safe_text(error)),
+                Style::default().fg(palette.error),
+            )),
+        );
+    }
+    if let Some(error) = app.event_log.error() {
+        issues.insert(
+            0,
+            Line::from(Span::styled(
+                format!("Log unavailable: {}", terminal_safe_text(&error)),
+                Style::default().fg(palette.error),
+            )),
+        );
+    }
+    if let Some(path) = app.event_log.path() {
+        issues.push(Line::from(format!(
+            "Log: {}",
+            terminal_safe_text(&path.display().to_string())
+        )));
+    }
     Paragraph::new(issues).wrap(Wrap { trim: true })
 }
 

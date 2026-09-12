@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use crate::windows_private_directory::create_dir_all as private_create_dir_all;
+#[cfg(not(any(unix, windows)))]
+use std::fs::create_dir_all as private_create_dir_all;
+
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -3670,6 +3675,7 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
     if path.is_dir() {
         return Ok(());
     }
@@ -3681,7 +3687,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path)
+        private_create_dir_all(path)
     }
 }
 

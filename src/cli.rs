@@ -21,6 +21,7 @@ use crate::automatic_remote_sync::{
 };
 use crate::config::CollectConfig;
 use crate::domain::{AccountSnapshot, Provenance};
+use crate::event_log::{EventLog, LogLevel};
 use crate::health_report::HealthReport;
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, default_history_root};
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
@@ -66,9 +67,9 @@ use crate::remote_sync_scheduler::{
 #[cfg(all(test, unix))]
 use crate::remote_transport::probe_remote_with_environment;
 use crate::remote_transport::{
-    RemoteProbeOptions, RemoteProbeReport, RemoteTransportError, SshCommandEnvironment,
-    ensure_current_process_remote_containment, probe_remote_with_agent_executable_and_environment,
-    tui_process_tree_inheritance_is_authorized,
+    DEFAULT_REMOTE_AGENT_EXECUTABLE, RemoteProbeOptions, RemoteProbeReport, RemoteTransportError,
+    SshCommandEnvironment, ensure_current_process_remote_containment,
+    probe_remote_with_agent_executable_and_environment, tui_process_tree_inheritance_is_authorized,
 };
 use crate::remotes_config::{
     RemoteHostEdit, RemoteHostState, RemotesConfig, RemotesConfigMutation, RemotesConfigStore,
@@ -287,6 +288,14 @@ pub struct Cli {
     /// Write content-free operation traces as JSONL (may add diagnostic I/O).
     #[arg(long, global = true, value_name = "FILE")]
     trace_log: Option<PathBuf>,
+
+    /// Append application diagnostics as JSONL (TUI default: state-dir/logs).
+    #[arg(long, global = true, value_name = "FILE")]
+    log_file: Option<PathBuf>,
+
+    /// Application diagnostic level; off disables the event log.
+    #[arg(long, global = true, value_enum, default_value_t = LogLevel::Warn)]
+    log_level: LogLevel,
 
     /// Internal PATH override preserved by service registrations.
     #[arg(
@@ -808,6 +817,44 @@ pub fn run() -> Result<i32> {
 
 fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i32> {
     validate_output_path_conflicts(&cli)?;
+    let managed = cli.log_file.is_none();
+    let log = if cli.command.is_none() || !managed {
+        let path = cli
+            .log_file
+            .clone()
+            .or_else(EventLog::default_path)
+            .map(absolute_path);
+        EventLog::open(path, cli.log_level, managed)
+    } else {
+        EventLog::default()
+    };
+    let result = run_with_event_log(cli, process_started, parsed_at, &log);
+    match &result {
+        Err(error) => log.record(LogLevel::Error, "runtime.failed", &format!("{error:#}")),
+        Ok(code) if *code != 0 => log.record(
+            LogLevel::Warn,
+            "runtime.partial",
+            &format!("command exited with code {code}"),
+        ),
+        Ok(_) => log.record(LogLevel::Info, "runtime.finished", "completed"),
+    }
+    log.finish();
+    if let Some(error) = log.error() {
+        eprintln!(
+            "warning: application log unavailable ({}): {error}",
+            log.path()
+                .map_or_else(|| "no path".to_owned(), |path| path.display().to_string())
+        );
+    }
+    result
+}
+
+fn run_with_event_log(
+    cli: Cli,
+    process_started: Instant,
+    parsed_at: Instant,
+    event_log: &EventLog,
+) -> Result<i32> {
     let trace_init_started = Instant::now();
     let debug_startup = matches!(cli.command.as_ref(), Some(Command::DebugStartup(_)));
     let trace = if debug_startup || cli.startup_log.is_some() {
@@ -827,6 +874,9 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
         .unwrap_or_default();
     let mut perf_log_guard = PerfLogGuard::new(perf_log.clone(), perf_log_path.clone());
     perf_log_guard.report_error();
+    if let Some(error) = perf_log.log_error() {
+        event_log.record(LogLevel::Warn, "log.perf", &error);
+    }
     let trace_log = trace_log_path
         .as_deref()
         .map(TraceLog::enabled)
@@ -836,6 +886,9 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     }
     let mut trace_log_guard = TraceLogGuard::new(trace_log.clone(), trace_log_path.clone());
     trace_log_guard.report_error();
+    if let Some(error) = trace_log.log_error() {
+        event_log.record(LogLevel::Warn, "log.trace", &error);
+    }
     let catalog_started = Instant::now();
     let catalog_status = if command_uses_model_catalog(cli.command.as_ref()) {
         let service_catalog_path = service_remotes_config
@@ -899,6 +952,7 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     };
     config.perf_log = perf_log;
     config.trace_log = trace_log.clone();
+    config.event_log = event_log.clone();
     config.startup_trace = trace.clone();
     config_span.finish_with(|| {
         format!(
@@ -1055,6 +1109,12 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     }
 
     let render_span = trace.span("output.render");
+    for warning in &result.snapshot.warnings {
+        event_log.record(LogLevel::Warn, "collection.warning", warning);
+    }
+    for error in &result.snapshot.errors {
+        event_log.record(LogLevel::Error, "collection.error", error);
+    }
     let output = render_output(&result.snapshot, &request)?;
     render_span.finish_with(|| format!("bytes={}", output.len()));
     let mut stdout = io::stdout().lock();
@@ -2089,7 +2149,7 @@ fn run_remote_pair(
     // accident, and an invalid local root must remain a pre-transport error.
     let (runtime, _profile_lease) =
         remote_source_lifecycle_runtime(collect_config, history_dir, "pair")?;
-    let report = probe_configured_host(
+    let (report, agent_executable) = probe_configured_host(
         collect_config,
         &host,
         inherit_remote_process_tree,
@@ -2130,10 +2190,11 @@ fn run_remote_pair(
         Err(error) => return Err(error.into()),
     }
     let source_id = report.response.source.node_id.clone();
-    let paired = store.pair_if_current_checked(
+    let paired = store.save_probe_if_current_checked(
         config.config_revision(),
         &host,
-        report.response.source.clone(),
+        &agent_executable,
+        Some(report.response.source.clone()),
         || {
             runtime
                 .source_history()
@@ -2386,7 +2447,7 @@ fn run_remote_test(
         .host(host_id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("remote host {host_id:?} is not configured"))?;
-    let report = match probe_configured_host(
+    let (report, agent_executable) = match probe_configured_host(
         collect_config,
         &host,
         inherit_remote_process_tree,
@@ -2415,7 +2476,21 @@ fn run_remote_test(
     let RemoteExportResponseBody::Probe(probe) = &report.response.result else {
         unreachable!("the probe transport accepts only probe responses")
     };
-    let current_host = ensure_remote_probe_target_current(store, config.config_revision(), &host)?;
+    let current_host = if agent_executable == host.agent_executable() {
+        ensure_remote_probe_target_current(store, config.config_revision(), &host)?
+    } else {
+        let updated = store.save_probe_if_current_checked(
+            config.config_revision(),
+            &host,
+            &agent_executable,
+            None,
+            || Ok(()),
+        )?;
+        updated
+            .host(host_id)
+            .expect("saving an agent preserves its host")
+            .clone()
+    };
     write_stdout(&format_remote_probe("tested", &current_host, &report))?;
     let ready = probe.state_writable
         && probe.rollout_readable
@@ -2520,7 +2595,7 @@ fn probe_configured_host(
     host: &crate::remotes_config::RemoteHostConfig,
     inherit_remote_process_tree: bool,
     cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<RemoteProbeReport> {
+) -> Result<(RemoteProbeReport, String)> {
     let options = RemoteProbeOptions {
         redaction_profile: if host.redact_content() {
             crate::source_history::RedactionProfile::Redacted
@@ -2530,13 +2605,79 @@ fn probe_configured_host(
         expected_source: host.expected_source().cloned(),
         ..RemoteProbeOptions::default()
     };
-    probe_remote_with_agent_executable_and_environment(
-        host.ssh_host(),
+    let environment =
+        remote_ssh_environment(collect_config, inherit_remote_process_tree, cancellation);
+    probe_with_agent_discovery(
         host.agent_executable(),
-        &options,
-        &remote_ssh_environment(collect_config, inherit_remote_process_tree, cancellation),
+        options.timeout,
+        |agent, timeout| {
+            probe_remote_with_agent_executable_and_environment(
+                host.ssh_host(),
+                agent,
+                &RemoteProbeOptions {
+                    timeout,
+                    ..options.clone()
+                },
+                &environment,
+            )
+        },
     )
-    .map_err(anyhow::Error::new)
+}
+
+// Only explicit setup operations discover executables. Saving the verified
+// path makes subsequent syncs one exchange per page, preserving their network
+// reservations. Every probe uses the same host, identity pin and protocol
+// validation; no shell startup files or arbitrary discovery scripts are run.
+const REMOTE_AGENT_CANDIDATES: &[&str] = &[
+    "~/.local/bin/codex-usage-monit",
+    "~/.cargo/bin/codex-usage-monit",
+    "/opt/homebrew/bin/codex-usage-monit",
+    "/usr/local/bin/codex-usage-monit",
+];
+
+fn probe_with_agent_discovery<T>(
+    configured: &str,
+    timeout: Duration,
+    mut probe: impl FnMut(&str, Duration) -> std::result::Result<T, RemoteTransportError>,
+) -> Result<(T, String)> {
+    let started = Instant::now();
+    let mut last_error = match probe(configured, timeout) {
+        Ok(report) => return Ok((report, configured.to_owned())),
+        Err(error)
+            if configured == DEFAULT_REMOTE_AGENT_EXECUTABLE
+                && remote_agent_command_missing(&error) =>
+        {
+            error
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for candidate in REMOTE_AGENT_CANDIDATES {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(RemoteTransportError::Timeout {
+                timeout,
+                cleanup_error: None,
+            }
+            .into());
+        }
+        match probe(candidate, remaining) {
+            Ok(report) => return Ok((report, (*candidate).to_owned())),
+            Err(error) if remote_agent_command_missing(&error) => last_error = error,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow::Error::new(last_error).context(
+        "remote agent not found in SSH PATH or common install directories; install codex-usage-monit on the remote or set its full path in Edit > Agent exe",
+    ))
+}
+
+fn remote_agent_command_missing(error: &RemoteTransportError) -> bool {
+    matches!(error, RemoteTransportError::ExitFailure { code: Some(127), diagnostic }
+        if diagnostic.contains("codex-usage-monit")
+            && (diagnostic.contains("command not found")
+                || diagnostic.contains(": not found")
+                || diagnostic.contains("No such file or directory")
+                || diagnostic.contains("no such file or directory")))
 }
 
 fn remote_ssh_environment(
@@ -2635,9 +2776,10 @@ fn format_remote_probe(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{action} {} via {}\nsource={}@{}\nstate-writable={} rollout-readable={} capabilities={}\nprotocol={} server={} elapsed={:.3}s payload={}B/{}B",
+        "{action} {} via {}\nagent={}\nsource={}@{}\nstate-writable={} rollout-readable={} capabilities={}\nprotocol={} server={} elapsed={:.3}s payload={}B/{}B",
         host.id(),
         host.ssh_host(),
+        host.agent_executable(),
         report.response.source.node_id,
         report.response.source.generation,
         probe.state_writable,
@@ -4571,6 +4713,14 @@ fn validate_output_path_conflicts_from(cli: &Cli, current_dir: &Path) -> Result<
 
 fn output_paths_for_command(cli: &Cli) -> Vec<(&'static str, PathBuf)> {
     let mut paths = Vec::new();
+    if cli.log_level != LogLevel::Off
+        && let Some(path) = cli.log_file.as_deref()
+    {
+        paths.push(("--log-file", path.to_path_buf()));
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".1");
+        paths.push(("--log-file rotation", PathBuf::from(backup)));
+    }
     if let Some(path) = cli.startup_log.as_deref() {
         paths.push(("--startup-log", path.to_path_buf()));
     }
@@ -4579,6 +4729,18 @@ fn output_paths_for_command(cli: &Cli) -> Vec<(&'static str, PathBuf)> {
     }
     if let Some(path) = cli.trace_log.as_deref() {
         paths.push(("--trace-log", path.to_path_buf()));
+    }
+    if cli.log_level != LogLevel::Off && cli.log_file.is_some() {
+        for (label, path) in [
+            ("--trace-log rotation", &cli.trace_log),
+            ("--perf-log rotation", &cli.perf_log),
+        ] {
+            if let Some(path) = path {
+                let mut backup = path.as_os_str().to_os_string();
+                backup.push(".1");
+                paths.push((label, PathBuf::from(backup)));
+            }
+        }
     }
     if let Some(path) = status_file_for_command(cli) {
         let label = match cli.command.as_ref() {
@@ -8171,6 +8333,121 @@ mod tests {
         assert!(error.to_string().contains("revision changed"));
     }
 
+    fn missing_agent_error() -> RemoteTransportError {
+        RemoteTransportError::ExitFailure {
+            code: Some(127),
+            diagnostic: "zsh:1: command not found: codex-usage-monit".to_owned(),
+        }
+    }
+
+    #[test]
+    fn remote_agent_discovery_finds_default_install_and_preserves_custom_paths() {
+        let mut attempts = Vec::new();
+        let (report, executable) = probe_with_agent_discovery(
+            DEFAULT_REMOTE_AGENT_EXECUTABLE,
+            Duration::from_secs(45),
+            |agent, remaining| {
+                assert!(!remaining.is_zero());
+                assert!(remaining <= Duration::from_secs(45));
+                attempts.push(agent.to_owned());
+                if agent == "~/.local/bin/codex-usage-monit" {
+                    Ok(42)
+                } else {
+                    Err(missing_agent_error())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report, 42);
+        assert_eq!(executable, "~/.local/bin/codex-usage-monit");
+        assert_eq!(
+            attempts,
+            ["codex-usage-monit", "~/.local/bin/codex-usage-monit"]
+        );
+
+        for custom in [
+            "/opt/custom/codex-usage-monit",
+            "C:/Tools/codex-usage-monit.exe",
+        ] {
+            let mut attempts = 0;
+            let error =
+                probe_with_agent_discovery::<()>(custom, Duration::from_secs(45), |agent, _| {
+                    attempts += 1;
+                    assert_eq!(agent, custom);
+                    Err(missing_agent_error())
+                })
+                .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(error.downcast_ref::<RemoteTransportError>().is_some());
+        }
+    }
+
+    #[test]
+    fn remote_agent_discovery_stops_on_authentication_protocol_and_cancellation_errors() {
+        for fail_after_missing in [false, true] {
+            for error in [
+                RemoteTransportError::ExitFailure {
+                    code: Some(255),
+                    diagnostic: "Permission denied (publickey)".to_owned(),
+                },
+                RemoteTransportError::UnexpectedResponse,
+                RemoteTransportError::Cancelled {
+                    cleanup_error: None,
+                },
+            ] {
+                let mut failure = Some(error);
+                let mut attempts = 0;
+                let result = probe_with_agent_discovery::<()>(
+                    DEFAULT_REMOTE_AGENT_EXECUTABLE,
+                    Duration::from_secs(45),
+                    |_, _| {
+                        attempts += 1;
+                        if fail_after_missing && attempts == 1 {
+                            Err(missing_agent_error())
+                        } else {
+                            Err(failure.take().unwrap())
+                        }
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(attempts, if fail_after_missing { 2 } else { 1 });
+            }
+        }
+    }
+
+    #[test]
+    fn remote_agent_discovery_bounds_attempts_and_reports_actionable_exhaustion() {
+        let mut attempts = 0;
+        let error = probe_with_agent_discovery::<()>(
+            DEFAULT_REMOTE_AGENT_EXECUTABLE,
+            Duration::from_secs(45),
+            |_, _| {
+                attempts += 1;
+                Err(missing_agent_error())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 5);
+        assert!(error.to_string().contains("Edit > Agent exe"));
+        assert!(error.downcast_ref::<RemoteTransportError>().is_some());
+
+        let mut attempts = 0;
+        let error = probe_with_agent_discovery::<()>(
+            DEFAULT_REMOTE_AGENT_EXECUTABLE,
+            Duration::ZERO,
+            |_, _| {
+                attempts += 1;
+                Err(missing_agent_error())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            error.downcast_ref::<RemoteTransportError>(),
+            Some(RemoteTransportError::Timeout { .. })
+        ));
+    }
+
     #[test]
     fn remote_test_rejects_same_revision_target_changes() {
         let directory = tempfile::tempdir().unwrap();
@@ -8246,6 +8523,71 @@ mod tests {
             trace_after.trace_log,
             Some(PathBuf::from("/tmp/trace.jsonl"))
         );
+    }
+
+    #[test]
+    fn event_log_cli_options_and_rotation_paths_are_validated() {
+        let default = Cli::try_parse_from(["codex-usage-monit"]).unwrap();
+        assert_eq!(default.log_level, LogLevel::Warn);
+        assert!(default.log_file.is_none());
+        for args in [
+            vec![
+                "codex-usage-monit",
+                "--log-file",
+                "events.jsonl",
+                "--log-level",
+                "info",
+                "snapshot",
+            ],
+            vec![
+                "codex-usage-monit",
+                "snapshot",
+                "--log-file",
+                "events.jsonl",
+                "--log-level",
+                "info",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.log_level, LogLevel::Info);
+            assert_eq!(cli.log_file, Some(PathBuf::from("events.jsonl")));
+        }
+        assert!(Cli::try_parse_from(["codex-usage-monit", "--log-level", "verbose"]).is_err());
+        for (flag, path) in [
+            ("--trace-log", "events.jsonl"),
+            ("--perf-log", "events.jsonl.1"),
+            ("--startup-log", "events.jsonl"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "codex-usage-monit",
+                "--log-file",
+                "events.jsonl",
+                flag,
+                path,
+            ])
+            .unwrap();
+            assert!(validate_output_path_conflicts(&cli).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--trace-log",
+            "trace.jsonl",
+            "--log-file",
+            "trace.jsonl.1",
+        ])
+        .unwrap();
+        assert!(validate_output_path_conflicts(&cli).is_err());
+        let off = Cli::try_parse_from([
+            "codex-usage-monit",
+            "--log-level",
+            "off",
+            "--log-file",
+            "same.jsonl",
+            "--trace-log",
+            "same.jsonl",
+        ])
+        .unwrap();
+        assert!(validate_output_path_conflicts(&off).is_ok());
     }
 
     #[test]

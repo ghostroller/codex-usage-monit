@@ -390,6 +390,10 @@ try {
         if (-not $SkipSmoke) {
             Write-Host "==> Test Windows verification exit-code and diagnostic handling"
             & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
+            Write-Host "==> Test Windows development TUI launcher"
+            & (Join-Path $PSScriptRoot "tests\dev-smoke.ps1")
+            Write-Host "==> Test Windows state permission inspection and repair"
+            & (Join-Path $PSScriptRoot "tests\repair-state-permissions.ps1")
         }
 
         $testArguments = @("test", "--locked", "--all-targets")

@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests/integration_scenarios.rs
+assertion_line: 267
 expression: settings.frame().snapshot_text()
 ---
 size=80x24
@@ -15,9 +16,9 @@ rows:
 08|│[G]Automatic sync: Off                                                        │
 09|│No configured or retained remote sources                                      │
 10|│                                                                              │
-11|│                                                                              │
-12|│[N]New  [E]Edit  [P]Pair  [D]Remove                                           │
-13|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data                         │
+11|│[N]New  [E]Edit  [P]Pair  [D]Remove                                           │
+12|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data                         │
+13|│                                                                              │
 14|└──────────────────────────────────────────────────────────────────────────────┘
 15|┌ Project mappings · explicit only─────────────────────────────────────────────┐
 16|│No project instances or explicit logical mappings                             │
@@ -99,12 +100,12 @@ styles:
 10:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 10:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 11:000+001 fg=#4b525c bg=#121417 mods=none text="│"
+11:001+035 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove"
 11:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 12:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-12:001+035 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove"
+12:001+053 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data"
 12:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 13:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-13:001+053 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data"
 13:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 14:000+080 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────────────────────────┘"
 15:000+001 fg=#4b525c bg=#121417 mods=none text="┌"

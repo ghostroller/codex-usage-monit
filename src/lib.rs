@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 mod diagnostic_log;
 pub mod domain;
+pub mod event_log;
 mod exact_json;
 mod file_lock;
 mod git_repository;
@@ -67,3 +68,5 @@ pub mod trace;
 pub mod trends;
 pub mod tui;
 pub mod ui_state;
+#[cfg(windows)]
+mod windows_private_directory;

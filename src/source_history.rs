@@ -1,3 +1,10 @@
+#[cfg(windows)]
+use crate::windows_private_directory::{
+    create_dir as private_create_dir, create_dir_all as private_create_dir_all,
+};
+#[cfg(not(any(unix, windows)))]
+use std::fs::{create_dir as private_create_dir, create_dir_all as private_create_dir_all};
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
@@ -3388,7 +3395,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     {
         #[cfg(windows)]
         reject_windows_reparse_components_before_create(path, "source history directory")?;
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
     }
     validate_private_directory(path)
 }
@@ -3525,10 +3532,10 @@ fn create_trusted_state_root(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         reject_windows_reparse_components_before_create(path, "source history state root")?;
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
     }
     #[cfg(not(any(unix, windows)))]
-    fs::create_dir_all(path)?;
+    private_create_dir_all(path)?;
     validate_trusted_state_root(path)
 }
 
@@ -3540,7 +3547,7 @@ fn create_private_child_directory(path: &Path) -> io::Result<()> {
         fs::DirBuilder::new().mode(0o700).create(path)?;
     }
     #[cfg(not(unix))]
-    fs::create_dir(path)?;
+    private_create_dir(path)?;
     validate_private_directory(path)
 }
 

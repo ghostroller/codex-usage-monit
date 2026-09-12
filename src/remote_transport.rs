@@ -1412,15 +1412,6 @@ where
     ) {
         return Err(error);
     }
-    if let Err(error) = input_result {
-        if error.kind() == io::ErrorKind::TimedOut {
-            return Err(RemoteTransportError::Timeout {
-                timeout,
-                cleanup_error: Some(error),
-            });
-        }
-        return Err(RemoteTransportError::RequestWrite(error));
-    }
     let stdout_result = match receive_worker(&stdout_worker, deadline, timeout, "stdout") {
         Ok(result) => result,
         Err(error) => {
@@ -1500,6 +1491,18 @@ where
         });
     }
     ensure_success(status, &stderr.bytes)?;
+    // A shell that cannot find the exporter may exit before consuming stdin.
+    // Prefer its bounded diagnostic over the resulting broken-pipe error;
+    // setup discovery and the TUI need the actual SSH/remote launch failure.
+    if let Err(error) = input_result {
+        if error.kind() == io::ErrorKind::TimedOut {
+            return Err(RemoteTransportError::Timeout {
+                timeout,
+                cleanup_error: Some(error),
+            });
+        }
+        return Err(RemoteTransportError::RequestWrite(error));
+    }
 
     let response: RemoteExportResponse<D, F> = decode_remote_frame(&stdout.bytes, response_limits)?;
     let response_decoded_bytes = decoded_remote_frame_payload_len(&stdout.bytes)?;

@@ -280,6 +280,8 @@ Global options should appear before the subcommand.
 | `--startup-log <FILE>` | Write startup timing events as JSONL. |
 | `--perf-log <FILE>` | Write runtime performance events as JSONL. |
 | `--trace-log <FILE>` | Write opt-in, per-operation diagnostic traces as JSONL. |
+| `--log-file <FILE>` | Append application warnings/errors as JSONL; TUI defaults to a session file under the state directory's `logs` folder. |
+| `--log-level <LEVEL>` | Application log threshold: `off`, `error`, `warn` (default), `info`, or `debug`. |
 
 Run `codex-usage-monit --help` or `codex-usage-monit <command> --help` for the complete option list.
 
@@ -494,6 +496,76 @@ History and recorder state are user data rather than a rebuildable parse cache. 
 Set `CODEX_USAGE_MONIT_STATE_DIR` to override the state directory. History is retained for 90 days in namespaced UTC-day JSON shards. `--no-rollout-cache` does not disable history, and uninstalling the background service does not delete it.
 
 ## Troubleshooting and diagnostics
+
+### TUI warnings and errors on Windows
+
+Ordinary `cargo run` starts the TUI with a persistent application event log at
+`%LOCALAPPDATA%\codex-usage-monit\logs\tui-<timestamp>-<pid>.jsonl`.
+`CODEX_USAGE_MONIT_STATE_DIR` also relocates this log directory. Other → Diagnostics
+shows the current log path and any failure to write it. The TUI continues running
+if logging is unavailable; the failure is also printed to stderr after exit.
+
+```powershell
+# Default: save warnings and errors automatically.
+cargo run
+# Also retain operation start/success events, at an explicit path.
+cargo run -- --log-file .\logs\tui.jsonl --log-level info
+# Disable application logging.
+cargo run -- --log-level off
+```
+
+Application logs include collection/history warnings, local-state/ACL failures,
+remote configuration and health errors, settings-save failures, and manual remote
+operation error details. Repeated unchanged diagnostics are deduplicated; resolved
+issues are recorded again if they recur. Each manual remote operation has an
+operation ID and a hashed source identifier. Background synchronization diagnostics
+reflect the persisted health state observed by the TUI, including failure category
+and attempt time; they do not reconstruct remote stderr from earlier recorder runs.
+
+These logs contain bounded diagnostic text, unlike the content-free `--trace-log`.
+Common credential-bearing lines are redacted and the local home directory is
+replaced by `<home>`; task/session bodies are not logged. Diagnostic paths and
+other SSH error context may remain. Windows event files are created with private
+DACLs and can be read while the TUI is running. Existing explicit files must already
+have private permissions; symlinks/reparse points and hard links are rejected.
+
+Each application log rotates at 8 MiB, keeping one `.1` backup. Default session
+logs retain the newest 20 sessions, skipping files still held by active TUIs.
+An explicit `--log-file` is appended across launches and is excluded from session
+cleanup. Use different files for simultaneous processes. `--log-file` is also
+accepted by CLI subcommands for runtime failures; it is not automatically forwarded
+to TUI helper processes or installed recorder services. TUI helpers return their
+error details to the parent, which writes the operation result to its own log.
+
+`--startup-log`, `--perf-log`, and `--trace-log` remain separate timing/performance
+streams and can be enabled alongside the application log using distinct paths.
+
+For Windows development, the PowerShell launcher enables all four streams and
+sets the application log level to `debug`:
+
+```powershell
+& .\scripts\windows\dev.ps1
+# Optional log parent directory and additional TUI arguments.
+& .\scripts\windows\dev.ps1 -LogRoot 'D:\TUI logs' -TuiArgs @('--offline', '--days', '14')
+```
+
+The launcher uses `cargo run --locked` with the development profile. Each run gets
+a new directory under `.codex-usage-monit\logs\dev\`, containing `events.jsonl`
+(warnings, errors, operation results and refresh diagnostics), `trace.jsonl`
+(operation timing), `perf.jsonl` (performance/resource samples), and `startup.jsonl`
+(startup stages). It prints the directory before launch and after exit. These
+explicit logs are excluded from automatic session cleanup; remove old run
+directories when no longer needed. The default directory is ignored by Git.
+
+Run it from PowerShell 5.1 or 7 with the usual Rust/MSVC development prerequisites.
+If the shell blocks local scripts, invoke
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\dev.ps1`;
+this does not change the saved execution policy. The launcher keeps the terminal
+attached for TUI keyboard/mouse input and sets `RUST_BACKTRACE=full` for the child.
+Build output and panic backtraces remain in the terminal, outside the four JSONL
+streams. The caller's location and backtrace setting are restored on exit.
+`-LogRoot` resolves relative to the caller; paths in `-TuiArgs` resolve relative
+to the repository root.
 
 ### `codex-usage-monit: command not found`
 

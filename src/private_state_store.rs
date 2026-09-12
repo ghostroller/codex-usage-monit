@@ -5,6 +5,13 @@
 //! bounded reads, and durable atomic replacement. Each caller retains its own
 //! schema validation and mutation/CAS rules.
 
+#[cfg(windows)]
+use crate::windows_private_directory::{
+    create_dir as private_create_dir, create_dir_all as private_create_dir_all,
+};
+#[cfg(not(any(unix, windows)))]
+use std::fs::{create_dir as private_create_dir, create_dir_all as private_create_dir_all};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -291,7 +298,7 @@ impl PrivateStoreLayout {
                 .create(path)?;
         }
         #[cfg(not(unix))]
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
         self.validate_state_root(path)
     }
 
@@ -306,7 +313,7 @@ impl PrivateStoreLayout {
             }
         }
         #[cfg(not(unix))]
-        match fs::create_dir(path) {
+        match private_create_dir(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),

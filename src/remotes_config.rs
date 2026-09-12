@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use crate::windows_private_directory::create_dir_all as private_create_dir_all;
+#[cfg(not(any(unix, windows)))]
+use std::fs::create_dir_all as private_create_dir_all;
+
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
@@ -1029,11 +1034,32 @@ impl RemotesConfigStore {
     /// exclusive allowlist lock is held. This is used to fence a durable
     /// source-purge intent against reattachment; callers must not perform
     /// network I/O or wait on a lock ordered before the remotes config lock.
+    #[cfg(test)]
     pub(crate) fn pair_if_current_checked(
         &self,
         expected_revision: u64,
         expected_host: &RemoteHostConfig,
         source: SourceGeneration,
+        precondition: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<RemotesConfig> {
+        self.save_probe_if_current_checked(
+            expected_revision,
+            expected_host,
+            expected_host.agent_executable(),
+            Some(source),
+            precondition,
+        )
+    }
+
+    /// Saves a verified executable and optionally pairs its source in one
+    /// publication. Discovery runs before acquiring this lock. Both the exact
+    /// host and revision must still match, including for an unpaired Test.
+    pub(crate) fn save_probe_if_current_checked(
+        &self,
+        expected_revision: u64,
+        expected_host: &RemoteHostConfig,
+        agent_executable: &str,
+        source: Option<SourceGeneration>,
         precondition: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<RemotesConfig> {
         let path = self.required_path()?;
@@ -1045,10 +1071,18 @@ impl RemotesConfigStore {
         ensure_expected_revision(expected_revision, current.config_revision)?;
         ensure_expected_host(&current, expected_host)?;
         precondition()?;
-        if current.apply_mutation(RemotesConfigMutation::pair_pin(
-            expected_host.id().to_owned(),
-            source,
-        ))? {
+        let mut changed = current.apply_mutation(RemotesConfigMutation::edit_host(
+            expected_host.id(),
+            RemoteHostEdit {
+                agent_executable: Some(agent_executable.to_owned()),
+                ..RemoteHostEdit::default()
+            },
+        ))?;
+        if let Some(source) = source {
+            changed |= current
+                .apply_mutation(RemotesConfigMutation::pair_pin(expected_host.id(), source))?;
+        }
+        if changed {
             let contents = serialize_config(&current)?;
             write_private_atomically(path, &contents)?;
         }
@@ -1492,7 +1526,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
     }
     validate_private_directory(path)
 }
@@ -2801,6 +2835,103 @@ mod tests {
         assert_eq!(
             store.commit(stale).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn discovered_agent_is_saved_with_pairing_atomically_and_fenced_against_edits() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config/remotes.json");
+        let store = RemotesConfigStore::new(path.clone());
+        let initial = store.load_or_create().unwrap();
+        let configured = store
+            .update(
+                initial.config_revision(),
+                RemotesConfigMutation::add_host("dev", "dev-alias"),
+            )
+            .unwrap();
+        let host = configured.host("dev").unwrap();
+        let agent = "~/.local/bin/codex-usage-monit";
+        let before = std::fs::read(&path).unwrap();
+        let failure = store.save_probe_if_current_checked(
+            configured.config_revision(),
+            host,
+            agent,
+            Some(source(NODE_ONE, 9)),
+            || Err(io::Error::other("purge pending")),
+        );
+        assert!(failure.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let tested = store
+            .save_probe_if_current_checked(configured.config_revision(), host, agent, None, || {
+                Ok(())
+            })
+            .unwrap();
+        let tested_host = tested.host("dev").unwrap();
+        assert_eq!(tested_host.agent_executable(), agent);
+        assert!(!tested_host.is_paired());
+        assert!(!tested_host.sync_enabled());
+        assert!(tested_host.redact_content());
+        assert!(!tested.auto_sync_enabled());
+        assert!(
+            store
+                .save_probe_if_current_checked(
+                    configured.config_revision(),
+                    host,
+                    agent,
+                    None,
+                    || Ok(())
+                )
+                .is_err()
+        );
+
+        let paired = store
+            .save_probe_if_current_checked(
+                tested.config_revision(),
+                tested_host,
+                "/opt/verified/codex-usage-monit",
+                Some(source(NODE_ONE, 9)),
+                || Ok(()),
+            )
+            .unwrap();
+        let paired_host = paired.host("dev").unwrap();
+        assert_eq!(
+            paired_host.agent_executable(),
+            "/opt/verified/codex-usage-monit"
+        );
+        assert_eq!(paired_host.expected_source(), Some(&source(NODE_ONE, 9)));
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            store
+                .save_probe_if_current_checked(
+                    paired.config_revision(),
+                    paired_host,
+                    agent,
+                    Some(source(NODE_TWO, 1)),
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut rewritten = serde_json::to_value(&paired).unwrap();
+        rewritten["hosts"][0]["sshHost"] = serde_json::json!("replacement-host");
+        std::fs::write(&path, serde_json::to_vec(&rewritten).unwrap()).unwrap();
+        assert!(
+            store
+                .save_probe_if_current_checked(
+                    paired.config_revision(),
+                    paired_host,
+                    agent,
+                    None,
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.load().unwrap().host("dev").unwrap().ssh_host(),
+            "replacement-host"
         );
     }
 

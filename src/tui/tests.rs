@@ -13776,6 +13776,244 @@ fn settings_remote_completion_is_applied_only_to_the_matching_request() {
     );
 }
 
+fn remote_action_test_output(code: u32, stdout: &[u8], stderr: &[u8]) -> Output {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    #[cfg(windows)]
+    let status = std::process::ExitStatus::from_raw(code);
+    #[cfg(unix)]
+    let status = std::process::ExitStatus::from_raw((code as i32) << 8);
+    Output {
+        status,
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+    }
+}
+
+#[test]
+fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
+    for (error, hint) in [
+        (
+            "error: zsh:1: command not found: codex-usage-monit",
+            "Edit > Agent exe",
+        ),
+        (
+            "error: Permission denied (publickey)",
+            "SSH key authentication",
+        ),
+        (
+            "error: Host key verification failed",
+            "Verify the remote host key",
+        ),
+        ("error: Connection refused", "remote SSH service"),
+    ] {
+        let output = remote_action_test_output(1, b"", error.as_bytes());
+        let detail = remote_ui_action_output(&output).unwrap_err();
+        assert!(detail.contains(error));
+        assert!(detail.contains(hint));
+        assert_eq!(remote_ui_action_error_kind(&detail), "command_failed");
+    }
+    let unsafe_text = format!("\x1b]52;c;clipboard\x07\n\u{202e}{}", "界".repeat(3000));
+    let detail =
+        remote_ui_action_output(&remote_action_test_output(1, b"", unsafe_text.as_bytes()))
+            .unwrap_err();
+    assert!(!detail.chars().any(char::is_control));
+    assert!(!detail.contains('\u{202e}'));
+    assert!(detail.chars().count() < 1300);
+    assert!(detail.ends_with('…'));
+    assert_eq!(
+        remote_ui_action_output(&remote_action_test_output(
+            2,
+            b"state-writable=false rollout-readable=true",
+            b""
+        )),
+        Ok(RemoteUiActionOutcome::NeedsAttention(
+            "state-writable=false rollout-readable=true".to_owned()
+        ))
+    );
+    assert!(
+        remote_ui_action_output(&remote_action_test_output(1, b"", b""))
+            .unwrap_err()
+            .contains("No error details")
+    );
+}
+
+#[test]
+fn settings_remote_error_details_render_without_moving_controls_and_reach_diagnostics() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(64, 20), (120, 32)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = interaction_test_app(0, 0);
+            install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+            app.view = View::Settings;
+            app.theme = theme;
+            app.selected_setting = SettingItem::ALL.len();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let test_before = app.settings_controls_hitbox.as_ref().unwrap().remote_test;
+            assert!(!test_before.is_empty());
+            handle_key_event(&mut app, key_event(KeyCode::Char('C')));
+            let running = app.remote_action_running.clone().unwrap();
+            let output = remote_action_test_output(1, b"", b"command not found: codex-usage-monit");
+            app.apply_remote_action_completion(RemoteUiActionCompletion {
+                request: running,
+                result: remote_ui_action_output(&output),
+            });
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(
+                app.settings_controls_hitbox.as_ref().unwrap().remote_test,
+                test_before
+            );
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let wrapped = content
+                .replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                wrapped.contains("command not found"),
+                "{width}x{height}: {content}"
+            );
+            assert!(
+                app.remote_action_diagnostic
+                    .as_deref()
+                    .unwrap()
+                    .contains("Edit > Agent exe")
+            );
+
+            app.view = View::Health;
+            let mut other = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            other.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = other
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("command not found"));
+            assert!(content.contains("Agent exe"));
+
+            app.view = View::Settings;
+            // Re-render Settings before interacting: Other clears its hitboxes.
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    test_before.x,
+                    test_before.y,
+                ),
+            );
+            let running = app.remote_action_running.clone().unwrap();
+            app.apply_remote_action_completion(RemoteUiActionCompletion {
+                request: running,
+                result: Ok(RemoteUiActionOutcome::Complete),
+            });
+            assert!(app.remote_action_diagnostic.is_none());
+        }
+    }
+}
+
+#[test]
+fn remote_ui_action_error_details_are_not_written_to_trace() {
+    let directory = tempfile::tempdir().unwrap();
+    let trace_path = directory.path().join("trace.jsonl");
+    let trace = TraceLog::enabled(&trace_path);
+    let request = RemoteUiActionRequest {
+        kind: RemoteUiActionKind::Test,
+        host_id: "private-host".to_owned(),
+        config_revision: 1,
+    };
+    let detail = "command failed (exit 1): private-key-path private-ssh-diagnostic";
+    let result = trace_remote_ui_action(
+        &request,
+        &trace,
+        &RemoteActionCancellation::default(),
+        || Err(detail.to_owned()),
+    );
+    assert_eq!(result.unwrap_err(), detail);
+    trace.finish();
+    let contents = std::fs::read_to_string(&trace_path).unwrap();
+    assert!(contents.contains("command_failed"));
+    assert!(!contents.contains("private-key-path"));
+    assert!(!contents.contains("private-ssh-diagnostic"));
+}
+
+#[test]
+fn event_log_tui_captures_diagnostics_and_failed_settings_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.jsonl");
+    let mut app = interaction_test_app(0, 0);
+    app.event_log = EventLog::open(Some(path.clone()), LogLevel::Warn, false);
+    app.snapshot
+        .errors
+        .push("account request timed out".to_owned());
+    app.history
+        .warnings
+        .push("source identity state directory DACL grants access".to_owned());
+    app.remote_sources.config_error = Some("local-state/permission-denied".to_owned());
+    app.observe_diagnostics();
+    app.observe_diagnostics();
+    let blocker = temp.path().join("blocked-parent");
+    std::fs::write(&blocker, "keep this file").unwrap();
+    app.save_ui_state(&UiStateStore::new(blocker.join("state.json")));
+    assert!(app.ui_save_error.is_some());
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let rows = contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    for event in [
+        "collection.error",
+        "history.warning",
+        "remote.config",
+        "ui.save",
+    ] {
+        assert_eq!(
+            rows.iter().filter(|row| row["event"] == event).count(),
+            1,
+            "{event}"
+        );
+    }
+    assert!(contents.contains("DACL grants access"));
+    assert_eq!(std::fs::read_to_string(blocker).unwrap(), "keep this file");
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| frame.render_widget(diagnostics_paragraph(&app), frame.area()))
+        .unwrap();
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("Log:"));
+    assert!(rendered.contains("Settings save failed:"));
+    app.event_log.finish();
+    app.event_log = EventLog::open(Some(temp.path().to_owned()), LogLevel::Warn, false);
+    terminal
+        .draw(|frame| frame.render_widget(diagnostics_paragraph(&app), frame.area()))
+        .unwrap();
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("Log unavailable:"));
+}
+
 #[test]
 fn settings_remote_editor_next_control_is_clickable_in_terse_layout() {
     let directory = tempfile::tempdir().unwrap();

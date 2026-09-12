@@ -21,6 +21,7 @@ pub struct CollectConfig {
     pub app_server_timeout: Duration,
     pub perf_log: PerfLog,
     pub trace_log: TraceLog,
+    pub event_log: crate::event_log::EventLog,
     pub startup_trace: StartupTrace,
 }
 
@@ -39,6 +40,7 @@ impl Default for CollectConfig {
             app_server_timeout: default_app_server_timeout(cfg!(windows)),
             perf_log: PerfLog::default(),
             trace_log: TraceLog::default(),
+            event_log: crate::event_log::EventLog::default(),
             startup_trace: StartupTrace::default(),
         }
     }

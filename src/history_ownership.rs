@@ -5,6 +5,13 @@
 //! future runtime cutover must use. In particular, process IDs and heartbeat
 //! timestamps are diagnostic metadata; they never authorize lock stealing.
 
+#[cfg(windows)]
+use crate::windows_private_directory::{
+    create_dir as private_create_dir, create_dir_all as private_create_dir_all,
+};
+#[cfg(not(any(unix, windows)))]
+use std::fs::{create_dir as private_create_dir, create_dir_all as private_create_dir_all};
+
 use std::cell::Cell;
 use std::ffi::OsStr;
 use std::fmt;
@@ -1411,7 +1418,7 @@ fn create_private_state_root(path: &Path) -> io::Result<()> {
     {
         #[cfg(windows)]
         reject_windows_reparse_components_before_create(path, "history ownership state root")?;
-        fs::create_dir_all(path)?;
+        private_create_dir_all(path)?;
     }
     let metadata = fs::symlink_metadata(path)?;
     validate_private_state_root(&metadata, path)
@@ -1429,7 +1436,7 @@ fn create_private_child_directory(parent: &Path, name: &str) -> io::Result<PathB
                 fs::DirBuilder::new().mode(0o700).create(&path)
             };
             #[cfg(not(unix))]
-            let create_result = fs::create_dir(&path);
+            let create_result = private_create_dir(&path);
             match create_result {
                 Ok(()) => {}
                 // Two first-use callers can both observe the missing child.

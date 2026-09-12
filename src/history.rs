@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use crate::windows_private_directory::create_dir_all as private_create_dir_all;
+#[cfg(not(any(unix, windows)))]
+use std::fs::create_dir_all as private_create_dir_all;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
@@ -4463,6 +4468,7 @@ fn open_lock_file(directory: &Path) -> io::Result<File> {
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
     if path.is_dir() {
         return Ok(());
     }
@@ -4474,7 +4480,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path)
+        private_create_dir_all(path)
     }
 }
 
