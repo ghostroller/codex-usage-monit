@@ -12530,6 +12530,111 @@ fn settings_remote_sources_render_across_compact_light_and_dark_layouts() {
 }
 
 #[test]
+fn settings_remote_viewport_shows_both_hosts_and_preserves_selection_and_hitboxes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(100, 24), (160, 40), (70, 24)] {
+            app.selected_setting = SettingItem::ALL.len();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let before = app.settings_controls_hitbox.clone().unwrap();
+            assert_eq!(before.remote_hosts.len(), 2, "{width}x{height}");
+            assert!(before.remote_hosts.iter().all(|area| !area.is_empty()));
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("dev-box") && content.contains("lab-box"));
+
+            handle_key_event(&mut app, key_event(KeyCode::Down));
+            assert_eq!(app.selected_remote_host_id().as_deref(), Some("lab"));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(
+                before.remote_hosts,
+                app.settings_controls_hitbox.as_ref().unwrap().remote_hosts
+            );
+            handle_key_event(&mut app, key_event(KeyCode::Up));
+            assert_eq!(app.selected_remote_host_id().as_deref(), Some("dev"));
+
+            for (index, id) in [(1, "lab"), (0, "dev")] {
+                let area = before.remote_hosts[index];
+                assert!(handle_mouse_event(
+                    &mut app,
+                    mouse_event(
+                        MouseEventKind::Down(MouseButton::Left),
+                        area.right() - 1,
+                        area.y,
+                    )
+                ));
+                assert_eq!(app.selected_remote_host_id().as_deref(), Some(id));
+            }
+            app.request_remote_action(RemoteUiActionKind::Test);
+            let request = app.remote_action_running.clone().unwrap();
+            app.apply_remote_action_completion(RemoteUiActionCompletion {
+                request,
+                result: Err("SSH connection failed with a long diagnostic that wraps across several status rows".repeat(3)),
+            });
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let after = app.settings_controls_hitbox.as_ref().unwrap();
+            assert_eq!(before.remote_hosts, after.remote_hosts);
+            assert_eq!(before.remote_test, after.remote_test);
+        }
+    }
+}
+
+#[test]
+fn settings_remote_viewport_reports_hidden_hosts_and_maps_scrolled_mouse_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (index, id) in [(0, "dev"), (1, "lab")] {
+            app.selected_setting = SettingItem::ALL.len() + index;
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains(&format!("{}-{}/2", index + 1, index + 1)));
+            let controls = app.settings_controls_hitbox.as_ref().unwrap();
+            let area = controls.remote_hosts[index];
+            assert!(!area.is_empty());
+            assert!(
+                controls
+                    .remote_hosts
+                    .iter()
+                    .take(index)
+                    .all(|area| area.is_empty())
+            );
+            app.selected_setting = SettingItem::ALL.len() + (1 - index);
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    area.right() - 1,
+                    area.y,
+                )
+            ));
+            assert_eq!(app.selected_remote_host_id().as_deref(), Some(id));
+        }
+    }
+}
+
+#[test]
 fn empty_remote_panel_is_keyboard_and_mouse_reachable_in_wide_and_compact_layouts() {
     for (width, height) in [(60, 12), (100, 24)] {
         let directory = tempfile::tempdir().unwrap();
@@ -13289,7 +13394,9 @@ fn settings_remote_purge_rechecks_that_the_source_is_still_detached() {
     assert!(app.pending_remote_action.is_none());
     assert!(app.remote_purge_confirmation.is_none());
     assert_eq!(
-        app.remote_action_status.as_deref(),
+        app.remote_action_status
+            .as_ref()
+            .map(RemoteActionStatus::message),
         Some("Source changed; purge was not started")
     );
 }
@@ -13353,7 +13460,9 @@ fn settings_remote_control_geometry_is_stable_while_an_action_is_running() {
             .unwrap()
             .config_revision(),
     });
-    app.remote_action_status = Some("远程连接测试运行中".to_owned());
+    app.remote_action_status = Some(RemoteActionStatus::Operation(
+        "远程连接测试运行中".to_owned(),
+    ));
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let inactive = app.settings_controls_hitbox.clone().unwrap();
     assert_eq!(active.remote_global, inactive.remote_global);
@@ -13902,7 +14011,8 @@ fn settings_remote_completion_is_applied_only_to_the_matching_request() {
     assert_eq!(app.remote_action_running.as_ref(), Some(&running));
     assert!(
         app.remote_action_status
-            .as_deref()
+            .as_ref()
+            .map(RemoteActionStatus::message)
             .is_some_and(|status| status.contains("started"))
     );
 
@@ -13913,7 +14023,8 @@ fn settings_remote_completion_is_applied_only_to_the_matching_request() {
     assert!(app.remote_action_running.is_none());
     assert!(
         app.remote_action_status
-            .as_deref()
+            .as_ref()
+            .map(RemoteActionStatus::message)
             .is_some_and(|status| status.contains("completed for dev"))
     );
 }
@@ -14240,6 +14351,77 @@ fn event_log_tui_distinguishes_remote_state_from_stale_data_and_records_recovery
         rows.iter().any(|row| row["event"] == "diagnostic.resolved"
             && row["diagnosticId"] == stale["diagnosticId"])
     );
+}
+
+#[test]
+fn event_log_tui_remote_toggle_success_is_state_and_rejections_do_not_depend_on_wording() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.jsonl");
+    let mut app = interaction_test_app(0, 0);
+    let (store, _) = install_remote_sources_fixture(&mut app, temp.path(), Utc::now());
+    let revision = store.load().unwrap().config_revision();
+    app.remote_sources.config = Some(
+        store
+            .update(
+                revision,
+                RemotesConfigMutation::add_host("started-completed", "test-box"),
+            )
+            .unwrap(),
+    );
+    app.event_log = EventLog::open(Some(path.clone()), LogLevel::Debug, false);
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    for key in ['g', 'g', 'h', 'h'] {
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        handle_key_event(&mut app, key_event(KeyCode::Char(key)));
+        app.observe_diagnostics();
+    }
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(!contents.contains("remote.action_rejected"), "{contents}");
+    let rows: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (event, state) in [
+        ("remote.auto_sync", "globalEnabled=false"),
+        ("remote.auto_sync", "globalEnabled=true"),
+        ("remote.auto_sync_host", "hostEnabled=false"),
+        ("remote.auto_sync_host", "hostEnabled=true"),
+    ] {
+        assert!(rows.iter().any(|row| row["event"] == event
+            && row["level"] == "info"
+            && row["kind"] == "state"
+            && row["message"].as_str().unwrap().contains(state)));
+    }
+
+    app.selected_setting = SettingItem::ALL.len() + 2;
+    app.request_remote_action(RemoteUiActionKind::Sync);
+    assert!(app.pending_remote_action.is_none());
+    app.observe_diagnostics();
+    app.observe_diagnostics();
+    // A subsequent successful state change must clear the rejection.
+    app.toggle_remote_global();
+    app.observe_diagnostics();
+    let contents = std::fs::read_to_string(path).unwrap();
+    let rows: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let rejected: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "remote.action_rejected")
+        .collect();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["level"], "warn");
+    assert!(
+        rejected[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("started-completed is unpaired")
+    );
+    assert!(rows.iter().any(|row| row["event"] == "diagnostic.resolved"
+        && row["diagnosticId"] == rejected[0]["diagnosticId"]));
 }
 
 #[test]

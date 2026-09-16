@@ -2899,6 +2899,21 @@ struct RemoteBandwidthHostStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteActionStatus {
+    State(String),
+    Rejected(String),
+    Operation(String),
+}
+
+impl RemoteActionStatus {
+    fn message(&self) -> &str {
+        match self {
+            Self::State(message) | Self::Rejected(message) | Self::Operation(message) => message,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RemoteUiActionKind {
     Add {
         ssh_host: String,
@@ -3380,7 +3395,7 @@ struct App {
     remote_bandwidth_store: Option<RemoteBandwidthBudgetStore>,
     pending_remote_action: Option<RemoteUiActionRequest>,
     remote_action_running: Option<RemoteUiActionRequest>,
-    remote_action_status: Option<String>,
+    remote_action_status: Option<RemoteActionStatus>,
     remote_action_diagnostic: Option<String>,
     event_log: EventLog,
     ui_save_error: Option<String>,
@@ -4477,8 +4492,9 @@ impl App {
         if self.remote_action_idle() {
             false
         } else {
-            self.remote_action_status =
-                Some("Another remote operation is still running".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Another remote operation is still running".to_owned(),
+            ));
             true
         }
     }
@@ -5020,7 +5036,9 @@ impl App {
 
     fn update_remote_config(&mut self, mutation: RemotesConfigMutation, label: &str) {
         let Some(config) = self.remote_sources.config.as_ref() else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         match self
@@ -5030,13 +5048,13 @@ impl App {
             Ok(updated) => {
                 self.remote_sources.config = Some(updated);
                 self.remote_sources.config_error = None;
-                self.remote_action_status = Some(label.to_owned());
+                self.remote_action_status = Some(RemoteActionStatus::State(label.to_owned()));
             }
             Err(error) => {
-                self.remote_action_status = Some(format!(
+                self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
                     "Remote config update failed ({})",
                     io_error_category(&error)
-                ));
+                )));
                 self.reload_remote_sources();
             }
         }
@@ -5050,7 +5068,9 @@ impl App {
             return;
         }
         let Some(config) = self.remote_sources.config.as_ref() else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         self.remote_editor = Some(RemoteEditorState {
@@ -5073,7 +5093,9 @@ impl App {
             return;
         }
         let Some(host) = self.selected_remote_host().cloned() else {
-            self.remote_action_status = Some("Select one remote host first".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Select one remote host first".to_owned(),
+            ));
             return;
         };
         let Some(config_revision) = self
@@ -5082,7 +5104,9 @@ impl App {
             .as_ref()
             .map(RemotesConfig::config_revision)
         else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         let ssh_host = host.ssh_host().to_owned();
@@ -5312,7 +5336,9 @@ impl App {
             return;
         }
         let Some(host_id) = self.selected_remote_host_id() else {
-            self.remote_action_status = Some("Select one remote host first".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Select one remote host first".to_owned(),
+            ));
             return;
         };
         let Some(config_revision) = self
@@ -5321,7 +5347,9 @@ impl App {
             .as_ref()
             .map(RemotesConfig::config_revision)
         else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         self.remote_remove_confirmation = Some(RemoteRemoveConfirmation {
@@ -5342,10 +5370,10 @@ impl App {
         let current = match self.remote_config_store.load() {
             Ok(current) => current,
             Err(error) => {
-                self.remote_action_status = Some(format!(
+                self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
                     "Remote config unavailable ({})",
                     io_error_category(&error)
-                ));
+                )));
                 self.cancel_remote_remove_confirmation();
                 return;
             }
@@ -5353,8 +5381,9 @@ impl App {
         if current.config_revision() != confirmation.config_revision
             || current.host(&confirmation.host_id).is_none()
         {
-            self.remote_action_status =
-                Some("Remote config changed; remove was not started".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config changed; remove was not started".to_owned(),
+            ));
             self.cancel_remote_remove_confirmation();
             self.reload_remote_sources();
             return;
@@ -5375,7 +5404,9 @@ impl App {
             .selected_detached_remote_source()
             .map(|source| source.source_id().clone())
         else {
-            self.remote_action_status = Some("Select one detached remote source first".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Select one detached remote source first".to_owned(),
+            ));
             return;
         };
         self.remote_purge_confirmation = Some(RemotePurgeConfirmation { source_id });
@@ -5397,7 +5428,9 @@ impl App {
             .iter()
             .any(|source| source.source_id() == &confirmation.source_id && source.detached());
         if !still_detached {
-            self.remote_action_status = Some("Source changed; purge was not started".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Source changed; purge was not started".to_owned(),
+            ));
             self.cancel_remote_purge_confirmation();
             return;
         }
@@ -5421,8 +5454,9 @@ impl App {
         config_revision: u64,
     ) {
         if self.remote_action_running.is_some() || self.pending_remote_action.is_some() {
-            self.remote_action_status =
-                Some("Another remote operation is still running".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Another remote operation is still running".to_owned(),
+            ));
             return;
         }
         let label = kind.label();
@@ -5433,7 +5467,9 @@ impl App {
         };
         self.pending_remote_action = Some(request.clone());
         self.remote_action_running = Some(request);
-        self.remote_action_status = Some(format!("Remote {label} started…"));
+        self.remote_action_status = Some(RemoteActionStatus::Operation(format!(
+            "Remote {label} started…"
+        )));
     }
 
     fn toggle_remote_global(&mut self) {
@@ -5446,7 +5482,9 @@ impl App {
             .as_ref()
             .map(RemotesConfig::auto_sync_enabled)
         else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         self.update_remote_config(
@@ -5464,15 +5502,17 @@ impl App {
             return;
         }
         let Some(host) = self.selected_remote_host().cloned() else {
-            self.remote_action_status = Some("Select one remote host first".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Select one remote host first".to_owned(),
+            ));
             return;
         };
         if !host.is_paired() {
-            self.remote_action_status = Some(format!(
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
                 "{} is unpaired; run `codex-usage-monit remote pair {}`",
                 host.id(),
                 host.id()
-            ));
+            )));
             return;
         }
         let enabled = host.sync_enabled();
@@ -5493,13 +5533,15 @@ impl App {
 
     fn toggle_selected_remote_source_in_aggregates(&mut self) {
         if !self.remote_action_idle() {
-            self.remote_action_status =
-                Some("Another remote operation is still running".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Another remote operation is still running".to_owned(),
+            ));
             return;
         }
         let Some(source) = self.selected_remote_source_metadata().cloned() else {
-            self.remote_action_status =
-                Some("The selected host has no synchronized history yet".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "The selected host has no synchronized history yet".to_owned(),
+            ));
             return;
         };
         let kind = if source.include_in_aggregates() {
@@ -5517,33 +5559,38 @@ impl App {
 
     fn request_remote_action(&mut self, kind: RemoteUiActionKind) {
         let Some(host) = self.selected_remote_host().cloned() else {
-            self.remote_action_status = Some("Select one remote host first".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Select one remote host first".to_owned(),
+            ));
             return;
         };
         if !self.remote_action_idle() {
-            self.remote_action_status =
-                Some("Another remote operation is still running".to_owned());
-            return;
-        }
-        if matches!(&kind, RemoteUiActionKind::Pair) && host.is_paired() {
-            self.remote_action_status = Some(format!(
-                "{} is already paired; edit or remove it before pairing another target",
-                host.id()
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Another remote operation is still running".to_owned(),
             ));
             return;
         }
+        if matches!(&kind, RemoteUiActionKind::Pair) && host.is_paired() {
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
+                "{} is already paired; edit or remove it before pairing another target",
+                host.id()
+            )));
+            return;
+        }
         if matches!(&kind, RemoteUiActionKind::Sync) && !host.is_paired() {
-            self.remote_action_status =
-                Some(format!("{} is unpaired; pair it before syncing", host.id()));
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
+                "{} is unpaired; pair it before syncing",
+                host.id()
+            )));
             return;
         }
         if matches!(&kind, RemoteUiActionKind::Sync)
             && host.redact_content() != self.local_redact_content
         {
-            self.remote_action_status = Some(format!(
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(format!(
                 "{} uses a different redaction profile; edit it before syncing",
                 host.id()
-            ));
+            )));
             return;
         }
         let Some(config_revision) = self
@@ -5552,7 +5599,9 @@ impl App {
             .as_ref()
             .map(RemotesConfig::config_revision)
         else {
-            self.remote_action_status = Some("Remote config is unavailable".to_owned());
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config is unavailable".to_owned(),
+            ));
             return;
         };
         self.queue_remote_action(kind, host.id().to_owned(), config_revision);
@@ -5581,7 +5630,7 @@ impl App {
             self.selected_setting = SettingItem::ALL.len() + index;
         }
         let succeeded = matches!(&completion.result, Ok(RemoteUiActionOutcome::Complete));
-        self.remote_action_status = Some(match completion.result {
+        self.remote_action_status = Some(RemoteActionStatus::Operation(match completion.result {
             Ok(RemoteUiActionOutcome::Complete) => format!(
                 "Remote {} completed for {}",
                 completion.request.kind.label(),
@@ -5597,11 +5646,13 @@ impl App {
                 completion.request.kind.label(),
                 completion.request.host_id
             ),
-        });
+        }));
         self.remote_action_diagnostic = if succeeded {
             None
         } else {
-            self.remote_action_status.clone()
+            self.remote_action_status
+                .as_ref()
+                .map(|status| status.message().to_owned())
         };
         if refresh_history {
             self.force_history_source_refresh();
@@ -9684,11 +9735,7 @@ impl App {
             issues.push((LogLevel::Warn, "project.save", status.clone()));
         }
         // Rejected actions never start a helper, so they need their own event.
-        if let Some(status) = &self.remote_action_status
-            && self.remote_action_diagnostic.as_ref() != Some(status)
-            && !status.contains("started")
-            && !status.contains("completed")
-        {
+        if let Some(RemoteActionStatus::Rejected(status)) = &self.remote_action_status {
             issues.push((LogLevel::Warn, "remote.action_rejected", status.clone()));
         }
         for health in &self.remote_sources.health {
@@ -12906,6 +12953,10 @@ fn push_remote_control(
     hitbox
 }
 
+// Borders, global toggle, and the two control rows. A nonempty list also needs a header.
+const REMOTE_SETTINGS_FIXED_ROWS: u16 = 5;
+const REMOTE_SETTINGS_STATUS_ROWS: u16 = 3;
+
 fn render_remote_sources_settings(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -12916,14 +12967,56 @@ fn render_remote_sources_settings(
         return;
     }
     let palette = app.theme.palette();
-    let block = panel(" Remote sources", app.theme);
+    let mut block = panel(" Remote sources", app.theme);
     let inner = block.inner(area);
+    let config = app.remote_sources.config.as_ref();
+    let host_count = config.map_or(0, |config| config.hosts().len());
+    let detached_sources = app
+        .remote_sources
+        .history_sources
+        .iter()
+        .filter(|source| source.detached())
+        .collect::<Vec<_>>();
+    let entry_count = host_count.saturating_add(detached_sources.len());
+    // Reserve status rows even while idle so host and button hitboxes do not
+    // move when a long SSH failure arrives. Keep at least one host in small panels.
+    let status_height = inner
+        .height
+        .saturating_sub(5)
+        .min(REMOTE_SETTINGS_STATUS_ROWS);
+    let controls_y = inner.bottom().saturating_sub(1 + status_height);
+    let manage_y = (inner.height >= 5).then_some(controls_y.saturating_sub(1));
+    let hosts_y = inner.y.saturating_add(1);
+    let hosts_bottom = manage_y.unwrap_or(controls_y);
+    let hosts_area = Rect::new(
+        inner.x,
+        hosts_y,
+        inner.width,
+        hosts_bottom.saturating_sub(hosts_y),
+    );
+    let capacity = usize::from(hosts_area.height.saturating_sub(1));
+    let selected = app
+        .selected_setting
+        .saturating_sub(SettingItem::ALL.len())
+        .min(entry_count.saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(entry_count.saturating_sub(capacity));
+    let end = entry_count.min(start.saturating_add(capacity));
+    if entry_count > 0 {
+        let range = if capacity == 0 {
+            format!(" 0/{entry_count} ")
+        } else {
+            format!(" {}-{end}/{entry_count} ", start + 1)
+        };
+        block = block.title_bottom(Line::from(range).right_aligned());
+    }
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
 
-    let config = app.remote_sources.config.as_ref();
     let idle = app.remote_action_idle();
     let shortcuts_active = app.shortcuts_active() && app.remote_settings_focused();
     let global_enabled = config.is_some_and(RemotesConfig::auto_sync_enabled);
@@ -12964,39 +13057,9 @@ fn render_remote_sources_settings(
     if inner.height <= 1 {
         return;
     }
-    // Reserve status rows even while idle so host and button hitboxes do not
-    // move when a long SSH failure arrives. Details also remain in Diagnostics.
-    let status_height = inner.height.saturating_sub(5).min(3);
-    let controls_y = inner.bottom().saturating_sub(1 + status_height);
-    let manage_y = (inner.height >= 5).then_some(controls_y.saturating_sub(1));
-    let hosts_y = inner.y.saturating_add(1);
-    let hosts_bottom = manage_y.unwrap_or(controls_y);
-    let hosts_area = Rect::new(
-        inner.x,
-        hosts_y,
-        inner.width,
-        hosts_bottom.saturating_sub(hosts_y),
-    );
     hitbox.remote_hosts.clear();
-    let host_count = config.map_or(0, |config| config.hosts().len());
-    let detached_sources = app
-        .remote_sources
-        .history_sources
-        .iter()
-        .filter(|source| source.detached())
-        .collect::<Vec<_>>();
-    let entry_count = host_count.saturating_add(detached_sources.len());
     if entry_count > 0 {
-        let capacity = usize::from(hosts_area.height.saturating_sub(1));
-        let selected = app
-            .selected_setting
-            .saturating_sub(SettingItem::ALL.len())
-            .min(entry_count.saturating_sub(1));
-        let start = selected
-            .saturating_add(1)
-            .saturating_sub(capacity)
-            .min(entry_count.saturating_sub(capacity));
-        let visible = (start..entry_count.min(start.saturating_add(capacity))).collect::<Vec<_>>();
+        let visible = (start..end).collect::<Vec<_>>();
         let rows = visible
             .iter()
             .map(|index| {
@@ -13257,7 +13320,11 @@ fn render_remote_sources_settings(
         hitbox.remote_include_enabled && shortcuts_active,
         app.theme,
     );
-    if let Some(status) = app.remote_action_status.as_deref() {
+    if let Some(status) = app
+        .remote_action_status
+        .as_ref()
+        .map(RemoteActionStatus::message)
+    {
         let status_area = Rect::new(
             inner.x,
             controls_y.saturating_add(1),
@@ -13563,7 +13630,8 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     let desired_remote_height = u16::try_from(remote_entry_count)
         .unwrap_or(u16::MAX)
-        .saturating_add(8)
+        .saturating_add(REMOTE_SETTINGS_FIXED_ROWS + REMOTE_SETTINGS_STATUS_ROWS)
+        .saturating_add(u16::from(remote_entry_count > 0))
         .clamp(7, 14);
     let remote_height = desired_remote_height.min(area.height.saturating_sub(7).max(1));
     let desired_project_height = u16::try_from(app.project_mappings.rows.len())
