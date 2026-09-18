@@ -791,6 +791,7 @@ impl fmt::Display for RemoteFactSyncError {
             }
             Self::Local(error) => write!(formatter, "remote fact local phase failed: {error}"),
             Self::Protocol(error) => write!(formatter, "remote fact protocol failed: {error}"),
+            Self::Transport(error) if error.is_version_mismatch() => write!(formatter, "remote fact compatibility failed: {error}"),
             Self::Transport(error) => write!(formatter, "remote fact transport failed: {error}"),
             Self::Remote(failure) => write!(
                 formatter,

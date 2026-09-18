@@ -14047,6 +14047,29 @@ fn remote_action_test_output(code: u32, stdout: &[u8], stderr: &[u8]) -> Output 
 }
 
 #[test]
+fn successful_agent_deployment_keeps_cleanup_warnings_visible_and_logged() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("events.jsonl");
+    let log = EventLog::open(Some(path.clone()), LogLevel::Info, false);
+    let output = remote_action_test_output(
+        0,
+        b"Matching agent deployed and verified",
+        b"warning: agent_upload_cleanup_failed: staging file may remain",
+    );
+    let detail = remote_ui_agent_success_detail(&output, &log);
+    assert!(detail.contains("deployed and verified"));
+    assert!(detail.contains("agent_upload_cleanup_failed"));
+    log.finish();
+    let events = std::fs::read_to_string(path).unwrap();
+    assert!(
+        events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .any(|event| event["event"] == "remote.agent.warning" && event["level"] == "warn")
+    );
+}
+
+#[test]
 fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
     for (error, hint) in [
         (
@@ -16507,4 +16530,83 @@ fn settings_quota_merge_control_is_opt_in_clickable_and_keyboard_accessible() {
     );
     source.set_detached(true);
     assert!(!source.quota_matches_local_account());
+}
+
+#[test]
+fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(40, 14), (60, 14), (80, 24), (110, 24)] {
+            app.pending_remote_action = None;
+            app.remote_action_running = None;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let controls = app.settings_controls_hitbox.clone().unwrap();
+            assert!(controls.remote_deploy_enabled);
+            let button = controls.remote_deploy;
+            assert!(!button.is_empty());
+            assert!(button.right() <= width);
+            let shortcut = &terminal.backend().buffer()[(button.x + 1, button.y)];
+            assert_eq!(shortcut.symbol(), "B");
+            assert_eq!(shortcut.fg, theme.palette().accent);
+            assert!(shortcut.modifier.contains(Modifier::BOLD));
+            handle_key_event(&mut app, key_event(KeyCode::Char('b')));
+            let request = app.pending_remote_action.take().unwrap();
+            assert_eq!(request.kind, RemoteUiActionKind::Deploy);
+            let mut command = Command::new("codex-usage-monit");
+            append_remote_ui_action_args(&mut command, &request);
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(&args[..2], &["remote", "deploy"]);
+            assert!(args.contains(&"--expected-revision".to_owned()));
+            app.remote_action_running = None;
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(
+                button,
+                app.settings_controls_hitbox.as_ref().unwrap().remote_deploy
+            );
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    button.right() - 1,
+                    button.y
+                )
+            ));
+            assert_eq!(
+                app.pending_remote_action.take().unwrap().kind,
+                RemoteUiActionKind::Deploy
+            );
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(
+                !app.settings_controls_hitbox
+                    .as_ref()
+                    .unwrap()
+                    .remote_deploy_enabled
+            );
+        }
+    }
+    assert_eq!(
+        remote_ui_action_error_kind("command failed (exit 1): agent_version_mismatch: old version"),
+        "agent_version_mismatch"
+    );
+    assert_eq!(
+        remote_ui_action_error_kind(
+            "command failed (exit 1): agent_artifact_missing: development build"
+        ),
+        "agent_artifact_missing"
+    );
+    app.remote_action_running = None;
+    app.pending_remote_action = None;
+    app.begin_remote_add();
+    handle_key_event(&mut app, key_event(KeyCode::Char('b')));
+    assert_eq!(app.remote_editor.as_ref().unwrap().host_id, "b");
+    assert!(app.pending_remote_action.is_none());
 }

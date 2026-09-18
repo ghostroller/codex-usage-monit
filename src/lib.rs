@@ -31,6 +31,7 @@ mod process_tree;
 pub mod project_mapping;
 mod quota_merge;
 mod remote_agent;
+mod remote_agent_manager;
 pub mod remote_bandwidth_budget;
 pub mod remote_collection;
 pub mod remote_delta_journal;

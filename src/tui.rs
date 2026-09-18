@@ -2483,6 +2483,7 @@ struct SettingsControlsHitbox {
     remote_remove: Rect,
     remote_enable: Rect,
     remote_test: Rect,
+    remote_deploy: Rect,
     remote_sync: Rect,
     remote_include: Rect,
     remote_quota: Rect,
@@ -2494,6 +2495,7 @@ struct SettingsControlsHitbox {
     remote_remove_enabled: bool,
     remote_enable_enabled: bool,
     remote_test_enabled: bool,
+    remote_deploy_enabled: bool,
     remote_sync_enabled: bool,
     remote_include_enabled: bool,
     remote_quota_enabled: bool,
@@ -2930,6 +2932,7 @@ enum RemoteUiActionKind {
     Pair,
     Remove,
     Test,
+    Deploy,
     Sync,
     Include,
     Exclude,
@@ -2946,6 +2949,7 @@ impl RemoteUiActionKind {
             Self::Pair => "pair",
             Self::Remove => "remove",
             Self::Test => "test",
+            Self::Deploy => "deploy",
             Self::Sync => "sync",
             Self::Include => "include",
             Self::MergeQuota => "merge-quota",
@@ -2978,6 +2982,7 @@ struct RemoteUiActionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RemoteUiActionOutcome {
     Complete,
+    CompleteWithDetails(String),
     NeedsAttention(String),
 }
 
@@ -5663,8 +5668,12 @@ impl App {
         {
             self.selected_setting = SettingItem::ALL.len() + index;
         }
-        let succeeded = matches!(&completion.result, Ok(RemoteUiActionOutcome::Complete));
+        let succeeded = matches!(
+            &completion.result,
+            Ok(RemoteUiActionOutcome::Complete | RemoteUiActionOutcome::CompleteWithDetails(_))
+        );
         self.remote_action_status = Some(RemoteActionStatus::Operation(match completion.result {
+            Ok(RemoteUiActionOutcome::CompleteWithDetails(detail)) => detail,
             Ok(RemoteUiActionOutcome::Complete) => format!(
                 "Remote {} completed for {}",
                 completion.request.kind.label(),
@@ -6867,6 +6876,10 @@ impl App {
         }
         if hitbox.remote_test_enabled && rect_contains(hitbox.remote_test, column, row) {
             self.request_remote_action(RemoteUiActionKind::Test);
+            return true;
+        }
+        if hitbox.remote_deploy_enabled && rect_contains(hitbox.remote_deploy, column, row) {
+            self.request_remote_action(RemoteUiActionKind::Deploy);
             return true;
         }
         if hitbox.remote_sync_enabled && rect_contains(hitbox.remote_sync, column, row) {
@@ -8491,6 +8504,14 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 }) =>
         {
             app.toggle_selected_remote_host();
+        }
+        KeyCode::Char('b' | 'B')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_deploy, hitbox.remote_deploy_enabled)
+                }) =>
+        {
+            app.request_remote_action(RemoteUiActionKind::Deploy);
         }
         KeyCode::Char('c' | 'C')
             if app.view == View::Settings
@@ -11322,11 +11343,25 @@ fn execute_remote_ui_action(
             // to the child because a second TraceLog would truncate it.
             let output = run_cancellable_remote_action_command(command, cancellation)
                 .map_err(|_| "launcher unavailable".to_owned())?;
-            remote_ui_action_output(&output)
+            let result = remote_ui_action_output(&output)?;
+            if matches!(result, RemoteUiActionOutcome::Complete)
+                && matches!(
+                    request.kind,
+                    RemoteUiActionKind::Test | RemoteUiActionKind::Deploy
+                )
+            {
+                return Ok(RemoteUiActionOutcome::CompleteWithDetails(
+                    remote_ui_agent_success_detail(&output, &config.event_log),
+                ));
+            }
+            Ok(result)
         },
     );
     match &result {
         Ok(RemoteUiActionOutcome::Complete) => operation.finish(LogLevel::Info, "completed"),
+        Ok(RemoteUiActionOutcome::CompleteWithDetails(detail)) => {
+            operation.finish(LogLevel::Info, detail)
+        }
         Ok(RemoteUiActionOutcome::NeedsAttention(detail)) => {
             operation.finish(LogLevel::Warn, detail)
         }
@@ -11336,12 +11371,34 @@ fn execute_remote_ui_action(
     RemoteUiActionCompletion { request, result }
 }
 
+fn remote_ui_agent_success_detail(output: &Output, log: &EventLog) -> String {
+    let compact = |bytes: &[u8]| {
+        terminal_safe_text(&String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]))
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut detail = compact(&output.stdout);
+    let warning = compact(&output.stderr);
+    if !warning.trim().is_empty() {
+        // Successful installation may still leave a staging file after a
+        // cleanup failure. Preserve that warning without calling deployment
+        // itself failed after its configuration has already been activated.
+        log.record(LogLevel::Warn, "remote.agent.warning", &warning);
+        detail.push(' ');
+        detail.push_str(&warning);
+    }
+    detail.chars().take(1200).collect()
+}
+
 fn remote_action_event(kind: &RemoteUiActionKind) -> &'static str {
     match kind {
         RemoteUiActionKind::Add { .. } => "remote.add",
         RemoteUiActionKind::Edit { .. } => "remote.edit",
         RemoteUiActionKind::Pair => "remote.pair",
         RemoteUiActionKind::Test => "remote.test",
+        RemoteUiActionKind::Deploy => "remote.agent.deploy",
         RemoteUiActionKind::Sync => "remote.sync",
         RemoteUiActionKind::Remove => "remote.remove",
         RemoteUiActionKind::Include => "remote.include",
@@ -11445,6 +11502,7 @@ fn trace_remote_ui_action(
                         | RemoteUiActionKind::Edit { .. }
                         | RemoteUiActionKind::Pair
                         | RemoteUiActionKind::Test
+                        | RemoteUiActionKind::Deploy
                         | RemoteUiActionKind::Remove
                         | RemoteUiActionKind::Include
                         | RemoteUiActionKind::Exclude
@@ -11456,7 +11514,9 @@ fn trace_remote_ui_action(
     });
     let result = action();
     match &result {
-        Ok(RemoteUiActionOutcome::Complete) => span.finish(TraceOutcome::Ok, TraceFields::new()),
+        Ok(RemoteUiActionOutcome::Complete | RemoteUiActionOutcome::CompleteWithDetails(_)) => {
+            span.finish(TraceOutcome::Ok, TraceFields::new())
+        }
         Ok(RemoteUiActionOutcome::NeedsAttention(_)) => {
             span.finish(TraceOutcome::Partial, TraceFields::new())
         }
@@ -11473,6 +11533,25 @@ fn trace_remote_ui_action(
 }
 
 fn remote_ui_action_error_kind(error: &str) -> &'static str {
+    if error.contains("agent_version_mismatch") || error.contains("VersionMismatch") {
+        return "agent_version_mismatch";
+    }
+    for kind in [
+        "agent_artifact_missing",
+        "agent_artifact_mismatch",
+        "agent_checksum_mismatch",
+        "agent_verification_failed",
+        "agent_readiness_failed",
+        "agent_download_failed",
+        "agent_upload_failed",
+        "agent_install_failed",
+        "agent_discovery_failed",
+        "agent_info_invalid",
+    ] {
+        if error.contains(kind) {
+            return kind;
+        }
+    }
     match error {
         "remote config busy" => "config_busy",
         "remote config unavailable" => "config_unavailable",
@@ -11546,6 +11625,7 @@ fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionR
         RemoteUiActionKind::Pair
         | RemoteUiActionKind::Remove
         | RemoteUiActionKind::Test
+        | RemoteUiActionKind::Deploy
         | RemoteUiActionKind::Sync
         | RemoteUiActionKind::Include
         | RemoteUiActionKind::Exclude
@@ -13250,13 +13330,14 @@ fn render_remote_sources_settings(
     let selected_detached = app.selected_detached_remote_source().is_some();
     if let Some(manage_y) = manage_y {
         let manage_area = Rect::new(inner.x, manage_y, inner.width, 1);
-        let compact = inner.width < 54;
+        let compact = inner.width < 72;
         hitbox.remote_new_enabled = config.is_some() && idle && app.shortcuts_active();
         hitbox.remote_edit_enabled = selected.is_some() && idle && app.shortcuts_active();
         hitbox.remote_pair_enabled =
             selected.is_some_and(|host| !host.is_paired()) && idle && app.shortcuts_active();
         hitbox.remote_purge_enabled = selected_detached && idle && app.shortcuts_active();
         hitbox.remote_remove_enabled = selected.is_some() && idle && app.shortcuts_active();
+        hitbox.remote_deploy_enabled = selected.is_some() && idle && app.shortcuts_active();
         let mut spans = Vec::new();
         let mut x = manage_area.x;
         hitbox.remote_new = push_remote_control(
@@ -13305,6 +13386,15 @@ fn render_remote_sources_settings(
             'D',
             if compact { "" } else { "Remove" },
             hitbox.remote_remove_enabled && shortcuts_active,
+            app.theme,
+        );
+        hitbox.remote_deploy = push_remote_control(
+            &mut spans,
+            &mut x,
+            manage_area,
+            'B',
+            if compact { "" } else { "Deploy agent" },
+            hitbox.remote_deploy_enabled && shortcuts_active,
             app.theme,
         );
         if let Some(host) = selected {
@@ -17784,6 +17874,7 @@ fn remote_sync_error_label(error: Option<RemoteSyncErrorCategory>) -> &'static s
         Some(RemoteSyncErrorCategory::ResourceLimit) => "resource-limit",
         Some(RemoteSyncErrorCategory::LocalState) => "local-state",
         Some(RemoteSyncErrorCategory::Protocol) => "protocol",
+        Some(RemoteSyncErrorCategory::Compatibility) => "agent version mismatch (Deploy agent)",
         Some(RemoteSyncErrorCategory::ProcessContainment) => "process-pause",
         Some(RemoteSyncErrorCategory::Transport) => "transport",
         Some(RemoteSyncErrorCategory::Remote) => "remote",

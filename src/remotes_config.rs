@@ -1271,12 +1271,15 @@ pub(crate) fn validate_agent_executable(agent_executable: &str) -> Result<(), St
     }
     if agent_executable.bytes().any(|byte| {
         !byte.is_ascii_alphanumeric()
-            && !matches!(byte, b'/' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
+            && !matches!(byte, b'/' | b'\\' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
     }) {
         return Err(
-            "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
+            "Agent executable may use ASCII letters, digits, '/', '\\', '.', '_', ':', '+', '~' or '-'"
                 .to_owned(),
         );
+    }
+    if agent_executable.contains('\\') && !agent_executable.ends_with(".exe") {
+        return Err("Backslashes are supported only for Windows .exe paths".to_owned());
     }
     Ok(())
 }
@@ -2052,7 +2055,7 @@ mod tests {
         assert_eq!(
             validate_remote_host_input("dev", "dev-box", "codex usage"),
             Err(
-                "Agent executable may use ASCII letters, digits, '/', '.', '_', ':', '+', '~' or '-'"
+                "Agent executable may use ASCII letters, digits, '/', '\\', '.', '_', ':', '+', '~' or '-'"
                     .to_owned()
             )
         );
@@ -2134,6 +2137,8 @@ mod tests {
             "~/.local/bin/codex-usage-monit",
             "/opt/codex/bin/codex-usage-monit",
             "C:/Users/dev/bin/codex_usage_monit.exe",
+            r".\managed-agents\codex-usage-monit.exe",
+            r"C:\Users\dev\bin\codex_usage_monit.exe",
             "agent+debug:1",
         ] {
             validate_agent_executable(executable).unwrap();

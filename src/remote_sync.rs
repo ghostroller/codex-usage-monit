@@ -1348,6 +1348,9 @@ impl fmt::Display for RemoteSyncError {
             }
             Self::Local(error) => write!(formatter, "remote sync local phase failed: {error}"),
             Self::Protocol(error) => write!(formatter, "remote sync protocol failed: {error}"),
+            Self::Transport(error) if error.is_version_mismatch() => {
+                write!(formatter, "remote sync compatibility failed: {error}")
+            }
             Self::Transport(error) => write!(formatter, "remote sync transport failed: {error}"),
             Self::ProcessContainment => formatter.write_str(
                 "remote sync paused because the SSH process tree could not be fully reclaimed",

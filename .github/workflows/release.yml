@@ -150,6 +150,15 @@ jobs:
         shell: pwsh
         run: python scripts/check-release-binary.py "dist/codex-usage-monit-$env:TARGET.exe"
 
+      - name: Package Unix managed agent
+        if: runner.os != 'Windows'
+        run: python3 scripts/package-agent.py "target/$TARGET/release/codex-usage-monit" --output-dir dist
+
+      - name: Package Windows managed agent
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/package-agent.py "dist/codex-usage-monit-$env:TARGET.exe" --output-dir dist
+
       - name: Upload packaged binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -157,6 +166,7 @@ jobs:
           path: |
             dist/codex-usage-monit-${{ matrix.target }}.tar.gz
             dist/codex-usage-monit-${{ matrix.target }}.exe
+            dist/codex-usage-monit-${{ matrix.target }}.agent*
           if-no-files-found: error
           retention-days: 1
 
@@ -184,7 +194,7 @@ jobs:
         run: |
           cp scripts/install.sh dist/install.sh
           cd dist
-          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe install.sh | sort -k 2 > SHA256SUMS
+          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe codex-usage-monit-*.agent codex-usage-monit-*.agent.json install.sh | sort -k 2 > SHA256SUMS
 
       - name: Create GitHub Release
         env:

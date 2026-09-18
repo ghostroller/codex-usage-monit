@@ -55,7 +55,7 @@ use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 
 pub const DEFAULT_REMOTE_AGENT_EXECUTABLE: &str = "codex-usage-monit";
 const SSH_REMOTE_AGENT_ARGUMENTS: [&str; 2] = ["remote-agent", "export"];
-const SSH_OPTIONS: &[&str] = &[
+pub(crate) const SSH_OPTIONS: &[&str] = &[
     "-T",
     "-o",
     "BatchMode=yes",
@@ -315,7 +315,7 @@ impl SshCommandEnvironment {
         self
     }
 
-    fn resolve_program(&self) -> io::Result<PathBuf> {
+    pub(crate) fn resolve_program(&self) -> io::Result<PathBuf> {
         let program = default_ssh_program();
         let Some(path) = self.path.as_deref() else {
             return Ok(program);
@@ -328,7 +328,7 @@ impl SshCommandEnvironment {
         })
     }
 
-    fn apply(&self, command: &mut Command) {
+    pub(crate) fn apply(&self, command: &mut Command) {
         // The one-shot TUI capability is consumed by the helper CLI and must
         // never be forwarded into OpenSSH, ProxyCommand, or remote processes.
         command
@@ -343,7 +343,7 @@ impl SshCommandEnvironment {
         !self.inherit_parent_process_tree
     }
 
-    fn cancellation_requested(&self) -> bool {
+    pub(crate) fn cancellation_requested(&self) -> bool {
         self.cancellation
             .as_deref()
             .is_some_and(|requested| requested.load(Ordering::Acquire))
@@ -503,6 +503,17 @@ pub enum RemoteTransportError {
 }
 
 impl RemoteTransportError {
+    pub(crate) fn is_version_mismatch(&self) -> bool {
+        match self {
+            Self::Remote(failure) => {
+                failure.kind == crate::remote_protocol::RemoteFailureKind::VersionMismatch
+            }
+            Self::Protocol(error) => error
+                .to_string()
+                .contains("protocol version is unsupported"),
+            _ => false,
+        }
+    }
     /// Returns true when the owned SSH process tree could not be proven fully
     /// reclaimed. Automatic callers must stop retrying this host: a helper
     /// from user SSH configuration (for example a ProxyCommand which created
@@ -1518,6 +1529,9 @@ where
 }
 
 fn remote_transport_error_kind(error: &RemoteTransportError) -> &'static str {
+    if error.is_version_mismatch() {
+        return "agent_version_mismatch";
+    }
     match error {
         RemoteTransportError::InvalidHost(_) => "invalid_host",
         RemoteTransportError::InvalidAgentExecutable(_) => "invalid_agent_executable",
@@ -2078,9 +2092,19 @@ fn ensure_success(status: ExitStatus, stderr: &[u8]) -> Result<(), RemoteTranspo
     if status.success() {
         return Ok(());
     }
+    let diagnostic = sanitize_diagnostic(stderr);
+    if String::from_utf8_lossy(stderr).contains("remote request protocol version is unsupported") {
+        return Err(RemoteTransportError::Remote(RemoteFailure {
+            kind: crate::remote_protocol::RemoteFailureKind::VersionMismatch,
+            message: format!(
+                "agent_version_mismatch: remote rejected protocol {REMOTE_PROTOCOL_VERSION}; its supported version is unknown. Use remote inspect HOST, then Settings [B] Deploy agent or remote deploy HOST. Old data protocols are not supported."
+            ),
+            retry_after_seconds: None,
+        }));
+    }
     Err(RemoteTransportError::ExitFailure {
         code: status.code(),
-        diagnostic: sanitize_diagnostic(stderr),
+        diagnostic,
     })
 }
 
@@ -2388,6 +2412,55 @@ impl Drop for ProcessTree {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_protocol_rejection_is_compatibility_not_network_failure() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        let error = super::ensure_success(
+            std::process::ExitStatus::from_raw(1),
+            b"error: remote request protocol version is unsupported",
+        )
+        .unwrap_err();
+        assert!(error.is_version_mismatch());
+        assert_eq!(
+            super::remote_transport_error_kind(&error),
+            "agent_version_mismatch"
+        );
+        let sync = crate::remote_sync::RemoteSyncError::Transport(error);
+        assert_eq!(
+            crate::remote_sync_health::RemoteSyncErrorCategory::from_sync_error(&sync),
+            crate::remote_sync_health::RemoteSyncErrorCategory::Compatibility
+        );
+        assert!(
+            sync.to_string()
+                .contains("remote sync compatibility failed")
+        );
+        let error = super::ensure_success(
+            std::process::ExitStatus::from_raw(1),
+            b"Permission denied (publickey)",
+        )
+        .unwrap_err();
+        assert!(!error.is_version_mismatch());
+        assert_eq!(super::remote_transport_error_kind(&error), "exit_failure");
+        let diagnostic = format!(
+            "{} remote request protocol version is unsupported",
+            "login banner ".repeat(100)
+        );
+        let error =
+            super::ensure_success(std::process::ExitStatus::from_raw(1), diagnostic.as_bytes())
+                .unwrap_err();
+        let fact = crate::remote_fact_sync::RemoteFactSyncError::Transport(error);
+        assert_eq!(
+            crate::remote_sync_health::RemoteSyncErrorCategory::from_fact_sync_error(&fact),
+            crate::remote_sync_health::RemoteSyncErrorCategory::Compatibility
+        );
+        assert!(
+            fact.to_string()
+                .contains("remote fact compatibility failed")
+        );
+    }
     use std::ffi::OsString;
 
     #[cfg(unix)]

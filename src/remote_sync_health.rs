@@ -96,6 +96,7 @@ pub enum RemoteSyncErrorCategory {
     ResourceLimit,
     LocalState,
     Protocol,
+    Compatibility,
     ProcessContainment,
     Transport,
     Remote,
@@ -157,6 +158,12 @@ impl RemoteSyncErrorCategory {
             RemoteSyncError::Transport(error) if error.process_containment_uncertain() => {
                 Self::ProcessContainment
             }
+            RemoteSyncError::Transport(error) if error.is_version_mismatch() => Self::Compatibility,
+            RemoteSyncError::Remote(error)
+                if error.kind == crate::remote_protocol::RemoteFailureKind::VersionMismatch =>
+            {
+                Self::Compatibility
+            }
             RemoteSyncError::Transport(_) => Self::Transport,
             RemoteSyncError::Remote(_) => Self::Remote,
         }
@@ -187,6 +194,14 @@ impl RemoteSyncErrorCategory {
             }
             RemoteFactSyncError::Transport(error) if error.process_containment_uncertain() => {
                 Self::ProcessContainment
+            }
+            RemoteFactSyncError::Transport(error) if error.is_version_mismatch() => {
+                Self::Compatibility
+            }
+            RemoteFactSyncError::Remote(error)
+                if error.kind == crate::remote_protocol::RemoteFailureKind::VersionMismatch =>
+            {
+                Self::Compatibility
             }
             RemoteFactSyncError::Transport(_) => Self::Transport,
             RemoteFactSyncError::Remote(_) => Self::Remote,

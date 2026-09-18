@@ -363,6 +363,16 @@ struct RemoteAgentArgs {
 
 #[derive(Clone, Debug, Subcommand)]
 enum RemoteAgentAction {
+    /// Print stable bootstrap metadata independently of the data protocol.
+    Info {
+        #[arg(long)]
+        sha256: bool,
+    },
+    /// Install this uploaded executable in its private, versioned directory.
+    Install {
+        #[arg(long)]
+        sha256: String,
+    },
     /// Serve exactly one framed request on stdin/stdout, then exit.
     Export,
     /// Print the stable source identity, creating it if it is genuinely absent.
@@ -401,6 +411,10 @@ enum RemoteAction {
     Unpair(RemoteHostArgs),
     /// Probe exactly one configured host without changing configuration.
     Test(RemoteHostArgs),
+    /// Inspect agent build/platform/protocol without exchanging usage data.
+    Inspect(RemoteHostArgs),
+    /// Deploy and verify a matching agent, then atomically switch this host.
+    Deploy(RemoteDeployArgs),
     /// Synchronize exactly one paired host without changing automatic-sync settings.
     Sync(RemoteSyncArgs),
     /// Opt one already paired host into future automatic scheduling.
@@ -411,6 +425,14 @@ enum RemoteAction {
     Remove(RemoteRemoveArgs),
     /// Inspect or change retained SSH source-history aggregation policy.
     Source(RemoteSourceArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct RemoteDeployArgs {
+    id: String,
+    /// Directory containing package-agent.py manifests and binaries.
+    #[arg(long, value_name = "DIR")]
+    bundle_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1152,6 +1174,17 @@ fn run_with_event_log(
 fn run_remote_agent(config: &CollectConfig, args: RemoteAgentArgs) -> Result<i32> {
     let store = SourceIdentityStore::discover();
     match args.action {
+        RemoteAgentAction::Info { sha256 } => {
+            let info = crate::remote_agent_manager::AgentInfo::local();
+            let info = if sha256 { info.with_checksum()? } else { info };
+            write_stdout(&format!("{}\n", serde_json::to_string(&info)?))?;
+        }
+        RemoteAgentAction::Install { sha256 } => {
+            write_stdout(&format!(
+                "{}\n",
+                crate::remote_agent_manager::install_self(&sha256)?
+            ))?;
+        }
         RemoteAgentAction::Export => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -1174,7 +1207,11 @@ fn run_remote(
 ) -> Result<i32> {
     let opens_ssh = matches!(
         &args.action,
-        RemoteAction::Pair(_) | RemoteAction::Test(_) | RemoteAction::Sync(_)
+        RemoteAction::Pair(_)
+            | RemoteAction::Test(_)
+            | RemoteAction::Sync(_)
+            | RemoteAction::Inspect(_)
+            | RemoteAction::Deploy(_)
     );
     if opens_ssh && !inherit_remote_process_tree {
         ensure_current_process_remote_containment().map_err(|error| {
@@ -1187,6 +1224,82 @@ fn run_remote(
     let termination = RemoteCommandTerminationSignal::install(opens_ssh)?;
     let cancellation = termination.cancellation();
     match args.action {
+        RemoteAction::Inspect(args) => {
+            let config = store.load_or_create()?;
+            ensure_expected_remote_config_revision(&config, expected_revision, "agent inspect")?;
+            let host = config
+                .host(&args.id)
+                .ok_or_else(|| anyhow::anyhow!("remote host {:?} is not configured", args.id))?;
+            let environment = remote_ssh_environment(
+                collect_config,
+                inherit_remote_process_tree,
+                cancellation.as_ref(),
+            );
+            let connection =
+                crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)?;
+            write_stdout(&format!(
+                "Local: {}\n",
+                crate::remote_agent_manager::AgentInfo::local().summary()
+            ))?;
+            match connection.inspect(host.agent_executable(), false)? {
+                Some(info) => {
+                    write_stdout(&format!("Remote: {}\n", info.summary()))?;
+                    info.check_protocol()?;
+                }
+                None => bail!(
+                    "agent_discovery_unavailable: configured agent is missing or predates remote-agent info; remote protocol/build unknown. Use Settings [B] Deploy agent or remote deploy {}. Old data protocols are not supported.",
+                    host.id()
+                ),
+            }
+            ensure_remote_probe_target_current(&store, config.config_revision(), host)?;
+            Ok(0)
+        }
+        RemoteAction::Deploy(args) => {
+            let config = store.load_or_create()?;
+            ensure_expected_remote_config_revision(&config, expected_revision, "agent deploy")?;
+            let host = config
+                .host(&args.id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote host {:?} is not configured", args.id))?;
+            let environment = remote_ssh_environment(
+                collect_config,
+                inherit_remote_process_tree,
+                cancellation.as_ref(),
+            );
+            let connection =
+                crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)?;
+            let executable =
+                connection.deploy(host.agent_executable(), args.bundle_dir.as_deref())?;
+            let report = probe_remote_with_agent_executable_and_environment(
+                host.ssh_host(),
+                &executable,
+                &RemoteProbeOptions {
+                    expected_source: host.expected_source().cloned(),
+                    redaction_profile: if host.redact_content() {
+                        crate::source_history::RedactionProfile::Redacted
+                    } else {
+                        crate::source_history::RedactionProfile::PreviewEnabled
+                    },
+                    ..RemoteProbeOptions::default()
+                },
+                &environment,
+            )?;
+            activate_deployed_agent(
+                &store,
+                config.config_revision(),
+                &host,
+                &executable,
+                &report,
+                || environment.cancellation_requested(),
+            )?;
+            write_stdout(&format!(
+                "Matching agent deployed and verified for {}: {}. Previous agent: {}. Source pin and recorder installation preserved.\n",
+                host.id(),
+                executable,
+                host.agent_executable()
+            ))?;
+            Ok(0)
+        }
         RemoteAction::Config(args) => {
             let mut transaction = store.begin_transaction()?;
             ensure_expected_remote_config_revision(
@@ -2456,6 +2569,55 @@ fn remote_state_root(history_dir: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
+fn activate_deployed_agent(
+    store: &RemotesConfigStore,
+    revision: u64,
+    host: &crate::remotes_config::RemoteHostConfig,
+    executable: &str,
+    report: &RemoteProbeReport,
+    cancelled: impl FnOnce() -> bool,
+) -> Result<()> {
+    let RemoteExportResponseBody::Probe(probe) = &report.response.result else {
+        bail!(
+            "agent_readiness_failed: expected a data readiness probe; previous configuration retained"
+        );
+    };
+    if report.response.protocol_version != crate::remote_protocol::REMOTE_PROTOCOL_VERSION
+        || !crate::remote_agent::current_accepted_revisions().accepts(&report.response.revisions)
+    {
+        bail!(
+            "agent_version_mismatch: installed agent data protocol/revisions or model catalog differ; previous configuration retained"
+        );
+    }
+    if host
+        .expected_source()
+        .is_some_and(|source| source != &report.response.source)
+    {
+        bail!(
+            "agent_identity_mismatch: installed agent sees a different source; previous configuration retained. Check the SSH login environment and custom launcher settings."
+        );
+    }
+    if !probe.state_writable
+        || !probe.rollout_readable
+        || !missing_remote_sync_capabilities(host, probe).is_empty()
+    {
+        bail!(
+            "agent_readiness_failed: installed agent cannot read rollouts/write state or lacks capabilities; previous configuration retained. {}",
+            format_remote_probe("deployment verification", host, report)
+        );
+    }
+    store.save_probe_if_current_checked(revision, host, executable, None, || {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "agent deployment cancelled before activation",
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 fn run_remote_test(
     collect_config: &CollectConfig,
     store: &RemotesConfigStore,
@@ -2497,6 +2659,14 @@ fn run_remote_test(
             return Err(error);
         }
     };
+    let environment =
+        remote_ssh_environment(collect_config, inherit_remote_process_tree, cancellation);
+    let connection =
+        crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)?;
+    if let Some(info) = connection.inspect(&agent_executable, false)? {
+        write_stdout(&format!("Agent: {}\n", info.summary()))?;
+        info.check_protocol()?;
+    }
     let RemoteExportResponseBody::Probe(probe) = &report.response.result else {
         unreachable!("the probe transport accepts only probe responses")
     };
@@ -2635,7 +2805,7 @@ fn probe_configured_host(
         host.agent_executable(),
         options.timeout,
         |agent, timeout| {
-            probe_remote_with_agent_executable_and_environment(
+            let result = probe_remote_with_agent_executable_and_environment(
                 host.ssh_host(),
                 agent,
                 &RemoteProbeOptions {
@@ -2643,7 +2813,26 @@ fn probe_configured_host(
                     ..options.clone()
                 },
                 &environment,
-            )
+            );
+            if let Err(error) = &result
+                && error.is_version_mismatch()
+                && let Ok(connection) =
+                    crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)
+                && let Ok(Some(info)) = connection.inspect(agent, false)
+            {
+                return Err(RemoteTransportError::Remote(
+                    crate::remote_protocol::RemoteFailure {
+                        kind: crate::remote_protocol::RemoteFailureKind::VersionMismatch,
+                        message: format!(
+                            "agent_version_mismatch: remote {}; local {}. Data protocol/revisions must match; use Settings [B] Deploy agent or remote deploy HOST. If the protocol matches, compare the configured model catalogs. {error}",
+                            info.summary(),
+                            crate::remote_agent_manager::AgentInfo::local().summary()
+                        ),
+                        retry_after_seconds: None,
+                    },
+                ));
+            }
+            result
         },
     )
 }
@@ -3968,6 +4157,7 @@ fn remote_sync_health_error_category(category: RemoteSyncErrorCategory) -> &'sta
         RemoteSyncErrorCategory::ResourceLimit => "request validation",
         RemoteSyncErrorCategory::LocalState => "local state",
         RemoteSyncErrorCategory::Protocol => "protocol",
+        RemoteSyncErrorCategory::Compatibility => "agent version mismatch (Deploy agent)",
         RemoteSyncErrorCategory::ProcessContainment => {
             "SSH process containment failed; automatic sync paused"
         }
@@ -5149,7 +5339,10 @@ fn command_uses_model_catalog(command: Option<&Command>) -> bool {
         Some(Command::Service(args)) => matches!(&args.action, ServiceAction::Install),
         Some(Command::Remote(args)) => matches!(
             &args.action,
-            RemoteAction::Pair(_) | RemoteAction::Test(_) | RemoteAction::Sync(_)
+            RemoteAction::Pair(_)
+                | RemoteAction::Test(_)
+                | RemoteAction::Sync(_)
+                | RemoteAction::Deploy(_)
         ),
         Some(Command::RemoteAgent(args)) => {
             matches!(&args.action, RemoteAgentAction::Export)
@@ -5200,6 +5393,95 @@ fn request_for(args: OutputArgs, section: Section) -> OutputRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployed_agent_activation_requires_readiness_identity_and_unchanged_configuration() {
+        use crate::remote_protocol::{RemoteExportResponse, RemoteTiming};
+        for failure in [
+            "none",
+            "state",
+            "rollouts",
+            "capability",
+            "identity",
+            "protocol",
+            "cancel",
+            "config",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (store, config) = paired_disabled_remote_config(directory.path());
+            let host = config.host("dev").unwrap();
+            let now = Utc::now();
+            let mut source = host.expected_source().unwrap().clone();
+            if failure == "identity" {
+                source.generation = std::num::NonZeroU64::new(99).unwrap();
+            }
+            let mut probe = ProbeResult {
+                capabilities: vec![
+                    RemoteCapability::DeltaJournal,
+                    RemoteCapability::LiveSnapshot,
+                    RemoteCapability::GzipFrame,
+                    RemoteCapability::PreviewContent,
+                ],
+                state_writable: failure != "state",
+                rollout_readable: failure != "rollouts",
+            };
+            if failure == "capability" {
+                probe.capabilities.clear();
+            }
+            let report = RemoteProbeReport {
+                response: RemoteExportResponse {
+                    protocol_version: if failure == "protocol" {
+                        1
+                    } else {
+                        crate::remote_protocol::REMOTE_PROTOCOL_VERSION
+                    },
+                    server_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                    source,
+                    redaction_profile: crate::source_history::RedactionProfile::PreviewEnabled,
+                    revisions: crate::remote_agent::current_revisions(),
+                    observed_at: now,
+                    timing: RemoteTiming {
+                        remote_received_at: now,
+                        remote_sent_at: now,
+                    },
+                    result: RemoteExportResponseBody::Probe(probe),
+                },
+                elapsed: Duration::ZERO,
+                request_bytes: 0,
+                response_bytes: 0,
+                stderr_bytes: 0,
+            };
+            if failure == "config" {
+                store
+                    .update(
+                        config.config_revision(),
+                        RemotesConfigMutation::add_host("other", "other-host"),
+                    )
+                    .unwrap();
+            }
+            let before = store.load().unwrap();
+            let result = activate_deployed_agent(
+                &store,
+                config.config_revision(),
+                host,
+                "managed-agent.exe",
+                &report,
+                || failure == "cancel",
+            );
+            let after = store.load().unwrap();
+            if failure == "none" {
+                result.unwrap();
+                let updated = after.host("dev").unwrap();
+                assert_eq!(updated.agent_executable(), "managed-agent.exe");
+                assert_eq!(updated.expected_source(), host.expected_source());
+                assert_eq!(updated.sync_enabled(), host.sync_enabled());
+                assert_eq!(updated.redact_content(), host.redact_content());
+            } else {
+                assert!(result.is_err(), "{failure}");
+                assert_eq!(after, before, "{failure}");
+            }
+        }
+    }
+
     use super::*;
     use crate::api_cost::API_PRICING_CATALOG_REVISION;
     use crate::domain::{

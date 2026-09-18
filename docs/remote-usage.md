@@ -11,9 +11,110 @@ snapshot remain the center's account information, counted once.
 
 ## First connection
 
-1. Install v0.4 on the center and remote. Use compatible model catalogs on both
+### Version policy during rapid iteration
+
+**We intentionally do not implement compatibility with older data protocols.**
+There is no protocol downgrade, old payload translation, or fallback that silently
+omits quota history. The project is evolving quickly: update the remote agent to
+the center's matching build when their protocols differ. A package version such
+as `0.4.0` alone does not establish compatibility. `remote-agent info` is a small,
+stable JSON bootstrap command independent of the usage wire protocol; it reports
+the package version, source build ID, target and exact data protocol version.
+The build ID hashes normalized Rust sources, `Cargo.toml`, `Cargo.lock` and
+`build.rs`, so unpublished edits have a different identity while the same source
+on different platforms has the same identity. Different build IDs are displayed;
+ordinary sync still requires exact protocol and data revisions/catalog agreement.
+Deploy always selects the exact center source build and target platform.
+
+An older executable that predates `info` is reported as **unknown/missing bootstrap
+metadata**, never guessed to support a particular protocol. An explicit OS probe
+can still install its replacement. This installation bootstrap is not support for
+its old data protocol. A legacy protocol rejection is classified as
+`compatibility` / `agent_version_mismatch`, not as an SSH network failure.
+
+### Inspect and deploy a matching agent
+
+```sh
+codex-usage-monit remote inspect local-mac
+codex-usage-monit remote deploy local-mac
+codex-usage-monit remote test local-mac
+```
+
+In TUI **Settings**, select a configured host and press **[B] Deploy agent** (or
+click the label). **[C] Test** displays the agent version/build when available and
+checks state, rollouts, source identity and data revisions. An unpaired host can
+be deployed; pairing and enabling automatic sync remain explicit operations.
+
+Deploy probes the OS/architecture, obtains the matching artifact, verifies its
+manifest and SHA-256, uploads through system SCP, and installs an immutable private
+copy below the SSH login's working directory:
+`.codex-usage-monit-agents/<source-build-prefix>/<target>/<binary-digest-prefix>/`.
+Directory keys use 32 build-ID and 16 binary-digest hex characters to keep Windows
+launch paths short. Verification still checks the full build ID and SHA-256. Windows
+uses an `.exe` and native backslash paths. Both SSH and SCP retain strict host-key
+checking and batch authentication. The remote login must have a stable writable
+working directory (normally its home directory); SFTP/SCP and the SSH shell must
+refer to the same directory. Windows remotes need x64, Windows PowerShell, and a
+cmd.exe or PowerShell SSH login shell;
+Unix remotes need `uname` and `chmod`.
+
+The installed binary must return the expected build, target, protocol and full
+checksum, then pass the normal data probe with the existing source identity pin.
+Only then is `agentExecutable` switched in one configuration revision check.
+Failure, cancellation, source mismatch or concurrent configuration edits preserve
+the prior configuration and retained history. Previous managed builds remain
+available; rollback uses `remote edit HOST --agent-executable PREVIOUS_PATH` and
+`remote test HOST`. A failed run can leave an unused managed copy; an interrupted
+upload can leave a randomly named `.codex-usage-monit-upload-*` staging file in
+the SSH working directory. Cleanup targets only that run's staging file.
+
+Deployment changes the exporter used by this center. It does not overwrite a
+package-manager/global installation, restart a recorder, or rotate the source
+identity. Upgrade a continuously running recorder separately when its collection
+behavior needs updating. A custom launcher that sets `CODEX_HOME` or state paths
+must have those same settings in the SSH login environment before using a managed
+agent; otherwise verification fails and leaves its configured launcher in place.
+
+Artifacts are selected from `--bundle-dir DIR`, `CODEX_USAGE_MONIT_AGENT_DIR`, an
+`agents` directory beside the center executable, or the exact version's official
+GitHub Release. Same-target deployment can use the center executable directly
+unless a bundle was explicitly selected. Release downloads require `curl` and
+HTTPS and verify the manifest build/target/size/hash; there is no `latest` or older
+release fallback. Manifests and binaries share the official release's trust root;
+SHA-256 detects corruption, not an independently signed supply chain.
+
+**An unpublished cross-platform development build needs a matching binary.** A
+Windows executable cannot run on macOS. Build the same source snapshot for each
+required target, then run this on that binary's native platform:
+
+```sh
+cargo build --release --locked
+python3 scripts/package-agent.py target/release/codex-usage-monit --output-dir dist/agents
+```
+
+For Windows use `python scripts/package-agent.py target/release/codex-usage-monit.exe
+--output-dir dist/agents`. Copy the generated binary and `.agent.json` together to
+the center's bundle directory. Configure the development TUI in PowerShell:
+
+```powershell
+$env:CODEX_USAGE_MONIT_AGENT_DIR = 'D:\AgentBundles\current'
+cargo run
+```
+
+Release builds publish these agent artifacts automatically. If the exact build is
+unavailable, deployment reports `agent_artifact_missing` or
+`agent_artifact_mismatch` before uploading anything; changing the package version
+alone does not make an older binary acceptable. Deployment is bounded to five
+minutes plus cleanup/data-probe time, with bounded subprocess output and
+process-tree cancellation. No hosted build, remote compilation, or git pull is
+started implicitly.
+
+### Configure a source
+
+1. Install the monitor on the center. Install it on the remote, or use **Deploy
+   agent** below to install a matching managed exporter. Use matching model catalogs on both
    ends: protocol, metric revisions and the effective catalog fingerprint must
-   agree. The exporter does not automatically install or update itself.
+   agree. Automatic sync never installs software; deployment is an explicit action.
 2. Configure one system OpenSSH alias and verify the remote host key through your
    normal SSH setup. The application uses batch authentication and strict host
    key checking; it cannot answer password, key-passphrase or host-key prompts.
@@ -27,7 +128,7 @@ snapshot remain the center's account information, counted once.
    shell startup files.
    This is an executable token, not a shell command: spaces, quoting and extra
    arguments are rejected. Windows can use a path such as
-   `C:/Tools/codex-usage-monit.exe`; `~` expansion is Unix-shell-specific.
+   `C:\Tools\codex-usage-monit.exe`; `~` expansion is Unix-shell-specific.
 4. The remote login must be able to read its Codex home and write the monitor's
    own state. A custom Codex home or environment can be supplied by a small
    remote launcher script with a safe executable path. Keep launcher output off

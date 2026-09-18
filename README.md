@@ -153,7 +153,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, inspect, or remove the optional per-user recorder. |
-| `remote` | Configure, test, and synchronize explicitly allowlisted SSH machines. Available in v0.4. |
+| `remote` | Configure, inspect, deploy agents, test, and synchronize explicitly allowlisted SSH machines. Available in v0.4. |
 | `debug-startup` | Profile both the TUI's placeholder first frame and its initial data-ready work without entering interactive mode. |
 
 The one-shot data commands support `--format text|json` and `--compact`, which writes JSON on one line instead of pretty-printing it. `debug-startup` instead provides `--width` and `--height` for its headless render. The snapshot-family commands (`snapshot`, `limits`, `tasks`, `turns`, `models`, `attribution`, and `windows`) plus `summary` and `trends` accept `--long-context` to select the optional Longx estimate for that invocation; the default remains the base estimate, and API-equivalent cost never changes.
@@ -228,6 +228,14 @@ codex-usage-monit --redact-content record
 ```
 
 Remote previews are redacted by default; the center's TUI, reports and recorder must use the same policy, hence `--redact-content` above. Opening the TUI alone does not start automatic SSH collection. For prerequisites, background setup, preview opt-in, source selection and troubleshooting, follow the [SSH usage guide](docs/remote-usage.md).
+
+Use `remote inspect HOST` to compare versions, source build IDs and data protocols.
+Settings → **B Deploy agent** or `remote deploy HOST` installs and verifies an
+isolated matching agent before switching that host's configuration. It preserves
+the existing source pin and recorder installation. During rapid iteration we
+**do not support older data protocols or downgrade negotiation**: deploy a matching
+build instead. Unpublished cross-platform development builds require a matching
+agent bundle; see [agent deployment and version policy](docs/remote-usage.md#version-policy-during-rapid-iteration).
 
 If the recorder uses a non-default history location, pass that same source-aware directory to stateful remote commands, for example `codex-usage-monit --redact-content remote --history-dir /srv/codex-state/history-v1 sync buildbox`. Pairing, unpairing/removal, retained-source management, and manual sync then share the recorder's exact persistence domain instead of silently using the platform default. The TUI and service commands use the state-root override described in the guide.
 

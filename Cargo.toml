@@ -6,6 +6,9 @@ description = "Local-first TUI and CLI monitor for Codex tasks, token usage, and
 license = "MIT"
 repository = "https://github.com/ghostroller/codex-usage-monit"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

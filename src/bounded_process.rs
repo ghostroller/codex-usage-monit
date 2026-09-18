@@ -24,6 +24,21 @@ pub(crate) fn output(
     timeout: Duration,
     max_bytes: usize,
 ) -> io::Result<Output> {
+    output_cancellable(command, timeout, max_bytes, || false)
+}
+
+pub(crate) fn output_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Output> {
+    if cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "command was cancelled before launch",
+        ));
+    }
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid command timeout"))?;
@@ -52,6 +67,12 @@ pub(crate) fn output(
         let mut stdout = Pipe::new(stdout, max_bytes)?;
         let mut stderr = Pipe::new(stderr, max_bytes)?;
         let status = loop {
+            if cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "command was cancelled",
+                ));
+            }
             stdout.poll()?;
             stderr.poll()?;
             if let Some(status) = child.try_wait()? {
@@ -410,6 +431,29 @@ pub(crate) mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_terminated(directory.path(), "parent_exits");
         assert_terminated(directory.path(), "descendant");
+    }
+
+    #[test]
+    fn cancellation_terminates_and_reaps_the_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = fixture_command("parent_hangs", directory.path());
+        let error = output_cancellable(&mut command, Duration::from_secs(5), 4096, || {
+            directory.path().join("descendant").is_file()
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_terminated(directory.path(), "parent_hangs");
+        assert_terminated(directory.path(), "descendant");
+        let directory = tempfile::tempdir().unwrap();
+        let error = output_cancellable(
+            &mut fixture_command("success", directory.path()),
+            Duration::from_secs(5),
+            4096,
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!directory.path().join("success").exists());
     }
 
     #[test]
