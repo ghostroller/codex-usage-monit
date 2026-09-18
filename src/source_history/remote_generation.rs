@@ -17,12 +17,14 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::remote_quota::{MAX_REMOTE_QUOTA_BYTES, REMOTE_QUOTA_FILE, apply_remote_quota};
 use super::session_evidence::{
     DIGESTS_DIRECTORY, DIGESTS_LOCK_FILE, MAX_COMPRESSED_EVIDENCE_SHARD_BYTES,
     validate_digest_shard_for_remote_clone,
 };
 use super::*;
 use crate::remote_protocol::{ModelCatalogFingerprint, ProtocolRevisions, SourceGeneration};
+use crate::remote_quota::RemoteQuotaChange;
 
 const REMOTE_HISTORY_DIRECTORY: &str = "remote-history-v1";
 const REMOTE_GENERATIONS_DIRECTORY: &str = "generations";
@@ -732,6 +734,7 @@ impl SourceHistoryStore {
         require_active: bool,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         generation.validate()?;
         binding.validate_namespace(source_id)?;
@@ -786,6 +789,14 @@ impl SourceHistoryStore {
             &directory.join(DIGESTS_DIRECTORY),
             digest_records,
         )?;
+        cleanup_remote_atomic_temporary_files(self, &directory, REMOTE_QUOTA_FILE)?;
+        apply_remote_quota(
+            self,
+            source_id,
+            redaction_profile,
+            &directory,
+            quota_records,
+        )?;
         Ok(RemoteHistoryPageWriteReport {
             bucket_history,
             session_digests,
@@ -807,6 +818,7 @@ impl SourceHistoryStore {
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
         activated_at: DateTime<Utc>,
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         expected_active.validate_namespace(source_id)?;
         replacement_generation.validate()?;
@@ -822,7 +834,8 @@ impl SourceHistoryStore {
                 "remote active replacement must use a distinct generation",
             ));
         }
-        let page_fingerprint = remote_page_fingerprint(bucket_records, digest_records)?;
+        let page_fingerprint =
+            remote_page_fingerprint(bucket_records, digest_records, quota_records)?;
         let expected_origin = RemoteGenerationOrigin::ActiveReplacement {
             expected_active_generation: expected_active.generation().clone(),
             page_fingerprint,
@@ -897,6 +910,15 @@ impl SourceHistoryStore {
             redaction_profile,
             &replacement_directory.join(DIGESTS_DIRECTORY),
             digest_records,
+        )?;
+
+        cleanup_remote_atomic_temporary_files(self, &replacement_directory, REMOTE_QUOTA_FILE)?;
+        apply_remote_quota(
+            self,
+            source_id,
+            redaction_profile,
+            &replacement_directory,
+            quota_records,
         )?;
 
         // Revalidate the exact replacement binding after nested shard writes.
@@ -1440,6 +1462,28 @@ impl SourceHistoryStore {
             RemoteCloneFamily::Digests,
         )?;
 
+        cleanup_remote_atomic_temporary_files(self, &directory, REMOTE_QUOTA_FILE)?;
+        let quota_source = expected_directory.join(REMOTE_QUOTA_FILE);
+        let quota_destination = directory.join(REMOTE_QUOTA_FILE);
+        if quota_source.try_exists()? {
+            super::remote_quota::validate_remote_quota_file(
+                self,
+                source_id,
+                redaction_profile,
+                &quota_source,
+            )?;
+            if quota_destination.try_exists()? {
+                ensure_private_files_equal(
+                    &quota_source,
+                    &quota_destination,
+                    MAX_REMOTE_QUOTA_BYTES,
+                )?;
+            } else if fs::hard_link(&quota_source, &quota_destination).is_err() {
+                let contents = read_private_file_bounded(&quota_source, MAX_REMOTE_QUOTA_BYTES)?;
+                write_private_atomically(&quota_destination, &contents)?;
+            }
+            validate_published_private_file(&quota_destination)?;
+        }
         metadata.clone_complete = true;
         write_private_atomically(
             &metadata_path,
@@ -1537,6 +1581,7 @@ impl SourceHistoryStore {
             self.validate_private_path(directory)?;
             let entry = entry?;
             if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_GENERATION_METADATA_FILE)
+                || is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE)
             {
                 validate_published_private_file(&entry.path())?;
                 continue;
@@ -1545,6 +1590,9 @@ impl SourceHistoryStore {
                 Some(REMOTE_GENERATION_METADATA_FILE) if !metadata => {
                     validate_published_private_file(&entry.path())?;
                     metadata = true;
+                }
+                Some(REMOTE_QUOTA_FILE) => {
+                    validate_remote_gc_regular_file(&entry.path(), MAX_REMOTE_QUOTA_BYTES, None)?;
                 }
                 Some(BUCKETS_DIRECTORY) if !buckets => {
                     self.validate_private_path(&entry.path())?;
@@ -1627,6 +1675,7 @@ impl SourceHistoryStore {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_remote_history_generation_page(
         &self,
         source_id: &NodeId,
@@ -1635,6 +1684,7 @@ impl SourceHistoryStore {
         binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.apply_remote_history_generation_page_unfenced(
             source_id,
@@ -1644,6 +1694,7 @@ impl SourceHistoryStore {
             false,
             bucket_records,
             digest_records,
+            quota_records,
         )
     }
 
@@ -1659,6 +1710,7 @@ impl SourceHistoryStore {
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
         activated_at: DateTime<Utc>,
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.apply_remote_history_active_page_cow_unfenced(
             source_id,
@@ -1669,6 +1721,7 @@ impl SourceHistoryStore {
             bucket_records,
             digest_records,
             activated_at,
+            quota_records,
         )
     }
 
@@ -1744,6 +1797,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_remote_history_generation_page(
         &self,
         source_id: &NodeId,
@@ -1752,6 +1806,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.validate_redaction(redaction_profile)?;
         self.fenced(|store| {
@@ -1763,6 +1818,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 false,
                 bucket_records,
                 digest_records,
+                quota_records,
             )
         })
     }
@@ -1780,6 +1836,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
         activated_at: DateTime<Utc>,
+        quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.validate_redaction(redaction_profile)?;
         self.fenced(|store| {
@@ -1792,6 +1849,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 bucket_records,
                 digest_records,
                 activated_at,
+                quota_records,
             )
         })
     }
@@ -2108,6 +2166,7 @@ fn validate_remote_generation_capacity_entry_locked(
     let mut metadata = None;
     let mut buckets = false;
     let mut digests = false;
+    let mut quota = false;
     for entry in fs::read_dir(directory)? {
         store.validate_private_path(directory)?;
         let entry = entry?;
@@ -2120,6 +2179,10 @@ fn validate_remote_generation_capacity_entry_locked(
                 stored.validate(&store.profile_id, source_id, redaction_profile, generation)?;
                 metadata = Some(stored);
             }
+            Some(REMOTE_QUOTA_FILE) => {
+                quota = true;
+                validate_remote_gc_regular_file(&entry.path(), MAX_REMOTE_QUOTA_BYTES, None)?;
+            }
             Some(BUCKETS_DIRECTORY) if !buckets => {
                 store.validate_private_path(&path)?;
                 buckets = true;
@@ -2127,6 +2190,9 @@ fn validate_remote_generation_capacity_entry_locked(
             Some(DIGESTS_DIRECTORY) if !digests => {
                 store.validate_private_path(&path)?;
                 digests = true;
+            }
+            _ if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE) => {
+                validate_remote_gc_regular_file(&path, MAX_REMOTE_QUOTA_BYTES, None)?;
             }
             _ if is_remote_atomic_temporary_file(
                 &entry.file_name(),
@@ -2144,7 +2210,7 @@ fn validate_remote_generation_capacity_entry_locked(
         }
     }
 
-    if metadata.is_none() && (buckets || digests) {
+    if metadata.is_none() && (buckets || digests || quota) {
         return Err(invalid_data(
             "remote history generation families exist without generation metadata",
         ));
@@ -2328,6 +2394,7 @@ fn validate_remote_gc_generation_directory_mode(
     let mut metadata = false;
     let mut buckets = false;
     let mut digests = false;
+    let mut quota = false;
     for entry in fs::read_dir(directory)? {
         store.validate_private_path(directory)?;
         let entry = entry?;
@@ -2341,6 +2408,14 @@ fn validate_remote_gc_generation_directory_mode(
                 )?;
                 metadata = true;
             }
+            Some(REMOTE_QUOTA_FILE) => {
+                quota = true;
+                validate_remote_gc_regular_file(
+                    &entry.path(),
+                    MAX_REMOTE_QUOTA_BYTES,
+                    Some(&mut usage),
+                )?;
+            }
             Some(BUCKETS_DIRECTORY) if !buckets => {
                 store.validate_private_path(&path)?;
                 usage.add_directory()?;
@@ -2352,6 +2427,9 @@ fn validate_remote_gc_generation_directory_mode(
                 usage.add_directory()?;
                 validate_remote_gc_family(store, &path, RemoteCloneFamily::Digests, &mut usage)?;
                 digests = true;
+            }
+            _ if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE) => {
+                validate_remote_gc_regular_file(&path, MAX_REMOTE_QUOTA_BYTES, Some(&mut usage))?;
             }
             _ if is_remote_atomic_temporary_file(
                 &entry.file_name(),
@@ -2378,7 +2456,7 @@ fn validate_remote_gc_generation_directory_mode(
             "remote history GC candidate namespace is incomplete",
         ));
     }
-    if !metadata && (buckets || digests) {
+    if !metadata && (buckets || digests || quota) {
         return Err(invalid_data(
             "partially deleted remote history GC trash lost its metadata out of order",
         ));
@@ -2485,13 +2563,20 @@ fn remove_remote_gc_generation_tree(
     for entry in fs::read_dir(directory)? {
         store.validate_private_path(directory)?;
         let entry = entry?;
-        if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_GENERATION_METADATA_FILE) {
+        if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_GENERATION_METADATA_FILE)
+            || is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE)
+        {
             metadata_temps.push(entry.path());
         }
     }
     for path in metadata_temps {
         validate_published_private_file(&path)?;
         fs::remove_file(path)?;
+    }
+    let quota_path = directory.join(REMOTE_QUOTA_FILE);
+    if quota_path.try_exists()? {
+        validate_remote_gc_regular_file(&quota_path, MAX_REMOTE_QUOTA_BYTES, None)?;
+        fs::remove_file(&quota_path)?;
     }
     let metadata_path = directory.join(REMOTE_GENERATION_METADATA_FILE);
     match fs::symlink_metadata(&metadata_path) {
@@ -2782,10 +2867,15 @@ fn read_private_file_bounded(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
 fn remote_page_fingerprint(
     bucket_records: &[SourceBucketRecord],
     digest_records: &[SourceSessionDigestRecord],
+    quota_records: &[RemoteQuotaChange],
 ) -> io::Result<String> {
     let mut writer = BoundedHashWriter::new(MAX_REMOTE_COW_FINGERPRINT_BYTES);
     writer.write_all(b"codex-usage-monit/remote-active-page/v1\0")?;
-    serde_json::to_writer(&mut writer, &(bucket_records, digest_records)).map_err(|error| {
+    serde_json::to_writer(
+        &mut writer,
+        &(bucket_records, digest_records, quota_records),
+    )
+    .map_err(|error| {
         invalid_data(format!(
             "could not fingerprint remote active history page: {error}"
         ))
@@ -3113,6 +3203,7 @@ mod tests {
                 binding,
                 &[bucket(at(10, 0), 10)],
                 &[digest("old-thread", at(10, 0), 10)],
+                &[],
             )
             .unwrap();
         history
@@ -3166,6 +3257,7 @@ mod tests {
                 &bucket_page,
                 &digest_page,
                 at(11, 15),
+                &[],
             )
             .unwrap();
 
@@ -3204,6 +3296,7 @@ mod tests {
                 &bucket_page,
                 &digest_page,
                 at(11, 15),
+                &[],
             )
             .unwrap();
         assert_eq!(replay, RemoteHistoryPageWriteReport::default());
@@ -3236,6 +3329,7 @@ mod tests {
                 &[bucket(at(10, 30), 30)],
                 &[digest("newer-thread", at(10, 30), 30)],
                 at(11, 30),
+                &[],
             )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
@@ -3587,6 +3681,7 @@ mod tests {
                 &binding,
                 &[bucket(at(10, 0), 5)],
                 &[digest("trash-thread", at(10, 0), 5)],
+                &[],
             )
             .unwrap();
 
@@ -3835,6 +3930,7 @@ mod tests {
                 &binding,
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
         assert_eq!(report, RemoteHistoryPageWriteReport::default());
@@ -3874,6 +3970,7 @@ mod tests {
                 &binding,
                 &[bucket(at(10, 0), 10)],
                 &[digest("old-thread", at(10, 0), 10)],
+                &[],
             )
             .unwrap();
         history
@@ -3900,6 +3997,7 @@ mod tests {
                 &binding,
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
+                &[],
             )
             .unwrap();
         assert_eq!(first_page.bucket_history.shards_written, 1);
@@ -3934,6 +4032,7 @@ mod tests {
                 &binding,
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
+                &[],
             )
             .unwrap();
         assert_eq!(replay.bucket_history.shards_skipped, 1);
@@ -3997,6 +4096,7 @@ mod tests {
                 &binding,
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
+                &[],
             )
             .unwrap();
 
@@ -4113,6 +4213,7 @@ mod tests {
                 &bucket_page,
                 &digest_page,
                 at(11, 15),
+                &[],
             )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -4159,6 +4260,7 @@ mod tests {
                     &bucket_page,
                     &digest_page,
                     at(11, 15),
+                    &[],
                 )
                 .is_err()
         );
@@ -4211,6 +4313,7 @@ mod tests {
                 &bucket_page,
                 &digest_page,
                 at(11, 15),
+                &[],
             )
             .unwrap();
         assert_eq!(report.bucket_history.shards_written, 1);
@@ -4240,6 +4343,7 @@ mod tests {
                 &bucket_page,
                 &digest_page,
                 at(11, 45),
+                &[],
             )
             .unwrap();
         assert_eq!(replay, RemoteHistoryPageWriteReport::default());
@@ -4283,6 +4387,7 @@ mod tests {
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
                 at(11, 15),
+                &[],
             )
             .unwrap();
         assert!(!bucket_temp.exists());
@@ -4308,6 +4413,7 @@ mod tests {
                     &[bucket_revision(2, at(10, 30), 30)],
                     &[],
                     at(11, 30),
+                    &[],
                 )
                 .unwrap_err()
                 .kind(),
@@ -4342,6 +4448,7 @@ mod tests {
                 &[bucket_revision(2, at(10, 30), 30)],
                 &[],
                 at(11, 30),
+                &[],
             )
             .unwrap();
         assert!(!destination_temp.exists());
@@ -4374,6 +4481,7 @@ mod tests {
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
                 at(11, 15),
+                &[],
             )
             .unwrap();
 
@@ -4387,6 +4495,7 @@ mod tests {
                 &[bucket(at(10, 30), 30)],
                 &[],
                 at(11, 30),
+                &[],
             )
             .unwrap_err();
         assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
@@ -4408,6 +4517,7 @@ mod tests {
                 &[bucket(at(10, 30), 31)],
                 &[],
                 at(11, 45),
+                &[],
             )
             .unwrap_err();
         assert_eq!(collision.kind(), io::ErrorKind::InvalidData);
@@ -4584,6 +4694,7 @@ mod tests {
                     &[bucket(at(10, 15), 20)],
                     &[],
                     at(11, 15),
+                    &[],
                 )
                 .unwrap_err()
                 .kind(),
@@ -4636,6 +4747,7 @@ mod tests {
                     &binding,
                     &[],
                     &[],
+                    &[],
                 )
                 .unwrap_err()
                 .kind(),
@@ -4676,6 +4788,7 @@ mod tests {
                     &binding,
                     &[bucket(at(12, 0), 1)],
                     &[],
+                    &[],
                 )
                 .unwrap_err()
                 .kind(),
@@ -4693,6 +4806,7 @@ mod tests {
                     &unknown,
                     &binding,
                     &[bucket(at(12, 0), 1)],
+                    &[],
                     &[],
                 )
                 .unwrap_err()
@@ -4718,6 +4832,7 @@ mod tests {
                     &binding,
                     true,
                     &[bucket(at(12, 15), 2)],
+                    &[],
                     &[],
                 )
                 .unwrap_err()

@@ -33,6 +33,7 @@ pub use session_evidence::*;
 mod remote_generation;
 pub use remote_generation::*;
 mod remote_live;
+mod remote_quota;
 pub use remote_live::*;
 mod local_observation;
 mod redaction_retirement;
@@ -355,6 +356,8 @@ pub struct SourceMetadata {
     display_label: String,
     aggregate_redaction_profile: RedactionProfile,
     include_in_aggregates: bool,
+    #[serde(default)]
+    quota_matches_local_account: bool,
     detached: bool,
 }
 
@@ -380,6 +383,7 @@ impl SourceMetadata {
             display_label: display_label.into(),
             aggregate_redaction_profile,
             include_in_aggregates: true,
+            quota_matches_local_account: false,
             detached: false,
         };
         metadata.validate()?;
@@ -410,6 +414,14 @@ impl SourceMetadata {
         self.include_in_aggregates
     }
 
+    pub fn quota_matches_local_account(&self) -> bool {
+        self.quota_matches_local_account
+    }
+
+    pub fn set_quota_matches_local_account(&mut self, same: bool) {
+        self.quota_matches_local_account = same;
+    }
+
     pub fn detached(&self) -> bool {
         self.detached
     }
@@ -433,6 +445,9 @@ impl SourceMetadata {
 
     pub fn set_detached(&mut self, detached: bool) {
         self.detached = detached;
+        if detached {
+            self.quota_matches_local_account = false;
+        }
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -2661,7 +2676,7 @@ fn source_record_intersects_since(record: &SourceBucketRecord, since: DateTime<U
         > since
 }
 
-fn validate_account_quota_point(point: &QuotaPoint) -> io::Result<()> {
+pub(crate) fn validate_account_quota_point(point: &QuotaPoint) -> io::Result<()> {
     let limit_id = point.limit_id.trim();
     if limit_id.is_empty()
         || limit_id != point.limit_id

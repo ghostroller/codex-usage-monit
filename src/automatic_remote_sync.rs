@@ -1330,6 +1330,7 @@ mod tests {
                             has_more: false,
                         },
                         payload: DeltaPayload {
+                            quota_changes: Vec::new(),
                             coverage: RemoteDeltaCoverage {
                                 requested_range: delta.range.clone(),
                                 covered_range: Some(delta.range.clone()),

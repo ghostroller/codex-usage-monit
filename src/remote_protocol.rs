@@ -24,7 +24,7 @@ use crate::source_model::{ObservedProjectKey, ProjectDisplayLabel, ThreadId};
 
 /// Third remote export schema: negotiated model catalogs carry an exact
 /// semantic content fingerprint in addition to their numeric revisions.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 5;
 /// First normalized per-event fact schema. It is intentionally independent
 /// from aggregate-history revisions so a center can reject an unknown fact
 /// shape without discarding otherwise compatible bucket data.
@@ -1013,6 +1013,7 @@ impl RemoteProtocolMessage for RemoteExportRequest {
 #[serde(rename_all = "snake_case")]
 pub enum RemoteCapability {
     DeltaJournal,
+    QuotaHistory,
     LiveSnapshot,
     SessionFactSnapshot,
     SessionFactDelta,
@@ -2432,6 +2433,8 @@ pub(crate) fn validate_remote_partial_reasons_for_storage(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteDeltaStats {
     pub journal_records_scanned: u64,
+    #[serde(default)]
+    pub quota_changes_emitted: u64,
     pub project_descriptors_emitted: u64,
     pub bucket_changes_emitted: u64,
     pub session_digest_changes_emitted: u64,
@@ -2460,7 +2463,8 @@ impl RemoteDeltaStats {
             .and_then(|live| live.snapshot.as_ref())
             .map(|snapshot| (snapshot.tasks.len(), snapshot.turns.len()))
             .unwrap_or_default();
-        if self.project_descriptors_emitted != payload.project_descriptors.len() as u64
+        if self.quota_changes_emitted != payload.quota_changes.len() as u64
+            || self.project_descriptors_emitted != payload.project_descriptors.len() as u64
             || self.bucket_changes_emitted != payload.bucket_changes.len() as u64
             || self.session_digest_changes_emitted != payload.session_digest_changes.len() as u64
             || self.live_tasks_emitted != live_tasks as u64
@@ -2486,6 +2490,7 @@ impl RemoteDeltaStats {
         }
         let emitted_changes = (payload.bucket_changes.len() as u64)
             .checked_add(payload.session_digest_changes.len() as u64)
+            .and_then(|count| count.checked_add(payload.quota_changes.len() as u64))
             .ok_or_else(|| invalid_message("remote emitted change count overflows"))?;
         // The source/profile cursor is global and range-independent. Every
         // scanned journal transition must therefore be present in exactly one
@@ -2505,6 +2510,8 @@ impl RemoteDeltaStats {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeltaPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_changes: Vec<crate::remote_quota::RemoteQuotaChange>,
     pub coverage: RemoteDeltaCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_descriptors: Vec<RemoteProjectDescriptor>,
@@ -2607,6 +2614,32 @@ impl DeltaPayload {
                 .map(|change| change.sequence.get()),
             "remote session digest changes",
         )?;
+        validate_count(self.quota_changes.len(), 4096, "remote quota changes")?;
+        for change in &self.quota_changes {
+            change
+                .quota
+                .validate()
+                .map_err(|error| invalid_message(error.to_string()))?;
+            if change.quota.day > context.observed_at.date_naive()
+                || change.sequence.get() < context.page.from_sequence
+                || change.sequence.get() > context.page.through_sequence
+                || change
+                    .quota
+                    .points
+                    .iter()
+                    .any(|point| point.observed_at > context.observed_at)
+            {
+                return Err(invalid_message(
+                    "remote quota change exceeds its page bounds",
+                ));
+            }
+        }
+        validate_change_order(
+            self.quota_changes
+                .iter()
+                .map(|change| change.sequence.get()),
+            "remote quota changes",
+        )?;
         let mut all_sequences = BTreeSet::new();
         if self
             .bucket_changes
@@ -2614,6 +2647,11 @@ impl DeltaPayload {
             .map(|change| change.sequence.get())
             .chain(
                 self.session_digest_changes
+                    .iter()
+                    .map(|change| change.sequence.get()),
+            )
+            .chain(
+                self.quota_changes
                     .iter()
                     .map(|change| change.sequence.get()),
             )
@@ -3771,6 +3809,7 @@ mod tests {
             }),
         });
         DeltaPayload {
+            quota_changes: Vec::new(),
             coverage: RemoteDeltaCoverage {
                 requested_range: ExportRange {
                     from: at("2026-08-30T00:00:00Z"),

@@ -10650,6 +10650,7 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
                 &binding,
                 &[SourceBucketRecord::upsert(1, remote_bucket).unwrap()],
                 &[],
+                &[],
             )
             .unwrap();
         writer
@@ -16423,4 +16424,87 @@ fn renders_all_views_at_common_terminal_sizes() {
             }
         }
     }
+}
+
+#[test]
+fn settings_quota_merge_control_is_opt_in_clickable_and_keyboard_accessible() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    let source_id: NodeId = "node-11111111111111111111111111111111".parse().unwrap();
+    let source = SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "dev").unwrap();
+    assert!(!source.quota_matches_local_account());
+    let store = SourceHistoryStore::new(
+        directory.path().join("source-history"),
+        "0123456789abcdef".parse().unwrap(),
+    );
+    store.save_source_metadata(&source).unwrap();
+    app.remote_source_history_store = Some(store);
+    app.reload_remote_sources_with_history(true);
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (width, height) in [(60, 14), (80, 24), (110, 24)] {
+            app.pending_remote_action = None;
+            app.remote_action_running = None;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let controls = app.settings_controls_hitbox.clone().unwrap();
+            assert!(controls.remote_quota_enabled);
+            assert!(!controls.remote_quota.is_empty());
+            let shortcut = &terminal.backend().buffer()
+                [(controls.remote_quota.x + 1, controls.remote_quota.y)];
+            assert_eq!(shortcut.symbol(), "O");
+            assert_eq!(shortcut.fg, theme.palette().accent);
+            assert!(shortcut.modifier.contains(Modifier::BOLD));
+            assert!(!handle_key_event(&mut app, key_event(KeyCode::Char('o'))));
+            let request = app.pending_remote_action.take().unwrap();
+            app.remote_action_running = None;
+            assert_eq!(request.kind, RemoteUiActionKind::MergeQuota);
+            let mut command = Command::new("codex-usage-monit");
+            append_remote_ui_action_args(&mut command, &request);
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["remote", "source", "merge-quota", source_id.as_str()]
+            );
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let click = app.settings_controls_hitbox.as_ref().unwrap().remote_quota;
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    click.right() - 1,
+                    click.y
+                )
+            ));
+            assert_eq!(
+                app.pending_remote_action.take().unwrap().kind,
+                RemoteUiActionKind::MergeQuota
+            );
+        }
+    }
+    app.remote_action_running = None;
+    let store = app.remote_source_history_store.as_ref().unwrap();
+    let mut source = store.load_source_metadata(&source_id).unwrap();
+    source.set_quota_matches_local_account(true);
+    store
+        .update_source_metadata(&source_id, |metadata| {
+            *metadata = source.clone();
+            Ok(())
+        })
+        .unwrap();
+    app.reload_remote_sources_with_history(true);
+    let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    handle_key_event(&mut app, key_event(KeyCode::Char('o')));
+    assert_eq!(
+        app.pending_remote_action.take().unwrap().kind,
+        RemoteUiActionKind::SeparateQuota
+    );
+    source.set_detached(true);
+    assert!(!source.quota_matches_local_account());
 }

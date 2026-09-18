@@ -157,11 +157,24 @@ impl RemoteDeltaRangePolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteDeltaIngestBinding {
+    #[serde(
+        default = "legacy_quota_protocol_version",
+        skip_serializing_if = "is_legacy_quota_protocol_version"
+    )]
+    protocol_version: u32,
     profile_id: HistoryProfileId,
     source: SourceGeneration,
     redaction_profile: RedactionProfile,
     revisions: ProtocolRevisions,
     range_policy: RemoteDeltaRangePolicy,
+}
+
+fn legacy_quota_protocol_version() -> u32 {
+    4
+}
+
+fn is_legacy_quota_protocol_version(version: &u32) -> bool {
+    *version == legacy_quota_protocol_version()
 }
 
 impl RemoteDeltaIngestBinding {
@@ -173,6 +186,7 @@ impl RemoteDeltaIngestBinding {
         range_policy: RemoteDeltaRangePolicy,
     ) -> io::Result<Self> {
         let binding = Self {
+            protocol_version: crate::remote_protocol::REMOTE_PROTOCOL_VERSION,
             profile_id,
             source,
             redaction_profile,
@@ -221,7 +235,8 @@ impl RemoteDeltaIngestBinding {
         response
             .validate_for_request(request)
             .map_err(|error| invalid_data(format!("remote delta exchange is invalid: {error}")))?;
-        if request.expected_source.as_ref() != Some(&self.source)
+        if request.protocol_version != self.protocol_version
+            || request.expected_source.as_ref() != Some(&self.source)
             || request.redaction_profile != self.redaction_profile
             || response.source != self.source
             || response.redaction_profile != self.redaction_profile
@@ -405,11 +420,14 @@ impl RemoteDeltaApplyTargetSeed {
 pub struct RemoteDeltaHistoryRecords {
     pub bucket_records: Vec<SourceBucketRecord>,
     pub session_digest_records: Vec<SourceSessionDigestRecord>,
+    pub quota_records: Vec<crate::remote_quota::RemoteQuotaChange>,
 }
 
 impl RemoteDeltaHistoryRecords {
     fn is_empty(&self) -> bool {
-        self.bucket_records.is_empty() && self.session_digest_records.is_empty()
+        self.bucket_records.is_empty()
+            && self.session_digest_records.is_empty()
+            && self.quota_records.is_empty()
     }
 }
 
@@ -1852,6 +1870,7 @@ fn apply_remote_delta_records(
                 &page.records.bucket_records,
                 &page.records.session_digest_records,
                 activated_at,
+                &page.records.quota_records,
             )?;
         }
         RemoteDeltaApplyTarget::Staging(generation) => {
@@ -1869,6 +1888,7 @@ fn apply_remote_delta_records(
                 &binding,
                 &page.records.bucket_records,
                 &page.records.session_digest_records,
+                &page.records.quota_records,
             )?;
         }
     }
@@ -2936,6 +2956,7 @@ fn history_records_from_payload(
         session_digest_records.push(record);
     }
     Ok(RemoteDeltaHistoryRecords {
+        quota_records: payload.quota_changes.clone(),
         bucket_records,
         session_digest_records,
     })
@@ -3572,6 +3593,7 @@ mod tests {
     ) -> DeltaPayload {
         let scanned = bucket_changes.len() + session_digest_changes.len();
         DeltaPayload {
+            quota_changes: Vec::new(),
             coverage: RemoteDeltaCoverage {
                 requested_range: range.clone(),
                 covered_range: Some(range),
@@ -5662,5 +5684,176 @@ mod tests {
                 assert!(retirement.marker.is_file());
             },
         );
+    }
+    #[test]
+    fn quota_sync_bootstrap_cow_replay_and_tombstones_keep_local_account_separate() {
+        use crate::domain::Provenance;
+        use crate::history::QuotaPoint;
+        use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
+        let root = tempdir().unwrap();
+        let binding = binding_with(1, 1, 60);
+        let ingest = store(root.path(), binding.clone());
+        let range = export_range(at(30, 3, 0), 60);
+        let make_change = |sequence, observed_at: DateTime<Utc>, remaining| RemoteQuotaChange {
+            sequence: nonzero64(sequence),
+            quota: RemoteQuotaDay {
+                day: observed_at.date_naive(),
+                points: vec![
+                    RemoteQuotaPoint::from_local(&QuotaPoint {
+                        observed_at,
+                        limit_id: "codex".into(),
+                        duration_mins: 300,
+                        resets_at: at(30, 4, 30),
+                        used_percent: 100.0 - remaining,
+                        remaining_percent: remaining,
+                        provenance: Provenance::ServerSnapshot,
+                    })
+                    .unwrap(),
+                ],
+            },
+        };
+        let make_response = |change: RemoteQuotaChange, more| {
+            let (mut page, _) = tombstone_page(9, change.sequence.get(), at(30, 3, 0));
+            page.has_more = more;
+            let mut payload = payload_for(range.clone(), Vec::new(), Vec::new());
+            payload.quota_changes = vec![change];
+            payload.stats.journal_records_scanned = 1;
+            payload.stats.quota_changes_emitted = 1;
+            response(&binding, range.clone(), page, payload)
+        };
+        with_history_writer(
+            root.path(),
+            PROFILE,
+            binding.redaction_profile,
+            |history, writer| {
+                writer
+                    .save_source_metadata(
+                        &SourceMetadata::new(
+                            binding.source.node_id.clone(),
+                            SourceKind::Ssh,
+                            "remote",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let read = || {
+                    history
+                        .load_remote_quota_since_with_budget(
+                            &binding.source.node_id,
+                            binding.redaction_profile,
+                            at(29, 0, 0),
+                            &mut crate::source_history::SourceHistoryReadBudget::for_query(),
+                        )
+                        .unwrap()
+                };
+                let mut session = ingest.try_begin().unwrap();
+                session.start_bootstrap(writer).unwrap();
+                for (sequence, observed, more) in
+                    [(1, at(29, 23, 50), true), (2, at(30, 3, 55), false)]
+                {
+                    let cursor = (sequence > 1).then_some(DeltaCursor {
+                        generation: nonzero64(9),
+                        sequence: sequence - 1,
+                    });
+                    let request = request(&binding, cursor, range.clone());
+                    let response = make_response(make_change(sequence, observed, 95.0), more);
+                    let page = session
+                        .prepare_page(&request, &response, response.observed_at)
+                        .unwrap();
+                    apply_and_commit_remote_delta_page(&mut session, writer, &page, at(30, 4, 2))
+                        .unwrap();
+                    assert!(read().is_empty()); // Staging quota is invisible until all pages commit.
+                }
+                activate_remote_delta_bootstrap(&mut session, writer, at(30, 4, 2))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read().len(), 2);
+                assert!(
+                    history
+                        .load_account_since(at(29, 0, 0))
+                        .unwrap()
+                        .quota_points
+                        .is_empty()
+                );
+                let incremental_request = request(
+                    &binding,
+                    Some(DeltaCursor {
+                        generation: nonzero64(9),
+                        sequence: 2,
+                    }),
+                    range.clone(),
+                );
+                let incremental_response =
+                    make_response(make_change(3, at(30, 3, 56), 94.8), false);
+                let prepared = session
+                    .prepare_page(
+                        &incremental_request,
+                        &incremental_response,
+                        incremental_response.observed_at,
+                    )
+                    .unwrap();
+                apply_remote_delta_records(&session, writer, &prepared, at(30, 4, 3)).unwrap();
+                drop(session); // Crash after COW publication, before advancing the ingest cursor.
+                assert_eq!(read()[1].remaining_percent, 94.8);
+                let mut recovered = ingest.try_begin().unwrap();
+                let replay = recovered.pending_page().unwrap().unwrap();
+                apply_and_commit_remote_delta_page(&mut recovered, writer, &replay, at(30, 4, 4))
+                    .unwrap();
+                assert_eq!(read().len(), 2);
+                let deletion = RemoteQuotaChange {
+                    sequence: nonzero64(4),
+                    quota: RemoteQuotaDay {
+                        day: at(29, 0, 0).date_naive(),
+                        points: Vec::new(),
+                    },
+                };
+                let deletion_response = make_response(deletion, false);
+                let deletion_request = request(
+                    &binding,
+                    Some(DeltaCursor {
+                        generation: nonzero64(9),
+                        sequence: 3,
+                    }),
+                    range.clone(),
+                );
+                let page = recovered
+                    .prepare_page(
+                        &deletion_request,
+                        &deletion_response,
+                        deletion_response.observed_at,
+                    )
+                    .unwrap();
+                apply_and_commit_remote_delta_page(&mut recovered, writer, &page, at(30, 4, 5))
+                    .unwrap();
+                assert_eq!(read().len(), 1);
+                assert!(loaded_bucket_totals(history, &binding).is_empty());
+            },
+        );
+    }
+    #[test]
+    fn quota_protocol_upgrade_preserves_legacy_binding_encoding_and_separates_new_cursors() {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyBinding<'a> {
+            profile_id: &'a HistoryProfileId,
+            source: &'a SourceGeneration,
+            redaction_profile: RedactionProfile,
+            revisions: &'a ProtocolRevisions,
+            range_policy: &'a RemoteDeltaRangePolicy,
+        }
+        let current = binding_with(1, 1, 60);
+        let old = LegacyBinding {
+            profile_id: &current.profile_id,
+            source: &current.source,
+            redaction_profile: current.redaction_profile,
+            revisions: &current.revisions,
+            range_policy: &current.range_policy,
+        };
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let legacy: RemoteDeltaIngestBinding = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.protocol_version, 4);
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
+        assert_ne!(serde_json::to_vec(&current).unwrap(), bytes);
+        assert_eq!(current.protocol_version, REMOTE_PROTOCOL_VERSION);
     }
 }

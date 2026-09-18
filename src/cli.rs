@@ -503,6 +503,10 @@ enum RemoteSourceAction {
     List(RemoteSourceListArgs),
     /// Include one persisted SSH source in aggregate queries.
     Include(RemoteSourceIdArgs),
+    /// Confirm this source uses the local account and merge its quota history.
+    MergeQuota(RemoteSourceIdArgs),
+    /// Stop merging this source's quota without deleting its observations.
+    SeparateQuota(RemoteSourceIdArgs),
     /// Exclude one persisted SSH source without deleting its history.
     Exclude(RemoteSourceIdArgs),
     /// Irreversibly delete one detached SSH source's retained history.
@@ -2283,6 +2287,7 @@ fn run_remote_source(
     args: RemoteSourceArgs,
     history_dir: Option<&Path>,
 ) -> Result<i32> {
+    let same_quota_account = matches!(&args.action, RemoteSourceAction::MergeQuota(_));
     match args.action {
         RemoteSourceAction::List(args) => {
             let (runtime, _profile_lease) =
@@ -2329,6 +2334,25 @@ fn run_remote_source(
                     }
                 };
             write_stdout(&output)?;
+            Ok(0)
+        }
+        RemoteSourceAction::MergeQuota(args) | RemoteSourceAction::SeparateQuota(args) => {
+            let same = same_quota_account;
+            let (runtime, _profile_lease) = remote_source_lifecycle_runtime(
+                collect_config,
+                history_dir,
+                "quota policy update",
+            )?;
+            crate::remote_source_metadata::set_remote_source_quota_account(
+                &runtime,
+                &args.source_id,
+                same,
+            )?;
+            write_stdout(if same {
+                "Quota history will merge with the local account (user-confirmed same account)"
+            } else {
+                "Quota history will remain separate from the local account"
+            })?;
             Ok(0)
         }
         RemoteSourceAction::Include(args) => {
@@ -2796,6 +2820,7 @@ fn format_remote_probe(
 fn remote_capability_label(capability: RemoteCapability) -> &'static str {
     match capability {
         RemoteCapability::DeltaJournal => "delta_journal",
+        RemoteCapability::QuotaHistory => "quota_history",
         RemoteCapability::LiveSnapshot => "live_snapshot",
         RemoteCapability::SessionFactSnapshot => "session_fact_snapshot",
         RemoteCapability::SessionFactDelta => "session_fact_delta",
@@ -7491,6 +7516,7 @@ mod tests {
                             has_more: false,
                         },
                         payload: DeltaPayload {
+                            quota_changes: Vec::new(),
                             coverage: RemoteDeltaCoverage {
                                 requested_range: delta.range.clone(),
                                 covered_range: Some(delta.range.clone()),

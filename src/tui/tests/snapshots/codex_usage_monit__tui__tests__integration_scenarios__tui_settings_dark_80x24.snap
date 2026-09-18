@@ -17,7 +17,7 @@ rows:
 09|│No configured or retained remote sources                                      │
 10|│                                                                              │
 11|│[N]New  [E]Edit  [P]Pair  [D]Remove                                           │
-12|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data                         │
+12|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data  [O]Quota: off          │
 13|│                                                                              │
 14|└──────────────────────────────────────────────────────────────────────────────┘
 15|┌ Project mappings · explicit only─────────────────────────────────────────────┐
@@ -103,7 +103,7 @@ styles:
 11:001+035 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove"
 11:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 12:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-12:001+053 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data"
+12:001+068 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data  [O]Quota: off"
 12:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 13:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 13:079+001 fg=#4b525c bg=#121417 mods=none text="│"

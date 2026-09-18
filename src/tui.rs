@@ -2485,6 +2485,7 @@ struct SettingsControlsHitbox {
     remote_test: Rect,
     remote_sync: Rect,
     remote_include: Rect,
+    remote_quota: Rect,
     remote_global_enabled: bool,
     remote_new_enabled: bool,
     remote_edit_enabled: bool,
@@ -2495,6 +2496,7 @@ struct SettingsControlsHitbox {
     remote_test_enabled: bool,
     remote_sync_enabled: bool,
     remote_include_enabled: bool,
+    remote_quota_enabled: bool,
     project_rows: Vec<Rect>,
     project_table: Option<TableHitbox>,
     project_scrollbar: Option<ScrollbarHitbox>,
@@ -2931,6 +2933,8 @@ enum RemoteUiActionKind {
     Sync,
     Include,
     Exclude,
+    MergeQuota,
+    SeparateQuota,
     Purge,
 }
 
@@ -2944,6 +2948,8 @@ impl RemoteUiActionKind {
             Self::Test => "test",
             Self::Sync => "sync",
             Self::Include => "include",
+            Self::MergeQuota => "merge-quota",
+            Self::SeparateQuota => "separate-quota",
             Self::Exclude => "exclude",
             Self::Purge => "purge",
         }
@@ -2952,7 +2958,12 @@ impl RemoteUiActionKind {
     fn may_change_history_projection(&self) -> bool {
         matches!(
             self,
-            Self::Sync | Self::Include | Self::Exclude | Self::Purge
+            Self::Sync
+                | Self::Include
+                | Self::Exclude
+                | Self::Purge
+                | Self::MergeQuota
+                | Self::SeparateQuota
         )
     }
 }
@@ -5531,6 +5542,29 @@ impl App {
         );
     }
 
+    fn toggle_selected_remote_quota(&mut self) {
+        if !self.remote_action_idle() {
+            return;
+        }
+        let Some(source) = self.selected_remote_source_metadata().cloned() else {
+            return;
+        };
+        if source.detached() {
+            return;
+        }
+        let kind = if source.quota_matches_local_account() {
+            RemoteUiActionKind::SeparateQuota
+        } else {
+            RemoteUiActionKind::MergeQuota
+        };
+        let revision = self
+            .remote_sources
+            .config
+            .as_ref()
+            .map_or(0, RemotesConfig::config_revision);
+        self.queue_remote_action(kind, source.source_id().to_string(), revision);
+    }
+
     fn toggle_selected_remote_source_in_aggregates(&mut self) {
         if !self.remote_action_idle() {
             self.remote_action_status = Some(RemoteActionStatus::Rejected(
@@ -6837,6 +6871,10 @@ impl App {
         }
         if hitbox.remote_sync_enabled && rect_contains(hitbox.remote_sync, column, row) {
             self.request_remote_action(RemoteUiActionKind::Sync);
+            return true;
+        }
+        if hitbox.remote_quota_enabled && rect_contains(hitbox.remote_quota, column, row) {
+            self.toggle_selected_remote_quota();
             return true;
         }
         if hitbox.remote_include_enabled && rect_contains(hitbox.remote_include, column, row) {
@@ -8469,6 +8507,14 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 }) =>
         {
             app.request_remote_action(RemoteUiActionKind::Sync);
+        }
+        KeyCode::Char('o' | 'O')
+            if app.view == View::Settings
+                && app.remote_control_active(|hitbox| {
+                    (hitbox.remote_quota, hitbox.remote_quota_enabled)
+                }) =>
+        {
+            app.toggle_selected_remote_quota();
         }
         KeyCode::Char('i' | 'I')
             if app.view == View::Settings
@@ -11260,6 +11306,8 @@ fn execute_remote_ui_action(
                 &request.kind,
                 RemoteUiActionKind::Include
                     | RemoteUiActionKind::Exclude
+                    | RemoteUiActionKind::MergeQuota
+                    | RemoteUiActionKind::SeparateQuota
                     | RemoteUiActionKind::Purge
             ) {
                 validate_remote_ui_action_config(&RemotesConfigStore::discover(), &request)?;
@@ -11299,6 +11347,8 @@ fn remote_action_event(kind: &RemoteUiActionKind) -> &'static str {
         RemoteUiActionKind::Include => "remote.include",
         RemoteUiActionKind::Exclude => "remote.exclude",
         RemoteUiActionKind::Purge => "remote.purge",
+        RemoteUiActionKind::MergeQuota => "remote.quota.merge",
+        RemoteUiActionKind::SeparateQuota => "remote.quota.separate",
     }
 }
 
@@ -11398,6 +11448,8 @@ fn trace_remote_ui_action(
                         | RemoteUiActionKind::Remove
                         | RemoteUiActionKind::Include
                         | RemoteUiActionKind::Exclude
+                        | RemoteUiActionKind::MergeQuota
+                        | RemoteUiActionKind::SeparateQuota
                         | RemoteUiActionKind::Purge
                 ),
             )
@@ -11454,7 +11506,11 @@ fn remote_ui_action_command(
 fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionRequest) {
     command.arg("remote");
     match &request.kind {
-        RemoteUiActionKind::Include | RemoteUiActionKind::Exclude | RemoteUiActionKind::Purge => {
+        RemoteUiActionKind::Include
+        | RemoteUiActionKind::Exclude
+        | RemoteUiActionKind::MergeQuota
+        | RemoteUiActionKind::SeparateQuota
+        | RemoteUiActionKind::Purge => {
             command
                 .arg("source")
                 .arg(request.kind.label())
@@ -11493,6 +11549,8 @@ fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionR
         | RemoteUiActionKind::Sync
         | RemoteUiActionKind::Include
         | RemoteUiActionKind::Exclude
+        | RemoteUiActionKind::MergeQuota
+        | RemoteUiActionKind::SeparateQuota
         | RemoteUiActionKind::Purge => {}
     }
 }
@@ -13271,12 +13329,14 @@ fn render_remote_sources_settings(
     hitbox.remote_test_enabled = can_test && app.shortcuts_active();
     hitbox.remote_sync_enabled = can_sync && app.shortcuts_active();
     hitbox.remote_include_enabled = selected_source.is_some() && idle && app.shortcuts_active();
+    hitbox.remote_quota_enabled =
+        selected_source.is_some_and(|source| !source.detached()) && idle && app.shortcuts_active();
     let enable_label = if selected.is_some_and(|host| host.sync_enabled()) {
         "Disable host"
     } else {
         "Enable host"
     };
-    let compact = inner.width < 54;
+    let compact = inner.width < 70;
     let mut spans = Vec::new();
     let mut x = controls_area.x;
     hitbox.remote_enable = push_remote_control(
@@ -13318,6 +13378,24 @@ fn render_remote_sources_settings(
         'I',
         if compact { "" } else { include_label },
         hitbox.remote_include_enabled && shortcuts_active,
+        app.theme,
+    );
+    let quota_label = match (
+        inner.width < 84,
+        selected_source.is_some_and(SourceMetadata::quota_matches_local_account),
+    ) {
+        (true, true) => "Quota: on ",
+        (true, false) => "Quota: off",
+        (false, true) => "Same account quota: on ",
+        (false, false) => "Same account quota: off",
+    };
+    hitbox.remote_quota = push_remote_control(
+        &mut spans,
+        &mut x,
+        controls_area,
+        'O',
+        if compact { "" } else { quota_label },
+        hitbox.remote_quota_enabled && shortcuts_active,
         app.theme,
     );
     if let Some(status) = app

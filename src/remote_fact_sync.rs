@@ -2044,6 +2044,7 @@ mod tests {
                 &binding,
                 &[],
                 records,
+                &[],
             )?;
             writer.activate_remote_history_generation(
                 &source_id,

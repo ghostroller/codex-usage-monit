@@ -47,6 +47,7 @@ const BUCKET_MINUTES: i64 = 15;
     deny_unknown_fields
 )]
 pub enum RemoteDeltaJournalRecord {
+    QuotaDay(crate::remote_quota::RemoteQuotaDay),
     UsageBucket {
         starts_at: DateTime<Utc>,
         mutation: RemoteUsageBucketMutation,
@@ -80,6 +81,7 @@ struct RemoteDeltaJournalRecordV1 {
 )]
 enum VersionedRemoteDeltaJournalRecord {
     V1(RemoteDeltaJournalRecordV1),
+    V2(RemoteDeltaJournalRecordV1),
 }
 
 /// Caller-owned page data which is not part of the durable aggregate journal.
@@ -171,10 +173,16 @@ pub fn encode_remote_delta_journal_record(
         "remote delta journal record",
     )?;
     validate_exact_descriptor_references(&record, &project_descriptors)?;
-    let versioned = VersionedRemoteDeltaJournalRecord::V1(RemoteDeltaJournalRecordV1 {
+    let is_quota = matches!(record, RemoteDeltaJournalRecord::QuotaDay(_));
+    let entry = RemoteDeltaJournalRecordV1 {
         record,
         project_descriptors,
-    });
+    };
+    let versioned = if is_quota {
+        VersionedRemoteDeltaJournalRecord::V2(entry)
+    } else {
+        VersionedRemoteDeltaJournalRecord::V1(entry)
+    };
     let payload = encode_canonical_bounded(&versioned)?;
     RemoteExportChange::new(content_derived_change_id(&payload), payload)
 }
@@ -239,6 +247,7 @@ fn decode_remote_delta_journal_page_with_descriptor_limit(
     let mut descriptors = BTreeMap::<String, RemoteProjectDescriptor>::new();
     let mut bucket_changes = Vec::new();
     let mut session_digest_changes = Vec::new();
+    let mut quota_changes = Vec::new();
 
     for entry in &page.entries {
         payload_bytes = payload_bytes
@@ -260,6 +269,9 @@ fn decode_remote_delta_journal_page_with_descriptor_limit(
             .ok_or_else(|| invalid_data("remote delta journal sequence must be nonzero"))?;
         validate_decoded_record(&decoded, sequence, page.generation, &inputs)?;
         match decoded.record {
+            RemoteDeltaJournalRecord::QuotaDay(quota) => {
+                quota_changes.push(crate::remote_quota::RemoteQuotaChange { sequence, quota })
+            }
             RemoteDeltaJournalRecord::UsageBucket {
                 starts_at,
                 mutation,
@@ -341,6 +353,7 @@ fn decode_remote_delta_journal_page_with_descriptor_limit(
         .map(|snapshot| (snapshot.tasks.len(), snapshot.turns.len()))
         .unwrap_or_default();
     inputs.stats.journal_records_scanned = scanned;
+    inputs.stats.quota_changes_emitted = quota_changes.len() as u64;
     inputs.stats.project_descriptors_emitted = project_descriptors.len() as u64;
     inputs.stats.bucket_changes_emitted = bucket_changes.len() as u64;
     inputs.stats.session_digest_changes_emitted = session_digest_changes.len() as u64;
@@ -348,6 +361,7 @@ fn decode_remote_delta_journal_page_with_descriptor_limit(
     inputs.stats.live_turns_emitted = live_turns as u64;
 
     let payload = DeltaPayload {
+        quota_changes,
         coverage: inputs.coverage,
         project_descriptors,
         bucket_changes,
@@ -379,7 +393,15 @@ fn validate_decoded_record(
     generation: NonZeroU64,
     inputs: &RemoteDeltaJournalPageInputs,
 ) -> io::Result<()> {
+    let quota_changes = match &decoded.record {
+        RemoteDeltaJournalRecord::QuotaDay(quota) => vec![crate::remote_quota::RemoteQuotaChange {
+            sequence,
+            quota: quota.clone(),
+        }],
+        _ => Vec::new(),
+    };
     let (bucket_changes, session_digest_changes) = match &decoded.record {
+        RemoteDeltaJournalRecord::QuotaDay(_) => (Vec::new(), Vec::new()),
         RemoteDeltaJournalRecord::UsageBucket {
             starts_at,
             mutation,
@@ -424,10 +446,15 @@ fn validate_decoded_record(
         has_more: false,
     };
     let payload = DeltaPayload {
+        quota_changes,
         coverage: inputs.coverage.clone(),
         project_descriptors: decoded.project_descriptors.clone(),
         stats: RemoteDeltaStats {
             journal_records_scanned: 1,
+            quota_changes_emitted: u64::from(matches!(
+                decoded.record,
+                RemoteDeltaJournalRecord::QuotaDay(_)
+            )),
             project_descriptors_emitted: decoded.project_descriptors.len() as u64,
             bucket_changes_emitted: bucket_changes.len() as u64,
             session_digest_changes_emitted: session_digest_changes.len() as u64,
@@ -485,7 +512,15 @@ fn decode_remote_delta_journal_change(
             "remote delta journal record is not in canonical encoding",
         ));
     }
-    let VersionedRemoteDeltaJournalRecord::V1(decoded) = versioned;
+    let decoded = match versioned {
+        VersionedRemoteDeltaJournalRecord::V1(decoded) => {
+            if matches!(decoded.record, RemoteDeltaJournalRecord::QuotaDay(_)) {
+                return Err(invalid_data("quota journal records require version 2"));
+            }
+            decoded
+        }
+        VersionedRemoteDeltaJournalRecord::V2(decoded) => decoded,
+    };
     validate_record_shape(&decoded.record)?;
     if decoded.project_descriptors.len() > MAX_DESCRIPTORS_PER_RECORD {
         return Err(invalid_data(
@@ -508,6 +543,7 @@ fn decode_remote_delta_journal_change(
 
 fn validate_record_shape(record: &RemoteDeltaJournalRecord) -> io::Result<()> {
     match record {
+        RemoteDeltaJournalRecord::QuotaDay(quota) => quota.validate()?,
         RemoteDeltaJournalRecord::UsageBucket {
             starts_at,
             mutation,
@@ -688,6 +724,7 @@ fn validate_exact_descriptor_references(
 
 fn record_project_keys(record: &RemoteDeltaJournalRecord) -> BTreeSet<String> {
     match record {
+        RemoteDeltaJournalRecord::QuotaDay(_) => BTreeSet::new(),
         RemoteDeltaJournalRecord::UsageBucket { mutation, .. } => match mutation {
             RemoteUsageBucketMutation::Upsert(bucket) => bucket
                 .project_groups
@@ -1551,7 +1588,8 @@ mod tests {
                 starts_at: at(1, 15),
                 mutation: match bucket_record(at(1, 0), descriptor.observed_project_key.clone()) {
                     RemoteDeltaJournalRecord::UsageBucket { mutation, .. } => mutation,
-                    RemoteDeltaJournalRecord::SessionDigest { .. } => unreachable!(),
+                    RemoteDeltaJournalRecord::SessionDigest { .. }
+                    | RemoteDeltaJournalRecord::QuotaDay(_) => unreachable!(),
                 },
             },
             project_descriptors: vec![descriptor],

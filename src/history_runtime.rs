@@ -2344,6 +2344,7 @@ mod tests {
                     })
                     .unwrap()],
                     &[],
+                    &[],
                 )
                 .unwrap();
             writer

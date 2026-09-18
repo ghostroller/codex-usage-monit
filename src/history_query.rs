@@ -720,7 +720,47 @@ fn load_v2_history_since_inner(
         ),
         Err(_) => account_trace.finish(TraceOutcome::Error, TraceFields::new()),
     }
-    let account = account_result?;
+    let mut account = account_result?;
+    let quota_trace = process_trace_log().span(
+        "history.v2.quota_merge",
+        TraceFields::new().usize("localPointCount", account.quota_points.len()),
+    );
+    let mut remote_quota_points = Vec::new();
+    let mut quota_source_count = 0;
+    // Quota is an account-wide projection, independent of the token source
+    // selector. Only explicit same-account, included, attached sources qualify.
+    for source in metadata_before.iter().filter(|source| {
+        source.kind() == SourceKind::Ssh
+            && source.quota_matches_local_account()
+            && source.include_in_aggregates()
+            && !source.detached()
+    }) {
+        let redaction = source.aggregate_redaction_profile();
+        if query_redaction == RedactionProfile::Redacted
+            && redaction == RedactionProfile::PreviewEnabled
+        {
+            continue;
+        }
+        quota_source_count += 1;
+        remote_quota_points.extend(store.load_remote_quota_since_with_budget(
+            source.source_id(),
+            redaction,
+            evidence_since,
+            read_budget,
+        )?);
+    }
+    let remote_quota_count = remote_quota_points.len();
+    if !remote_quota_points.is_empty() {
+        account.quota_points.extend(remote_quota_points);
+        account.quota_points = crate::quota_merge::merge_quota_points(account.quota_points);
+    }
+    quota_trace.finish(
+        TraceOutcome::Ok,
+        TraceFields::new()
+            .usize("confirmedSourceCount", quota_source_count)
+            .usize("remotePointCount", remote_quota_count)
+            .usize("mergedPointCount", account.quota_points.len()),
+    );
     let mut slices = Vec::new();
     let mut replica_evidence = Vec::new();
     let mut included_sources = Vec::new();
@@ -1675,6 +1715,7 @@ mod tests {
                 &generation,
                 &binding,
                 &[SourceBucketRecord::upsert(1, physical_bucket).unwrap()],
+                &[],
                 &[],
             )
             .unwrap();
@@ -4510,5 +4551,124 @@ mod tests {
             tombstone.change(),
             crate::source_history::SourceWeeklyChange::Tombstone
         ));
+    }
+    #[test]
+    fn quota_merge_requires_same_account_opt_in_and_remains_global_across_usage_filters() {
+        use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (mut legacy, ownership, store) =
+            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
+        let reset = at(8, 0, 0);
+        let local_point = quota(at(2, 9, 0), reset);
+        store
+            .record_account_points(std::slice::from_ref(&local_point))
+            .unwrap();
+        let active = activate_v2(&ownership);
+        let mut remote = source(
+            SOURCE_B,
+            "remote",
+            SourceKind::Ssh,
+            RedactionProfile::PreviewEnabled,
+        );
+        install_remote_bucket(&ownership, &store, &active, &remote, at(2, 10, 0), 20);
+        let mut newer = quota(at(2, 9, 3), reset + Duration::seconds(30));
+        newer.used_percent = 35.2;
+        newer.remaining_percent = 64.8;
+        let later = quota(at(2, 9, 10), reset);
+        {
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+            let writer = store.writer(&authority).unwrap();
+            let expected = store
+                .active_remote_history_ref(remote.source_id(), remote.aggregate_redaction_profile())
+                .unwrap()
+                .unwrap();
+            writer
+                .apply_remote_history_active_page_cow(
+                    remote.source_id(),
+                    remote.aggregate_redaction_profile(),
+                    &expected,
+                    &"ingest-gen-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .parse()
+                        .unwrap(),
+                    expected.binding(),
+                    &[],
+                    &[],
+                    at(2, 10, 30),
+                    &[RemoteQuotaChange {
+                        sequence: NonZeroU64::new(2).unwrap(),
+                        quota: RemoteQuotaDay {
+                            day: newer.observed_at.date_naive(),
+                            points: vec![
+                                RemoteQuotaPoint::from_local(&newer).unwrap(),
+                                RemoteQuotaPoint::from_local(&later).unwrap(),
+                            ],
+                        },
+                    }],
+                )
+                .unwrap();
+        }
+        let initial =
+            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        assert_eq!(initial.history.quota_points, vec![local_point.clone()]);
+        remote.set_quota_matches_local_account(true);
+        store
+            .update_source_metadata(remote.source_id(), |metadata| {
+                *metadata = remote.clone();
+                Ok(())
+            })
+            .unwrap();
+        let local_id: NodeId = SOURCE_A.parse().unwrap();
+        for selection in [
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Local(local_id.clone()),
+            HistorySourceSelection::Remote(remote.source_id().clone()),
+        ] {
+            let read = load_unified_history_since_selected(
+                &ownership,
+                &mut legacy,
+                &store,
+                &local_id,
+                &selection,
+                at(2, 0, 0),
+            )
+            .unwrap();
+            assert_eq!(read.history.quota_points.len(), 2);
+            assert_eq!(read.history.quota_points[0].observed_at, newer.observed_at);
+            assert_eq!(read.history.quota_points[0].remaining_percent, 64.8);
+            assert_eq!(read.history.quota_points[0].resets_at, reset);
+        }
+        remote.set_include_in_aggregates(false);
+        store
+            .update_source_metadata(remote.source_id(), |metadata| {
+                *metadata = remote.clone();
+                Ok(())
+            })
+            .unwrap();
+        let excluded =
+            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        assert_eq!(excluded.history.quota_points, vec![local_point.clone()]);
+        remote.set_include_in_aggregates(true);
+        remote.set_quota_matches_local_account(false);
+        store
+            .update_source_metadata(remote.source_id(), |metadata| {
+                *metadata = remote.clone();
+                Ok(())
+            })
+            .unwrap();
+        let separate =
+            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        assert_eq!(separate.history.quota_points, vec![local_point]);
+        // Projection never modifies local account samples or their export input.
+        assert_eq!(
+            store
+                .load_account_since(at(2, 0, 0))
+                .unwrap()
+                .quota_points
+                .len(),
+            1
+        );
     }
 }

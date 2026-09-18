@@ -4,8 +4,10 @@ One center can collect usage from explicitly selected SSH machines. Install the
 monitor on both ends; the remote runs a short-lived exporter on each request.
 The monitor adds no listening service, but the remote must already accept SSH
 logins. It sends normalized usage, bounded session evidence and recent task
-metadata, rather than copying raw rollout files. Account quota and reset credits
-remain the center's account information, counted once.
+metadata, rather than copying raw rollout files. Recorded quota observations are
+also synchronized, with explicit same-account confirmation required before they
+contribute to the center's quota history. Reset credits and the live account
+snapshot remain the center's account information, counted once.
 
 ## First connection
 
@@ -104,6 +106,59 @@ merge/split actions. Git evidence suggests mappings; it never silently merges
 projects. Other shows per-host aggregate status, session-fact attention,
 bandwidth pauses and SSH process-cleanup pauses.
 
+## Synchronize quota remaining history
+
+Keep a recorder (or a collecting TUI) running on the always-on machine. The SSH
+exporter reads its existing local quota recordings; it cannot reconstruct samples
+from periods when no monitor was recording, and does not call the account API.
+The exporter, recorder and TUI must use the same Codex home and state root.
+
+After pairing and synchronizing a source, select it in Settings → Remote sources
+and press **O**, labelled **Same account quota: off**, to confirm that its retained
+quota observations belong to the same account as the center. Press O again to
+stop merging. The corresponding CLI commands are:
+
+```sh
+codex-usage-monit remote source merge-quota NODE_ID
+codex-usage-monit remote source separate-quota NODE_ID
+```
+
+Use the same redaction and state-directory options as other remote commands.
+The default is off. This is a user confirmation, not automatic account detection:
+historical samples have no account identifier. Do not enable it for a different
+account or a source that switched accounts during its retained history. Use
+separate history profiles/state roots when recording different accounts.
+
+Raw observations stay source-owned even when merging is off. Only locally
+recorded account shards are exported, so two machines can synchronize each
+other without forwarding imported observations back and forth. Excluding a
+source from aggregates also excludes its quota contribution. Detaching/unpairing
+a source clears its same-account confirmation. Disabling automatic sync merely
+stops polling; it does not remove retained history.
+
+The merged curve unions observed periods within the retained 35-day window.
+For each limit and duration, reset times within two minutes of the earliest
+reset in a cluster are treated as clock drift; clustering does not chain across
+successive near matches. Each five-minute sampling slot uses the newest actual
+observation. Equal timestamps use the higher used percentage (then lower
+remaining percentage) as a deterministic tie-break. Percentages are never added
+or averaged. Separate reset cycles and gaps remain separate; no samples are
+invented for recorder outages. The original observations remain available for
+reprojection when a source is excluded.
+
+Quota remains an account-wide history in Trends, independent of its token source
+selector. The token and EST charts use the selected usage sources: All combines
+included local and remote usage, while Local or an exact remote selects that
+usage source. Replica reconciliation runs before All is aggregated; insufficient
+evidence and unavailable estimation inputs remain marked partial/unknown.
+
+Trace logs include `history.v2.quota_merge` with local, remote and merged point
+counts and the number of confirmed sources. Remote delta statistics include
+`quotaChangesEmitted`; `remote.quota.commit` records committed day-change and
+point counts. Quota recordings alone do not move an idle host to the active
+polling interval. An unreadable remote quota store produces
+`quota_history_unavailable`; usage export can still succeed.
+
 ## Read and manage retained usage
 
 - Summary and Trends support `--source all`, `--source local`, and a full
@@ -169,8 +224,13 @@ mismatch needs compatible installations, not repeated sync attempts.
 
 ## Rebuilding incompatible derived data
 
-The current implementation uses remote protocol v4, history metric revision 5,
-and parser cache revision 14. Protocol v4 carries an explicit
+The current implementation uses remote protocol v5, history metric revision 5,
+and parser cache revision 14. Protocol v5 adds quota-day journal changes to the
+bounded, replayable aggregate protocol. Upgrade both endpoints before syncing.
+Existing v4 cursors use a separate binding; the first v5 sync bootstraps a new
+generation and keeps the old visible history until publication. Quota support
+does not require deleting existing account observations or usage history.
+The protocol also carries an explicit
 `unclassifiedTokens` component: input + output + unclassified must equal total.
 Both endpoints must use this implementation before synchronizing.
 

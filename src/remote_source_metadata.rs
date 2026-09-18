@@ -180,6 +180,27 @@ pub fn set_remote_source_in_aggregates(
     })
 }
 
+/// Explicit user confirmation of an account relationship, never inferred from
+/// quota values, host names, or token usage. Raw observations remain separate.
+pub fn set_remote_source_quota_account(
+    runtime: &HistoryRuntime,
+    source_id: &crate::source_identity::NodeId,
+    same_account: bool,
+) -> io::Result<SourceMetadata> {
+    with_v2_writer(runtime, |writer| {
+        writer.update_source_metadata(source_id, |metadata| {
+            if metadata.kind() != SourceKind::Ssh || (same_account && metadata.detached()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "same-account quota confirmation requires an attached SSH source",
+                ));
+            }
+            metadata.set_quota_matches_local_account(same_account);
+            Ok(())
+        })
+    })
+}
+
 /// Removes one connection and transitions any already-persisted SSH source to
 /// a detached state before publishing the allowlist deletion.
 ///

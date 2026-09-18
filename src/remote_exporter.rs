@@ -44,7 +44,7 @@ use crate::source_identity::{SourceIdentity, SourceIdentityStore};
 
 const MAX_DURABLE_PAGE_ENTRIES: usize = 4_096;
 const MAX_DURABLE_PAGE_BYTES: u64 = 8 * 1024 * 1024;
-const REVISION_NAMESPACE: &str = "remote-export-revisions-v2";
+const REVISION_NAMESPACE: &str = "remote-export-revisions-v3";
 const HISTORICAL_COVERAGE_UNPROVEN: &str = "historical_coverage_unproven";
 const LIVE_SNAPSHOT_TRUNCATED: &str = "live_snapshot_truncated";
 const LIVE_SNAPSHOT_LOOKBACK_HOURS: i64 = 24;
@@ -342,6 +342,16 @@ pub fn prepare_remote_delta_page(
             desired = crate::remote_export_plan::filter_partial_export_records(desired, &previous)
                 .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
         }
+        match crate::remote_quota::plan_local_quota_records(config, identity_store, observed_at) {
+            Ok(quota_records) => desired.extend(quota_records),
+            Err(_) => add_warning(&mut inputs.warnings, "quota_history_unavailable", 1),
+        }
+        desired.sort_by(|left, right| left.logical_key().cmp(right.logical_key()));
+        inputs
+            .warnings
+            .sort_by(|left, right| left.code.cmp(&right.code));
+        validate_remote_delta_desired_records(&desired, &inputs)
+            .map_err(|error| RemoteDeltaPrepareError::Internal(error.into()))?;
         session
             .reconcile_materialized_records(
                 observed_at,
@@ -1315,7 +1325,7 @@ mod tests {
 
             let mut current = Some(path);
             while let Some(directory) = current {
-                if directory.ends_with("remote-export-revisions-v2") {
+                if directory.ends_with("remote-export-revisions-v3") {
                     break;
                 }
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1861,7 +1871,7 @@ mod tests {
         assert!(
             first_path
                 .to_string_lossy()
-                .contains("remote-export-revisions-v2")
+                .contains("remote-export-revisions-v3")
         );
     }
 
@@ -2070,5 +2080,57 @@ mod tests {
         const {
             assert!(MAX_LIVE_SERIALIZED_BYTES * 24 * 60 <= 96 * 1024 * 1024);
         }
+    }
+    #[test]
+    fn quota_history_is_journaled_incrementally_from_local_recorder_shards() {
+        let (_directory, config, store, identity, now) = fixture();
+        let root = store.path().unwrap().parent().unwrap();
+        let runtime = crate::history_runtime::HistoryRuntime::new(
+            root.join("history-v1"),
+            &config.codex_home,
+            config.redact_content,
+        )
+        .unwrap();
+        let point = crate::history::QuotaPoint {
+            observed_at: now - Duration::minutes(5),
+            limit_id: "codex".into(),
+            duration_mins: 300,
+            resets_at: now + Duration::hours(4),
+            used_percent: 12.3456,
+            remaining_percent: 87.6544,
+            provenance: crate::domain::Provenance::ServerSnapshot,
+        };
+        runtime
+            .source_history()
+            .record_account_points(std::slice::from_ref(&point))
+            .unwrap();
+        let prepared = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &current_revisions(),
+            RedactionProfile::Redacted,
+            &request(now),
+            now,
+        )
+        .unwrap();
+        let (page, payload) = prepared.decode().unwrap();
+        assert_eq!(payload.quota_changes.len(), 1);
+        assert_eq!(payload.quota_changes[0].quota.points[0].to_local(), point);
+        let mut continuation = request(now);
+        continuation.delta_cursor = Some(page.next_delta_cursor);
+        let (_, unchanged) = prepare_remote_delta_page(
+            &config,
+            &store,
+            &identity,
+            &current_revisions(),
+            RedactionProfile::Redacted,
+            &continuation,
+            now,
+        )
+        .unwrap()
+        .decode()
+        .unwrap();
+        assert!(unchanged.quota_changes.is_empty());
     }
 }

@@ -982,8 +982,29 @@ pub fn sync_remote_delta_bounded(
                 position = commit?;
                 ensure_committed_position(&position, &request, page, payload)?;
                 report.pages_committed += 1;
+                // Recorder quota samples are not token/task activity and must
+                // not keep an otherwise idle host on the active polling cadence.
                 report.changes_committed +=
                     payload.bucket_changes.len() + payload.session_digest_changes.len();
+                if !payload.quota_changes.is_empty() {
+                    use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
+                    process_trace_log()
+                        .span(
+                            "remote.quota.commit",
+                            TraceFields::new()
+                                .opaque("hostId", host.id())
+                                .usize("dayChangeCount", payload.quota_changes.len())
+                                .usize(
+                                    "pointCount",
+                                    payload
+                                        .quota_changes
+                                        .iter()
+                                        .map(|change| change.quota.points.len())
+                                        .sum(),
+                                ),
+                        )
+                        .finish(TraceOutcome::Ok, TraceFields::new());
+                }
                 report.live_state_changed |= payload.live.as_ref().is_some_and(|live| {
                     live.snapshot.is_some() && Some(live.live_revision) != known_live_revision
                 });
@@ -1437,6 +1458,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum FakeReply {
+        QuotaOnlyDelta,
         Delta { sequence: u64, has_more: bool },
         EmptyDelta,
         CursorExpired,
@@ -1635,6 +1657,29 @@ mod tests {
             })
         };
         let result = match reply {
+            FakeReply::QuotaOnlyDelta => {
+                let mut response = fake_response(
+                    request,
+                    FakeReply::Delta {
+                        sequence: 1,
+                        has_more: false,
+                    },
+                );
+                let RemoteExportResponseBody::Delta { payload, .. } = &mut response.result else {
+                    unreachable!()
+                };
+                payload.bucket_changes.clear();
+                payload.quota_changes = vec![crate::remote_quota::RemoteQuotaChange {
+                    sequence: NonZeroU64::new(1).unwrap(),
+                    quota: crate::remote_quota::RemoteQuotaDay {
+                        day: delta.range.to.date_naive(),
+                        points: Vec::new(),
+                    },
+                }];
+                payload.stats.bucket_changes_emitted = 0;
+                payload.stats.quota_changes_emitted = 1;
+                return response;
+            }
             FakeReply::Delta { sequence, has_more } => {
                 let generation = delta
                     .delta_cursor
@@ -1655,6 +1700,7 @@ mod tests {
                         has_more,
                     },
                     payload: DeltaPayload {
+                        quota_changes: Vec::new(),
                         coverage: RemoteDeltaCoverage {
                             requested_range: delta.range.clone(),
                             covered_range: Some(delta.range.clone()),
@@ -1696,6 +1742,7 @@ mod tests {
                         has_more: false,
                     },
                     payload: DeltaPayload {
+                        quota_changes: Vec::new(),
                         coverage: RemoteDeltaCoverage {
                             requested_range: delta.range.clone(),
                             covered_range: Some(delta.range.clone()),
@@ -3024,5 +3071,28 @@ mod tests {
             TryRemoteHostSyncLease::Acquired(_)
         ));
         drop(other);
+    }
+    #[test]
+    fn quota_only_sync_does_not_promote_idle_hosts_to_active_polling() {
+        let temp = TempDir::new().unwrap();
+        let (store, _, _, selected) = paired_config(&temp);
+        let guard = Rc::new(Cell::new(false));
+        let mut local = FakeLocal::new(guard.clone());
+        local.position.known_live_revision = NonZeroU64::new(1);
+        let mut transport = FakeTransport::new(guard, [FakeReply::QuotaOnlyDelta]);
+        let report = sync_remote_delta_bounded(
+            &store,
+            &selected,
+            PROFILE.parse().unwrap(),
+            &mut local,
+            &mut transport,
+            at(30, 12),
+            RemoteSyncLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(report.pages_committed, 1);
+        assert_eq!(report.changes_committed, 0);
+        assert!(!report.has_activity());
+        assert_eq!(report.completion, RemoteSyncCompletion::Complete);
     }
 }

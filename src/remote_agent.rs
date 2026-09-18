@@ -108,6 +108,7 @@ where
                 RemoteExportResponseBody::Probe(ProbeResult {
                     capabilities: vec![
                         RemoteCapability::DeltaJournal,
+                        RemoteCapability::QuotaHistory,
                         RemoteCapability::LiveSnapshot,
                         RemoteCapability::SessionFactSnapshot,
                         RemoteCapability::SessionFactDelta,
@@ -797,6 +798,7 @@ mod tests {
             probe.capabilities,
             vec![
                 RemoteCapability::DeltaJournal,
+                RemoteCapability::QuotaHistory,
                 RemoteCapability::LiveSnapshot,
                 RemoteCapability::SessionFactSnapshot,
                 RemoteCapability::SessionFactDelta,
