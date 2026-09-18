@@ -41,6 +41,7 @@ if ($Child) {
         processArchitecture = $env:PROCESSOR_ARCHITECTURE
         status = "failed"
         casesPassed = 0
+        contractCases = @{}
         detail = ""
     }
     try {
@@ -73,16 +74,24 @@ if ($Child) {
     if ($shellContracts) {
         if ($childExitCode -eq 0) {
             $transcript = Get-Content -LiteralPath $logPath -Raw
-            $counts = [regex]::Matches($transcript, 'Windows verification regression: (\d+) cases passed under PowerShell ([0-9.]+)\.')
-            if ($counts.Count -eq 1 -and $counts[0].Groups[1].Value -eq "60" -and
-                $counts[0].Groups[2].Value -eq $engineResult.version) {
-                $engineResult.casesPassed = 60
-                $engineResult.status = "passed"
+            $contracts = @(
+                @{ name = 'verification'; count = 60; pattern = 'Windows verification regression: (\d+) cases passed under PowerShell ([0-9.]+)\.' },
+                @{ name = 'launcher'; count = 17; pattern = 'Windows development launcher: (\d+) cases passed under PowerShell ([0-9.]+)\.' },
+                @{ name = 'permissions'; count = 10; pattern = 'PASS: (\d+) permission-repair contracts; PowerShell ([0-9.]+);' }
+            )
+            foreach ($contract in $contracts) {
+                $counts = [regex]::Matches($transcript, $contract.pattern)
+                if ($counts.Count -eq 1 -and [int]$counts[0].Groups[1].Value -eq $contract.count -and
+                    $counts[0].Groups[2].Value -eq $engineResult.version) {
+                    $engineResult.contractCases[$contract.name] = $contract.count
+                    $engineResult.casesPassed += $contract.count
+                } else {
+                    $engineResult.detail = "The transcript did not prove all $($contract.count) $($contract.name) contracts for this engine."
+                    $childExitCode = 1
+                    break
+                }
             }
-            else {
-                $engineResult.detail = "The transcript did not prove all 60 contracts for this engine."
-                $childExitCode = 1
-            }
+            if ($childExitCode -eq 0) { $engineResult.status = "passed" }
         }
         $engineResultPath = Join-Path $runRoot ($Engine + ".result.json")
         $engineResult | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath ($engineResultPath + ".tmp") -Encoding UTF8

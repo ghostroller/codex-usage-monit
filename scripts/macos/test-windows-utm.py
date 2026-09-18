@@ -21,6 +21,7 @@ import zipfile
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 DEFAULT_VM = "codex-usage-monit-windows"
+SHELL_CONTRACT_CASES = {"verification": 60, "launcher": 17, "permissions": 10}
 
 
 class GuestError(RuntimeError):
@@ -89,9 +90,11 @@ def parse_result(data, run_id, source_hash, expected_scope=None):
             prefix = expected.pop(engine.get("engine"), None)
             version = engine.get("version")
             if (prefix is None or not isinstance(version, str) or not version.startswith(prefix)
-                    or engine.get("status") != "passed" or engine.get("casesPassed") != 60
+                    or engine.get("status") != "passed"
+                    or engine.get("casesPassed") != sum(SHELL_CONTRACT_CASES.values())
+                    or engine.get("contractCases") != SHELL_CONTRACT_CASES
                     or not isinstance(engine.get("executable"), str) or not engine["executable"].strip()):
-                raise GuestError("Passing shell contracts require 60 cases on PowerShell 5.1 and 7")
+                raise GuestError("Passing shell contracts require all verification, launcher and permission cases on PowerShell 5.1 and 7")
     return result
 
 
@@ -123,7 +126,7 @@ def main(argv=None):
     parser.add_argument("--profile", choices=("debug", "release"), default="debug")
     parser.add_argument("--test-filter", default="")
     parser.add_argument("--focused", action="store_true", help="run filtered Rust tests only; requires --test-filter")
-    parser.add_argument("--shell-contracts", action="store_true", help="run only the 60 PowerShell wrapper contracts on each of Windows PowerShell 5.1 and PowerShell 7")
+    parser.add_argument("--shell-contracts", action="store_true", help="run verification, launcher and permission script contracts on both PowerShell 5.1 and 7, without project Cargo tests")
     parser.add_argument("--pwsh-path", default="", help="existing guest PowerShell 7 executable; required with --shell-contracts")
     parser.add_argument("--timeout", type=int, default=1800, help="guest verification limit in seconds")
     parser.add_argument("--output-dir", type=Path, help="host results directory; defaults to a unique temporary directory")

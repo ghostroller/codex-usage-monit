@@ -69,12 +69,24 @@ fn main() {
     $env:CUM_DEV_CAPTURE = $capture
     $env:CUM_DEV_EXIT = '0'
 
-    [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', [NullString]::Value, 'Process')
     & $testLauncher
     if ($LASTEXITCODE -ne 0) { throw 'Default launch failed.' }
     $firstRun = Assert-Launch (Join-Path $checkout '.codex-usage-monit\logs\dev')
     if ($null -ne [Environment]::GetEnvironmentVariable('RUST_BACKTRACE', 'Process')) {
         throw 'Launcher did not remove its temporary backtrace setting.'
+    }
+    $completed++
+
+    # Newer runtimes preserve an empty environment value, older ones remove
+    # it. In either case the launcher must restore the exact original state.
+    [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', '', 'Process')
+    $emptyBefore = [Environment]::GetEnvironmentVariable('RUST_BACKTRACE', 'Process')
+    & $testLauncher
+    $null = Assert-Launch (Join-Path $checkout '.codex-usage-monit\logs\dev')
+    $emptyAfter = [Environment]::GetEnvironmentVariable('RUST_BACKTRACE', 'Process')
+    if (($null -eq $emptyBefore) -ne ($null -eq $emptyAfter) -or $emptyBefore -cne $emptyAfter) {
+        throw 'Launcher changed an empty environment value into an absent one, or vice versa.'
     }
     $completed++
 
@@ -129,7 +141,11 @@ fn main() {
 finally {
     Pop-Location
     foreach ($name in $environmentNames) {
-        [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
+        if ($null -eq $previousEnvironment[$name]) {
+            [Environment]::SetEnvironmentVariable($name, [NullString]::Value, 'Process')
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
+        }
     }
     $resolvedRoot = [IO.Path]::GetFullPath($root)
     if ($resolvedRoot.StartsWith($temporaryParent, [StringComparison]::OrdinalIgnoreCase) -and

@@ -110,7 +110,18 @@ impl JsonlWriter {
             if confidential && !parent.exists() {
                 #[cfg(windows)]
                 crate::windows_private_directory::create_dir_all(parent)?;
-                #[cfg(not(windows))]
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    // The default log can be the state's first writer. Apply
+                    // the same creation policy as the identity/history stores,
+                    // without changing permissions on any existing ancestor.
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)?;
+                }
+                #[cfg(not(any(unix, windows)))]
                 fs::create_dir_all(parent)?;
             } else {
                 fs::create_dir_all(parent)?;
@@ -384,6 +395,51 @@ fn ensure_regular_file(file: &File, description: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn event_log_first_writer_keeps_the_state_root_private() {
+        let temp = tempdir().unwrap();
+        let state = temp.path().join("new-state");
+        let logs = state.join("logs");
+        let _writer = JsonlWriter::open_events(&logs.join("events.jsonl"), 1024).unwrap();
+        let identity = crate::source_identity::SourceIdentityStore::at_path(
+            state.join("source-identity.json"),
+        );
+        identity.load_or_create().unwrap();
+        identity.load().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [&state, &logs] {
+                assert_eq!(
+                    fs::metadata(directory).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_log_does_not_repermission_existing_parent_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempdir().unwrap();
+        let state = temp.path().join("existing");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        let _writer = JsonlWriter::open_events(&state.join("logs/events.jsonl"), 1024).unwrap();
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            crate::source_identity::SourceIdentityStore::at_path(
+                state.join("source-identity.json"),
+            )
+            .load_or_create()
+            .is_err()
+        );
+    }
 
     #[test]
     fn event_log_rotation_keeps_private_complete_records() {

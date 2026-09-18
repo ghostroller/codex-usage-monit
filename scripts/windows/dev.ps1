@@ -68,7 +68,13 @@ try {
     $exitCode = $LASTEXITCODE
 }
 finally {
-    [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', $previousBacktrace, 'Process')
+    if ($null -eq $previousBacktrace) {
+        # PowerShell 7/.NET can coerce $null to an empty string, which is a
+        # present environment variable. Pass a real null to remove it.
+        [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', [NullString]::Value, 'Process')
+    } else {
+        [Environment]::SetEnvironmentVariable('RUST_BACKTRACE', $previousBacktrace, 'Process')
+    }
     Pop-Location
     Write-Host "Development TUI exited. Log location: $runDirectory"
 }

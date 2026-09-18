@@ -45,6 +45,8 @@ grants. It verifies permissions and unchanged file contents afterwards. It
 refuses profile/system roots, unrecognized application directories, links
 (including junctions and hard links), unrelated owners, and an existing or
 in-tree backup filename. The application must remain stopped throughout repair.
+Both `-Path` and `-BackupPath` resolve relative to the caller's PowerShell location,
+not the process working directory; only FileSystem-provider paths are accepted.
 
 Keep the backup if a repair is interrupted; it identifies every original path
 and ACL. Re-running with a new backup filename is supported after resolving the
@@ -71,8 +73,12 @@ powershell.exe -NoProfile -File .\scripts\windows\tests\repair-state-permissions
 pwsh.exe -NoProfile -File .\scripts\windows\tests\repair-state-permissions.ps1
 ```
 
-The normal full Windows verification pipeline includes the six repair contracts
-in its current shell. A test process needs a private temporary directory, as the
-general suite intentionally uses already-private fixtures. Record the actual
+The normal full Windows verification pipeline includes the ten repair contracts
+in its current shell; the UTM `--shell-contracts` mode runs them in both 5.1 and 7.
+The contracts create a unique private fixture directory. If SYSTEM's temporary
+directory is under Windows, they use a unique child of CommonApplicationData
+instead, without changing TEMP, SystemTemp or production safety checks. ACL
+assertions compare unique authorized SIDs because the current user can itself
+be SYSTEM. Record the actual
 account, elevation, architecture and temporary-directory setup; a SYSTEM or
 elevated run does not establish standard-user execution.

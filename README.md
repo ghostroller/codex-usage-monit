@@ -524,6 +524,11 @@ issues are recorded again if they recur. Each manual remote operation has an
 operation ID and a hashed source identifier. Background synchronization diagnostics
 reflect the persisted health state observed by the TUI, including failure category
 and attempt time; they do not reconstruct remote stderr from earlier recorder runs.
+Each observation scope tracks at most 1024 entries. An oversized observation
+retains already published states instead of declaring them resolved, admits new
+entries only into free slots, and emits a deduplicated `log.observation_truncated`
+warning. A subsequent complete observation closes absent diagnostics and the
+truncation warning; repeated oversized samples cannot grow the retained map.
 
 These logs contain bounded diagnostic text, unlike the content-free `--trace-log`.
 Common credential-bearing lines are redacted and the local home directory is

@@ -370,8 +370,10 @@ try {
     }
 
     if ($ScriptContractsOnly) {
-        Write-Host "==> Test only Windows verification exit-code and diagnostic handling"
+        Write-Host "==> Test Windows script contracts without project Cargo tests"
         & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
+        & (Join-Path $PSScriptRoot "tests\dev-smoke.ps1")
+        & (Join-Path $PSScriptRoot "tests\repair-state-permissions.ps1")
     }
 
     if (-not $ScriptContractsOnly -and -not $SkipFormat) {

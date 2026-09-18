@@ -27,9 +27,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tests\
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tests\dev-smoke.ps1
 ```
 
-These contracts compile a small Rust Cargo substitute and run 16 cases per shell;
+These contracts compile a small Rust Cargo substitute and run 17 cases per shell;
 the normal full Windows pipeline also includes them under its current shell.
-They are separate from the 60 verification-wrapper contracts described below.
+They include restoration of both absent and empty environment values. The
+script-contract mode below runs them alongside the verification-wrapper and
+permission-repair contracts under both shells.
 
 First verify the existing guest and installed tools. This command does not install
 software, create a VM, or run project tests:
@@ -70,7 +72,7 @@ Windows MSVC target and `--profile release` for release-mode verification.
 it. The guest test deadline defaults to 1,800 seconds and can be set with
 `--timeout` (1–7,200 seconds).
 
-For PowerShell verification-script changes, run the existing 60 wrapper contracts
+For PowerShell script changes, run all three script-contract suites
 under both Windows PowerShell 5.1 and an already installed PowerShell 7:
 
 ```zsh
@@ -93,13 +95,15 @@ clean only the identified per-run and fixture temporary directories after saving
 their evidence. It does not change PATH and is not installed through MSI or a
 package manager. The runner does not download, update or delete this runtime.
 
-This mode prepares the same MSVC environment and compiles only the small native
-fixture used by `verify-smoke.ps1`. Each engine checks both native-error preferences
-through GitHub-style `-Command`, `-File`, and UTM wrappers: **60 cases per engine,
-120 total**. It skips project Cargo tests, format, Clippy, application builds and
+This mode prepares the same MSVC environment and compiles only small native
+fixtures. Each engine runs 60 verification-wrapper cases (both native-error
+preferences through GitHub-style `-Command`, `-File`, and UTM wrappers), 17
+development-launcher cases, and 10 permission-repair cases: **87 per engine,
+174 total**. It skips project Cargo tests, format, Clippy, application builds and
 the real CLI smoke. It cannot be combined with focused/test-filter, target,
 release-profile or doctor options. Results explicitly record `scope: shell-contracts`
-and each engine's executable, actual version, architecture, status and case count,
+and each engine's executable, actual version, architecture, status, total case
+count and `contractCases` breakdown,
 alongside the usual source identity and combined transcript. This is a script
 regression pass, not a full Windows or ConPTY pass.
 

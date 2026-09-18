@@ -6,9 +6,23 @@ if ([string]::IsNullOrEmpty($RepairScript)) {
     $RepairScript = Join-Path $PSScriptRoot '..\repair-state-permissions.ps1'
 }
 $RepairScript = [IO.Path]::GetFullPath($RepairScript)
-$root = Join-Path ([IO.Path]::GetTempPath()) ('monit-acl-contracts-' + [Guid]::NewGuid().ToString('N'))
+$temporaryParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+$systemDirectory = [IO.Path]::GetFullPath($env:SystemRoot).TrimEnd('\', '/')
+# SYSTEM's GetTempPath can ignore TEMP/TMP and select Windows\SystemTemp.
+# Keep the production refusal intact; only our unique test fixtures move.
+if ($temporaryParent.Equals($systemDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+    $temporaryParent.StartsWith($systemDirectory + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    $temporaryParent = [Environment]::GetFolderPath('CommonApplicationData')
+}
+if ([string]::IsNullOrWhiteSpace($temporaryParent)) { throw 'No safe test temporary parent is available.' }
+$temporaryParent = [IO.Path]::GetFullPath($temporaryParent).TrimEnd('\', '/')
+$root = Join-Path $temporaryParent ('monit-acl-contracts-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$rootAcl = Get-Acl -LiteralPath $root
+$rootAcl.SetSecurityDescriptorSddlForm("O:${userSid}D:P(A;OICI;FA;;;${userSid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+Set-Acl -LiteralPath $root -AclObject $rootAcl
+Write-Host "Permission-repair fixture root: $root; user $userSid"
 $count = 0
 
 function New-Fixture([string]$Name) {
@@ -55,8 +69,42 @@ try {
         $acl = Get-Acl -LiteralPath $entry.path
         Assert $acl.AreAccessRulesProtected "Inheritance remains enabled: $($entry.path)"
         Assert ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $userSid) 'Owner mismatch.'
-        Assert ($acl.Access.Count -eq 3) 'Expected exactly user, SYSTEM and Administrators grants.'
+        $expectedSids = @($userSid, 'S-1-5-18', 'S-1-5-32-544' | Sort-Object -Unique)
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        $actualSids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+        Assert (($actualSids -join ',') -eq ($expectedSids -join ',')) 'Unexpected ACL trustee set.'
+        foreach ($rule in $rules) {
+            Assert ($rule.AccessControlType -eq 'Allow' -and -not $rule.IsInherited -and
+                $rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) 'Expected explicit full-control grants.'
+        }
     }
+    $count++
+
+    $fixture = New-Fixture 'relative [test]'
+    $processDirectory = Join-Path $root 'process-cwd'
+    New-Item -ItemType Directory -Path $processDirectory | Out-Null
+    $previousProcessDirectory = [Environment]::CurrentDirectory
+    Push-Location -LiteralPath $root
+    try {
+        [Environment]::CurrentDirectory = $processDirectory
+        $inspection = (& $RepairScript -Path '.\relative [test]' | Out-String) | ConvertFrom-Json
+        Assert ($inspection.root -eq $fixture) 'Relative inspection ignored the PowerShell location.'
+        $count++
+        $relativeBackup = Join-Path $root 'relative-backup.json'
+        $result = (& $RepairScript -Path '.\relative [test]' -Repair -BackupPath '.\relative-backup.json' | Out-String) | ConvertFrom-Json
+        Assert ($result.repairedRoot -eq $fixture -and $result.backup -eq $relativeBackup -and
+            $result.contentsUnchanged -and (Test-Path -LiteralPath $relativeBackup)) 'Relative repair or backup used the process directory.'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $processDirectory 'relative-backup.json'))) 'Backup appeared in the wrong directory.'
+        $count++
+    } finally {
+        [Environment]::CurrentDirectory = $previousProcessDirectory
+        Pop-Location
+    }
+
+    Expect-Failure { & $RepairScript -Path 'Env:\' } 'FileSystem provider'
+    Expect-Failure { & $RepairScript -Path $fixture -Repair -BackupPath 'Env:\CODEX_REPAIR_BACKUP' } 'FileSystem provider'
+    $count++
+    Expect-Failure { & $RepairScript -Path ([IO.Path]::GetPathRoot($root)) } 'system/profile'
     $count++
 
     $fixture = New-Fixture 'backup-refusal'
@@ -105,9 +153,9 @@ try {
 } finally {
     # Verify the exact, unique temporary root before recursive cleanup.
     $resolved = [IO.Path]::GetFullPath($root)
-    $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
-    if (-not $resolved.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-        [IO.Path]::GetFileName($resolved) -notlike 'monit-acl-contracts-*') {
+    if (-not ([IO.Path]::GetDirectoryName($resolved)).Equals($temporaryParent, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolved) -notlike 'monit-acl-contracts-*' -or
+        ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Unsafe contract cleanup target: $resolved"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force

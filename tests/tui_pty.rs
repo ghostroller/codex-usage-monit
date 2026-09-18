@@ -399,6 +399,16 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     session.wait_for("selected Overview tab", |screen| {
         label_is_bold(screen, "Overview") || label_is_bold(screen, "Ovw")
     });
+    // The default logger is the first writer on a fresh installation. Loading
+    // fixture rows alone also succeeds in the degraded legacy fallback, so
+    // require source-aware initialization rather than merely a visible TUI.
+    let state = session._temp.path().join("state");
+    assert!(state.join("logs").is_dir());
+    codex_usage_monit::source_identity::SourceIdentityStore::at_path(
+        state.join("source-identity.json"),
+    )
+    .load()
+    .expect("default logging must not disable private source-aware history");
     assert!(!session.label_is_bold("Other"));
 
     session.send(b"3");

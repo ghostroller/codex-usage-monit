@@ -18,6 +18,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-FileSystemPath([string]$InputPath) {
+    $provider = $null
+    $drive = $null
+    # Unlike IO.Path.GetFullPath on a relative argument, this respects the
+    # caller's PowerShell location, including PSDrives and literal brackets.
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $InputPath, [ref]$provider, [ref]$drive)
+    if ($provider.Name -ne 'FileSystem') { throw 'The path must use the FileSystem provider.' }
+    $resolved = [IO.Path]::GetFullPath($resolved)
+    if ($resolved.Length -gt [IO.Path]::GetPathRoot($resolved).Length) {
+        $resolved = $resolved.TrimEnd('\', '/')
+    }
+    return $resolved
+}
+
 function Assert-NoReparseAncestor([string]$ItemPath) {
     $cursor = $ItemPath
     while (-not [string]::IsNullOrEmpty($cursor)) {
@@ -31,11 +46,11 @@ function Assert-NoReparseAncestor([string]$ItemPath) {
     }
 }
 
-$root = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+$root = Resolve-FileSystemPath $Path
 $rootItem = Get-Item -LiteralPath $root -Force
 if (-not $rootItem.PSIsContainer) { throw 'The target must be a directory.' }
 Assert-NoReparseAncestor $root
-$rootPrefix = $root + [IO.Path]::DirectorySeparatorChar
+$rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 $protectedLocations = @(
     [IO.Path]::GetPathRoot($root), $env:USERPROFILE, $env:LOCALAPPDATA,
     $env:APPDATA, $env:SystemRoot, (Join-Path $env:USERPROFILE '.ssh')
@@ -43,7 +58,7 @@ $protectedLocations = @(
 foreach ($location in $protectedLocations) {
     if ([string]::IsNullOrEmpty($location)) { continue }
     $location = [IO.Path]::GetFullPath($location).TrimEnd('\', '/')
-    if ($root.Equals($location, [StringComparison]::OrdinalIgnoreCase) -or
+    if ($root.TrimEnd('\', '/').Equals($location, [StringComparison]::OrdinalIgnoreCase) -or
         $location.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing a system/profile directory or its ancestor: $root"
     }
@@ -104,7 +119,7 @@ if (-not $Repair) {
     return
 }
 if ([string]::IsNullOrWhiteSpace($BackupPath)) { throw '-Repair requires -BackupPath outside the target directory.' }
-$backup = [IO.Path]::GetFullPath($BackupPath)
+$backup = Resolve-FileSystemPath $BackupPath
 if ($backup.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
     $backup.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'The ACL backup must be outside the target directory.'

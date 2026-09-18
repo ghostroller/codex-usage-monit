@@ -41,8 +41,16 @@ struct Inner {
 struct State {
     writer: Option<JsonlWriter>,
     error: Option<String>,
-    previous: BTreeMap<&'static str, BTreeMap<String, (LogLevel, &'static str)>>,
+    previous: BTreeMap<&'static str, Observation>,
     sequence: u64,
+}
+
+const OBSERVATION_LIMIT: usize = 1024;
+
+#[derive(Default)]
+struct Observation {
+    issues: BTreeMap<String, (LogLevel, &'static str)>,
+    truncated: bool,
 }
 
 #[derive(Default)]
@@ -232,11 +240,16 @@ impl EventLog {
     /// Emit state changes only. Diagnostics carry a stable ID and a recovery
     /// when absent from the next complete observation. Info states do not emit
     /// recoveries. Absence means no longer observed, not independently verified.
+    /// Incomplete observations retain already published states and admit new
+    /// ones only within a fixed bound, until a complete sample releases slots.
     pub fn observe(&self, scope: &'static str, issues: &[(LogLevel, &'static str, String)]) {
         let Some(inner) = &self.inner else { return };
-        let mut current = BTreeMap::new();
         let mut new = Vec::new();
         let mut resolved = Vec::new();
+        let truncated = issues.len() > OBSERVATION_LIMIT;
+        let truncation_message = format!(
+            "{scope}: diagnostic observation exceeds {OBSERVATION_LIMIT} entries; retaining published states and deferring additional diagnostics until a complete observation"
+        );
         {
             let mut state = inner
                 .state
@@ -246,26 +259,47 @@ impl EventLog {
                 return;
             }
             let previous = state.previous.entry(scope).or_default();
-            for (level, event, message) in issues.iter().take(1024) {
+            let mut current = if truncated {
+                previous.issues.clone()
+            } else {
+                BTreeMap::new()
+            };
+            for (level, event, message) in issues.iter().take(OBSERVATION_LIMIT) {
                 if *level == LogLevel::Off || *level > inner.level {
                     continue;
                 }
                 let key = fingerprint(&format!("{scope}:{level:?}:{event}:{message}"));
-                if current.insert(key.clone(), (*level, *event)).is_none()
-                    && !previous.contains_key(&key)
-                {
+                if current.contains_key(&key) || current.len() >= OBSERVATION_LIMIT {
+                    continue;
+                }
+                current.insert(key.clone(), (*level, *event));
+                if !previous.issues.contains_key(&key) {
                     new.push((key, *level, *event, message));
                 }
             }
             // A truncated observation cannot establish that omitted issues ended.
-            if issues.len() <= 1024 {
-                for (key, (level, event)) in previous.iter() {
+            if !truncated {
+                for (key, (level, event)) in &previous.issues {
                     if *level <= LogLevel::Warn && !current.contains_key(key) {
                         resolved.push((key.clone(), *level, *event));
                     }
                 }
             }
-            *previous = current;
+            if truncated != previous.truncated {
+                let key = fingerprint(&format!("{scope}:observation_truncated"));
+                if truncated {
+                    new.push((
+                        key,
+                        LogLevel::Warn,
+                        "log.observation_truncated",
+                        &truncation_message,
+                    ));
+                } else {
+                    resolved.push((key, LogLevel::Warn, "log.observation_truncated"));
+                }
+            }
+            previous.issues = current;
+            previous.truncated = truncated;
         }
         for (key, level, event, message) in new {
             self.record_context(
@@ -541,6 +575,97 @@ mod tests {
             !std::fs::read_to_string(path)
                 .unwrap()
                 .contains("private-host")
+        );
+    }
+
+    #[test]
+    fn event_log_truncated_observations_preserve_pending_recoveries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let log = EventLog::open(Some(path.clone()), LogLevel::Warn, false);
+        let original = (
+            LogLevel::Warn,
+            "original.issue",
+            "original problem".to_owned(),
+        );
+        log.observe("tui", std::slice::from_ref(&original));
+        for batch in 0..3 {
+            let mut issues = (0..1024)
+                .map(|i| (LogLevel::Warn, "other.issue", format!("{batch}:{i}")))
+                .collect::<Vec<_>>();
+            issues.push(original.clone());
+            log.observe("tui", &issues);
+            let state = log.inner.as_ref().unwrap().state.lock().unwrap();
+            assert!(state.previous["tui"].issues.len() <= OBSERVATION_LIMIT);
+        }
+        assert!(
+            !records(&path)
+                .iter()
+                .any(|row| row["event"] == "diagnostic.resolved")
+        );
+        // Returning to a complete observation must neither re-emit the original
+        // issue nor forget to close it when a later complete sample omits it.
+        log.observe("tui", std::slice::from_ref(&original));
+        log.observe("tui", &[]);
+        log.observe("tui", &[]);
+        let rows = records(&path);
+        let active: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "original.issue")
+            .collect();
+        let recovered: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["event"] == "diagnostic.resolved" && row["diagnosticEvent"] == "original.issue"
+            })
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(active[0]["diagnosticId"], recovered[0]["diagnosticId"]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "log.observation_truncated")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "diagnostic.resolved"
+                    && row["diagnosticEvent"] == "log.observation_truncated")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn event_log_complete_observation_at_limit_releases_previous_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let log = EventLog::open(Some(path.clone()), LogLevel::Warn, false);
+        log.observe("tui", &[(LogLevel::Warn, "old.issue", "old".to_owned())]);
+        let complete = (0..OBSERVATION_LIMIT)
+            .map(|i| (LogLevel::Warn, "new.issue", i.to_string()))
+            .collect::<Vec<_>>();
+        log.observe("tui", &complete);
+        log.observe("tui", &complete);
+        let rows = records(&path);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "new.issue")
+                .count(),
+            OBSERVATION_LIMIT
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "diagnostic.resolved"
+                    && row["diagnosticEvent"] == "old.issue")
+                .count(),
+            1
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["event"] == "log.observation_truncated")
         );
     }
 
