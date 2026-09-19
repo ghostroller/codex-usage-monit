@@ -413,9 +413,9 @@ enum RemoteAction {
     Test(RemoteHostArgs),
     /// Inspect agent build/platform/protocol without exchanging usage data.
     Inspect(RemoteHostArgs),
-    /// Have this host download its matching official GitHub Release and switch after verification.
+    /// Download the matching official Release, upgrade an existing recorder, and verify enabled-source sync.
     Deploy(RemoteHostArgs),
-    /// Development only: upload a locally trusted bundle and switch after verification.
+    /// Development only: upload a trusted bundle and run the same node update and verification flow.
     DeployDev(RemoteDeployArgs),
     /// Synchronize exactly one paired host without changing automatic-sync settings.
     Sync(RemoteSyncArgs),
@@ -593,6 +593,8 @@ struct ServiceArgs {
 enum ServiceAction {
     /// Install and start the current user's background recorder.
     Install,
+    /// Replace an existing recorder with this build, preserving its configuration and enabled state.
+    Upgrade(ServiceStatusArgs),
     /// Show registration state and the recorder's latest heartbeat.
     Status(ServiceStatusArgs),
     /// Stop and remove the current user's background recorder.
@@ -1250,7 +1252,7 @@ fn run_remote(
                     info.check_protocol()?;
                 }
                 None => bail!(
-                    "agent_discovery_unavailable: configured agent is missing or predates remote-agent info; remote protocol/build unknown. Use Settings [B] Deploy agent or remote deploy {}. Old data protocols are not supported.",
+                    "agent_discovery_unavailable: configured agent is missing or predates remote-agent info; remote protocol/build unknown. Use Settings [B] Update node or remote deploy {}. Old data protocols are not supported.",
                     host.id()
                 ),
             }
@@ -1262,6 +1264,7 @@ fn run_remote(
             &store,
             &args.id,
             None,
+            history_dir.as_deref(),
             expected_revision,
             inherit_remote_process_tree,
             cancellation.as_ref(),
@@ -1271,6 +1274,7 @@ fn run_remote(
             &store,
             &args.id,
             Some(&args.bundle_dir),
+            history_dir.as_deref(),
             expected_revision,
             inherit_remote_process_tree,
             cancellation.as_ref(),
@@ -2544,11 +2548,13 @@ fn remote_state_root(history_dir: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_remote_deploy(
     collect_config: &CollectConfig,
     store: &RemotesConfigStore,
     host_id: &str,
     development_bundle: Option<&Path>,
+    history_dir: Option<&Path>,
     expected_revision: Option<u64>,
     inherit_remote_process_tree: bool,
     cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
@@ -2591,7 +2597,43 @@ fn run_remote_deploy(
         },
         &environment,
     )?;
-    activate_deployed_agent(
+    validate_deployed_agent_probe(&host, &report)?;
+    ensure_remote_probe_target_current(store, config.config_revision(), &host)?;
+    eprintln!("remote.deploy: agent verified; upgrading the existing remote recorder");
+    let service_operation = collect_config
+        .event_log
+        .operation("remote.recorder.upgrade", host.id());
+    let recorder = match connection.upgrade_recorder(&executable) {
+        Ok(recorder) => {
+            service_operation.finish(
+                if recorder.diagnostic.is_some() {
+                    LogLevel::Warn
+                } else {
+                    LogLevel::Info
+                },
+                &format!(
+                    "{} enabled={} build={}{}",
+                    recorder.outcome,
+                    recorder.enabled,
+                    recorder.build_id,
+                    recorder
+                        .diagnostic
+                        .as_ref()
+                        .map(|detail| format!(" diagnostic={detail}"))
+                        .unwrap_or_default()
+                ),
+            );
+            if let Some(diagnostic) = &recorder.diagnostic {
+                eprintln!("remote recorder is running with diagnostics: {diagnostic}");
+            }
+            recorder
+        }
+        Err(error) => {
+            service_operation.finish(LogLevel::Error, &format!("{error:#}"));
+            return Err(error);
+        }
+    };
+    let activated_revision = activate_deployed_agent(
         store,
         config.config_revision(),
         &host,
@@ -2600,11 +2642,51 @@ fn run_remote_deploy(
         || environment.cancellation_requested(),
     )?;
     write_stdout(&format!(
-        "{origin} agent deployed and verified for {}: {}. Previous agent: {}. Source pin and recorder installation preserved.\n",
+        "{origin} agent deployed and verified for {}: {}. Previous agent: {}. Source pin preserved. Recorder: {} (enabled {}).\n",
         host.id(),
         executable,
-        host.agent_executable()
+        host.agent_executable(),
+        recorder.outcome,
+        recorder.enabled
     ))?;
+    if host.is_paired() && host.sync_enabled() {
+        let operation = collect_config
+            .event_log
+            .operation("remote.update.verify_sync", host.id());
+        let result = run_remote_sync(
+            collect_config,
+            store,
+            host.id(),
+            false,
+            history_dir,
+            Some(activated_revision),
+            inherit_remote_process_tree,
+            cancellation,
+        );
+        match result {
+            Ok(0) => operation.finish(LogLevel::Info, "data synchronization completed"),
+            Ok(_) => {
+                operation.finish(
+                    LogLevel::Warn,
+                    "node updated; data synchronization needs continuation or attention",
+                );
+                eprintln!(
+                    "node updated; data synchronization is incomplete. Continue with Sync now; bandwidth limits and retained history are preserved."
+                );
+                return Ok(2);
+            }
+            Err(error) => {
+                operation.finish(
+                    LogLevel::Error,
+                    &format!("node updated; verification sync failed: {error:#}"),
+                );
+                eprintln!(
+                    "node updated; verification sync failed: {error:#}. The new agent remains selected; retry Sync now."
+                );
+                return Ok(2);
+            }
+        }
+    }
     Ok(0)
 }
 
@@ -2615,6 +2697,23 @@ fn activate_deployed_agent(
     executable: &str,
     report: &RemoteProbeReport,
     cancelled: impl FnOnce() -> bool,
+) -> Result<u64> {
+    validate_deployed_agent_probe(host, report)?;
+    let updated = store.save_probe_if_current_checked(revision, host, executable, None, || {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "agent deployment cancelled before activation",
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(updated.config_revision())
+}
+
+fn validate_deployed_agent_probe(
+    host: &crate::remotes_config::RemoteHostConfig,
+    report: &RemoteProbeReport,
 ) -> Result<()> {
     let RemoteExportResponseBody::Probe(probe) = &report.response.result else {
         bail!(
@@ -2645,15 +2744,6 @@ fn activate_deployed_agent(
             format_remote_probe("deployment verification", host, report)
         );
     }
-    store.save_probe_if_current_checked(revision, host, executable, None, || {
-        if cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "agent deployment cancelled before activation",
-            ));
-        }
-        Ok(())
-    })?;
     Ok(())
 }
 
@@ -2863,7 +2953,7 @@ fn probe_configured_host(
                     crate::remote_protocol::RemoteFailure {
                         kind: crate::remote_protocol::RemoteFailureKind::VersionMismatch,
                         message: format!(
-                            "agent_version_mismatch: remote {}; local {}. Data protocol/revisions must match; use Settings [B] Deploy agent or remote deploy HOST. If the protocol matches, compare the configured model catalogs. {error}",
+                            "agent_version_mismatch: remote {}; local {}. Data protocol/revisions must match; use Settings [B] Update node or remote deploy HOST. If the protocol matches, compare the configured model catalogs. {error}",
                             info.summary(),
                             crate::remote_agent_manager::AgentInfo::local().summary()
                         ),
@@ -3830,6 +3920,18 @@ fn run_service(
     perf_log: Option<&Path>,
     trace_log: Option<&Path>,
 ) -> Result<i32> {
+    if let ServiceAction::Upgrade(output) = &args.action {
+        let report = crate::service::upgrade_registered_recorder()?;
+        write_stdout(&if matches!(output.format, FormatArg::Json) {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            format!(
+                "recorder upgrade: {} (build {}, enabled {})",
+                report.outcome, report.build_id, report.enabled
+            )
+        })?;
+        return Ok(0);
+    }
     let history_dir = default_history_root()
         .map(absolute_path)
         .ok_or_else(|| anyhow::anyhow!("a user state directory is unavailable"))?;
@@ -3846,8 +3948,9 @@ fn run_service(
     }
     let (status, output_format) = match args.action {
         ServiceAction::Install => (install_service(&options)?, None),
-        ServiceAction::Status(args) => (service_status(&options)?, Some(args)),
+        ServiceAction::Status(args) => (crate::service::registered_status(&options)?, Some(args)),
         ServiceAction::Uninstall => (uninstall_service(&options)?, None),
+        ServiceAction::Upgrade(_) => unreachable!("upgrade handled before default options"),
     };
     let output = match output_format {
         Some(args) if matches!(args.format, FormatArg::Json) => {
@@ -3898,6 +4001,16 @@ fn render_service_status_text(status: &crate::service::ServiceStatus) -> String 
         format!("recorder service: {}", status.state.label()),
         format!("platform: {}", status.platform),
     ];
+    if let Some(recorder) = &status.recorder {
+        lines.push(format!(
+            "recorder build: {} (pid {})",
+            recorder
+                .build_id
+                .as_deref()
+                .unwrap_or("unknown; service upgrade required"),
+            recorder.pid
+        ));
+    }
     if let Some(path) = status.registration_path.as_deref() {
         lines.push(format!("registration: {}", path.display()));
     }
@@ -4196,7 +4309,7 @@ fn remote_sync_health_error_category(category: RemoteSyncErrorCategory) -> &'sta
         RemoteSyncErrorCategory::ResourceLimit => "request validation",
         RemoteSyncErrorCategory::LocalState => "local state",
         RemoteSyncErrorCategory::Protocol => "protocol",
-        RemoteSyncErrorCategory::Compatibility => "agent version mismatch (Deploy agent)",
+        RemoteSyncErrorCategory::Compatibility => "agent version mismatch (Update node)",
         RemoteSyncErrorCategory::ProcessContainment => {
             "SSH process containment failed; automatic sync paused"
         }
@@ -4694,6 +4807,7 @@ fn run_recorder(
         history_runtime.legacy_history().namespace().to_string(),
         heartbeat_interval_seconds,
     );
+    recorder_status.service_definition_id = args.service_definition_id.clone();
     recorder_status
         .bind_source_aware_v2(active.epoch())
         .map_err(|error| anyhow::anyhow!("could not bind recorder ownership status: {error}"))?;
@@ -4712,6 +4826,9 @@ fn run_recorder(
     let mut local_state = RecorderLocalState::default();
 
     loop {
+        if crate::service::recorder_stop_requested(&status_file, &recorder_status)? {
+            recorder_stop.request_stop();
+        }
         if recorder_stop.is_stop_requested() {
             break;
         }
@@ -4760,7 +4877,11 @@ fn run_recorder(
         } else {
             next_local.min(next_account)
         };
-        if recorder_stop.wait_timeout(wake_at.saturating_duration_since(Instant::now())) {
+        if recorder_stop.wait_timeout(
+            wake_at
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1)),
+        ) {
             break;
         }
     }

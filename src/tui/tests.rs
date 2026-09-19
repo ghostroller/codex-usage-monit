@@ -2004,6 +2004,7 @@ fn remote_live_fixture(
         },
         revisions: crate::remote_agent::current_revisions(),
         redaction_profile: RedactionProfile::Redacted,
+        journal_generation: NonZeroU64::new(1),
         live_revision: NonZeroU64::new(1).unwrap(),
         snapshot: RemoteLiveSnapshot {
             captured_at,
@@ -14094,6 +14095,16 @@ fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
     }
     for (kind, message, hint) in [
         (
+            "agent_recorder_upgrade_failed",
+            "registration failed",
+            "Retry Update node to resume",
+        ),
+        (
+            "service_start_timeout",
+            "timed out waiting for heartbeat",
+            "Retry Update node to resume",
+        ),
+        (
             "agent_release_unavailable",
             "404",
             "matching official agent is not published",
@@ -16628,6 +16639,8 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
         "agent_version_mismatch"
     );
     for kind in [
+        "agent_recorder_upgrade_failed",
+        "service_start_timeout",
         "agent_release_unavailable",
         "agent_release_mismatch",
         "agent_release_download_failed",

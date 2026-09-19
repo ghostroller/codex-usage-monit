@@ -16,7 +16,7 @@ use crate::remote_protocol::{
 };
 use crate::source_identity::NodeId;
 
-const REMOTE_LIVE_FORMAT_VERSION: u32 = 1;
+const REMOTE_LIVE_FORMAT_VERSION: u32 = 2;
 const REMOTE_LIVE_FILE: &str = "remote-live.json";
 const REMOTE_LIVE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SOURCE_LOCK_FILE: &str = "source.lock";
@@ -33,6 +33,7 @@ pub struct SourceRemoteLiveSnapshot {
     pub source_generation: SourceGeneration,
     pub revisions: ProtocolRevisions,
     pub redaction_profile: RedactionProfile,
+    pub journal_generation: Option<NonZeroU64>,
     pub live_revision: NonZeroU64,
     pub snapshot: RemoteLiveSnapshot,
     pub project_descriptors: Vec<RemoteProjectDescriptor>,
@@ -51,6 +52,10 @@ struct StoredRemoteLiveSnapshot {
     source_generation: SourceGeneration,
     revisions: ProtocolRevisions,
     redaction_profile: RedactionProfile,
+    /// Absent in caches written before journal-scoped live revisions. Such
+    /// caches remain readable but cannot advertise a known live baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_generation: Option<NonZeroU64>,
     live_revision: NonZeroU64,
     snapshot: RemoteLiveSnapshot,
     project_descriptors: Vec<RemoteProjectDescriptor>,
@@ -68,7 +73,10 @@ impl StoredRemoteLiveSnapshot {
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
     ) -> io::Result<()> {
-        if self.format_version != REMOTE_LIVE_FORMAT_VERSION
+        let legacy = self.format_version == 1 && self.journal_generation.is_none();
+        let current =
+            self.format_version == REMOTE_LIVE_FORMAT_VERSION && self.journal_generation.is_some();
+        if !(legacy || current)
             || &self.profile_id != profile_id
             || &self.source_generation.node_id != source_id
             || self.redaction_profile != redaction_profile
@@ -102,6 +110,7 @@ impl StoredRemoteLiveSnapshot {
             source_generation: self.source_generation,
             revisions: self.revisions,
             redaction_profile: self.redaction_profile,
+            journal_generation: self.journal_generation,
             live_revision: self.live_revision,
             snapshot: self.snapshot,
             project_descriptors: self.project_descriptors,
@@ -124,6 +133,8 @@ impl SourceHistoryWriter<'_, '_, '_> {
         source_generation: &SourceGeneration,
         revisions: &ProtocolRevisions,
         redaction_profile: RedactionProfile,
+        journal_generation: NonZeroU64,
+        allow_journal_replacement: bool,
         live: &RemoteLiveState,
         project_descriptors: &[RemoteProjectDescriptor],
         remote_observed_at: DateTime<Utc>,
@@ -138,6 +149,8 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 source_generation,
                 revisions,
                 redaction_profile,
+                journal_generation,
+                allow_journal_replacement,
                 live,
                 project_descriptors,
                 remote_observed_at,
@@ -156,6 +169,7 @@ impl SourceHistoryStore {
         source_generation: &SourceGeneration,
         revisions: &ProtocolRevisions,
         redaction_profile: RedactionProfile,
+        journal_generation: Option<NonZeroU64>,
     ) -> io::Result<Option<NonZeroU64>> {
         Ok(self
             .load_remote_live_state(&source_generation.node_id)?
@@ -163,6 +177,8 @@ impl SourceHistoryStore {
                 state.source_generation == *source_generation
                     && state.revisions == *revisions
                     && state.redaction_profile == redaction_profile
+                    && journal_generation.is_some()
+                    && state.journal_generation == journal_generation
             })
             .map(|state| state.live_revision))
     }
@@ -224,6 +240,8 @@ impl SourceHistoryStore {
         source_generation: &SourceGeneration,
         revisions: &ProtocolRevisions,
         redaction_profile: RedactionProfile,
+        journal_generation: NonZeroU64,
+        allow_journal_replacement: bool,
         live: &RemoteLiveState,
         project_descriptors: &[RemoteProjectDescriptor],
         remote_observed_at: DateTime<Utc>,
@@ -255,8 +273,17 @@ impl SourceHistoryStore {
             read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?;
         if let Some(existing) = existing.as_ref() {
             existing.validate(&self.profile_id, source_id, redaction_profile)?;
+            if existing.journal_generation.is_some()
+                && existing.journal_generation != Some(journal_generation)
+                && !allow_journal_replacement
+            {
+                return Err(invalid_data(
+                    "remote live journal changed outside a cursorless bootstrap",
+                ));
+            }
             if (existing.source_generation != *source_generation
-                || existing.revisions != *revisions)
+                || existing.revisions != *revisions
+                || existing.journal_generation != Some(journal_generation))
                 && live.snapshot.is_none()
             {
                 return Err(io::Error::new(
@@ -267,7 +294,9 @@ impl SourceHistoryStore {
         }
 
         let existing = existing.as_ref().filter(|existing| {
-            existing.source_generation == *source_generation && existing.revisions == *revisions
+            existing.source_generation == *source_generation
+                && existing.revisions == *revisions
+                && existing.journal_generation == Some(journal_generation)
         });
         let (snapshot, descriptors) = match (&live.snapshot, existing) {
             (Some(snapshot), Some(existing)) if live.live_revision == existing.live_revision => {
@@ -309,6 +338,7 @@ impl SourceHistoryStore {
             source_generation: source_generation.clone(),
             revisions: revisions.clone(),
             redaction_profile,
+            journal_generation: Some(journal_generation),
             live_revision: live.live_revision,
             snapshot,
             project_descriptors: descriptors,
@@ -427,6 +457,128 @@ mod tests {
     }
 
     #[test]
+    fn journal_replacement_requires_bootstrap_and_preserves_same_journal_monotonicity() {
+        let (_directory, store, source) = fixture();
+        let revisions = crate::remote_agent::current_revisions();
+        let publish = |journal, revision, bootstrap, snapshot: bool| {
+            let mut live = full_live(revision, at(12, 0));
+            if !snapshot {
+                live.snapshot = None;
+            }
+            store.record_remote_live_state_unfenced(
+                &source,
+                &revisions,
+                RedactionProfile::Redacted,
+                NonZeroU64::new(journal).unwrap(),
+                bootstrap,
+                &live,
+                &[],
+                at(12, 0),
+                at(12, 1),
+                true,
+                &[],
+                &[],
+            )
+        };
+        publish(10, 2, true, true).unwrap();
+        assert!(
+            publish(10, 1, true, true)
+                .unwrap_err()
+                .to_string()
+                .contains("regressed")
+        );
+        assert!(publish(11, 1, false, true).is_err());
+        assert!(publish(11, 1, true, false).is_err());
+        assert_eq!(
+            store
+                .remote_live_revision_for_binding(
+                    &source,
+                    &revisions,
+                    RedactionProfile::Redacted,
+                    NonZeroU64::new(11)
+                )
+                .unwrap(),
+            None
+        );
+        publish(11, 1, true, true).unwrap();
+        publish(11, 1, true, true).unwrap(); // WAL replay after publication.
+        publish(11, 1, false, false).unwrap();
+        assert!(publish(10, 3, false, true).is_err());
+        assert_eq!(
+            store
+                .load_remote_live_state(&source.node_id)
+                .unwrap()
+                .unwrap()
+                .journal_generation,
+            NonZeroU64::new(11)
+        );
+    }
+
+    #[test]
+    fn pre_upgrade_live_cache_is_readable_but_requires_a_fresh_full_baseline() {
+        let (_directory, store, source) = fixture();
+        let revisions = crate::remote_agent::current_revisions();
+        store
+            .record_remote_live_state_unfenced(
+                &source,
+                &revisions,
+                RedactionProfile::Redacted,
+                NonZeroU64::new(10).unwrap(),
+                true,
+                &full_live(2, at(12, 0)),
+                &[],
+                at(12, 0),
+                at(12, 1),
+                true,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let path = store.remote_live_path(&source.node_id, RedactionProfile::Redacted);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("journalGeneration");
+        old["formatVersion"] = serde_json::json!(1);
+        std::fs::write(path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .load_remote_live_state(&source.node_id)
+                .unwrap()
+                .unwrap()
+                .live_revision
+                .get(),
+            2
+        );
+        assert_eq!(
+            store
+                .remote_live_revision_for_binding(
+                    &source,
+                    &revisions,
+                    RedactionProfile::Redacted,
+                    NonZeroU64::new(11)
+                )
+                .unwrap(),
+            None
+        );
+        store
+            .record_remote_live_state_unfenced(
+                &source,
+                &revisions,
+                RedactionProfile::Redacted,
+                NonZeroU64::new(11).unwrap(),
+                true,
+                &full_live(1, at(12, 2)),
+                &[],
+                at(12, 2),
+                at(12, 3),
+                true,
+                &[],
+                &[],
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn full_live_state_is_durable_and_revision_only_requires_the_exact_local_baseline() {
         let (_directory, store, source) = fixture();
         let revisions = crate::remote_agent::current_revisions();
@@ -436,6 +588,8 @@ mod tests {
                 &source,
                 &revisions,
                 RedactionProfile::Redacted,
+                NonZeroU64::new(10).unwrap(),
+                false,
                 &full_live(1, captured_at),
                 &[],
                 captured_at,
@@ -455,7 +609,12 @@ mod tests {
         assert!(loaded.range_complete);
         assert_eq!(
             store
-                .remote_live_revision_for_binding(&source, &revisions, RedactionProfile::Redacted,)
+                .remote_live_revision_for_binding(
+                    &source,
+                    &revisions,
+                    RedactionProfile::Redacted,
+                    NonZeroU64::new(10)
+                )
                 .unwrap(),
             Some(NonZeroU64::new(1).unwrap())
         );
@@ -469,6 +628,8 @@ mod tests {
                 &source,
                 &revisions,
                 RedactionProfile::Redacted,
+                NonZeroU64::new(10).unwrap(),
+                false,
                 &revision_only,
                 &[],
                 captured_at + Duration::minutes(1),
@@ -493,7 +654,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .remote_live_revision_for_binding(&source, &revisions, RedactionProfile::Redacted,)
+                .remote_live_revision_for_binding(
+                    &source,
+                    &revisions,
+                    RedactionProfile::Redacted,
+                    NonZeroU64::new(10)
+                )
                 .unwrap(),
             None
         );
@@ -502,6 +668,8 @@ mod tests {
                 &source,
                 &revisions,
                 RedactionProfile::Redacted,
+                NonZeroU64::new(10).unwrap(),
+                false,
                 &revision_only,
                 &[],
                 captured_at + Duration::minutes(2),
@@ -518,6 +686,8 @@ mod tests {
                 &source,
                 &revisions,
                 RedactionProfile::Redacted,
+                NonZeroU64::new(10).unwrap(),
+                false,
                 &full_live(1, captured_at),
                 &[],
                 captured_at + Duration::minutes(3),

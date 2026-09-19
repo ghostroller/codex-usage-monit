@@ -1308,10 +1308,19 @@ impl RemoteDeltaIngestSession<'_> {
     /// though the ordinary rolling range has advanced with wall-clock time.
     pub fn next_request_position(&self) -> io::Result<RemoteDeltaNextRequestPosition> {
         self.validate_fence()?;
+        let journal_generation = match &self.state.bootstrap {
+            Some(bootstrap) => bootstrap.cursor.map(|cursor| cursor.generation),
+            None => self
+                .state
+                .active
+                .as_ref()
+                .map(|active| active.cursor.generation),
+        };
         let known_live_revision = self.store.history_store.remote_live_revision_for_binding(
             &self.store.binding.source,
             &self.store.binding.revisions,
             self.store.binding.redaction_profile,
+            journal_generation,
         )?;
         if self.state.pending.is_some() {
             return Err(io::Error::new(
@@ -1874,6 +1883,26 @@ fn apply_remote_delta_records(
             )?;
         }
         RemoteDeltaApplyTarget::Staging(generation) => {
+            // A bootstrap from a retired binding must not publish live state
+            // after a different bootstrap has already become active.
+            let expected = session
+                .state
+                .bootstrap
+                .as_ref()
+                .and_then(|bootstrap| bootstrap.expected_active.as_ref())
+                .map(source_history_active_ref)
+                .transpose()?;
+            if session
+                .store
+                .history_store
+                .active_remote_history_ref(source_id, redaction_profile)?
+                != expected
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote bootstrap active history changed before page apply",
+                ));
+            }
             let generation = source_history_generation(generation)?;
             writer.ensure_remote_history_generation(
                 source_id,
@@ -1907,7 +1936,7 @@ fn apply_remote_live_state(
         .pending
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pending delta page"))?;
-    let (_, payload) = delta_response_page(&pending.response)?;
+    let (delta_page, payload) = delta_response_page(&pending.response)?;
     let Some(live) = payload.live.as_ref() else {
         if session.store.binding.range_policy.include_live() {
             return Err(invalid_data(
@@ -1916,6 +1945,19 @@ fn apply_remote_live_state(
         }
         return Ok(());
     };
+    if live.snapshot.is_none()
+        && session
+            .store
+            .history_store
+            .load_remote_live_state(&session.store.binding.source.node_id)?
+            .is_some_and(|cached| cached.journal_generation.is_none())
+    {
+        // A pre-upgrade revision-only WAL cannot prove which journal owns the
+        // retained live rows. Commit its historical records without refreshing
+        // that cache. next_request_position advertises no baseline, forcing a
+        // full replacement on the immediately following exchange.
+        return Ok(());
+    }
     let referenced = live
         .snapshot
         .iter()
@@ -1950,6 +1992,8 @@ fn apply_remote_live_state(
         &session.store.binding.source,
         &session.store.binding.revisions,
         session.store.binding.redaction_profile,
+        delta_page.generation,
+        matches!(&pending.request.request, RemoteExportRequestBody::Delta(delta) if delta.delta_cursor.is_none()),
         live,
         &live_descriptors,
         pending.response.observed_at,
@@ -3974,6 +4018,156 @@ mod tests {
                 exact_range: None,
                 known_live_revision: None,
             }
+        );
+    }
+
+    #[test]
+    fn upgrade_replays_saved_lower_live_revision_in_a_new_journal_without_deleting_history() {
+        let root = tempdir().unwrap();
+        let binding = live_binding_with(1, 1);
+        let ingest = store(root.path(), binding.clone());
+        let range = export_range(at(30, 3, 0), 60);
+        with_history_writer(
+            root.path(),
+            PROFILE,
+            binding.redaction_profile,
+            |history, writer| {
+                writer
+                    .save_source_metadata(
+                        &SourceMetadata::new(
+                            binding.source.node_id.clone(),
+                            SourceKind::Ssh,
+                            "remote",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let full = |revision| RemoteLiveState {
+                    live_revision: nonzero64(revision),
+                    snapshot: Some(RemoteLiveSnapshot {
+                        captured_at: at(30, 3, 59),
+                        tasks: vec![],
+                        turns: vec![],
+                    }),
+                };
+                writer
+                    .record_remote_live_state(
+                        &binding.source,
+                        &binding.revisions,
+                        binding.redaction_profile,
+                        nonzero64(7),
+                        true,
+                        &full(2),
+                        &[],
+                        at(30, 4, 0),
+                        at(30, 4, 0),
+                        true,
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+                let mut session = ingest.try_begin().unwrap();
+                session.start_bootstrap(writer).unwrap();
+                assert_eq!(
+                    session.next_request_position().unwrap().known_live_revision,
+                    None
+                );
+                // This request was persisted by the pre-fix center, which leaked
+                // the previous journal's known revision into cursorless bootstrap.
+                let mut old_request = request(&binding, None, range.clone());
+                let RemoteExportRequestBody::Delta(delta) = &mut old_request.request else {
+                    unreachable!()
+                };
+                delta.known_live_revision = Some(nonzero64(2));
+                let mut payload = payload_for(range.clone(), vec![], vec![]);
+                payload.live = Some(full(1));
+                let response = response(&binding, range, empty_page(9, 0), payload);
+                session
+                    .prepare_page(&old_request, &response, at(30, 4, 1))
+                    .unwrap();
+                drop(session);
+                let mut recovered = ingest.try_begin().unwrap();
+                let page = recovered.pending_page().unwrap().unwrap();
+                apply_remote_delta_records(&recovered, writer, &page, at(30, 4, 2)).unwrap();
+                apply_remote_live_state(&recovered, writer, &page).unwrap();
+                drop(recovered); // Crash after live publication, before cursor acknowledgement.
+                recovered = ingest.try_begin().unwrap();
+                let page = recovered.pending_page().unwrap().unwrap();
+                apply_and_commit_remote_delta_page(&mut recovered, writer, &page, at(30, 4, 3))
+                    .unwrap();
+                activate_remote_delta_bootstrap(&mut recovered, writer, at(30, 4, 3)).unwrap();
+                assert_eq!(
+                    recovered
+                        .next_request_position()
+                        .unwrap()
+                        .known_live_revision,
+                    Some(nonzero64(1))
+                );
+                assert!(recovered.pending_page().unwrap().is_none());
+                let live = history
+                    .load_remote_live_state(&binding.source.node_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(live.journal_generation, Some(nonzero64(9)));
+                assert_eq!(
+                    live.received_at,
+                    at(30, 4, 1),
+                    "replay must not make old data look newly received"
+                );
+                // The other pre-upgrade WAL shape is revision-only. Keep its
+                // old display cache stale and force a full next exchange.
+                let path = history
+                    .source_directory(&binding.source.node_id)
+                    .join(binding.redaction_profile.directory_name())
+                    .join("remote-live.json");
+                let mut cached: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                cached.as_object_mut().unwrap().remove("journalGeneration");
+                cached["formatVersion"] = serde_json::json!(1);
+                std::fs::write(path, serde_json::to_vec(&cached).unwrap()).unwrap();
+                let next_range = export_range(at(30, 3, 0), 60);
+                let mut old_request = request(
+                    &binding,
+                    Some(DeltaCursor {
+                        generation: nonzero64(9),
+                        sequence: 0,
+                    }),
+                    next_range.clone(),
+                );
+                let RemoteExportRequestBody::Delta(delta) = &mut old_request.request else {
+                    unreachable!()
+                };
+                delta.known_live_revision = Some(nonzero64(1));
+                let mut payload = payload_for(next_range.clone(), vec![], vec![]);
+                payload.live = Some(RemoteLiveState {
+                    live_revision: nonzero64(1),
+                    snapshot: None,
+                });
+                let next_response = self::response(&binding, next_range, empty_page(9, 0), payload);
+                recovered
+                    .prepare_page(&old_request, &next_response, at(30, 4, 2))
+                    .unwrap();
+                drop(recovered);
+                let mut recovered = ingest.try_begin().unwrap();
+                let page = recovered.pending_page().unwrap().unwrap();
+                apply_and_commit_remote_delta_page(&mut recovered, writer, &page, at(30, 4, 3))
+                    .unwrap();
+                assert_eq!(
+                    recovered
+                        .next_request_position()
+                        .unwrap()
+                        .known_live_revision,
+                    None
+                );
+                assert_eq!(
+                    history
+                        .load_remote_live_state(&binding.source.node_id)
+                        .unwrap()
+                        .unwrap()
+                        .received_at,
+                    at(30, 4, 1)
+                );
+            },
         );
     }
 

@@ -11451,7 +11451,12 @@ fn remote_ui_action_output(output: &Output) -> Result<RemoteUiActionOutcome, Str
         }
         Some(code) => {
             let detail = diagnostic(&output.stderr);
-            let hint = if detail.contains("agent_release_unavailable") {
+            let hint = if detail.contains("agent_recorder_upgrade")
+                || detail.contains("service_upgrade_")
+                || detail.contains("service_start_timeout")
+            {
+                " Remote recorder upgrade is incomplete. Retry Update node to resume; retained history and service configuration are preserved."
+            } else if detail.contains("agent_release_unavailable") {
                 " This center's matching official agent is not published. Use a matching published center build."
             } else if detail.contains("agent_release_mismatch") {
                 " Use a center build matching the official Release; trusted unpublished builds require the explicit deploy-dev CLI."
@@ -11545,6 +11550,11 @@ fn remote_ui_action_error_kind(error: &str) -> &'static str {
         return "agent_version_mismatch";
     }
     for kind in [
+        "service_start_timeout",
+        "service_upgrade_conflict",
+        "service_upgrade_unverifiable",
+        "agent_recorder_upgrade_failed",
+        "agent_recorder_upgrade_invalid",
         "agent_release_unavailable",
         "agent_release_mismatch",
         "agent_release_invalid",
@@ -13406,7 +13416,7 @@ fn render_remote_sources_settings(
             &mut x,
             manage_area,
             'B',
-            if compact { "" } else { "Deploy agent" },
+            if compact { "" } else { "Update node" },
             hitbox.remote_deploy_enabled && shortcuts_active,
             app.theme,
         );
@@ -17887,7 +17897,7 @@ fn remote_sync_error_label(error: Option<RemoteSyncErrorCategory>) -> &'static s
         Some(RemoteSyncErrorCategory::ResourceLimit) => "resource-limit",
         Some(RemoteSyncErrorCategory::LocalState) => "local-state",
         Some(RemoteSyncErrorCategory::Protocol) => "protocol",
-        Some(RemoteSyncErrorCategory::Compatibility) => "agent version mismatch (Deploy agent)",
+        Some(RemoteSyncErrorCategory::Compatibility) => "agent version mismatch (Update node)",
         Some(RemoteSyncErrorCategory::ProcessContainment) => "process-pause",
         Some(RemoteSyncErrorCategory::Transport) => "transport",
         Some(RemoteSyncErrorCategory::Remote) => "remote",

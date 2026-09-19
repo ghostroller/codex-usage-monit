@@ -27,6 +27,7 @@ use crate::history::HistoryStore;
 use crate::source_identity::validate_windows_private_file;
 
 mod recorder_coordination;
+mod upgrade;
 #[cfg(all(test, unix))]
 use recorder_coordination::RECORDER_INSTANCE_LOCK_FILE;
 use recorder_coordination::{
@@ -47,6 +48,9 @@ pub(crate) use recorder_coordination::{
 use recorder_coordination::{
     prepare_recorder_lock_state_root, recorder_windows_attributes_are_reparse,
 };
+pub(crate) use upgrade::recorder_stop_requested;
+pub use upgrade::registered_status;
+pub use upgrade::{ServiceUpgradeReport, upgrade_registered_recorder};
 
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
@@ -102,6 +106,8 @@ impl ServiceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorder: Option<RecorderStatusFile>,
     pub platform: String,
     pub state: ServiceState,
     pub installed: bool,
@@ -116,7 +122,8 @@ pub struct ServiceStatus {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceOptions {
     pub executable: PathBuf,
     pub codex_home: PathBuf,
@@ -139,6 +146,7 @@ pub struct ServiceOptions {
     pub redact_content: bool,
     pub no_rollout_cache: bool,
     #[cfg(test)]
+    #[serde(skip)]
     service_coordination_root_override: Option<PathBuf>,
 }
 
@@ -618,6 +626,8 @@ pub(crate) fn ensure_service_definition_is_trusted_at(
 
 pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
     validate_options(options)?;
+    let root = service_coordination_root_for_options(options)?;
+    let _upgrade_guard = upgrade::mutation_lock(&root)?;
     let platform = current_platform();
     if platform == Platform::Unsupported {
         bail!(
@@ -651,6 +661,7 @@ pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
         )?,
         Platform::Unsupported => unreachable!("unsupported platforms returned before installation"),
     }
+    upgrade::clear_journal(&root)?;
     status(options)
 }
 
@@ -680,6 +691,26 @@ fn replace_service_after_quiescence_with_start(
     quiesce: impl FnOnce() -> Result<ManagedServiceQuiescence>,
     install: impl FnOnce() -> Result<()>,
     fail_safe_cleanup: impl FnOnce() -> Result<()>,
+    publish_definition_trust: impl FnMut() -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    replace_service_checked(
+        options,
+        || Ok(()),
+        quiesce,
+        install,
+        fail_safe_cleanup,
+        publish_definition_trust,
+        start,
+    )
+}
+
+fn replace_service_checked(
+    options: &ServiceOptions,
+    preflight: impl FnOnce() -> Result<()>,
+    quiesce: impl FnOnce() -> Result<ManagedServiceQuiescence>,
+    install: impl FnOnce() -> Result<()>,
+    fail_safe_cleanup: impl FnOnce() -> Result<()>,
     mut publish_definition_trust: impl FnMut() -> Result<()>,
     start: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
@@ -697,6 +728,7 @@ fn replace_service_after_quiescence_with_start(
             "another service install/uninstall or history cutover already owns the current-user service registration scope"
         ),
     };
+    preflight()?;
     // Publish the non-expiring fence before touching the platform manager or
     // its definition. If this durable write fails, the old automatic-start
     // registration is left completely untouched. Registration and activation
@@ -948,6 +980,7 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
         Platform::Linux => systemd_status(options, heartbeat, heartbeat_recent),
         Platform::Windows => windows_task_status(options, heartbeat, heartbeat_recent),
         Platform::Unsupported => Ok(ServiceStatus {
+            recorder: None,
             platform: "unsupported".to_string(),
             state: ServiceState::Unknown,
             installed: false,
@@ -962,6 +995,8 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
         service_status.detail.push_str(&format!(
             "; recorder targets history namespace {namespace}, expected {expected_namespace}"
         ));
+    } else {
+        service_status.recorder = recorder.clone();
     }
     if let Some(error) = recorder.and_then(|status| status.last_error) {
         service_status
@@ -982,6 +1017,8 @@ fn expected_history_namespace(options: &ServiceOptions) -> String {
 }
 
 pub fn uninstall(options: &ServiceOptions) -> Result<ServiceStatus> {
+    let root = service_coordination_root_for_options(options)?;
+    let _upgrade_guard = upgrade::mutation_lock(&root)?;
     match current_platform() {
         Platform::MacOs => replace_service_after_quiescence(
             options,
@@ -1003,6 +1040,7 @@ pub fn uninstall(options: &ServiceOptions) -> Result<ServiceStatus> {
         )?,
         Platform::Unsupported => bail!("background service management is unsupported"),
     }
+    upgrade::clear_journal(&root)?;
     status(options)
 }
 
@@ -1184,7 +1222,10 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
                         &definition_id,
                         &expected_arguments,
                         expected_path.as_deref(),
-                    )?;
+                    )
+                    .or_else(|error| {
+                        upgrade::verify_disabled_launchd_is_unloaded().map_err(|_| error)
+                    })?;
                     Ok(ServiceDefinitionObservation::Fingerprint(
                         service_definition_fingerprint(&contents),
                     ))
@@ -1883,8 +1924,12 @@ fn install_launchd(options: &ServiceOptions) -> Result<()> {
 
 fn start_launchd() -> Result<()> {
     let target = format!("{}/{SERVICE_LABEL}", launchd_domain());
+    // bootstrap can already have started this newly verified definition via
+    // RunAtLoad/KeepAlive. Killing it here races its first collection and can
+    // make kickstart wait through termination/throttling instead of readiness.
+    // Old writers were quiesced before registration; only request a start.
     run_checked(
-        Command::new("launchctl").args(["kickstart", "-k", &target]),
+        Command::new("launchctl").args(["kickstart", &target]),
         "launchctl kickstart",
     )
 }
@@ -3519,6 +3564,7 @@ fn service_status(
         "no recorder registration found".to_string()
     };
     ServiceStatus {
+        recorder: None,
         platform: platform.to_string(),
         state,
         installed,
@@ -6145,6 +6191,7 @@ mod tests {
     fn service_status_has_a_stable_round_trip_json_shape() {
         let heartbeat = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
         let status = ServiceStatus {
+            recorder: None,
             platform: "linux-systemd-user".to_string(),
             state: ServiceState::NotInstalled,
             installed: false,
@@ -6199,6 +6246,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let status = ServiceStatus {
+            recorder: None,
             platform: "test".to_string(),
             state: ServiceState::Stopped,
             installed: true,

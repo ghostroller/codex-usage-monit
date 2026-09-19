@@ -16,7 +16,7 @@ rows:
 08|│[G]Automatic sync: Off                                                        │
 09|│No configured or retained remote sources                                      │
 10|│                                                                              │
-11|│[N]New  [E]Edit  [P]Pair  [D]Remove  [B]Deploy agent                          │
+11|│[N]New  [E]Edit  [P]Pair  [D]Remove  [B]Update node                           │
 12|│[H]Enable host  [C]Test  [S]Sync now  [I]Include data  [O]Quota: off          │
 13|│                                                                              │
 14|└──────────────────────────────────────────────────────────────────────────────┘
@@ -100,7 +100,7 @@ styles:
 10:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 10:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 11:000+001 fg=#4b525c bg=#121417 mods=none text="│"
-11:001+052 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove  [B]Deploy agent"
+11:001+051 fg=#7e8691 bg=#121417 mods=none text="[N]New  [E]Edit  [P]Pair  [D]Remove  [B]Update node"
 11:079+001 fg=#4b525c bg=#121417 mods=none text="│"
 12:000+001 fg=#4b525c bg=#121417 mods=none text="│"
 12:001+068 fg=#7e8691 bg=#121417 mods=none text="[H]Enable host  [C]Test  [S]Sync now  [I]Include data  [O]Quota: off"

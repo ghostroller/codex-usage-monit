@@ -41,7 +41,7 @@ codex-usage-monit remote deploy local-mac
 codex-usage-monit remote test local-mac
 ```
 
-In TUI **Settings**, select a configured host and press **[B] Deploy agent** (or
+In TUI **Settings**, select a configured host and press **[B] Update node** (or
 click the label). **[C] Test** displays the agent version/build when available and
 checks state, rollouts, source identity and data revisions. An unpaired host can
 be deployed; pairing and enabling automatic sync remain explicit operations.
@@ -67,23 +67,30 @@ not download or upload a local executable in this mode.
 
 The installed binary must return the expected build, target, protocol and full
 checksum, then pass the normal data probe with the existing source identity pin.
-Only then is `agentExecutable` switched in one configuration revision check.
-Failure, cancellation, source mismatch or concurrent configuration edits preserve
-the prior configuration and retained history. Previous managed builds remain
-available; rollback uses `remote edit HOST --agent-executable PREVIOUS_PATH` and
-`remote test HOST`. A failed run can leave an unused managed copy; interruption
-can leave a randomly named `.codex-usage-monit-release-*` staging directory in
-the SSH working directory. Normal cleanup removes only that run's two fixed-name
-staging files and its empty directory.
+The verified candidate next upgrades any existing application-managed recorder,
+preserving its registration options and enabled state. An absent recorder is not
+created; a disabled recorder is not started. Enabled recorders must publish a new,
+build-verified history heartbeat before the center switches `agentExecutable`
+with a configuration revision check. Paired, sync-enabled sources then perform a
+bounded real sync; incomplete verification returns exit 2 and keeps the new agent
+selected for retry. No old protocol fallback or manual cache deletion is needed.
 
-Deployment changes the exporter used by this center. It does not overwrite a
-package-manager/global installation, restart a recorder, or rotate the source
-identity. Upgrade a continuously running recorder separately when its collection
-behavior needs updating. A custom launcher that sets `CODEX_HOME` or state paths
+Preparation failures retain the previous service/configuration. A later failure
+can leave the remote service updated while center activation is pending; retry
+deploy to converge them. The private upgrade journal preserves service options
+through failed registration cleanup and interrupted SSH connections. Recovery
+proceeds forward, never blindly restarting an older writer after data migration.
+Previous managed builds remain on disk; an explicit old-path selection is not a
+guarantee that a downgrade can read the current state. See [remote update and
+recovery](remote-updates.md) for the complete sequence and failure semantics.
+
+Deployment preserves the source identity and global/package-manager executable;
+the upgraded recorder points at the new immutable managed build.
+A custom launcher that sets `CODEX_HOME` or state paths
 must have those same settings in the SSH login environment before using a managed
 agent; otherwise verification fails and leaves its configured launcher in place.
 
-`remote deploy` and TUI **[B] Deploy agent** ignore local bundles,
+`remote deploy` and TUI **[B] Update node** ignore local bundles,
 `CODEX_USAGE_MONIT_AGENT_DIR`, adjacent `agents` directories and the center's own
 executable. `remote deploy --bundle-dir ...` is rejected. A development build with
 unpublished edits must not silently install an older official binary, even when

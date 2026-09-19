@@ -40,6 +40,12 @@ pub struct RecorderStatusFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_namespace: Option<String>,
     pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_definition_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub last_attempt_at: DateTime<Utc>,
     pub last_history_heartbeat: Option<DateTime<Utc>>,
@@ -69,6 +75,9 @@ impl RecorderStatusFile {
             schema_version: STATUS_SCHEMA_VERSION,
             history_namespace: Some(history_namespace),
             pid: std::process::id(),
+            build_id: Some(env!("MONIT_BUILD_ID").to_string()),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            service_definition_id: None,
             started_at: now,
             last_attempt_at: now,
             last_history_heartbeat: None,

@@ -303,6 +303,47 @@ impl<'a> AgentConnection<'a> {
         self.output(&mut command, Duration::from_secs(45), MAX_INFO)
     }
 
+    /// The verified candidate owns service discovery, retained configuration,
+    /// replacement and crash recovery on its native platform.
+    pub fn upgrade_recorder(
+        &self,
+        installed: &str,
+    ) -> Result<crate::service::ServiceUpgradeReport> {
+        crate::remotes_config::validate_agent_executable(installed).map_err(anyhow::Error::msg)?;
+        let mut command = Command::new(self.environment.resolve_program()?);
+        command
+            .args(SSH_OPTIONS)
+            .arg("--")
+            .arg(self.host)
+            .arg(format!("{installed} service upgrade --format json"));
+        let output = self.output(&mut command, Duration::from_secs(180), MAX_INFO)?;
+        successful(&output, "agent_recorder_upgrade_failed")?;
+        let report: crate::service::ServiceUpgradeReport =
+            serde_json::from_slice(&output.stdout)
+                .context("agent_recorder_upgrade_invalid: invalid service readiness report")?;
+        ensure!(
+            report.build_id == AgentInfo::local().build_id
+                && matches!(
+                    report.outcome.as_str(),
+                    "ready" | "disabled" | "not_installed"
+                ),
+            "agent_recorder_upgrade_invalid: unexpected build or service outcome"
+        );
+        ensure!(
+            report.enabled == (report.outcome == "ready"),
+            "agent_recorder_upgrade_invalid: inconsistent enablement state"
+        );
+        if report.enabled {
+            ensure!(
+                report.outcome == "ready"
+                    && report.pid.is_some()
+                    && report.last_history_heartbeat.is_some(),
+                "agent_recorder_upgrade_invalid: enabled recorder has no verified heartbeat"
+            );
+        }
+        Ok(report)
+    }
+
     pub fn inspect(&self, executable: &str, sha256: bool) -> Result<Option<AgentInfo>> {
         crate::remotes_config::validate_agent_executable(executable).map_err(anyhow::Error::msg)?;
         let output = self.ssh(&format!(
@@ -688,6 +729,62 @@ mod tests {
             agent: info,
             size: bytes.len() as u64,
             sha256: checksum(bytes),
+        }
+    }
+
+    #[test]
+    fn recorder_upgrade_requires_matching_build_and_history_readiness() {
+        let environment = SshCommandEnvironment::default();
+        for case in [
+            "ready",
+            "disabled",
+            "not_installed",
+            "wrong_build",
+            "no_heartbeat",
+            "wrong_enabled",
+            "command_failed",
+        ] {
+            let mut report = crate::service::ServiceUpgradeReport {
+                outcome: "ready".into(),
+                build_id: AgentInfo::local().build_id,
+                enabled: true,
+                pid: Some(123),
+                last_history_heartbeat: Some(chrono::Utc::now()),
+                diagnostic: None,
+            };
+            match case {
+                "disabled" | "not_installed" => {
+                    report.outcome = case.into();
+                    report.enabled = false;
+                    report.pid = None;
+                    report.last_history_heartbeat = None;
+                }
+                "wrong_build" => report.build_id = "0".repeat(64),
+                "no_heartbeat" => report.last_history_heartbeat = None,
+                "wrong_enabled" => report.enabled = false,
+                _ => {}
+            }
+            let runner = |command: &Command| {
+                let arguments = command
+                    .get_args()
+                    .map(|v| v.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(arguments.contains("managed-agent service upgrade --format json"));
+                assert!(arguments.contains("StrictHostKeyChecking=yes"));
+                Ok(output(
+                    if case == "command_failed" { 1 } else { 0 },
+                    &serde_json::to_vec(&report).unwrap(),
+                    b"service upgrade diagnostic",
+                ))
+            };
+            let mut connection = AgentConnection::new("local-test", &environment).unwrap();
+            connection.runner = Some(&runner);
+            assert_eq!(
+                connection.upgrade_recorder("managed-agent").is_ok(),
+                matches!(case, "ready" | "disabled" | "not_installed"),
+                "{case}"
+            );
         }
     }
 

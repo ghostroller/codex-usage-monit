@@ -62,7 +62,7 @@ sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
 
-To upgrade, download the latest installer again and rerun it, then restart any running TUI. If the background recorder is installed, also run `codex-usage-monit service install` again after replacing the executable; this restarts the resident process on the new version. The application does not provide a self-update function.
+To upgrade, download the latest installer again and rerun it, then restart any running TUI. If the background recorder is installed, run the new executable’s `service upgrade` command; it preserves the registered options and enabled state and verifies the new recorder heartbeat. On Windows, place the new executable at a new versioned path before upgrading the service instead of overwriting a running executable. The application does not provide a self-update function.
 
 On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, rename it if desired, and place it in a directory on `PATH`:
 
@@ -152,7 +152,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `trends` | Print the TUI's quota and local-usage trend series. |
 | `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
-| `service` | Install, inspect, or remove the optional per-user recorder. |
+| `service` | Install, upgrade, inspect, or remove the optional per-user recorder. |
 | `remote` | Configure, inspect, deploy agents, test, and synchronize explicitly allowlisted SSH machines. Available in v0.4. |
 | `debug-startup` | Profile both the TUI's placeholder first frame and its initial data-ready work without entering interactive mode. |
 
@@ -230,10 +230,10 @@ codex-usage-monit --redact-content record
 Remote previews are redacted by default; the center's TUI, reports and recorder must use the same policy, hence `--redact-content` above. Opening the TUI alone does not start automatic SSH collection. For prerequisites, background setup, preview opt-in, source selection and troubleshooting, follow the [SSH usage guide](docs/remote-usage.md).
 
 Use `remote inspect HOST` to compare versions, source build IDs and data protocols.
-Settings → **B Deploy agent** or `remote deploy HOST` makes the SSH host download
+Settings → **B Update node** or `remote deploy HOST` makes the SSH host download
 its matching official GitHub Release, then verifies and installs an isolated
 agent before switching that host's configuration. It preserves
-the existing source pin and recorder installation. During rapid iteration we
+the existing source pin. It also updates an existing recorder, preserving its options and enabled state; see [remote update recovery](docs/remote-updates.md). During rapid iteration we
 **do not support older data protocols or downgrade negotiation**: deploy a matching
 build instead. Unpublished cross-platform development builds require a matching
 agent bundle through the explicit development-only `remote deploy-dev HOST

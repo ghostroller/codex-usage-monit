@@ -212,6 +212,7 @@ mod tests {
         let mut recorder = RecorderStatusFile::started(now, "history-namespace".to_string());
         recorder.record_degraded(now, "recorder error");
         let service = ServiceStatus {
+            recorder: None,
             platform: "linux-systemd-user".to_string(),
             state: ServiceState::Stopped,
             installed: true,
@@ -269,6 +270,8 @@ mod tests {
                         "schemaVersion": 3,
                         "historyNamespace": "history-namespace",
                         "pid": recorder.pid,
+                        "buildId": env!("MONIT_BUILD_ID"),
+                        "version": env!("CARGO_PKG_VERSION"),
                         "startedAt": "2026-08-30T12:00:00Z",
                         "lastAttemptAt": "2026-08-30T12:00:00Z",
                         "lastHistoryHeartbeat": "2026-08-30T12:00:00Z",

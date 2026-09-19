@@ -939,6 +939,7 @@ mod tests {
                 error: None,
             },
             service: Some(ServiceStatus {
+                recorder: None,
                 platform: "linux-systemd-user".to_string(),
                 state: ServiceState::Running,
                 installed: true,
