@@ -2,10 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## [0.5.0] - 2026-09-19
+
+### Added
+
+- Synchronize quota-remaining observations from explicitly configured sources and merge opted-in same-account histories without summing quota percentages across devices. Preserve observation times, reset-window boundaries and data-quality differences.
+- Inspect remote agent version, source build ID, target and protocol before synchronization. Settings **[B] Update node** and `remote deploy HOST` fetch the matching official GitHub Release directly on the SSH host; published assets now include machine-generated agent manifests.
+- Replace an existing remote recorder together with its agent, preserving collection options, paths, environment and enabled state. Durable upgrade journals support forward recovery; matching process/build/definition IDs and successful history heartbeats establish readiness before configuration activation and verification sync.
+- Add an explicit development-only `remote deploy-dev` entry point, structured lifecycle/diagnostic/operation logs, and a PowerShell development TUI launcher with separate application, trace and performance logs.
 
 ### Fixed
 
+- Preserve Windows private-state ACL boundaries without rejecting normal SSH configuration discovery, and harden Windows SSH invocation, temporary-state handling and diagnostics.
+- Keep multiple remote sources visible in compact TUI layouts and distinguish operational status, persistent diagnostics and telemetry in logs.
+- Bind remote live revisions to the exporter journal generation. Automatically recover legacy live caches and interrupted synchronization pages after updates, retain original receive timestamps and prevent stale bootstraps from overwriting newer active history.
+- Avoid terminating a newly registered launchd recorder during activation, and distinguish a successful node update from incomplete verification sync so transient local locks or bandwidth limits do not roll back a working service.
 - Read source-owned `token_usage_record` request evidence, deduplicate response identities across rollout copies, and suppress legacy counter mirrors only when coverage is proven. Subagent counters without a trustworthy baseline no longer attribute inherited cumulative usage.
 - Preserve total-only usage explicitly as `unclassifiedTokens` when it is mixed with known input/output breakdowns. Invalid local session digests no longer discard healthy sessions or authorize deletion of their previous evidence.
 - Resolve copied rollout filenames through session metadata without making unrelated canonical filenames exhaust the bounded owner probe budget.
@@ -13,7 +24,9 @@ All notable changes to this project are documented in this file.
 
 ### Compatibility
 
-- Remote protocol is now v4, history metric revision is 5, and rollout parser cache revision is 14. Upgrade both SSH endpoints together. For pre-release incompatible derived state, back it up and regenerate from retained source logs rather than migrating old aggregates; preserve source identities, configuration and account quota observations. See [rebuild guidance](docs/remote-usage.md#rebuilding-incompatible-derived-data).
+- Remote protocol is now v5, history metric revision is 5, and rollout parser cache revision is 14. Upgrade both SSH endpoints together. During rapid development, older wire protocols are not translated or negotiated; managed deployment requires the matching source build ID, not only a matching version string.
+- Local persisted-state recovery is separate from wire compatibility: live caches and interrupted pages recover automatically across exporter journal changes. Preserve source identities, configuration and account quota observations; follow [rebuild guidance](docs/remote-usage.md#rebuilding-incompatible-derived-data) only for incompatible pre-release derived aggregates. See the [node update and recorder recovery procedure](docs/remote-updates.md).
+- A node update preserves disabled services and does not create a recorder when none is registered. Local bundle upload is explicitly development-only; normal updates never fall back from official Release downloads to arbitrary local executables. Restart already-running TUIs after upgrading.
 
 ## [0.4.0] - 2026-09-08
 
