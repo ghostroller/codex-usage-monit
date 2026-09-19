@@ -183,6 +183,11 @@ mod tests {
     #[test]
     fn quota_history_buffers_long_offline_reconnection_during_retention_confirmation() {
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let store =
             SourceHistoryStore::new(root.path().to_owned(), "0123456789abcdef".parse().unwrap());
         let source: NodeId = "node-11111111111111111111111111111111".parse().unwrap();

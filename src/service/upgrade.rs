@@ -760,6 +760,13 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, UpgradeJournal) {
         let temp = tempfile::tempdir().unwrap();
+        // tempfile inherits the process umask; an existing state root must
+        // explicitly satisfy the same private-directory contract as production.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         recorder_coordination::prepare_recorder_lock_state_root(temp.path()).unwrap();
         let mut options = ServiceOptions::new(
             temp.path().join("版本 old/app.exe"),
