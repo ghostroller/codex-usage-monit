@@ -8,6 +8,8 @@ fn main() {
         PathBuf::from("Cargo.toml"),
         PathBuf::from("Cargo.lock"),
         PathBuf::from("build.rs"),
+        PathBuf::from("src/remote_agent_manager/release_bootstrap.py"),
+        PathBuf::from("src/remote_agent_manager/release_bootstrap.ps1"),
     ];
     let mut directories = vec![PathBuf::from("src")];
     while let Some(directory) = directories.pop() {

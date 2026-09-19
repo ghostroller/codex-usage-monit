@@ -413,8 +413,10 @@ enum RemoteAction {
     Test(RemoteHostArgs),
     /// Inspect agent build/platform/protocol without exchanging usage data.
     Inspect(RemoteHostArgs),
-    /// Deploy and verify a matching agent, then atomically switch this host.
-    Deploy(RemoteDeployArgs),
+    /// Have this host download its matching official GitHub Release and switch after verification.
+    Deploy(RemoteHostArgs),
+    /// Development only: upload a locally trusted bundle and switch after verification.
+    DeployDev(RemoteDeployArgs),
     /// Synchronize exactly one paired host without changing automatic-sync settings.
     Sync(RemoteSyncArgs),
     /// Opt one already paired host into future automatic scheduling.
@@ -430,9 +432,9 @@ enum RemoteAction {
 #[derive(Clone, Debug, Args)]
 struct RemoteDeployArgs {
     id: String,
-    /// Directory containing package-agent.py manifests and binaries.
+    /// Explicitly trusted development bundle; this is not publisher authentication.
     #[arg(long, value_name = "DIR")]
-    bundle_dir: Option<PathBuf>,
+    bundle_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1212,6 +1214,7 @@ fn run_remote(
             | RemoteAction::Sync(_)
             | RemoteAction::Inspect(_)
             | RemoteAction::Deploy(_)
+            | RemoteAction::DeployDev(_)
     );
     if opens_ssh && !inherit_remote_process_tree {
         ensure_current_process_remote_containment().map_err(|error| {
@@ -1254,52 +1257,24 @@ fn run_remote(
             ensure_remote_probe_target_current(&store, config.config_revision(), host)?;
             Ok(0)
         }
-        RemoteAction::Deploy(args) => {
-            let config = store.load_or_create()?;
-            ensure_expected_remote_config_revision(&config, expected_revision, "agent deploy")?;
-            let host = config
-                .host(&args.id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("remote host {:?} is not configured", args.id))?;
-            let environment = remote_ssh_environment(
-                collect_config,
-                inherit_remote_process_tree,
-                cancellation.as_ref(),
-            );
-            let connection =
-                crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)?;
-            let executable =
-                connection.deploy(host.agent_executable(), args.bundle_dir.as_deref())?;
-            let report = probe_remote_with_agent_executable_and_environment(
-                host.ssh_host(),
-                &executable,
-                &RemoteProbeOptions {
-                    expected_source: host.expected_source().cloned(),
-                    redaction_profile: if host.redact_content() {
-                        crate::source_history::RedactionProfile::Redacted
-                    } else {
-                        crate::source_history::RedactionProfile::PreviewEnabled
-                    },
-                    ..RemoteProbeOptions::default()
-                },
-                &environment,
-            )?;
-            activate_deployed_agent(
-                &store,
-                config.config_revision(),
-                &host,
-                &executable,
-                &report,
-                || environment.cancellation_requested(),
-            )?;
-            write_stdout(&format!(
-                "Matching agent deployed and verified for {}: {}. Previous agent: {}. Source pin and recorder installation preserved.\n",
-                host.id(),
-                executable,
-                host.agent_executable()
-            ))?;
-            Ok(0)
-        }
+        RemoteAction::Deploy(args) => run_remote_deploy(
+            collect_config,
+            &store,
+            &args.id,
+            None,
+            expected_revision,
+            inherit_remote_process_tree,
+            cancellation.as_ref(),
+        ),
+        RemoteAction::DeployDev(args) => run_remote_deploy(
+            collect_config,
+            &store,
+            &args.id,
+            Some(&args.bundle_dir),
+            expected_revision,
+            inherit_remote_process_tree,
+            cancellation.as_ref(),
+        ),
         RemoteAction::Config(args) => {
             let mut transaction = store.begin_transaction()?;
             ensure_expected_remote_config_revision(
@@ -2567,6 +2542,70 @@ fn remote_state_root(history_dir: Option<&Path>) -> Result<PathBuf> {
             history_root.display()
         )
     })
+}
+
+fn run_remote_deploy(
+    collect_config: &CollectConfig,
+    store: &RemotesConfigStore,
+    host_id: &str,
+    development_bundle: Option<&Path>,
+    expected_revision: Option<u64>,
+    inherit_remote_process_tree: bool,
+    cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<i32> {
+    let config = store.load_or_create()?;
+    ensure_expected_remote_config_revision(&config, expected_revision, "agent deploy")?;
+    let host = config
+        .host(host_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("remote host {host_id:?} is not configured"))?;
+    let environment =
+        remote_ssh_environment(collect_config, inherit_remote_process_tree, cancellation);
+    let connection =
+        crate::remote_agent_manager::AgentConnection::new(host.ssh_host(), &environment)?;
+    let (executable, origin) = if let Some(bundle) = development_bundle {
+        eprintln!(
+            "warning: development deployment executes a locally supplied build on the remote host; build IDs and checksums do not authenticate its publisher"
+        );
+        (
+            connection.deploy_dev(host.agent_executable(), bundle)?,
+            "Development bundle",
+        )
+    } else {
+        (
+            connection.deploy(host.agent_executable())?,
+            "Official GitHub Release",
+        )
+    };
+    let report = probe_remote_with_agent_executable_and_environment(
+        host.ssh_host(),
+        &executable,
+        &RemoteProbeOptions {
+            expected_source: host.expected_source().cloned(),
+            redaction_profile: if host.redact_content() {
+                crate::source_history::RedactionProfile::Redacted
+            } else {
+                crate::source_history::RedactionProfile::PreviewEnabled
+            },
+            ..RemoteProbeOptions::default()
+        },
+        &environment,
+    )?;
+    activate_deployed_agent(
+        store,
+        config.config_revision(),
+        &host,
+        &executable,
+        &report,
+        || environment.cancellation_requested(),
+    )?;
+    write_stdout(&format!(
+        "{origin} agent deployed and verified for {}: {}. Previous agent: {}. Source pin and recorder installation preserved.\n",
+        host.id(),
+        executable,
+        host.agent_executable()
+    ))?;
+    Ok(0)
 }
 
 fn activate_deployed_agent(
@@ -5343,6 +5382,7 @@ fn command_uses_model_catalog(command: Option<&Command>) -> bool {
                 | RemoteAction::Test(_)
                 | RemoteAction::Sync(_)
                 | RemoteAction::Deploy(_)
+                | RemoteAction::DeployDev(_)
         ),
         Some(Command::RemoteAgent(args)) => {
             matches!(&args.action, RemoteAgentAction::Export)
@@ -6679,6 +6719,48 @@ mod tests {
     fn clap_help_is_successful() {
         let error = Cli::try_parse_from(["codex-usage-monit", "--help"]).unwrap_err();
         assert!(!error.use_stderr());
+    }
+
+    #[test]
+    fn official_agent_deploy_cannot_select_local_artifacts_and_dev_requires_a_bundle() {
+        let cli = Cli::try_parse_from(["monit", "remote", "deploy", "test-host"]).unwrap();
+        assert!(command_uses_model_catalog(cli.command.as_ref()));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote(RemoteArgs {
+                action: RemoteAction::Deploy(_),
+                ..
+            }))
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "monit",
+                "remote",
+                "deploy",
+                "test-host",
+                "--bundle-dir",
+                "bundle"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["monit", "remote", "deploy-dev", "test-host"]).is_err());
+        let cli = Cli::try_parse_from([
+            "monit",
+            "remote",
+            "deploy-dev",
+            "test-host",
+            "--bundle-dir",
+            "bundle",
+        ])
+        .unwrap();
+        assert!(command_uses_model_catalog(cli.command.as_ref()));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote(RemoteArgs {
+                action: RemoteAction::DeployDev(_),
+                ..
+            }))
+        ));
     }
 
     #[test]

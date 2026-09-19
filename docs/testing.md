@@ -67,6 +67,17 @@ unchanged and run checks affected by subsequent edits. Before the final hosted
 checkpoint, reconcile the evidence with the committed source. Never turn a
 focused pass into a claim of a new full-platform pass.
 
+For agent deployment changes, run `python -B -m unittest discover -s tests -p
+test_remote_release_bootstrap.py -v` locally. On Windows this exercises both
+PowerShell 5.1 and 7 as well as the platform-independent Python preparation
+contracts; both shells must be installed. Rust `remote_agent_manager` tests cover
+the actual Windows stdin bootstrap invocation, SSH-only Release selection, the
+explicit development upload, and install verification. Fixture success proves
+the control flow, not availability of a published Release. Record an authorized
+live SSH attempt separately, including missing-release diagnostics and whether
+the prior configuration was preserved. Do not create a tag or publish assets just
+to turn an unavailable-release test into a successful installation.
+
 After a hosted failure, read its exact job/step log and classify it before
 requesting more compute:
 

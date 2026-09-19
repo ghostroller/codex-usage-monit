@@ -11451,7 +11451,15 @@ fn remote_ui_action_output(output: &Output) -> Result<RemoteUiActionOutcome, Str
         }
         Some(code) => {
             let detail = diagnostic(&output.stderr);
-            let hint = if detail.contains("command not found")
+            let hint = if detail.contains("agent_release_unavailable") {
+                " This center's matching official agent is not published. Use a matching published center build."
+            } else if detail.contains("agent_release_mismatch") {
+                " Use a center build matching the official Release; trusted unpublished builds require the explicit deploy-dev CLI."
+            } else if detail.contains("agent_release_download_failed") {
+                " Check HTTPS access to GitHub, curl and TLS on the remote host."
+            } else if detail.contains("agent_release_invalid") {
+                " Check the published agent manifest and assets. The configured agent was not changed."
+            } else if detail.contains("command not found")
                 || detail.contains("No such file or directory")
                 || detail.contains("not found in SSH PATH")
             {
@@ -11537,9 +11545,14 @@ fn remote_ui_action_error_kind(error: &str) -> &'static str {
         return "agent_version_mismatch";
     }
     for kind in [
+        "agent_release_unavailable",
+        "agent_release_mismatch",
+        "agent_release_invalid",
+        "agent_release_download_failed",
         "agent_artifact_missing",
         "agent_artifact_mismatch",
         "agent_checksum_mismatch",
+        "agent_release_prepare_failed",
         "agent_verification_failed",
         "agent_readiness_failed",
         "agent_download_failed",

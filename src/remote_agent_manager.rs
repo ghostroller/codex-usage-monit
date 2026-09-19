@@ -9,7 +9,7 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -187,7 +187,8 @@ fn managed_executable(info: &AgentInfo, digest: &str) -> String {
     }
 }
 
-/// Runs only from an explicitly uploaded candidate. Publication never replaces
+/// Runs only after official download or explicit development upload verification.
+/// Publication never replaces
 /// a different build or the user's global binary/recorder installation.
 pub(crate) fn install_self(expected_sha256: &str) -> Result<String> {
     ensure!(
@@ -197,7 +198,7 @@ pub(crate) fn install_self(expected_sha256: &str) -> Result<String> {
     let bytes = read_binary(&env::current_exe()?)?;
     ensure!(
         checksum(&bytes) == expected_sha256,
-        "agent_checksum_mismatch: uploaded executable changed"
+        "agent_checksum_mismatch: candidate executable changed"
     );
     install_bytes(&env::current_dir()?, &AgentInfo::local(), &bytes)
 }
@@ -259,6 +260,16 @@ impl<'a> AgentConnection<'a> {
     }
 
     fn output(&self, command: &mut Command, timeout: Duration, limit: usize) -> Result<Output> {
+        self.output_with_stdin(command, timeout, limit, Stdio::null())
+    }
+
+    fn output_with_stdin(
+        &self,
+        command: &mut Command,
+        timeout: Duration,
+        limit: usize,
+        stdin: Stdio,
+    ) -> Result<Output> {
         let remaining = self
             .deadline
             .saturating_duration_since(Instant::now())
@@ -272,9 +283,13 @@ impl<'a> AgentConnection<'a> {
         if let Some(runner) = self.runner {
             return runner(command);
         }
-        crate::bounded_process::output_cancellable(command, remaining, limit, || {
-            self.environment.cancellation_requested()
-        })
+        crate::bounded_process::output_cancellable_with_stdin(
+            command,
+            remaining,
+            limit,
+            stdin,
+            || self.environment.cancellation_requested(),
+        )
         .context("agent_command_failed")
     }
 
@@ -346,15 +361,77 @@ impl<'a> AgentConnection<'a> {
         Ok("x86_64-pc-windows-msvc".into())
     }
 
-    /// Returns an installed, checksum-verified path. The caller must run the
-    /// data readiness/source-pin probe and CAS its configuration separately.
-    pub fn deploy(&self, executable: &str, bundle: Option<&Path>) -> Result<String> {
+    /// Official mode downloads directly on the SSH host. No local artifact,
+    /// environment override, current-executable copy or upload fallback exists.
+    pub fn deploy(&self, executable: &str) -> Result<String> {
+        let target = self.target(executable)?;
+        let mut required = AgentInfo::local();
+        required.target = target;
+        let stage = format!(".codex-usage-monit-release-{}", nonce()?);
+        let windows = required.target.contains("windows");
+        let candidate = if windows {
+            format!(".\\{stage}\\agent.exe")
+        } else {
+            format!("./{stage}/agent")
+        };
+        let result = (|| {
+            let local = LocalStaging::new()?;
+            let input_path = local.0.join("bootstrap");
+            LAYOUT.write_atomically(&input_path, release_script(&required, &stage)?.as_bytes())?;
+            let mut command = Command::new(self.environment.resolve_program()?);
+            command
+                .args(SSH_OPTIONS)
+                .arg("--")
+                .arg(self.host)
+                .arg(if windows {
+                    powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))")
+                } else {
+                    "python3 -".into()
+                });
+            let output = self.output_with_stdin(
+                &mut command,
+                TIMEOUT,
+                MAX_INFO,
+                Stdio::from(fs::File::open(input_path)?),
+            )?;
+            successful(&output, "agent_release_prepare_failed")?;
+            let manifest: AgentManifest = serde_json::from_slice(&output.stdout)
+                .context("agent_release_invalid: remote bootstrap returned invalid metadata")?;
+            validate_manifest(&manifest, &required.target)?;
+            if !output.stderr.is_empty() {
+                eprintln!("warning: {}", safe_diagnostic(&output.stderr));
+            }
+            self.install_candidate(&candidate, &required, &manifest.sha256)
+        })();
+        let cleanup = if windows {
+            powershell(&format!(
+                "$ErrorActionPreference='Stop'; if (Test-Path -LiteralPath './{stage}') {{ foreach ($n in @('agent.exe','manifest.json')) {{ $p=Join-Path './{stage}' $n; if (Test-Path -LiteralPath $p) {{ Remove-Item -LiteralPath $p -Force }} }}; [IO.Directory]::Delete((Join-Path (Get-Location).Path '{stage}'),$false) }}"
+            ))
+        } else {
+            format!(
+                "if [ -d ./{stage} ]; then rm -f ./{stage}/agent ./{stage}/manifest.json && rmdir ./{stage}; fi"
+            )
+        };
+        if self
+            .ssh(&cleanup)
+            .and_then(|output| successful(&output, "agent_release_cleanup_failed"))
+            .is_err()
+        {
+            eprintln!(
+                "warning: agent_release_cleanup_failed: staging directory {stage} may remain on the remote host"
+            );
+        }
+        result
+    }
+
+    /// Explicit development-only upload. The operator trusts the supplied
+    /// local build; matching metadata/checksums are not publisher authentication.
+    pub fn deploy_dev(&self, executable: &str, bundle: &Path) -> Result<String> {
         let target = self.target(executable)?;
         let staging = LocalStaging::new()?;
         let (path, digest) = self.artifact(&target, bundle, &staging.0)?;
         let mut required = AgentInfo::local();
         required.target = target.clone();
-        let installed = managed_executable(&required, &digest);
         let upload = format!(
             ".codex-usage-monit-upload-{}{}",
             nonce()?,
@@ -387,15 +464,7 @@ impl<'a> AgentConnection<'a> {
             } else {
                 format!("./{upload}")
             };
-            let output = self.ssh(&format!(
-                "{candidate} remote-agent install --sha256 {digest}"
-            ))?;
-            successful(&output, "agent_install_failed")?;
-            let actual = self
-                .inspect(&installed, true)?
-                .context("agent_verification_failed: installed agent has no bootstrap metadata")?;
-            verify_match(&actual, &required, &digest)?;
-            Ok(installed)
+            self.install_candidate(&candidate, &required, &digest)
         })();
         // Remove only this operation's unpredictable staging file. A failed
         // cleanup must not hide the primary error; no recursive deletion.
@@ -418,45 +487,30 @@ impl<'a> AgentConnection<'a> {
         result
     }
 
+    fn install_candidate(
+        &self,
+        candidate: &str,
+        required: &AgentInfo,
+        digest: &str,
+    ) -> Result<String> {
+        let output = self.ssh(&format!(
+            "{candidate} remote-agent install --sha256 {digest}"
+        ))?;
+        successful(&output, "agent_install_failed")?;
+        let installed = managed_executable(required, digest);
+        let actual = self
+            .inspect(&installed, true)?
+            .context("agent_verification_failed: installed agent has no bootstrap metadata")?;
+        verify_match(&actual, required, digest)?;
+        Ok(installed)
+    }
+
     fn artifact(
         &self,
         target: &str,
-        bundle: Option<&Path>,
+        directory: &Path,
         staging: &Path,
     ) -> Result<(PathBuf, String)> {
-        let configured = bundle
-            .map(Path::to_path_buf)
-            .or_else(|| env::var_os("CODEX_USAGE_MONIT_AGENT_DIR").map(PathBuf::from));
-        if configured.is_none() && target == env!("MONIT_BUILD_TARGET") {
-            let bytes = read_binary(&env::current_exe()?)?;
-            let path = staging.join(artifact_name(target));
-            LAYOUT.write_atomically(&path, &bytes)?;
-            return Ok((path, checksum(&bytes)));
-        }
-        let adjacent = env::current_exe()?
-            .parent()
-            .context("executable directory missing")?
-            .join("agents");
-        let directory = if let Some(directory) = configured {
-            directory
-        } else if adjacent.join(manifest_name(target)).exists() {
-            adjacent
-        } else {
-            let base = format!(
-                "https://github.com/ghostroller/codex-usage-monit/releases/download/v{}/",
-                env!("CARGO_PKG_VERSION")
-            );
-            self.download(&format!("{base}{}", manifest_name(target)), &staging.join(manifest_name(target)), MAX_INFO as u64)
-                .with_context(|| format!("agent_artifact_missing: no matching {target} agent for build {}. For an unpublished development build, package that same source on the target platform with scripts/package-agent.py and set CODEX_USAGE_MONIT_AGENT_DIR; no older release fallback is allowed", env!("MONIT_BUILD_ID")))?;
-            let manifest = read_manifest(&staging.join(manifest_name(target)))?;
-            validate_manifest(&manifest, target)?;
-            self.download(
-                &format!("{base}{}", artifact_name(target)),
-                &staging.join(artifact_name(target)),
-                MAX_BINARY,
-            )?;
-            staging.to_path_buf()
-        };
         let manifest = read_manifest(&directory.join(manifest_name(target)))?;
         validate_manifest(&manifest, target)?;
         let bytes = read_binary(&directory.join(&manifest.file))?;
@@ -468,33 +522,21 @@ impl<'a> AgentConnection<'a> {
         LAYOUT.write_atomically(&path, &bytes)?;
         Ok((path, manifest.sha256))
     }
+}
 
-    fn download(&self, url: &str, path: &Path, maximum: u64) -> Result<()> {
-        let mut command = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
-        command
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--connect-timeout",
-                "10",
-                "--max-time",
-                "120",
-                "--max-filesize",
-            ])
-            .arg(maximum.to_string())
-            .arg("--output")
-            .arg(path)
-            .arg(url);
-        successful(
-            &self.output(&mut command, Duration::from_secs(125), MAX_INFO)?,
-            "agent_download_failed",
-        )
+fn release_script(required: &AgentInfo, stage: &str) -> Result<String> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(required)?);
+    if required.target.contains("windows") {
+        Ok(format!(
+            "{}\ntry {{ $e=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')) | ConvertFrom-Json; Invoke-ReleasePreparation $e '{stage}' | ConvertTo-Json -Depth 8 -Compress; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n",
+            include_str!("remote_agent_manager/release_bootstrap.ps1")
+        ))
+    } else {
+        Ok(format!(
+            "{}\nimport base64, sys\ntry:\n    print(json.dumps(prepare_release(json.loads(base64.b64decode('{encoded}')), '{stage}')))\nexcept Exception as error:\n    print(str(error), file=sys.stderr)\n    sys.exit(1)\n",
+            include_str!("remote_agent_manager/release_bootstrap.py")
+        ))
     }
 }
 
@@ -819,7 +861,7 @@ mod tests {
             };
             let mut connection = AgentConnection::new("test-host", &environment).unwrap();
             connection.runner = Some(&runner);
-            let result = connection.deploy("old-agent", Some(directory.path()));
+            let result = connection.deploy_dev("old-agent", directory.path());
             if failure == "none" {
                 assert_eq!(
                     result.unwrap(),
@@ -841,6 +883,151 @@ mod tests {
                 calls.last().unwrap().contains("EncodedCommand")
                     || calls.last().unwrap().contains("rm -f")
             );
+        }
+    }
+
+    #[test]
+    fn official_release_deployment_uses_ssh_only_and_never_falls_back_to_upload() {
+        for target in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+            for failure in ["none", "missing", "download", "mismatch", "verification"] {
+                let mut data = manifest(b"official binary");
+                data.agent.target = target.into();
+                data.file = artifact_name(target);
+                let calls = RefCell::new(Vec::new());
+                let bootstrap = if target.contains("windows") {
+                    powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))")
+                } else {
+                    "python3 -".into()
+                };
+                let runner = |command: &Command| {
+                    assert!(!command.get_program().to_string_lossy().contains("scp"));
+                    assert!(!command.get_program().to_string_lossy().contains("curl"));
+                    let args = command
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert!(args.contains("StrictHostKeyChecking=yes"));
+                    calls.borrow_mut().push(args.clone());
+                    if args.ends_with("old-agent remote-agent info") {
+                        return Ok(output(0, &serde_json::to_vec(&data.agent).unwrap(), b""));
+                    }
+                    if args.ends_with(&bootstrap) {
+                        if matches!(failure, "missing" | "download") {
+                            return Ok(output(
+                                1,
+                                b"",
+                                if failure == "missing" {
+                                    b"agent_release_unavailable: 404"
+                                } else {
+                                    b"agent_release_download_failed: offline"
+                                },
+                            ));
+                        }
+                        let mut returned: AgentManifest =
+                            serde_json::from_slice(&serde_json::to_vec(&data).unwrap()).unwrap();
+                        if failure == "mismatch" {
+                            returned.agent.build_id = "0".repeat(64);
+                        }
+                        return Ok(output(0, &serde_json::to_vec(&returned).unwrap(), b""));
+                    }
+                    if args.contains("remote-agent info --sha256") {
+                        let mut info = data.agent.clone();
+                        info.executable_sha256 = Some(if failure == "verification" {
+                            "0".repeat(64)
+                        } else {
+                            data.sha256.clone()
+                        });
+                        return Ok(output(0, &serde_json::to_vec(&info).unwrap(), b""));
+                    }
+                    Ok(output(0, b"", b""))
+                };
+                let environment = SshCommandEnvironment::default();
+                let mut connection = AgentConnection::new("test-host", &environment).unwrap();
+                connection.runner = Some(&runner);
+                let result = connection.deploy("old-agent");
+                assert_eq!(
+                    result.is_ok(),
+                    failure == "none",
+                    "{target}: {failure}: {result:?}"
+                );
+                let installed = calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.contains("remote-agent install"));
+                assert_eq!(installed, matches!(failure, "none" | "verification"));
+                if failure == "none" {
+                    assert_eq!(
+                        result.unwrap(),
+                        managed_executable(&data.agent, &data.sha256)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn official_bootstrap_runs_over_stdin_in_both_windows_shells() {
+        // Exercise the actual encoded-command trampoline and embedded entrypoint,
+        // not just a dot-sourced function. The fixture is deliberately not executable.
+        for shell in ["powershell.exe", "pwsh.exe"] {
+            for corrupt in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let data = manifest(b"downloaded bytes, never executed during preparation");
+                fs::write(
+                    directory.path().join("fixture.json"),
+                    serde_json::to_vec(&data).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    directory.path().join("fixture.bin"),
+                    if corrupt {
+                        b"corrupt".as_slice()
+                    } else {
+                        b"downloaded bytes, never executed during preparation".as_slice()
+                    },
+                )
+                .unwrap();
+                let stage = format!(".codex-usage-monit-release-{}", "1".repeat(32));
+                let script = release_script(&data.agent, &stage).unwrap().replace(
+                    "\ntry { $e=",
+                    "\nfunction Receive-ReleaseAsset { param($Url,$Destination,$Maximum); $fixture=if ($Url.EndsWith('.json')) {'fixture.json'} else {'fixture.bin'}; [IO.File]::Copy((Join-Path (Get-Location).Path $fixture),$Destination) }\ntry { $e=",
+                );
+                let input = directory.path().join("input");
+                fs::write(&input, script).unwrap();
+                let trampoline = powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))");
+                let mut command = Command::new(shell);
+                command
+                    .args(trampoline.split_whitespace().skip(1))
+                    .current_dir(directory.path());
+                let output = crate::bounded_process::output_cancellable_with_stdin(
+                    &mut command,
+                    Duration::from_secs(30),
+                    MAX_INFO,
+                    Stdio::from(fs::File::open(input).unwrap()),
+                    || false,
+                )
+                .unwrap();
+                assert_eq!(
+                    output.status.success(),
+                    !corrupt,
+                    "{shell}: {}",
+                    safe_diagnostic(&output.stderr)
+                );
+                if corrupt {
+                    assert!(safe_diagnostic(&output.stderr).contains("agent_checksum_mismatch"));
+                    assert!(!directory.path().join(&stage).exists());
+                } else {
+                    let actual: AgentManifest = serde_json::from_slice(&output.stdout).unwrap();
+                    validate_manifest(&actual, &data.agent.target).unwrap();
+                    assert_eq!(actual.sha256, data.sha256);
+                    assert_eq!(
+                        fs::read(directory.path().join(stage).join("agent.exe")).unwrap(),
+                        b"downloaded bytes, never executed during preparation"
+                    );
+                }
+            }
         }
     }
 
@@ -885,7 +1072,7 @@ mod tests {
             .unwrap();
             let staging = LocalStaging::new().unwrap();
             let error = connection
-                .artifact(&data.agent.target, Some(directory.path()), &staging.0)
+                .artifact(&data.agent.target, directory.path(), &staging.0)
                 .unwrap_err();
             assert!(error.to_string().contains(if wrong_build {
                 "agent_artifact_mismatch"

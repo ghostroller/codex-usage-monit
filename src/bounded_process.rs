@@ -33,6 +33,18 @@ pub(crate) fn output_cancellable(
     max_bytes: usize,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<Output> {
+    output_cancellable_with_stdin(command, timeout, max_bytes, Stdio::null(), cancelled)
+}
+
+/// A regular-file stdin can carry a bounded bootstrap script without a writer
+/// thread or an unbounded pipe write. The caller owns and validates its contents.
+pub(crate) fn output_cancellable_with_stdin(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+    stdin: Stdio,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Output> {
     if cancelled() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -43,7 +55,7 @@ pub(crate) fn output_cancellable(
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid command timeout"))?;
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_tree(command);
@@ -290,6 +302,12 @@ pub(crate) mod tests {
         let directory = std::path::PathBuf::from(std::env::var_os(PID_DIR_ENV).unwrap());
         fs::write(directory.join(&mode), std::process::id().to_string()).unwrap();
         match mode.as_str() {
+            "stdin" => {
+                let mut bytes = Vec::new();
+                io::stdin().read_to_end(&mut bytes).unwrap();
+                fs::write(directory.join("received"), bytes).unwrap();
+                std::process::exit(0);
+            }
             "success" | "failure" => {
                 println!("fixture stdout");
                 eprintln!("fixture stderr");
@@ -381,6 +399,25 @@ pub(crate) mod tests {
         let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
         unsafe { CloseHandle(process) };
         running
+    }
+
+    #[test]
+    fn regular_file_stdin_reaches_child_and_keeps_bounded_output_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        let bytes = vec![b'x'; 64 * 1024];
+        fs::write(&input, &bytes).unwrap();
+        let result = output_cancellable_with_stdin(
+            &mut fixture_command("stdin", directory.path()),
+            Duration::from_secs(5),
+            4096,
+            Stdio::from(fs::File::open(input).unwrap()),
+            || false,
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert_eq!(fs::read(directory.path().join("received")).unwrap(), bytes);
+        assert_terminated(directory.path(), "stdin");
     }
 
     #[test]

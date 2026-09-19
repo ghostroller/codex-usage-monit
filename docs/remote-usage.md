@@ -20,8 +20,9 @@ the center's matching build when their protocols differ. A package version such
 as `0.4.0` alone does not establish compatibility. `remote-agent info` is a small,
 stable JSON bootstrap command independent of the usage wire protocol; it reports
 the package version, source build ID, target and exact data protocol version.
-The build ID hashes normalized Rust sources, `Cargo.toml`, `Cargo.lock` and
-`build.rs`, so unpublished edits have a different identity while the same source
+The build ID hashes normalized Rust sources, the embedded release bootstrap
+scripts, `Cargo.toml`, `Cargo.lock` and `build.rs`, so unpublished edits have a
+different identity while the same source
 on different platforms has the same identity. Different build IDs are displayed;
 ordinary sync still requires exact protocol and data revisions/catalog agreement.
 Deploy always selects the exact center source build and target platform.
@@ -45,18 +46,24 @@ click the label). **[C] Test** displays the agent version/build when available a
 checks state, rollouts, source identity and data revisions. An unpaired host can
 be deployed; pairing and enabling automatic sync remain explicit operations.
 
-Deploy probes the OS/architecture, obtains the matching artifact, verifies its
-manifest and SHA-256, uploads through system SCP, and installs an immutable private
-copy below the SSH login's working directory:
+**The normal deployment path downloads the official Release on the remote host.**
+The center probes the OS/architecture and sends a small embedded bootstrap script
+over SSH. That script fetches the manifest and binary from the fixed repository
+`https://github.com/ghostroller/codex-usage-monit/releases/download/v<VERSION>/`.
+It checks the manifest's exact source build, version, protocol, platform, bounded
+size and SHA-256 before executing the candidate installer. Downloads and redirects
+require HTTPS. There is no `latest`, older-release or local-upload fallback.
+The installer creates an immutable private copy below the SSH login's working directory:
 `.codex-usage-monit-agents/<source-build-prefix>/<target>/<binary-digest-prefix>/`.
 Directory keys use 32 build-ID and 16 binary-digest hex characters to keep Windows
 launch paths short. Verification still checks the full build ID and SHA-256. Windows
-uses an `.exe` and native backslash paths. Both SSH and SCP retain strict host-key
-checking and batch authentication. The remote login must have a stable writable
-working directory (normally its home directory); SFTP/SCP and the SSH shell must
-refer to the same directory. Windows remotes need x64, Windows PowerShell, and a
-cmd.exe or PowerShell SSH login shell;
-Unix remotes need `uname` and `chmod`.
+uses an `.exe` and native backslash paths. SSH retains strict host-key checking
+and batch authentication. The remote login must have a stable writable working
+directory (normally its home directory) and HTTPS access to GitHub release assets.
+Windows remotes need x64, Windows PowerShell 5.1 or later, `curl.exe`, and a cmd.exe
+or PowerShell SSH login shell. Unix remotes need `uname`, Python 3.8 or later and
+`curl`. The remote needs neither project source nor a compiler. The center does
+not download or upload a local executable in this mode.
 
 The installed binary must return the expected build, target, protocol and full
 checksum, then pass the normal data probe with the existing source identity pin.
@@ -64,9 +71,10 @@ Only then is `agentExecutable` switched in one configuration revision check.
 Failure, cancellation, source mismatch or concurrent configuration edits preserve
 the prior configuration and retained history. Previous managed builds remain
 available; rollback uses `remote edit HOST --agent-executable PREVIOUS_PATH` and
-`remote test HOST`. A failed run can leave an unused managed copy; an interrupted
-upload can leave a randomly named `.codex-usage-monit-upload-*` staging file in
-the SSH working directory. Cleanup targets only that run's staging file.
+`remote test HOST`. A failed run can leave an unused managed copy; interruption
+can leave a randomly named `.codex-usage-monit-release-*` staging directory in
+the SSH working directory. Normal cleanup removes only that run's two fixed-name
+staging files and its empty directory.
 
 Deployment changes the exporter used by this center. It does not overwrite a
 package-manager/global installation, restart a recorder, or rotate the source
@@ -75,39 +83,77 @@ behavior needs updating. A custom launcher that sets `CODEX_HOME` or state paths
 must have those same settings in the SSH login environment before using a managed
 agent; otherwise verification fails and leaves its configured launcher in place.
 
-Artifacts are selected from `--bundle-dir DIR`, `CODEX_USAGE_MONIT_AGENT_DIR`, an
-`agents` directory beside the center executable, or the exact version's official
-GitHub Release. Same-target deployment can use the center executable directly
-unless a bundle was explicitly selected. Release downloads require `curl` and
-HTTPS and verify the manifest build/target/size/hash; there is no `latest` or older
-release fallback. Manifests and binaries share the official release's trust root;
-SHA-256 detects corruption, not an independently signed supply chain.
+`remote deploy` and TUI **[B] Deploy agent** ignore local bundles,
+`CODEX_USAGE_MONIT_AGENT_DIR`, adjacent `agents` directories and the center's own
+executable. `remote deploy --bundle-dir ...` is rejected. A development build with
+unpublished edits must not silently install an older official binary, even when
+both binaries report the same package version.
+
+Release CI generates `.agent` (Windows: `.agent.exe`) and `.agent.json` assets
+with `scripts/package-agent.py` on each native build runner. The manifest contains
+schema version, agent identity, the fixed binary filename, byte size and SHA-256;
+it is generated from the binary's bootstrap metadata, not handwritten. Formal
+deployment requires these assets in the matching version's Release. Older
+Releases without them are not converted or used as a fallback.
+
+The trust root is the fixed official GitHub repository, its release process and
+HTTPS. **A build ID and a hash are not publisher signatures:** a replaced binary
+and replaced manifest can agree with each other. This implementation does not
+verify an independent publisher signature or GitHub artifact attestation and
+cannot protect against a compromised center, remote login, publisher account or
+release workflow. Pulling directly on the remote avoids accepting an arbitrary
+local executable through the normal update interface.
+
+Useful diagnostics:
+
+| Code | Meaning / next step |
+| --- | --- |
+| `agent_release_unavailable` | The required tag or agent asset returned HTTP 404; use a center build whose matching agent has been published. |
+| `agent_release_mismatch` | The Release exists but its build/protocol/platform differs; a development center requires a matching development bundle or a matching published center. |
+| `agent_release_invalid` | The Release manifest or asset metadata is malformed; repair the published artifacts. |
+| `agent_release_download_failed` | Remote HTTPS/curl failed; check the remote's network, curl and TLS configuration. |
+| `agent_checksum_mismatch` | Downloaded bytes differ from the manifest; the candidate is not executed. |
+| `agent_release_prepare_failed` | Remote bootstrap failed, for example because Python/PowerShell is unavailable; inspect the accompanying SSH diagnostic. |
+
+### Explicit development-only local upload
 
 **An unpublished cross-platform development build needs a matching binary.** A
 Windows executable cannot run on macOS. Build the same source snapshot for each
-required target, then run this on that binary's native platform:
+required target, then run this on that binary's native platform, and only for
+locally trusted builds:
 
 ```sh
 cargo build --release --locked
 python3 scripts/package-agent.py target/release/codex-usage-monit --output-dir dist/agents
 ```
 
+Windows developers can also [cross-compile an Apple Silicon executable locally](windows-macos-cross.md).
+That workflow builds the binary on Windows; the native packaging step above is
+still required to inspect it and create its deployment manifest.
+
 For Windows use `python scripts/package-agent.py target/release/codex-usage-monit.exe
 --output-dir dist/agents`. Copy the generated binary and `.agent.json` together to
-the center's bundle directory. Configure the development TUI in PowerShell:
+the center's bundle directory, then explicitly opt into the development CLI:
 
 ```powershell
-$env:CODEX_USAGE_MONIT_AGENT_DIR = 'D:\AgentBundles\current'
-cargo run
+cargo run -- remote deploy-dev local-mac --bundle-dir 'D:\AgentBundles\current'
 ```
 
-Release builds publish these agent artifacts automatically. If the exact build is
-unavailable, deployment reports `agent_artifact_missing` or
-`agent_artifact_mismatch` before uploading anything; changing the package version
-alone does not make an older binary acceptable. Deployment is bounded to five
-minutes plus cleanup/data-probe time, with bounded subprocess output and
-process-tree cancellation. No hosted build, remote compilation, or git pull is
-started implicitly.
+This is a temporary development mechanism, not the normal updater. It prints a
+trust warning, requires an explicit directory, verifies the full metadata and
+hash, uploads through system SCP, then uses the same installation/readiness and
+configuration activation checks. It is unavailable in the TUI and is never used
+automatically after Release failure. The operator is authorizing execution of
+the supplied file; neither packaging nor its checksum proves that it is benign.
+SCP and SSH must refer to the same remote working directory. Cleanup removes only
+the operation's random `.codex-usage-monit-upload-*` staging file.
+
+Missing or mismatched development artifacts report `agent_artifact_missing` or
+`agent_artifact_mismatch` before upload. Changing the package version alone does
+not make an older binary acceptable. Both deployment modes have a five-minute
+installation budget, bounded subprocess output and process-tree cancellation;
+the final data probe has its own transport bounds. No hosted build, remote
+compilation or git pull is started implicitly.
 
 ### Configure a source
 

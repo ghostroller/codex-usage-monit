@@ -14092,6 +14092,36 @@ fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
         assert!(detail.contains(hint));
         assert_eq!(remote_ui_action_error_kind(&detail), "command_failed");
     }
+    for (kind, message, hint) in [
+        (
+            "agent_release_unavailable",
+            "404",
+            "matching official agent is not published",
+        ),
+        (
+            "agent_release_mismatch",
+            "different source build",
+            "explicit deploy-dev CLI",
+        ),
+        (
+            "agent_release_invalid",
+            "bad manifest",
+            "published agent manifest",
+        ),
+        // A curl timeout must not acquire the generic SSH connectivity hint.
+        (
+            "agent_release_download_failed",
+            "remote curl unavailable or timed out",
+            "HTTPS access to GitHub",
+        ),
+    ] {
+        let error = format!("agent_release_prepare_failed: {kind}: {message}");
+        let detail = remote_ui_action_output(&remote_action_test_output(1, b"", error.as_bytes()))
+            .unwrap_err();
+        assert!(detail.contains(hint), "{detail}");
+        assert!(!detail.contains("remote SSH service"), "{detail}");
+        assert_eq!(remote_ui_action_error_kind(&detail), kind);
+    }
     let unsafe_text = format!("\x1b]52;c;clipboard\x07\n\u{202e}{}", "界".repeat(3000));
     let detail =
         remote_ui_action_output(&remote_action_test_output(1, b"", unsafe_text.as_bytes()))
@@ -16597,6 +16627,17 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
         remote_ui_action_error_kind("command failed (exit 1): agent_version_mismatch: old version"),
         "agent_version_mismatch"
     );
+    for kind in [
+        "agent_release_unavailable",
+        "agent_release_mismatch",
+        "agent_release_download_failed",
+        "agent_checksum_mismatch",
+    ] {
+        assert_eq!(
+            remote_ui_action_error_kind(&format!("agent_release_prepare_failed: {kind}: detail")),
+            kind
+        );
+    }
     assert_eq!(
         remote_ui_action_error_kind(
             "command failed (exit 1): agent_artifact_missing: development build"
