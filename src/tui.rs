@@ -12790,7 +12790,7 @@ fn render_remote_update_dialog(frame: &mut Frame<'_>, area: Rect, app: &App) -> 
         area.height.min(14),
     );
     let title = format!(" Update {} ", terminal_safe_text(&dialog.host_id));
-    let block = panel(&title, app.theme);
+    let block = panel(&title, app.theme).style(app.theme.base_style());
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);

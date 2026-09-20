@@ -16754,6 +16754,59 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
 }
 
 #[test]
+fn settings_remote_update_dialog_paints_the_active_theme_background() {
+    let mut app = interaction_test_app(0, 0);
+    for theme in [Theme::Dark, Theme::Light] {
+        app.theme = theme;
+        for (scope, adopt) in [
+            (UiRemoteUpdateScope::Sync, false),
+            (UiRemoteUpdateScope::Node, false),
+            (UiRemoteUpdateScope::Node, true),
+        ] {
+            app.remote_update_dialog = Some(RemoteUpdateDialog {
+                host_id: "dev".to_owned(),
+                agent_executable: "/home/dev/.local/bin/codex-usage-monit".to_owned(),
+                config_revision: 1,
+                scope,
+                adopt,
+            });
+            // These viewports fit entirely inside the popup, including its
+            // borders and the resize-only and empty-interior layouts.
+            for (width, height) in [(76, 14), (40, 14), (30, 10), (2, 1)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut controls = RemoteUpdateHitbox::default();
+                terminal
+                    .draw(|frame| {
+                        controls = render_remote_update_dialog(frame, frame.area(), &app);
+                    })
+                    .unwrap();
+                let selected_scope = match scope {
+                    UiRemoteUpdateScope::Sync => controls.sync,
+                    UiRemoteUpdateScope::Node => controls.node,
+                };
+                for y in 0..height {
+                    for x in 0..width {
+                        let selected = rect_contains(selected_scope, x, y)
+                            || (adopt && rect_contains(controls.adopt, x, y));
+                        let cell = &terminal.backend().buffer()[(x, y)];
+                        assert_eq!(
+                            cell.bg,
+                            if selected {
+                                theme.palette().accent
+                            } else {
+                                theme.palette().background
+                            },
+                            "{theme:?} {scope:?} adopt={adopt} {width}x{height} at ({x}, {y})"
+                        );
+                        assert_ne!(cell.fg, Color::Reset);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn settings_remote_update_scope_and_adoption_are_explicit_and_whole_label_clickable() {
     for theme in [Theme::Dark, Theme::Light] {
         for (width, height) in [(40, 14), (80, 24), (110, 24)] {
