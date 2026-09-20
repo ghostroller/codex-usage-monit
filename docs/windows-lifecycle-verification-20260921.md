@@ -20,8 +20,9 @@ real user PATH, application uninstall registration, scheduled task or SCM servic
 
 Local logs and context manifests are retained under
 `D:\Workspace\codex-usage-monit\.codex-usage-monit\windows-lifecycle-evidence\`.
-The full command, identity, start/end time, source commit, snapshot identity,
-temporary directory and result are recorded in each `*-result.json`.
+The result files and snapshot manifests together record the full commands,
+identities, start/end times, source commit, snapshot identity, temporary
+directories and outcomes.
 
 The full-suite code snapshot is `snapshot-20260920T190047-final3`, aggregate SHA-256
 `f971da991b983019bc6323b9aa94a482e656fa4aa85dab30f17fc03b0cca43dd`.
