@@ -316,6 +316,144 @@ The run directory under `windows-shell-contracts/` contains the result and log;
 combined source comparison, complete commands, coverage and exclusions. No
 additional project rebuild was performed in shell-contracts mode.
 
+## Release checkpoint: deterministic process-fixture readiness
+
+[CI 35521703978](https://github.com/ghostroller/codex-usage-monit/actions/runs/35521703978)
+tested `f643eb6dbaed6309857c7f2bc9efa1c18b62ebef`. Linux, macOS and the dependency
+audit passed. Windows passed 1,682 library tests, but
+`bounded_process::tests::cancellation_terminates_and_reaps_the_process_tree`
+failed with `ParseIntError { kind: Empty }`. Integrations, ConPTY and CLI smoke
+were not reached. Evidence: `/private/tmp/codex-release-0.5.1/final-ci-result.json`
+and `final-ci-windows-job-106106796411.log`. This was diagnosed locally before
+any further hosted request.
+
+The fixture used file existence as readiness, although `fs::write` first creates
+an empty file. Cancellation could kill the writer before its PID was recorded.
+A native Windows x64 experiment explicitly paused at that boundary: the old
+implementation exposed an empty ready marker and failed deterministically; the
+new implementation kept the marker unpublished until the complete PID was
+written and the file closed. Evidence:
+`/private/tmp/codex-release-0.5.1/windows-pid-repro/346b549d514946498476ba12ea78a9bd/repro.log`.
+
+Only test modules changed. The shared process fixture now publishes PID files by
+same-directory rename after writing and closing them, with a deterministic
+before-write regression and useful failure diagnostics. The related-owner audit
+found two Unix SSH cancellation fixtures that also cancelled on file existence;
+they now wait for a complete newline-terminated positive PID, with regressions
+for empty, partial, invalid and expired-readiness cases. Even readiness failure
+triggers process cleanup before the test reports the failure. Other service,
+CLI, TUI, lock and completed-output consumers already had suitable ordering.
+
+The first Docker follow-up reproduced the audited timeout-startup assumption:
+`timeout_terminates_the_fake_ssh_process_group` could reach its 100 ms deadline
+before a descendant existed, then incorrectly require its PID file. That run
+passed 1,775 library tests and failed this one, before integration/smoke stages.
+Evidence: `/Volumes/File/codex-usage-monit-docker-build/runs/20260920T162545Z-arm64-51544/`;
+snapshot `5e2a12952b969c8957f9805a8a37e6f269e3d93b07c776fc6fe1ca0f1c27640d`.
+
+Both related process-tree timeout tests now establish fixture readiness before
+exercising an explicitly expired deadline, and measure cleanup separately from
+startup. The SSH test calls the production wait and cleanup functions; a
+separate high-level probe retains timeout-error classification coverage without
+requiring a descendant to start within 100 ms. No production timer, interface,
+process-containment behavior or updater policy changed. Production prefixes of
+both edited modules were compared byte-for-byte with the parent commit.
+
+### macOS follow-up and final candidate
+
+On macOS 15.7.2 ARM64 / Rust 1.97.0, snapshot
+`90816a681eee2af7736d558a393f3fdf58d080d5ff229b1862a2944c1fc0bf51`
+passed both affected modules, then the complete `sh scripts/verify-unix.sh`
+pipeline: 1,779 library tests, all integrations/PTY, format/Clippy, script
+contracts, preview, installer and CLI smoke. The existing manual benchmark and
+Windows-only Python case were not run on macOS. Evidence:
+`/private/tmp/codex-unified-update-checks/release-051-pid-fixture-mac-result.json`
+and its adjacent log.
+
+After removing the two timeout-startup assumptions, final snapshot
+`4e07e567f82c6f58e848abc328d6b929d1f0be8aeef2a216d00e03569aa8a20a`
+passed these commands on the unchanged checkout:
+
+```text
+cargo test --locked --lib bounded_process::tests
+cargo test --locked --lib remote_transport::tests
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release --bin codex-usage-monit
+python3 scripts/check-release-binary.py target/release/codex-usage-monit
+python3 scripts/package-release.py package target/release/codex-usage-monit --output-dir /private/tmp/codex-release-0.5.1/final-timing-bundle
+```
+
+The affected modules passed 8 and 35 tests. This was a focused follow-up to the
+successful full macOS run, not another full run. Evidence:
+`/private/tmp/codex-unified-update-checks/release-051-final-timing-mac-result.json`
+and its adjacent log; the complete command sequence is preserved in
+`/private/tmp/codex-release-0.5.1/verify-final-timing-mac.py`.
+
+Because the source identity includes test modules under `src/`, the final
+candidate's build ID is
+`f89ac3620545f89b566124675c581b74d4ee8741a0822bd20f9c0f08dd5fdb47`;
+its macOS binary SHA256 is
+`69c72709892620dc40b32303c29e4d1df06b8cfd62ded2e655f85031be98d3e1`.
+Version remains 0.5.1 and protocol remains 5. The explicit development bundle
+path is required to replace an earlier unpublished same-version source build;
+ordinary official updates retain their same-version conflict guard.
+
+The final candidate then completed the normal local node updater:
+
+```text
+target/release/codex-usage-monit update --bundle-dir /private/tmp/codex-release-0.5.1/final-timing-bundle --scope node --format json
+```
+
+The managed CLI and enabled recorder now use the final build above. The updater
+reported `complete`, recorder `ready`, CLI `updated`, and a new persisted
+heartbeat. The actual shell entry prints `codex-usage-monit 0.5.1` and resolves
+the final immutable executable. Source identity, identity anchor, remotes and
+project mappings retained their exact hashes; all original service options and
+non-argument launchd settings were preserved. Evidence:
+`/private/tmp/codex-release-0.5.1/local-final-update-result.json`,
+`local-final-update.stdout`, `local-final-before.json` and
+`local-final-verification.json`.
+
+### Final Linux follow-up
+
+`sh scripts/test-linux-docker.sh` passed on Linux ARM64 GNU / Rust 1.97.0,
+parent `f643eb6dbaed6309857c7f2bc9efa1c18b62ebef`, dirty isolated snapshot
+`fc73b5bed35be996b3e28df0597744f74e5de747de6533d7f175d6a370fe7541`.
+All 1,777 library tests and the integration/PTY suites passed, along with
+format/Clippy, script contracts, preview, installer and CLI smoke checks. The
+existing manual benchmark and Windows-only Python case were excluded; this
+native-architecture run does not claim Linux x64 coverage. Exact result and log:
+`/Volumes/File/codex-usage-monit-docker-build/runs/20260920T163225Z-arm64-60661/`.
+
+### Final Windows follow-up
+
+The final Windows ARM64 UTM guest, running the x64 target under SYSTEM with
+Rust 1.97.0, passed the complete pipeline:
+
+```text
+python3 scripts/macos/test-windows-utm.py --target x86_64-pc-windows-msvc --toolchain-home 'C:\Users\user' --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' --output-dir /private/tmp/codex-release-0.5.1/windows-pid-full
+```
+
+Run `d1eb61d24af84a9e9e6efd8d1900b222`, parent
+`f643eb6dbaed6309857c7f2bc9efa1c18b62ebef`, dirty ZIP snapshot
+`da869c5d282fb84f5b4ebb5cb8ba40e056485320bcd4215101971d2b4abdcf74`,
+passed 1,684 library and 124 integration tests (1,808 total), including both
+ConPTY tests, all 87 PowerShell 5.1 contracts, format, Clippy and CLI smoke.
+Only the existing manual benchmark was ignored. Start/end:
+2026-09-20 16:32:26–16:41:09 UTC. All 150 Rust, Python, PowerShell, shell and
+Cargo inputs were compared with the final checkout and match byte-for-byte.
+No required stage was skipped. The unchanged PowerShell 7 outer-wrapper evidence
+from the prior 174-case dual-engine run remains applicable and was not repeated.
+
+Exact result and full log:
+`/private/tmp/codex-release-0.5.1/windows-pid-full/d1eb61d24af84a9e9e6efd8d1900b222/`.
+The combined native reproduction, focused pass, final full pass, commands and
+source comparison are recorded in
+`/private/tmp/codex-release-0.5.1/windows-pid-verification.json`.
+Only documentation was updated after this final set of platform checks. The
+next hosted checkpoint must test the resulting new commit; neither earlier
+failed run can authorize its release tag.
+
 Old release assets and unknown legacy agent references remain retained. Grouping
 existing configuration/history into new subdirectories is a separate migration;
 this executable update preserves their current locations and source identity.

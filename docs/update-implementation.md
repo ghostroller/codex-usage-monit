@@ -44,10 +44,11 @@ schema changes. The original test evidence is retained in the verification recor
 - [x] Run affected tests during implementation and the relevant native macOS,
   Docker Linux and UTM Windows suites on the settled source; record exact source
   identities, commands, exclusions, results and logs before hosted CI.
-  Native macOS, Docker Linux and UTM Windows x64 full suites passed. The first
-  hosted checkpoint found a Windows shell-invocation test fixture defect; its
-  correction passed native regression, complete Windows verification and macOS
-  update integrations. See the exact coverage and snapshots in the record below.
+  Native macOS, Docker Linux and UTM Windows x64 full suites passed. Hosted
+  checkpoints exposed shell-invocation and PID-readiness test defects; local
+  deterministic regressions and a related-owner audit corrected them, including
+  startup-independent timeout fixtures. See the final coverage and snapshots
+  in the record below.
 - [ ] Publish 0.5.1 after a complete hosted checkpoint of the corrected commit;
   merge and tag that same green SHA, retain release audit/gate/binary smoke
   checks, then verify a real node-scope update on `ap-northeast-1`.

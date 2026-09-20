@@ -3361,12 +3361,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn read_complete_fixture_pid(path: &Path) -> Option<libc::pid_t> {
+        let record = fs::read_to_string(path).ok()?;
+        let digits = record.strip_suffix('\n')?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<libc::pid_t>().ok().filter(|pid| *pid > 0)
+    }
+
+    #[cfg(unix)]
+    fn cancel_after_fixture_pid(
+        path: &Path,
+        cancellation: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<libc::pid_t, String> {
+        let deadline = Instant::now() + timeout;
+        let ready = loop {
+            if let Some(pid) = read_complete_fixture_pid(path) {
+                break Ok(pid);
+            }
+            if Instant::now() >= deadline {
+                break Err(format!(
+                    "fixture did not publish a complete positive PID before the deadline: {}",
+                    path.display()
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        // Even fixture startup failure must release the running transport and
+        // clean up its process tree before the parent reports the failure.
+        cancellation.store(true, Ordering::Release);
+        ready
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_pid_readiness_requires_a_complete_positive_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.pid");
+        assert_eq!(read_complete_fixture_pid(&path), None);
+        for record in [
+            "",
+            "1",
+            "12345",
+            "0\n",
+            "-1\n",
+            "+1\n",
+            "12\n34",
+            "2147483648\n",
+        ] {
+            fs::write(&path, record).unwrap();
+            assert_eq!(read_complete_fixture_pid(&path), None, "{record:?}");
+        }
+        fs::write(&path, "12345\n").unwrap();
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            cancel_after_fixture_pid(&path, &cancellation, Duration::ZERO).unwrap(),
+            12345
+        );
+        assert!(cancellation.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_pid_deadline_still_cancels_before_reporting_incomplete_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.pid");
+        for record in ["", "12345"] {
+            fs::write(&path, record).unwrap();
+            let cancellation = AtomicBool::new(false);
+            let error = cancel_after_fixture_pid(&path, &cancellation, Duration::ZERO).unwrap_err();
+            assert!(cancellation.load(Ordering::Acquire));
+            assert!(error.contains("complete positive PID before the deadline"));
+        }
+    }
+
+    #[cfg(unix)]
     fn assert_process_exits_bounded(pid_path: &Path, subject: &str) {
         let pid = fs::read_to_string(pid_path)
             .unwrap()
             .trim()
             .parse::<libc::pid_t>()
             .unwrap();
+        assert_pid_exits_bounded(pid, subject);
+    }
+
+    #[cfg(unix)]
+    fn assert_pid_exits_bounded(pid: libc::pid_t, subject: &str) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let alive = unsafe { libc::kill(pid, 0) } == 0;
@@ -3497,15 +3579,80 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(script_path);
+        configure_process_tree(&mut command, true);
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let primary_pid = child.id() as libc::pid_t;
+        let mut process_tree = match attach_process_tree(&mut child, true) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let cleanup_error = kill_and_reap_bounded(child);
+                panic!("fixture isolation failed: {error}; cleanup: {cleanup_error:?}");
+            }
+        };
+
+        // Fixture startup is separate from the timeout contract. A loaded
+        // runner may not start the shell and its descendant within 100 ms.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let descendant_pid = loop {
+            if let Some(pid) = read_complete_fixture_pid(&descendant_pid_path) {
+                break Some(pid);
+            }
+            if Instant::now() >= ready_deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        let started = Instant::now();
+        let observed = descendant_pid.map(|pid| {
+            let primary_alive = unsafe { libc::kill(primary_pid, 0) } == 0;
+            let descendant_alive = unsafe { libc::kill(pid, 0) } == 0;
+            let outcome = wait_until(
+                &mut process_tree,
+                &mut child,
+                Instant::now(),
+                &SshCommandEnvironment::default(),
+                &AtomicU8::new(OutputLimit::NONE),
+            );
+            (pid, primary_alive, descendant_alive, outcome)
+        });
+        // Always clean up before asserting readiness or the timeout result.
+        let cleanup_error = terminate_and_reap_bounded(process_tree, child);
+        let (descendant_pid, primary_alive, descendant_alive, outcome) =
+            observed.expect("fake SSH timeout fixture did not publish a complete PID");
+        assert!(
+            primary_alive && descendant_alive,
+            "fixture was not alive before timeout"
+        );
+        assert!(matches!(outcome.unwrap(), ChildWaitOutcome::TimedOut));
+        assert!(
+            cleanup_error.is_none(),
+            "timeout cleanup failed: {cleanup_error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_pid_exits_bounded(primary_pid, "timed-out SSH primary");
+        assert_pid_exits_bounded(descendant_pid, "timed-out SSH descendant");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_timeout_without_assuming_descendant_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("fake-ssh-timeout");
+        fs::write(&script_path, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let options = RemoteProbeOptions {
             timeout: Duration::from_millis(100),
             ..RemoteProbeOptions::default()
         };
-        let started = Instant::now();
         let error = probe_remote_with_program(script_path, "dev-server", &options).unwrap_err();
         assert!(matches!(error, RemoteTransportError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert_process_exits_bounded(&descendant_pid_path, "timed-out SSH descendant");
     }
 
     #[cfg(unix)]
@@ -3527,11 +3674,7 @@ mod tests {
         let cancellation_worker = Arc::clone(&cancellation);
         let pid_path = descendant_pid_path.clone();
         let trigger = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_path.is_file() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            cancellation_worker.store(true, Ordering::Release);
+            cancel_after_fixture_pid(&pid_path, &cancellation_worker, Duration::from_secs(2))
         });
         let environment =
             SshCommandEnvironment::default().with_cancellation(Arc::clone(&cancellation));
@@ -3541,23 +3684,21 @@ mod tests {
         };
         let started = Instant::now();
 
-        let error = probe_remote_with_program_and_environment(
+        let result = probe_remote_with_program_and_environment(
             script_path,
             "dev-server",
             &options,
             &environment,
-        )
-        .unwrap_err();
-        trigger.join().unwrap();
+        );
+        let descendant_pid = trigger
+            .join()
+            .unwrap()
+            .expect("fake SSH cancellation fixture did not become ready");
+        let error = result.unwrap_err();
 
         assert!(matches!(error, RemoteTransportError::Cancelled { .. }));
         assert!(!error.process_containment_uncertain());
         assert!(started.elapsed() < Duration::from_secs(2));
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
@@ -3709,11 +3850,7 @@ mod tests {
         let trigger_cancellation = Arc::clone(&cancellation);
         let pid_path = holder_pid_path.clone();
         let trigger = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_path.is_file() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            trigger_cancellation.store(true, Ordering::Release);
+            cancel_after_fixture_pid(&pid_path, &trigger_cancellation, Duration::from_secs(2))
         });
         let environment =
             SshCommandEnvironment::default().with_cancellation(Arc::clone(&cancellation));
@@ -3723,19 +3860,16 @@ mod tests {
         };
         let started = Instant::now();
 
-        let error = probe_remote_with_program_and_environment(
+        let result = probe_remote_with_program_and_environment(
             script_path,
             "dev-server",
             &options,
             &environment,
-        )
-        .unwrap_err();
-        trigger.join().unwrap();
-        let holder_pid = fs::read_to_string(&holder_pid_path)
+        );
+        let holder_pid = trigger
+            .join()
             .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+            .expect("escaped proxy cancellation fixture did not become ready");
         let holder_survived = unsafe { libc::kill(holder_pid, 0) } == 0;
         if holder_survived {
             unsafe {
@@ -3743,6 +3877,7 @@ mod tests {
             }
         }
 
+        let error = result.unwrap_err();
         assert!(matches!(error, RemoteTransportError::Cancelled { .. }));
         assert!(error.process_containment_uncertain());
         assert!(

@@ -272,6 +272,7 @@ fn pipe_is_closed(error: &io::Error) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
@@ -294,13 +295,46 @@ pub(crate) mod tests {
         command
     }
 
+    fn publish_fixture_pid(
+        directory: &Path,
+        mode: &str,
+        pid: u32,
+        before_write: impl FnOnce(&Path),
+    ) {
+        // Consumers may cancel the entire tree as soon as this marker exists.
+        // Publish only after closing the complete PID, never the empty file
+        // that File::create makes visible before its first write.
+        let pending = directory.join(format!(".{mode}.pid-pending"));
+        let mut file = fs::File::create(&pending).unwrap();
+        before_write(&pending);
+        write!(file, "{pid}").unwrap();
+        drop(file);
+        fs::rename(pending, directory.join(mode)).unwrap();
+    }
+
+    #[test]
+    fn pid_marker_is_published_only_after_the_complete_pid_is_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant");
+        let pid = std::process::id();
+        publish_fixture_pid(directory.path(), "descendant", pid, |pending| {
+            assert!(fs::read(pending).unwrap().is_empty());
+            assert!(
+                !marker.is_file(),
+                "an incomplete PID marker must not signal readiness"
+            );
+        });
+        assert_eq!(fs::read_to_string(marker).unwrap(), pid.to_string());
+        assert!(!directory.path().join(".descendant.pid-pending").exists());
+    }
+
     #[test]
     fn process_fixture() {
         let Ok(mode) = std::env::var(MODE_ENV) else {
             return;
         };
         let directory = std::path::PathBuf::from(std::env::var_os(PID_DIR_ENV).unwrap());
-        fs::write(directory.join(&mode), std::process::id().to_string()).unwrap();
+        publish_fixture_pid(&directory, &mode, std::process::id(), |_| {});
         match mode.as_str() {
             "stdin" => {
                 let mut bytes = Vec::new();
@@ -351,10 +385,13 @@ pub(crate) mod tests {
     }
 
     fn assert_terminated(directory: &Path, mode: &str) {
-        let pid: u32 = fs::read_to_string(directory.join(mode))
-            .unwrap()
+        let marker = directory.join(mode);
+        let contents = fs::read_to_string(&marker)
+            .unwrap_or_else(|error| panic!("read {mode} PID marker {}: {error}", marker.display()));
+        let pid: u32 = contents
             .parse()
-            .unwrap();
+            .unwrap_or_else(|error| panic!("invalid {mode} PID marker {contents:?}: {error}"));
+        assert_ne!(pid, 0, "{mode} PID marker must identify a process");
         let deadline = Instant::now() + Duration::from_secs(2);
         while process_is_running(pid) {
             assert!(
@@ -440,15 +477,40 @@ pub(crate) mod tests {
     #[test]
     fn timeout_terminates_and_reaps_a_hung_primary_and_its_descendant() {
         let directory = tempfile::tempdir().unwrap();
-        let started = Instant::now();
-        let error = output(
+        let before_launch = Cell::new(true);
+        let descendant_ready = Cell::new(false);
+        let cleanup_started = Cell::new(None);
+        let result = output_cancellable(
             &mut fixture_command("parent_hangs", directory.path()),
-            Duration::from_secs(1),
+            Duration::ZERO,
             4096,
-        )
-        .unwrap_err();
+            || {
+                if before_launch.replace(false) {
+                    return false;
+                }
+                // Wait at the first post-launch poll before checking the
+                // already-expired deadline. Startup speed must not determine
+                // whether this test actually covers descendant cleanup.
+                let ready_deadline = Instant::now() + Duration::from_secs(5);
+                while !directory.path().join("descendant").is_file()
+                    && Instant::now() < ready_deadline
+                {
+                    thread::sleep(POLL_INTERVAL);
+                }
+                descendant_ready.set(directory.path().join("descendant").is_file());
+                cleanup_started.set(Some(Instant::now()));
+                // Never panic inside this callback: even failed fixture
+                // startup must go through the normal process-tree cleanup.
+                false
+            },
+        );
+        assert!(
+            descendant_ready.get(),
+            "descendant did not publish its PID before the readiness deadline: {result:?}"
+        );
+        let error = result.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(cleanup_started.get().unwrap().elapsed() < Duration::from_secs(5));
         assert_terminated(directory.path(), "parent_hangs");
         assert_terminated(directory.path(), "descendant");
     }
