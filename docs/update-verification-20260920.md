@@ -148,6 +148,27 @@ Evidence under `/private/tmp/codex-unified-update-checks/`:
 - One hosted integration checkpoint for the final committed source, recording
   the exact run ID and head SHA.
 
+## Hosted checkpoint status
+
+Implementation commit `44a44b13131e6a9c855c972e8963e49515e92260` was pushed to
+`codex/unified-node-updates` through HTTPS after SSH port 443 closed the
+connection. The ordinary checkpoint helper stopped during repository/branch
+preflight reads with GitHub API EOF errors, before reaching its dispatch call.
+A temporary curl adapter preserved the helper's clean-tree, exact-SHA and
+existing-run checks, but its API preflight also failed with a TLS handshake
+error. No attempt reported a successful dispatch or returned a run ID.
+
+Automatic approval review then refused another compatibility-transport attempt,
+citing potential duplicate CI scheduling after repeated failures. A subsequent
+read-only query for this exact commit's workflow runs also failed during TLS
+setup, so no hosted result can be claimed. When asked about one checkpoint after
+connectivity is restored and existing runs can be checked, the user chose to
+keep the current results. No further CI dispatch attempts are authorized in this
+batch; a later checkpoint must first confirm the intended source and existing runs.
+The temporary adapter is recorded at
+`/private/tmp/codex-unified-update-checks/run-checkpoint-curl.py`; it is not part
+of the product or the repository pipeline.
+
 Old release assets and unknown legacy agent references remain retained. Grouping
 existing configuration/history into new subdirectories is a separate migration;
 this executable update preserves their current locations and source identity.

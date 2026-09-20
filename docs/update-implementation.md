@@ -34,12 +34,16 @@ recorder use.
 - [x] Migrate active references away from legacy agent directories without
   deleting unknown references. Provide bounded, reference-aware version cleanup.
 - [x] Update installer, CLI commands, TUI help, English and Chinese docs.
-- [x] Validate download/archive failures, ownership/PATH conflicts, scopes,
+- [x] Add regression coverage for download/archive failures, ownership/PATH conflicts, scopes,
   service recovery/concurrency, old installation migration and Windows entry
   behavior, plus shortcut rendering/keyboard/mouse/compact layouts.
 - [ ] Run affected tests during implementation and the relevant native macOS,
   Docker Linux and UTM Windows suites on the settled source; record exact source
   identities, commands, exclusions, results and logs before hosted CI.
+  Native macOS and Docker Linux full suites passed; Windows has partial native
+  evidence, but its final UTM run is blocked by guest resource exhaustion.
+  Hosted CI remains pending after API failures and an automatic-review refusal;
+  the user chose to keep the current results and stop further CI attempts.
 - [x] Update this Mac's CLI only after the implementation and verification are
   ready; confirm the actual shell entry and recorder identity.
 
