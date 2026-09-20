@@ -4,6 +4,10 @@ Implementation branch: `codex/unified-node-updates`. All local runs started from
 `39c703310e96c8cf3471e3db115b9e21aba2b81e` plus the recorded dirty snapshots.
 No release tag or release publication is part of this verification.
 
+The final release target is **0.5.1**. The initial implementation and local
+installation below used the provisional, unpublished number 0.6.0; the later
+renumbering is recorded separately so the original evidence remains accurate.
+
 ## Completed local checks
 
 | Environment | Command | Result and source identity |
@@ -103,7 +107,7 @@ The standard development bundle was produced with
 `python3 scripts/package-release.py package target/release/codex-usage-monit
 --output-dir /private/tmp/codex-unified-update-checks/local-bundle`.
 
-The candidate is version `0.6.0`, protocol 5, build ID
+The initial candidate was version `0.6.0`, protocol 5, build ID
 `42a85c60f8a54c05f6054c5a81609411ded81242d01a3d5bd35b3520c7c16ff4`,
 binary SHA256 `64c87b735f3997b24a8b2e8df418145e7178b64ed4f511ba39e39f3ce19aaddf`.
 Evidence: `/private/tmp/codex-unified-update-checks/local-release.json` and
@@ -121,7 +125,7 @@ After the native full suite and candidate smoke test passed, the candidate ran:
 The update returned `complete`: the existing enabled recorder became `ready`
 with a fresh persisted heartbeat, and the existing manual CLI entry became
 `updated` without PATH shadowing. Both report the candidate build above. The
-actual `/Users/user/.local/bin/codex-usage-monit -V` now prints
+actual `/Users/user/.local/bin/codex-usage-monit -V` at that stage printed
 `codex-usage-monit 0.6.0`; `update status --format json` resolves the executable
 inside the managed `versions/` directory and reports journal phase `complete`.
 `service status --format json` reports the same build, `running: true`, and
@@ -138,6 +142,63 @@ Evidence under `/private/tmp/codex-unified-update-checks/`:
 `local-before.json`, `local-preservation-before.json`, `local-update-result.json`,
 `local-update.stdout.json`, `local-update.stderr.log`, and
 `local-preservation-after.json`.
+
+## Renumbering the unpublished candidate to 0.5.1
+
+At the user's request, only the application version in `Cargo.toml` and its own
+`Cargo.lock` package entry changed from `0.6.0` to `0.5.1`. Runtime code, schemas,
+protocol 5, and dependencies are unchanged. The preflight compared these inputs
+with commit `d854244951b155cad7199f0a51cca6ea361a343d`.
+
+On macOS 15.7.2 ARM64 with Rust 1.97.0, these checks passed on the unchanged dirty
+snapshot `8b70357ec05cf489c03d2ab478ea6441cbb5ab8ec5d7c70f111f18590f28e678`:
+
+```text
+cargo test --locked --lib update
+cargo test --locked --lib service::upgrade
+cargo test --locked --test update_cli --test agent_management
+python3 -B -m unittest discover -s tests -p test_release_package.py
+cargo build --locked --release --bin codex-usage-monit
+python3 scripts/check-release-binary.py target/release/codex-usage-monit
+python3 scripts/package-release.py package target/release/codex-usage-monit --output-dir /private/tmp/codex-unified-update-checks/local-bundle-0.5.1
+```
+
+The Rust runs passed 46, 15, and 4 tests respectively; all 6 packaging contracts
+and the optimized binary's offline fixture passed. Evidence:
+`/private/tmp/codex-unified-update-checks/version-051-result.json`,
+`version-051.log`, and `verify-051.py`. This focused verification does not claim
+another full platform run. Linux/Windows suites and hosted CI were not restarted;
+the previously documented Windows verification gap remains.
+
+The new build ID is
+`a56d5bae9389f09070a94fe6f581e96cd2144249c6aa2068e12d159f9038e855`,
+binary SHA256 `eda9b63bfd54d12061c7ff47d14945861325bb432e51e61d7dd9267e99d689ed`.
+
+The actual Mac was explicitly reinstalled to this identical-code candidate.
+Ordinary updates still reject numeric downgrades. After verifying the saved
+enabled state and every service option, the maintenance operation backed up the
+old registration, journals, launcher, and identity/configuration files privately,
+staged the new immutable executable, and invoked the existing service install
+and upgrade APIs. It then retired the completed CLI registration into that
+backup and used the normal node updater's explicit adoption path. No version
+field was forged and no general downgrade bypass was added.
+
+The immediate service readiness call initially encountered the new recorder's
+first-collection cutover lock. The attempted service restoration also stopped
+at that lock before changing registration. Once a fresh heartbeat was observed,
+resuming the same candidate's saved upgrade completed with the same new recorder
+PID. The CLI pointer remained unchanged until the new recorder was ready.
+
+Final verification passed: the actual CLI prints `codex-usage-monit 0.5.1`, the
+recorder runs the same build with a recent heartbeat, both update journals are
+complete, and the service floor is `0.5.1`. All original service settings,
+source-identity/anchor, remotes, and project mappings were preserved. The old
+immutable version and private maintenance backups remain retained.
+
+Evidence under `/private/tmp/codex-unified-update-checks/`:
+`renumber-local-051.py`, `renumber-051-result.json` (initial lock conflict),
+`renumber-051-service-resume-result.json`, and `renumber-051-completion.json`
+(successful final state). No CI, tag, or Release was started for this correction.
 
 ## Remaining verification
 

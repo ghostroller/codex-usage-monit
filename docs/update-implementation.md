@@ -5,6 +5,10 @@ machine. SSH is a transport/bootstrap layer, not a second activation engine.
 The application remains one complete executable for CLI, TUI, exporter and
 recorder use.
 
+The release target is **0.5.1**. The initial local validation used an unpublished
+0.6.0 development build; it was subsequently renumbered without runtime or data
+schema changes. The original test evidence is retained in the verification record.
+
 ## Scope and acceptance
 
 - [x] Share one target-machine update executor for local and SSH invocation.
