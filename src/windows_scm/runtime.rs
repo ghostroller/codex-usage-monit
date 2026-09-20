@@ -1,15 +1,21 @@
 //! Native SCM lifecycle; all recorder data is opened as the service account.
 use super::*;
 use std::{
+    ffi::OsString,
     io::{Seek, SeekFrom, Write},
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
+};
+use windows_service::{
+    define_windows_service,
+    service::{ServiceControl, ServiceControlAccept},
+    service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
+    service_dispatcher,
 };
 
 static CONFIG: OnceLock<MachineReceipt> = OnceLock::new();
-static STATUS: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 static STOP: AtomicBool = AtomicBool::new(false);
 static EXIT: AtomicU32 = AtomicU32::new(0);
 
@@ -18,85 +24,71 @@ pub(super) fn dispatch(receipt: MachineReceipt) -> Result<i32> {
         !matches!(receipt.phase.as_str(), "uninstalling" | "uninstalled"),
         "machine_uninstall_pending: recorder startup is disabled"
     );
-    let mut name = security::wide(&receipt.name)?;
+    let name = receipt.name.clone();
     CONFIG.set(receipt).map_err(|_| {
         anyhow::anyhow!("machine_dispatch_duplicate: SCM dispatcher already initialized")
     })?;
-    let table = [
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: name.as_mut_ptr(),
-            lpServiceProc: Some(service_main),
-        },
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: ptr::null_mut(),
-            lpServiceProc: None,
-        },
-    ];
-    ensure!(
-        unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } != 0,
-        "machine_dispatch_failed: this internal entry must be launched by SCM: {}",
-        io::Error::last_os_error()
-    );
+    service_dispatcher::start(name, ffi_service_main)
+        .context("machine_dispatch_failed: this internal entry must be launched by SCM")?;
     Ok(EXIT.load(Ordering::SeqCst) as i32)
 }
 
-unsafe extern "system" fn control(
-    control: u32,
-    _event: u32,
-    _data: *mut std::ffi::c_void,
-    _context: *mut std::ffi::c_void,
-) -> u32 {
+fn control(control: ServiceControl) -> ServiceControlHandlerResult {
     match control {
-        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
             STOP.store(true, Ordering::SeqCst);
-            0
+            ServiceControlHandlerResult::NoError
         }
-        SERVICE_CONTROL_INTERROGATE => 0,
-        _ => 120,
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
     }
 }
 
-fn publish_state(state: u32, checkpoint: u32, error: u32) -> Result<()> {
-    let status = SERVICE_STATUS {
-        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
-        dwCurrentState: state,
-        dwControlsAccepted: if state == SERVICE_RUNNING {
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-        } else {
-            0
-        },
-        dwWin32ExitCode: if error == 0 { 0 } else { 1066 },
-        dwServiceSpecificExitCode: error,
-        dwCheckPoint: checkpoint,
-        dwWaitHint: if matches!(state, SERVICE_START_PENDING | SERVICE_STOP_PENDING) {
-            10000
-        } else {
-            0
-        },
-    };
-    ensure!(
-        unsafe { SetServiceStatus(STATUS.load(Ordering::SeqCst), &status) } != 0,
-        "machine_status_publish_failed: {}",
-        io::Error::last_os_error()
-    );
-    Ok(())
+fn publish_state(
+    handle: &ServiceStatusHandle,
+    state: ServiceState,
+    checkpoint: u32,
+    error: u32,
+) -> Result<()> {
+    handle
+        .set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: if error == 0 {
+                ServiceExitCode::NO_ERROR
+            } else {
+                ServiceExitCode::ServiceSpecific(error)
+            },
+            checkpoint,
+            wait_hint: if matches!(
+                state,
+                ServiceState::StartPending | ServiceState::StopPending
+            ) {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            },
+            process_id: None,
+        })
+        .context("machine_status_publish_failed")
 }
 
-unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+define_windows_service!(ffi_service_main, service_main);
+
+fn service_main(_arguments: Vec<OsString>) {
     let Some(receipt) = CONFIG.get() else {
         return;
     };
-    let Ok(name) = security::wide(&receipt.name) else {
-        return;
-    };
-    let handle =
-        unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control), ptr::null()) };
-    if handle.is_null() {
+    let Ok(handle) = service_control_handler::register(&receipt.name, control) else {
         EXIT.store(1, Ordering::SeqCst);
         return;
-    }
-    STATUS.store(handle, Ordering::SeqCst);
-    let result = std::panic::catch_unwind(|| supervise(receipt));
+    };
+    let result = std::panic::catch_unwind(|| supervise(receipt, &handle));
     let code = match result {
         Ok(Ok(code)) => code,
         Ok(Err(error)) => {
@@ -109,7 +101,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         }
     };
     EXIT.store(code, Ordering::SeqCst);
-    let _ = publish_state(SERVICE_STOPPED, 0, code);
+    let _ = publish_state(&handle, ServiceState::Stopped, 0, code);
 }
 
 fn log_failure(receipt: &MachineReceipt, message: &str) {
@@ -189,8 +181,8 @@ pub(super) fn inspect_heartbeat(
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-fn supervise(receipt: &MachineReceipt) -> Result<u32> {
-    publish_state(SERVICE_START_PENDING, 1, 0)?;
+fn supervise(receipt: &MachineReceipt, handle: &ServiceStatusHandle) -> Result<u32> {
+    publish_state(handle, ServiceState::StartPending, 1, 0)?;
     ensure!(
         security::current_sid()? == receipt.account_sid,
         "machine_account_mismatch: runtime token differs"
@@ -247,7 +239,7 @@ fn supervise(receipt: &MachineReceipt) -> Result<u32> {
         }
         if let Some(started) = stop_started {
             checkpoint = checkpoint.saturating_add(1);
-            publish_state(SERVICE_STOP_PENDING, checkpoint, 0)?;
+            publish_state(handle, ServiceState::StopPending, checkpoint, 0)?;
             if started.elapsed() >= Duration::from_secs(25) {
                 child.terminate()?;
                 return Ok(0);
@@ -258,7 +250,7 @@ fn supervise(receipt: &MachineReceipt) -> Result<u32> {
                 heartbeat_matches(status, child.id(), &receipt.selected.build_id, prepared)
             }) {
                 ready = true;
-                publish_state(SERVICE_RUNNING, 0, 0)?;
+                publish_state(handle, ServiceState::Running, 0, 0)?;
             } else {
                 ensure!(
                     Instant::now() < deadline,
@@ -266,7 +258,7 @@ fn supervise(receipt: &MachineReceipt) -> Result<u32> {
                     log_path.display()
                 );
                 checkpoint = checkpoint.saturating_add(1);
-                publish_state(SERVICE_START_PENDING, checkpoint, 0)?;
+                publish_state(handle, ServiceState::StartPending, checkpoint, 0)?;
             }
         }
         std::thread::sleep(Duration::from_millis(200));

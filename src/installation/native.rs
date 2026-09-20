@@ -6,14 +6,12 @@ use std::ptr;
 
 use anyhow::{Context, Result, ensure};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
-use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-};
+use windows_sys::Win32::System::Registry::RegQueryValueExW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
 };
+use winreg::enums::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_EXPAND_SZ, REG_SZ};
+use winreg::{HKCU, RegKey, RegValue};
 
 use super::{InstallReceipt, RegistryValue, UserPath};
 
@@ -21,16 +19,6 @@ const MAX_VALUE: usize = 256 * 1024;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-struct Key(HKEY);
-impl Drop for Key {
-    fn drop(&mut self) {
-        // SAFETY: this owned handle came from a successful open/create call.
-        unsafe {
-            RegCloseKey(self.0);
-        }
-    }
 }
 
 pub(super) struct NativePath {
@@ -57,54 +45,30 @@ impl NativePath {
     }
 }
 
-fn open_user_key(subkey: &str, write: bool) -> Result<Option<Key>> {
-    let mut handle = ptr::null_mut();
-    let name = wide(subkey);
+fn open_user_key(subkey: &str, write: bool) -> Result<Option<RegKey>> {
     // A read/doctor never creates the key. Creation is reserved for an actual
     // accepted mutation after its second read of the current value.
-    let status = if write {
-        // SAFETY: all UTF-16 strings are NUL terminated and output is writable.
-        unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                name.as_ptr(),
-                0,
-                ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_QUERY_VALUE | KEY_SET_VALUE,
-                ptr::null(),
-                &mut handle,
-                ptr::null_mut(),
-            )
-        }
+    let result = if write {
+        HKCU.create_subkey_with_flags(subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)
+            .map(|(key, _)| key)
     } else {
-        // SAFETY: predefined HKCU is valid and output is writable.
-        unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                name.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut handle,
-            )
-        }
+        HKCU.open_subkey_with_flags(subkey, KEY_QUERY_VALUE)
     };
-    if status == ERROR_FILE_NOT_FOUND {
-        return Ok(None);
+    match result {
+        Ok(key) => Ok(Some(key)),
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(None),
+        Err(error) => anyhow::bail!("install_registry_failed: {error}"),
     }
-    ensure!(
-        status == ERROR_SUCCESS,
-        "install_registry_failed: {}",
-        io::Error::from_raw_os_error(status as i32)
-    );
-    Ok(Some(Key(handle)))
 }
 
-fn read_value(key: &Key) -> Result<Option<RegistryValue>> {
+fn read_value(key: &RegKey) -> Result<Option<RegistryValue>> {
     read_named_value(key, "Path")
 }
 
-fn read_named_value(key: &Key, name: &str) -> Result<Option<RegistryValue>> {
+fn read_named_value(key: &RegKey, name: &str) -> Result<Option<RegistryValue>> {
+    // winreg::get_raw_value grows/retries without a bound and rejects unknown
+    // value types. Keep this narrow raw query to cap allocation and contention,
+    // and let the PATH validation retain its existing unsupported-type error.
     let name = wide(name);
     for _ in 0..8 {
         let mut size = 0;
@@ -112,7 +76,7 @@ fn read_named_value(key: &Key, name: &str) -> Result<Option<RegistryValue>> {
         // SAFETY: null data with a writable size is the documented size query.
         let status = unsafe {
             RegQueryValueExW(
-                key.0,
+                key.raw_handle(),
                 name.as_ptr(),
                 ptr::null(),
                 &mut kind,
@@ -137,7 +101,7 @@ fn read_named_value(key: &Key, name: &str) -> Result<Option<RegistryValue>> {
         // the returned length and type, which are checked before using them.
         let status = unsafe {
             RegQueryValueExW(
-                key.0,
+                key.raw_handle(),
                 name.as_ptr(),
                 ptr::null(),
                 &mut kind,
@@ -165,47 +129,22 @@ fn read_named_value(key: &Key, name: &str) -> Result<Option<RegistryValue>> {
 const UNINSTALL_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\codex-usage-monit";
 
-fn uninstall_key_at(subkey: &str, create: bool) -> Result<Option<(Key, bool)>> {
-    let name = wide(subkey);
-    let mut handle = ptr::null_mut();
-    let mut disposition = 0;
-    // SAFETY: production passes the fixed per-user subkey; strings and output
-    // storage remain valid for both calls. Tests pass only isolated Software keys.
-    let status = unsafe {
-        if create {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                name.as_ptr(),
-                0,
-                ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_QUERY_VALUE | KEY_SET_VALUE,
-                ptr::null(),
-                &mut handle,
-                &mut disposition,
-            )
-        } else {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                name.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut handle,
-            )
-        }
+fn uninstall_key_at(subkey: &str, create: bool) -> Result<Option<(RegKey, bool)>> {
+    let result = if create {
+        HKCU.create_subkey_with_flags(subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)
+            .map(|(key, disposition)| (key, disposition == REG_CREATED_NEW_KEY))
+    } else {
+        HKCU.open_subkey_with_flags(subkey, KEY_QUERY_VALUE)
+            .map(|key| (key, false))
     };
-    if status == ERROR_FILE_NOT_FOUND {
-        return Ok(None);
+    match result {
+        Ok(key) => Ok(Some(key)),
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(None),
+        Err(error) => anyhow::bail!("install_uninstall_registry_failed: {error}"),
     }
-    ensure!(
-        status == ERROR_SUCCESS,
-        "install_uninstall_registry_failed: {}",
-        io::Error::from_raw_os_error(status as i32)
-    );
-    Ok(Some((Key(handle), disposition == REG_CREATED_NEW_KEY)))
 }
 
-fn check_uninstall_owner(key: &Key, root: &Path) -> Result<()> {
+fn check_uninstall_owner(key: &RegKey, root: &Path) -> Result<()> {
     let location = read_named_value(key, "InstallLocation")?
         .context("install_uninstall_key_conflict: existing uninstall key has no ownership")?;
     let actual = String::from_utf16(&location.units()?)?;
@@ -216,7 +155,7 @@ fn check_uninstall_owner(key: &Key, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn owned_uninstall_key_at(subkey: &str, root: &Path) -> Result<Key> {
+fn owned_uninstall_key_at(subkey: &str, root: &Path) -> Result<RegKey> {
     let (key, created) =
         uninstall_key_at(subkey, true)?.context("install_uninstall_registry_failed")?;
     // Check the actual handle returned by create/open. A separate existence
@@ -225,27 +164,6 @@ fn owned_uninstall_key_at(subkey: &str, root: &Path) -> Result<Key> {
         check_uninstall_owner(&key, root)?;
     }
     Ok(key)
-}
-
-fn set_value(key: &Key, name: &str, value: &RegistryValue) -> Result<()> {
-    let name = wide(name);
-    // SAFETY: named value and byte buffer remain valid for the call.
-    let status = unsafe {
-        RegSetValueExW(
-            key.0,
-            name.as_ptr(),
-            0,
-            value.kind,
-            value.bytes.as_ptr(),
-            value.bytes.len().try_into()?,
-        )
-    };
-    ensure!(
-        status == ERROR_SUCCESS,
-        "install_uninstall_registry_failed: {}",
-        io::Error::from_raw_os_error(status as i32)
-    );
-    Ok(())
 }
 
 pub(super) fn register_uninstall(receipt: &InstallReceipt) -> Result<()> {
@@ -281,21 +199,12 @@ pub(super) fn register_uninstall(receipt: &InstallReceipt) -> Result<()> {
             ),
         ),
     ] {
-        set_value(
-            &key,
-            name,
-            &RegistryValue::from_units(super::REG_SZ, &text.encode_utf16().collect::<Vec<_>>()),
-        )?;
+        key.set_value(name, &text)
+            .map_err(|error| anyhow::anyhow!("install_uninstall_registry_failed: {error}"))?;
     }
     for name in ["NoModify", "NoRepair"] {
-        set_value(
-            &key,
-            name,
-            &RegistryValue {
-                kind: REG_DWORD,
-                bytes: 1_u32.to_le_bytes().to_vec(),
-            },
-        )?;
+        key.set_value(name, &1_u32)
+            .map_err(|error| anyhow::anyhow!("install_uninstall_registry_failed: {error}"))?;
     }
     Ok(())
 }
@@ -306,16 +215,13 @@ pub(super) fn unregister_uninstall(receipt: &InstallReceipt) -> Result<()> {
     };
     check_uninstall_owner(&existing, &receipt.root)?;
     drop(existing);
-    let key = wide(UNINSTALL_KEY);
-    // SAFETY: deletes only the fixed product key whose InstallLocation was
+    // Deletes only the fixed product key whose InstallLocation was
     // checked above; never removes its parent or any machine-wide registration.
-    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) };
-    ensure!(
-        status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND,
-        "install_uninstall_registry_failed: {}",
-        io::Error::from_raw_os_error(status as i32)
-    );
-    Ok(())
+    match HKCU.delete_subkey_all(UNINSTALL_KEY) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(()),
+        Err(error) => anyhow::bail!("install_uninstall_registry_failed: {error}"),
+    }
 }
 
 impl UserPath for NativePath {
@@ -339,29 +245,28 @@ impl UserPath for NativePath {
         if read_value(&key)? != *before {
             return Ok(false);
         }
-        let name = wide("Path");
-        let status = if let Some(after) = after {
+        let result = if let Some(after) = after {
             after.units()?;
-            // SAFETY: byte length matches the live buffer, preserving value type.
-            unsafe {
-                RegSetValueExW(
-                    key.0,
-                    name.as_ptr(),
-                    0,
-                    after.kind,
-                    after.bytes.as_ptr(),
-                    after.bytes.len().try_into()?,
-                )
-            }
+            let _: u32 = after.bytes.len().try_into()?;
+            key.set_raw_value(
+                "Path",
+                &RegValue {
+                    vtype: if after.kind == super::REG_SZ {
+                        REG_SZ
+                    } else {
+                        REG_EXPAND_SZ
+                    },
+                    bytes: after.bytes.as_slice().into(),
+                },
+            )
         } else {
-            // SAFETY: key and NUL terminated value name are valid.
-            unsafe { RegDeleteValueW(key.0, name.as_ptr()) }
+            key.delete_value("Path")
         };
-        ensure!(
-            status == ERROR_SUCCESS || (after.is_none() && status == ERROR_FILE_NOT_FOUND),
-            "install_registry_write_failed: {}",
-            io::Error::from_raw_os_error(status as i32)
-        );
+        if let Err(error) = result
+            && !(after.is_none() && error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32))
+        {
+            anyhow::bail!("install_registry_write_failed: {error}");
+        }
         Ok(true)
     }
 
@@ -416,11 +321,7 @@ mod tests {
                 self.0
                     .starts_with(r"Software\CodexUsageMonit-InstallationTest-")
             );
-            let name = wide(&self.0);
-            // SAFETY: this exact random test-owned key is no longer in use.
-            unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, name.as_ptr());
-            }
+            let _ = HKCU.delete_subkey_all(&self.0);
         }
     }
 
@@ -488,12 +389,13 @@ mod tests {
         let isolated = IsolatedKey::new();
         let mut backend = isolated.backend();
         assert!(backend.read().unwrap().is_none());
+        assert!(open_user_key(&isolated.0, false).unwrap().is_none());
         let key = open_user_key(&isolated.0, true).unwrap().unwrap();
         let unsupported = RegistryValue {
-            kind: REG_DWORD,
+            kind: winreg::enums::REG_DWORD as u32,
             bytes: 7_u32.to_le_bytes().to_vec(),
         };
-        set_value(&key, "Path", &unsupported).unwrap();
+        key.set_value("Path", &7_u32).unwrap();
         assert!(
             backend
                 .compare_write(&Some(unsupported.clone()), &Some(unsupported.clone()))
@@ -502,6 +404,45 @@ mod tests {
         assert_eq!(backend.read().unwrap(), Some(unsupported.clone()));
         assert!(backend.compare_write(&Some(unsupported), &None).unwrap());
         assert!(backend.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_isolated_path_keeps_raw_utf16_and_enforces_read_limit() {
+        let isolated = IsolatedKey::new();
+        let mut backend = isolated.backend();
+        for kind in [REG_SZ, REG_EXPAND_SZ] {
+            // RegSetValueExW requires a terminating NUL for string values. An
+            // unpaired UTF-16 surrogate must survive without String conversion.
+            let raw = Some(RegistryValue {
+                kind,
+                bytes: [b'C' as u16, b':' as u16, 0xd800, 0]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            });
+            assert!(
+                backend
+                    .compare_write(&backend.read().unwrap(), &raw)
+                    .unwrap()
+            );
+            assert_eq!(backend.read().unwrap(), raw);
+        }
+        let key = open_user_key(&isolated.0, true).unwrap().unwrap();
+        key.set_raw_value(
+            "Path",
+            &RegValue {
+                vtype: winreg::enums::REG_SZ,
+                bytes: vec![0; MAX_VALUE + 2].into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            backend
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("registry read limit")
+        );
     }
 
     #[test]
@@ -516,7 +457,9 @@ mod tests {
             REG_SZ,
             &r"C:\other-installer".encode_utf16().collect::<Vec<_>>(),
         );
-        set_value(&foreign, "InstallLocation", &foreign_root).unwrap();
+        foreign
+            .set_value("InstallLocation", &r"C:\other-installer")
+            .unwrap();
         assert!(owned_uninstall_key_at(&isolated.0, our_root).is_err());
         assert_eq!(
             read_named_value(&foreign, "InstallLocation").unwrap(),
@@ -530,7 +473,13 @@ mod tests {
                 .encode_utf16()
                 .collect::<Vec<_>>(),
         );
-        set_value(&foreign, "InstallLocation", &our_location).unwrap();
+        foreign
+            .set_value("InstallLocation", &our_root.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(
+            read_named_value(&foreign, "InstallLocation").unwrap(),
+            Some(our_location)
+        );
         assert!(owned_uninstall_key_at(&isolated.0, our_root).is_ok());
     }
 }
