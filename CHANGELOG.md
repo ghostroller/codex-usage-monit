@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.1] - 2026-09-21
+
+### Added
+
+- Use one target-machine updater for local `update`, the installer and SSH deployment. Choose `sync` to update the exporter and an existing recorder, or `node` to also update the current user's CLI. The TUI remembers the selected scope per host and requests adoption explicitly for unmanaged standalone CLI installations.
+- Store complete executables in immutable version directories with a stable managed CLI entry. Preserve adopted CLI backups, support interrupted update recovery, report each component's outcome and provide reference-aware version cleanup.
+
+### Changed
+
+- Publish one application artifact per platform, a shared release manifest and checksums. The CLI, TUI, exporter and recorder use the same executable; new releases no longer include duplicate `.agent` assets.
+- Preserve recorder settings and enabled state during updates, verify the new recorder's persisted heartbeat before activating the CLI, and prevent incompatible older updaters from replacing an upgraded recorder.
+- Validate CLI ownership and installation directories before replacement. Package-managed installations remain under their package manager; user-owned standalone installations require explicit adoption.
+
+### Compatibility
+
+- Remote protocol remains v5. Managed SSH deployment still requires the center and remote to use the same source build. Existing source identities, configuration/history paths and disabled sync settings are preserved; updates do not install a recorder when none exists.
+- Retain old version directories and legacy agent references until they can be cleaned safely. Restart already-running TUIs to use the selected new version. See [update scopes and recovery](docs/remote-updates.md).
+
 ## [0.5.0] - 2026-09-19
 
 ### Added

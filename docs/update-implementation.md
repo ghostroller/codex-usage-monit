@@ -41,13 +41,16 @@ schema changes. The original test evidence is retained in the verification recor
 - [x] Add regression coverage for download/archive failures, ownership/PATH conflicts, scopes,
   service recovery/concurrency, old installation migration and Windows entry
   behavior, plus shortcut rendering/keyboard/mouse/compact layouts.
-- [ ] Run affected tests during implementation and the relevant native macOS,
+- [x] Run affected tests during implementation and the relevant native macOS,
   Docker Linux and UTM Windows suites on the settled source; record exact source
   identities, commands, exclusions, results and logs before hosted CI.
-  Native macOS and Docker Linux full suites passed; Windows has partial native
-  evidence, but its final UTM run is blocked by guest resource exhaustion.
-  Hosted CI remains pending after API failures and an automatic-review refusal;
-  the user chose to keep the current results and stop further CI attempts.
+  Native macOS, Docker Linux and UTM Windows x64 full suites passed. The first
+  hosted checkpoint found a Windows shell-invocation test fixture defect; its
+  correction passed native regression, complete Windows verification and macOS
+  update integrations. See the exact coverage and snapshots in the record below.
+- [ ] Publish 0.5.1 after a complete hosted checkpoint of the corrected commit;
+  merge and tag that same green SHA, retain release audit/gate/binary smoke
+  checks, then verify a real node-scope update on `ap-northeast-1`.
 - [x] Update this Mac's CLI only after the implementation and verification are
   ready; confirm the actual shell entry and recorder identity.
 

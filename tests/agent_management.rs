@@ -1,10 +1,6 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Output},
-};
+use std::{fs, path::Path, process::Command};
 
 fn command(root: &Path) -> Command {
     isolated_command(root, env!("CARGO_BIN_EXE_codex-usage-monit"))
@@ -23,10 +19,15 @@ fn isolated_command(root: &Path, executable: impl AsRef<std::ffi::OsStr>) -> Com
     command
 }
 
-fn success(output: Output) -> Vec<u8> {
+fn success(stage: &str, command: &mut Command) -> Vec<u8> {
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("{stage}: could not launch {command:?}: {error}"));
     assert!(
         output.status.success(),
-        "{}",
+        "{stage}: {command:?} exited with {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
@@ -42,10 +43,8 @@ fn bootstrap_info_is_independent_of_state_catalog_and_usage_protocol() {
     )
     .unwrap();
     let info: Value = serde_json::from_slice(&success(
-        command(root.path())
-            .args(["remote-agent", "info", "--sha256"])
-            .output()
-            .unwrap(),
+        "bootstrap info",
+        command(root.path()).args(["remote-agent", "info", "--sha256"]),
     ))
     .unwrap();
     assert_eq!(info["schemaVersion"], 1);
@@ -81,10 +80,8 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
     assert!(!root.path().join(".codex-usage-monit-agents").exists());
     let install = || {
         String::from_utf8(success(
-            command(root.path())
-                .args(["remote-agent", "install", "--sha256", &digest])
-                .output()
-                .unwrap(),
+            "immutable installation",
+            command(root.path()).args(["remote-agent", "install", "--sha256", &digest]),
         ))
         .unwrap()
         .trim()
@@ -92,37 +89,46 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
     };
     let installed = install();
     assert_eq!(installed, install());
-    let output = isolated_command(root.path(), &installed)
-        .args(["remote-agent", "info", "--sha256"])
-        .output()
-        .unwrap();
-    let info: Value = serde_json::from_slice(&success(output)).unwrap();
+    let info: Value = serde_json::from_slice(&success(
+        "direct immutable executable",
+        isolated_command(root.path(), &installed).args(["remote-agent", "info", "--sha256"]),
+    ))
+    .unwrap();
     assert_eq!(info["executableSha256"], digest);
     #[cfg(windows)]
     {
-        // OpenSSH's default Windows shell is cmd.exe. Forward slash paths
-        // beginning ./ are parsed as a command plus options and do not work.
-        let output = isolated_command(root.path(), "cmd.exe")
-            .args([
-                "/d",
-                "/s",
-                "/c",
-                &format!("\"\"{installed}\" remote-agent info\""),
-            ])
-            .output()
-            .unwrap();
-        let from_shell: Value = serde_json::from_slice(&success(output)).unwrap();
+        use base64::Engine;
+        use std::os::windows::process::CommandExt;
+
+        // Match the production SSH command: cmd cannot directly execute a
+        // canonical \\?\ path, so invoke it through encoded PowerShell. Pass
+        // cmd's command text literally rather than applying CRT argv quoting.
+        let script = format!(
+            "$ErrorActionPreference='Stop'; & '{}' remote-agent info; exit $LASTEXITCODE",
+            installed.replace('\'', "''")
+        );
+        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let from_shell: Value = serde_json::from_slice(&success(
+            "cmd shell via encoded PowerShell",
+            isolated_command(root.path(), "cmd.exe")
+                .args(["/d", "/s", "/c"])
+                .raw_arg(format!(
+                    "powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
+                )),
+        ))
+        .unwrap();
         assert_eq!(from_shell["buildId"], info["buildId"]);
-        let output = isolated_command(root.path(), "powershell.exe")
-            .args([
+        let from_shell: Value = serde_json::from_slice(&success(
+            "direct PowerShell literal invocation",
+            isolated_command(root.path(), "powershell.exe").args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &format!("& '{}' remote-agent info", installed.replace('\'', "''")),
-            ])
-            .output()
-            .unwrap();
-        let from_shell: Value = serde_json::from_slice(&success(output)).unwrap();
+                &script,
+            ]),
+        ))
+        .unwrap();
         assert_eq!(from_shell["buildId"], info["buildId"]);
     }
     assert!(!root.path().join("state").exists());

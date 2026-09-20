@@ -200,16 +200,7 @@ Evidence under `/private/tmp/codex-unified-update-checks/`:
 `renumber-051-service-resume-result.json`, and `renumber-051-completion.json`
 (successful final state). No CI, tag, or Release was started for this correction.
 
-## Remaining verification
-
-- The complete Windows x64 Rust/ConPTY suite and revised runner's native checks
-  remain blocked on the ARM64 UTM guest by the resource failure above. A single
-  hosted native Windows checkpoint will cover the product suite; it does not
-  substitute for the UTM-specific runner check.
-- One hosted integration checkpoint for the final committed source, recording
-  the exact run ID and head SHA.
-
-## Hosted checkpoint status
+## Initial hosted checkpoint pause
 
 Implementation commit `44a44b13131e6a9c855c972e8963e49515e92260` was pushed to
 `codex/unified-node-updates` through HTTPS after SSH port 443 closed the
@@ -224,11 +215,106 @@ citing potential duplicate CI scheduling after repeated failures. A subsequent
 read-only query for this exact commit's workflow runs also failed during TLS
 setup, so no hosted result can be claimed. When asked about one checkpoint after
 connectivity is restored and existing runs can be checked, the user chose to
-keep the current results. No further CI dispatch attempts are authorized in this
-batch; a later checkpoint must first confirm the intended source and existing runs.
+keep the current results. Further CI attempts were paused until the subsequent
+explicit request to merge, tag, publish 0.5.1 and update `ap-northeast-1`.
 The temporary adapter is recorded at
 `/private/tmp/codex-unified-update-checks/run-checkpoint-curl.py`; it is not part
 of the product or the repository pipeline.
+
+## Release checkpoint: Windows shell fixture correction
+
+After the user authorized publication, the ordinary checkpoint helper completed
+its exact-source and duplicate-run checks and dispatched
+[CI 35519549658](https://github.com/ghostroller/codex-usage-monit/actions/runs/35519549658)
+for `0a3fc4976190bcc42f7fcc03dedc827096a5bff9`. Linux, macOS and the dependency
+audit passed. Windows passed all 1,683 library tests, then failed
+`self_install_checks_bytes_and_can_execute_its_immutable_copy` in the
+`agent_management` integration target with `The specified path is invalid.`
+Later integration, ConPTY and smoke stages were not reached. Exact job evidence:
+`/private/tmp/codex-release-0.5.1/ci-result.json` and
+`ci-windows-job-106101152887.log`.
+
+This was a test fixture defect. Native Windows reproduction showed two distinct
+causes: passing a quoted command through ordinary Rust argument escaping breaks
+`cmd /c` parsing, and bare `cmd` cannot execute the canonical `\\?\` executable
+path returned by installation. The production SSH path already invokes such
+paths through PowerShell. The fixture now exercises the same
+`cmd -> PowerShell EncodedCommand` route, supplies the command with `raw_arg`,
+and includes the stage, command and complete output in failures. Direct process
+and direct PowerShell checks remain. No product source or build identity changed.
+The related command-owner audit found a separate pre-existing inherited-stdout
+test fixture in `src/git_repository.rs`; that follow-up is outside this release
+correction and was not changed.
+
+The UTM guest recovered and its doctor check passed without a forced reset.
+Native reproduction compared ordinary, spaced and canonical executable paths:
+the original invocation failed, while the production-shaped invocation passed.
+Evidence: `/private/tmp/codex-release-0.5.1/windows-cmd-repro/analysis.json` and
+`windows-cmd-repro/5d04fda016ad495496a6d841f5adfc96/{result.json,repro.log}`.
+
+On macOS 15.7.2 ARM64, Rust 1.97.0, the stable dirty snapshot
+`ce3018fc520e0e35aa97ca30726c254682a0e199f1b61f299943dabef35886bc`
+at parent `0a3fc4976190bcc42f7fcc03dedc827096a5bff9` passed all four affected
+integration tests:
+
+```text
+cargo test --locked --test agent_management --test update_cli
+```
+
+Evidence: `/private/tmp/codex-unified-update-checks/release-051-windows-fixture-mac-result.json`
+and `release-051-windows-fixture-mac.log`. The source was unchanged during testing.
+The full macOS/Linux suites were not repeated for this Windows-only test fix;
+the first hosted checkpoint had passed both on otherwise identical source.
+
+The native Windows focused regression passed one test on Windows ARM64 UTM,
+executing target `x86_64-pc-windows-msvc` with Rust 1.97.0 and PowerShell 7.6.5.
+Snapshot ZIP SHA256:
+`8c1673d7da550074c0853cbe3b56add3e5202670e7d1c70185b14fedbb8a60ff`.
+
+```text
+python3 scripts/macos/test-windows-utm.py --focused --test-filter self_install_checks_bytes_and_can_execute_its_immutable_copy --target x86_64-pc-windows-msvc --toolchain-home 'C:\Users\user' --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' --output-dir /private/tmp/codex-release-0.5.1/windows-focused
+```
+
+Evidence: `/private/tmp/codex-release-0.5.1/windows-focused/a4f71e01775c40a4b220dccff4f53197/`
+contains the exact request, result and verification log. Focused mode omits
+format/Clippy, the full suite, ConPTY and smoke checks; the full follow-up is
+recorded separately below. The failed hosted SHA must not be tagged; a new clean,
+pushed commit needs its own complete checkpoint before publication.
+
+### Complete Windows follow-up
+
+The same corrected test snapshot (ZIP SHA256 `8c1673d7da550074c0853cbe3b56add3e5202670e7d1c70185b14fedbb8a60ff`)
+passed the full native UTM pipeline under SYSTEM, with the same ARM64 guest,
+Rust 1.97.0 and x64 target described above:
+
+```text
+python3 scripts/macos/test-windows-utm.py --target x86_64-pc-windows-msvc --toolchain-home 'C:\Users\user' --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' --output-dir /private/tmp/codex-release-0.5.1/windows-full
+```
+
+Format, Clippy, all 87 PowerShell 5.1 contracts, 1,683 library tests, 124
+integration tests (including installation/update and ConPTY), and version/offline
+JSON smoke checks passed. One existing opt-in manual benchmark was ignored;
+no required pipeline stage was skipped. The run started at 15:52:48 UTC and
+finished at 15:59:31 UTC on September 20. Result and full log:
+`/private/tmp/codex-release-0.5.1/windows-full/ef4dccdd490f47e3ab2b7453e45ff4c8/`.
+This closes the earlier UTM resource and explicit-`pwsh` runner verification gaps.
+Subsequent changes before the next checkpoint are documentation only.
+
+The official outer-wrapper contracts then passed in both PowerShell
+5.1.26100.9457 (AMD64) and 7.6.5 (ARM64): 87 cases per engine, 174 total.
+
+```text
+python3 scripts/macos/test-windows-utm.py --shell-contracts --toolchain-home 'C:\Users\user' --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' --output-dir /private/tmp/codex-release-0.5.1/windows-shell-contracts
+```
+
+Run `98fc53b8abab48adad36a04f91bd673b`, ZIP SHA256
+`59b8ca651d1b165a101608df980718c90a631b5a8e6c9f022e439b7246499add`,
+differs from the full-suite snapshot only in `CHANGELOG.md` and the two update
+evidence documents. All Rust, PowerShell, Python, shell and build inputs match.
+The run directory under `windows-shell-contracts/` contains the result and log;
+`/private/tmp/codex-release-0.5.1/windows-final-verification.json` records the
+combined source comparison, complete commands, coverage and exclusions. No
+additional project rebuild was performed in shell-contracts mode.
 
 Old release assets and unknown legacy agent references remain retained. Grouping
 existing configuration/history into new subdirectories is a separate migration;
