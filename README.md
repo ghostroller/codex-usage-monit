@@ -39,7 +39,7 @@ _Deterministically rendered from the integration-test fixture. Local and hosted 
 
 ### Install a release binary
 
-The shell installer supports macOS and Linux on x86_64 and ARM64. It verifies the release archive against `SHA256SUMS`; the default installation requires no `sudo` and uses `~/.local/bin`.
+The shell installer supports macOS and Linux on x86_64 and ARM64. It checks `SHA256SUMS` and the shared `release-manifest.json`, then installs the complete application into a managed version directory. The default command entry is `~/.local/bin/codex-usage-monit`; installation requires no `sudo`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
@@ -62,17 +62,29 @@ sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
 
-To upgrade, download the latest installer again and rerun it, then restart any running TUI. If the background recorder is installed, run the new executable’s `service upgrade` command; it preserves the registered options and enabled state and verifies the new recorder heartbeat. On Windows, place the new executable at a new versioned path before upgrading the service instead of overwriting a running executable. The application does not provide a self-update function.
+For an application-managed installation, update the CLI and any existing recorder together:
 
-On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, rename it if desired, and place it in a directory on `PATH`:
+```bash
+codex-usage-monit update
+codex-usage-monit update --version X.Y.Z
+codex-usage-monit update status --format json
+```
+
+`update` defaults to the latest official Release and `--scope node`. Use `--scope sync` to update the synchronization executable and existing recorder while preserving the CLI entry. `--install-dir DIR` selects the initial managed CLI directory; `--adopt` explicitly migrates an existing standalone, manually installed CLI. On first registration, the updater selects the existing CLI found in the target process's PATH before falling back to the default directory. Package-manager locations, including Cargo and Homebrew, are rejected even with `--adopt`: update those installations through their original manager. `--bundle-dir DIR` selects an explicitly trusted local release bundle instead of a download and cannot be combined with `--version`.
+
+Rerunning the shell installer uses the same updater, including migration of a prior manual CLI at the chosen destination. It preserves recorder options, data paths and enabled state, and verifies an enabled recorder's new heartbeat. It does not create a missing service. Restart any already-open TUI after updating. Older binaries without `update` need the new release's installer first; existing old Releases and their installers remain available.
+
+The command entry is a stable launcher that reads a version selection from `installation.json`, not a symlink that the service follows. The recorder uses an immutable version's absolute path. This lets subsequent Windows updates change the selection without overwriting a running launcher; the first migration of an old Windows executable can still require closing it. Installation roots, PATH diagnostics and recovery are described in [application updates](docs/remote-updates.md).
+
+On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, then use it to create the managed installation. Add `%LOCALAPPDATA%\codex-usage-monit\bin` to your user `PATH`:
 
 ```powershell
 $binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
 $actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
 $expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
 if ($actual -ne $expected) { throw "checksum mismatch" }
-Move-Item $binary codex-usage-monit.exe
-.\codex-usage-monit.exe --version
+& ".\$binary" update
+& "$env:LOCALAPPDATA\codex-usage-monit\bin\codex-usage-monit.exe" --version
 ```
 
 ### Install from source
@@ -153,6 +165,7 @@ Running `codex-usage-monit` without a subcommand starts the TUI. One-shot subcom
 | `health` | Print unified snapshot, history, recorder, and service health. |
 | `record` | Continuously record local and account history without opening the TUI. |
 | `service` | Install, upgrade, inspect, or remove the optional per-user recorder. |
+| `update` | Update the managed application and existing recorder, or inspect them with `update status`. |
 | `remote` | Configure, inspect, deploy agents, test, and synchronize explicitly allowlisted SSH machines. Available in v0.4. |
 | `debug-startup` | Profile both the TUI's placeholder first frame and its initial data-ready work without entering interactive mode. |
 
@@ -230,15 +243,21 @@ codex-usage-monit --redact-content record
 Remote previews are redacted by default; the center's TUI, reports and recorder must use the same policy, hence `--redact-content` above. Opening the TUI alone does not start automatic SSH collection. For prerequisites, background setup, preview opt-in, source selection and troubleshooting, follow the [SSH usage guide](docs/remote-usage.md).
 
 Use `remote inspect HOST` to compare versions, source build IDs and data protocols.
-Settings → **B Update node** or `remote deploy HOST` makes the SSH host download
-its matching official GitHub Release, then verifies and installs an isolated
-agent before switching that host's configuration. It preserves
-the existing source pin. It also updates an existing recorder, preserving its options and enabled state; see [remote update recovery](docs/remote-updates.md). During rapid iteration we
-**do not support older data protocols or downgrade negotiation**: deploy a matching
-build instead. Unpublished cross-platform development builds require a matching
-agent bundle through the explicit development-only `remote deploy-dev HOST
---bundle-dir DIR` command. Normal deployment never uploads a local executable or
-falls back to that mode; see [agent deployment and version policy](docs/remote-usage.md#version-policy-during-rapid-iteration).
+Settings → **B Update node** opens a scope selector: **Sync components** updates
+the exporter and existing recorder; **Node application** also updates the remote
+user's managed CLI. The CLI equivalents are `remote deploy HOST --scope sync`
+(the default) and `remote deploy HOST --scope node`. A manual CLI needs explicit
+`--adopt` or **Adopt manual CLI**; package-manager installations are preserved.
+The TUI remembers the scope per host, but never remembers adoption permission.
+
+Both scopes download the official Release matching this center's exact build and
+use the same target-machine updater as local `update`. They preserve the source
+pin and recorder configuration. Service, CLI and verification-sync outcomes are
+reported separately; see [update recovery](docs/remote-updates.md). During rapid
+iteration we **do not support older data protocols or downgrade negotiation**.
+Unpublished builds require the explicit development-only `remote deploy-dev HOST
+--bundle-dir DIR --scope sync|node` path; official deployment never falls back to
+uploading a local executable. See [deployment and version policy](docs/remote-usage.md#version-policy-during-rapid-iteration).
 
 If the recorder uses a non-default history location, pass that same source-aware directory to stateful remote commands, for example `codex-usage-monit --redact-content remote --history-dir /srv/codex-state/history-v1 sync buildbox`. Pairing, unpairing/removal, retained-source management, and manual sync then share the recorder's exact persistence domain instead of silently using the platform default. The TUI and service commands use the state-root override described in the guide.
 
@@ -265,7 +284,7 @@ The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and
 codex-usage-monit service uninstall
 ```
 
-Run `service install` again after moving or replacing either executable, changing `--codex-home`, or changing collection options. Because each platform exposes one recorder registration per user, service changes and a pending v1-to-v2 history cutover share one current-user-global gate even when custom history directories differ. Before touching the manager, the installer writes a durable cutover blocker, removes any stale trust marker, disables and stops the previous managed recorder, and verifies that no separate foreground recorder owns the target history. Every new definition contains both the source-aware protocol and a deterministic identity derived from the executable, complete recorder arguments, and install-time environment. The installer binds the exact on-disk definition to the manager's loaded identity, verifies it again immediately before clearing the blocker, and only then permits the recorder to start. Linux units and Windows tasks remain inactive during this check; launchd must load a job before exposing its loaded arguments, so the installer keeps the target history's recorder lock until trust is complete and any eager launch attempt fails before it can write history. This also makes an old binary at the same path reject the new service command instead of becoming a legacy writer. A failed replacement never restores an older auto-start definition; trust, blocker-clear, and registration failures all enter verified cleanup, and an unproven cleanup leaves the blocker in place without a timeout. A dormant or changed registration without the matching trust record blocks first-time migration and crash recovery, while an already-active v2 history does not query the service manager again. Concurrent mutation by a pre-v0.4 installer or an administrator is outside the supported cutover protocol; the final recheck narrows that unavoidable cross-version window and fails closed when it observes a change. If no managed registration exists but a recent foreground-recorder status remains, installation and uninstallation also fail closed until that process is stopped. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
+Use `update` for an application upgrade; it coordinates an existing service automatically. Use `service upgrade` when applying an already prepared executable to the recorder alone. Run `service install` again when intentionally changing `--codex-home`, Codex executable location, or collection options. Because each platform exposes one recorder registration per user, service changes and a pending v1-to-v2 history cutover share one current-user-global gate even when custom history directories differ. Before touching the manager, the installer writes a durable cutover blocker, removes any stale trust marker, disables and stops the previous managed recorder, and verifies that no separate foreground recorder owns the target history. Every new definition contains both the source-aware protocol and a deterministic identity derived from the executable, complete recorder arguments, and install-time environment. The installer binds the exact on-disk definition to the manager's loaded identity, verifies it again immediately before clearing the blocker, and only then permits the recorder to start. Linux units and Windows tasks remain inactive during this check; launchd must load a job before exposing its loaded arguments, so the installer keeps the target history's recorder lock until trust is complete and any eager launch attempt fails before it can write history. This also makes an old binary at the same path reject the new service command instead of becoming a legacy writer. A failed replacement never restores an older auto-start definition; trust, blocker-clear, and registration failures all enter verified cleanup, and an unproven cleanup leaves the blocker in place without a timeout. A dormant or changed registration without the matching trust record blocks first-time migration and crash recovery, while an already-active v2 history does not query the service manager again. Concurrent mutation by a pre-v0.4 installer or an administrator is outside the supported cutover protocol; the final recheck narrows that unavoidable cross-version window and fails closed when it observes a change. If no managed registration exists but a recent foreground-recorder status remains, installation and uninstallation also fail closed until that process is stopped. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
 
 On systems without a supported service manager, run the recorder under tmux, Zellij, or another supervisor:
 

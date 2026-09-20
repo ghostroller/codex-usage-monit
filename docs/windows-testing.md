@@ -53,7 +53,8 @@ For the normal full pipeline, remove `--doctor`:
 
 ```zsh
 python3 scripts/macos/test-windows-utm.py \
-  --toolchain-home 'C:\Users\user'
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe'
 ```
 
 For a focused regression during development:
@@ -61,6 +62,7 @@ For a focused regression during development:
 ```zsh
 python3 scripts/macos/test-windows-utm.py \
   --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
   --focused --test-filter bounded_process::tests
 ```
 
@@ -71,6 +73,14 @@ Windows MSVC target and `--profile release` for release-mode verification.
 `--start` may start the existing stopped VM; no invocation recreates or replaces
 it. The guest test deadline defaults to 1,800 seconds and can be set with
 `--timeout` (1–7,200 seconds).
+
+`--pwsh-path` also works with full, focused, filtered, and doctor runs. When given,
+the guest validates the absolute executable path and PowerShell 7 version, then
+prepends its directory to the current process's PATH so native test subprocesses
+can launch `pwsh.exe` by name. It never writes machine or user PATH. Use this
+option for a portable runtime that is not already on PATH; without it, full and
+focused runs inherit the guest execution account's existing PATH. The result
+records the validated `pwshPath` and `pwshVersion`.
 
 For PowerShell script changes, run all three script-contract suites
 under both Windows PowerShell 5.1 and an already installed PowerShell 7:
@@ -84,16 +94,17 @@ python3 scripts/macos/test-windows-utm.py \
 
 Use the actual guest path to `pwsh.exe`; the runner does not install PowerShell or
 change the guest account. A missing or wrong-version engine is `blocked`, never
-a passing single-engine substitute. The ordinary `--doctor` probes Rust and the
-guest transport; it does not establish PowerShell 7 availability.
+a passing single-engine substitute. `--doctor` probes Rust and the guest
+transport; add `--pwsh-path` to also validate PowerShell 7 availability.
 
 The shared UTM guest retains portable PowerShell **7.6.5 ARM64** at the path
 above. It was extracted from the [official release archive](https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.zip),
 with SHA256 `20514a755d16428dc4355c85e0883c859531e71cc3e122670aa1fccdbf96ba7e`
 verified before and after transfer. Keep this directory as a reusable test tool;
 clean only the identified per-run and fixture temporary directories after saving
-their evidence. It does not change PATH and is not installed through MSI or a
-package manager. The runner does not download, update or delete this runtime.
+their evidence. It is not installed through MSI or a package manager and makes
+no persistent PATH changes. The runner does not download, update or delete this
+runtime.
 
 This mode prepares the same MSVC environment and compiles only small native
 fixtures. Each engine runs 60 verification-wrapper cases (both native-error

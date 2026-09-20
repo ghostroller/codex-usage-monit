@@ -39,7 +39,7 @@ _此图由集成测试夹具确定性生成；本地与远程验证均会检查�
 
 ### 安装 Release 程序
 
-Shell 安装器支持 x86_64 和 ARM64 架构的 macOS 与 Linux。它会使用 `SHA256SUMS` 校验 Release 压缩包；默认安装无需 `sudo`，目标目录是 `~/.local/bin`。
+Shell 安装器支持 x86_64 和 ARM64 架构的 macOS 与 Linux。它会校验 `SHA256SUMS` 和统一的 `release-manifest.json`，把完整程序放入受管版本目录；默认命令入口是 `~/.local/bin/codex-usage-monit`，无需 `sudo`。
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
@@ -62,17 +62,29 @@ sh install.sh --install-dir "$HOME/bin"
 sh install.sh --no-modify-path
 ```
 
-升级时，重新下载并运行最新版安装器，然后重启正在运行的 TUI。如果安装过后台记录服务，还要在替换可执行文件后再次运行 `codex-usage-monit service install`，让常驻进程切换到新版本。程序不提供自更新功能。
+受管安装可以通过同一个命令更新 CLI 和已有的 recorder：
 
-64 位 Windows 用户可以从[最新 Release](https://github.com/ghostroller/codex-usage-monit/releases/latest)下载 `codex-usage-monit-x86_64-pc-windows-msvc.exe` 和 `SHA256SUMS`。在 PowerShell 中校验后可按需改名，然后把 `codex-usage-monit.exe` 所在目录加入 `PATH`：
+```bash
+codex-usage-monit update
+codex-usage-monit update --version X.Y.Z
+codex-usage-monit update status --format json
+```
+
+`update` 默认下载最新正式 Release，范围默认为 `--scope node`。选择 `--scope sync` 时，只更新同步程序和已有 recorder，保留 CLI 入口。`--install-dir DIR` 指定首次建立受管 CLI 的目录；`--adopt` 明确迁移已有的手工安装 CLI。首次注册时会优先选择目标进程 PATH 中已有的 CLI，找不到时才使用默认目录。Cargo、Homebrew 等包管理器的安装位置即使使用 `--adopt` 也会被拒绝，应通过原包管理器更新。`--bundle-dir DIR` 使用明确受信任的本地发布包，不能与 `--version` 同时指定。
+
+重新运行 Shell 安装器也会调用这套更新器，并迁移所选目录中的旧手工 CLI。它会保留 recorder 的采集参数、数据路径和启用状态，验证启用服务的新进程心跳；没有安装服务时不会自动创建。更新后重启已打开的 TUI。尚无 `update` 命令的旧版本，需要先使用新 Release 的安装器；已经发布的旧 Release 和安装器继续保留。
+
+命令入口是读取 `installation.json` 版本选择的稳定启动器，不是供后台服务跟随的符号链接。recorder 固定使用某个不可变版本的绝对路径。Windows 后续升级只切换版本选择，无需覆盖正在运行的启动器；首次迁移旧 exe 时仍可能需要关闭旧进程。目录、PATH 检查和故障恢复见[应用更新说明](docs/remote-updates.md)。
+
+64 位 Windows 用户可以从[最新 Release](https://github.com/ghostroller/codex-usage-monit/releases/latest)下载 `codex-usage-monit-x86_64-pc-windows-msvc.exe` 和 `SHA256SUMS`。在 PowerShell 中校验后，用该程序建立受管安装，并将 `%LOCALAPPDATA%\codex-usage-monit\bin` 加入用户 `PATH`：
 
 ```powershell
 $binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
 $actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
 $expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
 if ($actual -ne $expected) { throw "checksum mismatch" }
-Move-Item $binary codex-usage-monit.exe
-.\codex-usage-monit.exe --version
+& ".\$binary" update
+& "$env:LOCALAPPDATA\codex-usage-monit\bin\codex-usage-monit.exe" --version
 ```
 
 ### 从源码安装
@@ -152,7 +164,8 @@ codex-usage-monit --offline snapshot --format json --compact
 | `trends` | 输出与 TUI 相同的额度和本地用量走势序列。 |
 | `health` | 统一输出 snapshot、历史、recorder 和后台服务健康状态。 |
 | `record` | 不启动 TUI，持续记录本地和账户历史。 |
-| `service` | 安装、检查或删除可选的用户级后台记录服务。 |
+| `service` | 安装、升级、检查或删除可选的用户级后台记录服务。 |
+| `update` | 更新受管应用和已有 recorder，或通过 `update status` 检查安装状态。 |
 | `remote` | 配置、测试和同步显式加入 allowlist 的 SSH 机器；自 v0.4 起提供。 |
 | `debug-startup` | 分析 TUI 占位首帧和初始数据就绪两阶段，但不进入交互模式。 |
 
@@ -229,6 +242,10 @@ codex-usage-monit --redact-content record
 
 远端标题和消息预览默认脱敏；中心的 TUI、报表和 recorder 必须使用相同策略，因此上面的命令带有 `--redact-content`。仅打开 TUI 不会启动自动 SSH 采集。前置条件、后台运行、显式开启预览、来源选择与故障恢复见 [SSH 用量汇总指南](docs/remote-usage.md)。
 
+`remote inspect HOST` 可以检查远端版本、build ID 和协议。Settings → **B Update node** 会打开范围选择：**Sync components** 更新 exporter 和已有 recorder，**Node application** 还会更新远端当前用户的受管 CLI。对应命令是 `remote deploy HOST --scope sync`（默认）和 `remote deploy HOST --scope node`。迁移手工 CLI 需要显式 `--adopt` 或启用 **Adopt manual CLI**；包管理器安装保持由原管理器负责。TUI 按主机保存范围，但每次都要重新授权接管手工入口。
+
+两种范围都下载与当前中心精确匹配的正式构建，并调用本地 `update` 使用的同一个目标机器更新器，保留源身份和 recorder 配置。服务、CLI 和更新后同步的结果分别报告，恢复步骤见[应用更新说明](docs/remote-updates.md)。未发布开发构建必须通过 `remote deploy-dev HOST --bundle-dir DIR --scope sync|node` 显式部署；正式部署不会在下载失败时自动上传本地程序，详见[版本与部署策略](docs/remote-usage.md#version-policy-during-rapid-iteration)。
+
 如果 recorder 使用非默认历史目录，所有会读写远程状态的命令都要指定同一个 source-aware 目录，例如 `codex-usage-monit --redact-content remote --history-dir /srv/codex-state/history-v1 sync buildbox`。这样配对、解绑/移除、保留来源管理与手工同步会进入 recorder 的同一个持久化域，不会静默落到平台默认目录。TUI 和服务命令应按指南配置相同的 state-root 环境变量。
 
 **Settings** 中也提供相同的逐主机控制和显式项目映射。Git 证据仍只是需要接受的建议；未映射 instance 会单独列出，可多选后明确执行手工 Merge，Split 则撤销 logical membership。同步完成后，Overview 使用两层本地数据：source-aware 统一历史独立于 Summary/Trends 的来源选择器，负责提供经过 replica 去重的 task/turn 行以及 5 小时/周窗口用量；有边界的 live 快照只负责近期状态和元数据。live 层包含活动/不确定任务以及最近 24 小时的终态记录，语义 revision 握手只在内容变化时发送完整快照，硬上限为 128 个 task、512 个 turn 和 64 KiB；没有变化时只发送 revision，本地 baseline 丢失时则强制补发完整 replacement。远端行只读，连续 15 分钟没有成功刷新后会变为 `STALE`。live 中的 task/turn 累计计数绝不会在历史缺失时冒充 5 小时或周窗口数据；历史覆盖不完整时会继续明确显示为下界。
@@ -254,7 +271,7 @@ macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低�
 codex-usage-monit service uninstall
 ```
 
-移动或替换任一可执行文件、修改 `--codex-home`，或者改变采集选项后，请重新运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 v1→v2 history cutover 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次迁移和迁移恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
+应用升级使用 `update`，它会自动协调已有服务；只把已经准备好的程序应用到 recorder 时可以使用 `service upgrade`。需要明确修改 `--codex-home`、Codex 可执行文件位置或采集选项时，再运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 v1→v2 history cutover 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次迁移和迁移恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
 
 没有受支持服务管理器的环境，可以在 tmux、Zellij 或其他 supervisor 中运行：
 

@@ -26,6 +26,29 @@ if (Test-Path -LiteralPath $gitDirectory -PathType Container) {
     $env:Path = "$gitDirectory;$env:Path"
 }
 
+function Initialize-PowerShellPath {
+    if ([string]::IsNullOrWhiteSpace($config.pwshPath)) {
+        if ($shellContracts) { throw "Shell contracts require an explicit --pwsh-path." }
+        return
+    }
+    if ($config.pwshPath -notmatch '^[A-Za-z]:[\\/]' -or
+        [IO.Path]::GetFileName($config.pwshPath) -ine "pwsh.exe" -or
+        $config.pwshPath.Contains(';') -or
+        -not (Test-Path -LiteralPath $config.pwshPath -PathType Leaf)) {
+        throw "PowerShell 7 is unavailable at --pwsh-path '$($config.pwshPath)'. Select an existing absolute guest pwsh.exe path without semicolons; this runner does not install it."
+    }
+    $pwshPath = (Get-Item -LiteralPath $config.pwshPath).FullName
+    $pwshVersion = @(& $pwshPath -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()')
+    if ($LASTEXITCODE -ne 0 -or $pwshVersion.Count -ne 1 -or $pwshVersion[0] -notmatch '^7\.') {
+        throw "The executable at --pwsh-path must run PowerShell 7."
+    }
+    # Rust tests launch pwsh.exe by name. Only this process and its descendants
+    # receive the selected portable engine; machine/user PATH is never changed.
+    $env:Path = (Split-Path -Parent $pwshPath) + ";" + $env:Path
+    $result.pwshPath = $pwshPath
+    $result.pwshVersion = $pwshVersion[0]
+}
+
 if ($Child) {
     Start-Transcript -LiteralPath $logPath -Force | Out-Null
     $childExitCode = 1
@@ -45,6 +68,13 @@ if ($Child) {
         detail = ""
     }
     try {
+        if (-not [string]::IsNullOrWhiteSpace($config.pwshPath)) {
+            $resolvedPwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source
+            if ([IO.Path]::GetFullPath($resolvedPwsh) -ine [IO.Path]::GetFullPath($config.pwshPath)) {
+                throw "The verification child did not inherit the selected PowerShell 7 on PATH."
+            }
+            Write-Host "PowerShell 7 available to test subprocesses: $resolvedPwsh"
+        }
         $arguments = @{ RepositoryPath = $sourceRoot; Profile = $config.profile }
         if ($config.target) { $arguments.Target = $config.target }
         if ($config.testFilter) { $arguments.TestFilter = $config.testFilter }
@@ -120,6 +150,8 @@ $result = [ordered]@{
     target = $config.target
     testFilter = $config.testFilter
     focused = $config.focused
+    pwshPath = ""
+    pwshVersion = ""
     logPath = $logPath
     startedAt = [DateTime]::UtcNow.ToString("o")
     commands = @()
@@ -163,6 +195,7 @@ function Invoke-VerificationChild([string]$PowerShellPath, [string]$EngineName, 
 
 $locationChanged = $false
 try {
+    Initialize-PowerShellPath
     if ($config.mode -ne "doctor") {
         $archivePath = $ConfigPath -replace '\.config\.json$', '.zip'
         $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -190,10 +223,6 @@ try {
         $powershell = Join-Path $PSHOME "powershell.exe"
         $guestDeadline = [DateTime]::UtcNow.AddSeconds([int]$config.timeoutSeconds)
         if ($shellContracts) {
-            if ($config.pwshPath -notmatch '^[A-Za-z]:[\\/]' -or
-                -not (Test-Path -LiteralPath $config.pwshPath -PathType Leaf)) {
-                throw "PowerShell 7 is unavailable at --pwsh-path '$($config.pwshPath)'. Select an existing guest pwsh.exe; this runner does not install it."
-            }
             $engines = @(
                 @{ name = "windows-powershell"; path = $powershell },
                 @{ name = "powershell-7"; path = $config.pwshPath }

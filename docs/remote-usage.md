@@ -33,18 +33,34 @@ can still install its replacement. This installation bootstrap is not support fo
 its old data protocol. A legacy protocol rejection is classified as
 `compatibility` / `agent_version_mismatch`, not as an SSH network failure.
 
-### Inspect and deploy a matching agent
+### Inspect and update a remote node
 
 ```sh
 codex-usage-monit remote inspect local-mac
-codex-usage-monit remote deploy local-mac
+codex-usage-monit remote deploy local-mac --scope sync
 codex-usage-monit remote test local-mac
+
+# Also update the remote user's managed command-line application.
+codex-usage-monit remote deploy local-mac --scope node
+
+# Explicitly migrate an existing manually installed CLI entry.
+codex-usage-monit remote deploy local-mac --scope node --adopt
 ```
 
 In TUI **Settings**, select a configured host and press **[B] Update node** (or
-click the label). **[C] Test** displays the agent version/build when available and
-checks state, rollouts, source identity and data revisions. An unpaired host can
-be deployed; pairing and enabling automatic sync remain explicit operations.
+click the whole label). The dialog offers **[S] Sync components** (exporter and
+existing recorder) or **[N] Node application** (also the managed CLI). CLI
+`remote deploy` defaults to `sync`; the TUI initially uses `sync` and remembers a
+chosen scope per host. **[A] Adopt manual CLI** is explicit authorization for one
+update and is never remembered. Package-manager paths, including Cargo and
+Homebrew, are rejected even with `--adopt`; use their own updater or keep the
+CLI unchanged with `sync`. The dialog shows the configured agent path and the
+center's target version/build. It does not claim to know an unprobed remote CLI
+version or ownership.
+
+**[C] Test** displays the agent version/build when available and checks state,
+rollouts, source identity and data revisions. An unpaired host can be deployed;
+pairing and enabling automatic sync remain explicit operations.
 
 **The normal deployment path downloads the official Release on the remote host.**
 The center probes the OS/architecture and sends a small embedded bootstrap script
@@ -53,13 +69,17 @@ over SSH. That script fetches the manifest and binary from the fixed repository
 It checks the manifest's exact source build, version, protocol, platform, bounded
 size and SHA-256 before executing the candidate installer. Downloads and redirects
 require HTTPS. There is no `latest`, older-release or local-upload fallback.
-The installer creates an immutable private copy below the SSH login's working directory:
-`.codex-usage-monit-agents/<source-build-prefix>/<target>/<binary-digest-prefix>/`.
-Directory keys use 32 build-ID and 16 binary-digest hex characters to keep Windows
-launch paths short. Verification still checks the full build ID and SHA-256. Windows
-uses an `.exe` and native backslash paths. SSH retains strict host-key checking
-and batch authentication. The remote login must have a stable writable working
-directory (normally its home directory) and HTTPS access to GitHub release assets.
+The installer creates an immutable version under the target user's platform
+application root: `~/Library/Application Support/codex-usage-monit/versions/` on
+macOS, `$XDG_DATA_HOME/codex-usage-monit/versions/` (default
+`~/.local/share/codex-usage-monit/versions/`) on Linux, or
+`%LOCALAPPDATA%\codex-usage-monit\versions\` on Windows. Each version directory
+is named `<version>-<full binary SHA256>` and contains the executable plus
+`build.json`. The remote login needs writable application storage and HTTPS
+access to GitHub Release assets. SSH retains strict host-key checking and batch
+authentication. Legacy `.codex-usage-monit-agents/` paths remain usable until an
+explicit deployment switches their references; old directories are not removed
+automatically. Existing configuration/history directories are not moved.
 Windows remotes need x64, Windows PowerShell 5.1 or later, `curl.exe`, and a cmd.exe
 or PowerShell SSH login shell. Unix remotes need `uname`, Python 3.8 or later and
 `curl`. The remote needs neither project source nor a compiler. The center does
@@ -67,13 +87,22 @@ not download or upload a local executable in this mode.
 
 The installed binary must return the expected build, target, protocol and full
 checksum, then pass the normal data probe with the existing source identity pin.
-The verified candidate next upgrades any existing application-managed recorder,
-preserving its registration options and enabled state. An absent recorder is not
-created; a disabled recorder is not started. Enabled recorders must publish a new,
-build-verified history heartbeat before the center switches `agentExecutable`
-with a configuration revision check. Paired, sync-enabled sources then perform a
-bounded real sync; incomplete verification returns exit 2 and keeps the new agent
-selected for retry. No old protocol fallback or manual cache deletion is needed.
+The verified candidate invokes the same target-machine updater used by local
+`codex-usage-monit update` and the shell installer. It upgrades any existing
+application-managed recorder, preserving its registration options and enabled
+state. An absent recorder is not created; a disabled recorder is not started.
+Enabled recorders must publish a new, build-verified history heartbeat. With
+`node`, the updater then activates the managed CLI; with `sync`, it preserves
+the CLI selection. The stable CLI is an executable launcher reading a version
+pointer from `installation.json`, not a symlink. Services always use the specific
+version's absolute path. PATH diagnostics describe the SSH process environment;
+a remote interactive shell may resolve another installation.
+
+After target activation, the center switches `agentExecutable` with a
+configuration revision check. Paired, sync-enabled sources then perform a bounded
+real sync. Component results distinguish recorder and CLI changes; incomplete
+verification returns exit 2 and keeps the activated agent selected for retry.
+No old protocol fallback or manual cache deletion is needed.
 
 Preparation failures retain the previous service/configuration. A later failure
 can leave the remote service updated while center activation is pending; retry
@@ -84,8 +113,11 @@ Previous managed builds remain on disk; an explicit old-path selection is not a
 guarantee that a downgrade can read the current state. See [remote update and
 recovery](remote-updates.md) for the complete sequence and failure semantics.
 
-Deployment preserves the source identity and global/package-manager executable;
-the upgraded recorder points at the new immutable managed build.
+Deployment preserves source identity. `sync` also preserves the existing CLI;
+`node` selects the new version for a registered CLI or an explicitly adopted
+manual CLI. Package-manager entries remain managed externally. A CLI activation
+failure after successful service upgrade is reported as partial, with both
+component outcomes retained in the target's update journal.
 A custom launcher that sets `CODEX_HOME` or state paths
 must have those same settings in the SSH login environment before using a managed
 agent; otherwise verification fails and leaves its configured launcher in place.
@@ -96,12 +128,15 @@ executable. `remote deploy --bundle-dir ...` is rejected. A development build wi
 unpublished edits must not silently install an older official binary, even when
 both binaries report the same package version.
 
-Release CI generates `.agent` (Windows: `.agent.exe`) and `.agent.json` assets
-with `scripts/package-agent.py` on each native build runner. The manifest contains
-schema version, agent identity, the fixed binary filename, byte size and SHA-256;
-it is generated from the binary's bootstrap metadata, not handwritten. Formal
-deployment requires these assets in the matching version's Release. Older
-Releases without them are not converted or used as a fallback.
+Release CI packages one standard `.tar.gz` per Unix platform and the standard
+Windows `.exe`, then merges their verified metadata into one
+`release-manifest.json` using `scripts/package-release.py`. The manifest records
+version, source build ID, protocol and each target's asset/executable size and
+SHA-256. Local installation and remote deployment share those payloads; new
+Releases no longer duplicate them as `.agent` / `.agent.exe` / `.agent.json`.
+`SHA256SUMS` and `install.sh` remain published. Already-published Releases keep
+all their assets for existing clients; the new deployment path requires the
+unified manifest instead of falling back to old assets.
 
 The trust root is the fixed official GitHub repository, its release process and
 HTTPS. **A build ID and a hash are not publisher signatures:** a replaced binary
@@ -115,12 +150,16 @@ Useful diagnostics:
 
 | Code | Meaning / next step |
 | --- | --- |
-| `agent_release_unavailable` | The required tag or agent asset returned HTTP 404; use a center build whose matching agent has been published. |
+| `agent_release_unavailable` | The required tag, unified manifest or platform asset returned HTTP 404; use a center build whose matching Release has been published. |
 | `agent_release_mismatch` | The Release exists but its build/protocol/platform differs; a development center requires a matching development bundle or a matching published center. |
 | `agent_release_invalid` | The Release manifest or asset metadata is malformed; repair the published artifacts. |
 | `agent_release_download_failed` | Remote HTTPS/curl failed; check the remote's network, curl and TLS configuration. |
 | `agent_checksum_mismatch` | Downloaded bytes differ from the manifest; the candidate is not executed. |
 | `agent_release_prepare_failed` | Remote bootstrap failed, for example because Python/PowerShell is unavailable; inspect the accompanying SSH diagnostic. |
+| `update_entry_unmanaged` | A standalone CLI already exists at the target; explicitly choose adoption or use a different initial install directory locally. |
+| `update_external_install` | The selected CLI location belongs to a package manager; update it with that manager or choose `sync`. `--adopt` does not override this. |
+| `update_entry_conflict` | The registered CLI was changed outside the updater; inspect the entry before retrying. |
+| `update_pending` | An unfinished target update has a different target/scope; resume the recorded update first. |
 
 ### Explicit development-only local upload
 
@@ -131,24 +170,27 @@ locally trusted builds:
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-agent.py target/release/codex-usage-monit --output-dir dist/agents
+python3 scripts/package-release.py package target/release/codex-usage-monit --output-dir dist/bundle
 ```
 
 Windows developers can also [cross-compile an Apple Silicon executable locally](windows-macos-cross.md).
 That workflow builds the binary on Windows; the native packaging step above is
 still required to inspect it and create its deployment manifest.
 
-For Windows use `python scripts/package-agent.py target/release/codex-usage-monit.exe
---output-dir dist/agents`. Copy the generated binary and `.agent.json` together to
-the center's bundle directory, then explicitly opt into the development CLI:
+For Windows use `python scripts/package-release.py package
+target/release/codex-usage-monit.exe --output-dir dist/bundle`. Copy the generated
+platform archive/executable and `release-manifest.json` together to the center's
+bundle directory, then explicitly opt into the development CLI:
 
 ```powershell
-cargo run -- remote deploy-dev local-mac --bundle-dir 'D:\AgentBundles\current'
+cargo run -- remote deploy-dev local-mac --bundle-dir 'D:\AgentBundles\current' --scope node
 ```
 
-This is a temporary development mechanism, not the normal updater. It prints a
-trust warning, requires an explicit directory, verifies the full metadata and
-hash, uploads through system SCP, then uses the same installation/readiness and
+The same bundle also works with local `update --bundle-dir DIR`. Development
+remote deployment accepts the same `--scope sync|node` and explicit `--adopt`
+options as official deployment. It prints a trust warning, requires an explicit
+directory, verifies the full manifest, archive and executable hashes, uploads the
+executable through system SCP, then uses the same target updater, readiness and
 configuration activation checks. It is unavailable in the TUI and is never used
 automatically after Release failure. The operator is authorizing execution of
 the supplied file; neither packaging nor its checksum proves that it is benign.

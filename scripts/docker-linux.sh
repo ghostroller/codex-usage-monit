@@ -129,7 +129,23 @@ docker run --init --rm --pull never --platform "$platform" --cap-drop ALL \
         channel=$(sed -n "s/^channel = \"\([^\"]*\)\"/\1/p" rust-toolchain.toml)
         [[ -n "$channel" ]] || { echo "missing repository Rust toolchain" >&2; exit 2; }
         export RUSTUP_TOOLCHAIN=$channel-$CODEX_USAGE_MONIT_LINUX_TRIPLE
-        rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+        cached_toolchain_ready() {
+            local tool executable
+            for tool in rustc cargo rustfmt cargo-fmt clippy-driver cargo-clippy; do
+                executable=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" "$tool" 2>/dev/null) || return 1
+                [[ "$executable" == "$RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/bin/$tool" ]] || return 1
+                "$executable" --version >/dev/null 2>&1 || return 1
+            done
+        }
+        # Even a pinned, fully installed toolchain makes `rustup install` query
+        # the distribution server. Reuse only its exact executable cache so a
+        # temporary TLS outage does not prevent an otherwise offline run.
+        if cached_toolchain_ready; then
+            echo "Using verified cached Rust toolchain: $RUSTUP_TOOLCHAIN"
+        else
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+            cached_toolchain_ready || { echo "installed Rust toolchain is incomplete or cannot execute: $RUSTUP_TOOLCHAIN" >&2; exit 2; }
+        fi
         operation=$1
         shift
         if [[ "$operation" == build ]]; then

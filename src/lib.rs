@@ -30,6 +30,7 @@ mod private_state_store;
 mod process_tree;
 pub mod project_mapping;
 mod quota_merge;
+mod release;
 mod remote_agent;
 mod remote_agent_manager;
 pub mod remote_bandwidth_budget;
@@ -71,5 +72,6 @@ pub mod trace;
 pub mod trends;
 pub mod tui;
 pub mod ui_state;
+pub mod update;
 #[cfg(windows)]
 mod windows_private_directory;

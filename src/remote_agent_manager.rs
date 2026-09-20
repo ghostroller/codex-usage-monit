@@ -14,13 +14,13 @@ use std::{
 };
 
 use crate::{
-    private_state_store::{LockFilePolicy, LockMode, PrivateStoreLayout},
+    private_state_store::PrivateStoreLayout,
     remote_protocol::REMOTE_PROTOCOL_VERSION,
     remote_transport::{SSH_OPTIONS, SshCommandEnvironment},
 };
 
 const MAX_BINARY: u64 = 128 * 1024 * 1024;
-const MAX_INFO: usize = 32 * 1024;
+const MAX_INFO: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(300);
 const TARGETS: &[&str] = &[
     "x86_64-pc-windows-msvc",
@@ -71,7 +71,7 @@ impl AgentInfo {
         Ok(self)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == 1 && self.product == "codex-usage-monit",
             "agent_info_invalid: unsupported bootstrap metadata"
@@ -101,7 +101,7 @@ impl AgentInfo {
     pub fn check_protocol(&self) -> Result<()> {
         ensure!(
             self.protocol_version == REMOTE_PROTOCOL_VERSION,
-            "agent_version_mismatch: remote {} protocol {} build {}; local {} requires protocol {} build {}. Use Settings [B] Deploy agent or remote deploy HOST. Old data protocols are not supported.",
+            "agent_version_mismatch: remote {} protocol {} build {}; local {} requires protocol {} build {}. Use Settings [B] Update node or remote deploy HOST. Old data protocols are not supported.",
             self.version,
             self.protocol_version,
             self.build_id,
@@ -156,77 +156,22 @@ fn read_binary(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn artifact_name(target: &str) -> String {
-    format!(
-        "codex-usage-monit-{target}.agent{}",
-        if target.contains("windows") {
-            ".exe"
-        } else {
-            ""
-        }
-    )
-}
-fn manifest_name(target: &str) -> String {
-    format!("codex-usage-monit-{target}.agent.json")
-}
-fn managed_executable(info: &AgentInfo, digest: &str) -> String {
-    let path = format!(
-        "./.codex-usage-monit-agents/{}/{}/{}/codex-usage-monit{}",
-        &info.build_id[..32],
-        info.target,
-        &digest[..16],
-        if info.target.contains("windows") {
-            ".exe"
-        } else {
-            ""
-        }
-    );
-    if info.target.contains("windows") {
-        path.replace('/', "\\")
-    } else {
-        path
-    }
+    crate::release::artifact_name(target)
 }
 
-/// Runs only after official download or explicit development upload verification.
-/// Publication never replaces
-/// a different build or the user's global binary/recorder installation.
+/// Candidate execution is permitted only after the bootstrap validates it.
 pub(crate) fn install_self(expected_sha256: &str) -> Result<String> {
     ensure!(
         is_hash(expected_sha256),
         "agent_checksum_invalid: expected SHA-256 must be lowercase hex"
     );
-    let bytes = read_binary(&env::current_exe()?)?;
     ensure!(
-        checksum(&bytes) == expected_sha256,
+        checksum(&read_binary(&env::current_exe()?)?) == expected_sha256,
         "agent_checksum_mismatch: candidate executable changed"
     );
-    install_bytes(&env::current_dir()?, &AgentInfo::local(), &bytes)
-}
-
-fn install_bytes(base: &Path, info: &AgentInfo, bytes: &[u8]) -> Result<String> {
-    info.validate()?;
-    let relative = managed_executable(info, &checksum(bytes));
-    let path = base.join(relative.replace('\\', "/").trim_start_matches("./"));
-    let root = base.join(".codex-usage-monit-agents");
-    let parent = path.parent().expect("managed path parent");
-    LAYOUT.create_directory_beneath(&root, parent)?;
-    let _lock = LAYOUT.open_lock(parent, LockMode::Exclusive, LockFilePolicy::Create)?;
-    match LAYOUT.read_bounded(&path) {
-        Ok(existing) => ensure!(
-            checksum(&existing) == checksum(bytes),
-            "agent_install_conflict: this build path already contains a different binary; existing agent was preserved"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            LAYOUT.write_atomically(&path, bytes)?
-        }
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(relative)
+    Ok(crate::update::install_current()?
+        .to_string_lossy()
+        .into_owned())
 }
 
 #[cfg(test)]
@@ -303,52 +248,56 @@ impl<'a> AgentConnection<'a> {
         self.output(&mut command, Duration::from_secs(45), MAX_INFO)
     }
 
-    /// The verified candidate owns service discovery, retained configuration,
-    /// replacement and crash recovery on its native platform.
-    pub fn upgrade_recorder(
+    /// The same target-machine updater is used by local CLI and remote TUI.
+    pub fn update_node(
         &self,
         installed: &str,
-    ) -> Result<crate::service::ServiceUpgradeReport> {
+        scope: crate::update::UpdateScope,
+        adopt: bool,
+        allow_dev_build: bool,
+    ) -> Result<crate::update::UpdateReport> {
         crate::remotes_config::validate_agent_executable(installed).map_err(anyhow::Error::msg)?;
-        let mut command = Command::new(self.environment.resolve_program()?);
-        command
-            .args(SSH_OPTIONS)
-            .arg("--")
-            .arg(self.host)
-            .arg(format!("{installed} service upgrade --format json"));
-        let output = self.output(&mut command, Duration::from_secs(180), MAX_INFO)?;
-        successful(&output, "agent_recorder_upgrade_failed")?;
-        let report: crate::service::ServiceUpgradeReport =
-            serde_json::from_slice(&output.stdout)
-                .context("agent_recorder_upgrade_invalid: invalid service readiness report")?;
-        ensure!(
-            report.build_id == AgentInfo::local().build_id
-                && matches!(
-                    report.outcome.as_str(),
-                    "ready" | "disabled" | "not_installed"
-                ),
-            "agent_recorder_upgrade_invalid: unexpected build or service outcome"
-        );
-        ensure!(
-            report.enabled == (report.outcome == "ready"),
-            "agent_recorder_upgrade_invalid: inconsistent enablement state"
-        );
-        if report.enabled {
-            ensure!(
-                report.outcome == "ready"
-                    && report.pid.is_some()
-                    && report.last_history_heartbeat.is_some(),
-                "agent_recorder_upgrade_invalid: enabled recorder has no verified heartbeat"
-            );
+        let scope_name = match scope {
+            crate::update::UpdateScope::Sync => "sync",
+            crate::update::UpdateScope::Node => "node",
+        };
+        let mut args = vec!["update", "apply", "--scope", scope_name, "--format", "json"];
+        if adopt {
+            args.push("--adopt");
         }
+        if allow_dev_build {
+            args.push("--allow-dev-build");
+        }
+        let mut command = Command::new(self.environment.resolve_program()?);
+        command.args(SSH_OPTIONS).arg("--").arg(self.host).arg(
+            crate::remote_transport::remote_executable_command(installed, &args),
+        );
+        let output = self.output(&mut command, Duration::from_secs(240), MAX_INFO)?;
+        // Partial results are structured so the caller can preserve a completed
+        // service replacement even if CLI activation still needs attention.
+        if !matches!(output.status.code(), Some(0..=2)) || output.stdout.is_empty() {
+            successful(&output, "agent_node_update_failed")?;
+        }
+        let report: crate::update::UpdateReport = serde_json::from_slice(&output.stdout)
+            .context("agent_node_update_invalid: invalid update result")?;
+        crate::update::validate_apply_report(
+            &report,
+            &AgentInfo::local(),
+            Path::new(installed),
+            scope,
+            output.status.code(),
+        )?;
         Ok(report)
     }
 
     pub fn inspect(&self, executable: &str, sha256: bool) -> Result<Option<AgentInfo>> {
         crate::remotes_config::validate_agent_executable(executable).map_err(anyhow::Error::msg)?;
-        let output = self.ssh(&format!(
-            "{executable} remote-agent info{}",
-            if sha256 { " --sha256" } else { "" }
+        let mut args = vec!["remote-agent", "info"];
+        if sha256 {
+            args.push("--sha256");
+        }
+        let output = self.ssh(&crate::remote_transport::remote_executable_command(
+            executable, &args,
         ))?;
         if !output.status.success() {
             let diagnostic = safe_diagnostic(&output.stderr);
@@ -534,11 +483,23 @@ impl<'a> AgentConnection<'a> {
         required: &AgentInfo,
         digest: &str,
     ) -> Result<String> {
-        let output = self.ssh(&format!(
-            "{candidate} remote-agent install --sha256 {digest}"
+        let output = self.ssh(&crate::remote_transport::remote_executable_command(
+            candidate,
+            &["remote-agent", "install", "--sha256", digest],
         ))?;
         successful(&output, "agent_install_failed")?;
-        let installed = managed_executable(required, digest);
+        let installed = String::from_utf8(output.stdout)
+            .context("agent_install_invalid: installation path is not UTF-8")?
+            .trim()
+            .to_owned();
+        crate::remotes_config::validate_agent_executable(&installed).map_err(anyhow::Error::msg)?;
+        ensure!(
+            installed.starts_with('/')
+                || installed.starts_with(r"\\")
+                || (installed.as_bytes().get(1) == Some(&b':')
+                    && matches!(installed.as_bytes().get(2), Some(b'/' | b'\\'))),
+            "agent_install_invalid: updater must return an absolute executable path"
+        );
         let actual = self
             .inspect(&installed, true)?
             .context("agent_verification_failed: installed agent has no bootstrap metadata")?;
@@ -552,23 +513,28 @@ impl<'a> AgentConnection<'a> {
         directory: &Path,
         staging: &Path,
     ) -> Result<(PathBuf, String)> {
-        let manifest = read_manifest(&directory.join(manifest_name(target)))?;
-        validate_manifest(&manifest, target)?;
-        let bytes = read_binary(&directory.join(&manifest.file))?;
-        ensure!(
-            bytes.len() as u64 == manifest.size && checksum(&bytes) == manifest.sha256,
-            "agent_checksum_mismatch: artifact differs from its manifest"
-        );
+        let mut expected = AgentInfo::local();
+        expected.target = target.to_owned();
+        let bytes = crate::release::read_bundle_binary(directory, &expected)?;
+        let digest = checksum(&bytes);
         let path = staging.join("verified-agent.bin");
         LAYOUT.write_atomically(&path, &bytes)?;
-        Ok((path, manifest.sha256))
+        Ok((path, digest))
     }
 }
 
 fn release_script(required: &AgentInfo, stage: &str) -> Result<String> {
+    preparation_script(
+        &serde_json::to_value(required)?,
+        stage,
+        required.target.contains("windows"),
+    )
+}
+
+fn preparation_script(required: &serde_json::Value, stage: &str, windows: bool) -> Result<String> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(required)?);
-    if required.target.contains("windows") {
+    if windows {
         Ok(format!(
             "{}\ntry {{ $e=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')) | ConvertFrom-Json; Invoke-ReleasePreparation $e '{stage}' | ConvertTo-Json -Depth 8 -Compress; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n",
             include_str!("remote_agent_manager/release_bootstrap.ps1")
@@ -579,6 +545,176 @@ fn release_script(required: &AgentInfo, stage: &str) -> Result<String> {
             include_str!("remote_agent_manager/release_bootstrap.py")
         ))
     }
+}
+
+/// A local update follows the explicitly trusted bundle's identity. Remote
+/// deployment separately requires a build matching its center.
+fn read_local_bundle(bundle: &Path, target: &str) -> Result<(AgentInfo, Vec<u8>)> {
+    let manifest = crate::release::ReleaseManifest::read(&bundle.join("release-manifest.json"))?;
+    manifest.artifact(target)?;
+    let expected = AgentInfo {
+        schema_version: manifest.schema_version,
+        product: manifest.product,
+        version: manifest.version,
+        build_id: manifest.build_id,
+        target: target.to_owned(),
+        protocol_version: manifest.protocol_version,
+        executable_sha256: None,
+    };
+    let binary = crate::release::read_bundle_binary(bundle, &expected)?;
+    Ok((expected, binary))
+}
+
+/// Acquisition differs only in transport; activation always runs the verified
+/// target binary's shared `update apply` command.
+pub(crate) fn update_local(
+    version: &str,
+    bundle: Option<&Path>,
+    options: &crate::update::ApplyOptions,
+) -> Result<crate::update::UpdateReport> {
+    let stage = LocalStaging::new()?;
+    let target = AgentInfo::local()
+        .target
+        .replace("-linux-gnu", "-linux-musl");
+    ensure!(
+        TARGETS.contains(&target.as_str()),
+        "release_target_unsupported: {target}"
+    );
+    let windows = target.contains("windows");
+    let (candidate, expected, digest) = if let Some(bundle) = bundle {
+        eprintln!("warning: executing an explicitly trusted development bundle");
+        let (expected, binary) = read_local_bundle(bundle, &target)?;
+        let digest = checksum(&binary);
+        let candidate = stage.0.join(if windows {
+            "candidate.exe"
+        } else {
+            "candidate"
+        });
+        LAYOUT.write_atomically(&candidate, &binary)?;
+        (candidate, expected, digest)
+    } else {
+        let version = version.strip_prefix('v').unwrap_or(version);
+        ensure!(
+            !version.is_empty()
+                && version.len() <= 80
+                && version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')),
+            "release_version_invalid: expected latest or a release version"
+        );
+        let name = format!(".codex-usage-monit-release-{}", nonce()?);
+        let required = serde_json::json!({"target": target, "version": version});
+        let input = stage.0.join("bootstrap");
+        LAYOUT.write_atomically(
+            &input,
+            preparation_script(&required, &name, windows)?.as_bytes(),
+        )?;
+        let mut command = if windows {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "& ([scriptblock]::Create([Console]::In.ReadToEnd()))",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("python3");
+            command.arg("-");
+            command
+        };
+        command.current_dir(&stage.0);
+        let output = crate::bounded_process::output_cancellable_with_stdin(
+            &mut command,
+            TIMEOUT,
+            MAX_INFO,
+            Stdio::from(fs::File::open(input)?),
+            || false,
+        )
+        .context("release_prepare_failed: local download bootstrap unavailable")?;
+        successful(&output, "release_prepare_failed")?;
+        let manifest: AgentManifest =
+            serde_json::from_slice(&output.stdout).context("release_manifest_invalid")?;
+        manifest.agent.validate()?;
+        ensure!(
+            manifest.agent.target == target
+                && (version == "latest" || manifest.agent.version == version)
+                && manifest.schema_version == 1
+                && manifest.file == artifact_name(&target)
+                && manifest.size > 0
+                && manifest.size <= MAX_BINARY
+                && is_hash(&manifest.sha256),
+            "release_manifest_invalid: downloaded identity differs"
+        );
+        (
+            stage
+                .0
+                .join(name)
+                .join(if windows { "agent.exe" } else { "agent" }),
+            manifest.agent,
+            manifest.sha256,
+        )
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))?;
+    }
+    ensure!(
+        checksum(&read_binary(&candidate)?) == digest,
+        "release_checksum_mismatch: candidate changed"
+    );
+    let output = crate::bounded_process::output(
+        Command::new(&candidate).args(["remote-agent", "info", "--sha256"]),
+        Duration::from_secs(30),
+        MAX_INFO,
+    )?;
+    successful(&output, "release_candidate_invalid")?;
+    let actual: AgentInfo = serde_json::from_slice(&output.stdout)?;
+    verify_match(&actual, &expected, &digest)?;
+    let mut command = Command::new(candidate);
+    command.args([
+        "update",
+        "apply",
+        "--scope",
+        match options.scope {
+            crate::update::UpdateScope::Sync => "sync",
+            crate::update::UpdateScope::Node => "node",
+        },
+        "--format",
+        "json",
+    ]);
+    if let Some(directory) = &options.install_dir {
+        command.arg("--install-dir").arg(directory);
+    }
+    if options.adopt {
+        command.arg("--adopt");
+    }
+    if options.allow_dev_build {
+        command.arg("--allow-dev-build");
+    }
+    let output = crate::bounded_process::output(&mut command, Duration::from_secs(300), MAX_INFO)?;
+    if !output.stderr.is_empty() {
+        eprintln!("{}", safe_diagnostic(&output.stderr));
+    }
+    let report: crate::update::UpdateReport = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("update_apply_failed: {}", safe_diagnostic(&output.stderr)))?;
+    let installed = crate::update::installation_root()?
+        .join("versions")
+        .join(format!("{}-{digest}", actual.version))
+        .join(if windows {
+            "codex-usage-monit.exe"
+        } else {
+            "codex-usage-monit"
+        });
+    crate::update::validate_apply_report(
+        &report,
+        &actual,
+        &installed,
+        options.scope,
+        output.status.code(),
+    )?;
+    Ok(report)
 }
 
 fn safe_diagnostic(bytes: &[u8]) -> String {
@@ -620,20 +756,6 @@ fn target_from_uname(text: &str) -> Result<String> {
         }
         _ => bail!("agent_target_unsupported: unsupported uname OS/architecture"),
     }
-}
-fn read_manifest(path: &Path) -> Result<AgentManifest> {
-    let file = fs::File::open(path).context("agent_artifact_missing: manifest unavailable")?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "agent_manifest_invalid: expected a regular manifest file"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_INFO as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_INFO,
-        "agent_manifest_invalid: manifest too large"
-    );
-    serde_json::from_slice(&bytes).context("agent_manifest_invalid")
 }
 fn validate_manifest(manifest: &AgentManifest, target: &str) -> Result<()> {
     manifest.agent.validate()?;
@@ -688,6 +810,24 @@ impl Drop for LocalStaging {
         // staging files. Do not recursively traverse a changed directory tree.
         if let Ok(entries) = fs::read_dir(&self.0) {
             for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".codex-usage-monit-release-")
+                {
+                    for name in [
+                        "agent",
+                        "agent.exe",
+                        "manifest.json",
+                        "payload.tar.gz",
+                        "unpacked.tar",
+                    ] {
+                        let _ = fs::remove_file(entry.path().join(name));
+                    }
+                    let _ = fs::remove_dir(entry.path());
+                    continue;
+                }
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -722,7 +862,8 @@ mod tests {
     }
 
     fn manifest(bytes: &[u8]) -> AgentManifest {
-        let info = AgentInfo::local();
+        let mut info = AgentInfo::local();
+        info.target = info.target.replace("-linux-gnu", "-linux-musl");
         AgentManifest {
             schema_version: 1,
             file: artifact_name(&info.target),
@@ -730,6 +871,69 @@ mod tests {
             size: bytes.len() as u64,
             sha256: checksum(bytes),
         }
+    }
+
+    fn managed_executable(info: &AgentInfo, digest: &str) -> String {
+        format!(
+            "{}/versions/{}-{}/codex-usage-monit{}",
+            if info.target.contains("windows") {
+                "C:/managed"
+            } else {
+                "/tmp/managed"
+            },
+            info.version,
+            digest,
+            if info.target.contains("windows") {
+                ".exe"
+            } else {
+                ""
+            }
+        )
+    }
+
+    fn manifest_name(_: &str) -> String {
+        "release-manifest.json".into()
+    }
+
+    fn bundle_payload(data: &AgentManifest, binary: &[u8]) -> Vec<u8> {
+        if data.agent.target.contains("windows") {
+            return binary.to_vec();
+        }
+        use std::io::Write;
+        let padded_size = binary.len().div_ceil(512) * 512;
+        let mut tar = vec![0; 512 + padded_size + 1024];
+        tar[..17].copy_from_slice(b"codex-usage-monit");
+        tar[124..136].copy_from_slice(format!("{:011o}\0", binary.len()).as_bytes());
+        tar[156] = b'0';
+        tar[148..156].fill(b' ');
+        let sum: u64 = tar[..512].iter().map(|b| u64::from(*b)).sum();
+        tar[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        tar[512..512 + binary.len()].copy_from_slice(binary);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&tar).unwrap();
+        gzip.finish().unwrap()
+    }
+
+    fn write_bundle(directory: &Path, binary: &[u8]) -> AgentManifest {
+        let data = manifest(binary);
+        let payload = bundle_payload(&data, binary);
+        let mut metadata = release_manifest(&data);
+        metadata["artifacts"][0]["size"] = serde_json::json!(payload.len());
+        metadata["artifacts"][0]["sha256"] = serde_json::json!(checksum(&payload));
+        fs::write(directory.join(&data.file), payload).unwrap();
+        fs::write(
+            directory.join("release-manifest.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        data
+    }
+
+    fn release_manifest(data: &AgentManifest) -> serde_json::Value {
+        serde_json::json!({"schemaVersion":1,"product":data.agent.product,"version":data.agent.version,
+            "buildId":data.agent.build_id,"protocolVersion":data.agent.protocol_version,
+            "artifacts":[{"target":data.agent.target,"file":data.file,"size":data.size,"sha256":data.sha256,
+                "binarySize":data.size,"binarySha256":data.sha256}]})
     }
 
     #[test]
@@ -764,13 +968,32 @@ mod tests {
                 "wrong_enabled" => report.enabled = false,
                 _ => {}
             }
+            let report = crate::update::UpdateReport {
+                schema_version: 1,
+                outcome: "complete".into(),
+                build_id: AgentInfo::local().build_id,
+                version: AgentInfo::local().version,
+                executable: PathBuf::from("managed-agent"),
+                scope: crate::update::UpdateScope::Sync,
+                recorder: report,
+                cli: crate::update::CliUpdateReport {
+                    outcome: "not_requested".into(),
+                    executable: None,
+                    resolved_executable: None,
+                    shadowed: false,
+                    diagnostic: None,
+                },
+                diagnostic: None,
+            };
             let runner = |command: &Command| {
                 let arguments = command
                     .get_args()
                     .map(|v| v.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" ");
-                assert!(arguments.contains("managed-agent service upgrade --format json"));
+                assert!(
+                    arguments.contains("managed-agent update apply --scope sync --format json")
+                );
                 assert!(arguments.contains("StrictHostKeyChecking=yes"));
                 Ok(output(
                     if case == "command_failed" { 1 } else { 0 },
@@ -781,11 +1004,273 @@ mod tests {
             let mut connection = AgentConnection::new("local-test", &environment).unwrap();
             connection.runner = Some(&runner);
             assert_eq!(
-                connection.upgrade_recorder("managed-agent").is_ok(),
+                connection
+                    .update_node(
+                        "managed-agent",
+                        crate::update::UpdateScope::Sync,
+                        false,
+                        false
+                    )
+                    .is_ok(),
                 matches!(case, "ready" | "disabled" | "not_installed"),
                 "{case}"
             );
         }
+    }
+
+    fn update_report(
+        scope: crate::update::UpdateScope,
+        installed: &str,
+    ) -> crate::update::UpdateReport {
+        let local = AgentInfo::local();
+        crate::update::UpdateReport {
+            schema_version: 1,
+            outcome: "complete".into(),
+            build_id: local.build_id.clone(),
+            version: local.version,
+            executable: installed.into(),
+            scope,
+            recorder: crate::service::ServiceUpgradeReport {
+                outcome: "ready".into(),
+                build_id: local.build_id,
+                enabled: true,
+                pid: Some(123),
+                last_history_heartbeat: Some(chrono::Utc::now()),
+                diagnostic: None,
+            },
+            cli: crate::update::CliUpdateReport {
+                outcome: if scope == crate::update::UpdateScope::Node {
+                    "updated"
+                } else {
+                    "not_requested"
+                }
+                .into(),
+                executable: (scope == crate::update::UpdateScope::Node)
+                    .then(|| PathBuf::from("/home/user/.local/bin/codex-usage-monit")),
+                resolved_executable: None,
+                shadowed: false,
+                diagnostic: None,
+            },
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn node_update_forwards_the_selected_scope_and_only_explicit_adoption() {
+        let environment = SshCommandEnvironment::default();
+        for scope in [
+            crate::update::UpdateScope::Sync,
+            crate::update::UpdateScope::Node,
+        ] {
+            for (adopt, allow_dev_build) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let installed = "/home/user/Application Support/codex-usage-monit/versions/agent";
+                let report = update_report(scope, installed);
+                let runner = |command: &Command| {
+                    let arguments = command
+                        .get_args()
+                        .map(|v| v.to_string_lossy())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        arguments
+                            .iter()
+                            .any(|v| v.as_ref() == "StrictHostKeyChecking=yes")
+                    );
+                    let invocation = arguments.last().unwrap();
+                    assert!(
+                        invocation.starts_with(&format!("'{installed}' update apply --scope "))
+                    );
+                    assert!(
+                        invocation.contains(if scope == crate::update::UpdateScope::Node {
+                            "--scope node --format json"
+                        } else {
+                            "--scope sync --format json"
+                        })
+                    );
+                    assert_eq!(invocation.contains(" --adopt"), adopt);
+                    assert_eq!(invocation.contains(" --allow-dev-build"), allow_dev_build);
+                    assert!(!invocation.contains("--install-dir"));
+                    Ok(output(0, &serde_json::to_vec(&report).unwrap(), b""))
+                };
+                let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+                connection.runner = Some(&runner);
+                let actual = connection
+                    .update_node(installed, scope, adopt, allow_dev_build)
+                    .unwrap();
+                assert_eq!(actual.scope, scope);
+                assert_eq!(actual.outcome, "complete");
+            }
+        }
+    }
+
+    #[test]
+    fn node_update_rejects_wrong_identity_readiness_and_false_completion() {
+        let environment = SshCommandEnvironment::default();
+        for case in [
+            "schema",
+            "version",
+            "build",
+            "path",
+            "scope",
+            "unknown_outcome",
+            "exit_status",
+            "recorder_build",
+            "recorder_pid",
+            "recorder_heartbeat",
+            "cli_pending",
+            "cli_failed",
+            "cli_not_requested",
+        ] {
+            let mut report = update_report(crate::update::UpdateScope::Node, "managed-agent");
+            let mut code = 0;
+            match case {
+                "schema" => report.schema_version = 2,
+                "version" => report.version = "0.0.1".into(),
+                "build" => report.build_id = "0".repeat(64),
+                "path" => report.executable = "another-agent".into(),
+                "scope" => report.scope = crate::update::UpdateScope::Sync,
+                "unknown_outcome" => report.outcome = "pending".into(),
+                "exit_status" => code = 2,
+                "recorder_build" => report.recorder.build_id = "0".repeat(64),
+                "recorder_pid" => report.recorder.pid = None,
+                "recorder_heartbeat" => report.recorder.last_history_heartbeat = None,
+                "cli_pending" => report.cli.outcome = "pending".into(),
+                "cli_failed" => report.cli.outcome = "failed".into(),
+                "cli_not_requested" => report.cli.outcome = "not_requested".into(),
+                _ => unreachable!(),
+            }
+            let runner = |_: &Command| Ok(output(code, &serde_json::to_vec(&report).unwrap(), b""));
+            let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+            connection.runner = Some(&runner);
+            assert!(
+                connection
+                    .update_node(
+                        "managed-agent",
+                        crate::update::UpdateScope::Node,
+                        false,
+                        false
+                    )
+                    .is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_update_preserves_partial_or_failed_reports_without_claiming_completion() {
+        let environment = SshCommandEnvironment::default();
+        for (outcome, code) in [("partial", 2), ("failed", 1)] {
+            let mut report = update_report(crate::update::UpdateScope::Node, "managed-agent");
+            report.outcome = outcome.into();
+            report.cli.outcome = if outcome == "partial" {
+                "failed"
+            } else {
+                "pending"
+            }
+            .into();
+            report.diagnostic = Some("Retry this candidate to continue".into());
+            if outcome == "failed" {
+                report.recorder.outcome = "failed".into();
+                report.recorder.enabled = false;
+                report.recorder.pid = None;
+                report.recorder.last_history_heartbeat = None;
+            }
+            let runner = |_: &Command| Ok(output(code, &serde_json::to_vec(&report).unwrap(), b""));
+            let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+            connection.runner = Some(&runner);
+            let actual = connection
+                .update_node(
+                    "managed-agent",
+                    crate::update::UpdateScope::Node,
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(actual.outcome, outcome);
+            assert_ne!(actual.outcome, "complete");
+            assert!(actual.diagnostic.is_some());
+        }
+    }
+
+    #[test]
+    fn successful_exit_cannot_hide_a_partial_update() {
+        let environment = SshCommandEnvironment::default();
+        let mut report = update_report(crate::update::UpdateScope::Node, "managed-agent");
+        report.outcome = "partial".into();
+        report.cli.outcome = "failed".into();
+        let runner = |_: &Command| Ok(output(0, &serde_json::to_vec(&report).unwrap(), b""));
+        let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+        connection.runner = Some(&runner);
+        assert!(
+            connection
+                .update_node(
+                    "managed-agent",
+                    crate::update::UpdateScope::Node,
+                    false,
+                    false
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_install_rejects_nonabsolute_or_multiline_result_before_inspection() {
+        let environment = SshCommandEnvironment::default();
+        let required = AgentInfo::local();
+        for path in [
+            b"relative-agent".as_slice(),
+            b"../agent",
+            b"",
+            b"/tmp/agent\nnoise",
+            b"/tmp/invalid-\xff",
+        ] {
+            let calls = RefCell::new(0);
+            let runner = |_: &Command| {
+                *calls.borrow_mut() += 1;
+                Ok(output(0, path, b""))
+            };
+            let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+            connection.runner = Some(&runner);
+            assert!(
+                connection
+                    .install_candidate("./candidate", &required, &checksum(b"bytes"))
+                    .is_err()
+            );
+            assert_eq!(
+                *calls.borrow(),
+                1,
+                "invalid result caused a second remote execution"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_install_accepts_native_windows_canonical_path() {
+        let environment = SshCommandEnvironment::default();
+        let required = AgentInfo::local();
+        let digest = checksum(b"bytes");
+        let installed = r"\\?\C:\Users\Name 用户\AppData\Local\codex-usage-monit\versions\selected\codex-usage-monit.exe";
+        let mut actual = required.clone();
+        actual.executable_sha256 = Some(digest.clone());
+        let calls = RefCell::new(0);
+        let runner = |_: &Command| {
+            *calls.borrow_mut() += 1;
+            Ok(if *calls.borrow() == 1 {
+                output(0, installed.as_bytes(), b"")
+            } else {
+                output(0, &serde_json::to_vec(&actual).unwrap(), b"")
+            })
+        };
+        let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+        connection.runner = Some(&runner);
+        assert_eq!(
+            connection
+                .install_candidate("./candidate", &required, &digest)
+                .unwrap(),
+            installed
+        );
+        assert_eq!(*calls.borrow(), 2);
     }
 
     #[test]
@@ -820,10 +1305,10 @@ mod tests {
     #[test]
     fn artifacts_must_match_source_build_target_version_protocol_and_checksum() {
         let mut data = manifest(b"agent");
-        validate_manifest(&data, &AgentInfo::local().target).unwrap();
+        validate_manifest(&data, &data.agent.target).unwrap();
         data.agent.build_id = "f".repeat(64);
         assert!(
-            validate_manifest(&data, &AgentInfo::local().target)
+            validate_manifest(&data, &data.agent.target)
                 .unwrap_err()
                 .to_string()
                 .contains("agent_artifact_mismatch")
@@ -844,43 +1329,9 @@ mod tests {
     }
 
     #[test]
-    fn install_is_immutable_idempotent_and_keeps_other_builds() {
-        let directory = tempfile::tempdir().unwrap();
-        let info = AgentInfo::local();
-        let first = install_bytes(directory.path(), &info, b"first").unwrap();
-        assert_eq!(
-            first,
-            install_bytes(directory.path(), &info, b"first").unwrap()
-        );
-        let second = install_bytes(directory.path(), &info, b"second build profile").unwrap();
-        assert_ne!(first, second);
-        assert_eq!(fs::read(directory.path().join(&first)).unwrap(), b"first");
-        let mut different = info.clone();
-        different.build_id = "0".repeat(64);
-        let third = install_bytes(directory.path(), &different, b"third").unwrap();
-        assert_ne!(first, third);
-        let first_path = directory.path().join(&first);
-        fs::write(&first_path, b"tampered").unwrap();
-        assert!(
-            install_bytes(directory.path(), &info, b"first")
-                .unwrap_err()
-                .to_string()
-                .contains("agent_install_conflict")
-        );
-        assert_eq!(fs::read(first_path).unwrap(), b"tampered");
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn deployment_checks_every_stage_before_returning_a_verified_path() {
         let directory = tempfile::tempdir().unwrap();
-        let data = manifest(b"test binary");
-        fs::write(directory.path().join(&data.file), b"test binary").unwrap();
-        fs::write(
-            directory.path().join(manifest_name(&data.agent.target)),
-            serde_json::to_vec(&data).unwrap(),
-        )
-        .unwrap();
+        let data = write_bundle(directory.path(), b"test binary");
         let environment = SshCommandEnvironment::default();
         for failure in ["none", "upload", "install", "checksum", "identity"] {
             let calls = RefCell::new(Vec::new());
@@ -894,6 +1345,9 @@ mod tests {
                 assert!(args.contains("StrictHostKeyChecking=yes"));
                 assert!(args.contains("BatchMode=yes"));
                 if command.get_program().to_string_lossy().contains("scp") {
+                    let arguments = command.get_args().collect::<Vec<_>>();
+                    let source = arguments[arguments.len() - 2];
+                    assert_eq!(fs::read(source).unwrap(), b"test binary");
                     return Ok(output(
                         if failure == "upload" { 1 } else { 0 },
                         b"",
@@ -938,12 +1392,12 @@ mod tests {
                 if args.contains("remote-agent install") {
                     return Ok(output(
                         if failure == "install" { 1 } else { 0 },
-                        b"installed",
+                        managed_executable(&data.agent, &data.sha256).as_bytes(),
                         b"install failure",
                     ));
                 }
                 if args.contains("remote-agent info --sha256") {
-                    let mut info = AgentInfo::local();
+                    let mut info = data.agent.clone();
                     info.executable_sha256 = Some(if failure == "checksum" {
                         "0".repeat(64)
                     } else {
@@ -1028,6 +1482,13 @@ mod tests {
                         }
                         return Ok(output(0, &serde_json::to_vec(&returned).unwrap(), b""));
                     }
+                    if args.contains("remote-agent install") {
+                        return Ok(output(
+                            0,
+                            managed_executable(&data.agent, &data.sha256).as_bytes(),
+                            b"",
+                        ));
+                    }
                     if args.contains("remote-agent info --sha256") {
                         let mut info = data.agent.clone();
                         info.executable_sha256 = Some(if failure == "verification" {
@@ -1063,6 +1524,64 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn official_unix_bootstrap_prepares_the_shared_archive_over_stdin() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let body = b"downloaded bytes, never executed during preparation";
+            let data = write_bundle(directory.path(), body);
+            fs::rename(
+                directory.path().join("release-manifest.json"),
+                directory.path().join("fixture.json"),
+            )
+            .unwrap();
+            fs::rename(
+                directory.path().join(&data.file),
+                directory.path().join("fixture.tar.gz"),
+            )
+            .unwrap();
+            if corrupt {
+                fs::write(directory.path().join("fixture.tar.gz"), b"corrupt").unwrap();
+            }
+            let stage = format!(".codex-usage-monit-release-{}", "1".repeat(32));
+            let script = release_script(&data.agent, &stage).unwrap().replace(
+                "\nimport base64, sys\ntry:",
+                "\nimport shutil\ndef receive_release_asset(url, destination, maximum):\n    fixture = 'fixture.json' if url.endswith('.json') else 'fixture.tar.gz'\n    shutil.copyfile(fixture, destination)\nimport base64, sys\ntry:",
+            );
+            let input = directory.path().join("input");
+            fs::write(&input, script).unwrap();
+            let mut command = Command::new("python3");
+            command.arg("-").current_dir(directory.path());
+            let output = crate::bounded_process::output_cancellable_with_stdin(
+                &mut command,
+                Duration::from_secs(30),
+                MAX_INFO,
+                Stdio::from(fs::File::open(input).unwrap()),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(
+                output.status.success(),
+                !corrupt,
+                "{}",
+                safe_diagnostic(&output.stderr)
+            );
+            if corrupt {
+                assert!(safe_diagnostic(&output.stderr).contains("agent_checksum_mismatch"));
+                assert!(!directory.path().join(&stage).exists());
+            } else {
+                let actual: AgentManifest = serde_json::from_slice(&output.stdout).unwrap();
+                validate_manifest(&actual, &data.agent.target).unwrap();
+                assert_eq!(actual.sha256, data.sha256);
+                assert_eq!(
+                    fs::read(directory.path().join(stage).join("agent")).unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn official_bootstrap_runs_over_stdin_in_both_windows_shells() {
@@ -1074,7 +1593,7 @@ mod tests {
                 let data = manifest(b"downloaded bytes, never executed during preparation");
                 fs::write(
                     directory.path().join("fixture.json"),
-                    serde_json::to_vec(&data).unwrap(),
+                    serde_json::to_vec(&release_manifest(&data)).unwrap(),
                 )
                 .unwrap();
                 fs::write(
@@ -1152,6 +1671,31 @@ mod tests {
     }
 
     #[test]
+    fn local_bundle_can_upgrade_beyond_the_running_build_while_remote_bundle_stays_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = write_bundle(directory.path(), b"new application build");
+        let path = directory.path().join("release-manifest.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        metadata["version"] = serde_json::json!("999.0.0");
+        metadata["buildId"] = serde_json::json!("0".repeat(64));
+        metadata["protocolVersion"] = serde_json::json!(data.agent.protocol_version + 1);
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let (identity, binary) = read_local_bundle(directory.path(), &data.agent.target).unwrap();
+        assert_eq!(identity.version, "999.0.0");
+        assert_eq!(identity.build_id, "0".repeat(64));
+        assert_eq!(identity.protocol_version, data.agent.protocol_version + 1);
+        assert_eq!(binary, b"new application build");
+        assert!(crate::release::read_bundle_binary(directory.path(), &data.agent).is_err());
+        let different_target = if data.agent.target.contains("windows") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-pc-windows-msvc"
+        };
+        assert!(read_local_bundle(directory.path(), different_target).is_err());
+    }
+
+    #[test]
     fn corrupt_or_wrong_build_bundles_never_upload() {
         let directory = tempfile::tempdir().unwrap();
         let mut data = manifest(b"agent");
@@ -1164,7 +1708,7 @@ mod tests {
             }
             fs::write(
                 directory.path().join(manifest_name(&data.agent.target)),
-                serde_json::to_vec(&data).unwrap(),
+                serde_json::to_vec(&release_manifest(&data)).unwrap(),
             )
             .unwrap();
             let staging = LocalStaging::new().unwrap();

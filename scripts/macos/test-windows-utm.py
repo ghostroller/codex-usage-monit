@@ -127,7 +127,7 @@ def main(argv=None):
     parser.add_argument("--test-filter", default="")
     parser.add_argument("--focused", action="store_true", help="run filtered Rust tests only; requires --test-filter")
     parser.add_argument("--shell-contracts", action="store_true", help="run verification, launcher and permission script contracts on both PowerShell 5.1 and 7, without project Cargo tests")
-    parser.add_argument("--pwsh-path", default="", help="existing guest PowerShell 7 executable; required with --shell-contracts")
+    parser.add_argument("--pwsh-path", default="", help="existing guest PowerShell 7 executable to expose on this run's PATH; required with --shell-contracts")
     parser.add_argument("--timeout", type=int, default=1800, help="guest verification limit in seconds")
     parser.add_argument("--output-dir", type=Path, help="host results directory; defaults to a unique temporary directory")
     args = parser.parse_args(argv)
@@ -139,8 +139,6 @@ def main(argv=None):
         parser.error("--shell-contracts cannot be combined with --doctor, --focused, --test-filter, --target, or --profile release")
     if args.shell_contracts and not args.pwsh_path.strip():
         parser.error("--shell-contracts requires --pwsh-path pointing to an existing guest PowerShell 7 executable")
-    if args.pwsh_path and not args.shell_contracts:
-        parser.error("--pwsh-path is only used with --shell-contracts")
     executable = shutil.which("utmctl")
     if not executable:
         raise GuestError("utmctl is unavailable. Install UTM and its command-line tool first.")

@@ -97,10 +97,12 @@ No native macOS tests or remote deployment were run as part of that cross-build
 verification. These identifiers describe the recorded commit; subsequent source
 changes require rebuilding both center and development agent.
 
-`scripts/package-agent.py` currently executes the target binary to obtain its
+`scripts/package-agent.py` executes the target binary to obtain its
 bootstrap metadata, so it must still run on the binary's native platform. This
 cross-build produces the executable; it does not itself produce a validated
-`.agent.json` deployment bundle or change the configured remote source.
+deployment bundle or change the configured remote source. The recorded build
+used the former `.agent.json` format; current packaging uses the shared platform
+asset and `release-manifest.json` described in [remote updates](remote-updates.md).
 
 References: [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild),
 [Rust macOS targets](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html).

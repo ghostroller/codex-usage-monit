@@ -1,0 +1,877 @@
+use super::*;
+use std::cell::Cell;
+
+fn fixture() -> (tempfile::TempDir, PathBuf, InstalledVersion) {
+    let temp = tempfile::tempdir_in(env::temp_dir().canonicalize().unwrap()).unwrap();
+    let root = temp.path().join("application");
+    let target = install_bytes(&root, &AgentInfo::local(), b"trusted candidate fixture").unwrap();
+    (temp, root, target)
+}
+
+fn options(scope: UpdateScope, adopt: bool) -> ApplyOptions {
+    ApplyOptions {
+        scope,
+        install_dir: None,
+        adopt,
+        allow_dev_build: false,
+    }
+}
+
+fn absent(target: &InstalledVersion) -> ServiceUpgradeReport {
+    ServiceUpgradeReport {
+        outcome: "not_installed".into(),
+        build_id: target.build_id.clone(),
+        enabled: false,
+        pid: None,
+        last_history_heartbeat: None,
+        diagnostic: None,
+    }
+}
+
+fn write_executable(path: &Path, bytes: &[u8]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    executable_permissions(path).unwrap();
+}
+
+#[test]
+fn immutable_install_rejects_tampering_and_retains_other_versions() {
+    let (_temp, root, first) = fixture();
+    let second = install_bytes(&root, &AgentInfo::local(), b"other candidate").unwrap();
+    assert_ne!(first.executable, second.executable);
+    assert_eq!(
+        BINARIES.read_bounded(&first.executable).unwrap(),
+        b"trusted candidate fixture"
+    );
+    fs::write(&first.executable, b"changed bytes").unwrap();
+    let error =
+        install_bytes(&root, &AgentInfo::local(), b"trusted candidate fixture").unwrap_err();
+    assert!(error.to_string().contains("update_install_conflict"));
+    assert_eq!(fs::read(first.executable).unwrap(), b"changed bytes");
+    validate_version(&root, &second).unwrap();
+}
+
+#[test]
+fn standalone_adoption_requires_explicit_choice_before_recorder_mutation() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let entry = directory.join(BINARY_NAME);
+    write_executable(&entry, b"existing user executable");
+    let invoked = Cell::new(false);
+    let error = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || {
+            invoked.set(true);
+            Ok(absent(&target))
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_entry_unmanaged"));
+    assert!(!invoked.get());
+    assert_eq!(fs::read(&entry).unwrap(), b"existing user executable");
+    assert!(!root.join(JOURNAL).exists());
+}
+
+#[test]
+fn node_update_adopts_standalone_cli_retaining_backup_without_installing_service() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let entry = directory.join(BINARY_NAME);
+    write_executable(&entry, b"existing user executable");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, true),
+        &directory,
+        Some(directory.as_os_str()),
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "complete");
+    assert_eq!(report.recorder.outcome, "not_installed");
+    assert_eq!(report.cli.outcome, "updated");
+    assert!(!report.cli.shadowed);
+    assert_eq!(
+        fs::read(
+            root.join("adopted-cli")
+                .join(digest(b"existing user executable"))
+        )
+        .unwrap(),
+        b"existing user executable"
+    );
+    assert_eq!(
+        proxy_target(&root, &entry).unwrap(),
+        Some(target.executable.clone())
+    );
+    assert_eq!(proxy_target(&root, &target.executable).unwrap(), None);
+}
+
+#[test]
+fn sync_update_preserves_cli_and_never_registers_it() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let entry = directory.join(BINARY_NAME);
+    write_executable(&entry, b"unmanaged CLI remains unchanged");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Sync, false),
+        &directory,
+        None,
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "complete");
+    assert_eq!(report.cli.outcome, "not_requested");
+    assert_eq!(
+        fs::read(&entry).unwrap(),
+        b"unmanaged CLI remains unchanged"
+    );
+    assert!(!root.join(REGISTRATION).exists());
+}
+
+#[test]
+fn later_update_changes_pointer_without_replacing_open_launcher() {
+    let (temp, root, first) = fixture();
+    let directory = temp.path().join("bin");
+    apply_at(
+        &root,
+        first.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&first)),
+    )
+    .unwrap();
+    let entry = directory.join(BINARY_NAME);
+    let initial = fs::read(&entry).unwrap();
+    let mut reader = File::open(&entry).unwrap();
+    let second = install_bytes(&root, &AgentInfo::local(), b"later candidate fixture").unwrap();
+    let report = apply_at(
+        &root,
+        second.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&second)),
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "complete");
+    assert_eq!(fs::read(&entry).unwrap(), initial);
+    let mut held = Vec::new();
+    reader.read_to_end(&mut held).unwrap();
+    assert_eq!(held, initial);
+    assert_eq!(
+        proxy_target(&root, &entry).unwrap(),
+        Some(second.executable)
+    );
+    assert!(first.executable.exists());
+}
+
+#[test]
+fn recorder_failure_is_durable_and_retry_completes_forward() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let first = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || bail!("fixture recorder failure"),
+    )
+    .unwrap();
+    assert_eq!(first.outcome, "failed");
+    assert_eq!(first.recorder.outcome, "failed");
+    assert!(!directory.join(BINARY_NAME).exists());
+    let journal: UpdateJournal = read_json(&root.join(JOURNAL)).unwrap().unwrap();
+    assert_eq!(journal.phase, "failed");
+    assert!(
+        journal
+            .report
+            .diagnostic
+            .unwrap()
+            .contains("fixture recorder failure")
+    );
+    let second = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    assert_eq!(second.outcome, "complete");
+    assert_eq!(
+        proxy_target(&root, &directory.join(BINARY_NAME)).unwrap(),
+        Some(target.executable)
+    );
+}
+
+#[test]
+fn pending_update_does_not_silently_change_scope_or_candidate() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || bail!("fixture recorder failure"),
+    )
+    .unwrap();
+    let error = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Sync, false),
+        &directory,
+        None,
+        || panic!("must not mutate recorder"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_pending"));
+    let other = install_bytes(&root, &AgentInfo::local(), b"different candidate").unwrap();
+    let error = apply_at(
+        &root,
+        other,
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || panic!("must not mutate recorder"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_pending"));
+}
+
+#[test]
+fn cli_conflict_after_service_upgrade_reports_partial_and_preserves_changed_file() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let entry = directory.join(BINARY_NAME);
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || {
+            write_executable(&entry, b"concurrent user installation");
+            Ok(absent(&target))
+        },
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "partial");
+    assert_eq!(report.recorder.outcome, "not_installed");
+    assert_eq!(report.cli.outcome, "failed");
+    assert_eq!(fs::read(&entry).unwrap(), b"concurrent user installation");
+    let retry = apply_at(
+        &root,
+        target,
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || panic!("preflight must reject the conflict"),
+    );
+    assert!(
+        retry
+            .unwrap_err()
+            .to_string()
+            .contains("update_entry_conflict")
+    );
+}
+
+#[test]
+fn crash_after_launcher_publication_can_finish_registration() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let plan = plan_cli(
+        &root,
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        &target,
+    )
+    .unwrap();
+    write_executable(
+        &plan.executable,
+        &BINARIES.read_bounded(&target.executable).unwrap(),
+    );
+    assert!(!root.join(REGISTRATION).exists());
+    activate_cli(&root, &plan, &target).unwrap();
+    assert_eq!(
+        proxy_target(&root, &plan.executable).unwrap(),
+        Some(target.executable)
+    );
+}
+
+#[test]
+fn ownership_rejects_package_manager_even_with_adoption() {
+    let (temp, root, target) = fixture();
+    for path in [
+        ".cargo/bin",
+        "homebrew/bin",
+        "scoop/apps/bin",
+        "Cellar/package/bin",
+    ] {
+        let directory = temp.path().join(path);
+        let error = plan_cli(
+            &root,
+            &options(UpdateScope::Node, true),
+            &directory,
+            None,
+            &target,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("update_external_install"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn adoption_never_replaces_a_symlink_or_its_target() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    fs::create_dir(&directory).unwrap();
+    let other = temp.path().join("other-cli");
+    write_executable(&other, b"other owner");
+    std::os::unix::fs::symlink(&other, directory.join(BINARY_NAME)).unwrap();
+    let error = plan_cli(
+        &root,
+        &options(UpdateScope::Node, true),
+        &directory,
+        None,
+        &target,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_entry_unmanaged"));
+    assert_eq!(fs::read(&other).unwrap(), b"other owner");
+}
+
+#[test]
+fn path_shadowing_is_reported_without_changing_shell_profiles() {
+    let (temp, root, target) = fixture();
+    let shadow_directory = temp.path().join("other-bin");
+    let shadow = shadow_directory.join(BINARY_NAME);
+    write_executable(&shadow, b"existing PATH application");
+    let directory = temp.path().join("bin");
+    let path = env::join_paths([&shadow_directory, &directory]).unwrap();
+    let mut explicit = options(UpdateScope::Node, false);
+    explicit.install_dir = Some(directory.clone());
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &explicit,
+        &directory,
+        Some(&path),
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    assert!(report.cli.shadowed);
+    assert_eq!(report.cli.resolved_executable, Some(shadow.clone()));
+    assert_eq!(fs::read(shadow).unwrap(), b"existing PATH application");
+}
+
+#[test]
+fn update_holds_mutation_lock_during_recorder_cutover() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Sync, false),
+        &directory,
+        None,
+        || {
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(STORE.lock_file_name))
+                .unwrap();
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            Ok(absent(&target))
+        },
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "complete");
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(STORE.lock_file_name))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+    drop(crate::file_lock::FileLock::from_locked(contender));
+}
+
+#[test]
+fn launcher_rejects_a_tampered_target_instead_of_running_it() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    fs::write(&target.executable, b"changed target").unwrap();
+    let error = proxy_target(&root, &directory.join(BINARY_NAME)).unwrap_err();
+    assert!(error.to_string().contains("update_checksum_mismatch"));
+}
+
+#[test]
+fn semantic_downgrade_is_never_enabled_by_development_override() {
+    for (older, newer) in [
+        ("0.5.0", "0.6.0"),
+        ("1.0.0-rc.2", "1.0.0-rc.10"),
+        ("1.0.0-rc.1", "1.0.0"),
+        ("1.2.9", "1.2.10"),
+    ] {
+        let error = ensure_not_downgrade(older, "a", newer, Some("b"), true).unwrap_err();
+        assert!(error.to_string().contains("update_downgrade_blocked"));
+        ensure_not_downgrade(newer, "b", older, Some("a"), false).unwrap();
+    }
+    assert!(
+        ensure_not_downgrade("0.6.0", "a", "0.6.0", Some("b"), false)
+            .unwrap_err()
+            .to_string()
+            .contains("update_build_conflict")
+    );
+    ensure_not_downgrade("0.6.0", "a", "0.6.0", Some("b"), true).unwrap();
+    ensure_not_downgrade("0.6.0+build", "a", "0.6.0", Some("a"), false).unwrap();
+}
+
+#[test]
+fn sync_cannot_downgrade_shared_state_below_managed_cli_version() {
+    let (temp, root, mut target) = fixture();
+    let directory = temp.path().join("bin");
+    let mut new_info = AgentInfo::local();
+    new_info.version = "99.0.0".into();
+    let newer = install_bytes(&root, &new_info, b"newer version").unwrap();
+    apply_at(
+        &root,
+        newer.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&newer)),
+    )
+    .unwrap();
+    target.version = AgentInfo::local().version;
+    let error = apply_at(
+        &root,
+        target,
+        &options(UpdateScope::Sync, false),
+        &directory,
+        None,
+        || panic!("must not downgrade recorder"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_downgrade_blocked"));
+}
+
+fn version_id(version: &InstalledVersion) -> String {
+    version
+        .executable
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into()
+}
+
+#[test]
+fn prune_requires_explicit_ids_and_external_reference_acknowledgement() {
+    for options in [
+        PruneOptions {
+            versions: vec![],
+            apply: true,
+            acknowledge_unreferenced: true,
+        },
+        PruneOptions {
+            versions: vec!["some-version".into()],
+            apply: true,
+            acknowledge_unreferenced: false,
+        },
+    ] {
+        assert!(validate_prune_options(&options).is_err());
+    }
+    for id in ["../other", "/absolute", "..", "a\\b"] {
+        assert!(
+            validate_prune_options(&PruneOptions {
+                versions: vec![id.into()],
+                apply: false,
+                acknowledge_unreferenced: false
+            })
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn prune_keeps_current_service_cli_and_pending_references() {
+    let (temp, root, current) = fixture();
+    let cli = install_bytes(&root, &AgentInfo::local(), b"selected cli").unwrap();
+    let service = install_bytes(&root, &AgentInfo::local(), b"registered recorder").unwrap();
+    let pending = install_bytes(&root, &AgentInfo::local(), b"pending update").unwrap();
+    let unused = install_bytes(&root, &AgentInfo::local(), b"unused old version").unwrap();
+    let directory = temp.path().join("bin");
+    apply_at(
+        &root,
+        cli.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&cli)),
+    )
+    .unwrap();
+    apply_at(
+        &root,
+        pending.clone(),
+        &options(UpdateScope::Sync, false),
+        &directory,
+        None,
+        || bail!("pending fixture"),
+    )
+    .unwrap();
+    let all = [&current, &cli, &service, &pending, &unused];
+    let report = prune_at(
+        &root,
+        &PruneOptions {
+            versions: all.iter().map(|v| version_id(v)).collect(),
+            apply: true,
+            acknowledge_unreferenced: true,
+        },
+        &current.executable,
+        std::slice::from_ref(&service.executable),
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .versions
+            .iter()
+            .filter(|v| v.action == "kept")
+            .count(),
+        4
+    );
+    assert_eq!(
+        report
+            .versions
+            .iter()
+            .filter(|v| v.action == "removed")
+            .count(),
+        1
+    );
+    for item in [&current, &cli, &service, &pending] {
+        assert!(item.executable.exists());
+    }
+    assert!(!unused.executable.exists());
+}
+
+#[test]
+fn prune_is_dry_by_default_and_keeps_unknown_contents() {
+    let (_temp, root, current) = fixture();
+    let old = install_bytes(&root, &AgentInfo::local(), b"unused old version").unwrap();
+    let unknown = install_bytes(&root, &AgentInfo::local(), b"unknown extra contents").unwrap();
+    fs::write(
+        unknown.executable.parent().unwrap().join("user-file"),
+        b"retain me",
+    )
+    .unwrap();
+    let report = prune_at(
+        &root,
+        &PruneOptions {
+            versions: vec![],
+            apply: false,
+            acknowledge_unreferenced: false,
+        },
+        &current.executable,
+        &[],
+    )
+    .unwrap();
+    assert!(
+        report
+            .versions
+            .iter()
+            .any(|v| v.id == version_id(&old) && v.action == "candidate")
+    );
+    assert!(
+        report
+            .versions
+            .iter()
+            .any(|v| v.id == version_id(&unknown) && v.action == "unknown")
+    );
+    assert!(old.executable.exists());
+    assert!(unknown.executable.exists());
+}
+
+#[test]
+fn reexecuted_candidate_reports_require_identity_scope_and_exit_agreement() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("bin");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    let info = AgentInfo::local();
+    validate_apply_report(
+        &report,
+        &info,
+        &target.executable,
+        UpdateScope::Node,
+        Some(0),
+    )
+    .unwrap();
+    for mutation in 0..8 {
+        let mut changed = report.clone();
+        let mut exit = Some(0);
+        match mutation {
+            0 => changed.schema_version = 2,
+            1 => changed.build_id = "a".repeat(64),
+            2 => changed.version = "0.0.0".into(),
+            3 => changed.executable = directory.join("unexpected"),
+            4 => changed.scope = UpdateScope::Sync,
+            5 => changed.outcome = "partial".into(),
+            6 => exit = Some(2),
+            7 => changed.cli.executable = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_apply_report(&changed, &info, &target.executable, UpdateScope::Node, exit)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_directory_alias_cannot_hide_package_manager_ownership() {
+    let (temp, root, target) = fixture();
+    let manager = temp.path().join("homebrew");
+    fs::create_dir_all(manager.join("bin")).unwrap();
+    let alias = temp.path().join("friendly-name");
+    std::os::unix::fs::symlink(&manager, &alias).unwrap();
+    let error = plan_cli(
+        &root,
+        &options(UpdateScope::Node, true),
+        &alias.join("bin"),
+        None,
+        &target,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_external_install"));
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_install_parent_registers_physical_launcher_path() {
+    let (temp, root, target) = fixture();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let directory = alias.join("bin");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        Some(directory.as_os_str()),
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    let physical = real.join("bin").join(BINARY_NAME);
+    assert_eq!(report.cli.executable, Some(physical.clone()));
+    assert!(!report.cli.shadowed);
+    assert_eq!(
+        proxy_target(&root, &physical).unwrap(),
+        Some(target.executable)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_proxy_leaves_console_close_to_default_handler() {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT};
+    assert_eq!(unsafe { proxy_console_control(CTRL_C_EVENT) }, 1);
+    assert_eq!(unsafe { proxy_console_control(CTRL_BREAK_EVENT) }, 1);
+    assert_eq!(unsafe { proxy_console_control(CTRL_CLOSE_EVENT) }, 0);
+}
+
+#[test]
+fn discovered_path_cli_requires_adoption_before_recorder_changes() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("custom-bin");
+    let entry = directory.join(BINARY_NAME);
+    let default = temp.path().join("default-bin");
+    write_executable(&entry, b"existing PATH executable");
+    let error = apply_at(
+        &root,
+        target,
+        &options(UpdateScope::Node, false),
+        &default,
+        Some(directory.as_os_str()),
+        || panic!("must reject unmanaged PATH CLI before service mutation"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_entry_unmanaged"));
+    assert!(!root.join(JOURNAL).exists());
+    assert!(!default.exists());
+    assert_eq!(fs::read(entry).unwrap(), b"existing PATH executable");
+}
+
+#[test]
+fn explicit_adoption_updates_the_discovered_path_entry() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("custom-bin");
+    let entry = directory.join(BINARY_NAME);
+    let default = temp.path().join("default-bin");
+    write_executable(&entry, b"existing PATH executable");
+    let report = apply_at(
+        &root,
+        target.clone(),
+        &options(UpdateScope::Node, true),
+        &default,
+        Some(directory.as_os_str()),
+        || Ok(absent(&target)),
+    )
+    .unwrap();
+    assert_eq!(report.outcome, "complete");
+    assert_eq!(report.cli.executable, Some(entry.clone()));
+    assert!(!report.cli.shadowed);
+    assert!(!default.exists());
+    assert_eq!(
+        proxy_target(&root, &entry).unwrap(),
+        Some(target.executable)
+    );
+}
+
+#[test]
+fn registered_cli_takes_precedence_over_a_different_path_entry() {
+    let (temp, root, first) = fixture();
+    let directory = temp.path().join("managed-bin");
+    apply_at(
+        &root,
+        first.clone(),
+        &options(UpdateScope::Node, false),
+        &directory,
+        None,
+        || Ok(absent(&first)),
+    )
+    .unwrap();
+    let other_directory = temp.path().join("other-bin");
+    let other = other_directory.join(BINARY_NAME);
+    write_executable(&other, b"other PATH executable");
+    let second = install_bytes(&root, &AgentInfo::local(), b"next candidate").unwrap();
+    let report = apply_at(
+        &root,
+        second.clone(),
+        &options(UpdateScope::Node, false),
+        &temp.path().join("default-bin"),
+        Some(other_directory.as_os_str()),
+        || Ok(absent(&second)),
+    )
+    .unwrap();
+    assert_eq!(report.cli.executable, Some(directory.join(BINARY_NAME)));
+    assert!(report.cli.shadowed);
+    assert_eq!(fs::read(other).unwrap(), b"other PATH executable");
+}
+
+#[test]
+fn discovered_package_manager_cli_cannot_be_adopted() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join(".cargo/bin");
+    let entry = directory.join(BINARY_NAME);
+    write_executable(&entry, b"package manager executable");
+    let error = apply_at(
+        &root,
+        target,
+        &options(UpdateScope::Node, true),
+        &temp.path().join("default-bin"),
+        Some(directory.as_os_str()),
+        || panic!("must reject package manager CLI before service mutation"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_external_install"));
+    assert_eq!(fs::read(entry).unwrap(), b"package manager executable");
+}
+
+#[cfg(unix)]
+#[test]
+fn discovered_path_symlink_is_not_resolved_into_an_adoptable_target() {
+    let (temp, root, target) = fixture();
+    let directory = temp.path().join("path-bin");
+    fs::create_dir(&directory).unwrap();
+    let real = temp.path().join("other-bin").join(BINARY_NAME);
+    write_executable(&real, b"separately owned target");
+    let entry = directory.join(BINARY_NAME);
+    std::os::unix::fs::symlink(&real, &entry).unwrap();
+    assert_eq!(
+        resolve_path_entry(Some(directory.as_os_str())),
+        Some(entry.clone())
+    );
+    let error = apply_at(
+        &root,
+        target,
+        &options(UpdateScope::Node, true),
+        &temp.path().join("default-bin"),
+        Some(directory.as_os_str()),
+        || panic!("must reject symlink CLI before service mutation"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("update_entry_unmanaged"));
+    assert!(
+        fs::symlink_metadata(entry)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(real).unwrap(), b"separately owned target");
+}
+
+#[test]
+fn immutable_agent_directories_cannot_become_cli_entries() {
+    let (temp, root, target) = fixture();
+    let legacy = temp
+        .path()
+        .join(".codex-usage-monit-agents/build/target/digest");
+    write_executable(&legacy.join(BINARY_NAME), b"legacy immutable agent");
+    for directory in [target.executable.parent().unwrap(), legacy.as_path()] {
+        let entry = directory.join(BINARY_NAME);
+        let original = fs::read(&entry).unwrap();
+        for explicit in [false, true] {
+            let mut selected = options(UpdateScope::Node, true);
+            selected.install_dir = explicit.then(|| directory.to_path_buf());
+            let error = apply_at(
+                &root,
+                target.clone(),
+                &selected,
+                &temp.path().join("default-bin"),
+                Some(directory.as_os_str()),
+                || panic!("immutable CLI target must fail before service mutation"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("update_entry_conflict"));
+            assert!(error.to_string().contains("immutable"));
+            assert_eq!(fs::read(&entry).unwrap(), original);
+            assert!(!root.join(JOURNAL).exists());
+        }
+    }
+}

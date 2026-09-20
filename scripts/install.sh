@@ -20,7 +20,7 @@ esac
 
 usage() {
     cat <<'EOF'
-Install codex-usage-monit from GitHub Releases.
+Install or update codex-usage-monit and its existing recorder from GitHub Releases.
 
 Usage:
   install.sh [--version latest|[v]X.Y.Z]
@@ -143,12 +143,10 @@ asset="$BINARY_NAME-$target.tar.gz"
 base_url="https://github.com/$REPOSITORY/$RELEASE_PATH"
 temp_root=${TMPDIR:-/tmp}
 work_dir=
-staged_binary=
 profile_temp=
 
 cleanup() {
     [ -z "$profile_temp" ] || rm -f "$profile_temp"
-    [ -z "$staged_binary" ] || rm -f "$staged_binary"
     [ -z "$work_dir" ] || rm -rf "$work_dir"
 }
 trap cleanup 0
@@ -159,27 +157,37 @@ trap 'exit 143' TERM
 work_dir=$(mktemp -d "$temp_root/codex-usage-monit.XXXXXX")
 archive="$work_dir/$asset"
 checksums="$work_dir/SHA256SUMS"
+manifest="$work_dir/release-manifest.json"
 
 download() {
     destination=$1
     url=$2
+    maximum=$3
     curl \
         --proto '=https' \
+        --proto-redir '=https' \
         --tlsv1.2 \
         --fail \
         --location \
         --silent \
         --show-error \
         --retry 3 \
+        --connect-timeout 10 \
+        --max-time 120 \
+        --max-filesize "$maximum" \
         --output "$destination" \
         "$url"
 }
 
 info "Downloading $asset from $REPOSITORY..."
-download "$archive" "$base_url/$asset"
-download "$checksums" "$base_url/SHA256SUMS"
+download "$archive" "$base_url/$asset" 134217728
+download "$checksums" "$base_url/SHA256SUMS" 32768
+download "$manifest" "$base_url/release-manifest.json" 32768
 
-if ! expected_checksum=$(awk -v name="$asset" '
+verify_checksum() {
+checked_path=$1
+checked_name=$2
+if ! expected_checksum=$(awk -v name="$checked_name" '
     $2 == name {
         if (length($1) != 64 || $1 ~ /[^0-9A-Fa-f]/) exit 2
         count += 1
@@ -190,18 +198,21 @@ if ! expected_checksum=$(awk -v name="$asset" '
         else exit 1
     }
 ' "$checksums"); then
-    die "SHA256SUMS does not contain exactly one valid checksum for $asset"
+    die "SHA256SUMS does not contain exactly one valid checksum for $checked_name"
 fi
 
 case "$checksum_tool" in
     sha256sum)
-        actual_checksum=$(sha256sum "$archive" | awk '{ print tolower($1) }')
+        actual_checksum=$(sha256sum "$checked_path" | awk '{ print tolower($1) }')
         ;;
     shasum)
-        actual_checksum=$(shasum -a 256 "$archive" | awk '{ print tolower($1) }')
+        actual_checksum=$(shasum -a 256 "$checked_path" | awk '{ print tolower($1) }')
         ;;
 esac
-[ "$actual_checksum" = "$expected_checksum" ] || die "checksum verification failed for $asset"
+[ "$actual_checksum" = "$expected_checksum" ] || die "checksum verification failed for $checked_name"
+}
+verify_checksum "$archive" "$asset"
+verify_checksum "$manifest" release-manifest.json
 
 if ! archive_members=$(tar -tzf "$archive"); then
     die "could not read $asset"
@@ -220,8 +231,16 @@ extracted_binary="$extract_dir/$BINARY_NAME"
 [ -f "$extracted_binary" ] && [ ! -L "$extracted_binary" ] \
     || die "release archive did not contain a regular binary"
 chmod 0755 "$extracted_binary"
-"$extracted_binary" --version >/dev/null \
-    || die "downloaded binary failed its version check"
+# The checksum-verified candidate validates the shared manifest, its own bytes,
+# build identity and the requested version before the update executor can mutate
+# any installation. This keeps the shell installer independent of Python/jq.
+if [ "$VERSION" = latest ]; then
+    "$extracted_binary" update verify-release --manifest "$manifest" --target "$target" >/dev/null \
+        || die "downloaded binary failed release identity verification"
+else
+    "$extracted_binary" update verify-release --manifest "$manifest" --target "$target" --version "${VERSION#v}" >/dev/null \
+        || die "downloaded binary failed release identity verification"
+fi
 
 case "$INSTALL_DIR" in
     /*) ;;
@@ -236,11 +255,8 @@ fi
 if [ -e "$destination" ] && [ ! -f "$destination" ] && [ ! -L "$destination" ]; then
     die "install destination is not a regular file: $destination"
 fi
-staged_binary=$(mktemp "$INSTALL_DIR/.codex-usage-monit.XXXXXX")
-cp "$extracted_binary" "$staged_binary"
-chmod 0755 "$staged_binary"
-mv -f "$staged_binary" "$destination"
-staged_binary=
+"$extracted_binary" update apply --scope node --install-dir "$INSTALL_DIR" --adopt \
+    || die "application update failed; retry to resume the recorded update"
 
 quote_shell_word() {
     escaped=$(printf '%s' "$1" | sed "s/'/'\"'\"'/g")

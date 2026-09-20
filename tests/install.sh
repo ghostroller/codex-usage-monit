@@ -33,11 +33,30 @@ mkdir -p "$fixture_dir" "$release_dir" "$mock_bin" "$temp_dir"
 
 cat > "$fixture_dir/codex-usage-monit" <<'EOF'
 #!/bin/sh
-if [ "${1:-}" = "--version" ]; then
-    printf 'codex-usage-monit 0.1.0\n'
-    exit 0
-fi
-printf 'fixture binary\n'
+case "${1:-} ${2:-}" in
+    'update verify-release')
+        shift 2
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --manifest) [ -f "$2" ] || exit 2; shift 2 ;;
+                --target) shift 2 ;;
+                --version) [ "$2" = 0.1.0 ] || exit 3; shift 2 ;;
+                *) exit 4 ;;
+            esac
+        done
+        exit 0
+        ;;
+    'update apply')
+        [ "$3" = --scope ] && [ "$4" = node ] && [ "$5" = --install-dir ] && [ "$7" = --adopt ] || exit 5
+        mkdir -p "$6"
+        cp "$0" "$6/codex-usage-monit"
+        chmod 755 "$6/codex-usage-monit"
+        printf 'candidate update executor invoked\n'
+        exit 0
+        ;;
+    '--version ') printf 'codex-usage-monit 0.1.0\n'; exit 0 ;;
+esac
+exit 6
 EOF
 chmod 0755 "$fixture_dir/codex-usage-monit"
 
@@ -51,12 +70,14 @@ do
         -C "$fixture_dir" codex-usage-monit
 done
 
+printf '{"version":"0.1.0"}\n' > "$release_dir/release-manifest.json"
+
 (
     cd "$release_dir"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum codex-usage-monit-*.tar.gz | sort -k 2 > SHA256SUMS
+        sha256sum codex-usage-monit-*.tar.gz release-manifest.json | sort -k 2 > SHA256SUMS
     else
-        shasum -a 256 codex-usage-monit-*.tar.gz | sort -k 2 > SHA256SUMS
+        shasum -a 256 codex-usage-monit-*.tar.gz release-manifest.json | sort -k 2 > SHA256SUMS
     fi
 )
 
@@ -290,30 +311,32 @@ unsafe_fixture="$TEST_ROOT/unsafe-fixture"
 unsafe_release="$TEST_ROOT/unsafe-release"
 mkdir -p "$unsafe_fixture" "$unsafe_release"
 cp "$fixture_dir/codex-usage-monit" "$unsafe_fixture/codex-usage-monit"
+cp "$release_dir/release-manifest.json" "$unsafe_release/"
 printf 'unexpected member\n' > "$unsafe_fixture/extra.txt"
 tar -czf "$unsafe_release/codex-usage-monit-aarch64-apple-darwin.tar.gz" \
     -C "$unsafe_fixture" codex-usage-monit extra.txt
 (
     cd "$unsafe_release"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum codex-usage-monit-aarch64-apple-darwin.tar.gz > SHA256SUMS
+        sha256sum codex-usage-monit-aarch64-apple-darwin.tar.gz release-manifest.json > SHA256SUMS
     else
-        shasum -a 256 codex-usage-monit-aarch64-apple-darwin.tar.gz > SHA256SUMS
+        shasum -a 256 codex-usage-monit-aarch64-apple-darwin.tar.gz release-manifest.json > SHA256SUMS
     fi
 )
 mock_release_dir=$unsafe_release
 mock_uname_s=Darwin
 mock_uname_m=arm64
 unsafe_home="$TEST_ROOT/home-unsafe-archive"
-if run_installer "$unsafe_home" --no-modify-path >/dev/null 2>&1; then
+if run_installer "$unsafe_home" --no-modify-path >"$TEST_ROOT/unsafe.log" 2>&1; then
     fail "archive with unexpected members unexpectedly succeeded"
 fi
+assert_file_contains "$TEST_ROOT/unsafe.log" "release archive has unexpected members"
 [ ! -e "$unsafe_home/.local/bin/codex-usage-monit" ] \
     || fail "unsafe archive installed a binary"
 
 bad_release="$TEST_ROOT/bad-release"
 mkdir -p "$bad_release"
-cp "$release_dir"/*.tar.gz "$bad_release/"
+cp "$release_dir"/*.tar.gz "$release_dir/release-manifest.json" "$bad_release/"
 awk -v name="codex-usage-monit-x86_64-unknown-linux-musl.tar.gz" '
     $2 == name { $1 = "0000000000000000000000000000000000000000000000000000000000000000" }
     { print $1 "  " $2 }
@@ -331,6 +354,15 @@ fi
     || fail "failed install replaced the existing binary"
 
 mock_release_dir=$release_dir
+mock_uname_s=Darwin
+mock_uname_m=arm64
+wrong_version_home="$TEST_ROOT/home-wrong-version"
+if run_installer "$wrong_version_home" --version 9.9.9 --no-modify-path >/dev/null 2>&1; then
+    fail "mismatched release version unexpectedly succeeded"
+fi
+[ ! -e "$wrong_version_home/.local/bin/codex-usage-monit" ] \
+    || fail "identity verification failure reached the update executor"
+
 mock_uname_s=Plan9
 mock_uname_m=mips
 if run_installer "$TEST_ROOT/home-unsupported" --no-modify-path >/dev/null 2>&1; then

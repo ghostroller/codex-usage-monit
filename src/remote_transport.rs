@@ -1616,9 +1616,140 @@ fn build_ssh_command(program: &Path, ssh_host: &str, agent_executable: &str) -> 
     command.args(SSH_OPTIONS);
     command.arg("--");
     command.arg(ssh_host);
-    command.arg(agent_executable);
-    command.args(SSH_REMOTE_AGENT_ARGUMENTS);
+    if executable_needs_quoting(agent_executable) {
+        command.arg(remote_executable_command(
+            agent_executable,
+            &SSH_REMOTE_AGENT_ARGUMENTS,
+        ));
+    } else {
+        command.arg(agent_executable);
+        command.args(SSH_REMOTE_AGENT_ARGUMENTS);
+    }
     command
+}
+
+#[cfg(test)]
+mod executable_path_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_native_path_is_one_literal_argument_even_with_shell_syntax() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root
+            .path()
+            .join("Application Support 中文 \\ '$(touch SHOULD_NOT_EXIST); agent");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = executable.to_str().unwrap();
+        crate::remotes_config::validate_agent_executable(path).unwrap();
+        let command = remote_executable_command(path, &["remote-agent", "export"]);
+        let result = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"remote-agent\nexport\n");
+        assert!(!root.path().join("SHOULD_NOT_EXIST").exists());
+    }
+
+    #[test]
+    fn windows_native_path_uses_encoded_literal_invocation() {
+        use base64::Engine;
+        let command = remote_executable_command(
+            r"C:\Users\O'Brien 用户\App Data\codex-usage-monit.exe",
+            &["remote-agent", "export"],
+        );
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let script = String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(script.contains(
+            "& 'C:\\Users\\O''Brien 用户\\App Data\\codex-usage-monit.exe' 'remote-agent' 'export'"
+        ));
+        assert!(script.ends_with("exit $LASTEXITCODE"));
+        assert!(
+            remote_executable_command("C:/App Data/MONIT.EXE", &["-V"])
+                .starts_with("powershell.exe -NoProfile")
+        );
+    }
+}
+
+fn is_windows_executable_path(path: &str) -> bool {
+    path.starts_with(".\\")
+        || path.starts_with("\\\\")
+        || (path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && path.as_bytes().get(1) == Some(&b':')
+            && matches!(path.as_bytes().get(2), Some(b'/' | b'\\')))
+}
+
+fn executable_needs_quoting(path: &str) -> bool {
+    if !is_windows_executable_path(path) && path.contains('\\') {
+        return true;
+    }
+    path.bytes().any(|b| {
+        !b.is_ascii_alphanumeric()
+            && !matches!(b, b'/' | b'\\' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')
+    })
+}
+
+/// Build one remote shell command. Callers validate the executable first;
+/// arguments are data and are quoted independently. Encoded PowerShell works
+/// under both supported Windows OpenSSH login shells and preserves exit codes.
+pub(crate) fn remote_executable_command(executable: &str, args: &[&str]) -> String {
+    let windows = is_windows_executable_path(executable);
+    if windows && executable_needs_quoting(executable) {
+        use base64::Engine;
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let script = format!(
+            "$ErrorActionPreference='Stop'; & {} {}; exit $LASTEXITCODE",
+            quote(executable),
+            args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
+        );
+        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        return format!(
+            "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+    }
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+    let executable = if executable_needs_quoting(executable) {
+        if let Some(relative) = executable.strip_prefix("~/") {
+            format!("\"$HOME\"/{}", quote(relative))
+        } else {
+            quote(executable)
+        }
+    } else {
+        executable.to_owned()
+    };
+    let arguments = args
+        .iter()
+        .map(|s| {
+            if !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+            {
+                (*s).to_owned()
+            } else {
+                quote(s)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{executable} {arguments}")
 }
 
 fn validate_ssh_host(ssh_host: &str) -> Result<(), RemoteTransportError> {

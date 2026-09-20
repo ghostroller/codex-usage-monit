@@ -3,6 +3,7 @@ use crate::windows_private_directory::create_dir_all as private_create_dir_all;
 #[cfg(not(any(unix, windows)))]
 use std::fs::create_dir_all as private_create_dir_all;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::atomic_file::replace_file;
 use crate::source_identity::NodeId;
 
-pub const UI_STATE_VERSION: u32 = 6;
+pub const UI_STATE_VERSION: u32 = 7;
 
 const APP_DIRECTORY: &str = "codex-usage-monit";
 const STATE_FILE: &str = "tui-state.json";
@@ -116,6 +117,24 @@ pub enum UiTaskSourceFilter {
     Cli,
 }
 
+/// A host's chosen update scope; permission to adopt an unmanaged entry is never saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiRemoteUpdateScope {
+    #[default]
+    Sync,
+    Node,
+}
+
+impl UiRemoteUpdateScope {
+    pub fn argument(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Node => "node",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiTableColumns {
@@ -156,6 +175,7 @@ pub struct UiState {
     pub table_columns: UiTableColumns,
     pub task_list_mode: UiTaskListMode,
     pub task_source_filter: UiTaskSourceFilter,
+    pub remote_update_scopes: BTreeMap<String, UiRemoteUpdateScope>,
 }
 
 impl Default for UiState {
@@ -176,6 +196,7 @@ impl Default for UiState {
             table_columns: UiTableColumns::default(),
             task_list_mode: UiTaskListMode::Flat,
             task_source_filter: UiTaskSourceFilter::All,
+            remote_update_scopes: BTreeMap::new(),
         }
     }
 }
@@ -412,6 +433,7 @@ mod tests {
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Flat,
                 task_source_filter: UiTaskSourceFilter::All,
+                remote_update_scopes: BTreeMap::new(),
             }
         );
     }
@@ -447,6 +469,7 @@ mod tests {
             },
             task_list_mode: UiTaskListMode::Tree,
             task_source_filter: UiTaskSourceFilter::Subagent,
+            remote_update_scopes: BTreeMap::from([("dev".to_owned(), UiRemoteUpdateScope::Node)]),
         };
         assert!(store.save(&expected).unwrap());
         assert_eq!(store.load(), expected);
@@ -517,6 +540,7 @@ mod tests {
                 table_columns: UiTableColumns::default(),
                 task_list_mode: UiTaskListMode::Tree,
                 task_source_filter: UiTaskSourceFilter::Cli,
+                remote_update_scopes: BTreeMap::new(),
             }
         );
         assert!(store.writes_allowed());

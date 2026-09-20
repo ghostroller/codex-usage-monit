@@ -124,14 +124,12 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target "$TARGET"
 
-      - name: Strip and package Unix binary
+      - name: Strip Unix binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           binary="target/$TARGET/release/codex-usage-monit"
           strip "$binary"
-          mkdir -p dist
-          tar -czf "dist/codex-usage-monit-$TARGET.tar.gz" -C "$(dirname "$binary")" codex-usage-monit
 
       - name: Stage Windows binary
         if: runner.os == 'Windows'
@@ -150,14 +148,14 @@ jobs:
         shell: pwsh
         run: python scripts/check-release-binary.py "dist/codex-usage-monit-$env:TARGET.exe"
 
-      - name: Package Unix managed agent
+      - name: Package shared Unix application
         if: runner.os != 'Windows'
-        run: python3 scripts/package-agent.py "target/$TARGET/release/codex-usage-monit" --output-dir dist
+        run: python3 scripts/package-release.py package "target/$TARGET/release/codex-usage-monit" --output-dir dist --metadata-only
 
-      - name: Package Windows managed agent
+      - name: Package shared Windows application
         if: runner.os == 'Windows'
         shell: pwsh
-        run: python scripts/package-agent.py "dist/codex-usage-monit-$env:TARGET.exe" --output-dir dist
+        run: python scripts/package-release.py package "dist/codex-usage-monit-$env:TARGET.exe" --output-dir dist --metadata-only
 
       - name: Upload packaged binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -166,7 +164,7 @@ jobs:
           path: |
             dist/codex-usage-monit-${{ matrix.target }}.tar.gz
             dist/codex-usage-monit-${{ matrix.target }}.exe
-            dist/codex-usage-monit-${{ matrix.target }}.agent*
+            dist/release-metadata-${{ matrix.target }}.json
           if-no-files-found: error
           retention-days: 1
 
@@ -189,18 +187,23 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Verify and merge all platform release metadata
+        run: python3 scripts/package-release.py merge --output-dir dist
+
       - name: Create checksums
         shell: bash
         run: |
           cp scripts/install.sh dist/install.sh
           cd dist
-          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe codex-usage-monit-*.agent codex-usage-monit-*.agent.json install.sh | sort -k 2 > SHA256SUMS
+          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe release-manifest.json install.sh | sort -k 2 > SHA256SUMS
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*
+          gh release create "$GITHUB_REF_NAME"
+          dist/codex-usage-monit-*.tar.gz dist/codex-usage-monit-*.exe
+          dist/release-manifest.json dist/SHA256SUMS dist/install.sh
           --verify-tag
           --title "codex-usage-monit $GITHUB_REF_NAME"
           --generate-notes

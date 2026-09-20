@@ -23,9 +23,10 @@ class AgentPackageTests(unittest.TestCase):
             with patch.object(PACKAGE.subprocess, "check_output", return_value=json.dumps(info).encode()) as run:
                 manifest = PACKAGE.package(binary, root / "agents")
             self.assertEqual(run.call_args.args[0][1:], ["remote-agent", "info", "--sha256"])
-            self.assertEqual(manifest["agent"]["buildId"], info["buildId"])
-            self.assertEqual((root / "agents" / manifest["file"]).read_bytes(), binary.read_bytes())
-            self.assertNotIn("executableSha256", manifest["agent"])
+            self.assertEqual(manifest["buildId"], info["buildId"])
+            self.assertEqual((root / "agents" / manifest["artifacts"][0]["file"]).read_bytes(), binary.read_bytes())
+            self.assertNotIn("executableSha256", manifest)
+            self.assertFalse(any((root / "agents").glob("*.agent*")))
 
     def test_rejects_a_binary_changed_while_inspecting_it(self):
         with tempfile.TemporaryDirectory() as root:

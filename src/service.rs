@@ -50,7 +50,9 @@ use recorder_coordination::{
 };
 pub(crate) use upgrade::recorder_stop_requested;
 pub use upgrade::registered_status;
+pub(crate) use upgrade::with_update_references;
 pub use upgrade::{ServiceUpgradeReport, upgrade_registered_recorder};
+pub(crate) use upgrade::{inspect_update_recorder, upgrade_registered_recorder_for_update};
 
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";

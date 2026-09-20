@@ -124,6 +124,100 @@ else:
         self.assertEqual(self.run_pipeline("--help").returncode, 0)
         self.assertEqual(self.docker_calls(), [])
 
+    def run_toolchain_preparation(self, **settings):
+        # Execute the actual container preparation block without Docker, Cargo
+        # builds or network. Fixtures expose only the requested pinned tools.
+        source = (ROOT / "scripts/docker-linux.sh").read_text()
+        start = source.index("        channel=$(")
+        end = source.index("        operation=$1", start)
+        script = "set -euo pipefail\n" + source[start:end]
+        tools = ("rustc", "cargo", "rustfmt", "cargo-fmt", "clippy-driver", "cargo-clippy")
+        expected = "1.97.0-aarch64-unknown-linux-gnu"
+        cache = self.directory / "rustup cache"
+        installed = cache / "toolchains" / expected / "bin"
+        installed.mkdir(parents=True, exist_ok=True)
+        ready = self.directory / "installed"
+        ready.unlink(missing_ok=True)
+        calls = self.directory / "toolchain-calls.jsonl"
+        calls.unlink(missing_ok=True)
+        (self.directory / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.97.0"\n')
+        for tool in tools:
+            path = installed / tool
+            path.write_text(f"#!{sys.executable}\n" + """
+import json, os, pathlib, sys
+tool = pathlib.Path(sys.argv[0]).name
+with open(os.environ['MOCK_TOOLCHAIN_CALLS'], 'a') as log:
+    log.write(json.dumps([tool, *sys.argv[1:]]) + '\\n')
+ready = pathlib.Path(os.environ['MOCK_TOOLCHAIN_READY']).exists()
+if os.environ.get('MOCK_BROKEN_TOOL') == tool and (not ready or os.environ.get('MOCK_INSTALL_BROKEN')):
+    sys.exit(70)
+""")
+            path.chmod(0o755)
+        rustup = self.directory / "bin/rustup"
+        rustup.write_text(f"#!{sys.executable}\n" + """
+import json, os, pathlib, sys
+with open(os.environ['MOCK_TOOLCHAIN_CALLS'], 'a') as log:
+    log.write(json.dumps(['rustup', *sys.argv[1:]]) + '\\n')
+ready = pathlib.Path(os.environ['MOCK_TOOLCHAIN_READY'])
+if sys.argv[1] == 'which':
+    assert sys.argv[2] == '--toolchain'
+    if os.environ.get('MOCK_MISSING_TOOLCHAIN') and not ready.exists():
+        sys.exit(1)
+    selected = sys.argv[3]
+    if os.environ.get('MOCK_OTHER_TOOLCHAIN') and not ready.exists():
+        selected = '1.97.1-aarch64-unknown-linux-gnu'
+    print(pathlib.Path(os.environ['RUSTUP_HOME']) / 'toolchains' / selected / 'bin' / sys.argv[4])
+elif sys.argv[1:3] == ['toolchain', 'install']:
+    if os.environ.get('MOCK_INSTALL_FAIL'):
+        sys.exit(75)
+    ready.touch()
+else:
+    sys.exit(90)
+""")
+        rustup.chmod(0o755)
+        environment = {
+            **self.environment,
+            "RUSTUP_HOME": str(cache),
+            "CODEX_USAGE_MONIT_LINUX_TRIPLE": "aarch64-unknown-linux-gnu",
+            "MOCK_TOOLCHAIN_CALLS": str(calls),
+            "MOCK_TOOLCHAIN_READY": str(ready),
+            **settings,
+        }
+        result = subprocess.run(["bash", "-c", script], cwd=self.directory,
+                                env=environment, text=True, capture_output=True, timeout=15)
+        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
+    def test_complete_exact_toolchain_cache_executes_tools_without_distribution_access(self):
+        result, calls = self.run_toolchain_preparation(MOCK_INSTALL_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Using verified cached Rust toolchain: 1.97.0-aarch64-unknown-linux-gnu", result.stdout)
+        tools = ("rustc", "cargo", "rustfmt", "cargo-fmt", "clippy-driver", "cargo-clippy")
+        self.assertEqual(calls, [call for tool in tools for call in (
+            ["rustup", "which", "--toolchain", "1.97.0-aarch64-unknown-linux-gnu", tool],
+            [tool, "--version"],
+        )])
+
+    def test_missing_broken_or_other_toolchain_is_installed_and_rechecked(self):
+        settings = [{"MOCK_MISSING_TOOLCHAIN": "1"}, {"MOCK_OTHER_TOOLCHAIN": "1"}]
+        settings += [{"MOCK_BROKEN_TOOL": tool} for tool in
+                     ("rustc", "cargo", "rustfmt", "cargo-fmt", "clippy-driver", "cargo-clippy")]
+        for case in settings:
+            with self.subTest(case=case):
+                result, calls = self.run_toolchain_preparation(**case)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                installs = [call for call in calls if call[:3] == ["rustup", "toolchain", "install"]]
+                self.assertEqual(installs, [["rustup", "toolchain", "install",
+                    "1.97.0-aarch64-unknown-linux-gnu", "--profile", "minimal", "--component",
+                    "rustfmt,clippy", "--no-self-update"]])
+                self.assertEqual(calls[-1], ["cargo-clippy", "--version"])
+
+    def test_toolchain_install_failure_or_unusable_repair_stops_before_verification(self):
+        result, _ = self.run_toolchain_preparation(MOCK_MISSING_TOOLCHAIN="1", MOCK_INSTALL_FAIL="1")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        result, _ = self.run_toolchain_preparation(MOCK_BROKEN_TOOL="rustfmt", MOCK_INSTALL_BROKEN="1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("incomplete or cannot execute", result.stderr)
+
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires a Unix shell host")
 class UnixVerificationPipelineTests(unittest.TestCase):

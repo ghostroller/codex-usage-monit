@@ -4,13 +4,18 @@ use super::*;
 use std::time::{Duration, Instant};
 
 const JOURNAL: &str = "recorder-upgrade.json";
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpgradeJournal {
     schema_version: u32,
+    /// A durable fence for shared recorder updates. Version-one updaters reject
+    /// the new journal before stopping a service; newer readers enforce this
+    /// floor even after an upgrade has completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimum_updater_version: Option<String>,
     build_id: String,
     target: ServiceOptions,
     previous_fingerprint: String,
@@ -55,7 +60,17 @@ pub(super) fn clear_journal(root: &Path) -> Result<()> {
 }
 
 fn save_journal(root: &Path, journal: &UpgradeJournal) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(journal)?;
+    // Revalidate the durable floor as well as the caller's copy. This also
+    // prevents a freshly constructed/no-op journal from overwriting a newer
+    // completed fence. The service mutation lock serializes these writes.
+    let _previous = read_journal(root)?;
+    let mut persisted = journal.clone();
+    validate_journal(&persisted, env!("CARGO_PKG_VERSION"))?;
+    persisted.schema_version = JOURNAL_VERSION;
+    // Validation requires this updater to be at least the saved floor, so this
+    // assignment advances (or preserves) the floor and can never lower it.
+    persisted.minimum_updater_version = Some(env!("CARGO_PKG_VERSION").into());
+    let bytes = serde_json::to_vec_pretty(&persisted)?;
     if bytes.len() > SERVICE_DEFINITION_MAX_BYTES as usize {
         bail!(
             "service_upgrade_state_invalid: retained configuration exceeds the recoverable journal limit"
@@ -76,7 +91,12 @@ fn read_journal(root: &Path) -> Result<Option<UpgradeJournal>> {
         Err(error) => return Err(error.into()),
     };
     let journal: UpgradeJournal = serde_json::from_slice(&bytes)?;
-    if journal.schema_version != JOURNAL_VERSION
+    validate_journal(&journal, env!("CARGO_PKG_VERSION"))?;
+    Ok(Some(journal))
+}
+
+fn validate_journal(journal: &UpgradeJournal, updater_version: &str) -> Result<()> {
+    if !matches!(journal.schema_version, 1 | JOURNAL_VERSION)
         || !matches!(
             journal.phase.as_str(),
             "prepared" | "replacing" | "awaiting_heartbeat" | "complete" | "failed"
@@ -84,12 +104,140 @@ fn read_journal(root: &Path) -> Result<Option<UpgradeJournal>> {
     {
         bail!("service_upgrade_state_invalid: unsupported upgrade journal");
     }
-    Ok(Some(journal))
+    if journal.schema_version == JOURNAL_VERSION && journal.minimum_updater_version.is_none() {
+        bail!("service_upgrade_state_invalid: version-two journal has no minimum updater version");
+    }
+    if let Some(minimum) = &journal.minimum_updater_version {
+        crate::update::ensure_not_downgrade(updater_version, "", minimum, None, false)
+            .context("service_upgrade_version_fenced: this recorder requires a newer updater; update the center before retrying")?;
+    }
+    Ok(())
+}
+
+fn complete_upgrade(
+    root: &Path,
+    journal: &mut UpgradeJournal,
+    status: Option<RecorderStatusFile>,
+) -> Result<ServiceUpgradeReport> {
+    journal.phase = "complete".into();
+    journal.last_error = None;
+    save_journal(root, journal)?;
+    Ok(report(journal, status))
 }
 
 /// Existing registrations only: absence is a successful no-op. Retries use the
 /// saved configuration even when a failed replacement removed the old task.
 pub fn upgrade_registered_recorder() -> Result<ServiceUpgradeReport> {
+    upgrade_registered_recorder_checked(false)
+}
+
+/// The updater repeats its version guard while holding the service mutation
+/// lock, so a concurrent service operation cannot invalidate a prior preflight.
+pub(crate) fn upgrade_registered_recorder_for_update(
+    allow_dev_build: bool,
+) -> Result<ServiceUpgradeReport> {
+    upgrade_registered_recorder_checked(allow_dev_build)
+}
+
+pub(crate) struct RecorderUpdateIdentity {
+    pub version: String,
+    pub build_id: Option<String>,
+}
+
+pub(crate) fn inspect_update_recorder() -> Result<Vec<RecorderUpdateIdentity>> {
+    let root = service_coordination_root()?;
+    let journal = read_journal(&root)?;
+    let pending = journal.as_ref().filter(|j| j.phase != "complete");
+    let existing = read_registration_during_upgrade(pending)?;
+    inspect_update_identities(existing.as_ref(), pending)
+}
+
+fn executable_update_identity(executable: &Path) -> Result<RecorderUpdateIdentity> {
+    let output = crate::bounded_process::output(
+        Command::new(executable).args(["remote-agent", "info"]),
+        Duration::from_secs(15),
+        32 * 1024,
+    )
+    .context("update_recorder_unverifiable: could not inspect registered executable")?;
+    if output.status.success() {
+        let info: crate::remote_agent_manager::AgentInfo =
+            serde_json::from_slice(&output.stdout)
+                .context("update_recorder_unverifiable: invalid registered executable metadata")?;
+        if info.schema_version != 1 || info.product != "codex-usage-monit" {
+            bail!("update_recorder_unverifiable: registered executable has an unexpected identity");
+        }
+        return Ok(RecorderUpdateIdentity {
+            version: info.version,
+            build_id: Some(info.build_id),
+        });
+    }
+    let output = crate::bounded_process::output(
+        Command::new(executable).arg("--version"),
+        Duration::from_secs(15),
+        4096,
+    )
+    .context("update_recorder_unverifiable: could not inspect legacy recorder version")?;
+    if !output.status.success() {
+        bail!("update_recorder_unverifiable: registered executable did not report its version");
+    }
+    let text = String::from_utf8(output.stdout)?;
+    let version = text
+        .trim()
+        .strip_prefix("codex-usage-monit ")
+        .context("update_recorder_unverifiable: unexpected registered executable version output")?;
+    Ok(RecorderUpdateIdentity {
+        version: version.into(),
+        build_id: None,
+    })
+}
+
+fn inspect_update_identities(
+    existing: Option<&Registration>,
+    pending: Option<&UpgradeJournal>,
+) -> Result<Vec<RecorderUpdateIdentity>> {
+    let mut identities = Vec::new();
+    if let Some(existing) = existing {
+        identities.push(executable_update_identity(&existing.options.executable)?);
+        if let Some(status) = read_recorder_status(&existing.options.status_file)?
+            && status.service_definition_id.as_deref()
+                == Some(existing.options.service_definition_id().as_str())
+            && let Some(version) = status.version
+        {
+            identities.push(RecorderUpdateIdentity {
+                version,
+                build_id: status.build_id,
+            });
+        }
+    } else if let Some(pending) = pending {
+        identities.push(executable_update_identity(&pending.target.executable)?);
+    }
+    Ok(identities)
+}
+
+pub(crate) fn with_update_references<T>(
+    lock: bool,
+    operation: impl FnOnce(&[PathBuf]) -> Result<T>,
+) -> Result<T> {
+    let root = service_coordination_root()?;
+    let _guard = if lock {
+        Some(mutation_lock(&root)?)
+    } else {
+        None
+    };
+    let journal = read_journal(&root)?;
+    let pending = journal.as_ref().filter(|j| j.phase != "complete");
+    let registration = read_registration_during_upgrade(pending)?;
+    let mut paths = Vec::new();
+    if let Some(registration) = registration {
+        paths.push(registration.options.executable);
+    }
+    if let Some(pending) = pending {
+        paths.push(pending.target.executable.clone());
+    }
+    operation(&paths)
+}
+
+fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceUpgradeReport> {
     let root = service_coordination_root()?;
     let _guard = mutation_lock(&root)?;
     let build_id = env!("MONIT_BUILD_ID").to_string();
@@ -97,6 +245,18 @@ pub fn upgrade_registered_recorder() -> Result<ServiceUpgradeReport> {
     let saved = read_journal(&root)?;
     let existing =
         read_registration_during_upgrade(saved.as_ref().filter(|j| j.phase != "complete"))?;
+    for identity in inspect_update_identities(
+        existing.as_ref(),
+        saved.as_ref().filter(|j| j.phase != "complete"),
+    )? {
+        crate::update::ensure_not_downgrade(
+            env!("CARGO_PKG_VERSION"),
+            &build_id,
+            &identity.version,
+            identity.build_id.as_deref(),
+            allow_dev_build,
+        )?;
+    }
     let mut journal = match saved.filter(|j| j.phase != "complete") {
         Some(mut journal) => {
             // Forward repair by a later candidate is allowed only if the
@@ -115,10 +275,7 @@ pub fn upgrade_registered_recorder() -> Result<ServiceUpgradeReport> {
                     None
                 };
                 if !journal.enabled || status.is_some() {
-                    journal.phase = "complete".into();
-                    journal.last_error = None;
-                    save_journal(&root, &journal)?;
-                    return Ok(report(&journal, status));
+                    return complete_upgrade(&root, &mut journal, status);
                 }
             }
             journal.previous_fingerprint = existing
@@ -141,8 +298,9 @@ pub fn upgrade_registered_recorder() -> Result<ServiceUpgradeReport> {
             };
             let mut target = existing.options;
             target.executable = executable;
-            let journal = UpgradeJournal {
+            let mut journal = UpgradeJournal {
                 schema_version: JOURNAL_VERSION,
+                minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
                 build_id: build_id.clone(),
                 target,
                 previous_fingerprint: existing.fingerprint,
@@ -153,10 +311,10 @@ pub fn upgrade_registered_recorder() -> Result<ServiceUpgradeReport> {
             };
             if target_fingerprint(&journal.target)? == journal.previous_fingerprint {
                 if !journal.enabled {
-                    return Ok(report(&journal, None));
+                    return complete_upgrade(&root, &mut journal, None);
                 }
                 if let Some(status) = ready_status(&journal, false)? {
-                    return Ok(report(&journal, Some(status)));
+                    return complete_upgrade(&root, &mut journal, Some(status));
                 }
             }
             journal
@@ -786,6 +944,7 @@ mod tests {
         options.environment_path = Some(OsString::from("path with space;quote\";trailing\\"));
         let journal = UpgradeJournal {
             schema_version: JOURNAL_VERSION,
+            minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
             build_id: env!("MONIT_BUILD_ID").into(),
             previous_fingerprint: "0".repeat(64),
             target: options,
@@ -1104,5 +1263,138 @@ mod tests {
         ));
         assert!(save_journal(temp.path(), &journal).is_err());
         assert!(read_journal(temp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn journal_v1_is_readable_and_migrates_without_losing_recovery_configuration() {
+        for phase in [
+            "prepared",
+            "replacing",
+            "awaiting_heartbeat",
+            "failed",
+            "complete",
+        ] {
+            let (temp, mut legacy) = fixture();
+            legacy.schema_version = 1;
+            legacy.minimum_updater_version = None;
+            legacy.phase = phase.into();
+            legacy.last_error = Some("retained diagnostic".into());
+            write_private_atomically(
+                &temp.path().join(JOURNAL),
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+            let loaded = read_journal(temp.path()).unwrap().unwrap();
+            assert_eq!(loaded.schema_version, 1);
+            assert!(loaded.minimum_updater_version.is_none());
+            save_journal(temp.path(), &loaded).unwrap();
+            let upgraded = read_journal(temp.path()).unwrap().unwrap();
+            assert_eq!(upgraded.schema_version, 2);
+            assert_eq!(
+                upgraded.minimum_updater_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(upgraded.target, legacy.target);
+            assert_eq!(upgraded.enabled, legacy.enabled);
+            assert_eq!(upgraded.previous_fingerprint, legacy.previous_fingerprint);
+            assert_eq!(upgraded.phase, legacy.phase);
+            assert_eq!(upgraded.last_error, legacy.last_error);
+        }
+    }
+
+    #[test]
+    fn noop_ready_and_disabled_upgrades_persist_the_new_fence() {
+        for enabled in [false, true] {
+            for existing_journal in [false, true] {
+                let (temp, mut journal) = fixture();
+                journal.schema_version = 1;
+                journal.minimum_updater_version = None;
+                journal.enabled = enabled;
+                journal.last_error = Some("old failure".into());
+                if existing_journal {
+                    write_private_atomically(
+                        &temp.path().join(JOURNAL),
+                        &serde_json::to_vec(&journal).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let status = enabled.then(|| heartbeat(&journal));
+                let report = complete_upgrade(temp.path(), &mut journal, status).unwrap();
+                assert_eq!(report.outcome, if enabled { "ready" } else { "disabled" });
+                let saved = read_journal(temp.path()).unwrap().unwrap();
+                assert_eq!(saved.schema_version, 2);
+                assert_eq!(saved.phase, "complete");
+                assert!(saved.last_error.is_none());
+                assert_eq!(
+                    saved.minimum_updater_version.as_deref(),
+                    Some(env!("CARGO_PKG_VERSION"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn future_updater_floor_blocks_read_write_and_replacement_before_stop() {
+        let (temp, mut future) = fixture();
+        future.minimum_updater_version = Some("999.0.0".into());
+        future.phase = "complete".into();
+        let original = serde_json::to_vec(&future).unwrap();
+        write_private_atomically(&temp.path().join(JOURNAL), &original).unwrap();
+        assert!(
+            format!("{:#}", read_journal(temp.path()).unwrap_err())
+                .contains("service_upgrade_version_fenced")
+        );
+        assert!(validate_journal(&future, "1000.0.0").is_ok());
+        assert!(save_journal(temp.path(), &future).is_err());
+        let mut fresh = future.clone();
+        fresh.minimum_updater_version = Some(env!("CARGO_PKG_VERSION").into());
+        assert!(
+            save_journal(temp.path(), &fresh).is_err(),
+            "fresh journals must not lower the existing durable floor"
+        );
+        let result = execute_upgrade(
+            temp.path(),
+            &mut future,
+            |_| panic!("must not stop or replace a newer recorder"),
+            |_| panic!("must not start or await a recorder"),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(temp.path().join(JOURNAL)).unwrap(), original);
+    }
+
+    #[test]
+    fn version_two_journal_requires_a_valid_floor_and_fences_legacy_readers() {
+        // This is the v0.5 reader's exact serde envelope. It rejects v2 before
+        // any service inspection/replacement, including a completed journal.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct LegacyJournal {
+            schema_version: u32,
+            build_id: String,
+            target: ServiceOptions,
+            previous_fingerprint: String,
+            enabled: bool,
+            prepared_at: DateTime<Utc>,
+            phase: String,
+            last_error: Option<String>,
+        }
+        let (temp, mut journal) = fixture();
+        journal.phase = "complete".into();
+        save_journal(temp.path(), &journal).unwrap();
+        let bytes = fs::read(temp.path().join(JOURNAL)).unwrap();
+        assert!(serde_json::from_slice::<LegacyJournal>(&bytes).is_err());
+        let saved: UpgradeJournal = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(saved.schema_version, 1);
+        let mut legacy = journal.clone();
+        legacy.schema_version = 1;
+        legacy.minimum_updater_version = None;
+        assert!(
+            serde_json::from_slice::<LegacyJournal>(&serde_json::to_vec(&legacy).unwrap()).is_ok()
+        );
+        journal.minimum_updater_version = None;
+        assert!(validate_journal(&journal, env!("CARGO_PKG_VERSION")).is_err());
+        journal.minimum_updater_version = Some("invalid".into());
+        assert!(validate_journal(&journal, env!("CARGO_PKG_VERSION")).is_err());
     }
 }

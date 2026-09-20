@@ -18,6 +18,9 @@ The shared entry point also runs directly on native Linux or macOS.
 The host needs Docker, Git, Bash, and Python 3. Docker must be running and the Rust image must already exist locally. The
 default image is `rust:1.97.1-bookworm`; the runner installs the exact repository
 toolchain from `rust-toolchain.toml`, including rustfmt and Clippy, into a cache.
+Once all pinned tools and their Cargo wrappers are executable, later runs reuse them without a
+Rust distribution metadata request. A missing tool still requires installation;
+the runner never substitutes the image's different Rust version.
 The first run needs network access for Rust and Cargo dependencies. Subsequent
 runs reuse downloads and compiled artifacts. Custom images need Git, Bash,
 Python 3, a C compiler, pkg-config, tar, Perl, file, sha256sum, and normal Unix process utilities.

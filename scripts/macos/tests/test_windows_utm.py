@@ -73,7 +73,7 @@ class WindowsRunnerTests(unittest.TestCase):
 
     def test_shell_contract_cli_rejects_ambiguous_scope_before_guest_access(self):
         path = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
-        invalid = [["--shell-contracts"], ["--pwsh-path", path]]
+        invalid = [["--shell-contracts"], ["--shell-contracts", "--pwsh-path", " "]]
         for extra in [["--doctor"], ["--focused", "--test-filter", "test"], ["--test-filter", "test"],
                       ["--target", "aarch64-pc-windows-msvc"], ["--profile", "release"]]:
             invalid.append(["--shell-contracts", "--pwsh-path", path] + extra)
@@ -97,8 +97,9 @@ class WindowsRunnerTests(unittest.TestCase):
         path = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
         cases = [([], "full"), (["--doctor"], "doctor"),
                  (["--test-filter", "test"], "filtered"),
-                 (["--focused", "--test-filter", "test"], "rust-focused"),
-                 (["--shell-contracts", "--pwsh-path", path], "shell-contracts")]
+                 (["--focused", "--test-filter", "test"], "rust-focused")]
+        cases += [(flags + ["--pwsh-path", path], scope) for flags, scope in cases]
+        cases.append((["--shell-contracts", "--pwsh-path", path], "shell-contracts"))
         for flags, scope in cases:
             with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
                 requests = []
@@ -132,7 +133,7 @@ class WindowsRunnerTests(unittest.TestCase):
                 self.assertEqual(len(requests), 1)
                 self.assertEqual(requests[0]["scope"], scope)
                 self.assertEqual(requests[0]["mode"], "doctor" if scope == "doctor" else "verify")
-                self.assertEqual(requests[0]["pwshPath"], path if scope == "shell-contracts" else "")
+                self.assertEqual(requests[0]["pwshPath"], path if "--pwsh-path" in flags else "")
                 self.assertEqual(requests[0]["focused"], scope == "rust-focused")
 
     def test_unavailable_vm_leaves_a_machine_readable_blocked_result(self):

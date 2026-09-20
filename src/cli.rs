@@ -322,6 +322,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Update this user's application and existing recorder with the shared updater.
+    Update(UpdateArgs),
     /// Print a complete or filtered one-shot snapshot.
     Snapshot(SnapshotArgs),
     /// Print quota windows.
@@ -414,7 +416,7 @@ enum RemoteAction {
     /// Inspect agent build/platform/protocol without exchanging usage data.
     Inspect(RemoteHostArgs),
     /// Download the matching official Release, upgrade an existing recorder, and verify enabled-source sync.
-    Deploy(RemoteHostArgs),
+    Deploy(RemoteUpdateArgs),
     /// Development only: upload a trusted bundle and run the same node update and verification flow.
     DeployDev(RemoteDeployArgs),
     /// Synchronize exactly one paired host without changing automatic-sync settings.
@@ -435,6 +437,79 @@ struct RemoteDeployArgs {
     /// Explicitly trusted development bundle; this is not publisher authentication.
     #[arg(long, value_name = "DIR")]
     bundle_dir: PathBuf,
+    #[command(flatten)]
+    update: RemoteUpdateOptions,
+}
+
+#[derive(Clone, Debug, Args)]
+struct RemoteUpdateArgs {
+    id: String,
+    #[command(flatten)]
+    update: RemoteUpdateOptions,
+}
+
+#[derive(Clone, Debug, Args)]
+struct RemoteUpdateOptions {
+    /// Sync updates the exporter and existing recorder; node also updates the CLI entry.
+    #[arg(long, value_enum, default_value_t = crate::update::UpdateScope::Sync)]
+    scope: crate::update::UpdateScope,
+    /// Explicitly adopt an existing user-owned standalone CLI (node scope only).
+    #[arg(long)]
+    adopt: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UpdateArgs {
+    #[command(subcommand)]
+    action: Option<UpdateAction>,
+    /// Official release version, or latest. Unpublished builds require an explicit bundle.
+    #[arg(long, default_value = "latest")]
+    version: String,
+    #[arg(long, value_name = "DIR", conflicts_with = "version")]
+    bundle_dir: Option<PathBuf>,
+    #[command(flatten)]
+    apply: UpdateApplyArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UpdateApplyArgs {
+    #[arg(long, value_enum, default_value_t = crate::update::UpdateScope::Node)]
+    scope: crate::update::UpdateScope,
+    #[arg(long, value_name = "DIR")]
+    install_dir: Option<PathBuf>,
+    #[arg(long)]
+    adopt: bool,
+    #[arg(long, hide = true)]
+    allow_dev_build: bool,
+    #[arg(long, value_enum, default_value_t = FormatArg::Text)]
+    format: FormatArg,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum UpdateAction {
+    /// Inspect managed installations and the last update without applying changes.
+    Status(OutputArgs),
+    /// List removable versions; deletion requires explicit IDs and external-reference acknowledgement.
+    Prune {
+        versions: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        acknowledge_unreferenced: bool,
+    },
+    /// Apply this already verified executable using the target-machine updater.
+    #[command(hide = true)]
+    Apply(UpdateApplyArgs),
+    /// Verify a downloaded executable against the unified release manifest.
+    #[command(hide = true)]
+    VerifyRelease {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Args)]
@@ -846,6 +921,9 @@ pub fn run() -> Result<i32> {
 }
 
 fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i32> {
+    if let Some(Command::Update(args)) = &cli.command {
+        return run_update(args.clone());
+    }
     validate_output_path_conflicts(&cli)?;
     let managed = cli.log_file.is_none();
     let log = if cli.command.is_none() || !managed {
@@ -1046,6 +1124,7 @@ fn run_with_event_log(
     }
 
     let command = match command {
+        Command::Update(args) => return run_update(args),
         Command::Record(args) => {
             return run_recorder(
                 config,
@@ -1124,6 +1203,7 @@ fn run_with_event_log(
             unreachable!("specialized commands are handled before snapshot output routing")
         }
         Command::DebugStartup(_) => unreachable!("debug-startup returned before output routing"),
+        Command::Update(_) => unreachable!("update returned before output routing"),
     };
     let limits_only = request.sections.len() == 1 && request.sections.contains(&Section::Limits);
     let mut result = if limits_only && !config.offline {
@@ -1172,6 +1252,107 @@ fn run_with_event_log(
         2
     } else {
         0
+    })
+}
+
+fn run_update(args: UpdateArgs) -> Result<i32> {
+    let apply = match args.action {
+        Some(UpdateAction::Prune {
+            versions,
+            apply,
+            acknowledge_unreferenced,
+        }) => {
+            let report = crate::update::prune(crate::update::PruneOptions {
+                versions,
+                apply,
+                acknowledge_unreferenced,
+            })?;
+            write_stdout(&serde_json::to_string_pretty(&report)?)?;
+            return Ok(0);
+        }
+        Some(UpdateAction::Status(output)) => {
+            let status = crate::update::inspect()?;
+            match output.format {
+                FormatArg::Json => write_stdout(&serde_json::to_string_pretty(&status)?)?,
+                FormatArg::Text => {
+                    write_stdout(&format!(
+                        "Application: {} (build {})\nExecutable: {}\nInstallation: {}\nVersion store: {}\nInstalled versions: {}",
+                        status.version,
+                        status.build_id,
+                        status.executable.display(),
+                        status.source,
+                        status.root.display(),
+                        status.versions.len()
+                    ))?;
+                    if let Some(entry) = &status.cli.executable {
+                        write_stdout(&format!("CLI entry: {}", entry.display()))?;
+                    }
+                    if let Some(detail) = &status.cli.diagnostic {
+                        write_stdout(detail)?;
+                    }
+                    if let Some(phase) = &status.journal_phase {
+                        write_stdout(&format!("Last update phase: {phase}"))?;
+                    }
+                }
+            }
+            return Ok(0);
+        }
+        Some(UpdateAction::VerifyRelease {
+            manifest,
+            target,
+            version,
+        }) => {
+            crate::release::ReleaseManifest::read(&manifest)?
+                .verify_current(&target, version.as_deref())?;
+            write_stdout("Release executable identity and checksum verified")?;
+            return Ok(0);
+        }
+        Some(UpdateAction::Apply(apply)) => (true, apply),
+        None => (false, args.apply),
+    };
+    let options = crate::update::ApplyOptions {
+        scope: apply.1.scope,
+        install_dir: apply.1.install_dir.map(absolute_path),
+        adopt: apply.1.adopt,
+        allow_dev_build: apply.1.allow_dev_build || args.bundle_dir.is_some(),
+    };
+    if options.adopt && matches!(options.scope, crate::update::UpdateScope::Sync) {
+        bail!("--adopt requires --scope node");
+    }
+    let report = if apply.0 {
+        crate::update::apply(options)?
+    } else {
+        crate::remote_agent_manager::update_local(
+            &args.version,
+            args.bundle_dir.as_deref(),
+            &options,
+        )?
+    };
+    match apply.1.format {
+        FormatArg::Json => write_stdout(&serde_json::to_string_pretty(&report)?)?,
+        FormatArg::Text => {
+            write_stdout(&format!(
+                "Application update: {} (version {}, build {})\nExecutable: {}\nRecorder: {}\nCLI: {}",
+                report.outcome,
+                report.version,
+                report.build_id,
+                report.executable.display(),
+                report.recorder.outcome,
+                report.cli.outcome
+            ))?;
+            if let Some(detail) = &report.diagnostic {
+                write_stdout(detail)?;
+            }
+            if let Some(detail) = &report.cli.diagnostic {
+                write_stdout(detail)?;
+            }
+            write_stdout("Restart any already-open TUI to use the updated application.")?;
+        }
+    }
+    Ok(match report.outcome.as_str() {
+        "complete" | "ready" => 0,
+        "partial" => 2,
+        _ => 1,
     })
 }
 
@@ -1264,6 +1445,7 @@ fn run_remote(
             &store,
             &args.id,
             None,
+            &args.update,
             history_dir.as_deref(),
             expected_revision,
             inherit_remote_process_tree,
@@ -1274,6 +1456,7 @@ fn run_remote(
             &store,
             &args.id,
             Some(&args.bundle_dir),
+            &args.update,
             history_dir.as_deref(),
             expected_revision,
             inherit_remote_process_tree,
@@ -2554,11 +2737,15 @@ fn run_remote_deploy(
     store: &RemotesConfigStore,
     host_id: &str,
     development_bundle: Option<&Path>,
+    update_options: &RemoteUpdateOptions,
     history_dir: Option<&Path>,
     expected_revision: Option<u64>,
     inherit_remote_process_tree: bool,
     cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<i32> {
+    if update_options.adopt && matches!(update_options.scope, crate::update::UpdateScope::Sync) {
+        bail!("--adopt requires --scope node");
+    }
     let config = store.load_or_create()?;
     ensure_expected_remote_config_revision(&config, expected_revision, "agent deploy")?;
     let host = config
@@ -2603,8 +2790,14 @@ fn run_remote_deploy(
     let service_operation = collect_config
         .event_log
         .operation("remote.recorder.upgrade", host.id());
-    let recorder = match connection.upgrade_recorder(&executable) {
-        Ok(recorder) => {
+    let update = match connection.update_node(
+        &executable,
+        update_options.scope,
+        update_options.adopt,
+        development_bundle.is_some(),
+    ) {
+        Ok(update) => {
+            let recorder = &update.recorder;
             service_operation.finish(
                 if recorder.diagnostic.is_some() {
                     LogLevel::Warn
@@ -2626,13 +2819,21 @@ fn run_remote_deploy(
             if let Some(diagnostic) = &recorder.diagnostic {
                 eprintln!("remote recorder is running with diagnostics: {diagnostic}");
             }
-            recorder
+            update
         }
         Err(error) => {
             service_operation.finish(LogLevel::Error, &format!("{error:#}"));
             return Err(error);
         }
     };
+    let recorder = &update.recorder;
+    if update.outcome == "failed" {
+        write_stdout(&serde_json::to_string_pretty(&update)?)?;
+        eprintln!(
+            "node update incomplete; retry the same scope to resume. CLI and recorder outcomes are reported separately."
+        );
+        return Ok(2);
+    }
     let activated_revision = activate_deployed_agent(
         store,
         config.config_revision(),
@@ -2649,6 +2850,19 @@ fn run_remote_deploy(
         recorder.outcome,
         recorder.enabled
     ))?;
+    write_stdout(&format!(
+        "CLI: {}{}. Restart any already-open TUI after an application update.",
+        update.cli.outcome,
+        update
+            .cli
+            .executable
+            .as_ref()
+            .map(|p| format!(" ({})", p.display()))
+            .unwrap_or_default()
+    ))?;
+    if let Some(detail) = &update.cli.diagnostic {
+        eprintln!("CLI: {detail}");
+    }
     if host.is_paired() && host.sync_enabled() {
         let operation = collect_config
             .event_log
@@ -2687,7 +2901,7 @@ fn run_remote_deploy(
             }
         }
     }
-    Ok(0)
+    Ok(if update.outcome == "partial" { 2 } else { 0 })
 }
 
 fn activate_deployed_agent(
@@ -5515,6 +5729,7 @@ fn command_uses_model_catalog(command: Option<&Command>) -> bool {
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "tui",
+        Some(Command::Update(_)) => "update",
         Some(Command::Snapshot(_)) => "snapshot",
         Some(Command::Limits(_)) => "limits",
         Some(Command::Tasks(_)) => "tasks",

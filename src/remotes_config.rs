@@ -1269,6 +1269,20 @@ pub(crate) fn validate_agent_executable(agent_executable: &str) -> Result<(), St
             "Agent executable must contain 1-{MAX_AGENT_EXECUTABLE_BYTES} bytes"
         ));
     }
+    // Managed installations use native absolute paths (including macOS's
+    // Application Support and non-ASCII account names). They are always quoted
+    // by the transport, never interpreted as shell command fragments.
+    let explicit_path = agent_executable.starts_with('/')
+        || agent_executable.starts_with("./")
+        || agent_executable.starts_with("~/")
+        || agent_executable.starts_with(r".\")
+        || agent_executable.starts_with(r"\\")
+        || (agent_executable.as_bytes().get(1) == Some(&b':')
+            && agent_executable.as_bytes()[0].is_ascii_alphabetic()
+            && matches!(agent_executable.as_bytes().get(2), Some(b'/' | b'\\')));
+    if explicit_path && !agent_executable.chars().any(char::is_control) {
+        return Ok(());
+    }
     if agent_executable.bytes().any(|byte| {
         !byte.is_ascii_alphanumeric()
             && !matches!(byte, b'/' | b'\\' | b'.' | b'_' | b':' | b'+' | b'~' | b'-')

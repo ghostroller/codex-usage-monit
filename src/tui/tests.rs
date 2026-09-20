@@ -14072,6 +14072,22 @@ fn successful_agent_deployment_keeps_cleanup_warnings_visible_and_logged() {
 
 #[test]
 fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
+    let report = serde_json::json!({
+        "outcome": "partial",
+        "recorder": { "outcome": "ready", "diagnostic": null },
+        "cli": { "outcome": "failed", "diagnostic": "update_entry_busy: close the old CLI" }
+    });
+    let result = remote_ui_action_output(&remote_action_test_output(
+        2,
+        &serde_json::to_vec(&report).unwrap(),
+        b"node update incomplete; retry the same scope",
+    ))
+    .unwrap();
+    assert!(
+        matches!(result, RemoteUiActionOutcome::NeedsAttention(detail)
+        if detail.contains("Recorder: ready") && detail.contains("CLI: failed")
+            && detail.contains("close the old CLI") && detail.contains("same scope"))
+    );
     for (error, hint) in [
         (
             "error: zsh:1: command not found: codex-usage-monit",
@@ -14094,6 +14110,26 @@ fn remote_ui_action_preserves_safe_error_details_hints_and_partial_results() {
         assert_eq!(remote_ui_action_error_kind(&detail), "command_failed");
     }
     for (kind, message, hint) in [
+        (
+            "update_entry_unmanaged",
+            "CLI entry is unmanaged",
+            "explicitly enable Adopt manual CLI",
+        ),
+        (
+            "update_external_install",
+            "Cargo owns this path",
+            "Update the CLI with its package manager",
+        ),
+        (
+            "update_entry_conflict",
+            "entry changed outside this updater",
+            "inspect that entry before retrying",
+        ),
+        (
+            "agent_node_update_failed",
+            "target updater interrupted",
+            "same scope to resume",
+        ),
         (
             "agent_recorder_upgrade_failed",
             "registration failed",
@@ -16597,8 +16633,45 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
             assert_eq!(shortcut.fg, theme.palette().accent);
             assert!(shortcut.modifier.contains(Modifier::BOLD));
             handle_key_event(&mut app, key_event(KeyCode::Char('b')));
+            assert!(app.pending_remote_action.is_none());
+            assert_eq!(
+                app.remote_update_dialog.as_ref().unwrap().scope,
+                UiRemoteUpdateScope::Sync
+            );
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let dialog = app.remote_update_hitbox.unwrap();
+            for area in [
+                dialog.sync,
+                dialog.node,
+                dialog.adopt,
+                dialog.confirm,
+                dialog.cancel,
+            ] {
+                assert!(!area.is_empty());
+                assert!(area.right() <= width && area.bottom() <= height);
+            }
+            let buffer = terminal.backend().buffer();
+            let selected = &buffer[(dialog.sync.x + 1, dialog.sync.y)];
+            assert_eq!(selected.symbol(), "S");
+            assert!(selected.modifier.contains(Modifier::UNDERLINED));
+            let node = &buffer[(dialog.node.x + 1, dialog.node.y)];
+            assert_eq!(node.symbol(), "N");
+            assert_eq!(node.fg, theme.palette().accent);
+            assert!(node.modifier.contains(Modifier::BOLD));
+            let adopt = &buffer[(dialog.adopt.x + 1, dialog.adopt.y)];
+            assert_eq!(adopt.symbol(), "A");
+            assert_ne!(adopt.fg, theme.palette().accent);
+            handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+            assert!(!app.remote_update_dialog.as_ref().unwrap().adopt);
+            handle_key_event(&mut app, key_event(KeyCode::Enter));
             let request = app.pending_remote_action.take().unwrap();
-            assert_eq!(request.kind, RemoteUiActionKind::Deploy);
+            assert_eq!(
+                request.kind,
+                RemoteUiActionKind::Deploy {
+                    scope: UiRemoteUpdateScope::Sync,
+                    adopt: false
+                }
+            );
             let mut command = Command::new("codex-usage-monit");
             append_remote_ui_action_args(&mut command, &request);
             let args = command
@@ -16607,6 +16680,7 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
                 .collect::<Vec<_>>();
             assert_eq!(&args[..2], &["remote", "deploy"]);
             assert!(args.contains(&"--expected-revision".to_owned()));
+            assert_eq!(&args[args.len() - 2..], &["--scope", "sync"]);
             app.remote_action_running = None;
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             assert_eq!(
@@ -16621,9 +16695,23 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
                     button.y
                 )
             ));
+            assert!(app.remote_update_dialog.is_some());
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let confirm = app.remote_update_hitbox.unwrap().confirm;
+            assert!(handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    confirm.right() - 1,
+                    confirm.y
+                )
+            ));
             assert_eq!(
                 app.pending_remote_action.take().unwrap().kind,
-                RemoteUiActionKind::Deploy
+                RemoteUiActionKind::Deploy {
+                    scope: UiRemoteUpdateScope::Sync,
+                    adopt: false
+                }
             );
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             assert!(
@@ -16663,4 +16751,163 @@ fn settings_agent_deployment_supports_keyboard_whole_label_click_and_compact_lay
     handle_key_event(&mut app, key_event(KeyCode::Char('b')));
     assert_eq!(app.remote_editor.as_ref().unwrap().host_id, "b");
     assert!(app.pending_remote_action.is_none());
+}
+
+#[test]
+fn settings_remote_update_scope_and_adoption_are_explicit_and_whole_label_clickable() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(40, 14), (80, 24), (110, 24)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = interaction_test_app(0, 0);
+            install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+            app.view = View::Settings;
+            app.theme = theme;
+            app.selected_setting = SettingItem::ALL.len();
+            app.begin_remote_update();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let controls = app.remote_update_hitbox.unwrap();
+            let text =
+                buffer_rect_text(terminal.backend().buffer(), Rect::new(0, 0, width, height));
+            assert!(text.contains("Target:") && text.contains("this center"));
+            assert!(text.contains("Agent:") && text.contains("before changes"));
+            assert!(text.contains("Cargo / Homebrew"));
+            // Every control keeps its whole-label hitbox across both selected scopes.
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    controls.node.right() - 1,
+                    controls.node.y,
+                ),
+            );
+            assert_eq!(
+                app.remote_update_dialog.as_ref().unwrap().scope,
+                UiRemoteUpdateScope::Node
+            );
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.remote_update_hitbox.unwrap(), controls);
+            let adopt = &terminal.backend().buffer()[(controls.adopt.x + 1, controls.adopt.y)];
+            assert_eq!(adopt.fg, theme.palette().accent);
+            assert!(adopt.modifier.contains(Modifier::BOLD));
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    controls.adopt.right() - 1,
+                    controls.adopt.y,
+                ),
+            );
+            assert!(app.remote_update_dialog.as_ref().unwrap().adopt);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.remote_update_hitbox.unwrap(), controls);
+            let adopt = &terminal.backend().buffer()[(controls.adopt.x + 1, controls.adopt.y)];
+            assert!(adopt.modifier.contains(Modifier::UNDERLINED));
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    controls.sync.right() - 1,
+                    controls.sync.y,
+                ),
+            );
+            assert_eq!(
+                app.remote_update_dialog.as_ref().unwrap().scope,
+                UiRemoteUpdateScope::Sync
+            );
+            assert!(!app.remote_update_dialog.as_ref().unwrap().adopt);
+            handle_key_event(&mut app, key_event(KeyCode::Char('n')));
+            handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+            handle_key_event(&mut app, key_event(KeyCode::Enter));
+            let request = app.pending_remote_action.take().unwrap();
+            assert_eq!(
+                request.kind,
+                RemoteUiActionKind::Deploy {
+                    scope: UiRemoteUpdateScope::Node,
+                    adopt: true
+                }
+            );
+            let mut command = Command::new("codex-usage-monit");
+            append_remote_ui_action_args(&mut command, &request);
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(&args[args.len() - 3..], &["--scope", "node", "--adopt"]);
+            assert_eq!(
+                app.ui_state().remote_update_scopes.get("dev"),
+                Some(&UiRemoteUpdateScope::Node)
+            );
+            app.remote_action_running = None;
+            app.begin_remote_update();
+            assert_eq!(
+                app.remote_update_dialog.as_ref().unwrap().scope,
+                UiRemoteUpdateScope::Node
+            );
+            assert!(!app.remote_update_dialog.as_ref().unwrap().adopt);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            handle_mouse_event(
+                &mut app,
+                mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    controls.cancel.right() - 1,
+                    controls.cancel.y,
+                ),
+            );
+            assert!(app.remote_update_dialog.is_none());
+            assert!(app.pending_remote_action.is_none());
+            let saved = app.ui_state();
+            let mut restarted = interaction_test_app(0, 0);
+            restarted.apply_ui_state(&saved, None);
+            assert_eq!(
+                restarted.ui_state().remote_update_scopes,
+                saved.remote_update_scopes
+            );
+            app.selected_setting += 1;
+            app.begin_remote_update();
+            assert_eq!(
+                app.remote_update_dialog.as_ref().unwrap().scope,
+                UiRemoteUpdateScope::Sync
+            );
+        }
+    }
+}
+
+#[test]
+fn settings_remote_update_rejects_stale_config_and_hides_actions_in_tiny_terminals() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = interaction_test_app(0, 0);
+    let (store, _) = install_remote_sources_fixture(&mut app, directory.path(), Utc::now());
+    app.view = View::Settings;
+    app.selected_setting = SettingItem::ALL.len();
+    app.begin_remote_update();
+    let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert!(app.remote_update_hitbox.unwrap().confirm.is_empty());
+    handle_key_event(&mut app, key_event(KeyCode::Enter));
+    assert!(app.pending_remote_action.is_none());
+    handle_key_event(&mut app, key_event(KeyCode::Char('n')));
+    assert_eq!(
+        app.remote_update_dialog.as_ref().unwrap().scope,
+        UiRemoteUpdateScope::Sync
+    );
+    handle_key_event(&mut app, key_event(KeyCode::Left));
+    assert!(app.remote_update_dialog.is_none());
+    app.begin_remote_update();
+    let mut transaction = store.begin_transaction().unwrap();
+    transaction
+        .apply(RemotesConfigMutation::add_host("new", "new-box"))
+        .unwrap();
+    store.commit(transaction).unwrap();
+    app.confirm_remote_update();
+    assert!(app.pending_remote_action.is_none());
+    assert!(app.remote_update_dialog.is_none());
+    assert!(app.remote_update_scopes.is_empty());
+    assert!(
+        app.remote_action_status
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("update was not started")
+    );
 }

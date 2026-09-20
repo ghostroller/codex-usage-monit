@@ -171,9 +171,9 @@ use crate::trends::{
 #[cfg(test)]
 use crate::trends::{remaining_trend, trend_day_bounds, weekly_resets_overlapping};
 use crate::ui_state::{
-    UiHistorySourceSelection, UiState, UiStateStore, UiSummaryGrain, UiSummaryMetric,
-    UiSummaryRange, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme, UiView,
-    UiWindowScope,
+    UiHistorySourceSelection, UiRemoteUpdateScope, UiState, UiStateStore, UiSummaryGrain,
+    UiSummaryMetric, UiSummaryRange, UiTableColumns, UiTaskListMode, UiTaskSourceFilter, UiTheme,
+    UiView, UiWindowScope,
 };
 
 const LOCAL_REFRESH: Duration = Duration::from_secs(2);
@@ -2531,6 +2531,15 @@ struct RemoteRemoveConfirmationHitbox {
 
 type RemotePurgeConfirmationHitbox = RemoteRemoveConfirmationHitbox;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteUpdateHitbox {
+    sync: Rect,
+    node: Rect,
+    adopt: Rect,
+    confirm: Rect,
+    cancel: Rect,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowControlsHitbox {
     toggle_turns: Rect,
@@ -2932,7 +2941,10 @@ enum RemoteUiActionKind {
     Pair,
     Remove,
     Test,
-    Deploy,
+    Deploy {
+        scope: UiRemoteUpdateScope,
+        adopt: bool,
+    },
     Sync,
     Include,
     Exclude,
@@ -2949,7 +2961,7 @@ impl RemoteUiActionKind {
             Self::Pair => "pair",
             Self::Remove => "remove",
             Self::Test => "test",
-            Self::Deploy => "deploy",
+            Self::Deploy { .. } => "deploy",
             Self::Sync => "sync",
             Self::Include => "include",
             Self::MergeQuota => "merge-quota",
@@ -3169,6 +3181,15 @@ struct RemoteEditorState {
     agent_executable_cursor: usize,
     config_revision: u64,
     validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteUpdateDialog {
+    host_id: String,
+    agent_executable: String,
+    config_revision: u64,
+    scope: UiRemoteUpdateScope,
+    adopt: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3415,6 +3436,9 @@ struct App {
     remote_action_diagnostic: Option<String>,
     event_log: EventLog,
     ui_save_error: Option<String>,
+    remote_update_scopes: BTreeMap<String, UiRemoteUpdateScope>,
+    remote_update_dialog: Option<RemoteUpdateDialog>,
+    remote_update_hitbox: Option<RemoteUpdateHitbox>,
     remote_editor: Option<RemoteEditorState>,
     remote_editor_hitbox: Option<RemoteEditorHitbox>,
     remote_remove_confirmation: Option<RemoteRemoveConfirmation>,
@@ -3568,6 +3592,9 @@ impl App {
             remote_action_diagnostic: None,
             event_log: EventLog::default(),
             ui_save_error: None,
+            remote_update_scopes: BTreeMap::new(),
+            remote_update_dialog: None,
+            remote_update_hitbox: None,
             remote_editor: None,
             remote_editor_hitbox: None,
             remote_remove_confirmation: None,
@@ -3765,6 +3792,7 @@ impl App {
         self.summary_offset = 0;
         self.summary_inspected_date = None;
         self.summary_daily_dragging = false;
+        self.remote_update_scopes = state.remote_update_scopes.clone();
         self.table_columns = state.table_columns;
         self.task_list_mode = state.task_list_mode.into();
         self.expanded_task_threads.clear();
@@ -4189,6 +4217,7 @@ impl App {
             summary_metric: self.summary_metric.into(),
             summary_show_all_projects: self.summary_show_all_projects,
             history_source_selection: (&self.history_source_selection).into(),
+            remote_update_scopes: self.remote_update_scopes.clone(),
             table_columns: self.table_columns,
             task_list_mode: self.task_list_mode.into(),
             task_source_filter: self.task_source_filter.into(),
@@ -4442,6 +4471,7 @@ impl App {
         !self.focus.is_search()
             && !self.quit_confirmation_visible
             && self.resume_confirmation.is_none()
+            && self.remote_update_dialog.is_none()
             && self.remote_editor.is_none()
             && self.remote_remove_confirmation.is_none()
             && self.remote_purge_confirmation.is_none()
@@ -4499,6 +4529,7 @@ impl App {
     fn remote_action_idle(&self) -> bool {
         self.remote_action_running.is_none()
             && self.pending_remote_action.is_none()
+            && self.remote_update_dialog.is_none()
             && self.remote_editor.is_none()
             && self.remote_remove_confirmation.is_none()
             && self.remote_purge_confirmation.is_none()
@@ -5345,6 +5376,81 @@ impl App {
         };
         self.cancel_remote_editor();
         self.queue_remote_action(kind, editor.host_id, editor.config_revision);
+    }
+
+    fn begin_remote_update(&mut self) {
+        if self.reject_remote_config_mutation_while_busy() {
+            return;
+        }
+        let Some(host) = self.selected_remote_host() else {
+            return;
+        };
+        self.remote_update_dialog = Some(RemoteUpdateDialog {
+            host_id: host.id().to_owned(),
+            agent_executable: host.agent_executable().to_owned(),
+            config_revision: self
+                .remote_sources
+                .config
+                .as_ref()
+                .map_or(0, RemotesConfig::config_revision),
+            scope: self
+                .remote_update_scopes
+                .get(host.id())
+                .copied()
+                .unwrap_or_default(),
+            adopt: false,
+        });
+    }
+
+    fn cancel_remote_update(&mut self) {
+        self.remote_update_dialog = None;
+        self.remote_update_hitbox = None;
+    }
+
+    fn select_remote_update_scope(&mut self, scope: UiRemoteUpdateScope) {
+        if let Some(dialog) = self.remote_update_dialog.as_mut() {
+            dialog.scope = scope;
+            // Adoption is separate, explicit authorization for this operation only.
+            dialog.adopt = false;
+        }
+    }
+
+    fn toggle_remote_update_adoption(&mut self) {
+        if let Some(dialog) = self.remote_update_dialog.as_mut()
+            && dialog.scope == UiRemoteUpdateScope::Node
+        {
+            dialog.adopt = !dialog.adopt;
+        }
+    }
+
+    fn confirm_remote_update(&mut self) {
+        let Some(dialog) = self.remote_update_dialog.clone() else {
+            return;
+        };
+        // Capture the dialog's host and revision, not a possibly changed row selection.
+        let current = self.remote_config_store.load();
+        if !current.as_ref().is_ok_and(|config| {
+            config.config_revision() == dialog.config_revision
+                && config.host(&dialog.host_id).is_some()
+        }) {
+            self.cancel_remote_update();
+            self.remote_action_status = Some(RemoteActionStatus::Rejected(
+                "Remote config changed or unavailable; update was not started".to_owned(),
+            ));
+            self.reload_remote_sources();
+            return;
+        }
+        self.remote_update_scopes
+            .insert(dialog.host_id.clone(), dialog.scope);
+        self.cancel_remote_update();
+        self.queue_remote_action(
+            RemoteUiActionKind::Deploy {
+                scope: dialog.scope,
+                adopt: dialog.adopt,
+            },
+            dialog.host_id,
+            dialog.config_revision,
+        );
     }
 
     fn begin_remote_remove_confirmation(&mut self) {
@@ -6879,7 +6985,7 @@ impl App {
             return true;
         }
         if hitbox.remote_deploy_enabled && rect_contains(hitbox.remote_deploy, column, row) {
-            self.request_remote_action(RemoteUiActionKind::Deploy);
+            self.begin_remote_update();
             return true;
         }
         if hitbox.remote_sync_enabled && rect_contains(hitbox.remote_sync, column, row) {
@@ -7873,6 +7979,25 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.remote_update_dialog.is_some() {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(hitbox) = app.remote_update_hitbox
+        {
+            if rect_contains(hitbox.sync, event.column, event.row) {
+                app.select_remote_update_scope(UiRemoteUpdateScope::Sync);
+            } else if rect_contains(hitbox.node, event.column, event.row) {
+                app.select_remote_update_scope(UiRemoteUpdateScope::Node);
+            } else if rect_contains(hitbox.adopt, event.column, event.row) {
+                app.toggle_remote_update_adoption();
+            } else if rect_contains(hitbox.confirm, event.column, event.row) {
+                app.confirm_remote_update();
+            } else if rect_contains(hitbox.cancel, event.column, event.row) {
+                app.cancel_remote_update();
+            }
+        }
+        return true;
+    }
+
     if app.remote_editor.is_some() {
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some(hitbox) = app.remote_editor_hitbox
@@ -8186,6 +8311,25 @@ fn fast_model_line(value: &str, column_width: usize, theme: Theme) -> Line<'stat
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
+    }
+
+    if app.remote_update_dialog.is_some() {
+        let controls = app.remote_update_hitbox.unwrap_or_default();
+        match key.code {
+            KeyCode::Char('s' | 'S') if !controls.sync.is_empty() => {
+                app.select_remote_update_scope(UiRemoteUpdateScope::Sync)
+            }
+            KeyCode::Char('n' | 'N') if !controls.node.is_empty() => {
+                app.select_remote_update_scope(UiRemoteUpdateScope::Node)
+            }
+            KeyCode::Char('a' | 'A') if !controls.adopt.is_empty() => {
+                app.toggle_remote_update_adoption()
+            }
+            KeyCode::Enter if !controls.confirm.is_empty() => app.confirm_remote_update(),
+            KeyCode::Esc | KeyCode::Left => app.cancel_remote_update(),
+            _ => {}
+        }
+        return false;
     }
 
     if app.remote_editor.is_some() {
@@ -8511,7 +8655,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                     (hitbox.remote_deploy, hitbox.remote_deploy_enabled)
                 }) =>
         {
-            app.request_remote_action(RemoteUiActionKind::Deploy);
+            app.begin_remote_update();
         }
         KeyCode::Char('c' | 'C')
             if app.view == View::Settings
@@ -11347,7 +11491,7 @@ fn execute_remote_ui_action(
             if matches!(result, RemoteUiActionOutcome::Complete)
                 && matches!(
                     request.kind,
-                    RemoteUiActionKind::Test | RemoteUiActionKind::Deploy
+                    RemoteUiActionKind::Test | RemoteUiActionKind::Deploy { .. }
                 )
             {
                 return Ok(RemoteUiActionOutcome::CompleteWithDetails(
@@ -11398,7 +11542,7 @@ fn remote_action_event(kind: &RemoteUiActionKind) -> &'static str {
         RemoteUiActionKind::Edit { .. } => "remote.edit",
         RemoteUiActionKind::Pair => "remote.pair",
         RemoteUiActionKind::Test => "remote.test",
-        RemoteUiActionKind::Deploy => "remote.agent.deploy",
+        RemoteUiActionKind::Deploy { .. } => "remote.agent.deploy",
         RemoteUiActionKind::Sync => "remote.sync",
         RemoteUiActionKind::Remove => "remote.remove",
         RemoteUiActionKind::Include => "remote.include",
@@ -11440,10 +11584,38 @@ fn remote_ui_action_output(output: &Output) -> Result<RemoteUiActionOutcome, Str
     match output.status.code() {
         Some(0) => Ok(RemoteUiActionOutcome::Complete),
         Some(2) => {
-            let mut detail = diagnostic(&output.stderr);
-            if detail.is_empty() {
-                detail = diagnostic(&output.stdout);
-            }
+            // Target updates return component reports on stdout while stderr
+            // can contain only a generic retry message. Keep the actual failure
+            // and completed component visible instead of discarding the report.
+            let component_detail = serde_json::from_slice::<serde_json::Value>(
+                &output.stdout[..output.stdout.len().min(8192)],
+            )
+            .ok()
+            .filter(|report| report.get("recorder").is_some() && report.get("cli").is_some())
+            .map(|report| {
+                [("recorder", "Recorder"), ("cli", "CLI")]
+                    .into_iter()
+                    .map(|(key, label)| {
+                        let component = &report[key];
+                        let outcome = component["outcome"].as_str().unwrap_or("unknown");
+                        match component["diagnostic"].as_str() {
+                            Some(reason) => format!("{label}: {outcome} ({reason})"),
+                            None => format!("{label}: {outcome}"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
+            let stdout = component_detail.unwrap_or_else(|| diagnostic(&output.stdout));
+            let stderr = diagnostic(&output.stderr);
+            let mut detail = diagnostic(
+                [stdout, stderr]
+                    .into_iter()
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+                    .as_bytes(),
+            );
             if detail.is_empty() {
                 detail = "Operation incomplete; retry after checking the remote source".to_owned();
             }
@@ -11451,7 +11623,15 @@ fn remote_ui_action_output(output: &Output) -> Result<RemoteUiActionOutcome, Str
         }
         Some(code) => {
             let detail = diagnostic(&output.stderr);
-            let hint = if detail.contains("agent_recorder_upgrade")
+            let hint = if detail.contains("update_entry_unmanaged") {
+                " To migrate a manually installed CLI, choose Node application and explicitly enable Adopt manual CLI."
+            } else if detail.contains("update_external_install") {
+                " Update the CLI with its package manager, or choose Sync components to keep that CLI installation."
+            } else if detail.contains("update_entry_conflict") {
+                " The managed CLI entry changed outside this updater; inspect that entry before retrying."
+            } else if detail.contains("agent_node_update_failed") {
+                " The node update is incomplete. Retry Update node with the same scope to resume."
+            } else if detail.contains("agent_recorder_upgrade")
                 || detail.contains("service_upgrade_")
                 || detail.contains("service_start_timeout")
             {
@@ -11515,7 +11695,7 @@ fn trace_remote_ui_action(
                         | RemoteUiActionKind::Edit { .. }
                         | RemoteUiActionKind::Pair
                         | RemoteUiActionKind::Test
-                        | RemoteUiActionKind::Deploy
+                        | RemoteUiActionKind::Deploy { .. }
                         | RemoteUiActionKind::Remove
                         | RemoteUiActionKind::Include
                         | RemoteUiActionKind::Exclude
@@ -11550,6 +11730,11 @@ fn remote_ui_action_error_kind(error: &str) -> &'static str {
         return "agent_version_mismatch";
     }
     for kind in [
+        "update_entry_unmanaged",
+        "update_external_install",
+        "update_entry_conflict",
+        "agent_node_update_failed",
+        "agent_node_update_invalid",
         "service_start_timeout",
         "service_upgrade_conflict",
         "service_upgrade_unverifiable",
@@ -11645,10 +11830,15 @@ fn append_remote_ui_action_args(command: &mut Command, request: &RemoteUiActionR
                 .arg("--redact-content")
                 .arg(redact_content.to_string());
         }
+        RemoteUiActionKind::Deploy { scope, adopt } => {
+            command.arg("--scope").arg(scope.argument());
+            if *adopt {
+                command.arg("--adopt");
+            }
+        }
         RemoteUiActionKind::Pair
         | RemoteUiActionKind::Remove
         | RemoteUiActionKind::Test
-        | RemoteUiActionKind::Deploy
         | RemoteUiActionKind::Sync
         | RemoteUiActionKind::Include
         | RemoteUiActionKind::Exclude
@@ -11671,6 +11861,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.turn_controls_hitbox = None;
     app.window_controls_hitbox = None;
     app.settings_controls_hitbox = None;
+    app.remote_update_hitbox = None;
     app.remote_editor_hitbox = None;
     app.remote_remove_confirmation_hitbox = None;
     app.remote_purge_confirmation_hitbox = None;
@@ -11796,6 +11987,8 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     }
     if app.remote_editor.is_some() {
         app.remote_editor_hitbox = Some(render_remote_editor(frame, area, app));
+    } else if app.remote_update_dialog.is_some() {
+        app.remote_update_hitbox = Some(render_remote_update_dialog(frame, area, app));
     } else if app.remote_remove_confirmation.is_some() {
         app.remote_remove_confirmation_hitbox =
             Some(render_remote_remove_confirmation(frame, area, app));
@@ -12582,6 +12775,160 @@ fn render_remote_editor(frame: &mut Frame<'_>, area: Rect, app: &App) -> RemoteE
         content,
         next,
         save,
+        cancel,
+    }
+}
+
+fn render_remote_update_dialog(frame: &mut Frame<'_>, area: Rect, app: &App) -> RemoteUpdateHitbox {
+    let Some(dialog) = app.remote_update_dialog.as_ref() else {
+        return RemoteUpdateHitbox::default();
+    };
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(76) / 2,
+        area.y + area.height.saturating_sub(14) / 2,
+        area.width.min(76),
+        area.height.min(14),
+    );
+    let title = format!(" Update {} ", terminal_safe_text(&dialog.host_id));
+    let block = panel(&title, app.theme);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return RemoteUpdateHitbox::default();
+    }
+    if inner.height < 12 || inner.width < 30 {
+        frame.render_widget(
+            Paragraph::new("Resize to 32 x 14 to choose update scope.")
+                .style(app.theme.base_style())
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        let row = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+        let mut spans = Vec::new();
+        let mut x = row.x;
+        let cancel = append_summary_control(
+            &mut spans,
+            row,
+            &mut x,
+            SummaryControlSpec {
+                leading: "",
+                shortcut: "←".to_owned(),
+                suffix: "Back",
+                selected: false,
+                shortcuts_active: true,
+                theme: app.theme,
+            },
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        return RemoteUpdateHitbox {
+            cancel,
+            ..RemoteUpdateHitbox::default()
+        };
+    }
+    let lines = [
+        (
+            0,
+            format!("Target: {} (this center)", env!("CARGO_PKG_VERSION")),
+        ),
+        (1, format!("Build: {}", env!("MONIT_BUILD_ID"))),
+        (
+            2,
+            format!("Agent: {}", terminal_safe_text(&dialog.agent_executable)),
+        ),
+        (4, "Agent + existing recorder; keeps CLI".to_owned()),
+        (6, "Agent + existing recorder + CLI".to_owned()),
+        (8, "CLI: checked on remote before changes".to_owned()),
+        (9, "Adopt takes over a manual CLI entry".to_owned()),
+        (10, "Cargo / Homebrew: use their updater".to_owned()),
+    ];
+    for (row, text) in lines {
+        frame.render_widget(
+            Paragraph::new(truncate_display_text(&text, usize::from(inner.width)))
+                .style(app.theme.base_style()),
+            Rect::new(inner.x, inner.y + row, inner.width, 1),
+        );
+    }
+    let mut control = |row, shortcut: &str, suffix, selected, active| {
+        let row = Rect::new(inner.x, inner.y + row, inner.width, 1);
+        let mut spans = Vec::new();
+        let mut x = row.x;
+        let hitbox = append_summary_control(
+            &mut spans,
+            row,
+            &mut x,
+            SummaryControlSpec {
+                leading: "",
+                shortcut: shortcut.to_owned(),
+                suffix,
+                selected,
+                shortcuts_active: active,
+                theme: app.theme,
+            },
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        hitbox
+    };
+    let sync = control(
+        3,
+        "S",
+        "Sync components",
+        dialog.scope == UiRemoteUpdateScope::Sync,
+        true,
+    );
+    let node = control(
+        5,
+        "N",
+        "Node application",
+        dialog.scope == UiRemoteUpdateScope::Node,
+        true,
+    );
+    let adopt = control(
+        7,
+        "A",
+        if dialog.adopt {
+            "Adopt manual CLI: on "
+        } else {
+            "Adopt manual CLI: off"
+        },
+        dialog.adopt,
+        dialog.scope == UiRemoteUpdateScope::Node,
+    );
+    let row = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+    let mut spans = Vec::new();
+    let mut x = row.x;
+    let confirm = append_summary_control(
+        &mut spans,
+        row,
+        &mut x,
+        SummaryControlSpec {
+            leading: "",
+            shortcut: "↵".to_owned(),
+            suffix: "Update",
+            selected: false,
+            shortcuts_active: true,
+            theme: app.theme,
+        },
+    );
+    let cancel = append_summary_control(
+        &mut spans,
+        row,
+        &mut x,
+        SummaryControlSpec {
+            leading: "   ",
+            shortcut: "←".to_owned(),
+            suffix: "Back",
+            selected: false,
+            shortcuts_active: true,
+            theme: app.theme,
+        },
+    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), row);
+    RemoteUpdateHitbox {
+        sync,
+        node,
+        adopt,
+        confirm,
         cancel,
     }
 }

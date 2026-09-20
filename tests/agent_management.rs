@@ -7,9 +7,16 @@ use std::{
 };
 
 fn command(root: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-usage-monit"));
+    isolated_command(root, env!("CARGO_BIN_EXE_codex-usage-monit"))
+}
+
+fn isolated_command(root: &Path, executable: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(executable);
     command
         .current_dir(root)
+        .env("HOME", root)
+        .env("LOCALAPPDATA", root.join("local"))
+        .env("XDG_DATA_HOME", root.join("data"))
         .env("CODEX_USAGE_MONIT_STATE_DIR", root.join("state"))
         .env("CODEX_USAGE_MONIT_CONFIG_DIR", root.join("config"))
         .env("CODEX_USAGE_MONIT_CACHE_DIR", root.join("cache"));
@@ -85,8 +92,7 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
     };
     let installed = install();
     assert_eq!(installed, install());
-    let output = Command::new(root.path().join(&installed))
-        .current_dir(root.path())
+    let output = isolated_command(root.path(), &installed)
         .args(["remote-agent", "info", "--sha256"])
         .output()
         .unwrap();
@@ -96,20 +102,23 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
     {
         // OpenSSH's default Windows shell is cmd.exe. Forward slash paths
         // beginning ./ are parsed as a command plus options and do not work.
-        let output = Command::new("cmd.exe")
-            .current_dir(root.path())
-            .args(["/d", "/c", &format!("{installed} remote-agent info")])
+        let output = isolated_command(root.path(), "cmd.exe")
+            .args([
+                "/d",
+                "/s",
+                "/c",
+                &format!("\"\"{installed}\" remote-agent info\""),
+            ])
             .output()
             .unwrap();
         let from_shell: Value = serde_json::from_slice(&success(output)).unwrap();
         assert_eq!(from_shell["buildId"], info["buildId"]);
-        let output = Command::new("powershell.exe")
-            .current_dir(root.path())
+        let output = isolated_command(root.path(), "powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &format!("{installed} remote-agent info"),
+                &format!("& '{}' remote-agent info", installed.replace('\'', "''")),
             ])
             .output()
             .unwrap();
