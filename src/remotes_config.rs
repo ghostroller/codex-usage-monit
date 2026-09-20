@@ -1015,6 +1015,12 @@ impl RemotesConfigStore {
         open_locked_lock_file(config_parent(path), LockMode::Exclusive)
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_lock_exclusive_for_test(&self) -> io::Result<Option<FileLock>> {
+        let path = self.required_path()?;
+        try_open_locked_lock_file(config_parent(path), LockMode::Exclusive)
+    }
+
     /// Pins a probe result only if the exact host entry that was probed is
     /// still current. The revision and host comparison happen while holding
     /// the same exclusive lock as the write, so even a non-cooperating writer

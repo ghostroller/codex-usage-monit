@@ -861,6 +861,43 @@ mod tests {
         }
     }
 
+    fn fixture_remote_command(command: &Command) -> String {
+        use base64::Engine;
+        let remote = command
+            .get_args()
+            .last()
+            .expect("SSH fixture must have a remote command")
+            .to_str()
+            .unwrap();
+        let Some(encoded) =
+            remote.strip_prefix("powershell.exe -NoProfile -NonInteractive -EncodedCommand ")
+        else {
+            return remote.into();
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("remote PowerShell command must be Base64");
+        assert!(bytes.len().is_multiple_of(2));
+        String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .expect("remote PowerShell command must be UTF-16")
+    }
+
+    fn fixture_calls_agent(remote: &str, arguments: &[&str]) -> bool {
+        remote.contains(&arguments.join(" "))
+            || remote.contains(
+                &arguments
+                    .iter()
+                    .map(|argument| format!("'{argument}'"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+    }
+
     fn manifest(bytes: &[u8]) -> AgentManifest {
         let mut info = AgentInfo::local();
         info.target = info.target.replace("-linux-gnu", "-linux-musl");
@@ -1341,7 +1378,6 @@ mod tests {
                     .map(|arg| arg.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" ");
-                calls.borrow_mut().push(args.clone());
                 assert!(args.contains("StrictHostKeyChecking=yes"));
                 assert!(args.contains("BatchMode=yes"));
                 if command.get_program().to_string_lossy().contains("scp") {
@@ -1354,6 +1390,8 @@ mod tests {
                         b"transfer",
                     ));
                 }
+                let remote = fixture_remote_command(command);
+                calls.borrow_mut().push(remote.clone());
                 if args.contains("old-agent remote-agent info") {
                     // A legacy agent can still identify the platform through
                     // the separate bootstrap OS probe, never through v4 data.
@@ -1389,14 +1427,14 @@ mod tests {
                         ));
                     }
                 }
-                if args.contains("remote-agent install") {
+                if fixture_calls_agent(&remote, &["remote-agent", "install"]) {
                     return Ok(output(
                         if failure == "install" { 1 } else { 0 },
                         managed_executable(&data.agent, &data.sha256).as_bytes(),
                         b"install failure",
                     ));
                 }
-                if args.contains("remote-agent info --sha256") {
+                if fixture_calls_agent(&remote, &["remote-agent", "info", "--sha256"]) {
                     let mut info = data.agent.clone();
                     info.executable_sha256 = Some(if failure == "checksum" {
                         "0".repeat(64)
@@ -1408,7 +1446,16 @@ mod tests {
                     }
                     return Ok(output(0, &serde_json::to_vec(&info).unwrap(), b""));
                 }
-                Ok(output(0, b"X64", b""))
+                if remote.contains("RuntimeInformation]::OSArchitecture") {
+                    return Ok(output(0, b"X64", b""));
+                }
+                assert!(
+                    remote.starts_with("chmod 700 ")
+                        || remote.contains("rm -f ")
+                        || remote.contains("Remove-Item -LiteralPath"),
+                    "unexpected deployment fixture command: {remote}"
+                );
+                Ok(output(0, b"", b""))
             };
             let mut connection = AgentConnection::new("test-host", &environment).unwrap();
             connection.runner = Some(&runner);
@@ -1422,16 +1469,20 @@ mod tests {
                 assert!(result.is_err(), "{failure}");
             }
             let calls = calls.borrow();
-            assert!(calls.iter().any(|call| call.contains("remote-agent info")));
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| fixture_calls_agent(call, &["remote-agent", "info"]))
+            );
             if failure == "upload" {
                 assert!(
                     !calls
                         .iter()
-                        .any(|call| call.contains("remote-agent install"))
+                        .any(|call| fixture_calls_agent(call, &["remote-agent", "install"]))
                 );
             }
             assert!(
-                calls.last().unwrap().contains("EncodedCommand")
+                calls.last().unwrap().contains("Remove-Item -LiteralPath")
                     || calls.last().unwrap().contains("rm -f")
             );
         }
@@ -1459,7 +1510,8 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(" ");
                     assert!(args.contains("StrictHostKeyChecking=yes"));
-                    calls.borrow_mut().push(args.clone());
+                    let remote = fixture_remote_command(command);
+                    calls.borrow_mut().push(remote.clone());
                     if args.ends_with("old-agent remote-agent info") {
                         return Ok(output(0, &serde_json::to_vec(&data.agent).unwrap(), b""));
                     }
@@ -1482,14 +1534,14 @@ mod tests {
                         }
                         return Ok(output(0, &serde_json::to_vec(&returned).unwrap(), b""));
                     }
-                    if args.contains("remote-agent install") {
+                    if fixture_calls_agent(&remote, &["remote-agent", "install"]) {
                         return Ok(output(
                             0,
                             managed_executable(&data.agent, &data.sha256).as_bytes(),
                             b"",
                         ));
                     }
-                    if args.contains("remote-agent info --sha256") {
+                    if fixture_calls_agent(&remote, &["remote-agent", "info", "--sha256"]) {
                         let mut info = data.agent.clone();
                         info.executable_sha256 = Some(if failure == "verification" {
                             "0".repeat(64)
@@ -1498,6 +1550,10 @@ mod tests {
                         });
                         return Ok(output(0, &serde_json::to_vec(&info).unwrap(), b""));
                     }
+                    assert!(
+                        remote.contains("rm -f ") || remote.contains("Remove-Item -LiteralPath"),
+                        "unexpected release fixture command: {remote}"
+                    );
                     Ok(output(0, b"", b""))
                 };
                 let environment = SshCommandEnvironment::default();
@@ -1512,7 +1568,7 @@ mod tests {
                 let installed = calls
                     .borrow()
                     .iter()
-                    .any(|call| call.contains("remote-agent install"));
+                    .any(|call| fixture_calls_agent(call, &["remote-agent", "install"]));
                 assert_eq!(installed, matches!(failure, "none" | "verification"));
                 if failure == "none" {
                     assert_eq!(

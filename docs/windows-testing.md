@@ -14,6 +14,21 @@ failure is a diagnostic to investigate, not a reason to silently switch runners.
 
 ## Daily host entry point
 
+The full native `scripts/windows/verify.ps1` pipeline and `-ScriptContractsOnly`
+also require Python 3 on PATH. They run the release bootstrap, user installer,
+signed-setup rejection and packaging contracts, including PowerShell 5.1/7.
+Installer registry tests use randomly named keys under HKCU\Software; they never
+change the actual user PATH or application uninstall registration. A sandbox
+which denies registry writes must record that restriction separately or run
+these isolated tests in the intended normal-user context.
+
+When a sandbox's default TEMP inherits access for another test identity, use a
+dedicated temporary directory owned by the executing SID and limited to that
+SID, SYSTEM and Administrators. Do not weaken product ACL validation or change
+permissions on the user's actual state just to make tests pass. Keep this test
+TEMP outside any Git checkout: repository-discovery tests intentionally inspect
+all ancestor directories, so a checkout-local TEMP is not a non-repository fixture.
+
 To start the development TUI on a native Windows machine with comprehensive
 application logging, run `& .\scripts\windows\dev.ps1`. See the
 [Windows TUI logging instructions](../README.md#tui-warnings-and-errors-on-windows)

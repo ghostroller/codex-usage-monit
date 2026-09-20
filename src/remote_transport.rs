@@ -1616,7 +1616,7 @@ fn build_ssh_command(program: &Path, ssh_host: &str, agent_executable: &str) -> 
     command.args(SSH_OPTIONS);
     command.arg("--");
     command.arg(ssh_host);
-    if executable_needs_quoting(agent_executable) {
+    if is_windows_executable_path(agent_executable) || executable_needs_quoting(agent_executable) {
         command.arg(remote_executable_command(
             agent_executable,
             &SSH_REMOTE_AGENT_ARGUMENTS,
@@ -1686,6 +1686,72 @@ mod executable_path_tests {
                 .starts_with("powershell.exe -NoProfile")
         );
     }
+
+    #[test]
+    fn relative_windows_paths_keep_windows_shell_semantics() {
+        for path in [r"tools\agent.exe", r"..\tools\agent.exe", r".\agent.exe"] {
+            crate::remotes_config::validate_agent_executable(path).unwrap();
+            assert!(
+                remote_executable_command(path, &["remote-agent", "info"])
+                    .starts_with("powershell.exe -NoProfile"),
+                "{path} must not receive POSIX quoting"
+            );
+        }
+        assert!(!is_windows_executable_path(
+            r"/opt/unix\directory/agent.exe"
+        ));
+        assert!(!is_windows_executable_path(r"~/unix\directory/agent.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_remote_invocation_runs_under_cmd_and_both_powershells() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = root.path().join("tools");
+        let child = root.path().join("child");
+        fs::create_dir(&tools).unwrap();
+        fs::create_dir(&child).unwrap();
+        let executable = tools.join("agent.exe");
+        fs::copy(
+            PathBuf::from(env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+            &executable,
+        )
+        .unwrap();
+        let absolute = executable.to_string_lossy().into_owned();
+        for (directory, path) in [
+            (root.path(), r"tools\agent.exe"),
+            (root.path(), r".\tools\agent.exe"),
+            (child.as_path(), r"..\tools\agent.exe"),
+            (root.path(), absolute.as_str()),
+        ] {
+            let invocation = remote_executable_command(path, &["/d", "/c", "echo literal-ready"]);
+            for shell in ["cmd.exe", "powershell.exe", "pwsh.exe"] {
+                let mut command = Command::new(shell);
+                command.current_dir(directory);
+                if shell == "cmd.exe" {
+                    command.args(["/d", "/c", &invocation]);
+                } else {
+                    command.args(["-NoProfile", "-NonInteractive", "-Command", &invocation]);
+                }
+                let result = crate::bounded_process::output(
+                    &mut command,
+                    Duration::from_secs(30),
+                    64 * 1024,
+                )
+                .unwrap();
+                assert_eq!(
+                    result.status.code(),
+                    Some(0),
+                    "{shell}: {path}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&result.stdout).trim(),
+                    "literal-ready"
+                );
+            }
+        }
+    }
 }
 
 fn is_windows_executable_path(path: &str) -> bool {
@@ -1694,6 +1760,14 @@ fn is_windows_executable_path(path: &str) -> bool {
         || (path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
             && path.as_bytes().get(1) == Some(&b':')
             && matches!(path.as_bytes().get(2), Some(b'/' | b'\\')))
+        // Config also accepts relative Windows .exe paths without a .\ prefix.
+        // A backslash is legal in a Unix filename, so preserve explicit Unix
+        // paths instead of routing every backslash through PowerShell.
+        || (!path.starts_with('/')
+            && !path.starts_with("~/")
+            && !path.starts_with("./")
+            && path.contains('\\')
+            && path.to_ascii_lowercase().ends_with(".exe"))
 }
 
 fn executable_needs_quoting(path: &str) -> bool {
@@ -1708,10 +1782,12 @@ fn executable_needs_quoting(path: &str) -> bool {
 
 /// Build one remote shell command. Callers validate the executable first;
 /// arguments are data and are quoted independently. Encoded PowerShell works
-/// under both supported Windows OpenSSH login shells and preserves exit codes.
+/// under both supported Windows OpenSSH login shells. The inner script returns
+/// the native exit code; an outer PowerShell login shell can normalize nonzero
+/// codes, so structured component outcomes remain authoritative.
 pub(crate) fn remote_executable_command(executable: &str, args: &[&str]) -> String {
     let windows = is_windows_executable_path(executable);
-    if windows && executable_needs_quoting(executable) {
+    if windows {
         use base64::Engine;
         let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
         let script = format!(
@@ -2653,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_windows_agent_executable_is_one_exact_ssh_argument() {
+    fn custom_windows_agent_executable_uses_one_encoded_shell_command() {
         let command = build_ssh_command(
             Path::new("ssh-test"),
             "windows-server",
@@ -2661,17 +2737,11 @@ mod tests {
         );
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let mut expected = SSH_OPTIONS.iter().map(OsString::from).collect::<Vec<_>>();
-        expected.extend(
-            [
-                "--",
-                "windows-server",
-                "C:/Users/codex/bin/codex-usage-monit.exe",
-                "remote-agent",
-                "export",
-            ]
-            .into_iter()
-            .map(OsString::from),
-        );
+        expected.extend([OsString::from("--"), OsString::from("windows-server")]);
+        expected.push(OsString::from(remote_executable_command(
+            "C:/Users/codex/bin/codex-usage-monit.exe",
+            &["remote-agent", "export"],
+        )));
         assert_eq!(args, expected);
     }
 

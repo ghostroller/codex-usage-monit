@@ -114,6 +114,9 @@ use crate::trace::{TraceFields, TraceLog, TraceOutcome};
 use crate::trends::{TrendsReport, build_trends_report};
 use crate::tui::Theme;
 
+#[cfg(windows)]
+mod machine;
+
 struct PerfLogGuard {
     log: PerfLog,
     path: Option<PathBuf>,
@@ -322,6 +325,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Install or repair this user's Windows command and optional login recorder.
+    Install(InstallArgs),
+    /// Remove owned Windows registration while preserving configuration and history.
+    Uninstall(ServiceStatusArgs),
+    /// Diagnose Windows installation ownership, command resolution and user PATH.
+    Doctor(ServiceStatusArgs),
     /// Update this user's application and existing recorder with the shared updater.
     Update(UpdateArgs),
     /// Print a complete or filtered one-shot snapshot.
@@ -483,6 +492,42 @@ struct UpdateApplyArgs {
     allow_dev_build: bool,
     #[arg(long, value_enum, default_value_t = FormatArg::Text)]
     format: FormatArg,
+}
+
+#[derive(Clone, Debug, Args)]
+struct InstallArgs {
+    #[command(subcommand)]
+    action: Option<InstallAction>,
+    #[arg(long, default_value = "latest")]
+    version: String,
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["version", "current_binary"])]
+    bundle_dir: Option<PathBuf>,
+    #[arg(long, conflicts_with = "no_modify_path")]
+    add_to_path: bool,
+    #[arg(long)]
+    no_modify_path: bool,
+    #[arg(long, global = true, value_enum, default_value_t = InstallRecorder::None)]
+    recorder: InstallRecorder,
+    #[arg(long)]
+    adopt: bool,
+    #[arg(long, hide = true)]
+    current_binary: bool,
+    #[arg(long, hide = true)]
+    allow_dev_build: bool,
+    #[arg(long, global = true, value_enum, default_value_t = FormatArg::Text)]
+    format: FormatArg,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum InstallAction {
+    /// Restore this installer's owned PATH and command registration.
+    Repair,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum InstallRecorder {
+    None,
+    OnLogon,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -666,14 +711,25 @@ struct ServiceArgs {
 
 #[derive(Clone, Debug, Subcommand)]
 enum ServiceAction {
+    /// Manage an explicitly configured Windows machine service (administrator required).
+    #[cfg(windows)]
+    Machine(machine::MachineArgs),
     /// Install and start the current user's background recorder.
-    Install,
+    Install(ServiceStatusArgs),
     /// Replace an existing recorder with this build, preserving its configuration and enabled state.
     Upgrade(ServiceStatusArgs),
     /// Show registration state and the recorder's latest heartbeat.
     Status(ServiceStatusArgs),
     /// Stop and remove the current user's background recorder.
     Uninstall,
+    /// Enable and start the installed recorder, preserving its collection options.
+    Start(ServiceStatusArgs),
+    /// Disable login startup and cooperatively stop the installed recorder.
+    Stop(ServiceStatusArgs),
+    /// Restart the installed recorder without changing its options.
+    Restart(ServiceStatusArgs),
+    /// Repair a known managed registration using its saved options.
+    Repair(ServiceStatusArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -924,6 +980,17 @@ fn run_with(cli: Cli, process_started: Instant, parsed_at: Instant) -> Result<i3
     if let Some(Command::Update(args)) = &cli.command {
         return run_update(args.clone());
     }
+    if let Some(Command::Doctor(args)) = &cli.command {
+        let report = crate::installation::doctor()?;
+        return write_installation_report(&report, args.format, 0);
+    }
+    #[cfg(windows)]
+    if let Some(Command::Service(ServiceArgs {
+        action: ServiceAction::Machine(args),
+    })) = &cli.command
+    {
+        return machine::run(args, cli.no_rollout_cache);
+    }
     validate_output_path_conflicts(&cli)?;
     let managed = cli.log_file.is_none();
     let log = if cli.command.is_none() || !managed {
@@ -1124,6 +1191,43 @@ fn run_with_event_log(
     }
 
     let command = match command {
+        Command::Install(args) => {
+            return run_install(
+                &config,
+                args,
+                perf_log_path.as_deref(),
+                trace_log_path.as_deref(),
+            );
+        }
+        Command::Uninstall(args) => {
+            let report = crate::installation::uninstall(|expected_identity| {
+                let history = default_history_root()
+                    .map(absolute_path)
+                    .ok_or_else(|| anyhow::anyhow!("a user state directory is unavailable"))?;
+                let options = build_service_options(
+                    &config,
+                    history.clone(),
+                    default_status_file(&history),
+                    None,
+                    None,
+                )?;
+                let registered = crate::service::registered_status(&options)?;
+                if registered.installed {
+                    anyhow::ensure!(
+                        registered
+                            .registration_path
+                            .as_ref()
+                            .is_some_and(|path| { path.to_string_lossy() == expected_identity }),
+                        "install_ownership_conflict: the current recorder does not match this installation receipt"
+                    );
+                }
+                uninstall_service(&options)?;
+                Ok(())
+            })?;
+            let code = if report.outcome == "pending" { 2 } else { 0 };
+            return write_installation_report(&report, args.format, code);
+        }
+        Command::Doctor(_) => unreachable!("doctor returned before runtime initialization"),
         Command::Update(args) => return run_update(args),
         Command::Record(args) => {
             return run_recorder(
@@ -1194,6 +1298,9 @@ fn run_with_event_log(
         Command::Attribution(args) => request_for(args, Section::Attribution),
         Command::Windows(args) => request_for(args, Section::Windows),
         Command::Record(_)
+        | Command::Install(_)
+        | Command::Uninstall(_)
+        | Command::Doctor(_)
         | Command::Service(_)
         | Command::Remote(_)
         | Command::Summary(_)
@@ -1253,6 +1360,174 @@ fn run_with_event_log(
     } else {
         0
     })
+}
+
+fn write_installation_report(
+    report: &impl serde::Serialize,
+    format: FormatArg,
+    code: i32,
+) -> Result<i32> {
+    let value = serde_json::to_value(report)?;
+    if matches!(format, FormatArg::Json) {
+        write_stdout(&serde_json::to_string_pretty(&value)?)?;
+    } else {
+        write_stdout(&format!(
+            "Windows installation: {}",
+            value
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("inspected")
+        ))?;
+        let receipt = value.get("receipt");
+        for (label, item) in [
+            (
+                "Install directory",
+                value
+                    .get("root")
+                    .or_else(|| receipt.and_then(|r| r.get("root"))),
+            ),
+            (
+                "Command",
+                value
+                    .get("executable")
+                    .or_else(|| receipt.and_then(|r| r.get("executable"))),
+            ),
+            ("Owner", receipt.and_then(|r| r.get("owner"))),
+            ("Recorder task", receipt.and_then(|r| r.get("taskIdentity"))),
+            ("Diagnostic", value.get("diagnostic")),
+        ] {
+            if let Some(text) = item.and_then(|v| v.as_str()) {
+                write_stdout(&format!(
+                    "{label}: {}",
+                    crate::domain::terminal_safe_text(text)
+                ))?;
+            }
+        }
+        if let Some(path) = value.get("path").filter(|v| !v.is_null()) {
+            let registered = path
+                .get("persistentRegistered")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            write_stdout(if registered {
+                "User PATH: registered"
+            } else {
+                "User PATH: not registered"
+            })?;
+            if let Some(diagnostic) = path.get("diagnostic").and_then(|v| v.as_str()) {
+                write_stdout(&crate::domain::terminal_safe_text(diagnostic))?;
+            }
+        }
+        if value.get("dataPreserved").and_then(|v| v.as_bool()) == Some(true) {
+            write_stdout("Configuration and history have been preserved.")?;
+        }
+        if let Some(diagnostics) = value.get("diagnostics").and_then(|v| v.as_array()) {
+            for diagnostic in diagnostics.iter().filter_map(|v| v.as_str()) {
+                write_stdout(&crate::domain::terminal_safe_text(diagnostic))?;
+            }
+        }
+    }
+    Ok(code)
+}
+
+fn run_install(
+    config: &CollectConfig,
+    args: InstallArgs,
+    perf_log: Option<&Path>,
+    trace_log: Option<&Path>,
+) -> Result<i32> {
+    let mut report = if matches!(args.action, Some(InstallAction::Repair)) {
+        anyhow::ensure!(
+            args.version == "latest"
+                && args.bundle_dir.is_none()
+                && !args.current_binary
+                && !args.adopt
+                && !args.add_to_path
+                && !args.no_modify_path
+                && !args.allow_dev_build,
+            "install_repair_options: repair preserves the selected version and recorded PATH choice; use install to change them"
+        );
+        crate::installation::repair()?
+    } else {
+        crate::installation::install(crate::installation::InstallOptions {
+            version: args.version,
+            bundle: args.bundle_dir.map(absolute_path),
+            current_binary: args.current_binary,
+            modify_path: !args.no_modify_path,
+            adopt: args.adopt,
+            allow_dev_build: args.allow_dev_build,
+        })?
+    };
+    if args.recorder == InstallRecorder::OnLogon {
+        let executable = match report.update.as_ref() {
+            Some(update) => update.executable.clone(),
+            None => crate::update::selected_cli_executable()?,
+        };
+        let mut command = std::process::Command::new(&executable);
+        command
+            .arg("--codex-home")
+            .arg(absolute_path(config.codex_home.clone()))
+            .arg("--days")
+            .arg(config.lookback_days.to_string())
+            .arg("--max-files")
+            .arg(config.max_files.to_string())
+            .arg("--active-grace-minutes")
+            .arg(config.active_grace.as_secs().div_ceil(60).to_string());
+        if let Some(path) = &config.codex_bin {
+            command.arg("--codex-bin").arg(path);
+        }
+        if config.offline {
+            command.arg("--offline");
+        }
+        if config.redact_content {
+            command.arg("--redact-content");
+        }
+        if config.rollout_cache_dir.is_none() {
+            command.arg("--no-rollout-cache");
+        }
+        if let Some(path) = perf_log {
+            config.perf_log.finish();
+            command.arg("--perf-log").arg(path);
+        }
+        if let Some(path) = trace_log {
+            config.trace_log.finish();
+            command.arg("--trace-log").arg(path);
+        }
+        command.args(["service", "install", "--format", "json"]);
+        let registration = crate::installation::with_recorder_registration(&executable, || {
+            let result = crate::bounded_process::output(
+                &mut command,
+                Duration::from_secs(180),
+                1024 * 1024,
+            )?;
+            anyhow::ensure!(
+                result.status.success(),
+                "recorder registration failed: {}",
+                crate::domain::terminal_safe_text(&String::from_utf8_lossy(&result.stderr))
+            );
+            let status: crate::service::ServiceStatus = serde_json::from_slice(&result.stdout)?;
+            anyhow::ensure!(
+                status.installed && status.registration_path.is_some(),
+                "install_recorder_incomplete: manager did not retain the recorder registration"
+            );
+            Ok(())
+        })?;
+        report.receipt = registration.receipt;
+        if registration.operation.is_err() || registration.recovery_error.is_some() {
+            report.outcome = "partial".into();
+            write_installation_report(&report, args.format, 2)?;
+            if let Err(error) = registration.operation {
+                eprintln!(
+                    "{}",
+                    crate::domain::terminal_safe_text(&format!("{error:#}"))
+                );
+            }
+            if let Some(error) = registration.recovery_error {
+                eprintln!("{}", crate::domain::terminal_safe_text(&error));
+            }
+            return Ok(2);
+        }
+    }
+    write_installation_report(&report, args.format, 0)
 }
 
 fn run_update(args: UpdateArgs) -> Result<i32> {
@@ -4151,20 +4426,34 @@ fn run_service(
         .ok_or_else(|| anyhow::anyhow!("a user state directory is unavailable"))?;
     let status_file = default_status_file(&history_dir);
     let mut options = build_service_options(config, history_dir, status_file, perf_log, trace_log)?;
-    if matches!(&args.action, ServiceAction::Install) && !config.offline {
+    if matches!(&args.action, ServiceAction::Install(_)) && !config.offline {
         options.codex_bin = Some(resolve_service_codex(config)?);
     }
-    if matches!(&args.action, ServiceAction::Install) && perf_log.is_some() {
+    if matches!(&args.action, ServiceAction::Install(_)) && perf_log.is_some() {
         config.perf_log.finish();
     }
-    if matches!(&args.action, ServiceAction::Install) && trace_log.is_some() {
+    if matches!(&args.action, ServiceAction::Install(_)) && trace_log.is_some() {
         config.trace_log.finish();
     }
     let (status, output_format) = match args.action {
-        ServiceAction::Install => (install_service(&options)?, None),
+        ServiceAction::Install(args) => {
+            #[cfg(windows)]
+            {
+                options.executable = crate::update::install_current()?;
+            }
+            (install_service(&options)?, Some(args))
+        }
         ServiceAction::Status(args) => (crate::service::registered_status(&options)?, Some(args)),
         ServiceAction::Uninstall => (uninstall_service(&options)?, None),
+        ServiceAction::Start(args) => (crate::service::start_registered()?, Some(args)),
+        ServiceAction::Stop(args) => (crate::service::stop_registered()?, Some(args)),
+        ServiceAction::Restart(args) => (crate::service::restart_registered()?, Some(args)),
+        ServiceAction::Repair(args) => (crate::service::repair_registered()?, Some(args)),
         ServiceAction::Upgrade(_) => unreachable!("upgrade handled before default options"),
+        #[cfg(windows)]
+        ServiceAction::Machine(_) => {
+            unreachable!("machine service handled before user initialization")
+        }
     };
     let output = match output_format {
         Some(args) if matches!(args.format, FormatArg::Json) => {
@@ -4227,6 +4516,28 @@ fn render_service_status_text(status: &crate::service::ServiceStatus) -> String 
     }
     if let Some(path) = status.registration_path.as_deref() {
         lines.push(format!("registration: {}", path.display()));
+    }
+    if let Some(details) = &status.registration {
+        lines.push(format!("backend: {}", details.backend));
+        lines.push(format!("enabled: {}", details.enabled));
+        lines.push(format!("manager state: {}", details.manager_state));
+        lines.push(format!("health: {}", details.health));
+        if details.requires_interactive_logon {
+            lines.push(format!(
+                "interactive logon: {}",
+                match details.interactive_session_available {
+                    Some(true) => "available",
+                    Some(false) => "waiting for logon",
+                    None => "unknown",
+                }
+            ));
+        }
+        if let Some(code) = details.last_exit_code {
+            lines.push(format!("last exit code: {code}"));
+        }
+        if let Some(path) = &details.log_file {
+            lines.push(format!("recorder log: {}", path.display()));
+        }
     }
     lines.push(format!(
         "last history heartbeat: {}",
@@ -5710,7 +6021,9 @@ fn command_uses_model_catalog(command: Option<&Command>) -> bool {
         // attribution. Health collection, in contrast, stages a history
         // observation and therefore must use the validated active catalog.
         Some(Command::Limits(_)) => false,
-        Some(Command::Service(args)) => matches!(&args.action, ServiceAction::Install),
+        Some(Command::Service(args)) => matches!(&args.action, ServiceAction::Install(_)),
+        Some(Command::Install(args)) => args.recorder == InstallRecorder::OnLogon,
+        Some(Command::Uninstall(_) | Command::Doctor(_) | Command::Update(_)) => false,
         Some(Command::Remote(args)) => matches!(
             &args.action,
             RemoteAction::Pair(_)
@@ -5729,6 +6042,9 @@ fn command_uses_model_catalog(command: Option<&Command>) -> bool {
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "tui",
+        Some(Command::Install(_)) => "install",
+        Some(Command::Uninstall(_)) => "uninstall",
+        Some(Command::Doctor(_)) => "doctor",
         Some(Command::Update(_)) => "update",
         Some(Command::Snapshot(_)) => "snapshot",
         Some(Command::Limits(_)) => "limits",
@@ -5769,6 +6085,85 @@ fn request_for(args: OutputArgs, section: Section) -> OutputRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_installation_cli_keeps_registration_explicit() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["codex-usage-monit", "install"]).unwrap();
+        let Some(super::Command::Install(args)) = cli.command.as_ref() else {
+            panic!("install command")
+        };
+        assert_eq!(args.recorder, super::InstallRecorder::None);
+        assert!(!args.no_modify_path);
+        assert!(!super::command_uses_model_catalog(cli.command.as_ref()));
+        let repair = super::Cli::try_parse_from([
+            "codex-usage-monit",
+            "install",
+            "repair",
+            "--recorder",
+            "on-logon",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            repair.command,
+            Some(super::Command::Install(super::InstallArgs {
+                action: Some(super::InstallAction::Repair),
+                recorder: super::InstallRecorder::OnLogon,
+                format: super::FormatArg::Json,
+                ..
+            }))
+        ));
+        let cli = super::Cli::try_parse_from([
+            "codex-usage-monit",
+            "install",
+            "--recorder",
+            "on-logon",
+            "--no-modify-path",
+            "--bundle-dir",
+            "candidate",
+        ])
+        .unwrap();
+        assert!(super::command_uses_model_catalog(cli.command.as_ref()));
+        assert!(
+            super::Cli::try_parse_from([
+                "codex-usage-monit",
+                "install",
+                "--add-to-path",
+                "--no-modify-path"
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "codex-usage-monit",
+                "install",
+                "--version",
+                "0.5.1",
+                "--bundle-dir",
+                "candidate"
+            ])
+            .is_err()
+        );
+        for action in ["start", "stop", "restart", "repair", "status"] {
+            let cli = super::Cli::try_parse_from([
+                "codex-usage-monit",
+                "service",
+                action,
+                "--format",
+                "json",
+            ])
+            .unwrap();
+            assert!(!super::command_uses_model_catalog(cli.command.as_ref()));
+        }
+        for command in ["doctor", "uninstall"] {
+            let cli =
+                super::Cli::try_parse_from(["codex-usage-monit", command, "--format", "json"])
+                    .unwrap();
+            assert!(!super::command_uses_model_catalog(cli.command.as_ref()));
+        }
+    }
+
     #[test]
     fn deployed_agent_activation_requires_readiness_identity_and_unchanged_configuration() {
         use crate::remote_protocol::{RemoteExportResponse, RemoteTiming};
@@ -7609,7 +8004,7 @@ mod tests {
     }
 
     #[test]
-    fn service_status_owns_json_options_without_leaking_them_to_mutating_actions() {
+    fn service_output_options_belong_to_explicitly_supported_actions() {
         let status = Cli::try_parse_from([
             "codex-usage-monit",
             "service",
@@ -7629,12 +8024,33 @@ mod tests {
             }))
         ));
 
-        for action in ["install", "uninstall"] {
-            let error =
-                Cli::try_parse_from(["codex-usage-monit", "service", action, "--format", "json"])
-                    .unwrap_err();
-            assert!(error.use_stderr(), "service {action} accepted --format");
-        }
+        let install = Cli::try_parse_from([
+            "codex-usage-monit",
+            "service",
+            "install",
+            "--format",
+            "json",
+            "--compact",
+        ])
+        .unwrap();
+        assert!(matches!(
+            install.command,
+            Some(Command::Service(ServiceArgs {
+                action: ServiceAction::Install(ServiceStatusArgs {
+                    format: FormatArg::Json,
+                    compact: true,
+                }),
+            }))
+        ));
+        let error = Cli::try_parse_from([
+            "codex-usage-monit",
+            "service",
+            "uninstall",
+            "--format",
+            "json",
+        ])
+        .unwrap_err();
+        assert!(error.use_stderr(), "service uninstall accepted --format");
     }
 
     #[cfg(windows)]

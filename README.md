@@ -76,16 +76,17 @@ Rerunning the shell installer uses the same updater, including migration of a pr
 
 The command entry is a stable launcher that reads a version selection from `installation.json`, not a symlink that the service follows. The recorder uses an immutable version's absolute path. This lets subsequent Windows updates change the selection without overwriting a running launcher; the first migration of an old Windows executable can still require closing it. Installation roots, PATH diagnostics and recovery are described in [application updates](docs/remote-updates.md).
 
-On 64-bit Windows, download `codex-usage-monit-x86_64-pc-windows-msvc.exe` and `SHA256SUMS` from the [latest release](https://github.com/ghostroller/codex-usage-monit/releases/latest). Verify the executable in PowerShell, then use it to create the managed installation. Add `%LOCALAPPDATA%\codex-usage-monit\bin` to your user `PATH`:
+On 64-bit Windows, run the user installer from PowerShell. It verifies the release manifest and executable, creates a managed installation, and registers its command directory in your user `PATH`; no administrator account is needed:
+
+These download commands require the first release containing the Windows installer; before publication, use this checkout's script with a matching local release bundle.
 
 ```powershell
-$binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
-$actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
-$expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
-if ($actual -ne $expected) { throw "checksum mismatch" }
-& ".\$binary" update
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/ghostroller/codex-usage-monit/releases/latest/download/install.ps1' -OutFile .\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 & "$env:LOCALAPPDATA\codex-usage-monit\bin\codex-usage-monit.exe" --version
 ```
+
+Reopen your terminal application before using the bare `codex-usage-monit` command. Add `-Recorder on-logon` to install the current user's background recorder, or `-NoModifyPath` to keep PATH unchanged. Version pinning, offline bundles, repair, uninstall, and the separate administrator-managed server mode are documented in the [Windows installation guide](docs/windows-installation.md).
 
 ### Install from source
 
@@ -283,6 +284,8 @@ The installer uses a LaunchAgent on macOS, a `systemd --user` unit on Linux, and
 ```bash
 codex-usage-monit service uninstall
 ```
+
+Windows tasks run through an embedded, version-bound GUI host that starts the recorder without a console and supervises its process tree. `service start` enables automatic starts and starts recording; `service stop` disables automatic starts and stops recording. `service restart` requires an enabled registration, while `service repair` preserves its enabled/disabled state and resumes the existing upgrade workflow. `service status --format json` separates manager state, heartbeat health, and `waiting_for_logon`. The default Windows task requires the same user to remain logged in; SSH access alone does not satisfy that condition. See the [Windows guide](docs/windows-installation.md) for server mode and recovery.
 
 Use `update` for an application upgrade; it coordinates an existing service automatically. Use `service upgrade` when applying an already prepared executable to the recorder alone. Run `service install` again when intentionally changing `--codex-home`, Codex executable location, or collection options. Because each platform exposes one recorder registration per user, service changes and a pending v1-to-v2 history cutover share one current-user-global gate even when custom history directories differ. Before touching the manager, the installer writes a durable cutover blocker, removes any stale trust marker, disables and stops the previous managed recorder, and verifies that no separate foreground recorder owns the target history. Every new definition contains both the source-aware protocol and a deterministic identity derived from the executable, complete recorder arguments, and install-time environment. The installer binds the exact on-disk definition to the manager's loaded identity, verifies it again immediately before clearing the blocker, and only then permits the recorder to start. Linux units and Windows tasks remain inactive during this check; launchd must load a job before exposing its loaded arguments, so the installer keeps the target history's recorder lock until trust is complete and any eager launch attempt fails before it can write history. This also makes an old binary at the same path reject the new service command instead of becoming a legacy writer. A failed replacement never restores an older auto-start definition; trust, blocker-clear, and registration failures all enter verified cleanup, and an unproven cleanup leaves the blocker in place without a timeout. A dormant or changed registration without the matching trust record blocks first-time migration and crash recovery, while an already-active v2 history does not query the service manager again. Concurrent mutation by a pre-v0.4 installer or an administrator is outside the supported cutover protocol; the final recheck narrows that unavoidable cross-version window and fails closed when it observes a change. If no managed registration exists but a recent foreground-recorder status remains, installation and uninstallation also fail closed until that process is stopped. A LaunchAgent belongs to the logged-in macOS GUI user. A systemd user unit normally follows the user's login session unless lingering is enabled. The Windows task uses an interactive user token and therefore runs while that user is logged in. On a headless host whose user session does not persist, enable the platform's supported user-service persistence or use an existing supervisor.
 

@@ -403,6 +403,8 @@ pub(crate) fn install_current() -> Result<PathBuf> {
 }
 
 pub(crate) fn apply(options: ApplyOptions) -> Result<UpdateReport> {
+    #[cfg(windows)]
+    crate::installation::ownership_preflight()?;
     ensure!(
         options.scope == UpdateScope::Node || (options.install_dir.is_none() && !options.adopt),
         "update_scope_invalid: install-dir/adopt require node scope"
@@ -545,6 +547,8 @@ fn apply_at(
     upgrade_recorder: impl FnOnce() -> Result<ServiceUpgradeReport>,
 ) -> Result<UpdateReport> {
     let _lock = STORE.open_lock(root, LockMode::Exclusive, LockFilePolicy::Create)?;
+    #[cfg(windows)]
+    crate::installation::ownership_preflight_at(root)?;
     validate_version(root, &target)?;
     if let Some(registration) = read_installation(root)? {
         ensure_not_downgrade(
@@ -618,6 +622,13 @@ fn apply_at(
             },
         }
     };
+    // A first Windows migration may need to replace an ordinary executable.
+    // Check and retain write access before stopping the recorder: a running
+    // image cannot be opened this way, and this handle prevents a new image
+    // mapping until publication has completed. Compatible launchers need no
+    // replacement and therefore remain usable throughout the update.
+    let _replacement_guard =
+        preflight_cli_replacement(journal.cli_plan.as_ref(), &target, options)?;
     journal.phase = "prepared".into();
     journal.report.diagnostic = None;
     journal.report.recorder.outcome = "pending".into();
@@ -908,6 +919,15 @@ fn plan_cli(
     } else {
         None
     };
+    if let Some(discovered) = &discovered {
+        ensure!(
+            discovered
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(BINARY_NAME)),
+            "update_entry_wrapper: PATH resolves {}; wrappers cannot be adopted as an executable. Choose --install-dir explicitly, then review PATH precedence with Get-Command codex-usage-monit -All",
+            discovered.display()
+        );
+    }
     let directory = normalized_absolute(
         options
             .install_dir
@@ -947,7 +967,20 @@ fn plan_cli(
             previous_sha256.is_none() || options.adopt,
             "update_entry_unmanaged: existing CLI is not managed; use --adopt to explicitly migrate this user-owned file or choose another install directory"
         );
-        target.sha256.clone()
+        #[cfg(windows)]
+        let compatible = if let Some(previous) = &previous_sha256 {
+            previous != &target.sha256
+                && verify_compatible_launcher(root, &executable, previous, target)?
+        } else {
+            false
+        };
+        #[cfg(not(windows))]
+        let compatible = false;
+        if compatible {
+            previous_sha256.clone().expect("verified existing launcher")
+        } else {
+            target.sha256.clone()
+        }
     };
     Ok(CliPlan {
         executable,
@@ -955,6 +988,228 @@ fn plan_cli(
         launcher_sha256,
         previous_registration: existing,
     })
+}
+
+/// Prove the old executable understands the frozen launcher contract without
+/// changing the live registration. Version strings alone are not evidence: a
+/// portable build may have different capabilities at the same package version.
+#[cfg(windows)]
+fn verify_compatible_launcher(
+    root: &Path,
+    executable: &Path,
+    previous_sha256: &str,
+    target: &InstalledVersion,
+) -> Result<bool> {
+    let bytes = read_external_binary(executable)?;
+    ensure!(
+        digest(&bytes) == previous_sha256,
+        "update_entry_conflict: old CLI changed before its launcher compatibility check"
+    );
+    if !has_windows_pe_header(&bytes) {
+        return Ok(false);
+    }
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("update_probe_failed: {e}"))?;
+    let base = root.join(format!(".launcher-probe-{}", digest(&random)));
+    let probe_root = base.join("codex-usage-monit");
+    STORE.create_directory_beneath(root, &probe_root)?;
+    struct Cleanup {
+        files: Vec<PathBuf>,
+        directories: Vec<PathBuf>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            // Delete only files created by this probe. Unexpected files are
+            // retained rather than recursively deleting executable-owned data.
+            for path in &self.files {
+                let _ = fs::remove_file(path);
+            }
+            for path in &self.directories {
+                let _ = fs::remove_dir(path);
+            }
+        }
+    }
+    let selected_path = version_path(&probe_root, &target.version, &target.sha256)?;
+    let version_dir = selected_path
+        .parent()
+        .context("missing probe version directory")?;
+    let probe_entry = probe_root.join(BINARY_NAME);
+    let _cleanup = Cleanup {
+        files: vec![
+            probe_entry.clone(),
+            probe_root.join(REGISTRATION),
+            probe_root.join("update.lock"),
+            selected_path.clone(),
+            version_dir.join(VERSION_METADATA),
+        ],
+        directories: vec![
+            version_dir.to_path_buf(),
+            probe_root.join("versions"),
+            probe_root.clone(),
+            base.clone(),
+        ],
+    };
+    let mut target_info = AgentInfo::local();
+    target_info.version.clone_from(&target.version);
+    target_info.build_id.clone_from(&target.build_id);
+    target_info.target.clone_from(&target.target);
+    let selected = install_bytes(
+        &probe_root,
+        &target_info,
+        &BINARIES.read_bounded(&target.executable)?,
+    )?;
+    BINARIES.write_atomically(&probe_entry, &bytes)?;
+    write_json(
+        &probe_root.join(REGISTRATION),
+        &Installation {
+            schema_version: 1,
+            executable: probe_entry.clone(),
+            launcher_sha256: previous_sha256.into(),
+            selected: selected.clone(),
+        },
+    )?;
+    let mut command = Command::new(&probe_entry);
+    command
+        .env("LOCALAPPDATA", &base)
+        .args(["remote-agent", "info", "--sha256"]);
+    // CreateProcess itself can block on a malformed-image system dialog before
+    // the bounded runner has a Child to poll/terminate. Suppress loader dialogs
+    // for this thread only; never change another thread's process-wide mode.
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetThreadErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+        SetThreadErrorMode,
+    };
+    struct ErrorMode(u32);
+    impl Drop for ErrorMode {
+        fn drop(&mut self) {
+            unsafe { SetThreadErrorMode(self.0, std::ptr::null_mut()) };
+        }
+    }
+    let previous_mode = unsafe { GetThreadErrorMode() };
+    ensure!(
+        unsafe {
+            SetThreadErrorMode(
+                previous_mode
+                    | SEM_FAILCRITICALERRORS
+                    | SEM_NOGPFAULTERRORBOX
+                    | SEM_NOOPENFILEERRORBOX,
+                std::ptr::null_mut(),
+            )
+        } != 0,
+        "update_probe_failed: cannot suppress executable-loader dialogs: {}",
+        io::Error::last_os_error()
+    );
+    let _mode = ErrorMode(previous_mode);
+    let Ok(output) = crate::bounded_process::output(
+        &mut command,
+        Duration::from_secs(15),
+        MAX_METADATA as usize,
+    ) else {
+        return Ok(false);
+    };
+    let Ok(actual) = serde_json::from_slice::<AgentInfo>(&output.stdout) else {
+        return Ok(false);
+    };
+    Ok(output.status.success()
+        && actual.schema_version == 1
+        && actual.product == "codex-usage-monit"
+        && actual.version == target.version
+        && actual.build_id == target.build_id
+        && actual.target == target.target
+        && actual.protocol_version == AgentInfo::local().protocol_version
+        && actual.executable_sha256.as_deref() == Some(&selected.sha256))
+}
+
+#[cfg(windows)]
+fn has_windows_pe_header(bytes: &[u8]) -> bool {
+    if bytes.get(..2) != Some(b"MZ") {
+        return false;
+    }
+    let Some(offset) = bytes.get(60..64) else {
+        return false;
+    };
+    let offset = u32::from_le_bytes(offset.try_into().expect("four byte PE offset")) as usize;
+    offset.checked_add(24).is_some_and(|end| {
+        bytes
+            .get(offset..end)
+            .is_some_and(|header| header[..4] == *b"PE\0\0")
+    })
+}
+
+/// Check a trusted Windows executable's compatibility with a prepared managed
+/// version. This starts a copy of the explicitly supplied executable in an
+/// isolated installation root; callers must establish trust before invoking
+/// it. In particular, command discovery/doctor must not execute unknown files.
+/// The live CLI registration, recorder and executable bytes are unchanged.
+#[cfg(windows)]
+pub fn verify_launcher_compatibility(
+    executable: &Path,
+    prepared_executable: &Path,
+) -> Result<bool> {
+    let prepared_executable = prepared_executable.canonicalize()?;
+    let version_dir = prepared_executable
+        .parent()
+        .context("missing version directory")?;
+    let root = version_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("missing installation root")?;
+    STORE.validate_state_root(root)?;
+    let target: InstalledVersion = read_json(&version_dir.join(VERSION_METADATA))?
+        .context("update_version_missing: metadata is missing")?;
+    ensure!(
+        target.executable == prepared_executable,
+        "update_path_invalid: prepared executable differs from its metadata"
+    );
+    validate_version(root, &target)?;
+    let previous_sha256 =
+        entry_hash(executable)?.context("update_entry_missing: launcher is missing")?;
+    if previous_sha256 == target.sha256 {
+        return Ok(true);
+    }
+    verify_compatible_launcher(root, executable, &previous_sha256, &target)
+}
+
+fn preflight_cli_replacement(
+    plan: Option<&CliPlan>,
+    target: &InstalledVersion,
+    options: &ApplyOptions,
+) -> Result<Option<fs::File>> {
+    #[cfg(windows)]
+    if let Some(plan) = plan {
+        let actual = entry_hash(&plan.executable)?;
+        if actual.is_some() && actual.as_deref() != Some(&plan.launcher_sha256) {
+            let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+            let recovery = format!(
+                "& {} update apply --scope node --install-dir {} --adopt{} --format json",
+                quote(&target.executable),
+                quote(
+                    plan.executable
+                        .parent()
+                        .context("CLI entry has no parent")?
+                ),
+                if options.allow_dev_build {
+                    " --allow-dev-build"
+                } else {
+                    ""
+                },
+            );
+            let file = OpenOptions::new().write(true).open(&plan.executable).with_context(|| {
+                format!(
+                    "update_entry_busy: cannot prepare the old CLI for replacement; the recorder has not been changed by this attempt. Close processes using {} and run this prepared candidate from PowerShell: {recovery}",
+                    plan.executable.display()
+                )
+            })?;
+            ensure!(
+                entry_hash(&plan.executable)? == actual,
+                "update_entry_conflict: old CLI changed during replacement preflight"
+            );
+            return Ok(Some(file));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (plan, target, options);
+    Ok(None)
 }
 
 fn validate_cli_plan(root: &Path, plan: &CliPlan, target: &InstalledVersion) -> Result<()> {
@@ -1076,20 +1331,50 @@ fn publish_entry(path: &Path, bytes: &[u8], expected: Option<&str>) -> Result<()
 }
 
 fn resolve_path_entry(path: Option<&OsStr>) -> Option<PathBuf> {
+    resolve_path_entry_with_extensions(path, env::var_os("PATHEXT").as_deref())
+}
+
+fn resolve_path_entry_with_extensions(
+    path: Option<&OsStr>,
+    extensions: Option<&OsStr>,
+) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names = extensions
+        .unwrap_or_else(|| OsStr::new(".COM;.EXE;.BAT;.CMD"))
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| {
+            extension.starts_with('.')
+                && extension.len() > 1
+                && extension.len() <= 16
+                && extension[1..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!("codex-usage-monit{extension}"))
+        .collect::<Vec<_>>();
+    #[cfg(not(windows))]
+    let names = {
+        let _ = extensions;
+        vec![BINARY_NAME.to_owned()]
+    };
     env::split_paths(path?).find_map(|directory| {
-        let candidate = directory.join(BINARY_NAME);
-        let metadata = fs::metadata(&candidate).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
+        names.iter().find_map(|name| {
+            let candidate = directory.join(name);
+            let metadata = fs::metadata(&candidate).ok()?;
+            if !metadata.is_file() {
                 return None;
             }
-        }
-        std::path::absolute(candidate).ok()
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return None;
+                }
+            }
+            std::path::absolute(candidate).ok()
+        })
     })
 }
 
@@ -1205,6 +1490,166 @@ pub(crate) fn inspect() -> Result<UpdateStatus> {
     })
 }
 
+/// Remove only the registered command entry, retaining versions and user data.
+/// A running Windows launcher returns false so the installer can report a
+/// pending uninstall without discarding the ownership needed for a retry.
+#[cfg(windows)]
+pub(crate) fn unregister_cli(expected_executable: &Path) -> Result<bool> {
+    let root = installation_root()?;
+    if !root.exists() {
+        return Ok(true);
+    }
+    STORE.validate_state_root(&root)?;
+    let _lock = STORE.open_lock(&root, LockMode::Exclusive, LockFilePolicy::Create)?;
+    unregister_cli_at(&root, expected_executable)
+}
+
+#[cfg(windows)]
+pub(crate) fn with_installation_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let root = installation_root()?;
+    STORE.validate_state_root(&root)?;
+    let _lock = STORE.open_lock(&root, LockMode::Exclusive, LockFilePolicy::Create)?;
+    let journal: Option<UpdateJournal> = read_json(&root.join(JOURNAL))?;
+    ensure!(
+        journal.is_none_or(|journal| journal.phase == "complete"),
+        "update_pending: finish the retained application update before changing installation ownership"
+    );
+    operation()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn with_installation_lock<T>(_operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    bail!("installation_platform_unsupported: this installation lifecycle requires Windows")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn unregister_cli(_expected_executable: &Path) -> Result<bool> {
+    bail!("installation_platform_unsupported: this installation lifecycle requires Windows")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn repair_cli() -> Result<PathBuf> {
+    bail!("installation_platform_unsupported: this installation lifecycle requires Windows")
+}
+
+/// Return the verified version selected by the managed CLI, independently of
+/// the calling executable. Repairing a recorder from an older bootstrap must
+/// not silently replace a newer CLI selection with that bootstrap's build.
+#[cfg(windows)]
+pub(crate) fn selected_cli_executable() -> Result<PathBuf> {
+    let root = installation_root()?;
+    STORE.validate_state_root(&root)?;
+    let _lock = STORE.open_lock(&root, LockMode::Shared, LockFilePolicy::Existing)?;
+    crate::installation::ownership_preflight_at(&root)?;
+    selected_cli_executable_at(&root)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn selected_cli_executable() -> Result<PathBuf> {
+    bail!("installation_platform_unsupported: this installation lifecycle requires Windows")
+}
+
+#[cfg(windows)]
+fn selected_cli_executable_at(root: &Path) -> Result<PathBuf> {
+    let journal: Option<UpdateJournal> = read_json(&root.join(JOURNAL))?;
+    ensure!(
+        journal.is_none_or(|journal| journal.phase == "complete"),
+        "update_pending: finish the retained application update before using its selected CLI"
+    );
+    let registration = read_installation(root)?
+        .context("update_entry_unmanaged: install a managed CLI before repairing its recorder")?;
+    ensure!(
+        entry_hash(&registration.executable)?.as_deref() == Some(&registration.launcher_sha256),
+        "update_entry_conflict: registered launcher is missing or changed; repair the owned CLI before repairing its recorder"
+    );
+    validate_version(root, &registration.selected)?;
+    Ok(registration.selected.executable)
+}
+
+#[cfg(windows)]
+fn unregister_cli_at(root: &Path, expected_executable: &Path) -> Result<bool> {
+    let journal: Option<UpdateJournal> = read_json(&root.join(JOURNAL))?;
+    ensure!(
+        journal.is_none_or(|journal| journal.phase == "complete"),
+        "update_pending: finish the retained application update before uninstalling its CLI"
+    );
+    let expected_executable = normalized_absolute(expected_executable)?;
+    let Some(registration) = read_installation(root)? else {
+        ensure!(
+            entry_hash(&expected_executable)?.is_none(),
+            "update_entry_unmanaged: no registration owns the existing CLI; file preserved"
+        );
+        return Ok(true);
+    };
+    ensure!(
+        registration.executable == expected_executable,
+        "update_entry_conflict: a different CLI entry is registered; existing files preserved"
+    );
+    if let Some(actual) = entry_hash(&registration.executable)? {
+        ensure!(
+            actual == registration.launcher_sha256,
+            "update_entry_conflict: the registered CLI was changed outside the installer; file preserved"
+        );
+        match fs::remove_file(&registration.executable) {
+            Ok(()) => {}
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::remove_file(root.join(REGISTRATION))?;
+    Ok(true)
+}
+
+/// Recreate a missing owned launcher from its verified selected version. This
+/// never replaces an existing file and does not mutate recorder registration.
+#[cfg(windows)]
+pub(crate) fn repair_cli() -> Result<PathBuf> {
+    let root = installation_root()?;
+    STORE.validate_state_root(&root)?;
+    let _lock = STORE.open_lock(&root, LockMode::Exclusive, LockFilePolicy::Create)?;
+    repair_cli_at(&root)
+}
+
+#[cfg(windows)]
+fn repair_cli_at(root: &Path) -> Result<PathBuf> {
+    let journal: Option<UpdateJournal> = read_json(&root.join(JOURNAL))?;
+    ensure!(
+        journal.is_none_or(|journal| journal.phase == "complete"),
+        "update_pending: finish the retained application update before repairing its CLI"
+    );
+    let mut registration = read_installation(root)?
+        .context("update_entry_unmanaged: install a managed CLI before repairing it")?;
+    validate_version(root, &registration.selected)?;
+    if let Some(actual) = entry_hash(&registration.executable)? {
+        ensure!(
+            actual == registration.launcher_sha256,
+            "update_entry_conflict: the registered CLI was changed outside the installer; file preserved"
+        );
+        return Ok(registration.executable);
+    }
+    let directory = registration
+        .executable
+        .parent()
+        .context("CLI entry has no parent")?;
+    if !directory.exists() {
+        crate::windows_private_directory::create_dir_all(directory)?;
+    }
+    validate_install_directory(directory)?;
+    let bytes = BINARIES.read_bounded(&registration.selected.executable)?;
+    ensure!(
+        digest(&bytes) == registration.selected.sha256,
+        "update_checksum_mismatch: selected version changed during repair"
+    );
+    // Commit the new launcher's identity before publication. If publication
+    // fails the entry remains absent, so the same repair safely resumes.
+    registration
+        .launcher_sha256
+        .clone_from(&registration.selected.sha256);
+    write_json(&root.join(REGISTRATION), &registration)?;
+    publish_entry(&registration.executable, &bytes, None)?;
+    Ok(registration.executable)
+}
+
 pub(crate) fn prune(options: PruneOptions) -> Result<PruneReport> {
     validate_prune_options(&options)?;
     let root = installation_root()?;
@@ -1234,7 +1679,14 @@ pub(crate) fn prune(options: PruneOptions) -> Result<PruneReport> {
     // No direct service install/uninstall may change a reference during deletion.
     let _lock = STORE.open_lock(&root, LockMode::Exclusive, LockFilePolicy::Create)?;
     crate::service::with_update_references(options.apply, |references| {
-        let mut report = prune_at(&root, &options, &current_executable()?, references)?;
+        let references = references.to_vec();
+        #[cfg(windows)]
+        let references = {
+            let mut references = references;
+            references.extend(crate::installation::referenced_executables()?);
+            references
+        };
+        let mut report = prune_at(&root, &options, &current_executable()?, &references)?;
         report.legacy_roots = legacy_roots;
         Ok(report)
     })
@@ -1288,7 +1740,7 @@ fn prune_at(
                 action: "unknown".into(),
                 reason: "Not a verified managed version; retained.".into(),
             };
-            let candidate = (|| -> Result<InstalledVersion> {
+            let candidate = (|| -> Result<(InstalledVersion, bool)> {
                 ensure!(entry.file_type()?.is_dir(), "not a directory");
                 STORE.validate_private_directory(&entry.path())?;
                 let installed =
@@ -1302,20 +1754,36 @@ fn prune_at(
                 let names = fs::read_dir(entry.path())?
                     .map(|e| e.map(|e| e.file_name()))
                     .collect::<io::Result<Vec<_>>>()?;
+                #[cfg(windows)]
+                let has_components = crate::service::validate_windows_version_components(
+                    &entry.path(),
+                    &installed.build_id,
+                )?;
+                #[cfg(not(windows))]
+                let has_components = false;
                 ensure!(
-                    names.len() == 2
+                    names.len() == (if has_components { 4 } else { 2 })
                         && names.iter().all(|name| name == OsStr::new(BINARY_NAME)
-                            || name == OsStr::new(VERSION_METADATA)),
+                            || name == OsStr::new(VERSION_METADATA)
+                            || (has_components
+                                && (name == OsStr::new("recorder-host.exe")
+                                    || name == OsStr::new("windows-components.json")))),
                     "version contains unknown files"
                 );
-                Ok(installed)
+                Ok((installed, has_components))
             })();
-            if let Ok(installed) = candidate {
+            if let Ok((installed, has_components)) = candidate {
                 item.executable = Some(installed.executable.clone());
                 if protected.iter().any(|path| {
                     path == &installed.executable
+                        || (has_components && path.parent() == installed.executable.parent())
                         || path.canonicalize().ok().is_some_and(|path| {
-                            Some(path) == installed.executable.canonicalize().ok()
+                            let executable = installed.executable.canonicalize().ok();
+                            Some(&path) == executable.as_ref()
+                                || (has_components
+                                    && executable.as_ref().is_some_and(|executable| {
+                                        path.parent() == executable.parent()
+                                    }))
                         })
                 }) {
                     item.action = "kept".into();
@@ -1328,8 +1796,14 @@ fn prune_at(
                     item.reason = "No local managed reference; other centers/manual processes cannot be discovered. Explicit selection and acknowledgement are required to delete.".into();
                 } else {
                     let removal = (|| -> Result<()> {
-                        // Delete only the two verified files. Never recursively
+                        // Delete only the verified files. Never recursively
                         // remove a directory, even after an unexpected failure.
+                        if has_components {
+                            crate::service::remove_windows_version_components(
+                                &entry.path(),
+                                &installed.build_id,
+                            )?;
+                        }
                         fs::remove_file(&installed.executable)?;
                         fs::remove_file(entry.path().join(VERSION_METADATA))?;
                         fs::remove_dir(entry.path())?;
@@ -1396,11 +1870,16 @@ fn proxy_target(root: &Path, executable: &Path) -> Result<Option<PathBuf>> {
 /// Called before argument parsing. Return None for an ordinary executable.
 /// Unix replaces the launcher process; Windows keeps its stable exe and waits.
 pub fn maybe_run_proxy() -> Result<Option<i32>> {
+    let executable = current_executable()?;
+    #[cfg(windows)]
+    if crate::windows_scm::is_machine_executable(&executable)? {
+        return Ok(None);
+    }
     let root = match installation_root() {
         Ok(root) => root,
         Err(_) => return Ok(None),
     };
-    let Some(target) = proxy_target(&root, &current_executable()?)? else {
+    let Some(target) = proxy_target(&root, &executable)? else {
         return Ok(None);
     };
     let mut command = Command::new(target);

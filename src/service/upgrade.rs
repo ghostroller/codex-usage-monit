@@ -229,10 +229,16 @@ pub(crate) fn with_update_references<T>(
     let registration = read_registration_during_upgrade(pending)?;
     let mut paths = Vec::new();
     if let Some(registration) = registration {
+        if let Some(host) = registration.options.windows_host {
+            paths.push(host.executable);
+        }
         paths.push(registration.options.executable);
     }
     if let Some(pending) = pending {
         paths.push(pending.target.executable.clone());
+        if let Some(host) = &pending.target.windows_host {
+            paths.push(host.executable.clone());
+        }
     }
     operation(&paths)
 }
@@ -282,6 +288,7 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
                 .as_ref()
                 .map_or(journal.previous_fingerprint, |r| r.fingerprint.clone());
             journal.target.executable = executable;
+            journal.target = windows_host::prepare(&journal.target, journal.enabled)?;
             journal.build_id = build_id.clone();
             journal
         }
@@ -298,6 +305,7 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
             };
             let mut target = existing.options;
             target.executable = executable;
+            target = windows_host::prepare(&target, existing.enabled)?;
             let mut journal = UpgradeJournal {
                 schema_version: JOURNAL_VERSION,
                 minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -723,6 +731,8 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             Err(error) => Err(error.into()),
         }
     };
+    let mut host = None;
+    let mut host_log = None;
     let (arguments, environment, enabled, fingerprint) = match current_platform() {
         Platform::MacOs => {
             let Some(bytes) = read(&launchd_registration_path()?)? else {
@@ -769,7 +779,12 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             let document = decode_windows_task_xml(&bytes)?;
             let task = parse_windows_task_xml(&document)?;
             verify_windows_task_structure(&task, &sid, false)?;
-            let mut args = windows_arguments(task.text("Task/Actions/Exec/Arguments")?)?;
+            let arguments = windows_arguments(task.text("Task/Actions/Exec/Arguments")?)?;
+            let imported =
+                windows_host::unwrap_task(task.text("Task/Actions/Exec/Command")?, arguments)?;
+            let mut args = imported.arguments;
+            host = imported.host;
+            host_log = imported.log;
             let environment = if args
                 .first()
                 .is_some_and(|a| a.starts_with("--service-path="))
@@ -782,7 +797,7 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             } else {
                 None
             };
-            args.insert(0, task.text("Task/Actions/Exec/Command")?.to_string());
+            args.insert(0, imported.recorder);
             (
                 args,
                 environment,
@@ -792,7 +807,11 @@ fn read_registration_definition() -> Result<Option<Registration>> {
         }
         Platform::Unsupported => bail!("service upgrade is unsupported"),
     };
-    let options = parse_registered_options(&arguments, environment)?;
+    let mut options = parse_registered_options(&arguments, environment)?;
+    options.windows_host = host;
+    if host_log.is_some_and(|path| path != windows_host::host_log_file(&options)) {
+        bail!("service_host_invalid: task log path does not match the registered status directory");
+    }
     if target_fingerprint(&options)? != fingerprint {
         bail!(
             "service_upgrade_unverifiable: registration is not an exact application-managed definition"
@@ -810,6 +829,222 @@ pub fn registered_status(fallback: &ServiceOptions) -> Result<ServiceStatus> {
         Some(registration) => super::status(&registration.options),
         None => super::status(fallback),
     }
+}
+
+/// Installer recovery can claim a task only after both its full definition and
+/// immutable business executable match, even if its first heartbeat failed.
+pub(crate) fn trusted_registration_identity(expected_executable: &Path) -> Result<Option<String>> {
+    if current_platform() != Platform::Windows {
+        bail!("Windows task identity requested on another platform");
+    }
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let Some(registration) = read_registration()? else {
+        return Ok(None);
+    };
+    ensure_service_definition_is_trusted_at(
+        &root,
+        ServiceDefinitionObservation::Fingerprint(registration.fingerprint),
+    )?;
+    if fs::canonicalize(&registration.options.executable)? != fs::canonicalize(expected_executable)?
+    {
+        bail!(
+            "service_install_identity_mismatch: registered recorder belongs to another executable"
+        );
+    }
+    Ok(Some(windows_task_name(&windows_current_user_sid()?)))
+}
+
+pub(super) fn wait_for_installed_recorder(
+    options: &ServiceOptions,
+    prepared_at: DateTime<Utc>,
+) -> Result<()> {
+    let journal = UpgradeJournal {
+        schema_version: JOURNAL_VERSION,
+        minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_id: env!("MONIT_BUILD_ID").into(),
+        target: options.clone(),
+        previous_fingerprint: target_fingerprint(options)?,
+        enabled: true,
+        prepared_at,
+        phase: "awaiting_heartbeat".into(),
+        last_error: None,
+    };
+    wait_ready(&journal)?;
+    Ok(())
+}
+
+/// SCM owns an exact child process handle, while the stop file must also bind
+/// the recorder instance timestamp so PID reuse cannot stop another writer.
+#[cfg(windows)]
+pub(crate) fn request_foreground_recorder_stop(
+    status_file: &Path,
+    expected_pid: u32,
+    expected_build_id: &str,
+) -> Result<()> {
+    let status =
+        read_recorder_status(status_file)?.context("recorder has not published its status")?;
+    if status.pid != expected_pid || status.build_id.as_deref() != Some(expected_build_id) {
+        bail!("recorder_stop_identity_changed: status does not belong to the supervised recorder");
+    }
+    let request = StopRequest {
+        pid: status.pid,
+        started_at: status.started_at,
+        build_id: expected_build_id.into(),
+    };
+    write_private_atomically(
+        &status_file.with_extension("stop.json"),
+        &serde_json::to_vec(&request)?,
+    )?;
+    Ok(())
+}
+
+/// Mutations may operate only on the exact definition previously trusted by
+/// this application. A task with the same name is not proof of ownership.
+pub(super) fn registered_options_for_mutation(root: &Path) -> Result<Option<ServiceOptions>> {
+    registered_options_for_mutation_with(root, read_registration_during_upgrade)
+}
+
+fn registered_options_for_mutation_with(
+    root: &Path,
+    read: impl FnOnce(Option<&UpgradeJournal>) -> Result<Option<Registration>>,
+) -> Result<Option<ServiceOptions>> {
+    let journal = read_journal(root)?;
+    let pending = journal
+        .as_ref()
+        .filter(|journal| journal.phase != "complete");
+    let Some(registration) = read(pending)? else {
+        return Ok(None);
+    };
+    if let Some(journal) = pending {
+        validate_resume_registration(journal, Some(&registration))?;
+    } else {
+        ensure_service_definition_is_trusted_at(
+            root,
+            ServiceDefinitionObservation::Fingerprint(registration.fingerprint.clone()),
+        )?;
+    }
+    Ok(Some(registration.options))
+}
+
+fn lifecycle_registration(root: &Path) -> Result<Registration> {
+    if read_journal(root)?.is_some_and(|journal| journal.phase != "complete") {
+        bail!("service_update_pending: finish service repair before changing recorder enablement");
+    }
+    let registration =
+        read_registration()?.context("service_not_installed: install the recorder first")?;
+    ensure_service_definition_is_trusted_at(
+        root,
+        ServiceDefinitionObservation::Fingerprint(registration.fingerprint.clone()),
+    )?;
+    Ok(registration)
+}
+
+fn lifecycle_stop(registration: &Registration) -> Result<()> {
+    disable_registration()?;
+    request_graceful_stop(&registration.options)?;
+    match current_platform() {
+        Platform::Windows => {
+            quiesce_windows_task_for_install(&registration.options)?;
+        }
+        Platform::Linux => {
+            quiesce_systemd_for_install(&registration.options)?;
+        }
+        Platform::MacOs => {
+            quiesce_launchd_for_install(&registration.options)?;
+        }
+        Platform::Unsupported => bail!("service management is unsupported"),
+    }
+    Ok(())
+}
+
+fn lifecycle_start(registration: &Registration) -> Result<ServiceStatus> {
+    if current_platform() == Platform::Windows {
+        windows_host::require_interactive_session()?;
+    }
+    validate_options(&registration.options)?;
+    let identity = executable_update_identity(&registration.options.executable)?;
+    let build_id = identity
+        .build_id
+        .context("service_repair_required: recorder lacks a verifiable build identity")?;
+    let journal = UpgradeJournal {
+        schema_version: JOURNAL_VERSION,
+        minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_id,
+        target: registration.options.clone(),
+        previous_fingerprint: registration.fingerprint.clone(),
+        enabled: true,
+        prepared_at: Utc::now(),
+        phase: "awaiting_heartbeat".into(),
+        last_error: None,
+    };
+    if registration.enabled && ready_status(&journal, false)?.is_some() {
+        return super::status(&registration.options);
+    }
+    match current_platform() {
+        Platform::Windows => start_windows_task()?,
+        Platform::Linux => {
+            run_checked(
+                Command::new("systemctl").args(["--user", "enable", SYSTEMD_UNIT]),
+                "enable recorder",
+            )?;
+            start_systemd()?;
+        }
+        Platform::MacOs => {
+            run_checked(
+                Command::new("launchctl")
+                    .args(["enable", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
+                "enable recorder",
+            )?;
+            install_launchd(&registration.options)?;
+            start_launchd()?;
+        }
+        Platform::Unsupported => bail!("service management is unsupported"),
+    }
+    wait_ready(&journal)?;
+    super::status(&registration.options)
+}
+
+/// Enable future automatic starts and start the registered recorder now.
+pub fn start_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let registration = lifecycle_registration(&root)?;
+    lifecycle_start(&registration)
+}
+
+/// Disable automatic starts and cooperatively stop the registered recorder.
+pub fn stop_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let registration = lifecycle_registration(&root)?;
+    lifecycle_stop(&registration)?;
+    super::status(&registration.options)
+}
+
+/// Restart an enabled registration; a deliberately disabled recorder stays off.
+pub fn restart_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let mut registration = lifecycle_registration(&root)?;
+    if !registration.enabled {
+        bail!("service_disabled: use service start to enable the recorder");
+    }
+    if current_platform() == Platform::Windows {
+        windows_host::require_interactive_session()?;
+    }
+    lifecycle_stop(&registration)?;
+    registration.enabled = false;
+    lifecycle_start(&registration)
+}
+
+/// Reuse forward recovery and preserve the saved enablement and collection
+/// options; this never rolls a migrated writer back to an older executable.
+pub fn repair_registered() -> Result<ServiceStatus> {
+    upgrade_registered_recorder()?;
+    let registration =
+        read_registration()?.context("service_not_installed: install the recorder first")?;
+    super::status(&registration.options)
 }
 
 fn parse_registered_options(
@@ -877,7 +1112,7 @@ fn parse_registered_options(
 }
 
 #[cfg(windows)]
-fn windows_arguments(text: &str) -> Result<Vec<String>> {
+pub(super) fn windows_arguments(text: &str) -> Result<Vec<String>> {
     use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
     let line = format!("recorder.exe {text}")
         .encode_utf16()
@@ -908,7 +1143,7 @@ fn windows_arguments(text: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(not(windows))]
-fn windows_arguments(_text: &str) -> Result<Vec<String>> {
+pub(super) fn windows_arguments(_text: &str) -> Result<Vec<String>> {
     bail!("Windows task arguments require Windows")
 }
 
@@ -1129,6 +1364,101 @@ mod tests {
                 .contains("service_upgrade_conflict")
         );
         assert!(!root.join(RECORDER_CUTOVER_BLOCKER_FILE).exists());
+    }
+
+    #[test]
+    fn windows_reinstall_rejects_untrusted_existing_task_before_any_mutation() {
+        for marker_present in [false, true] {
+            let (temp, mut journal) = fixture();
+            let root = temp.path().join("coordination");
+            journal.target.service_coordination_root_override = Some(root.clone());
+            create_private_directory(&root).unwrap();
+            let sid = "S-1-5-21-1234";
+            let original = windows_task_xml(&journal.target, sid);
+            let marker_path = root.join(CURRENT_SERVICE_DEFINITION_FILE);
+            let marker_bytes = serde_json::to_vec(&CurrentServiceDefinitionMarker {
+                schema_version: CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION,
+                platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
+                fingerprint: canonical_windows_task_fingerprint(original.as_bytes(), sid).unwrap(),
+            })
+            .unwrap();
+            if marker_present {
+                write_private_atomically(&marker_path, &marker_bytes).unwrap();
+            }
+            let mut external = journal.target.clone();
+            external.offline = false;
+            let external_xml = windows_task_xml(&external, sid);
+            let task_path = root.join("existing-task.xml");
+            write_private_atomically(&task_path, external_xml.as_bytes()).unwrap();
+            let registration = Registration {
+                options: external,
+                fingerprint: canonical_windows_task_fingerprint(external_xml.as_bytes(), sid)
+                    .unwrap(),
+                enabled: true,
+            };
+            let _lock = mutation_lock(&root).unwrap();
+            let result = replace_service_checked(
+                &journal.target,
+                || {
+                    registered_options_for_mutation_with(&root, |_| Ok(Some(registration)))
+                        .map(|_| ())
+                },
+                || panic!("must not disable or stop an untrusted existing task"),
+                || panic!("must not overwrite an untrusted existing task"),
+                || panic!("must not delete the existing task after failed preflight"),
+                || panic!("must not publish replacement trust"),
+                || panic!("must not start the candidate"),
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("trusted current-version marker"),
+                "unexpected failure: {error:#}"
+            );
+            assert_eq!(fs::read(&task_path).unwrap(), external_xml.as_bytes());
+            if marker_present {
+                assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+            } else {
+                assert!(!marker_path.exists());
+            }
+            assert!(!root.join(RECORDER_CUTOVER_BLOCKER_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn windows_reinstall_preflight_accepts_absence_trusted_tasks_and_retained_recovery() {
+        let (temp, journal) = fixture();
+        let root = temp.path().join("coordination");
+        create_private_directory(&root).unwrap();
+        assert!(
+            registered_options_for_mutation_with(&root, |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        let fingerprint = target_fingerprint(&journal.target).unwrap();
+        let marker_path = root.join(CURRENT_SERVICE_DEFINITION_FILE);
+        let marker = CurrentServiceDefinitionMarker {
+            schema_version: CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION,
+            platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
+            fingerprint: fingerprint.clone(),
+        };
+        write_private_atomically(&marker_path, &serde_json::to_vec(&marker).unwrap()).unwrap();
+        let read = |_: Option<&UpgradeJournal>| {
+            Ok(Some(Registration {
+                options: journal.target.clone(),
+                fingerprint: fingerprint.clone(),
+                enabled: false,
+            }))
+        };
+        assert_eq!(
+            registered_options_for_mutation_with(&root, read).unwrap(),
+            Some(journal.target.clone())
+        );
+        fs::remove_file(marker_path).unwrap();
+        save_journal(&root, &journal).unwrap();
+        assert_eq!(
+            registered_options_for_mutation_with(&root, read).unwrap(),
+            Some(journal.target)
+        );
     }
 
     #[test]

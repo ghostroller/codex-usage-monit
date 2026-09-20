@@ -74,6 +74,17 @@ function Invoke-Cargo {
     Assert-NativeSuccess $Description
 }
 
+function Invoke-InstallerContracts {
+    if ($null -eq (Get-Command python -ErrorAction SilentlyContinue)) {
+        throw 'Python 3 is required for the Windows installer and release contracts.'
+    }
+    foreach ($pattern in @('test_remote_release_bootstrap.py', 'test_windows_install.py', 'test_windows_setup.py', 'test_release_package.py')) {
+        Write-Host "==> Test $pattern (PowerShell 5.1 and 7 where applicable)"
+        & python -B -m unittest discover -s tests -p $pattern -v
+        Assert-NativeSuccess "Test $pattern"
+    }
+}
+
 function Get-VisualStudioInstallationPaths {
     param(
         [Parameter(Mandatory = $true)]
@@ -374,6 +385,7 @@ try {
         & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
         & (Join-Path $PSScriptRoot "tests\dev-smoke.ps1")
         & (Join-Path $PSScriptRoot "tests\repair-state-permissions.ps1")
+        Invoke-InstallerContracts
     }
 
     if (-not $ScriptContractsOnly -and -not $SkipFormat) {
@@ -390,6 +402,7 @@ try {
 
     if (-not $ScriptContractsOnly -and -not $SkipTests) {
         if (-not $SkipSmoke) {
+            Invoke-InstallerContracts
             Write-Host "==> Test Windows verification exit-code and diagnostic handling"
             & (Join-Path $PSScriptRoot "tests\verify-smoke.ps1") -VerificationScript $PSCommandPath
             Write-Host "==> Test Windows development TUI launcher"

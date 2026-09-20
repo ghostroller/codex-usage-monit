@@ -2905,14 +2905,19 @@ mod tests {
                     Err(error) => Err(RemoteFactSyncError::Local(error)),
                 }
             });
-            stage_started_rx
-                .recv_timeout(StdDuration::from_secs(1))
-                .expect("the production fact stage should reach its real staging lock");
+            let changed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Readiness includes filesystem validation and thread scheduling;
+                // its elapsed time says nothing about config lock contention.
+                stage_started_rx
+                    .recv()
+                    .expect("the production fact stage should reach its real staging lock");
+                let config_guard = fixture
+                    .config_store
+                    .try_lock_exclusive_for_test()
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{change} was blocked by real fact staging"));
+                drop(config_guard);
 
-            let mutation_store = fixture.config_store.clone();
-            let revision = selected.config_revision();
-            let (changed_tx, changed_rx) = mpsc::channel();
-            let mutator = thread::spawn(move || {
                 let mutation = match change {
                     "disable" => RemotesConfigMutation::disable_host("dev"),
                     "remove" => RemotesConfigMutation::remove_host("dev"),
@@ -2926,23 +2931,21 @@ mod tests {
                     "global-off" => RemotesConfigMutation::set_auto_sync_enabled(false),
                     _ => unreachable!(),
                 };
-                changed_tx
-                    .send(mutation_store.update(revision, mutation))
+                fixture
+                    .config_store
+                    .update(selected.config_revision(), mutation)
                     .unwrap();
-            });
-            let changed = changed_rx.recv_timeout(StdDuration::from_secs(1));
-            if changed.is_err() {
-                let _ = fs2::FileExt::unlock(staging_guard.as_file());
-                let _ = worker.join();
-                let _ = mutator.join();
-                panic!("{change} was blocked by real fact staging");
+            }));
+            // Release the real staging lock before joining, including assertion
+            // failures, so a failed regression cannot strand the worker.
+            drop(staging_guard);
+            let worker_result = worker.join();
+            if let Err(error) = changed {
+                std::panic::resume_unwind(error);
             }
-            changed.unwrap().unwrap();
-            mutator.join().unwrap();
-            fs2::FileExt::unlock(staging_guard.as_file()).unwrap();
 
             assert!(matches!(
-                worker.join().unwrap(),
+                worker_result.unwrap(),
                 Err(RemoteFactSyncError::ConfigurationChanged { .. })
             ));
             assert!(
