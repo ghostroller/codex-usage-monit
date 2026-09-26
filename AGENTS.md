@@ -1,5 +1,7 @@
 # Repository Guidance
 
+- If `.agent/environment.local.md` exists, read it before running tests, builds, or CI-related operations. It only supplements machine-specific environment differences and does not override project-level rules.
+
 ## Verification: local first, hosted at checkpoints
 
 - Read [the testing workflow](docs/testing.md) before choosing a test environment. During implementation, run affected tests locally. For a completed batch of platform-sensitive changes, use the local Docker Linux and UTM Windows runners before considering hosted CI; use native macOS for macOS behavior.
