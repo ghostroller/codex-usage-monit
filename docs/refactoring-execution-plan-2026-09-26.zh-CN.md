@@ -275,15 +275,96 @@ cargo test --locked <已经确认实际存在的测试过滤词>
 
 以下是未来的实施约束，**不是默认工作包**。M0 可以完成源码清单和场景草案，但不得据此关闭 facts 或改变输出。
 
+**N4 决策材料状态（2026-09-26）：**以下草案已按 `62f6a3ab2a787759867379071ffd5fa1d00b4ba6` 增量复核；复用第 11.1 节清单，没有重做全仓盘点。手动/自动 facts follow-up、AllIncluded reconciliation、v5 handler 及共享本地物化消费者仍存在。M3 已提供准备一次、共享 quota/预算及逐次 fence 的内部边界，尚未提供这里拟议的来源集合产品。**材料完成不等于选择 A；下列行为、schema、兼容与删除策略全部待批。**
+
+推荐决定：若目标明确收窄为“各来源记录的日常用量”，选择 A，并同时接受下表能力损失及 A0/A4 契约；若复制、迁移、分叉后的全局唯一事件用量仍属核心需求，保留 C，结束 A 删除路线。批准前继续 C。真实用户中复制/分叉的频率、旧 JSON 消费者数量、各能力使用率及愿意接受的损失均**未知**；未读取真实历史或增加遥测，不以代码体量代替产品证据。来源表示观察/导出节点，不证明用量实际在哪台机器产生。
+
+| 合成场景 / 决策输入 | 保留 C 的含义 | 选择 A 的唯一草案预期 |
+| --- | --- | --- |
+| 独立会话：来源甲 20、乙 30，覆盖完整 | 唯一事件投影为 50 | 分列甲 20、乙 30；不展示全局唯一总量，即使此例相加恰好为 50 |
+| 完整复制：两源各有相同的 100，完整摘要证明相同 | 折叠为 100，不必额外补 facts | 两行各 100，并注明来源记录可能重叠 |
+| 公共 100，甲新增 20、乙新增 30；facts 完整有效 | 公共部分一次、独有部分均保留，合计 150 | 甲 120、乙 130；首个 A 版本不提供记录合计，绝不把旧 All 的 150 同名改成 250 |
+| 上述分叉 facts 缺失/过期，但每源聚合完整 | 按现有证据排序选权威副本并标限制；仅这些数字不能确定权威或精确总量，不能取最大值 130 | 仍分列 120、130；不为跨源 facts 缺失发起补齐，也不因此降级每源已完整的覆盖 |
+| 相同事件 ID 的 facts 冲突，但每源聚合完整 | 按现有强证据参与者选该事件、保留其他独有事件并告警；未给出事件内容/证据排序时数值未知 | 展示各源已有记录，跨源冲突不改变各源值；不得宣称哪一份是唯一真实消费 |
+| 父会话与 subagent 有不同 thread ID | 保留 lineage 和子代理独有用量 | 保留每源 lineage；源 ID 与 thread ID 共同定位，不能把子代理当副本删掉 |
+| 同账户两源在同一 reset 窗口观察到 40% / 45%，后者更新且证据兼容 | 按账户 quota 规则选用 45% | 同样单列账户 GLOBAL 45%，不算 85%；账户身份/窗口不能确认时分开标未知，不强行合并 |
+
 ### A0：冻结语义、依赖与兼容策略
 
 选择来源记录语义，确认不再提供跨来源同会话唯一事件总量。冻结 CLI 默认行为、新集合 JSON/schema、旧 `--source all` 处理、UI 保存状态、逻辑会话 ID、项目/任务 ID、partial 与退出码映射。
 
-建立实际删除清单：
+**待批行为契约草案 v1：**推荐一次有版本说明的产品切换，不长期维持 A/C 两套引擎。下面是确定的建议值，不能当成当前 CLI 已支持的选项。
+
+| 接口 / 状态 | 推荐草案与验收结果 |
+| --- | --- |
+| CLI 默认与显式选择 | `summary` / `trends` 不给来源时返回已纳入来源集合；新增 `--all-sources` 显式拼写。`--source local` / `--source <NodeId>` 保留精确来源计算，返回单行集合；与 `--all-sources` 同用拒绝。显式旧 `--source all` 在读取/写入前报迁移提示并退出 64；不静默替换含义。`health` 继续检查所有纳入来源，不顺手增加来源过滤参数 |
+| 集合 JSON | 新 envelope 固定 `schema: "source-reports"`、`schemaVersion: 1`、`reportKind: summary/trends/health`、`asOf`、`status`、`sources`、`accountQuota`、`diagnostics`、`error`；不复用旧顶层 `schemaVersion: 1` 的意义。每行带 `sourceId`、`generation`、`revision`、`freshness`、`status`、`report`、`error`；取不到的身份版本字段为 `null`，不能编造 0。`report` 保留相应精确来源报告的指标、覆盖度、价格不确定性和精确数值编码，失败时为 `null`；不加入顶层总 tokens/费用 |
+| quota 与 Health | Summary/Trends 的 `accountQuota` 单独返回 `status: available/notObserved/failed`、已按现有账户规则投影的 `report` 或 `null`、结构化 `error`；同一请求只准备一次，来源行不复制 GLOBAL quota。Health 只给 quota 状态/诊断，`accountQuota.report` 固定 `null`，每源 `report` 只含现有 Health 允许的健康信息；recorder/service 放在 `diagnostics` 一次，不借新 envelope 泄露 token/account 明细 |
+| TUI / 图表 | 原 All 入口更名为 Sources，Overview/Models/Summary/Trends 均按源展示；Health 展示逐源诊断。图表分母与来源、时段一致；项目映射保留为标签分组，首个 A 版本不提供跨源记录合计。若未来增加，必须另行命名“来源记录合计（未去重）”，不能还原为 All |
+| 保存状态 / 标识 | 一次版本化迁移将保存的 All 选择转为 Sources，并显示一次语义变更提示；仍存在的精确 source ID 保留。已删除/排除来源仍显示不可用选中态，不回落 local。旧跨源 logical session ID 失效并提示重选；来源会话/项目/任务 ID 使用带类型、来源维度的键，不把旧 logical ID 猜成 thread ID；项目映射和本源 lineage 保留 |
+| 出错输出 | 能完成请求初始化时，即使全部来源失败也输出上述 envelope；逐行 `error` 使用稳定 code 加诊断文本。参数错误输出 stderr 且退出 64；无法建立可信请求/安全状态时 stderr 退出 1，不尝试绕过 fence 读取。沿用现有 stdout 管道提前关闭的成功退出约定，不由本路线另改 |
+
+**身份版本字段的推荐类型：**`generation` 为正 `u64` 的十进制字符串，本地来自 `SourceIdentity::generation`，SSH 来自已验证 binding 的 `SourceGeneration.generation`；不能填中心 `ingest-gen-*`。`revision` 是带类型的诊断对象或 `null`：本地用 `{kind: "localReservationHighWater", value: "42"}` 表示相同 profile/redaction 下实际读到的保留高水位，可能含未提交编号空洞，绝不称已提交次数；SSH 用 `{kind: "remoteActiveGeneration", value: "ingest-gen-…"}` 表示实际读取的中心 active generation 字符串。两者都只是已观察到的版本信息，不是完整报告的 ETag、增量游标或写入前置条件；它们不能替代完整 active binding、协议/catalog revisions、ownership/profile、quota/live、映射和策略的内部 fence，也不代表跨源同一时刻快照。无法可信读取对应值时为 `null`，不把路径、私有指纹或合成数字当版本。初版 A 不提供基于这两个字段的增量/条件查询接口。
+
+两条成功查询的身份片段示例（其余 report/status 字段省略，非完整响应；所有数字均为合成）：
+
+```json
+[
+  {"sourceId": "node-11111111111111111111111111111111", "generation": "1", "revision": {"kind": "localReservationHighWater", "value": "42"}},
+  {"sourceId": "node-22222222222222222222222222222222", "generation": "3", "revision": {"kind": "remoteActiveGeneration", "value": "ingest-gen-33333333333333333333333333333333"}}
+]
+```
+
+A0 冻结时须把成功本地/SSH、保留后未提交空洞及取不到版本的完整响应加入黄金样例，并检查 `u64` 超过 JavaScript 精确整数范围时字符串仍无损；不把当前内部 Rust DTO 的数字编码直接暴露为上述新 schema。
+
+`status` 的判定次序同样待批，按下列优先级形成唯一结果。来源的 `freshness` 独立取 `fresh/stale/offline/unknown`；来源 `status` 取 `complete/partial/noData/failed`，无数据与有证据的零值不同。没有纳入来源时返回 `empty`/1。仅用于展示的诊断不自动变成 partial；覆盖缺口、现有报告的 partial/价格不确定性判定、离线/过期和查询失败均须保留。
+
+| 场景（前面的规则优先） | Summary / Trends 集合 status、退出码及输出 |
+| --- | --- |
+| 全部选中来源查询失败 | `failed`，1；每源保留错误，quota 能读取则仍保留，不返回本地替代值 |
+| 无可用用量观察，至少一源查询成功 | `empty`，1；无数据行 `noData`，同时保留其他失败/离线及 quota 诊断，不填完整零值 |
+| 至少一源有可用观察，但另一已纳入源失败/无数据，或任何行 partial/离线/过期/新鲜度未知，或 quota 读取失败 | `partial`，2；成功行和可用旧数据保留，失败行不隐去。quota 失败不抹掉可用 token 值；这是 A 待实施的新行为 |
+| 所有选中来源覆盖完整、状态新鲜，quota 可用或正常无观察 | `complete`，0；`notObserved` 表示正常缺少 quota 观察，不等同读取失败。完整窗口有证据的零值可属于本行 |
+| 被配置排除的来源 | 不纳入默认集合，也不因此造成 partial；显式请求该来源则单行 `failed`、1，原因 `source_excluded`，不改变配置 |
+
+Health 使用诊断成功标准：可读取且没有健康降级为 `complete`/0；能输出诊断但存在来源、quota、recorder 或 service 错误/降级为 `partial`/2；无法建立可信请求为失败/1。没有 token 观察本身不使健康检查失败。此差异保留现有 Health 的职责，不能套用 Summary/Trends 的 `empty` 退出规则。
+
+示例（合成且仅演示 CLI/状态，尚未实现）：`summary --all-sources --format json` 遇公共 100 + 分叉 20/30 时返回 `sources` 两行 120、130，`status=complete`、退出 0，不出现 150 或 250 的顶层总量；甲可用而乙读取失败时保留甲 120、乙 `report=null/error.code=source_read_failed`，`status=partial`、退出 2；相同输入若显式写 `--source all` 则在查询前退出 64。实际行 payload 由精确来源报告 DTO 的 schema 夹具冻结，不能用以上简写替代完整 JSON 黄金样例。
+
+最小失败 envelope 草案示例（该合成 NodeId 未配置，退出 1；`error` 固定 `{code,message}` 或 `null`，`asOf` 使用 RFC 3339；这不是真实程序输出）：
+
+```json
+{
+  "schema": "source-reports",
+  "schemaVersion": 1,
+  "reportKind": "summary",
+  "asOf": "2026-09-26T00:00:00Z",
+  "status": "failed",
+  "sources": [{
+    "sourceId": "node-11111111111111111111111111111111",
+    "generation": null,
+    "revision": null,
+    "freshness": "unknown",
+    "status": "failed",
+    "report": null,
+    "error": {"code": "source_not_found", "message": "Requested source is not configured"}
+  }],
+  "accountQuota": {"status": "notObserved", "report": null, "error": null},
+  "diagnostics": [],
+  "error": {"code": "all_sources_failed", "message": "No selected source could be read"}
+}
+```
+
+**最后消费者删除矩阵（本次只核对，未删除）：**
 
 | 符号/模块 | 当前生产消费者 | 中心/agent/共享 | 保留责任 | 最后消费者退役阶段 | 验证 |
 | --- | --- | --- | --- | --- | --- |
-| 由实际 HEAD 盘点填写，不以猜测预填 |  |  |  |  |  |
+| `logical_replica::detect_replica_candidates`、`history_query/reconciliation::plan_replica_resolution` | AllIncluded 投影、`remote_fact_sync` planner | 中心 | 精确来源投影、摘要和 lineage | A1 迁移全部前后台消费者且 A2 停 planner 后，A3 删除 | 复制/分叉场景；后台 Overview/Models 无旧归并调用 |
+| `replica_fact_followup::{prepare,execute_prepared}_replica_fact_followup` | `cli` 手动同步、`automatic_remote_sync` | 中心 | 同步收尾与其 fence/预算/health/quota | A2 同时停两入口，A3 删除专用实现 | 两入口 transport spy 的 `SessionFacts` 计数为 0，收尾仍执行 |
+| `remote_fact_sync::{plan_next_replica_fact_sync,sync_remote_thread_facts_bounded}` | 上述 follow-up | 中心 | 聚合页、游标、身份、预算和错误处理不得连删 | follow-up 无消费者后 A3；共享字段先拆分 | 聚合页失败不推进、重试幂等、generation 改变仍受 fence |
+| `remote_agent` 的 `SessionFacts`、`remote_fact_exporter::prepare_remote_fact_page`、facts wire DTO | v5 服务端；本地物化函数另被中心 follow-up 使用 | agent / 中心共享 | `materialize_complete_session_facts_from_normalized_observation` 在 A2 后仍被 exporter 使用 | A4 协调协议边界后才删除最后一侧 | 新旧二进制配对、明确拒绝、无半成功/坏游标 |
+| `source_history/session_evidence`、`source_export`、`remote_export_state` | facts ingest/export、reconciliation、摘要/聚合导出 | 共享 | 源身份、摘要、revision、quota、generation、游标和 fence | A3 仅中心专用部分，v5 部分等 A4；共享部分保留 | 按字段追踪剩余消费者，分页/恢复/ownership 回归 |
+| `local_observation`、`remote_generation`、`finalize_remote_sync_attempt` | 本地 observation、聚合发布、手动/自动收尾 | 共享 | redo、COW/manifest、revision 不复用及安全提交 | 无 A 删除阶段；不计入 A 净删除量 | 原有观察提交/恢复、两类同步收尾继续通过 |
 
 至少检查 facts planner、follow-up、同步摄取、exporter、reconciliation，以及 `source_history`、`source_export`、`remote_export_state`、`session_evidence` 中混合职责。同步编排和存储共享代码不能因名字包含 facts 就整块删除。
 
@@ -291,7 +372,9 @@ cargo test --locked <已经确认实际存在的测试过滤词>
 
 基于 M3 的内部边界实现来源报告集合。复用精确来源的计算，不按源重复 stage/flush 或 quota 合并。保留源 ID、revision、新鲜度、partial、价格不确定性和错误。
 
-多来源默认按来源展示；可选合计必须独立命名为未去重记录合计。账户 GLOBAL quota 单独展示，不对百分比求和。比例与图表分母必须对应同一来源/时段，或明确使用未去重记录口径。
+接入点是 [`prepare_report_history` / `PreparedReportHistory`](../src/history_application.rs) 与 [`HistoryQueryContext`](../src/history_query.rs)，不是恢复已删除的 monolithic 加载器。当前 `PreparedReportHistory::query` 和 `HistoryQueryResult::into_snapshot` 保留旧错误策略；当前 quota 失败也使 usage 返回错误。A 获批后才扩展可分别消费 quota/usage 的应用接口及回归，不可把循环调用旧适配器描述成已经支持部分成功。保留每次查询的 ownership/profile、policy/mapping/revision 校验、共享读预算和四次一致性尝试上限；多源 revision 是分别观察到的值，不是分布式同一时刻快照。
+
+多来源默认按来源展示；首版按 A0 不提供合计。账户 GLOBAL quota 单独展示，不对百分比求和。比例与图表分母必须对应同一来源/时段。
 
 更新 Overview、Models、Summary、Trends、Health、后台刷新、CLI/JSON 和所有实际消费者；旧 All 不能同名静默改为求和。显式来源不可用不回落本地，旧逻辑会话 ID 不能被误作新的来源会话 ID。
 
@@ -311,17 +394,17 @@ cargo test --locked <已经确认实际存在的测试过滤词>
 
 ### A4：协议、磁盘状态及旧进程协调迁移
 
-冻结并验证下列矩阵，允许的结果可以是安全拒绝，而不必假装全部兼容：
+**推荐协调切换，不支持跨产品语义的混合版本写入。** 以下均是待批准、待用旧二进制夹具验证的拒绝/恢复策略，不是已经实现的兼容保证。A1/A2 可分工准备，但不能在旧 All 消费者仍依赖 facts 时先启用 A2；A4 前旧 v5 服务端保持原契约，不能靠删 capability 猜测客户端不会请求。
 
-| 场景 | 必须明确 |
-| --- | --- |
-| 新中心 + 旧 agent | 支持范围或明确版本不匹配；不能只去掉 capability 就假定旧行为不会发生 |
-| 旧中心 + 新 agent | 不产生半成功/坏游标；拒绝或兼容的契约明确 |
-| 同机旧 recorder/TUI/CLI 正在运行 | 阻止冲突写入的方法与升级顺序，不能只依靠旧程序不认识的新标志 |
-| 迁移中断/重启 | 可恢复状态、重试幂等、原始数据仍可用 |
-| 新格式写入后重启旧二进制 | 如何阻止误写；是否只能通过一致备份恢复 |
-| 旧 UI/过滤器/逻辑 ID | 显式迁移或失效提示，保留具体来源选择 |
-| 备份与回滚 | 备份内容、一致性、恢复步骤、不可回退边界 |
+| 场景 | 唯一推荐草案 / 拒绝点 | 所需验收证据 |
+| --- | --- | --- |
+| 新中心 + 旧 agent | A4 激活后在协议协商处拒绝该源，同步标版本不匹配；不请求 facts、不推进页游标、不覆盖已有源数据；A1 集合保留该源失败/旧数据诊断 | 固定旧 agent 二进制与 transport spy；失败前后游标/manifest 相等 |
+| 旧中心 + 新 agent | 新边界在请求解码/版本协商时明确拒绝旧协议，先于任何导出状态写入；不返回看似成功的空页 | 旧中心夹具确认明确失败且无游标推进；新 agent 无新导出快照残留 |
+| 同机旧 recorder/TUI/CLI 仍运行 | 拒绝激活。经明确授权停止旧写者，取得旧版本也会参与的原共同锁并重新验证进程/文件身份后才可准备迁移；任一旧写路径未受同一互斥约束或无法证明停机就不迁移。新标志/新锁/只查一次 PID 均不足 | 已支持旧二进制实际持锁/竞争夹具，迁移期间尝试旧写入；逐项覆盖 recorder/TUI/CLI，不实际停止用户服务来做本次材料 |
+| 迁移中断/重启 | 先在隔离新目录准备并验证，旧目录保留一致快照；发布激活记录前失败则旧状态仍为权威，恢复时丢弃或幂等重建未发布副本；激活后只按已验证记录恢复新状态，不混读两个目录 | 准备、复制、校验、激活发布前后逐点中断；来源身份/桶/quota/游标/提交状态成组相等 |
+| 新格式写入后启动旧二进制 | 不允许把旧二进制指向新目录；必须先证明既有旧格式校验会在写前拒绝，不能依赖旧程序看不懂的新 marker。证明不足则禁止原地切换，只允许隔离新目录且已验证部署入口不会误指；仍无法排除误写就拒绝激活 | 旧二进制显式指定新目录和按默认入口重启的夹具；失败后新目录字节不变。仅有迁移锁通过不算此项通过 |
+| 旧 UI / 过滤器 / logical ID | 按 A0 一次迁移；All 显示 Sources 语义提示，精确来源保留，旧 logical ID 明确失效，无静默本地替代 | 保存状态黄金夹具、未知/排除来源、同名不同类型 ID；键盘/鼠标/compact 路径 |
+| 备份与回滚 | 切换前停止写者并在旧共同锁内制作一致备份，包含历史、源身份、账户 quota、游标/manifest、ownership/profile、配置/映射/UI 版本；恢复到独立旧目录并验证后才重启旧版本。激活后新写入不自动反向转换；需回退时明确接受回到备份时点，新目录另行保留 | 备份完整性清单与 hash、旧二进制恢复演练；不得把可重建 facts 备份当成全部权威数据备份 |
 
 实际协议版本号由仓库约定和变更情况决定，不在本文件预先猜定。仅在该边界统一退役旧 facts handler/exporter/wire DTO。
 
@@ -339,38 +422,58 @@ cargo test --locked <已经确认实际存在的测试过滤词>
 
 此路线只有收到明确的原型任务才启动；生产切换另行审批。R3 尚未确定时，只研究不依赖 facts 去留的本地观察契约，不迁移准备退役的数据。
 
+**N4 任务书状态（2026-09-26）：**本节材料已补齐，原型尚未委托或运行。推荐先独立委托 P1；若希望有条件延伸到 P2，委托须明确写入 P2 范围和下述通过门。是否选择 A 不影响 P1 启动，P1 也不是 A 的前置条件。当前未新增数据库依赖、读取真实历史或选定版本；所有收益与原型平台结果均待测。
+
 ### P1：单次本地 observation
 
 隔离原型覆盖一次 observation 的多数据族提交、同 revision 可见性、重启恢复和多进程一致读取。使用合成或明确授权的脱敏副本，既有 JSON 生产路径不受影响，不自动导入真实历史。
 
-输出的不只是演示代码，还应逐项提供证据：
+**可独立委托的任务范围：**从 [`source_history/local_observation.rs`](../src/source_history/local_observation.rs) 的既有契约与 failpoint 开始，写一套隔离的 local-observation SQLite 适配和对照驱动；不接入生产选择器、不新增长期可选后端。比较同一批 account quota、bucket、weekly、session digest 和 metadata 的提交/读取，不导入事件 facts、远端快照或生产 history-root。M3 的准备/查询边界可作为未来接入位置，本原型不改 CLI/TUI 行为，也不把替换 `PreparedReportHistory` 计作存储收益。
 
-| 项目 | 必须产出 |
-| --- | --- |
-| 依赖版本 | `rusqlite`、`libsqlite3-sys`、features、实际运行 SQLite 版本/来源；包含适用安全修复 |
-| 文件安全 | DB/WAL/SHM 与目录权限、路径/对象替换边界、只读和恢复过程；对现有威胁模型的满足或明确缺口 |
-| revision | 已保留编号不复用、所有权/profile 改变、中断重试及对读者可见结果的对应测试 |
-| 事务边界 | 短事务；网络、分页等待、长时间解析不占写事务；忙等待/取消有界 |
-| 精确金额 | `u128` 往返、边界、排序、聚合、溢出；不能只测试插入后读回 |
-| 持久性 | journal/synchronous 等实际配置；与旧实现相当的目标；明确进程崩溃与断电测试证据差异 |
-| WAL/资源 | checkpoint、长读者、增长上限、磁盘不足和中断恢复；自定义 history-root 的文件系统策略 |
-| 性能/构建 | 冷启动、写入、查询延迟、磁盘/写放大、二进制与依赖构建成本；固定数据和配置 |
-| 迁移草案 | 旧格式导入、schema 版本、备份和回退；未获授权不实际迁移用户数据 |
-| 净维护收益 | 可由数据库替代的旧机制、必须保留的业务规则、新增适配/迁移/测试责任 |
+推荐原型方案以 `journal_mode=WAL`、`synchronous=FULL` 为起点，短事务发布全部数据族、独立持久化保留 revision 高水位，再用业务 fence 校验提交；这些配置本身不是满足旧持久性契约的证明。保留 revision 与数据发布是两个不同承诺：一次崩溃可以留下编号空洞，不能使已保留编号因数据事务回滚而重新发放。初始金额候选用 16 字节大端 BLOB 保存 `u128`，由 Rust 做受检精确聚合，排序/索引仍需证明；不把 SQLite INTEGER/REAL 或内置 `SUM` 当成 `u128` 的等价物。该方案只是原型比较起点，不是已证明可用的替代。
 
-底层 SQLite 应包含 WAL-reset 修复；官方给出的常规修复边界为 3.51.3（2026-03-13）及之后，也存在部分旧分支回补。实施时核实实际版本及更新的官方信息，不把本文件当作永久充分的依赖安全清单。[E4]
+| 顺序 / 工作包 | 固定输入、工作与产物 | 可并行性与边界 |
+| --- | --- | --- |
+| P1.0 冻结对照 | 记录实际 HEAD、工具链、平台/文件系统、旧 JSON 配置；确定原型隔离目录及有界忙等待/取消阈值。用固定 seed `20260926` 合成 0、1、1,000、10,000 条记录档位，清单记各数据族数量、时间范围、hash 和磁盘尺寸；正常/空/partial observation、tombstone、重复和 profile/ownership 改变另列小夹具 | 不重复盘点全仓；不含 facts，A/C 未定也可独立完成。开跑前冻结资源上限与评价阈值，不跑到满意再选样本 |
+| P1.1 依赖与文件安全 | 明确委托后才选择候选 `rusqlite` / `libsqlite3-sys`、features、链接方式，重新核对适用公告及实际 SQLite 版本；验证 DB/WAL/SHM/目录权限、对象替换和只读策略 | 可与合成夹具准备并行；依赖文件统一由主 agent 管理。缺少当前版本证据不得进入性能比较或声称安全 |
+| P1.2 提交与恢复 | 实现 revision 保留和单 observation 原子发布；对保留后、事务中、提交前后、重启重试及所有权切换设置确定性中断；至少两个独立读者与一个写者进程用就绪握手竞争 | 等 P1.0/P1.1 通过；不把网络/长解析放进写事务，不通过禁用并发验证降低目标 |
+| P1.3 数值/资源对照 | 验证 0、`2^63-1`、`2^63`、`2^64`、`u128::MAX` 及溢出；比较同一数据集/持久性配置下的新进程首次打开与已初始化重复打开、提交、查询、文件增长/写放大和构建成本 | 安全/原子性/精确性通过后再测。每个固定条件各 10 次，记录全部样本、中位数/最大值和失败数；未控制 OS 缓存不称真正冷缓存，不以小样本保证 p95 |
+| P1.4 评价与移交 | 交付命令、输入/输出 hash、失败点记录、平台缺口、下表逐项结论及维护责任差额；给出采用候选/限定补证/不采用的一个结论 | 主 agent 统一复审；没有授权 P2 则在此结束，不自动扩到远端或真实数据 |
+
+输出的不只是演示代码，还应逐项提供证据。以下硬门不能用性能收益抵销；“通过”指原型范围，不代表生产迁移通过。
+
+| 项目 | 通过证据 | 停止 / 限定补证条件 |
+| --- | --- | --- |
+| 依赖版本 | 固定 Rust 包/features/链接来源；记录运行 `sqlite_version()`、编译选项、实际底层版本与核查日期，核对届时适用修复 | 只有包装库版本、旧网页结论或未知动态链接版本则停止；离线缺公告证据标未验证，不自动触发 CI |
+| 文件安全 | DB/WAL/SHM、父目录、实际打开对象及恢复/只读路径满足既有威胁模型；路径替换、权限扩大可被拒绝 | 任一旁路可写或对象绑定无法证明则停止；未执行的平台列缺口，不能拿 Windows 结果冒充 Unix/macOS |
+| revision / 原子性 | 已保留编号不复用；读者只能见同一已提交 revision 的全部数据族；空/partial observation 不能抹掉待恢复旧批次；profile/ownership 改变拒绝旧提交 | 任一混合 revision、旧持有者成功提交、重复编号或重试丢数据即停止，不能用自增行号替代契约 |
+| 事务边界 | 解析在事务外，原子提交为短事务；忙等待和取消在 P1.0 固定上限内，竞争不破坏读取一致性 | 依赖无限重试、网络等待占写锁或永久串行化才能通过则停止 |
+| 精确金额 | 所有边界值读写、索引排序、分组聚合及溢出拒绝一致；编码迁移无精度损失 | 使用 REAL、整数截断/饱和或只验证 round-trip 则不通过 |
+| 持久性 | 记录 journal/synchronous/checkpoint 配置及 SQLite 对照的耐久目标；进程中断后按契约恢复，明确 fsync/平台差异 | 降低持久性才更快则不计收益；进程终止测试不能写成断电验证，断电实验不自动纳入 |
+| WAL / 资源 | 长读者与 checkpoint 并发、增长预算、磁盘不足、中断及非默认 history-root 的拒绝/支持策略均有记录 | 超过预设增长/等待上限而无可执行收敛策略则停止扩围；不默认为网络文件系统安全 |
+| 性能 / 构建 | 固定条件原始样本、峰值内存、磁盘/写放大、二进制与依赖构建增量；量不到的写未知；与相同持久性 JSON 基线比较 | 超过 P1.0 冻结的预算则不建议采用；若阈值或代表性未定，只能限定补证，不能事后挑指标宣布胜出 |
+| 迁移草案 | 仅用合成旧格式说明导入校验、schema 版本、备份一致性、恢复到旧副本及不可反向转换边界 | 需要读取真实历史才能继续则停在数据授权门；不试迁移用户目录 |
+| 净维护收益 | 列明数据库可替代的本地 redo/多族发布责任、仍保留的 revision/fence/权限/业务规则及新增依赖/迁移/运维测试成本；纯移动不算删除 | 若完整旧 redo/COW 仍需长期复制进数据库且新增责任不减，结论不采用；P1 不据此删除远端 generation/COW |
+
+原审核曾记录 WAL-reset 修复边界 3.51.3（2026-03-13）及部分旧分支回补，见 [E4]；这是原审核引用的历史材料，**本次 N4 未联网核实，也不是任何候选版本的当前安全证书**。明确委托原型后才核对官方最新资料、实际链接版本及其他适用公告，不凭“高于该版本”宣布安全。
 
 不要用降低持久性的配置制造性能优势。现有 revision 持久化保留规则不能简单由普通回滚事务替代；数据库文件的打开前路径检查也不能未经证明就等同于验证实际操作对象。
 
 ### P2：一个远端增量页
 
-只有 P1 结果足以支持继续投入时，才验证一个远端页的 expected-active、页身份/指纹、数据族与游标共同发布、重复执行、来源 generation 改变及中断恢复。
+只有 P1 结果足以支持继续投入、**且明确委托范围包含 P2**，才验证一个远端页的 expected-active、页身份/指纹、数据族与游标共同发布、重复执行、来源 generation 改变及中断恢复。默认只扩展合成聚合页，不加入待 A/C 决定的 facts 存储；不启动真实 SSH 同步。验收固定为旧 expected-active 拒绝、重复页幂等、数据族与游标同成同败、generation 切换使旧提交失效，失败页不能过滤后继续推进游标。
 
 不能把远端网络事务扩展成一个长期 SQLite 写事务；不能由本地事务成功直接删除所有 COW/generation。应说明数据库具体接管了哪些原子发布和恢复责任。
 
 ### 原型退出与停止条件
 
-结论允许为采用、继续限定验证或不采用。安全/数值/并发契约不能满足、平台构建代价过大，或适配后无法减少维护责任时，停止扩大原型并记录证据。
+| 结论 | 必须满足 / 下一步 |
+| --- | --- |
+| 采用候选 | 硬门全部有证据、已测平台与预算达标、维护责任净减少；只建议另拟生产迁移方案，不改生产后端。P2 仍检查委托范围 |
+| 继续限定验证 | 未出现硬门失败，但明确的一项证据/平台/预算缺口影响判断；列唯一补证范围、次数和停止上限，经范围授权后继续，不泛化扩围 |
+| 不采用 | 安全/精确数值/revision/并发契约失败且无有界修复，或达到预设补证上限、平台/构建成本不可接受、无净维护收益；停止扩大，保留结论和失败证据 |
+
+以上结论不依赖先选 A 或 C。A/C 决策、P1 委托、P2 扩围、生产切换及真实数据操作是分别记录的门；前一项通过不会自动打开后一项。R7 的 `tui-input` / `gix-url` 原型和 R8 的日志/通知/进程/下载库替换仍不纳入这份任务书。
 
 原型通过后，另提交生产迁移方案及真实数据操作授权请求。**不保留一个无人维护的永久可选 SQLite 后端，也不在 SQLite 上长期原样复制全部旧 redo/COW 引擎。**
 
@@ -511,11 +614,11 @@ ConPTY 冷启动失败没有按环境问题直接略过：正式测试在串行�
 
 本轮提交及后续规划只做源码一致性、文档链接、指令与 diff 检查，沿用第 11.3 节的组合测试证据，不宣称另有一次完整套件全绿。所有提交仅在本机，未 push、创建 tag、发布、部署或触发 GitHub CI。
 
-## 12. 下一阶段任务规划（尚未执行）
+## 12. 下一阶段任务规划（实施结果见第 13 节）
 
 ### 12.1 建议顺序与范围
 
-M0—M6 已完成，不再重做。建议下一次实施先推进 **N1—N3：Windows 验证稳定性、受控测量和依赖审计**；N4 的产品/架构决策材料可独立准备。N5 是有条件的平台补证，当前 Windows 机器缺少对应原生环境时保持未执行，不阻塞前四项。这里列出任务和验收，不代表本轮已经启动实现，也不改变第 9、10 节的决策门。
+本节是在 `62f6a3a` 提交的实施前规划；收到“按规划的继续”后，实际执行情况另记第 13 节。M0—M6 已完成，不再重做。下一阶段先推进 **N1—N3：Windows 验证稳定性、受控测量和依赖审计**；N4 的产品/架构决策材料独立准备。N5 是有条件的平台补证，当前 Windows 机器缺少对应原生环境时保持未执行，不阻塞前四项，也不改变第 9、10 节的决策门。以下保留原定范围和验收标准。
 
 ```text
 0656a20 已提交基线 + 已有验证证据
@@ -574,7 +677,127 @@ R7 的 `tui-input`/`gix-url` 原型、R8 日志/通知/进程等库替换、唯�
 
 主 agent 维护基线/证据、依赖及文档；N1、N2 分属两个不重叠文件集合，N4 可由第三名 agent 只做材料。N2 的正式测量等待 N1 环境配置稳定，期间可准备合成场景；测量与重测试不要并发争抢机器。若根因跨越文件所有权，先交主 agent 协调再修改，禁止双方同时编辑公共接口或依赖文件。
 
-各包在迭代中只跑目标测试；主 agent 在源码稳定后统一跑一次相关 Windows 完整入口与组合复审。沿用未变源码的既有证据，新增修复按影响补验；只改规划文档不跑 Rust 全量。按第 11 节格式追加实际完成/未完成项、完整命令、源码身份、失败分类、净成本及尚未打开的门。提交、push、CI、发布分别遵照当时委托；当前仅有本地提交与规划授权，没有后续外部操作授权。
+各包在迭代中只跑目标测试；主 agent 在源码稳定后统一跑一次相关 Windows 完整入口与组合复审。沿用未变源码的既有证据，新增修复按影响补验；只改规划文档不跑 Rust 全量。按第 11 节格式追加实际完成/未完成项、完整命令、源码身份、失败分类、净成本及尚未打开的门。提交、push、CI、发布分别遵照当时委托；规划提交时仅有本地提交与规划授权，后续实施委托与结果见第 13 节，始终没有自动执行外部操作的授权。
+
+## 13. N1—N4 实施记录
+
+### 13.1 本轮基线与范围
+
+收到“按规划的继续”后，以 `62f6a3ab2a787759867379071ffd5fa1d00b4ba6` 的干净工作区开工，源码快照仍为 `24453cdcc122ebbba85ed4c484ee687ff5b9e3d2a47970845b280636f00c7544`。先重新阅读仓库指令、本机环境说明和测试流程，沿用 Windows 11 AMD64、Rust 1.97.0 原生验证。新证据位于 `target/verification/refactoring-next-20260926/`；第 11 节的历史日志及审核原文字节保持不变。
+
+N1、N2 与 N4 分属三个 agent 的不重叠文件集合，主 agent 负责 N3、接口协调、组合验证和本记录。N2 正式采样避开构建与重测试；独立复审只读取文件。没有重做 M0—M6，也没有启动 A 产品切换、facts 删除、SQLite 原型或生产迁移。
+
+### 13.2 N1：Windows 环境与确定性回归
+
+`scripts/windows/verify.ps1` 新增 `-TestTempDir`，在测试/冒烟前打印实际账户、TEMP 与模块环境，拒绝不存在的目录、Git 工作区内目录及会让夹具继承其他身份访问权的目录。该检查只创建并检查临时探针，不修复 ACL、不授予特权。TEMP/TMP/PSModulePath 在成功和失败时恢复；Windows PowerShell 5.1 使用本引擎模块目录。另修复了 5.1 参数默认表达式中的 `PSScriptRoot` 问题：默认仓库路径改在脚本正文求值。安装集成夹具明确诊断 5.1 的 260 UTF-16 路径上限。
+
+本次正常宿主账户使用仓库外短目录 `C:\Users\Ghost\AppData\Local\Temp\cm-next-20260926`；其 DACL 仅允许该账户、SYSTEM 和 Administrators，见 `n1/host-temp.json`。受限沙箱与正常账户的权限不同，未把正常账户通过写成沙箱也通过。
+
+- 非仓库缓存回归使用受控 Git exit 128，并确认真实夹具祖先没有 `.git`。两个 materialization 回归仍执行真实 Git 初始化/发现/配置，随后重放捕获字节验证脱敏和共享缓存，避免把进程调度预算混入语义断言；新增超时仍保留项目、Git evidence 为 unavailable 的回归。原有真实 Git 子进程与预算覆盖保留，生产 750 ms / 2.5 s 限制不变。
+- combined snapshot 回归在两个数据族之间用独立文件描述符直接验证锁竞争，读取完成后验证释放；在实际 manifest 发布点通过仅测试启用的 hook 验证发布者持有排他锁。删除以 100 ms 未完成推断阻塞的断言，没有提高产品或测试超时。
+- 独立复审发现只检查 reader 会漏掉 publisher 锁回归，以及负向脚本用例可能掩盖环境恢复失败；分别补入实际发布点检查和父进程必须看到的恢复成功标记。
+
+开跑前固定四个相关用例、串行及四线程各 10 批、每进程 90 秒上限。改前与改后均 **20 批 / 80 项通过**，日志全部保留于 `n1/before-*`、`n1/after-*`；改前没有复现此前三个负载敏感失败，因此只能说明夹具与断言更确定，不能声称已经证明历史失败的唯一根因。重复批次之后又补入 reader 回调必须执行的 `Cell<bool>` 断言，该末次变更由第 13.5 节最终库全量覆盖，不属于此前 20 批的产物；`n1/summary.json` 保留前后哈希。相关 Git 模块 16 项、agent_management 2 项通过。
+
+PowerShell 7.4.1 / 5.1.26100.9444 的验证外层契约各 78 项通过；随后默认路径修复涉及的六种 valid-zero 调用在两种 shell 各补验 6 项通过。契约数由每 shell 60 增至 78，相应 UTM 结果校验由每个 PowerShell 引擎 87 更新至 105，双引擎合计 210，未启动 VM。宿主 Python UTM 合约 10 项通过；首次沙箱符号链接 OS 1314 失败及两次已修复的测试编译错误保留，不计通过。
+
+### 13.3 N2：受控测量
+
+新增显式 opt-in 的 `scripts/windows/measure-tui-history.py`、Cargo 管理的 ignored `tests/tui_measurement.rs` 和库内合成夹具准备入口；不依赖硬编码的 rlib 文件名，不读取真实历史。流程是先 `--phase plan` 冻结输出目录、两个产品二进制、来源提交、私有 TEMP 和样本数，再依次 `prepare`、`pilot`、`summarize-pilot`、`sample`、`summarize`。`--help` 列出参数；每个批次目录只允许启动一次，失败或中断记录及未执行条目均保留。重新诊断使用明确的新批次，不能覆写失败后宣称原批通过。
+
+对照产品分别是 `abef359eac136a2b004c7e4b98890cee27bd37fe` 和 `0656a201edbb5517a9f3ecac78549cbc6d8a15c0` 的现有产物，先复制冻结，再以可执行 SHA-256 和按对应 Git 源码重算的 buildId 双重核对。它们对应 M0—M6 前后生产实现，本轮 N1 Rust 变化仅在测试编译中启用。原构建日志支持相同 Rust 1.97.0、Windows x64、未优化 profile；未记录的有效编译 flags 保持未知，未重新构建产品来补造旧证据。debug 产物分别为 31,955,968 / 32,064,512 字节，差 108,544 字节；不外推 release 尺寸或受控构建成本。
+
+四个固定条件为全新本地状态、已初始化本地状态、三个合成持久来源的 All 查询、三个来源下本地 Summary/Trends 与后台 All。最后一项依次观察稳定输入、跨五分钟槽位的 quota 变更、quota 策略由三个纳入源变为两个。每个条件/二进制预定 10 次，共 80 次，交替基线/候选顺序；同一绝对合成 Codex home、模板字节、来源数量、账户和工具版本固定。进程首次启动、空应用状态与未受控的 OS 文件缓存明确区分；这些来源没有真实 SSH 或 live 快照，不声称覆盖 live 新鲜度。
+
+试测修复了三类仪器问题：Windows 的 CRLF marker 与 Rust 固定字节不符；光标位置回复分片写入使 ConPTY 在产品 main 之前等待；产品在 Windows 上对日志持有排他字节锁，运行中读日志不能用于等待就绪。最终采用完整回复单次写入、屏幕就绪并在退出后用 trace 时间核对、按 UTC 阶段边界读取已解锁日志。原失败、终止清理及独立诊断保留；它们不是产品延迟样本。quota 原先加一秒会落在同一槽位，已改为跨槽位并检查相对记录增长；query 场景只以成功完成事件确证。
+
+三个来源的试测显示查询完成可能跨越 12/24 秒观察窗口，因此在正式开批前最后冻结为每个稳态阶段 45 秒、至少一个完成 refresh，并验证实际 quota/策略变化；cache hit/miss 是观测结果，不用期望的命中结果筛掉样本。初始诊断上限 30 秒、稳态诊断上限 55 秒、helper 硬期限 240 秒、退出/句柄清理预算 5 秒。正式 ConPTY 的 8 秒期限完全不变；上述诊断窗口不算正式通过。窗口冻结后不再延长，也不重试正式失败样本。
+
+正式 `n2/protocol.json` 的 SHA-256 为 `fa6aef4b4593934b6e5667dda3a611d0cccc133614ab90bb7f7f6e5909cf3504`；基线/候选产品 SHA-256 分别为 `e2deccc4287075feffe9ccf08dc5808117b2360b24d2cb9bc7a3cc5656a7b3bf` / `063915937f390e6ac2b1fcf4c6ce7985f685e5e9e58f7b1f16ffe775538a4eba`。正式批于 `2026-09-26T16:04:45Z`（香港时间 9 月 27 日零时）启动，结果不回写成前一日旧基线的测试证据。
+
+原批于 `2026-09-26T16:59:31Z` 完成，**80/80 次均执行，70 次 helper 成功、10 次失败**，没有补跑。输入、产品、helper、协议及测量源码哈希均未变化，`inputBatchValid=true`；场景完整成立 70/80，`allScenariosEstablished=false`。9 次失败是在 30 秒内没有初始有效帧：All 两版各第 5、6 轮，后台候选第 1、2、5、7、9 轮（轮号从 0 开始）。另一次后台候选第 3 轮已有有效初始帧，但 45 秒 idle 阶段没有完成 refresh，不能认定稳态场景成立。没有 helper 硬期限、清理失败或 trace/event 解析错误。
+
+下表每格预定 10 次；时间单位为秒，仅统计 trace 确认 V2 且初始查询成功的有效帧。超时属于至少 30 秒的右删失结果，未被填成 30 秒、0 秒或丢弃。次慢值只是样本描述，不是稳定 p95。
+
+| 条件 | 产品 | 有效帧 n | 初始超时 | 完整场景 n | 中位数 | 次慢 | 最大值 | 有效帧中 >8 秒 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fresh_local | 基线 | 10 | 0 | 10 | 9.684 | 11.640 | 13.070 | 10 |
+| fresh_local | 候选 | 10 | 0 | 10 | 9.795 | 11.023 | 12.339 | 10 |
+| initialized_local | 基线 | 10 | 0 | 10 | 4.325 | 4.751 | 5.022 | 0 |
+| initialized_local | 候选 | 10 | 0 | 10 | 4.552 | 5.097 | 5.114 | 0 |
+| three_remotes_all | 基线 | 8 | 2 | 8 | 14.548 | 18.251 | 18.325 | 8 |
+| three_remotes_all | 候选 | 8 | 2 | 8 | 24.408 | 28.222 | 29.129 | 8 |
+| three_remotes_background | 基线 | 10 | 0 | 10 | 11.845 | 23.749 | 27.904 | 10 |
+| three_remotes_background | 候选 | 5 | 5 | 4 | 26.271 | 28.162 | 29.591 | 5 |
+
+加上初始超时，除 initialized_local 外，各格已知超过 8 秒的下限都是 10/10；这些带仪器的时间不是正式 ConPTY 测试结果。后台 quota 记录 1→2、策略纳入源 3→2 和独立 Local/All 成功查询，在基线 10 次、候选 4 次完整场景中成立；idle 阶段对应 10/4 次观察到缓存复用，依据无新增 usage/account 查询的完成 refresh 推断，未把推断写成直接测得的 cache-hit 事件。候选另一次虽然完成后两阶段，仍因 idle 证据缺失不算完整场景。
+
+fresh 的首个正式启动为 13.070 / 9.820 秒，其余 9 次中位数为 9.515 / 9.769 秒；所有组的首个及重复启动均另列于 `n2/metrics.json`。正式首个启动之前已经做过身份探测、pilot 和验证，因此不能称为 OS 冷缓存。同职责 `history.stage_load` 的基线/候选中位数分别为 fresh **3.625 / 3.792**、initialized **3.283 / 3.732**、All **11.954 / 18.349**、后台 **5.345 / 11.912** 秒（均只取有效初始子集）。本地组接近，但两个多来源场景存在明显的候选变慢信号，不能宣称无性能退化。
+
+有效初始阶段的 account_load/quota_merge 在前三组均为 1→1 次，后台从 2→1 次，证明共享 quota 减少了逻辑加载，但没有证明端到端更快。M3 把 quota 加载移到查询上下文，两版 `history.v2.query` 的计时范围不同，不能直接用其耗时差宣称同职责加速。逻辑加载 span 不等同系统调用或物理磁盘读取数；metadata_load span 不覆盖所有新增 revision 探测，不能把该 span 数减少当作总探测减少。嵌套 span 的耗时也不能直接相加为总成本。全部诊断、原始 trace/屏幕、每次完整调用和批次状态保存在 `n2/`，派生统计中的缺失字段记未知，不以 0 代替。
+
+资源计数覆盖全部尝试及整个进程，后台包括三个 45 秒窗口；失败提前退出会使其 CPU/I/O 更少，不能据此认定节省。各组 peak working set 中位数为 **26.81–28.20 MiB**。All 的基线/候选进程 CPU 中位数为 **14.711 / 21.523 秒**，读取 transfer 为 **101,901 / 147,826 字节**，写入 transfer 为 **32,702 / 32,338.5 字节**，最终状态字节数中位数均为 **24,155**；这组资源值含两版各自的两个超时尝试。其余 CPU、I/O、状态大小、逐行 busy 比例与首次/重复启动见 `metrics.json`。All 的全机 busy 中位数为 77.2% / 89.3%，负载差异限制了耗时归因。
+
+只读源码与 trace 联合复审定位了可选缓存的重复准备：在三远端、无重试的 All 路径中，候选新增内层 query_inputs 的前后探测共 6 次，以及 Overview 消费已有 unified seed 前为可选缓存执行的额外探测共 6 次。后者涉及私有目录、root lock、manifest 和 binding 检查。内层检查在变化时重试并清 quota，外层检查只决定能否缓存，范围也不同，不能互相替代。单个 probe 没有独立 span，不能把全部耗时差归给它们。
+
+原 80 次封存后，针对 Overview 的 supplied-seed 分支单独实施窄修改：保留 metadata 和每个远端 active-ref 的现有错误检查，清除可选缓存并直接使用完整查询结果；没有 seed 时保持原查询、前后版本检查和 TTL。代价是之后首次无 seed 请求需要正常查询建缓存。该改动不覆盖 Local + 后台 All 的 None 路径，不解决上表后台失败。三项定向回归及主 agent 的受影响组合验证见第 13.5 节。
+
+随后独立比较旧候选 `0656a20` 与窄优化 `216705c017ec9b2e5073fdb3ba930aa185adb7be`，只测已初始化三远端 All，固定交替 10 对、初始期限仍为 30 秒，不重试。复用原绝对 home、模板、账户、helper 和时间输入；准备入口验证原 driver 哈希，采样入口要求成功身份验证记录绑定同一协议与提交 buildId。新协议 SHA-256 为 `a61dded18a7df27e245dcaf4f755d81b229c1a48da039f25ff0ff5da231d7e9c`；新产品 SHA-256 为 `88fd68860ad4f199ac9e62a988190a2a2de25409aff1492db1f457359dead02d`，buildId 为 `519dc8e737b6ef7679a6845e95d35a34c90ad70e879fe438b5d1bd097e97e444`。新 debug 产物 32,031,744 字节；仍不据此推断 release 尺寸或受控构建成本。
+
+该批于 `2026-09-26T17:13:00Z` 至 `17:18:11Z` 执行，**20/20 场景成立、失败 0、初始超时 0**，全部输入、产品、helper、协议及源码哈希未变。以下时间为秒：
+
+| 独立 All 对照 | 有效初始 n | 中位数 | 次慢 | 最大值 | 有效帧中 >8 秒 | 同职责 stage_load 中位数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 旧候选 `0656a20` | 10 | 16.594 | 17.610 | 18.115 | 10 | 11.855 |
+| 窄优化 `216705c` | 10 | 13.814 | 14.233 | 14.409 | 10 | 11.510 |
+
+10 个有效配对的就绪时间差中位数为 **-3.066 秒**、比值中位数 **0.821**，本批每对均更快；这支持当前合成场景的改善，不是一般性能承诺。trace 中 stage_load 结束至 initial_data_ready 的间隔中位数为 **3.836 / 1.488 秒**，20 行均恰有一组匹配、没有缺失；该间隔包含其他后续工作，不等于单独 revision probe 耗时。首个本批启动为 16.334 / 14.191 秒，其余 9 次中位数为 16.740 / 13.744 秒。原候选在本批已比原 80 次批的 24.408 秒中位数快，说明不能把不同时间批次直接混作同一对照，也不能宣称已经恢复到 `abef359` 的水平。
+
+本批全部尝试的进程 CPU 中位数为 **16.164 / 13.531 秒**、读取 transfer **152,103 / 128,792.5 字节**、写入 transfer **32,346 / 32,337 字节**、peak working set **28,805,120 / 28,889,088 字节**，最终状态均 **24,155 字节**。全机 busy 中位数为 **46.2% / 44.9%**，较原批明显不同。资源覆盖启动至退出，不能称为某个 probe 的独立成本；两版全量有效 flags 仍未完全记录。这 20 次只验证 All supplied-seed 路径，不重测 fresh 或后台，不覆盖真实 SSH/live 新鲜度，也不改变原 80 次的失败结论。原始行、调用、身份记录及派生统计独立保存于 `n2/seed-comparison/`，没有覆写原批证据。
+
+进程 I/O transfer 不是物理磁盘访问，working set 不是 allocator 峰值；revision 探测、quota DTO clone、真实冷缓存及受控构建成本没有独立测量时记未知，不补造 0 或性能承诺。试测记录到较高的全机 busy 比例，主 agent 只读检查确认仍有浏览器、编辑器、用户现有监控应用及非本任务确认的构建活动；没有终止用户进程。本任务只保证自己的采样与编译/重测试不并发，逐行保留负载。共享宿主的变化不能靠交替次序完全消除，不以这些样本作一般性能或稳定 p95 保证。
+
+### 13.4 N3 与 N4
+
+N3 使用仓库固定的 `cargo-audit 0.22.2` 对未改变的 Cargo.lock 执行 `audit --deny warnings`，RustSec 数据库提交 `e2111519ba6d14a5da59a7b2e5c8083ae8a37c01`（更新时间 `2026-09-25T19:51:57+02:00`）。247 个锁定依赖、1,271 条公告，**0 漏洞 / 0 warning**，无忽略项或 target 过滤。完整命令、锁文件哈希和时点限制见 [依赖审计记录](dependency-audit.md) 及 `n3/audit.log/json`。首次离线安装因工具未缓存失败，随后固定版本仅安装到工作区忽略目录；未改变全局 PATH、Cargo.toml 或 Cargo.lock。
+
+N4 已增补第 9、10 节：A/C 独立/复制/分叉/缺失 facts/quota 例子、A0 集合 schema 与 CLI/UI/错误草案、最后消费者及 A4 新旧中心/agent/同机进程/中断/旧版本重开/备份回滚矩阵；P1 的固定合成档位、revision 保留、数值/安全/持久性/资源硬门及 P2 独立委托边界。JSON 示例和相对链接已静态校验。以上是待批准材料，没有选择 A，也没有创建 SQLite 适配或添加依赖。
+
+### 13.5 组合验证、成本与剩余边界
+
+主 agent 在源码稳定后只运行一次完整 Windows 入口。源码/脚本输入快照为 `75d0c31656b589261ff933542fbc43935f36f4f89dc84250db6af9f153a5c721`，测试前后相同；每条命令的完整参数、账户、环境与文件哈希见同名 JSON。正常宿主账户和私有 TEMP 与第 13.2 节一致，`CARGO_NET_OFFLINE=true`，target/build 分别为 `D:\Workspace\codex-usage-monit\target\refactoring-final` 和 `D:\Workspace\codex-usage-monit\target\refactoring-final-build`。
+
+| 实际检查 | 结果 | 证据文件（本轮目录下） |
+| --- | --- | --- |
+| `pwsh -NoProfile -File scripts/windows/verify.ps1 -CargoTargetDir D:\Workspace\codex-usage-monit\target\refactoring-final -CargoBuildDir D:\Workspace\codex-usage-monit\target\refactoring-final-build -TestTempDir C:\Users\Ghost\AppData\Local\Temp\cm-next-20260926` | fmt、Clippy all-targets `-D warnings`、25 项 Python 契约、78 项 verify、17 项 dev、10 项 ACL 契约通过；库 1,780 passed / 1 ignored；已到达的集成目标 113 passed / 1 failed / 2 ignored。ConPTY 初始数据超时使入口退出 1，后续目标及 CLI 冒烟当时未运行 | `windows-full.log/json` |
+| `cargo test --locked --offline --no-fail-fast --test update_cli --test usage_evidence -- --test-threads=4` | 补完未运行的目标：13 passed / 1 ignored | `windows-remaining.log/json` |
+| `cargo test --locked --offline --test tui_pty real_tui_pty_handles_keyboard_mouse_search_resize_and_exit -- --exact --test-threads=1` | 一次定向串行复验仍失败，8.13 秒；未重跑整套或放宽 8 秒期限 | `windows-conpty-focused.log/json` |
+| 同一 `verify.ps1` 及三个目录参数，加 `-SkipFormat -SkipClippy -SkipTests` | CLI 原生构建、version、offline JSON/partial/非空任务冒烟通过；源码前后未变 | `windows-cli-smoke.log/json` |
+| `python -W error::ResourceWarning -m unittest discover -s scripts/windows/tests -p test_measure_tui_history.py -v` | 测量工具的 6 项失败清理、证据解析和有效样本筛选契约通过 | `n2/driver-contracts-final.log` |
+| `target/tools/actionlint-1.7.12/actionlint.exe -oneline` | 通过；官方 Windows amd64 归档摘要已核对，工具仅位于工作区忽略目录 | `actionlint.log/json`、`actionlint-install.json` |
+
+上述窄优化前的全量入口与补完目标合计 **1,780 项库测试、126 项集成测试通过，1 项正式 ConPTY 用例失败**。默认忽略的四项分别是原有真实历史 benchmark、旧二进制兼容检查，以及两个新测量入口；前者未获真实历史委托，兼容检查沿用第 11 节锁实现未变的既有证据，新测量入口仅由第 13.3 节显式执行。该统计没有把失败重算为通过，也不是一次全套全绿。
+
+原 80 次封存后，新增 supplied-seed 的三来源/警告/错误/缓存生命周期回归，以及共享 quota/策略失效定向回归，**3 项通过**。只修改 `src/tui.rs` 与其测试后，主 agent 按影响补验，没有重跑全量：
+
+| 窄优化后的实际检查 | 结果 | 证据文件 |
+| --- | --- | --- |
+| `cargo test --locked --offline --lib tui::tests -- --test-threads=4` | **340 passed / 1 ignored**；含新增回归 | `windows-tui-final.log/json` |
+| `cargo test --locked --offline --test tui_pty --test tui_data_integration -- --test-threads=1` | **4 passed**；正式 ConPTY 的 8 秒期限未改 | `windows-conpty-final.log/json` |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | 通过 | `windows-clippy-final.log/json` |
+| `cargo fmt --all -- --check` | 通过 | `windows-format-final.log/json` |
+
+四条命令均绑定完整源码/脚本快照 `d6a942d9df7178626d5aa6147364d12ee810a8fe939b098bc91012bf7cca8114`，各自执行前后相同；ConPTY 记录含新产品构建日志。测试时 HEAD 尚为 `2f6b689`，这两个文件仍未提交；其逐文件哈希与随后 `216705c` 完全一致，保留原日志中的 HEAD，不改写成提交后运行。两个快照均覆盖相同的 191 个 Cargo/构建配置、src/tests/scripts 文件，不含文档、环境或二进制。最终源码与首次全量之间仅上述两个 TUI 文件变化，其他模块沿用相同字节的全量证据，不把两批计数相加冒充新增覆盖。后一次正式 ConPTY 通过满足该窄改动的本次验证，但不是消除共享宿主冷启动风险的证明。
+
+两次 ConPTY 失败均已显示正常 TUI 框架并停在 `Finalizing usage snapshot...`，不符合试测中卡在 main 之前的光标回复仪器问题。高共享负载是观测到的条件，但不足以证明唯一根因；既有冷启动期限余量风险仍未关闭。
+
+只读复审进一步确认，这条进度文案在初始历史写入/查询阶段未更新，不能据屏幕断言 rollout materialize 是瓶颈。试测 trace 中该步骤仅为亚毫秒，后续 history.stage_load 及此前未充分细分的初始化均有成本；单次试测不足以支持性能补丁。正式失败分类保留为“Windows 冷启动数据就绪预算违约已复现，产品成本与宿主负载贡献未隔离”，不标为纯环境问题或已证明的 M3 回归。
+
+相对 `62f6a3a`，生产 Rust 只调整了第 13.3 节 Overview supplied-seed 分支的可选缓存策略，公共接口未变；其余 Rust 变更为测试、夹具或 `cfg(test)` hook。Cargo.toml、Cargo.lock、Rust 工具链与生产依赖图不变，没有新增库。按 `source_cost.py` 的物理行/非空行口径，生产 TUI 净减 **10 / 10 行**，Rust 测试及 hook 净增 **778 / 764 行**，验证与测量脚本净增 **846 / 779 行**。测试与测量能力有维护成本，不能以生产分支减行宣称总体瘦身。库 API 的未来 A/SQLite 设计只在文档中存在。
+
+本地提交 `da4d5440f7b6135007e380ee4d873c088e8d40bf` 保存 N1，`2f6b689e84e02ac8e43368242ce9248a18401caf` 保存 N2 测量工具；两次提交没有改变已验证的工作区源码字节，原 80 次与完整验证的快照仍为 `75d0c31656b589261ff933542fbc43935f36f4f89dc84250db6af9f153a5c721`。`216705c017ec9b2e5073fdb3ba930aa185adb7be` 保存上述已补验的窄优化。文档静态检查覆盖 20 个本地链接、2 个 JSON 示例及原审查文档字节哈希；最终检查结果与文档提交后的 HEAD 另存本轮 `docs-check.json` / `implementation-record.json`。提交只写本地仓库，未 push、触发 CI、创建 tag 或发布。
+
+本轮没有执行 N5：当前 Windows 本机未使用相应 Unix/macOS 原生环境；按委托不运行 Docker、UTM、远端或 hosted CI。真实服务安装、真实历史基准及断电实验仍未执行。A 产品决策、SQLite 原型委托及生产迁移的门继续关闭。
 
 [E1]: https://docs.rs/semver/1.0.28/semver/struct.Version.html#method.cmp_precedence "semver 的升级优先级比较"
 [E2]: https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock "标准库锁、竞争错误与句柄生命周期"

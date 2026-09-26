@@ -1,5 +1,35 @@
 # Dependency advisory disposition
 
+## 2026-09-26 local checkpoint
+
+Audited the lockfile at source commit `62f6a3ab2a787759867379071ffd5fa1d00b4ba6`
+using cargo-audit 0.22.2 on native Windows x86_64. RustSec database commit
+`e2111519ba6d14a5da59a7b2e5c8083ae8a37c01` was last updated at
+`2026-09-25T19:51:57+02:00` and contained 1,271 advisories. The complete lockfile
+contained 247 dependencies; there were **zero vulnerabilities and zero advisory
+warnings**, with no ignored advisories or target filters. Yanked-package checking
+was enabled. No project dependency or lockfile changes were needed.
+
+The lockfile SHA-256 was
+`3d6e81337754deabd7eb5c25a440501dd7e414ba3a1b4d9b07362d26711bc298`.
+The missing checker was installed into the ignored workspace directory with
+`cargo install cargo-audit --version 0.22.2 --locked --root target/tools/refactoring-audit`;
+it was not installed globally. The audit command was:
+
+```powershell
+target/tools/refactoring-audit/bin/cargo-audit.exe audit --deny warnings --db target/verification/refactoring-next-20260926/n3/advisory-db --json
+```
+
+The JSON report and execution record are in
+`target/verification/refactoring-next-20260926/n3/audit.log` and `audit.json`.
+The earlier offline installation attempt failed because the tool was not cached;
+the subsequent fixed-version installation and network-backed audit succeeded.
+This local audit did not trigger hosted CI and is not a new runtime test pass or
+a guarantee against future advisories. The historical dependency changes below
+remain unchanged.
+
+## 2026-09-08 dependency changes
+
 Checked on 2026-09-08 against RustSec database commit
 `faedffd5118c1835e13cca3babb6059afb1eb8d0` using cargo-audit 0.22.2.
 The review started at repository commit `8104cfc`; its supplied report used

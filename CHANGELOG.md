@@ -10,6 +10,9 @@ All notable changes to this project are documented in this file.
 - Use standard-library file locks in production, retaining explicit unlock guards and compatibility tests with older `fs2` processes.
 - Separate history preparation from shared CLI/TUI queries, preserving source selection, replica reconciliation and report output. Reuse account quota within a validated query request and invalidate projections when contributing quota sources change.
 - Parse launchd plist fields structurally with bounded XML input while preserving generated service definitions and fingerprints. Share the durable private-file replacement sequence where publication contracts match.
+- Validate the native Windows test account and inherited temporary-directory permissions before running tests, with an explicit private temporary-directory override and restored caller environment. Make Git evidence and manifest-lock regressions independent of scheduler timing.
+- Add an opt-in synthetic TUI measurement workflow with frozen comparison binaries, fixed sample batches, and retained failure evidence.
+- Reuse supplied All-source Overview projections without preparing an optional cache entry, retaining source errors and consistency checks for subsequent queries.
 
 ## [0.5.2] - 2026-09-26
 
