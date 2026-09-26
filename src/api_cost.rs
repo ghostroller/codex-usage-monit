@@ -514,6 +514,20 @@ mod tests {
                 11_900_000_000_000,
             ),
             (
+                "gpt-6-sol",
+                219_000_000_000,
+                438_000_000_000,
+                1_190_000_000_000,
+                2_380_000_000_000,
+            ),
+            (
+                "gpt-6-luna",
+                10_950_000_000,
+                21_900_000_000,
+                59_500_000_000,
+                119_000_000_000,
+            ),
+            (
                 "gpt-5.6-sol",
                 438_000_000_000,
                 876_000_000_000,
@@ -712,17 +726,33 @@ mod tests {
             total_tokens: input_tokens,
             ..TokenUsage::default()
         };
-        let short = price_call(&call("gpt-5.6-sol", None, tokens(272_000)));
-        let long = price_call(&call("gpt-5.6-sol", None, tokens(272_001)));
-        let mut ambiguous_call = call("gpt-5.6-sol", None, tokens(272_001));
-        ambiguous_call.request_usage_exact = false;
-        let ambiguous = price_call(&ambiguous_call);
+        for (model, short_price, long_price, ambiguous_min) in [
+            (
+                "gpt-5.6-sol",
+                1_088_000_000_000,
+                2_176_008_000_000,
+                1_088_004_000_000,
+            ),
+            (
+                "gpt-6-sol",
+                544_000_000_000,
+                1_088_004_000_000,
+                544_002_000_000,
+            ),
+            ("gpt-6-luna", 27_200_000_000, 54_400_200_000, 27_200_100_000),
+        ] {
+            let short = price_call(&call(model, None, tokens(272_000)));
+            let long = price_call(&call(model, None, tokens(272_001)));
+            let mut ambiguous_call = call(model, None, tokens(272_001));
+            ambiguous_call.request_usage_exact = false;
+            let ambiguous = price_call(&ambiguous_call);
 
-        assert_eq!(short.minimum_pico_usd, 1_088_000_000_000);
-        assert_eq!(long.minimum_pico_usd, 2_176_008_000_000);
-        assert_eq!(ambiguous.minimum_pico_usd, 1_088_004_000_000);
-        assert_eq!(ambiguous.maximum_pico_usd, 2_176_008_000_000);
-        assert_eq!(ambiguous.partial_reason, Some(LONG_CONTEXT_AMBIGUOUS));
+            assert_eq!(short.minimum_pico_usd, short_price, "{model}");
+            assert_eq!(long.minimum_pico_usd, long_price, "{model}");
+            assert_eq!(ambiguous.minimum_pico_usd, ambiguous_min, "{model}");
+            assert_eq!(ambiguous.maximum_pico_usd, long_price, "{model}");
+            assert_eq!(ambiguous.partial_reason, Some(LONG_CONTEXT_AMBIGUOUS));
+        }
     }
 
     #[test]

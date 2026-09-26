@@ -295,6 +295,6 @@ fn missing_catalog_uses_the_bundled_metadata() {
     let output = monitor_command(&config_dir, &codex_home).output().unwrap();
     assert!(output.status.success() || output.status.code() == Some(2));
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["apiPricing"]["catalogRevision"], 3);
-    assert_eq!(document["apiPricing"]["ratesAsOf"], "2026-09-07");
+    assert_eq!(document["apiPricing"]["catalogRevision"], 4);
+    assert_eq!(document["apiPricing"]["ratesAsOf"], "2026-09-26");
 }

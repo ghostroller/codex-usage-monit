@@ -5417,7 +5417,10 @@ fn models_panel_keeps_cost_column_and_moves_api_summary_to_details() {
     assert!(details.contains("API equivalent $1.2345"));
     assert!(details.contains("model calls only"));
     assert!(details.contains("coverage 75.0%"));
-    assert!(details.contains("rates 2026-09-07"));
+    assert!(details.contains(&format!(
+        "rates {}",
+        crate::model_catalog::api_pricing_rates_as_of()
+    )));
 }
 
 #[test]

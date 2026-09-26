@@ -8,9 +8,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub(crate) const MODEL_CATALOG_VERSION: u32 = 1;
-pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 6;
-pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 3;
-pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-09-07";
+pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 7;
+pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 4;
+pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-09-26";
 pub(crate) const BUNDLED_API_PRICING_SOURCE_URL: &str =
     "https://developers.openai.com/api/docs/pricing";
 
@@ -1070,6 +1070,66 @@ fn bundled_catalog() -> ModelCatalog {
         },
     );
     catalog.insert_builtin(
+        &["gpt-6-sol"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(400, 40, 2_000),
+                Some(CreditTokenRates::new(1_000, 100, 5_000)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(2_000_000, 200_000, Some(2_500_000), 10_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        4_000_000,
+                        400_000,
+                        Some(5_000_000),
+                        15_000_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(4_000_000, 400_000, Some(5_000_000), 20_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        8_000_000,
+                        800_000,
+                        Some(10_000_000),
+                        30_000_000,
+                    )),
+                )),
+            }),
+        },
+    );
+    catalog.insert_builtin(
+        &["gpt-6-luna"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(20, 2, 100),
+                Some(CreditTokenRates::new(50, 5, 250)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(100_000, 10_000, Some(125_000), 500_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        200_000,
+                        20_000,
+                        Some(250_000),
+                        750_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(200_000, 20_000, Some(250_000), 1_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        400_000,
+                        40_000,
+                        Some(500_000),
+                        1_500_000,
+                    )),
+                )),
+            }),
+        },
+    );
+    catalog.insert_builtin(
         &[
             "gpt-5.6-sol",
             "gpt-5.6",
@@ -1302,6 +1362,13 @@ mod tests {
         DecimalValue::String(value.to_string())
     }
 
+    fn parse_next_revision_catalog(contents: &[u8]) -> io::Result<ModelCatalog> {
+        let mut config: serde_json::Value = serde_json::from_slice(contents).unwrap();
+        config["estimatorRevision"] = (BUNDLED_ESTIMATOR_REVISION + 1).into();
+        config["apiPricingCatalogRevision"] = (BUNDLED_API_PRICING_CATALOG_REVISION + 1).into();
+        parse_catalog(&serde_json::to_vec(&config).unwrap())
+    }
+
     #[test]
     fn bundled_catalog_contains_astra_credit_and_api_rates() {
         let catalog = bundled_catalog();
@@ -1317,23 +1384,73 @@ mod tests {
     }
 
     #[test]
+    fn bundled_sol_and_luna_keep_fractional_rates_exact() {
+        let catalog = bundled_catalog();
+        let cases = [
+            (
+                "gpt-6-sol",
+                CreditTokenRates::new(400, 40, 2_000),
+                CreditTokenRates::new(1_000, 100, 5_000),
+                ApiTokenRates::new(2_000_000, 200_000, Some(2_500_000), 10_000_000),
+                ApiTokenRates::new(4_000_000, 400_000, Some(5_000_000), 15_000_000),
+                ApiTokenRates::new(4_000_000, 400_000, Some(5_000_000), 20_000_000),
+                ApiTokenRates::new(8_000_000, 800_000, Some(10_000_000), 30_000_000),
+            ),
+            (
+                "gpt-6-luna",
+                CreditTokenRates::new(20, 2, 100),
+                CreditTokenRates::new(50, 5, 250),
+                ApiTokenRates::new(100_000, 10_000, Some(125_000), 500_000),
+                ApiTokenRates::new(200_000, 20_000, Some(250_000), 750_000),
+                ApiTokenRates::new(200_000, 20_000, Some(250_000), 1_000_000),
+                ApiTokenRates::new(400_000, 40_000, Some(500_000), 1_500_000),
+            ),
+        ];
+        for (model, standard, fast, short, long, fast_short, fast_long) in cases {
+            let entry = catalog.models.get(model).unwrap();
+            assert_eq!(entry.credit, credit_model(standard, Some(fast), true));
+            assert_eq!(
+                entry.api,
+                Some(ApiModelRates {
+                    standard: api_tier(short, ApiLongContextRates::Published(long)),
+                    fast: Some(api_tier(
+                        fast_short,
+                        ApiLongContextRates::Published(fast_long),
+                    )),
+                }),
+                "{model}",
+            );
+            assert_eq!(
+                lookup(Some(&format!("  {}  ", model.to_uppercase()))),
+                Some(*entry)
+            );
+        }
+        for unlisted in ["gpt-6", "gpt-6-sol-latest", "gpt-6-luna-latest"] {
+            assert_eq!(lookup(Some(unlisted)), None, "{unlisted}");
+        }
+    }
+
+    #[test]
     fn auto_review_is_api_only_and_uses_luna_api_rates() {
         let catalog = bundled_catalog();
         let auto_review = catalog.models.get("codex-auto-review").unwrap();
         let luna = catalog.models.get("gpt-5.6-luna").unwrap();
 
+        assert_eq!(catalog.credit_fallback_model, "gpt-5.6-luna");
         assert_eq!(auto_review.credit, None);
         assert_eq!(auto_review.api, luna.api);
+        assert_ne!(
+            auto_review.api,
+            catalog.models.get("gpt-6-luna").unwrap().api
+        );
         assert!(luna.credit.is_some());
     }
 
     #[test]
     fn configured_catalog_parses_decimal_rates_and_aliases() {
-        let catalog = parse_catalog(
+        let catalog = parse_next_revision_catalog(
             br#"{
               "version": 1,
-              "estimatorRevision": 7,
-              "apiPricingCatalogRevision": 4,
               "ratesAsOf": "2026-09-07",
               "sourceUrl": "https://example.invalid/rates",
               "longContextInputThreshold": 123,
@@ -1357,8 +1474,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(catalog.estimator_revision, 7);
-        assert_eq!(catalog.api_pricing_catalog_revision, 4);
+        assert_eq!(catalog.estimator_revision, BUNDLED_ESTIMATOR_REVISION + 1);
+        assert_eq!(
+            catalog.api_pricing_catalog_revision,
+            BUNDLED_API_PRICING_CATALOG_REVISION + 1
+        );
         assert_eq!(catalog.long_context_input_threshold, 123);
         let entry = catalog.models.get("new-model-latest").unwrap();
         assert_eq!(
@@ -1374,12 +1494,10 @@ mod tests {
     #[test]
     fn catalog_fingerprint_is_canonical_and_changes_with_pricing_content() {
         fn configured(input: &str, aliases: &str) -> ModelCatalog {
-            parse_catalog(
+            parse_next_revision_catalog(
                 format!(
                     r#"{{
                       "version": 1,
-                      "estimatorRevision": 7,
-                      "apiPricingCatalogRevision": 4,
                       "ratesAsOf": "2026-09-07",
                       "sourceUrl": "https://example.invalid/rates",
                       "longContextInputThreshold": 272000,
@@ -1425,7 +1543,9 @@ mod tests {
     fn documented_complete_catalog_is_valid_and_contains_current_aliases() {
         let catalog = parse_catalog(include_bytes!("../docs/model-catalog.example.json")).unwrap();
 
-        assert!(catalog.models.contains_key("gpt-6-astra"));
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(catalog.models.contains_key(model), "{model}");
+        }
         assert_eq!(
             catalog.models.get("gpt-daybreak-blue-latest").unwrap().api,
             catalog.models.get("gpt-5.6-sol").unwrap().api
@@ -1472,8 +1592,6 @@ mod tests {
     fn configured_catalog_rejects_duplicate_aliases_and_stale_revisions() {
         let duplicate = br#"{
           "version": 1,
-          "estimatorRevision": 7,
-          "apiPricingCatalogRevision": 4,
           "ratesAsOf": "2026-09-07",
           "sourceUrl": "https://example.invalid/rates",
           "longContextInputThreshold": 272000,
@@ -1484,7 +1602,7 @@ mod tests {
           ]
         }"#;
         assert!(
-            parse_catalog(duplicate)
+            parse_next_revision_catalog(duplicate)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")

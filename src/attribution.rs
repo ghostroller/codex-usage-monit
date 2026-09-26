@@ -667,6 +667,8 @@ mod tests {
         };
         let cases = [
             ("gpt-6-astra", 40_600, 101_500),
+            ("gpt-6-sol", 8_120, 20_300),
+            ("gpt-6-luna", 406, 1_015),
             ("gpt-5.6-sol", 16_240, 40_600),
             ("gpt-5.6", 16_240, 40_600),
             ("daybreak-blue-latest", 16_240, 40_600),
@@ -826,6 +828,34 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_sol_and_luna_preserve_fractional_credits_with_optional_long_context() {
+        let tokens = TokenUsage {
+            input_tokens: 272_001,
+            cached_input_tokens: 200_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 1,
+            total_tokens: 272_002,
+            ..TokenUsage::default()
+        };
+        // Cache writes remain regular input for credits. These totals use
+        // eighth-credit units, including Luna Fast's 0.625 cached rate and
+        // its optional long-context 46.875 output rate.
+        for (model, fast, base, with_long) in [
+            ("gpt-6-sol", false, 36_802_400, 73_603_800),
+            ("gpt-6-sol", true, 92_006_000, 184_009_500),
+            ("gpt-6-luna", false, 1_840_120, 3_680_190),
+            ("gpt-6-luna", true, 4_600_300, 9_200_475),
+        ] {
+            let weight = estimate_call_weight(&rated_call(model, fast, tokens));
+            assert_eq!(weight.units, base, "{model} fast={fast}");
+            assert_eq!(weight.units_with_api_long_context(), with_long);
+            assert!(weight.used_long_context_pricing);
+            assert!(!weight.used_model_fallback);
+            assert!(!weight.used_long_context_detection_fallback);
+        }
+    }
+
+    #[test]
     fn request_boundaries_prevent_aggregate_input_from_triggering_the_surcharge() {
         let mut first = rated_call(
             "gpt-5.6-luna",
@@ -871,6 +901,9 @@ mod tests {
         };
 
         for model in [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6",
             "gpt-5.6-sol",
             "daybreak-blue-latest",

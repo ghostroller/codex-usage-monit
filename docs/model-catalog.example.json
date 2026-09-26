@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "estimatorRevision": 7,
-  "apiPricingCatalogRevision": 4,
-  "ratesAsOf": "2026-09-07",
+  "estimatorRevision": 8,
+  "apiPricingCatalogRevision": 5,
+  "ratesAsOf": "2026-09-26",
   "sourceUrl": "https://developers.openai.com/api/docs/pricing",
   "longContextInputThreshold": 272000,
   "creditFallbackModel": "gpt-5.6-luna",
@@ -27,6 +27,54 @@
           "long": {
             "mode": "published",
             "rates": { "input": 40, "cachedInput": 4, "cacheWrite": 50, "output": 150 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6-sol",
+      "credit": {
+        "standard": { "input": 50, "cachedInput": 5, "output": 250 },
+        "fast": { "input": 125, "cachedInput": "12.5", "output": 625 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 2, "cachedInput": "0.2", "cacheWrite": "2.5", "output": 10 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 4, "cachedInput": "0.4", "cacheWrite": 5, "output": 15 }
+          }
+        },
+        "fast": {
+          "short": { "input": 4, "cachedInput": "0.4", "cacheWrite": 5, "output": 20 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 8, "cachedInput": "0.8", "cacheWrite": 10, "output": 30 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6-luna",
+      "credit": {
+        "standard": { "input": "2.5", "cachedInput": "0.25", "output": "12.5" },
+        "fast": { "input": "6.25", "cachedInput": "0.625", "output": "31.25" },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": "0.1", "cachedInput": "0.01", "cacheWrite": "0.125", "output": "0.5" },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.2", "cachedInput": "0.02", "cacheWrite": "0.25", "output": "0.75" }
+          }
+        },
+        "fast": {
+          "short": { "input": "0.2", "cachedInput": "0.02", "cacheWrite": "0.25", "output": 1 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": "0.4", "cachedInput": "0.04", "cacheWrite": "0.5", "output": "1.5" }
           }
         }
       }
