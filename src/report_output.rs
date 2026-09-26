@@ -940,6 +940,7 @@ mod tests {
             },
             service: Some(ServiceStatus {
                 recorder: None,
+                registration: None,
                 platform: "linux-systemd-user".to_string(),
                 state: ServiceState::Running,
                 installed: true,

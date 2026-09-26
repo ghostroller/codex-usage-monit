@@ -213,6 +213,7 @@ mod tests {
         recorder.record_degraded(now, "recorder error");
         let service = ServiceStatus {
             recorder: None,
+            registration: None,
             platform: "linux-systemd-user".to_string(),
             state: ServiceState::Stopped,
             installed: true,

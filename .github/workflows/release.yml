@@ -194,8 +194,9 @@ jobs:
         shell: bash
         run: |
           cp scripts/install.sh dist/install.sh
+          cp scripts/install.ps1 dist/install.ps1
           cd dist
-          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe release-manifest.json install.sh | sort -k 2 > SHA256SUMS
+          sha256sum codex-usage-monit-*.tar.gz codex-usage-monit-*.exe release-manifest.json install.sh install.ps1 | sort -k 2 > SHA256SUMS
 
       - name: Create GitHub Release
         env:
@@ -203,7 +204,7 @@ jobs:
         run: >-
           gh release create "$GITHUB_REF_NAME"
           dist/codex-usage-monit-*.tar.gz dist/codex-usage-monit-*.exe
-          dist/release-manifest.json dist/SHA256SUMS dist/install.sh
+          dist/release-manifest.json dist/SHA256SUMS dist/install.sh dist/install.ps1
           --verify-tag
           --title "codex-usage-monit $GITHUB_REF_NAME"
           --generate-notes

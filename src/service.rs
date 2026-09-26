@@ -28,6 +28,7 @@ use crate::source_identity::validate_windows_private_file;
 
 mod recorder_coordination;
 mod upgrade;
+mod windows_host;
 #[cfg(all(test, unix))]
 use recorder_coordination::RECORDER_INSTANCE_LOCK_FILE;
 use recorder_coordination::{
@@ -50,9 +51,17 @@ use recorder_coordination::{
 };
 pub(crate) use upgrade::recorder_stop_requested;
 pub use upgrade::registered_status;
+#[cfg(windows)]
+pub(crate) use upgrade::request_foreground_recorder_stop;
+pub(crate) use upgrade::trusted_registration_identity;
 pub(crate) use upgrade::with_update_references;
 pub use upgrade::{ServiceUpgradeReport, upgrade_registered_recorder};
 pub(crate) use upgrade::{inspect_update_recorder, upgrade_registered_recorder_for_update};
+pub use upgrade::{repair_registered, restart_registered, start_registered, stop_registered};
+pub use windows_host::WindowsRecorderHost;
+pub(crate) use windows_host::remove_windows_version_components;
+#[cfg(windows)]
+pub(crate) use windows_host::validate_windows_version_components;
 
 const SERVICE_LABEL: &str = "com.ghostroller.codex-usage-monit.recorder";
 const SYSTEMD_UNIT: &str = "codex-usage-monit-recorder.service";
@@ -122,12 +131,32 @@ pub struct ServiceStatus {
     #[serde(default)]
     pub heartbeat_recent: bool,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<ServiceRegistrationDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRegistrationDetails {
+    pub backend: String,
+    pub user_sid: Option<String>,
+    pub requires_interactive_logon: bool,
+    pub interactive_session_available: Option<bool>,
+    pub enabled: bool,
+    pub manager_state: String,
+    pub health: String,
+    pub last_exit_code: Option<i64>,
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceOptions {
     pub executable: PathBuf,
+    /// Optional version-bound launch adapter. Semantic recorder identity stays
+    /// unchanged; the full task fingerprint and upgrade journal bind the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_host: Option<WindowsRecorderHost>,
     pub codex_home: PathBuf,
     pub codex_bin: Option<PathBuf>,
     pub history_dir: PathBuf,
@@ -186,6 +215,7 @@ impl ServiceOptions {
     ) -> Self {
         Self {
             executable,
+            windows_host: None,
             codex_home,
             codex_bin: None,
             history_dir,
@@ -627,9 +657,12 @@ pub(crate) fn ensure_service_definition_is_trusted_at(
 }
 
 pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
-    validate_options(options)?;
     let root = service_coordination_root_for_options(options)?;
     let _upgrade_guard = upgrade::mutation_lock(&root)?;
+    let prepared = windows_host::prepare(options, true)?;
+    let options = &prepared;
+    validate_options(options)?;
+    let prepared_at = Utc::now();
     let platform = current_platform();
     if platform == Platform::Unsupported {
         bail!(
@@ -653,8 +686,9 @@ pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
             || persist_current_service_definition_marker(options),
             start_systemd,
         )?,
-        Platform::Windows => replace_service_after_quiescence_with_start(
+        Platform::Windows => replace_service_checked(
             options,
+            || upgrade::registered_options_for_mutation(&root).map(|_| ()),
             || quiesce_windows_task_for_install(options),
             || install_windows_task(options),
             cleanup_windows_task_registration,
@@ -664,6 +698,9 @@ pub fn install(options: &ServiceOptions) -> Result<ServiceStatus> {
         Platform::Unsupported => unreachable!("unsupported platforms returned before installation"),
     }
     upgrade::clear_journal(&root)?;
+    if platform == Platform::Windows {
+        upgrade::wait_for_installed_recorder(options, prepared_at)?;
+    }
     status(options)
 }
 
@@ -973,10 +1010,15 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
         .and_then(|status| status.history_namespace.as_deref())
         .filter(|namespace| *namespace != expected_namespace)
         .map(str::to_string);
+    let definition_mismatch = current_platform() == Platform::Windows
+        && recorder
+            .as_ref()
+            .is_some_and(|status| !recorder_matches_service_definition(options, status));
     let heartbeat_recent = recorder
         .as_ref()
         .is_some_and(|status| status.heartbeat_is_recent(Utc::now()))
-        && namespace_mismatch.is_none();
+        && namespace_mismatch.is_none()
+        && !definition_mismatch;
     let mut service_status = match current_platform() {
         Platform::MacOs => launchd_status(options, heartbeat, heartbeat_recent),
         Platform::Linux => systemd_status(options, heartbeat, heartbeat_recent),
@@ -991,6 +1033,7 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
             last_history_heartbeat: heartbeat,
             heartbeat_recent,
             detail: "service management is unsupported; use record --foreground".to_string(),
+            registration: None,
         }),
     }?;
     if let Some(namespace) = namespace_mismatch {
@@ -1000,12 +1043,26 @@ pub fn status(options: &ServiceOptions) -> Result<ServiceStatus> {
     } else {
         service_status.recorder = recorder.clone();
     }
+    if definition_mismatch {
+        service_status.detail.push_str(
+            "; recorder heartbeat does not match the registered service definition and source-aware writer identity",
+        );
+    }
     if let Some(error) = recorder.and_then(|status| status.last_error) {
         service_status
             .detail
             .push_str(&format!("; last recorder error: {error}"));
     }
     Ok(service_status)
+}
+
+fn recorder_matches_service_definition(
+    options: &ServiceOptions,
+    status: &RecorderStatusFile,
+) -> bool {
+    status.service_definition_id.as_deref() == Some(options.service_definition_id().as_str())
+        && status.history_backend == Some(RecorderHistoryBackend::SourceAwareV2)
+        && status.ownership_epoch.is_some_and(|epoch| epoch > 1)
 }
 
 fn expected_history_namespace(options: &ServiceOptions) -> String {
@@ -1021,6 +1078,8 @@ fn expected_history_namespace(options: &ServiceOptions) -> String {
 pub fn uninstall(options: &ServiceOptions) -> Result<ServiceStatus> {
     let root = service_coordination_root_for_options(options)?;
     let _upgrade_guard = upgrade::mutation_lock(&root)?;
+    let registered = upgrade::registered_options_for_mutation(&root)?;
+    let options = registered.as_ref().unwrap_or(options);
     match current_platform() {
         Platform::MacOs => replace_service_after_quiescence(
             options,
@@ -1066,6 +1125,9 @@ fn result_summary<T, E: fmt::Display>(result: std::result::Result<T, E>) -> Stri
 }
 
 fn validate_options(options: &ServiceOptions) -> Result<()> {
+    if let Some(host) = &options.windows_host {
+        windows_host::validate_host(&options.executable, host)?;
+    }
     if !options.executable.is_absolute() {
         bail!("service executable path must be absolute");
     }
@@ -2686,14 +2748,91 @@ fn cleanup_windows_task_registration() -> Result<()> {
 }
 
 fn windows_task_status(
-    _options: &ServiceOptions,
+    options: &ServiceOptions,
     heartbeat: Option<DateTime<Utc>>,
     heartbeat_recent: bool,
 ) -> Result<ServiceStatus> {
     let user_sid = windows_current_user_sid()?;
     let task_name = windows_task_name(&user_sid);
     let mut run = run_windows_task_operation;
-    windows_task_status_with(&task_name, heartbeat, heartbeat_recent, &mut run)
+    let mut status = windows_task_status_with(&task_name, heartbeat, heartbeat_recent, &mut run)?;
+    status.registration_path = Some(PathBuf::from(&task_name));
+    if status.installed {
+        let details = windows_task_details(&task_name)?;
+        let session = windows_host::has_interactive_session().ok();
+        let healthy = status.running && status.heartbeat_recent;
+        status.registration = Some(ServiceRegistrationDetails {
+            backend: if options.windows_host.is_some() {
+                "windows-task-hosted"
+            } else {
+                "windows-task-direct"
+            }
+            .into(),
+            user_sid: Some(user_sid),
+            requires_interactive_logon: true,
+            interactive_session_available: session,
+            enabled: details.enabled,
+            manager_state: windows_state_name(details.state).into(),
+            health: if healthy {
+                "healthy"
+            } else if !details.enabled {
+                "disabled"
+            } else if session == Some(false) {
+                "waiting_for_logon"
+            } else if status.running {
+                "awaiting_heartbeat"
+            } else {
+                "stopped"
+            }
+            .into(),
+            last_exit_code: Some(details.last_result),
+            log_file: options
+                .windows_host
+                .as_ref()
+                .map(|_| windows_host::host_log_file(options)),
+        });
+        if session == Some(false) && details.enabled {
+            status
+                .detail
+                .push_str("; waiting_for_logon: the same user must have an interactive session");
+        }
+    }
+    Ok(status)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsTaskDetails {
+    state: i32,
+    enabled: bool,
+    last_result: i64,
+}
+
+fn windows_state_name(state: i32) -> &'static str {
+    match state {
+        WINDOWS_TASK_STATE_DISABLED => "disabled",
+        WINDOWS_TASK_STATE_QUEUED => "queued",
+        WINDOWS_TASK_STATE_READY => "ready",
+        WINDOWS_TASK_STATE_RUNNING => "running",
+        _ => "unknown",
+    }
+}
+
+fn windows_task_details(task_name: &str) -> Result<WindowsTaskDetails> {
+    let script = r#"$ErrorActionPreference='Stop'
+$service=New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$task=$service.GetFolder('\').GetTask($env:CODEX_USAGE_MONIT_TASK_NAME)
+[Console]::Out.Write((@{state=[int]$task.State;enabled=[bool]$task.Enabled;lastResult=[long]$task.LastTaskResult} | ConvertTo-Json -Compress))"#;
+    let output = run_service_command(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env(WINDOWS_TASK_STATE_ENV, task_name),
+    )?;
+    if !output.status.success() {
+        bail!("could not query task details: {}", output_detail(&output));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn windows_task_status_with(
@@ -2962,8 +3101,20 @@ fn register_windows_task_xml(options: &ServiceOptions, task_name: &str, xml: &[u
 }
 
 fn windows_task_xml(options: &ServiceOptions, user_sid: &str) -> String {
-    let command = xml_escape(&options.executable.to_string_lossy());
-    let arguments = xml_escape(&windows_recorder_arguments(options));
+    let command = xml_escape(&windows_host::task_command(options).to_string_lossy());
+    let arguments = xml_escape(&windows_host::task_arguments(options));
+    let working_directory = options.windows_host.as_ref().map_or(String::new(), |_| {
+        format!(
+            "\n      <WorkingDirectory>{}</WorkingDirectory>",
+            xml_escape(
+                &options
+                    .executable
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_string_lossy()
+            )
+        )
+    });
     let user_sid = xml_escape(user_sid);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3006,7 +3157,7 @@ fn windows_task_xml(options: &ServiceOptions, user_sid: &str) -> String {
   <Actions Context="RecorderUser">
     <Exec>
       <Command>{command}</Command>
-      <Arguments>{arguments}</Arguments>
+      <Arguments>{arguments}</Arguments>{working_directory}
     </Exec>
   </Actions>
 </Task>
@@ -3021,11 +3172,20 @@ fn verify_windows_task_xml_matches_options(
 ) -> Result<()> {
     let actual = decode_windows_task_xml(actual)?;
     let parsed = parse_windows_task_xml(&actual)?;
-    let expected_command = options.executable.to_string_lossy();
-    let expected_arguments = windows_recorder_arguments(options);
+    let expected_command = windows_host::task_command(options).to_string_lossy();
+    let expected_arguments = windows_host::task_arguments(options);
     verify_windows_task_structure(&parsed, user_sid, true)?;
     if parsed.text("Task/Actions/Exec/Command")? != expected_command
         || parsed.text("Task/Actions/Exec/Arguments")? != expected_arguments
+        || parsed.text_or_default("Task/Actions/Exec/WorkingDirectory", "")?
+            != options.windows_host.as_ref().map_or_else(String::new, |_| {
+                options
+                    .executable
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_string_lossy()
+                    .into_owned()
+            })
     {
         bail!("Task Scheduler definition has an unexpected recorder command or argument list");
     }
@@ -3045,10 +3205,19 @@ fn canonical_windows_task_fingerprint(actual: &[u8], user_sid: &str) -> Result<S
     let trigger_user = parsed.text("Task/Triggers/LogonTrigger/UserId")?;
     let principal_user = parsed.text("Task/Principals/Principal/UserId")?;
     let definition_id = definition_id_from_tokenized_contract(arguments, None)?;
-    let canonical = format!(
+    let mut canonical = format!(
         "task-contract=source-aware-v2/windows-task-v1\ncommand={}\narguments={}\ndefinition-id={}\nuser-trigger={}\nuser-principal={}\ntrigger-enabled=true\nsettings-enabled=normalized\nlogon-type=InteractiveToken\nrun-level=LeastPrivilege\nmultiple-instances=IgnoreNew\nbattery-start=false\nbattery-stop=false\nhard-terminate=true\nstart-when-available=true\nnetwork-required=false\non-demand=true\nhidden=false\nidle=false\nwake=false\nexecution-limit=PT0S\npriority=7\nrestart-interval=PT1M\nrestart-count=255\n",
         command, arguments, definition_id, trigger_user, principal_user
     );
+    if parsed
+        .nodes
+        .contains_key("Task/Actions/Exec/WorkingDirectory")
+    {
+        canonical.push_str(&format!(
+            "working-directory={}\nlaunch-contract=embedded-recorder-host-v1\n",
+            parsed.text("Task/Actions/Exec/WorkingDirectory")?
+        ));
+    }
     Ok(service_definition_fingerprint(canonical.as_bytes()))
 }
 
@@ -3123,7 +3292,19 @@ fn verify_windows_task_structure(
     {
         bail!("Task Scheduler definition has an unexpected Settings/Enabled state");
     }
-    definition_id_from_tokenized_contract(task.text("Task/Actions/Exec/Arguments")?, None)?;
+    let arguments = task.text("Task/Actions/Exec/Arguments")?;
+    let hosted = arguments.starts_with("--host-sha256 ");
+    if hosted {
+        if task.text("Task/Actions/Exec/WorkingDirectory")?.is_empty() {
+            bail!("hosted recorder requires its immutable working directory");
+        }
+    } else if task
+        .nodes
+        .contains_key("Task/Actions/Exec/WorkingDirectory")
+    {
+        bail!("legacy direct recorder must not contain a custom working directory");
+    }
+    definition_id_from_tokenized_contract(arguments, None)?;
     Ok(())
 }
 
@@ -3141,6 +3322,7 @@ impl ParsedWindowsTaskXml {
             "Task/Actions/Exec",
             "Task/Actions/Exec/Command",
             "Task/Actions/Exec/Arguments",
+            "Task/Actions/Exec/WorkingDirectory",
         ];
         const TRIGGERS: &[&str] = &[
             "Task/Triggers",
@@ -3454,7 +3636,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(windows)]
-fn windows_current_user_sid() -> Result<String> {
+pub(crate) fn windows_current_user_sid() -> Result<String> {
     use std::mem;
     use std::ptr;
     use std::slice;
@@ -3531,7 +3713,7 @@ fn windows_current_user_sid() -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn windows_current_user_sid() -> Result<String> {
+pub(crate) fn windows_current_user_sid() -> Result<String> {
     bail!("the current Windows user SID is unavailable on this platform")
 }
 
@@ -3575,6 +3757,7 @@ fn service_status(
         last_history_heartbeat: heartbeat,
         heartbeat_recent,
         detail,
+        registration: None,
     }
 }
 
@@ -4998,6 +5181,34 @@ mod tests {
     }
 
     #[test]
+    fn windows_health_rejects_foreground_or_previous_registration_heartbeats() {
+        let directory = tempdir().unwrap();
+        let options = options(directory.path());
+        let now = Utc::now();
+        let mut heartbeat = RecorderStatusFile::started(now, expected_history_namespace(&options));
+        heartbeat.record_success(now);
+        heartbeat.bind_source_aware_v2(2).unwrap();
+        assert!(heartbeat.heartbeat_is_recent(now));
+        assert!(
+            !recorder_matches_service_definition(&options, &heartbeat),
+            "a fresh foreground writer is not the registered task"
+        );
+        heartbeat.service_definition_id = Some(options.service_definition_id());
+        assert!(recorder_matches_service_definition(&options, &heartbeat));
+        let mut newer = options.clone();
+        newer.executable = directory.path().join("new-version/codex-usage-monit.exe");
+        assert!(
+            !recorder_matches_service_definition(&newer, &heartbeat),
+            "a previous immutable version cannot satisfy the new task's health"
+        );
+        heartbeat.ownership_epoch = Some(1);
+        assert!(!recorder_matches_service_definition(&options, &heartbeat));
+        heartbeat.ownership_epoch = Some(2);
+        heartbeat.history_backend = Some(RecorderHistoryBackend::LegacyV1);
+        assert!(!recorder_matches_service_definition(&options, &heartbeat));
+    }
+
+    #[test]
     fn status_file_round_trips_atomically_and_tracks_freshness() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("nested/recorder-status.json");
@@ -6202,6 +6413,7 @@ mod tests {
             last_history_heartbeat: Some(heartbeat),
             heartbeat_recent: false,
             detail: "no registration".to_string(),
+            registration: None,
         };
 
         assert_eq!(
@@ -6259,6 +6471,7 @@ mod tests {
             last_history_heartbeat: None,
             heartbeat_recent: false,
             detail: "non-Unicode path".to_string(),
+            registration: None,
         };
 
         let value = serde_json::to_value(status).unwrap();

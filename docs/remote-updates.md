@@ -42,6 +42,22 @@ Local `--version` accepts `latest` or a release version, optionally prefixed wit
 the selected CLI entry, PATH resolution and the last update journal without
 applying an update. `--install-dir` and `--adopt` require `node` scope.
 
+On Windows, initial command/PATH registration and optional login recording use
+the explicit [user installer](windows-installation.md). Updating a node does
+not add a PATH entry or create an absent recorder. `.cmd`/`.bat` and other
+PATHEXT wrappers are reported as possible command shadowing and are not adopted
+as executable launchers. Compatible running standalone executables can remain
+the stable proxy while the selected version changes; an incompatible occupied
+executable fails preflight before the recorder changes, with a retained-candidate
+command for retry after existing sessions close.
+
+Windows SSH executable paths such as `tools\agent.exe` and `..\tools\agent.exe`
+use the same encoded literal invocation as absolute Windows paths. Task Scheduler
+recorders still require their user's interactive logon; a node update checks
+this before stopping an enabled recorder. Unattended machine services have a
+separate administrator-managed lifecycle (`service machine`) and are outside
+current-user `sync`/`node` deployment scopes.
+
 Settings **[B] Update node** opens a dialog for the selected host. **[S] Sync
 components** preserves its CLI; **[N] Node application** includes the CLI.
 **[A] Adopt manual CLI** explicitly authorizes migration of a standalone existing

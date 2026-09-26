@@ -195,6 +195,17 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('python3 scripts/check-release-binary.py', build)
         self.assertIn('python scripts/check-release-binary.py', build)
 
+    def test_windows_bootstrap_is_published_with_checksums(self):
+        publish = mapping_block(self.jobs("release"), "publish", 2)
+        steps = job_steps(publish)
+        checksums = next(step for step in steps if "Create checksums" in step)
+        create = next(step for step in steps if "Create GitHub Release" in step)
+        script = literal_run(checksums)
+        self.assertIn("cp scripts/install.ps1 dist/install.ps1", script)
+        checksum_line = next(line for line in script.splitlines() if "sha256sum " in line)
+        self.assertIn("install.ps1", checksum_line)
+        self.assertIn("dist/install.ps1", create)
+
     @unittest.skipUnless(shutil.which("bash"), "bash is required to execute the release gate")
     def test_release_gate_rejects_every_incomplete_dependency_combination(self):
         gate = mapping_block(self.jobs("release"), "verification-gate", 2)

@@ -76,16 +76,17 @@ codex-usage-monit update status --format json
 
 命令入口是读取 `installation.json` 版本选择的稳定启动器，不是供后台服务跟随的符号链接。recorder 固定使用某个不可变版本的绝对路径。Windows 后续升级只切换版本选择，无需覆盖正在运行的启动器；首次迁移旧 exe 时仍可能需要关闭旧进程。目录、PATH 检查和故障恢复见[应用更新说明](docs/remote-updates.md)。
 
-64 位 Windows 用户可以从[最新 Release](https://github.com/ghostroller/codex-usage-monit/releases/latest)下载 `codex-usage-monit-x86_64-pc-windows-msvc.exe` 和 `SHA256SUMS`。在 PowerShell 中校验后，用该程序建立受管安装，并将 `%LOCALAPPDATA%\codex-usage-monit\bin` 加入用户 `PATH`：
+64 位 Windows 用户可在 PowerShell 中运行用户安装器。它会校验发布清单和程序、建立受管安装，并将命令目录注册到用户 `PATH`，不需要管理员权限：
+
+下列下载命令需要先发布包含 Windows 安装器的版本；发布前请使用当前源码中的脚本及匹配的本地发布包。
 
 ```powershell
-$binary = "codex-usage-monit-x86_64-pc-windows-msvc.exe"
-$actual = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
-$expected = ((Select-String -Path SHA256SUMS -Pattern " $([regex]::Escape($binary))$").Line -split "\s+")[0]
-if ($actual -ne $expected) { throw "checksum mismatch" }
-& ".\$binary" update
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/ghostroller/codex-usage-monit/releases/latest/download/install.ps1' -OutFile .\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 & "$env:LOCALAPPDATA\codex-usage-monit\bin\codex-usage-monit.exe" --version
 ```
+
+重新打开终端应用后再使用不带路径的 `codex-usage-monit`。添加 `-Recorder on-logon` 可注册当前用户的后台 recorder；`-NoModifyPath` 可保持 PATH 不变。固定版本、离线安装、修复、卸载，以及需要管理员配置的独立服务器模式见 [Windows 安装指南](docs/windows-installation.md)。
 
 ### 从源码安装
 
@@ -270,6 +271,8 @@ macOS 使用 LaunchAgent，Linux 使用 `systemd --user`，Windows 使用最低�
 ```bash
 codex-usage-monit service uninstall
 ```
+
+Windows 任务通过内嵌、与业务版本绑定的 GUI host 无窗口启动 recorder，并管理其进程树。`service start` 会启用自动启动并立即开始记录；`service stop` 会禁用自动启动并停止记录。`service restart` 要求注册项处于启用状态；`service repair` 保留原启用/停用状态，沿现有更新流程向前恢复。`service status --format json` 区分 manager 状态、心跳健康和 `waiting_for_logon`。默认 Windows 任务要求同一用户保持交互登录，仅有 SSH 会话不够；服务器模式和恢复步骤见 [Windows 安装指南](docs/windows-installation.md)。
 
 应用升级使用 `update`，它会自动协调已有服务；只把已经准备好的程序应用到 recorder 时可以使用 `service upgrade`。需要明确修改 `--codex-home`、Codex 可执行文件位置或采集选项时，再运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 v1→v2 history cutover 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次迁移和迁移恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
 

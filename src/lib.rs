@@ -20,6 +20,7 @@ pub mod history_ownership;
 pub mod history_profile_lease;
 pub mod history_query;
 pub mod history_runtime;
+mod installation;
 pub mod local_history_migration;
 pub(crate) mod logical_replica;
 mod model_catalog;
@@ -75,3 +76,5 @@ pub mod ui_state;
 pub mod update;
 #[cfg(windows)]
 mod windows_private_directory;
+#[cfg(windows)]
+mod windows_scm;

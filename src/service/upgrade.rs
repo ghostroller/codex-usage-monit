@@ -229,10 +229,16 @@ pub(crate) fn with_update_references<T>(
     let registration = read_registration_during_upgrade(pending)?;
     let mut paths = Vec::new();
     if let Some(registration) = registration {
+        if let Some(host) = registration.options.windows_host {
+            paths.push(host.executable);
+        }
         paths.push(registration.options.executable);
     }
     if let Some(pending) = pending {
         paths.push(pending.target.executable.clone());
+        if let Some(host) = &pending.target.windows_host {
+            paths.push(host.executable.clone());
+        }
     }
     operation(&paths)
 }
@@ -282,6 +288,7 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
                 .as_ref()
                 .map_or(journal.previous_fingerprint, |r| r.fingerprint.clone());
             journal.target.executable = executable;
+            journal.target = windows_host::prepare(&journal.target, journal.enabled)?;
             journal.build_id = build_id.clone();
             journal
         }
@@ -298,6 +305,7 @@ fn upgrade_registered_recorder_checked(allow_dev_build: bool) -> Result<ServiceU
             };
             let mut target = existing.options;
             target.executable = executable;
+            target = windows_host::prepare(&target, existing.enabled)?;
             let mut journal = UpgradeJournal {
                 schema_version: JOURNAL_VERSION,
                 minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -479,17 +487,24 @@ fn disable_registration() -> Result<()> {
 }
 
 fn ready_status(journal: &UpgradeJournal, require_new: bool) -> Result<Option<RecorderStatusFile>> {
-    let Some(status) = read_recorder_status(&journal.target.status_file)? else {
-        return Ok(None);
-    };
-    if !heartbeat_matches(&status, journal, require_new) {
-        return Ok(None);
-    }
-    let observed = super::status(&journal.target)?;
+    Ok(ready_status_from_observation(
+        journal,
+        require_new,
+        super::status(&journal.target)?,
+    ))
+}
+
+fn ready_status_from_observation(
+    journal: &UpgradeJournal,
+    require_new: bool,
+    observed: ServiceStatus,
+) -> Option<RecorderStatusFile> {
     if !observed.running || !observed.heartbeat_recent {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(status))
+    observed
+        .recorder
+        .filter(|status| heartbeat_matches(status, journal, require_new))
 }
 
 fn heartbeat_matches(
@@ -509,14 +524,21 @@ fn heartbeat_matches(
 }
 
 fn wait_ready(journal: &UpgradeJournal) -> Result<RecorderStatusFile> {
+    wait_ready_for_instance(journal, true)
+}
+
+fn wait_ready_for_instance(
+    journal: &UpgradeJournal,
+    require_new: bool,
+) -> Result<RecorderStatusFile> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if let Some(status) = ready_status(journal, true)? {
+        if let Some(status) = ready_status(journal, require_new)? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
             bail!(
-                "service_start_timeout: new recorder did not publish a verified history heartbeat; inspect service status and retry service upgrade"
+                "service_start_timeout: recorder did not publish a verified history heartbeat; inspect service status and retry service upgrade"
             );
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -723,6 +745,8 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             Err(error) => Err(error.into()),
         }
     };
+    let mut host = None;
+    let mut host_log = None;
     let (arguments, environment, enabled, fingerprint) = match current_platform() {
         Platform::MacOs => {
             let Some(bytes) = read(&launchd_registration_path()?)? else {
@@ -769,7 +793,12 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             let document = decode_windows_task_xml(&bytes)?;
             let task = parse_windows_task_xml(&document)?;
             verify_windows_task_structure(&task, &sid, false)?;
-            let mut args = windows_arguments(task.text("Task/Actions/Exec/Arguments")?)?;
+            let arguments = windows_arguments(task.text("Task/Actions/Exec/Arguments")?)?;
+            let imported =
+                windows_host::unwrap_task(task.text("Task/Actions/Exec/Command")?, arguments)?;
+            let mut args = imported.arguments;
+            host = imported.host;
+            host_log = imported.log;
             let environment = if args
                 .first()
                 .is_some_and(|a| a.starts_with("--service-path="))
@@ -782,7 +811,7 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             } else {
                 None
             };
-            args.insert(0, task.text("Task/Actions/Exec/Command")?.to_string());
+            args.insert(0, imported.recorder);
             (
                 args,
                 environment,
@@ -792,7 +821,11 @@ fn read_registration_definition() -> Result<Option<Registration>> {
         }
         Platform::Unsupported => bail!("service upgrade is unsupported"),
     };
-    let options = parse_registered_options(&arguments, environment)?;
+    let mut options = parse_registered_options(&arguments, environment)?;
+    options.windows_host = host;
+    if host_log.is_some_and(|path| path != windows_host::host_log_file(&options)) {
+        bail!("service_host_invalid: task log path does not match the registered status directory");
+    }
     if target_fingerprint(&options)? != fingerprint {
         bail!(
             "service_upgrade_unverifiable: registration is not an exact application-managed definition"
@@ -810,6 +843,343 @@ pub fn registered_status(fallback: &ServiceOptions) -> Result<ServiceStatus> {
         Some(registration) => super::status(&registration.options),
         None => super::status(fallback),
     }
+}
+
+/// Installer recovery can claim a task only after both its full definition and
+/// immutable business executable match, even if its first heartbeat failed.
+pub(crate) fn trusted_registration_identity(expected_executable: &Path) -> Result<Option<String>> {
+    if current_platform() != Platform::Windows {
+        bail!("Windows task identity requested on another platform");
+    }
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let Some(registration) = read_registration()? else {
+        return Ok(None);
+    };
+    ensure_service_definition_is_trusted_at(
+        &root,
+        ServiceDefinitionObservation::Fingerprint(registration.fingerprint),
+    )?;
+    if fs::canonicalize(&registration.options.executable)? != fs::canonicalize(expected_executable)?
+    {
+        bail!(
+            "service_install_identity_mismatch: registered recorder belongs to another executable"
+        );
+    }
+    Ok(Some(windows_task_name(&windows_current_user_sid()?)))
+}
+
+pub(super) fn wait_for_installed_recorder(
+    options: &ServiceOptions,
+    prepared_at: DateTime<Utc>,
+) -> Result<()> {
+    let journal = UpgradeJournal {
+        schema_version: JOURNAL_VERSION,
+        minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_id: env!("MONIT_BUILD_ID").into(),
+        target: options.clone(),
+        previous_fingerprint: target_fingerprint(options)?,
+        enabled: true,
+        prepared_at,
+        phase: "awaiting_heartbeat".into(),
+        last_error: None,
+    };
+    wait_ready(&journal)?;
+    Ok(())
+}
+
+/// SCM owns an exact child process handle, while the stop file must also bind
+/// the recorder instance timestamp so PID reuse cannot stop another writer.
+#[cfg(windows)]
+pub(crate) fn request_foreground_recorder_stop(
+    status_file: &Path,
+    expected_pid: u32,
+    expected_build_id: &str,
+) -> Result<()> {
+    let status =
+        read_recorder_status(status_file)?.context("recorder has not published its status")?;
+    if status.pid != expected_pid || status.build_id.as_deref() != Some(expected_build_id) {
+        bail!("recorder_stop_identity_changed: status does not belong to the supervised recorder");
+    }
+    let request = StopRequest {
+        pid: status.pid,
+        started_at: status.started_at,
+        build_id: expected_build_id.into(),
+    };
+    write_private_atomically(
+        &status_file.with_extension("stop.json"),
+        &serde_json::to_vec(&request)?,
+    )?;
+    Ok(())
+}
+
+/// Mutations may operate only on the exact definition previously trusted by
+/// this application. A task with the same name is not proof of ownership.
+pub(super) fn registered_options_for_mutation(root: &Path) -> Result<Option<ServiceOptions>> {
+    registered_options_for_mutation_with(root, read_registration_during_upgrade)
+}
+
+fn registered_options_for_mutation_with(
+    root: &Path,
+    read: impl FnOnce(Option<&UpgradeJournal>) -> Result<Option<Registration>>,
+) -> Result<Option<ServiceOptions>> {
+    let journal = read_journal(root)?;
+    let pending = journal
+        .as_ref()
+        .filter(|journal| journal.phase != "complete");
+    let Some(registration) = read(pending)? else {
+        return Ok(None);
+    };
+    if let Some(journal) = pending {
+        validate_resume_registration(journal, Some(&registration))?;
+    } else {
+        ensure_service_definition_is_trusted_at(
+            root,
+            ServiceDefinitionObservation::Fingerprint(registration.fingerprint.clone()),
+        )?;
+    }
+    Ok(Some(registration.options))
+}
+
+fn lifecycle_registration(root: &Path) -> Result<Registration> {
+    if read_journal(root)?.is_some_and(|journal| journal.phase != "complete") {
+        bail!("service_update_pending: finish service repair before changing recorder enablement");
+    }
+    let registration =
+        read_registration()?.context("service_not_installed: install the recorder first")?;
+    ensure_service_definition_is_trusted_at(
+        root,
+        ServiceDefinitionObservation::Fingerprint(registration.fingerprint.clone()),
+    )?;
+    Ok(registration)
+}
+
+fn lifecycle_stop(registration: &Registration) -> Result<()> {
+    disable_registration()?;
+    request_graceful_stop(&registration.options)?;
+    match current_platform() {
+        Platform::Windows => {
+            quiesce_windows_task_for_install(&registration.options)?;
+        }
+        Platform::Linux => {
+            quiesce_systemd_for_install(&registration.options)?;
+        }
+        Platform::MacOs => {
+            quiesce_launchd_for_install(&registration.options)?;
+        }
+        Platform::Unsupported => bail!("service management is unsupported"),
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleManagerState {
+    Unloaded,
+    Stopped,
+    Active,
+}
+
+fn lifecycle_manager_state(platform: Platform) -> Result<LifecycleManagerState> {
+    match platform {
+        Platform::Windows => {
+            let task = windows_task_name(&windows_current_user_sid()?);
+            Ok(
+                if windows_task_is_running_with(&task, &mut run_windows_task_operation)? {
+                    LifecycleManagerState::Active
+                } else {
+                    LifecycleManagerState::Stopped
+                },
+            )
+        }
+        Platform::MacOs => {
+            let output = run_service_command(
+                Command::new("launchctl")
+                    .args(["print", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
+            )?;
+            if launchd_output_reports_running(&output) {
+                Ok(LifecycleManagerState::Active)
+            } else if output.status.success() {
+                Ok(LifecycleManagerState::Stopped)
+            } else if launchd_print_reports_missing(&output_detail(&output)) {
+                Ok(LifecycleManagerState::Unloaded)
+            } else {
+                bail!(
+                    "could not inspect recorder launchd state: {}",
+                    output_detail(&output)
+                )
+            }
+        }
+        Platform::Linux => {
+            let output = run_service_command(Command::new("systemctl").args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                SYSTEMD_UNIT,
+            ]))?;
+            if !output.status.success() {
+                bail!(
+                    "could not inspect recorder systemd state: {}",
+                    output_detail(&output)
+                );
+            }
+            match String::from_utf8_lossy(&output.stdout).trim() {
+                "active" | "activating" | "reloading" => Ok(LifecycleManagerState::Active),
+                "inactive" | "failed" => Ok(LifecycleManagerState::Stopped),
+                state => bail!(
+                    "cannot start recorder in systemd state {state:?}; retry after it settles"
+                ),
+            }
+        }
+        Platform::Unsupported => bail!("service management is unsupported"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleStartOperation {
+    Enable,
+    Load,
+    Start,
+}
+
+fn run_lifecycle_start_operation(
+    platform: Platform,
+    operation: LifecycleStartOperation,
+) -> Result<()> {
+    match (platform, operation) {
+        (Platform::Windows, operation) => {
+            let task = windows_task_name(&windows_current_user_sid()?);
+            let args = match operation {
+                LifecycleStartOperation::Enable => vec!["/Change", "/TN", &task, "/ENABLE"],
+                LifecycleStartOperation::Start => vec!["/Run", "/TN", &task],
+                LifecycleStartOperation::Load => {
+                    bail!("Task Scheduler registration already exists")
+                }
+            };
+            run_checked(
+                Command::new("schtasks.exe").args(args),
+                "start recorder task",
+            )
+        }
+        (Platform::Linux, LifecycleStartOperation::Enable) => run_checked(
+            Command::new("systemctl").args(["--user", "enable", SYSTEMD_UNIT]),
+            "enable recorder",
+        ),
+        (Platform::Linux, LifecycleStartOperation::Start) => run_checked(
+            Command::new("systemctl").args(["--user", "start", SYSTEMD_UNIT]),
+            "start recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Enable) => run_checked(
+            Command::new("launchctl")
+                .args(["enable", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
+            "enable recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Load) => run_checked(
+            Command::new("launchctl")
+                .args(["bootstrap", &launchd_domain()])
+                .arg(launchd_registration_path()?),
+            "load recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Start) => start_launchd(),
+        _ => bail!("unsupported recorder start operation"),
+    }
+}
+
+fn lifecycle_start_with(
+    enabled: bool,
+    require_new: bool,
+    inspect: impl FnOnce() -> Result<LifecycleManagerState>,
+    mut run: impl FnMut(LifecycleStartOperation) -> Result<()>,
+    ready: impl FnOnce(bool) -> Result<RecorderStatusFile>,
+) -> Result<()> {
+    let state = inspect()?;
+    if !enabled {
+        run(LifecycleStartOperation::Enable)?;
+    }
+    if state == LifecycleManagerState::Unloaded {
+        run(LifecycleStartOperation::Load)?;
+    }
+    if state != LifecycleManagerState::Active {
+        run(LifecycleStartOperation::Start)?;
+    }
+    // An idempotent start may reuse a running/queued recorder that has not yet
+    // produced its first heartbeat. Restart and replacement still require a
+    // new instance after their verified quiescence boundary.
+    ready(require_new || state != LifecycleManagerState::Active)?;
+    Ok(())
+}
+
+fn lifecycle_start(registration: &Registration, require_new: bool) -> Result<ServiceStatus> {
+    if current_platform() == Platform::Windows {
+        windows_host::require_interactive_session()?;
+    }
+    validate_options(&registration.options)?;
+    let identity = executable_update_identity(&registration.options.executable)?;
+    let build_id = identity
+        .build_id
+        .context("service_repair_required: recorder lacks a verifiable build identity")?;
+    let journal = UpgradeJournal {
+        schema_version: JOURNAL_VERSION,
+        minimum_updater_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_id,
+        target: registration.options.clone(),
+        previous_fingerprint: registration.fingerprint.clone(),
+        enabled: true,
+        prepared_at: Utc::now(),
+        phase: "awaiting_heartbeat".into(),
+        last_error: None,
+    };
+    let platform = current_platform();
+    lifecycle_start_with(
+        registration.enabled,
+        require_new,
+        || lifecycle_manager_state(platform),
+        |operation| run_lifecycle_start_operation(platform, operation),
+        |require_new| wait_ready_for_instance(&journal, require_new),
+    )?;
+    super::status(&registration.options)
+}
+
+/// Enable future automatic starts and start the registered recorder now.
+pub fn start_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let registration = lifecycle_registration(&root)?;
+    lifecycle_start(&registration, false)
+}
+
+/// Disable automatic starts and cooperatively stop the registered recorder.
+pub fn stop_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let registration = lifecycle_registration(&root)?;
+    lifecycle_stop(&registration)?;
+    super::status(&registration.options)
+}
+
+/// Restart an enabled registration; a deliberately disabled recorder stays off.
+pub fn restart_registered() -> Result<ServiceStatus> {
+    let root = service_coordination_root()?;
+    let _guard = mutation_lock(&root)?;
+    let mut registration = lifecycle_registration(&root)?;
+    if !registration.enabled {
+        bail!("service_disabled: use service start to enable the recorder");
+    }
+    if current_platform() == Platform::Windows {
+        windows_host::require_interactive_session()?;
+    }
+    lifecycle_stop(&registration)?;
+    registration.enabled = false;
+    lifecycle_start(&registration, true)
+}
+
+/// Reuse forward recovery and preserve the saved enablement and collection
+/// options; this never rolls a migrated writer back to an older executable.
+pub fn repair_registered() -> Result<ServiceStatus> {
+    upgrade_registered_recorder()?;
+    let registration =
+        read_registration()?.context("service_not_installed: install the recorder first")?;
+    super::status(&registration.options)
 }
 
 fn parse_registered_options(
@@ -877,7 +1247,7 @@ fn parse_registered_options(
 }
 
 #[cfg(windows)]
-fn windows_arguments(text: &str) -> Result<Vec<String>> {
+pub(super) fn windows_arguments(text: &str) -> Result<Vec<String>> {
     use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
     let line = format!("recorder.exe {text}")
         .encode_utf16()
@@ -908,7 +1278,7 @@ fn windows_arguments(text: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(not(windows))]
-fn windows_arguments(_text: &str) -> Result<Vec<String>> {
+pub(super) fn windows_arguments(_text: &str) -> Result<Vec<String>> {
     bail!("Windows task arguments require Windows")
 }
 
@@ -1034,6 +1404,176 @@ mod tests {
         );
     }
 
+    fn observed_recorder(status: RecorderStatusFile) -> ServiceStatus {
+        let mut observed = service_status(
+            "test-manager",
+            true,
+            true,
+            None,
+            status.last_history_heartbeat,
+            true,
+            true,
+        );
+        observed.recorder = Some(status);
+        observed
+    }
+
+    #[test]
+    fn start_reuses_active_instance_after_missing_or_stale_heartbeat() {
+        for missing in [false, true] {
+            let (_temp, journal) = fixture();
+            let mut recovered = heartbeat(&journal);
+            recovered.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+            let mut initial = observed_recorder(recovered.clone());
+            initial.heartbeat_recent = false;
+            if missing {
+                initial.recorder = None;
+            } else {
+                initial.recorder.as_mut().unwrap().last_history_heartbeat =
+                    Some(journal.prepared_at - chrono::Duration::hours(2));
+            }
+            // Task Scheduler's running/queued instance and launchd's running
+            // job survive an idempotent start with their original started_at.
+            lifecycle_start_with(
+                true,
+                false,
+                || Ok(LifecycleManagerState::Active),
+                |_| panic!("an existing instance must not be loaded or started again"),
+                |require_new| {
+                    assert!(
+                        ready_status_from_observation(&journal, require_new, initial).is_none()
+                    );
+                    ready_status_from_observation(
+                        &journal,
+                        require_new,
+                        observed_recorder(recovered),
+                    )
+                    .context("the existing recorder's recovered heartbeat must complete start")
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn start_bootstraps_only_unloaded_jobs_and_kickstarts_loaded_idle_jobs() {
+        for state in [
+            LifecycleManagerState::Stopped,
+            LifecycleManagerState::Unloaded,
+        ] {
+            let (_temp, journal) = fixture();
+            let mut operations = Vec::new();
+            lifecycle_start_with(
+                false,
+                false,
+                || Ok(state),
+                |operation| {
+                    if operation == LifecycleStartOperation::Load
+                        && state != LifecycleManagerState::Unloaded
+                    {
+                        bail!("bootstrap rejected: launchd job is already loaded");
+                    }
+                    operations.push(operation);
+                    Ok(())
+                },
+                |require_new| {
+                    let mut previous = heartbeat(&journal);
+                    previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+                    assert!(
+                        ready_status_from_observation(
+                            &journal,
+                            require_new,
+                            observed_recorder(previous)
+                        )
+                        .is_none()
+                    );
+                    ready_status_from_observation(
+                        &journal,
+                        require_new,
+                        observed_recorder(heartbeat(&journal)),
+                    )
+                    .context("new instance must become ready")
+                },
+            )
+            .unwrap();
+            let expected = if state == LifecycleManagerState::Unloaded {
+                vec![
+                    LifecycleStartOperation::Enable,
+                    LifecycleStartOperation::Load,
+                    LifecycleStartOperation::Start,
+                ]
+            } else {
+                vec![
+                    LifecycleStartOperation::Enable,
+                    LifecycleStartOperation::Start,
+                ]
+            };
+            assert_eq!(operations, expected);
+        }
+    }
+
+    #[test]
+    fn start_rejects_unverifiable_manager_state_before_any_mutation() {
+        let error = lifecycle_start_with(
+            false,
+            false,
+            || bail!("manager query denied"),
+            |_| panic!("failed inspection must not enable or bootstrap a recorder"),
+            |_| panic!("failed inspection must not be treated as successful start"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("manager query denied"));
+    }
+
+    #[test]
+    fn restart_never_accepts_a_preexisting_instance_even_if_manager_is_active_again() {
+        let (_temp, journal) = fixture();
+        let mut previous = heartbeat(&journal);
+        previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        let error = lifecycle_start_with(
+            false,
+            true,
+            || Ok(LifecycleManagerState::Active),
+            |operation| {
+                assert_eq!(operation, LifecycleStartOperation::Enable);
+                Ok(())
+            },
+            |require_new| {
+                ready_status_from_observation(&journal, require_new, observed_recorder(previous))
+                    .context("restart requires a new instance")
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("restart requires a new instance")
+        );
+    }
+
+    #[test]
+    fn existing_instance_readiness_preserves_identity_and_live_heartbeat_checks() {
+        let (_temp, journal) = fixture();
+        let mut existing = heartbeat(&journal);
+        existing.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        let good = observed_recorder(existing);
+        assert!(ready_status_from_observation(&journal, false, good.clone()).is_some());
+        for mismatch in 0..5 {
+            let mut bad = good.clone();
+            match mismatch {
+                0 => bad.running = false,
+                1 => bad.heartbeat_recent = false,
+                2 => bad.recorder.as_mut().unwrap().build_id = Some("wrong-build".into()),
+                3 => {
+                    bad.recorder.as_mut().unwrap().service_definition_id =
+                        Some("wrong-definition".into())
+                }
+                _ => bad.recorder.as_mut().unwrap().ownership_epoch = None,
+            }
+            assert!(ready_status_from_observation(&journal, false, bad).is_none());
+        }
+    }
+
     #[test]
     fn replacement_failure_keeps_configuration_for_forward_recovery_after_task_removal() {
         let (temp, mut journal) = fixture();
@@ -1129,6 +1669,101 @@ mod tests {
                 .contains("service_upgrade_conflict")
         );
         assert!(!root.join(RECORDER_CUTOVER_BLOCKER_FILE).exists());
+    }
+
+    #[test]
+    fn windows_reinstall_rejects_untrusted_existing_task_before_any_mutation() {
+        for marker_present in [false, true] {
+            let (temp, mut journal) = fixture();
+            let root = temp.path().join("coordination");
+            journal.target.service_coordination_root_override = Some(root.clone());
+            create_private_directory(&root).unwrap();
+            let sid = "S-1-5-21-1234";
+            let original = windows_task_xml(&journal.target, sid);
+            let marker_path = root.join(CURRENT_SERVICE_DEFINITION_FILE);
+            let marker_bytes = serde_json::to_vec(&CurrentServiceDefinitionMarker {
+                schema_version: CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION,
+                platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
+                fingerprint: canonical_windows_task_fingerprint(original.as_bytes(), sid).unwrap(),
+            })
+            .unwrap();
+            if marker_present {
+                write_private_atomically(&marker_path, &marker_bytes).unwrap();
+            }
+            let mut external = journal.target.clone();
+            external.offline = false;
+            let external_xml = windows_task_xml(&external, sid);
+            let task_path = root.join("existing-task.xml");
+            write_private_atomically(&task_path, external_xml.as_bytes()).unwrap();
+            let registration = Registration {
+                options: external,
+                fingerprint: canonical_windows_task_fingerprint(external_xml.as_bytes(), sid)
+                    .unwrap(),
+                enabled: true,
+            };
+            let _lock = mutation_lock(&root).unwrap();
+            let result = replace_service_checked(
+                &journal.target,
+                || {
+                    registered_options_for_mutation_with(&root, |_| Ok(Some(registration)))
+                        .map(|_| ())
+                },
+                || panic!("must not disable or stop an untrusted existing task"),
+                || panic!("must not overwrite an untrusted existing task"),
+                || panic!("must not delete the existing task after failed preflight"),
+                || panic!("must not publish replacement trust"),
+                || panic!("must not start the candidate"),
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("trusted current-version marker"),
+                "unexpected failure: {error:#}"
+            );
+            assert_eq!(fs::read(&task_path).unwrap(), external_xml.as_bytes());
+            if marker_present {
+                assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+            } else {
+                assert!(!marker_path.exists());
+            }
+            assert!(!root.join(RECORDER_CUTOVER_BLOCKER_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn windows_reinstall_preflight_accepts_absence_trusted_tasks_and_retained_recovery() {
+        let (temp, journal) = fixture();
+        let root = temp.path().join("coordination");
+        create_private_directory(&root).unwrap();
+        assert!(
+            registered_options_for_mutation_with(&root, |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        let fingerprint = target_fingerprint(&journal.target).unwrap();
+        let marker_path = root.join(CURRENT_SERVICE_DEFINITION_FILE);
+        let marker = CurrentServiceDefinitionMarker {
+            schema_version: CURRENT_SERVICE_DEFINITION_SCHEMA_VERSION,
+            platform: format!("{:?}", current_platform()).to_ascii_lowercase(),
+            fingerprint: fingerprint.clone(),
+        };
+        write_private_atomically(&marker_path, &serde_json::to_vec(&marker).unwrap()).unwrap();
+        let read = |_: Option<&UpgradeJournal>| {
+            Ok(Some(Registration {
+                options: journal.target.clone(),
+                fingerprint: fingerprint.clone(),
+                enabled: false,
+            }))
+        };
+        assert_eq!(
+            registered_options_for_mutation_with(&root, read).unwrap(),
+            Some(journal.target.clone())
+        );
+        fs::remove_file(marker_path).unwrap();
+        save_journal(&root, &journal).unwrap();
+        assert_eq!(
+            registered_options_for_mutation_with(&root, read).unwrap(),
+            Some(journal.target)
+        );
     }
 
     #[test]
