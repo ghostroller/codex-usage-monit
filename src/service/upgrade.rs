@@ -487,17 +487,24 @@ fn disable_registration() -> Result<()> {
 }
 
 fn ready_status(journal: &UpgradeJournal, require_new: bool) -> Result<Option<RecorderStatusFile>> {
-    let Some(status) = read_recorder_status(&journal.target.status_file)? else {
-        return Ok(None);
-    };
-    if !heartbeat_matches(&status, journal, require_new) {
-        return Ok(None);
-    }
-    let observed = super::status(&journal.target)?;
+    Ok(ready_status_from_observation(
+        journal,
+        require_new,
+        super::status(&journal.target)?,
+    ))
+}
+
+fn ready_status_from_observation(
+    journal: &UpgradeJournal,
+    require_new: bool,
+    observed: ServiceStatus,
+) -> Option<RecorderStatusFile> {
     if !observed.running || !observed.heartbeat_recent {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(status))
+    observed
+        .recorder
+        .filter(|status| heartbeat_matches(status, journal, require_new))
 }
 
 fn heartbeat_matches(
@@ -517,14 +524,21 @@ fn heartbeat_matches(
 }
 
 fn wait_ready(journal: &UpgradeJournal) -> Result<RecorderStatusFile> {
+    wait_ready_for_instance(journal, true)
+}
+
+fn wait_ready_for_instance(
+    journal: &UpgradeJournal,
+    require_new: bool,
+) -> Result<RecorderStatusFile> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if let Some(status) = ready_status(journal, true)? {
+        if let Some(status) = ready_status(journal, require_new)? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
             bail!(
-                "service_start_timeout: new recorder did not publish a verified history heartbeat; inspect service status and retry service upgrade"
+                "service_start_timeout: recorder did not publish a verified history heartbeat; inspect service status and retry service upgrade"
             );
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -958,7 +972,144 @@ fn lifecycle_stop(registration: &Registration) -> Result<()> {
     Ok(())
 }
 
-fn lifecycle_start(registration: &Registration) -> Result<ServiceStatus> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleManagerState {
+    Unloaded,
+    Stopped,
+    Active,
+}
+
+fn lifecycle_manager_state(platform: Platform) -> Result<LifecycleManagerState> {
+    match platform {
+        Platform::Windows => {
+            let task = windows_task_name(&windows_current_user_sid()?);
+            Ok(
+                if windows_task_is_running_with(&task, &mut run_windows_task_operation)? {
+                    LifecycleManagerState::Active
+                } else {
+                    LifecycleManagerState::Stopped
+                },
+            )
+        }
+        Platform::MacOs => {
+            let output = run_service_command(
+                Command::new("launchctl")
+                    .args(["print", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
+            )?;
+            if launchd_output_reports_running(&output) {
+                Ok(LifecycleManagerState::Active)
+            } else if output.status.success() {
+                Ok(LifecycleManagerState::Stopped)
+            } else if launchd_print_reports_missing(&output_detail(&output)) {
+                Ok(LifecycleManagerState::Unloaded)
+            } else {
+                bail!(
+                    "could not inspect recorder launchd state: {}",
+                    output_detail(&output)
+                )
+            }
+        }
+        Platform::Linux => {
+            let output = run_service_command(Command::new("systemctl").args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                SYSTEMD_UNIT,
+            ]))?;
+            if !output.status.success() {
+                bail!(
+                    "could not inspect recorder systemd state: {}",
+                    output_detail(&output)
+                );
+            }
+            match String::from_utf8_lossy(&output.stdout).trim() {
+                "active" | "activating" | "reloading" => Ok(LifecycleManagerState::Active),
+                "inactive" | "failed" => Ok(LifecycleManagerState::Stopped),
+                state => bail!(
+                    "cannot start recorder in systemd state {state:?}; retry after it settles"
+                ),
+            }
+        }
+        Platform::Unsupported => bail!("service management is unsupported"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleStartOperation {
+    Enable,
+    Load,
+    Start,
+}
+
+fn run_lifecycle_start_operation(
+    platform: Platform,
+    operation: LifecycleStartOperation,
+) -> Result<()> {
+    match (platform, operation) {
+        (Platform::Windows, operation) => {
+            let task = windows_task_name(&windows_current_user_sid()?);
+            let args = match operation {
+                LifecycleStartOperation::Enable => vec!["/Change", "/TN", &task, "/ENABLE"],
+                LifecycleStartOperation::Start => vec!["/Run", "/TN", &task],
+                LifecycleStartOperation::Load => {
+                    bail!("Task Scheduler registration already exists")
+                }
+            };
+            run_checked(
+                Command::new("schtasks.exe").args(args),
+                "start recorder task",
+            )
+        }
+        (Platform::Linux, LifecycleStartOperation::Enable) => run_checked(
+            Command::new("systemctl").args(["--user", "enable", SYSTEMD_UNIT]),
+            "enable recorder",
+        ),
+        (Platform::Linux, LifecycleStartOperation::Start) => run_checked(
+            Command::new("systemctl").args(["--user", "start", SYSTEMD_UNIT]),
+            "start recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Enable) => run_checked(
+            Command::new("launchctl")
+                .args(["enable", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
+            "enable recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Load) => run_checked(
+            Command::new("launchctl")
+                .args(["bootstrap", &launchd_domain()])
+                .arg(launchd_registration_path()?),
+            "load recorder",
+        ),
+        (Platform::MacOs, LifecycleStartOperation::Start) => start_launchd(),
+        _ => bail!("unsupported recorder start operation"),
+    }
+}
+
+fn lifecycle_start_with(
+    enabled: bool,
+    require_new: bool,
+    inspect: impl FnOnce() -> Result<LifecycleManagerState>,
+    mut run: impl FnMut(LifecycleStartOperation) -> Result<()>,
+    ready: impl FnOnce(bool) -> Result<RecorderStatusFile>,
+) -> Result<()> {
+    let state = inspect()?;
+    if !enabled {
+        run(LifecycleStartOperation::Enable)?;
+    }
+    if state == LifecycleManagerState::Unloaded {
+        run(LifecycleStartOperation::Load)?;
+    }
+    if state != LifecycleManagerState::Active {
+        run(LifecycleStartOperation::Start)?;
+    }
+    // An idempotent start may reuse a running/queued recorder that has not yet
+    // produced its first heartbeat. Restart and replacement still require a
+    // new instance after their verified quiescence boundary.
+    ready(require_new || state != LifecycleManagerState::Active)?;
+    Ok(())
+}
+
+fn lifecycle_start(registration: &Registration, require_new: bool) -> Result<ServiceStatus> {
     if current_platform() == Platform::Windows {
         windows_host::require_interactive_session()?;
     }
@@ -978,30 +1129,14 @@ fn lifecycle_start(registration: &Registration) -> Result<ServiceStatus> {
         phase: "awaiting_heartbeat".into(),
         last_error: None,
     };
-    if registration.enabled && ready_status(&journal, false)?.is_some() {
-        return super::status(&registration.options);
-    }
-    match current_platform() {
-        Platform::Windows => start_windows_task()?,
-        Platform::Linux => {
-            run_checked(
-                Command::new("systemctl").args(["--user", "enable", SYSTEMD_UNIT]),
-                "enable recorder",
-            )?;
-            start_systemd()?;
-        }
-        Platform::MacOs => {
-            run_checked(
-                Command::new("launchctl")
-                    .args(["enable", &format!("{}/{SERVICE_LABEL}", launchd_domain())]),
-                "enable recorder",
-            )?;
-            install_launchd(&registration.options)?;
-            start_launchd()?;
-        }
-        Platform::Unsupported => bail!("service management is unsupported"),
-    }
-    wait_ready(&journal)?;
+    let platform = current_platform();
+    lifecycle_start_with(
+        registration.enabled,
+        require_new,
+        || lifecycle_manager_state(platform),
+        |operation| run_lifecycle_start_operation(platform, operation),
+        |require_new| wait_ready_for_instance(&journal, require_new),
+    )?;
     super::status(&registration.options)
 }
 
@@ -1010,7 +1145,7 @@ pub fn start_registered() -> Result<ServiceStatus> {
     let root = service_coordination_root()?;
     let _guard = mutation_lock(&root)?;
     let registration = lifecycle_registration(&root)?;
-    lifecycle_start(&registration)
+    lifecycle_start(&registration, false)
 }
 
 /// Disable automatic starts and cooperatively stop the registered recorder.
@@ -1035,7 +1170,7 @@ pub fn restart_registered() -> Result<ServiceStatus> {
     }
     lifecycle_stop(&registration)?;
     registration.enabled = false;
-    lifecycle_start(&registration)
+    lifecycle_start(&registration, true)
 }
 
 /// Reuse forward recovery and preserve the saved enablement and collection
@@ -1267,6 +1402,176 @@ mod tests {
             heartbeat_matches(&bad, &journal, true),
             "SSH failure must not roll back healthy local collection"
         );
+    }
+
+    fn observed_recorder(status: RecorderStatusFile) -> ServiceStatus {
+        let mut observed = service_status(
+            "test-manager",
+            true,
+            true,
+            None,
+            status.last_history_heartbeat,
+            true,
+            true,
+        );
+        observed.recorder = Some(status);
+        observed
+    }
+
+    #[test]
+    fn start_reuses_active_instance_after_missing_or_stale_heartbeat() {
+        for missing in [false, true] {
+            let (_temp, journal) = fixture();
+            let mut recovered = heartbeat(&journal);
+            recovered.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+            let mut initial = observed_recorder(recovered.clone());
+            initial.heartbeat_recent = false;
+            if missing {
+                initial.recorder = None;
+            } else {
+                initial.recorder.as_mut().unwrap().last_history_heartbeat =
+                    Some(journal.prepared_at - chrono::Duration::hours(2));
+            }
+            // Task Scheduler's running/queued instance and launchd's running
+            // job survive an idempotent start with their original started_at.
+            lifecycle_start_with(
+                true,
+                false,
+                || Ok(LifecycleManagerState::Active),
+                |_| panic!("an existing instance must not be loaded or started again"),
+                |require_new| {
+                    assert!(
+                        ready_status_from_observation(&journal, require_new, initial).is_none()
+                    );
+                    ready_status_from_observation(
+                        &journal,
+                        require_new,
+                        observed_recorder(recovered),
+                    )
+                    .context("the existing recorder's recovered heartbeat must complete start")
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn start_bootstraps_only_unloaded_jobs_and_kickstarts_loaded_idle_jobs() {
+        for state in [
+            LifecycleManagerState::Stopped,
+            LifecycleManagerState::Unloaded,
+        ] {
+            let (_temp, journal) = fixture();
+            let mut operations = Vec::new();
+            lifecycle_start_with(
+                false,
+                false,
+                || Ok(state),
+                |operation| {
+                    if operation == LifecycleStartOperation::Load
+                        && state != LifecycleManagerState::Unloaded
+                    {
+                        bail!("bootstrap rejected: launchd job is already loaded");
+                    }
+                    operations.push(operation);
+                    Ok(())
+                },
+                |require_new| {
+                    let mut previous = heartbeat(&journal);
+                    previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+                    assert!(
+                        ready_status_from_observation(
+                            &journal,
+                            require_new,
+                            observed_recorder(previous)
+                        )
+                        .is_none()
+                    );
+                    ready_status_from_observation(
+                        &journal,
+                        require_new,
+                        observed_recorder(heartbeat(&journal)),
+                    )
+                    .context("new instance must become ready")
+                },
+            )
+            .unwrap();
+            let expected = if state == LifecycleManagerState::Unloaded {
+                vec![
+                    LifecycleStartOperation::Enable,
+                    LifecycleStartOperation::Load,
+                    LifecycleStartOperation::Start,
+                ]
+            } else {
+                vec![
+                    LifecycleStartOperation::Enable,
+                    LifecycleStartOperation::Start,
+                ]
+            };
+            assert_eq!(operations, expected);
+        }
+    }
+
+    #[test]
+    fn start_rejects_unverifiable_manager_state_before_any_mutation() {
+        let error = lifecycle_start_with(
+            false,
+            false,
+            || bail!("manager query denied"),
+            |_| panic!("failed inspection must not enable or bootstrap a recorder"),
+            |_| panic!("failed inspection must not be treated as successful start"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("manager query denied"));
+    }
+
+    #[test]
+    fn restart_never_accepts_a_preexisting_instance_even_if_manager_is_active_again() {
+        let (_temp, journal) = fixture();
+        let mut previous = heartbeat(&journal);
+        previous.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        let error = lifecycle_start_with(
+            false,
+            true,
+            || Ok(LifecycleManagerState::Active),
+            |operation| {
+                assert_eq!(operation, LifecycleStartOperation::Enable);
+                Ok(())
+            },
+            |require_new| {
+                ready_status_from_observation(&journal, require_new, observed_recorder(previous))
+                    .context("restart requires a new instance")
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("restart requires a new instance")
+        );
+    }
+
+    #[test]
+    fn existing_instance_readiness_preserves_identity_and_live_heartbeat_checks() {
+        let (_temp, journal) = fixture();
+        let mut existing = heartbeat(&journal);
+        existing.started_at = journal.prepared_at - chrono::Duration::minutes(3);
+        let good = observed_recorder(existing);
+        assert!(ready_status_from_observation(&journal, false, good.clone()).is_some());
+        for mismatch in 0..5 {
+            let mut bad = good.clone();
+            match mismatch {
+                0 => bad.running = false,
+                1 => bad.heartbeat_recent = false,
+                2 => bad.recorder.as_mut().unwrap().build_id = Some("wrong-build".into()),
+                3 => {
+                    bad.recorder.as_mut().unwrap().service_definition_id =
+                        Some("wrong-definition".into())
+                }
+                _ => bad.recorder.as_mut().unwrap().ownership_epoch = None,
+            }
+            assert!(ready_status_from_observation(&journal, false, bad).is_none());
+        }
     }
 
     #[test]

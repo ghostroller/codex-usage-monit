@@ -881,6 +881,39 @@ pub fn install(options: MachineInstallOptions, password_stdin: bool) -> Result<M
     report(&receipt, Some(&service), None)
 }
 
+fn mutate_service<T>(
+    receipt: &mut MachineReceipt,
+    action: MachineAction,
+    mutation: impl FnOnce(&mut MachineReceipt) -> Result<T>,
+) -> Result<T> {
+    if matches!(
+        action,
+        MachineAction::Start | MachineAction::Restart | MachineAction::Upgrade
+    ) {
+        // Only install configures recovery and verifies the supplied credentials.
+        // Do not let another operation consume its resumable receipt before all
+        // installation steps have succeeded. A partial uninstall must likewise
+        // finish before a new installation can establish these guarantees.
+        ensure!(
+            receipt.phase != "installing",
+            "machine_install_incomplete: repeat the identical service machine install command to finish installation before starting or upgrading"
+        );
+        ensure!(
+            !matches!(receipt.phase.as_str(), "uninstalling" | "uninstalled"),
+            "machine_uninstall_pending: finish service machine uninstall before reinstalling"
+        );
+    }
+    ensure!(
+        receipt.pending.is_none()
+            || matches!(
+                action,
+                MachineAction::Upgrade | MachineAction::Stop | MachineAction::Uninstall
+            ),
+        "machine_update_pending: resume the same upgrade before starting the recorder"
+    );
+    mutation(receipt)
+}
+
 pub fn operate(name: &str, action: MachineAction) -> Result<MachineReport> {
     if action != MachineAction::Status {
         security::require_administrator()?;
@@ -911,95 +944,85 @@ pub fn operate(name: &str, action: MachineAction) -> Result<MachineReport> {
         return report(&receipt, None, Some("Service registration is absent. Protected versions and all user data are retained.".into()));
     }
     let service = service.context("machine_service_missing: protected receipt retained; use explicit uninstall before reinstalling")?;
-    ensure!(
-        receipt.pending.is_none()
-            || matches!(
-                action,
-                MachineAction::Upgrade | MachineAction::Stop | MachineAction::Uninstall
-            ),
-        "machine_update_pending: resume the same upgrade before starting the recorder"
-    );
-    match action {
-        MachineAction::Start => {
-            start_service(&service)?;
-            if receipt.phase == "installing" {
-                receipt.phase = "complete".into();
-                save(&receipt)?;
-            }
-        }
-        MachineAction::Stop => stop_service(&service)?,
-        MachineAction::Restart => {
-            stop_service(&service)?;
-            start_service(&service)?;
-        }
-        MachineAction::Upgrade => {
-            let target = prepare_version(&receipt.root, &receipt.account_sid)?;
-            let was_running = matches!(
-                query_state(&service)?.current_state,
-                ServiceState::Running | ServiceState::StartPending
-            );
-            prepare_upgrade(&mut receipt, &target, was_running)?;
-            save(&receipt)?;
-            // A queued SCM recovery must not restart the old ImagePath between
-            // observing STOPPED and selecting the new writer. Keep startup
-            // disabled through this entire transition; retries move forward.
-            configure_startup(&service, SERVICE_DISABLED)?;
-            stop_service(&service)?;
-            select_upgrade(&mut receipt)?;
-            save(&receipt)?;
-            let command = security::wide(&image_path(&receipt, &receipt.selected))?;
-            // Change only ImagePath while the persisted startup fence is active.
-            change_registration(&service, SERVICE_NO_CHANGE, Some(&command), None)
-                .context("machine_upgrade_failed: candidate retained for forward recovery")?;
-            verify_registration(&service, &receipt)?;
-            configure_startup(
-                &service,
-                if receipt.automatic_start {
-                    SERVICE_AUTO_START
-                } else {
-                    SERVICE_DEMAND_START
-                },
-            )?;
-            if receipt.pending.as_ref().unwrap().was_running {
+    mutate_service(&mut receipt, action, |receipt| {
+        match action {
+            MachineAction::Start => {
                 start_service(&service)?;
             }
-            receipt.phase = "complete".into();
-            receipt.pending = None;
-            save(&receipt)?;
-        }
-        MachineAction::Uninstall => {
-            receipt.phase = "uninstalling".into();
-            save(&receipt)?;
-            configure_startup(&service, SERVICE_DISABLED)?;
-            stop_service(&service)?;
-            service.delete().context("machine_uninstall_failed")?;
-            drop(service);
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                match open_service(&manager, name, false) {
-                    Ok(None) => break,
-                    Ok(Some(handle)) => drop(handle),
-                    Err(error)
-                        if error
-                            .downcast_ref::<windows_service::Error>()
-                            .and_then(service_error_code)
-                            == Some(ERROR_SERVICE_MARKED_FOR_DELETE) => {}
-                    Err(error) => return Err(error),
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "machine_uninstall_pending: SCM is waiting for another open service handle; retry uninstall later"
-                );
-                std::thread::sleep(Duration::from_millis(100));
+            MachineAction::Stop => stop_service(&service)?,
+            MachineAction::Restart => {
+                stop_service(&service)?;
+                start_service(&service)?;
             }
-            receipt.phase = "uninstalled".into();
-            receipt.pending = None;
-            save(&receipt)?;
-            return report(&receipt, None, Some("Service registration removed. Protected application versions and all recorder/user data are retained.".into()));
+            MachineAction::Upgrade => {
+                let target = prepare_version(&receipt.root, &receipt.account_sid)?;
+                let was_running = matches!(
+                    query_state(&service)?.current_state,
+                    ServiceState::Running | ServiceState::StartPending
+                );
+                prepare_upgrade(receipt, &target, was_running)?;
+                save(receipt)?;
+                // A queued SCM recovery must not restart the old ImagePath between
+                // observing STOPPED and selecting the new writer. Keep startup
+                // disabled through this entire transition; retries move forward.
+                configure_startup(&service, SERVICE_DISABLED)?;
+                stop_service(&service)?;
+                select_upgrade(receipt)?;
+                save(receipt)?;
+                let command = security::wide(&image_path(receipt, &receipt.selected))?;
+                // Change only ImagePath while the persisted startup fence is active.
+                change_registration(&service, SERVICE_NO_CHANGE, Some(&command), None)
+                    .context("machine_upgrade_failed: candidate retained for forward recovery")?;
+                verify_registration(&service, receipt)?;
+                configure_startup(
+                    &service,
+                    if receipt.automatic_start {
+                        SERVICE_AUTO_START
+                    } else {
+                        SERVICE_DEMAND_START
+                    },
+                )?;
+                if receipt.pending.as_ref().unwrap().was_running {
+                    start_service(&service)?;
+                }
+                receipt.phase = "complete".into();
+                receipt.pending = None;
+                save(receipt)?;
+            }
+            MachineAction::Uninstall => {
+                receipt.phase = "uninstalling".into();
+                save(receipt)?;
+                configure_startup(&service, SERVICE_DISABLED)?;
+                stop_service(&service)?;
+                service.delete().context("machine_uninstall_failed")?;
+                drop(service);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    match open_service(&manager, name, false) {
+                        Ok(None) => break,
+                        Ok(Some(handle)) => drop(handle),
+                        Err(error)
+                            if error
+                                .downcast_ref::<windows_service::Error>()
+                                .and_then(service_error_code)
+                                == Some(ERROR_SERVICE_MARKED_FOR_DELETE) => {}
+                        Err(error) => return Err(error),
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "machine_uninstall_pending: SCM is waiting for another open service handle; retry uninstall later"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                receipt.phase = "uninstalled".into();
+                receipt.pending = None;
+                save(receipt)?;
+                return report(receipt, None, Some("Service registration removed. Protected application versions and all recorder/user data are retained.".into()));
+            }
+            MachineAction::Status => unreachable!(),
         }
-        MachineAction::Status => unreachable!(),
-    }
-    report(&receipt, Some(&service), None)
+        report(receipt, Some(&service), None)
+    })
 }
 
 fn report(
@@ -1187,34 +1210,132 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scm_upgrade_recovery_retains_candidate_floor_and_original_running_state() {
-        let version = |number: &str, byte: char| MachineVersion {
+    fn version_fixture(number: &str, byte: char) -> MachineVersion {
+        MachineVersion {
             version: number.into(),
             build_id: byte.to_string().repeat(64),
             sha256: byte.to_string().repeat(64),
             executable: PathBuf::from(format!(
                 r"C:\Program Files\machine\{number}\codex-usage-monit.exe"
             )),
-        };
-        let old = version("0.5.0", 'a');
-        let target = version("0.6.0", 'b');
-        let other = version("0.7.0", 'c');
+        }
+    }
+
+    fn receipt_fixture() -> MachineReceipt {
+        let selected = version_fixture("0.5.0", 'a');
+        MachineReceipt {
+            schema_version: 1,
+            owner: "machine".into(),
+            name: "recorder".into(),
+            account: r"PC\recorder".into(),
+            account_sid: "S-1-5-21-1-2-3-1001".into(),
+            root: r"C:\Program Files\machine".into(),
+            minimum_updater_version: selected.version.clone(),
+            selected,
+            recorder: recorder_fixture(),
+            automatic_start: true,
+            phase: "complete".into(),
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn scm_interrupted_install_cannot_start_or_upgrade_before_recovery_is_configured() {
+        for phase in ["installing", "uninstalling", "uninstalled"] {
+            for action in [
+                MachineAction::Start,
+                MachineAction::Restart,
+                MachineAction::Upgrade,
+            ] {
+                let mut receipt = receipt_fixture();
+                // Simulate the durable receipt after CreateService succeeds but
+                // before recovery is configured, or cleanup of that same state.
+                receipt.phase = phase.into();
+                let retained = serde_json::to_vec(&receipt).unwrap();
+                let mut receipt = serde_json::from_slice(&retained).unwrap();
+                let mut mutation_ran = false;
+                let error = mutate_service(&mut receipt, action, |receipt| {
+                    mutation_ran = true;
+                    // Model the previous upgrade path consuming the resumable
+                    // receipt. This closure must never reach any SCM mutation.
+                    receipt.selected = version_fixture("0.6.0", 'b');
+                    receipt.phase = "complete".into();
+                    Ok(())
+                })
+                .unwrap_err();
+                let expected = if phase == "installing" {
+                    "machine_install_incomplete"
+                } else {
+                    "machine_uninstall_pending"
+                };
+                assert!(error.to_string().contains(expected), "{phase}: {action:?}");
+                assert!(!mutation_ran, "{phase}: {action:?}");
+                assert_eq!(serde_json::to_vec(&receipt).unwrap(), retained);
+            }
+        }
+    }
+
+    #[test]
+    fn scm_mutation_gate_preserves_cleanup_and_resumable_upgrades() {
+        for phase in ["installing", "uninstalling", "uninstalled", "complete"] {
+            for action in [MachineAction::Stop, MachineAction::Uninstall] {
+                let mut receipt = receipt_fixture();
+                receipt.phase = phase.into();
+                let mut mutation_ran = false;
+                mutate_service(&mut receipt, action, |_| {
+                    mutation_ran = true;
+                    Ok(())
+                })
+                .unwrap();
+                assert!(mutation_ran, "{phase}: {action:?}");
+            }
+        }
+        for action in [
+            MachineAction::Start,
+            MachineAction::Restart,
+            MachineAction::Upgrade,
+        ] {
+            let mut receipt = receipt_fixture();
+            mutate_service(&mut receipt, action, |_| Ok(())).unwrap();
+        }
+        for replacing in [false, true] {
+            for action in [
+                MachineAction::Start,
+                MachineAction::Stop,
+                MachineAction::Restart,
+                MachineAction::Upgrade,
+                MachineAction::Uninstall,
+            ] {
+                let mut receipt = receipt_fixture();
+                prepare_upgrade(&mut receipt, &version_fixture("0.6.0", 'b'), true).unwrap();
+                if replacing {
+                    select_upgrade(&mut receipt).unwrap();
+                }
+                let mut mutation_ran = false;
+                let result = mutate_service(&mut receipt, action, |_| {
+                    mutation_ran = true;
+                    Ok(())
+                });
+                let allowed = matches!(
+                    action,
+                    MachineAction::Stop | MachineAction::Upgrade | MachineAction::Uninstall
+                );
+                assert_eq!(result.is_ok(), allowed, "{replacing}: {action:?}");
+                assert_eq!(mutation_ran, allowed, "{replacing}: {action:?}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("machine_update_pending"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scm_upgrade_recovery_retains_candidate_floor_and_original_running_state() {
+        let old = version_fixture("0.5.0", 'a');
+        let target = version_fixture("0.6.0", 'b');
+        let other = version_fixture("0.7.0", 'c');
         for running in [false, true] {
-            let mut receipt = MachineReceipt {
-                schema_version: 1,
-                owner: "machine".into(),
-                name: "recorder".into(),
-                account: r"PC\recorder".into(),
-                account_sid: "S-1-5-21-1-2-3-1001".into(),
-                root: r"C:\Program Files\machine".into(),
-                selected: old.clone(),
-                minimum_updater_version: old.version.clone(),
-                recorder: recorder_fixture(),
-                automatic_start: true,
-                phase: "complete".into(),
-                pending: None,
-            };
+            let mut receipt = receipt_fixture();
             prepare_upgrade(&mut receipt, &target, running).unwrap();
             assert_eq!(receipt.selected, old);
             select_upgrade(&mut receipt).unwrap();
