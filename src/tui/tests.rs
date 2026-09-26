@@ -10680,6 +10680,141 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
 }
 
 #[test]
+#[ignore = "synthetic measurement fixture; invoked only by scripts/windows/measure-tui-history.py"]
+fn prepare_synthetic_history_measurement_fixture() {
+    use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
+    use crate::ui_state::{UiHistorySourceSelection, UiState, UiStateStore, UiView};
+
+    let root = PathBuf::from(std::env::var_os("N2_FIXTURE_ROOT").expect("N2_FIXTURE_ROOT"));
+    let codex_home = PathBuf::from(std::env::var_os("N2_CODEX_HOME").expect("N2_CODEX_HOME"));
+    assert!(root.is_absolute() && codex_home.is_absolute());
+    assert_eq!(
+        std::fs::read_to_string(root.join("synthetic-measurement.txt")).unwrap(),
+        "codex-usage-monit synthetic measurement v1\n"
+    );
+    assert!(!root.join("state").exists(), "fixture must start empty");
+    let now = DateTime::parse_from_rfc3339(&std::env::var("N2_OBSERVED_AT").unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
+    let remote_count: usize = std::env::var("N2_REMOTE_COUNT").unwrap().parse().unwrap();
+    assert!(remote_count <= 3);
+    let mut runtime = HistoryRuntime::new_with_project_mapping_store(
+        root.join("state/history-v1"),
+        &codex_home,
+        false,
+        crate::project_mapping::ProjectMappingStore::new(root.join("config/project-mappings.json")),
+    )
+    .unwrap();
+    let _profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let active = runtime.ensure_v2_active().unwrap();
+    let quota = QuotaPoint {
+        observed_at: now,
+        limit_id: "codex".to_owned(),
+        duration_mins: 10_080,
+        resets_at: now + ChronoDuration::days(6),
+        used_percent: 20.0,
+        remaining_percent: 80.0,
+        provenance: Provenance::ServerSnapshot,
+    };
+    let mut observation = tui_runtime_test_observation(now - ChronoDuration::minutes(20), 10);
+    observation.quota_points.push(quota.clone());
+    runtime
+        .record_local_observation(&observation, LocalObservationMode::Incremental)
+        .unwrap();
+    {
+        let lease = runtime.ownership().acquire_writer_lease().unwrap();
+        let authority = runtime
+            .ownership()
+            .authorize_v2_write(&lease, &active)
+            .unwrap();
+        let writer = runtime.source_history().writer(&authority).unwrap();
+        for index in 1..=remote_count {
+            let node: NodeId = format!("node-{index:032x}").parse().unwrap();
+            let mut metadata = SourceMetadata::new_with_redaction_profile(
+                node.clone(),
+                SourceKind::Ssh,
+                format!("synthetic-{index}"),
+                runtime.redaction_profile(),
+            )
+            .unwrap();
+            metadata.set_quota_matches_local_account(true);
+            writer.save_source_metadata(&metadata).unwrap();
+            let generation = format!("ingest-gen-{index:032x}").parse().unwrap();
+            let one = NonZeroU32::new(1).unwrap();
+            let binding = SourceHistoryRemoteBinding::new(
+                SourceGeneration {
+                    node_id: node.clone(),
+                    generation: NonZeroU64::new(1).unwrap(),
+                },
+                ProtocolRevisions {
+                    history_format: one,
+                    metric: one,
+                    estimator: one,
+                    project_breakdown: one,
+                    api_pricing_catalog: one,
+                    model_catalog_fingerprint:
+                        crate::remote_protocol::test_model_catalog_fingerprint(1),
+                },
+            )
+            .unwrap();
+            writer
+                .ensure_remote_history_generation(
+                    &node,
+                    runtime.redaction_profile(),
+                    &generation,
+                    &binding,
+                )
+                .unwrap();
+            let mut bucket =
+                tui_runtime_test_bucket(now - ChronoDuration::minutes(20), 20 * index as u64);
+            bucket.project_groups[0].thread_id = format!("synthetic-remote-{index}");
+            writer
+                .apply_remote_history_generation_page(
+                    &node,
+                    runtime.redaction_profile(),
+                    &generation,
+                    &binding,
+                    &[SourceBucketRecord::upsert(1, bucket).unwrap()],
+                    &[],
+                    &[RemoteQuotaChange {
+                        sequence: NonZeroU64::new(2).unwrap(),
+                        quota: RemoteQuotaDay {
+                            day: now.date_naive(),
+                            points: vec![RemoteQuotaPoint::from_local(&quota).unwrap()],
+                        },
+                    }],
+                )
+                .unwrap();
+            writer
+                .activate_remote_history_generation(
+                    &node,
+                    runtime.redaction_profile(),
+                    None,
+                    &generation,
+                    &binding,
+                    now,
+                )
+                .unwrap();
+        }
+    }
+    let mut ui = UiState::default();
+    if std::env::var("N2_LOCAL_SELECTED").as_deref() == Ok("1") {
+        ui.view = UiView::Summary;
+        ui.history_source_selection = UiHistorySourceSelection::Local {
+            node_id: runtime.source_identity().node_id().clone(),
+        };
+    }
+    UiStateStore::new(root.join("state/tui-state.json"))
+        .save(&ui)
+        .unwrap();
+    std::fs::write(root.join("fixture-binding.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "profileId": runtime.profile_id().as_str(), "localNodeId": runtime.source_identity().node_id().as_str(),
+        "remoteCount": remote_count, "observedAt": now, "view": ui.view,
+        "sourceSelection": ui.history_source_selection,
+    })).unwrap()).unwrap();
+}
+
+#[test]
 fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_old_cache() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
