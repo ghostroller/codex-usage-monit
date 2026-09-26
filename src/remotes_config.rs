@@ -16,7 +16,6 @@ use std::sync::{Arc, atomic::AtomicBool};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::atomic_file::replace_file;
 use crate::file_lock::FileLock;
 use crate::remote_protocol::SourceGeneration;
 
@@ -1431,21 +1430,13 @@ fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     create_private_directory(parent)?;
 
     let file_name = path.file_name().unwrap_or_else(|| OsStr::new(CONFIG_FILE));
-    let (temporary, mut file) = create_temporary_file(parent, file_name)?;
-    let result = (|| {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, path)?;
-        validate_published_private_file(path, "remotes config file")?;
-        sync_directory(parent)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::private_state_store::publish_private_replacement(
+        create_temporary_file(parent, file_name)?,
+        parent,
+        path,
+        contents,
+        |path| validate_published_private_file(path, "remotes config file"),
+    )
 }
 
 /// Publishes the initial default without racing an independently created user

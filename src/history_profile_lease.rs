@@ -27,7 +27,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::atomic_file::replace_file;
 use crate::source_history::{HistoryProfileId, RedactionProfile};
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
@@ -973,19 +972,13 @@ fn write_active_profile(
         return Err(invalid_data("active history profile marker is too large"));
     }
 
-    let (temporary_path, mut temporary) = create_temporary_file(directory)?;
-    let result = (|| {
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        replace_file(&temporary_path, &path)?;
-        validate_published_marker(&path)?;
-        sync_directory(directory)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+    crate::private_state_store::publish_private_replacement(
+        create_temporary_file(directory)?,
+        directory,
+        &path,
+        &contents,
+        validate_published_marker,
+    )
 }
 
 fn validate_published_marker(path: &Path) -> io::Result<()> {

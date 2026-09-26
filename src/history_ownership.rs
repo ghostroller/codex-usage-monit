@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::replace_file;
 use crate::source_history::{HistoryProfileId, RedactionProfile};
 #[cfg(windows)]
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
@@ -1088,19 +1087,13 @@ fn write_private_atomically(path: &Path, contents: &[u8], subject: &str) -> io::
         Err(error) => return Err(error),
     }
     let file_name = path.file_name().unwrap_or_else(|| OsStr::new("state"));
-    let (temporary, mut file) = create_temporary_file(parent, file_name)?;
-    let result = (|| {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, path)?;
-        validate_published_private_file(path, subject)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::private_state_store::publish_private_replacement(
+        create_temporary_file(parent, file_name)?,
+        parent,
+        path,
+        contents,
+        |path| validate_published_private_file(path, subject),
+    )
 }
 
 /// Publishes fully-synced contents without ever replacing an existing path.

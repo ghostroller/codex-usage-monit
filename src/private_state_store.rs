@@ -213,19 +213,13 @@ impl PrivateStoreLayout {
             Err(error) => return Err(error),
         }
 
-        let (temporary_path, mut temporary) = self.create_temporary_file(parent)?;
-        let result = (|| {
-            temporary.write_all(contents)?;
-            temporary.sync_all()?;
-            drop(temporary);
-            replace_file(&temporary_path, path)?;
-            validate_published_private_file(path, self.data_subject)?;
-            sync_directory(parent)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary_path);
-        }
-        result
+        publish_private_replacement(
+            self.create_temporary_file(parent)?,
+            parent,
+            path,
+            contents,
+            |path| validate_published_private_file(path, self.data_subject),
+        )
     }
 
     pub(crate) fn validate_state_root(&self, path: &Path) -> io::Result<()> {
@@ -352,6 +346,34 @@ impl PrivateStoreLayout {
             format!("could not allocate a {} temporary file", self.store_name),
         ))
     }
+}
+
+/// Publishes an already safely allocated private file in the target directory.
+/// Callers retain their own input limits, directory/ACL/identity validation and
+/// temporary naming. This only shares the durable replacement sequence; it is
+/// not a create-once, staged recovery, or executable-installation transaction.
+/// A post-publication validation/sync error is propagated without rolling back
+/// a replacement that already happened, matching the callers' existing policy.
+pub(crate) fn publish_private_replacement(
+    temporary: (PathBuf, File),
+    parent: &Path,
+    target: &Path,
+    contents: &[u8],
+    validate_published: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (temporary_path, mut file) = temporary;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary_path, target)?;
+        validate_published(target)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn read_private_bounded(path: &Path, maximum: u64, subject: &str) -> io::Result<Vec<u8>> {
@@ -681,5 +703,91 @@ mod tests {
 
         assert!(TEST_LAYOUT.data_file_exists(&path).unwrap());
         assert_eq!(TEST_LAYOUT.read_bounded(&path).unwrap(), b"{}\n");
+
+        let mut reader = File::open(&path).unwrap();
+        TEST_LAYOUT
+            .write_atomically(&path, b"{\"new\":true}\n")
+            .unwrap();
+        let mut previous = String::new();
+        reader.read_to_string(&mut previous).unwrap();
+        assert_eq!(previous, "{}\n");
+        assert_eq!(
+            TEST_LAYOUT.read_bounded(&path).unwrap(),
+            b"{\"new\":true}\n"
+        );
+        validate_published_private_file(&path, TEST_LAYOUT.data_subject).unwrap();
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn replacement_write_failure_preserves_target_and_cleans_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("state.json");
+        let temporary = directory.path().join(".state.json.1.0.tmp");
+        fs::write(&target, b"original").unwrap();
+        fs::write(&temporary, b"").unwrap();
+        let read_only_file = File::open(&temporary).unwrap();
+
+        let result = publish_private_replacement(
+            (temporary.clone(), read_only_file),
+            directory.path(),
+            &target,
+            b"replacement",
+            |_| panic!("failed writes must not publish or validate a new target"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn replacement_rename_failure_preserves_target_and_cleans_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("existing-directory");
+        let temporary = directory.path().join(".state.json.1.0.tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("original"), b"original").unwrap();
+        let file = File::create(&temporary).unwrap();
+
+        let result = publish_private_replacement(
+            (temporary.clone(), file),
+            directory.path(),
+            &target,
+            b"replacement",
+            |_| panic!("failed replacement must not run target validation"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(target.join("original")).unwrap(), b"original");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn replacement_reports_post_publication_validation_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("state.json");
+        let temporary = directory.path().join(".state.json.1.0.tmp");
+        fs::write(&target, b"original").unwrap();
+        let file = File::create(&temporary).unwrap();
+
+        let error = publish_private_replacement(
+            (temporary.clone(), file),
+            directory.path(),
+            &target,
+            b"replacement",
+            |published| {
+                assert_eq!(fs::read(published).unwrap(), b"replacement");
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "validation failed",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert!(!temporary.exists());
     }
 }
