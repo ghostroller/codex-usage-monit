@@ -27,11 +27,7 @@ use crate::history_ownership::{
     HistoryOwnershipManifest, HistoryOwnershipState, HistoryOwnershipStore, InitializeV1Outcome,
     OwnershipCasOutcome, OwnershipManifestStatus,
 };
-use crate::history_query::{
-    HistorySourceSelection, UnifiedHistoryBackend, UnifiedHistorySnapshot,
-    load_unified_history_since_selected_with_project_mapping_store as query_unified_history_since_selected,
-    load_unified_history_since_with_project_mapping_store as query_unified_history_since,
-};
+use crate::history_query::{HistorySourceSelection, UnifiedHistoryBackend, UnifiedHistorySnapshot};
 use crate::local_history_migration::{
     LocalV1MigrationOptions, activate_local_v2_history, migrate_local_v1_history,
 };
@@ -518,15 +514,7 @@ impl HistoryRuntime {
         &mut self,
         since: DateTime<Utc>,
     ) -> io::Result<UnifiedHistorySnapshot> {
-        let mut snapshot = query_unified_history_since(
-            &self.ownership,
-            &mut self.legacy,
-            &self.source_history,
-            &self.project_mapping_store,
-            since,
-        )?;
-        self.append_pending_runtime_warning(&mut snapshot);
-        Ok(snapshot)
+        self.load_unified_history_since_selected(&HistorySourceSelection::AllIncluded, since)
     }
 
     /// Loads one exact physical-source projection without falling back to an
@@ -536,15 +524,29 @@ impl HistoryRuntime {
         selection: &HistorySourceSelection,
         since: DateTime<Utc>,
     ) -> io::Result<UnifiedHistorySnapshot> {
-        let mut snapshot = query_unified_history_since_selected(
+        self.query_history_selected(
+            selection,
+            &mut crate::history_query::HistoryQueryContext::new(since),
+        )
+    }
+
+    /// Query only: callers establish ownership and perform any migration or
+    /// observation commits before opening this request-scoped context.
+    pub(crate) fn query_history_selected(
+        &mut self,
+        selection: &HistorySourceSelection,
+        context: &mut crate::history_query::HistoryQueryContext,
+    ) -> io::Result<UnifiedHistorySnapshot> {
+        let mut snapshot = crate::history_query::load_unified_history_with_context(
             &self.ownership,
             &mut self.legacy,
             &self.source_history,
             &self.project_mapping_store,
-            self.source_identity.node_id(),
+            &self.source_identity,
             selection,
-            since,
-        )?;
+            context,
+        )?
+        .into_snapshot()?;
         self.append_pending_runtime_warning(&mut snapshot);
         Ok(snapshot)
     }
@@ -640,7 +642,19 @@ impl HistoryRuntime {
         selection: &HistorySourceSelection,
         since: DateTime<Utc>,
     ) -> io::Result<UnifiedHistorySnapshot> {
-        let mut snapshot = self.load_unified_history_since_selected(selection, since)?;
+        self.query_history_with_staged_selected(
+            selection,
+            &mut crate::history_query::HistoryQueryContext::new(since),
+        )
+    }
+
+    pub(crate) fn query_history_with_staged_selected(
+        &mut self,
+        selection: &HistorySourceSelection,
+        context: &mut crate::history_query::HistoryQueryContext,
+    ) -> io::Result<UnifiedHistorySnapshot> {
+        let since = context.since();
+        let mut snapshot = self.query_history_selected(selection, context)?;
         // A v2 snapshot is already an additive local+remote aggregate. The
         // legacy overlay helper performs key replacement, so applying it here
         // could replace the whole aggregate bucket with only the staged local

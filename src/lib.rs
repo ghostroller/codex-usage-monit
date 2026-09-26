@@ -16,6 +16,7 @@ mod file_lock;
 mod git_repository;
 pub mod health_report;
 pub mod history;
+pub(crate) mod history_application;
 pub mod history_ownership;
 pub mod history_profile_lease;
 pub mod history_query;

@@ -31,12 +31,12 @@ use crate::project_mapping::{ProjectMappingProjection, ProjectMappingStore};
 #[cfg(test)]
 use crate::source_history::UsageEventFact;
 use crate::source_history::{
-    ActiveFactSet, LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING, RedactionProfile,
-    SessionUsageMetrics, SourceBucketChange, SourceHistoryReadBudget, SourceHistoryRemoteActiveRef,
-    SourceHistoryStore, SourceKind, SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
-    is_local_observation_recovery_pending,
+    AccountHistoryData, ActiveFactSet, LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING,
+    RedactionProfile, SessionUsageMetrics, SourceBucketChange, SourceHistoryReadBudget,
+    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
+    SourceSessionDigest, SourceSessionDigestChange, is_local_observation_recovery_pending,
 };
-use crate::source_identity::NodeId;
+use crate::source_identity::{NodeId, SourceIdentity};
 #[cfg(test)]
 use crate::source_model::ObservedProjectKey;
 use crate::source_model::ThreadId;
@@ -262,16 +262,17 @@ pub fn load_unified_history_since_with_project_mapping_store(
     project_mapping_store: &ProjectMappingStore,
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
-    let mapping = load_project_mapping_projection(project_mapping_store);
-    load_unified_history_since_inner(
+    query_with_context(
         ownership,
         legacy,
         source_history,
-        &mapping,
+        || load_project_mapping_projection(project_mapping_store),
+        None,
         None,
         &HistorySourceSelection::AllIncluded,
-        since,
-    )
+        &mut HistoryQueryContext::new(since),
+    )?
+    .into_snapshot()
 }
 
 /// Loads one ownership-consistent projection for a specific physical source.
@@ -309,21 +310,23 @@ pub fn load_unified_history_since_selected_with_project_mapping_store(
     selection: &HistorySourceSelection,
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
-    let mapping = load_project_mapping_projection(project_mapping_store);
-    load_unified_history_since_inner(
+    query_with_context(
         ownership,
         legacy,
         source_history,
-        &mapping,
+        || load_project_mapping_projection(project_mapping_store),
+        None,
         Some(bound_local_source_id),
         selection,
-        since,
-    )
+        &mut HistoryQueryContext::new(since),
+    )?
+    .into_snapshot()
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct LoadedProjectMappingProjection {
     projection: ProjectMappingProjection,
+    revision: u64,
     unavailable: bool,
 }
 
@@ -331,17 +334,297 @@ fn load_project_mapping_projection(store: &ProjectMappingStore) -> LoadedProject
     match store.load() {
         Ok(mappings) => LoadedProjectMappingProjection {
             projection: mappings.projection(),
+            revision: mappings.revision(),
             unavailable: false,
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => LoadedProjectMappingProjection {
             projection: ProjectMappingProjection::default(),
+            revision: 0,
             unavailable: false,
         },
         Err(_) => LoadedProjectMappingProjection {
             projection: ProjectMappingProjection::default(),
+            revision: 0,
             unavailable: true,
         },
     }
+}
+
+/// Detached account result, separate from the selected usage result. The compatibility
+/// adapter deliberately keeps quota failures fatal to the existing report projection.
+pub(crate) struct HistoryQueryResult {
+    pub account_quota: io::Result<AccountHistoryData>,
+    pub usage: io::Result<UnifiedHistorySnapshot>,
+}
+
+impl HistoryQueryResult {
+    pub fn into_snapshot(self) -> io::Result<UnifiedHistorySnapshot> {
+        self.account_quota?;
+        self.usage
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct QueryInputs {
+    state_root: std::path::PathBuf,
+    ownership: HistoryOwnershipManifest,
+    mapping: LoadedProjectMappingProjection,
+    metadata: Vec<SourceMetadata>,
+    local_revision: Option<u64>,
+    remote_revisions: Vec<Option<SourceHistoryRemoteActiveRef>>,
+    revision_probes_valid: bool,
+}
+
+struct PreparedQuota {
+    inputs: QueryInputs,
+    account: io::Result<AccountHistoryData>,
+}
+
+/// One application request, with one fixed range and a single shared read allowance.
+/// It must be dropped at the end of the request, never kept as a cross-refresh cache.
+/// Every selection revalidates its ownership, policy, mapping and revision inputs.
+/// Remote revisions remain per-source observations, not a distributed snapshot.
+pub(crate) struct HistoryQueryContext {
+    since: DateTime<Utc>,
+    budget: SourceHistoryReadBudget,
+    quota: Option<PreparedQuota>,
+    #[cfg(test)]
+    pub(crate) quota_loads: usize,
+}
+
+impl HistoryQueryContext {
+    pub fn new(since: DateTime<Utc>) -> Self {
+        Self {
+            since,
+            budget: SourceHistoryReadBudget::for_query(),
+            quota: None,
+            #[cfg(test)]
+            quota_loads: 0,
+        }
+    }
+
+    pub fn since(&self) -> DateTime<Utc> {
+        self.since
+    }
+}
+
+fn query_inputs(
+    ownership: &HistoryOwnershipStore,
+    source_history: &SourceHistoryStore,
+    mapping: LoadedProjectMappingProjection,
+    local_identity: Option<&SourceIdentity>,
+) -> io::Result<QueryInputs> {
+    let manifest = initialized_manifest(ownership)?;
+    let mut metadata = if manifest.state() == HistoryOwnershipState::V2Active {
+        source_history.list_source_metadata()?
+    } else {
+        Vec::new()
+    };
+    metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
+    let mut revision_probes_valid = true;
+    let local_revision = if manifest.state() == HistoryOwnershipState::V2Active {
+        local_identity
+            .map(|identity| {
+                source_history
+                    .load_local_observation_revision(identity, ownership.redaction_profile())
+            })
+            .transpose()
+            .unwrap_or_else(|_| {
+                // A cache probe must not introduce a new global failure for an
+                // exact remote query. The actual quota/usage reads retain their
+                // established failure boundaries; only reuse is disabled.
+                revision_probes_valid = false;
+                None
+            })
+    } else {
+        None
+    };
+    let remote_revisions = metadata
+        .iter()
+        .filter(|source| {
+            source.kind() == SourceKind::Ssh
+                && source.include_in_aggregates()
+                && !source.detached()
+                && source.quota_matches_local_account()
+                && !(ownership.redaction_profile() == RedactionProfile::Redacted
+                    && source.aggregate_redaction_profile() == RedactionProfile::PreviewEnabled)
+        })
+        .map(|source| {
+            source_history
+                .active_remote_history_ref(source.source_id(), source.aggregate_redaction_profile())
+                .unwrap_or_else(|_| {
+                    revision_probes_valid = false;
+                    None
+                })
+        })
+        .collect();
+    Ok(QueryInputs {
+        state_root: ownership.state_root().to_owned(),
+        ownership: manifest,
+        mapping,
+        metadata,
+        local_revision,
+        remote_revisions,
+        revision_probes_valid,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_with_context(
+    ownership: &HistoryOwnershipStore,
+    legacy: &mut HistoryStore,
+    source_history: &SourceHistoryStore,
+    mapping: impl Fn() -> LoadedProjectMappingProjection,
+    local_identity: Option<&SourceIdentity>,
+    bound_local_source_id: Option<&NodeId>,
+    selection: &HistorySourceSelection,
+    context: &mut HistoryQueryContext,
+) -> io::Result<HistoryQueryResult> {
+    validate_store_bindings(ownership, legacy, source_history)?;
+    let since = context.since;
+    for _ in 0..MAX_STABLE_QUERY_ATTEMPTS {
+        let before = query_inputs(ownership, source_history, mapping(), local_identity)?;
+        let local_identity_mismatch = matches!(selection, HistorySourceSelection::Local(source_id) if bound_local_source_id != Some(source_id));
+        if before.ownership.state() != HistoryOwnershipState::V2Active {
+            // An ownership switch invalidates account data even if this request
+            // later returns to V2 with a different epoch.
+            context.quota = None;
+            let legacy_history = legacy.load_since(since);
+            let account_quota = Ok(AccountHistoryData {
+                quota_points: legacy_history.quota_points.clone(),
+            });
+            let status = if local_identity_mismatch {
+                HistorySourceSelectionStatus::Unavailable(
+                    HistorySourceUnavailableReason::LocalIdentityMismatch,
+                )
+            } else if matches!(selection, HistorySourceSelection::Remote(_)) {
+                HistorySourceSelectionStatus::Unavailable(
+                    HistorySourceUnavailableReason::UnsupportedByLegacy,
+                )
+            } else {
+                HistorySourceSelectionStatus::Applied
+            };
+            let history = match status {
+                HistorySourceSelectionStatus::Unavailable(reason) => {
+                    unavailable_v1_history(legacy_history, selection, reason)
+                }
+                _ => legacy_history,
+            };
+            if before == query_inputs(ownership, source_history, mapping(), local_identity)? {
+                return Ok(HistoryQueryResult {
+                    account_quota,
+                    usage: Ok(UnifiedHistorySnapshot {
+                        history,
+                        backend: UnifiedHistoryBackend::V1,
+                        ownership_epoch: before.ownership.epoch(),
+                        source_selection: selection.clone(),
+                        source_selection_status: status,
+                        included_sources: Vec::new(),
+                        redaction_skipped_sources: Vec::new(),
+                    }),
+                });
+            }
+            continue;
+        }
+        if !before.revision_probes_valid
+            || context
+                .quota
+                .as_ref()
+                .is_none_or(|quota| quota.inputs != before)
+        {
+            #[cfg(test)]
+            {
+                context.quota_loads += 1;
+            }
+            let evidence_since = since
+                .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            let account = load_account_quota(
+                source_history,
+                &before.metadata,
+                ownership.redaction_profile(),
+                evidence_since,
+                &mut context.budget,
+            );
+            context.quota = Some(PreparedQuota {
+                inputs: before.clone(),
+                account,
+            });
+        }
+        let account = &context
+            .quota
+            .as_ref()
+            .expect("quota initialized for this attempt")
+            .account;
+        let usage = match account {
+            Ok(account) => load_v2_history_since(
+                &V2HistoryQuery {
+                    query_redaction: ownership.redaction_profile(),
+                    ownership_epoch: before.ownership.epoch(),
+                    store: source_history,
+                    project_mapping: &before.mapping,
+                    bound_local_source_id,
+                    selection,
+                    since,
+                    metadata: &before.metadata,
+                    account,
+                },
+                &mut context.budget,
+            ),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        };
+        let after = query_inputs(ownership, source_history, mapping(), local_identity)?;
+        if before != after || matches!(&usage, Ok(None)) {
+            context.quota = None;
+            continue;
+        }
+        let account_quota = match account {
+            Ok(account) => Ok(account.clone()),
+            // Keep the original error (including OS code and typed cause) for
+            // the compatibility adapter. Failed quota is never cached.
+            Err(_) => context.quota.take().expect("failed quota exists").account,
+        };
+        return Ok(HistoryQueryResult {
+            account_quota,
+            usage: usage.map(|read| {
+                let read = read.expect("unstable query retried above");
+                UnifiedHistorySnapshot {
+                    history: read.history,
+                    backend: UnifiedHistoryBackend::V2,
+                    ownership_epoch: before.ownership.epoch(),
+                    source_selection: selection.clone(),
+                    source_selection_status: read.source_selection_status,
+                    included_sources: read.included_sources,
+                    redaction_skipped_sources: read.redaction_skipped_sources,
+                }
+            }),
+        });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "history ownership or source policy changed repeatedly during the query",
+    ))
+}
+
+pub(crate) fn load_unified_history_with_context(
+    ownership: &HistoryOwnershipStore,
+    legacy: &mut HistoryStore,
+    source_history: &SourceHistoryStore,
+    project_mapping_store: &ProjectMappingStore,
+    identity: &SourceIdentity,
+    selection: &HistorySourceSelection,
+    context: &mut HistoryQueryContext,
+) -> io::Result<HistoryQueryResult> {
+    query_with_context(
+        ownership,
+        legacy,
+        source_history,
+        || load_project_mapping_projection(project_mapping_store),
+        Some(identity),
+        Some(identity.node_id()),
+        selection,
+        context,
+    )
 }
 
 fn load_unified_history_since_inner(
@@ -353,99 +636,17 @@ fn load_unified_history_since_inner(
     selection: &HistorySourceSelection,
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
-    validate_store_bindings(ownership, legacy, source_history)?;
-    // One allowance covers the complete logical query, including bounded
-    // retries when ownership or source metadata changes during the read.
-    let mut source_read_budget = SourceHistoryReadBudget::for_query();
-
-    for _ in 0..MAX_STABLE_QUERY_ATTEMPTS {
-        let before = initialized_manifest(ownership)?;
-        let local_identity_mismatch = matches!(
-            selection,
-            HistorySourceSelection::Local(source_id)
-                if bound_local_source_id != Some(source_id)
-        );
-        let (
-            history,
-            backend,
-            included_sources,
-            redaction_skipped_sources,
-            source_selection_status,
-        ) = match before.state() {
-            HistoryOwnershipState::V1Active | HistoryOwnershipState::Migrating => {
-                let legacy_history = legacy.load_since(since);
-                let status = if local_identity_mismatch {
-                    HistorySourceSelectionStatus::Unavailable(
-                        HistorySourceUnavailableReason::LocalIdentityMismatch,
-                    )
-                } else if matches!(selection, HistorySourceSelection::Remote(_)) {
-                    HistorySourceSelectionStatus::Unavailable(
-                        HistorySourceUnavailableReason::UnsupportedByLegacy,
-                    )
-                } else {
-                    HistorySourceSelectionStatus::Applied
-                };
-                let history = match status {
-                    HistorySourceSelectionStatus::Applied
-                    | HistorySourceSelectionStatus::AppliedExcludedFromAggregates => legacy_history,
-                    HistorySourceSelectionStatus::Unavailable(reason) => {
-                        unavailable_v1_history(legacy_history, selection, reason)
-                    }
-                };
-                (
-                    history,
-                    UnifiedHistoryBackend::V1,
-                    Vec::new(),
-                    Vec::new(),
-                    status,
-                )
-            }
-            HistoryOwnershipState::V2Active => {
-                let Some(v2) = load_v2_history_since(
-                    &V2HistoryQuery {
-                        query_redaction: ownership.redaction_profile(),
-                        ownership_epoch: before.epoch(),
-                        store: source_history,
-                        project_mapping,
-                        bound_local_source_id,
-                        selection,
-                        since,
-                    },
-                    &mut source_read_budget,
-                )?
-                else {
-                    // Source policy changed while it was being read. A
-                    // retry starts from a new complete metadata snapshot.
-                    continue;
-                };
-                (
-                    v2.history,
-                    UnifiedHistoryBackend::V2,
-                    v2.included_sources,
-                    v2.redaction_skipped_sources,
-                    v2.source_selection_status,
-                )
-            }
-        };
-
-        let after = initialized_manifest(ownership)?;
-        if before == after {
-            return Ok(UnifiedHistorySnapshot {
-                history,
-                backend,
-                ownership_epoch: after.epoch(),
-                source_selection: selection.clone(),
-                source_selection_status,
-                included_sources,
-                redaction_skipped_sources,
-            });
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "history ownership or source policy changed repeatedly during the query",
-    ))
+    query_with_context(
+        ownership,
+        legacy,
+        source_history,
+        || project_mapping.clone(),
+        None,
+        bound_local_source_id,
+        selection,
+        &mut HistoryQueryContext::new(since),
+    )?
+    .into_snapshot()
 }
 
 fn unavailable_v1_history(
@@ -633,6 +834,68 @@ fn annotate_model_catalog_uncovered_tokens(
     }
 }
 
+fn load_account_quota(
+    store: &SourceHistoryStore,
+    metadata: &[SourceMetadata],
+    query_redaction: RedactionProfile,
+    evidence_since: DateTime<Utc>,
+    read_budget: &mut SourceHistoryReadBudget,
+) -> io::Result<AccountHistoryData> {
+    // Account quota is global and intentionally loaded once, independently
+    // of how many local or SSH sources participate.
+    let account_trace = process_trace_log().span("history.v2.account_load", TraceFields::new());
+    let account_result = store.load_account_since_with_budget(evidence_since, read_budget);
+    match &account_result {
+        Ok(account) => account_trace.finish(
+            TraceOutcome::Ok,
+            TraceFields::new().usize("recordCount", account.quota_points.len()),
+        ),
+        Err(_) => account_trace.finish(TraceOutcome::Error, TraceFields::new()),
+    }
+    let mut account = account_result?;
+    let quota_trace = process_trace_log().span(
+        "history.v2.quota_merge",
+        TraceFields::new().usize("localPointCount", account.quota_points.len()),
+    );
+    let mut remote_quota_points = Vec::new();
+    let mut quota_source_count = 0;
+    // Quota is an account-wide projection, independent of the token source
+    // selector. Only explicit same-account, included, attached sources qualify.
+    for source in metadata.iter().filter(|source| {
+        source.kind() == SourceKind::Ssh
+            && source.quota_matches_local_account()
+            && source.include_in_aggregates()
+            && !source.detached()
+    }) {
+        let redaction = source.aggregate_redaction_profile();
+        if query_redaction == RedactionProfile::Redacted
+            && redaction == RedactionProfile::PreviewEnabled
+        {
+            continue;
+        }
+        quota_source_count += 1;
+        remote_quota_points.extend(store.load_remote_quota_since_with_budget(
+            source.source_id(),
+            redaction,
+            evidence_since,
+            read_budget,
+        )?);
+    }
+    let remote_quota_count = remote_quota_points.len();
+    if !remote_quota_points.is_empty() {
+        account.quota_points.extend(remote_quota_points);
+        account.quota_points = crate::quota_merge::merge_quota_points(account.quota_points);
+    }
+    quota_trace.finish(
+        TraceOutcome::Ok,
+        TraceFields::new()
+            .usize("confirmedSourceCount", quota_source_count)
+            .usize("remotePointCount", remote_quota_count)
+            .usize("mergedPointCount", account.quota_points.len()),
+    );
+    Ok(account)
+}
+
 #[derive(Clone, Copy)]
 struct V2HistoryQuery<'a> {
     query_redaction: RedactionProfile,
@@ -642,6 +905,8 @@ struct V2HistoryQuery<'a> {
     bound_local_source_id: Option<&'a NodeId>,
     selection: &'a HistorySourceSelection,
     since: DateTime<Utc>,
+    metadata: &'a [SourceMetadata],
+    account: &'a AccountHistoryData,
 }
 
 /// Returns `None` when source policy changed during the read.
@@ -690,77 +955,13 @@ fn load_v2_history_since_inner(
         bound_local_source_id,
         selection,
         since,
+        ..
     } = *query;
     let evidence_since = since
         .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let metadata_trace = process_trace_log().span(
-        "history.v2.metadata_load",
-        TraceFields::new().label("phase", "before"),
-    );
-    let metadata_result = store.list_source_metadata();
-    match &metadata_result {
-        Ok(metadata) => metadata_trace.finish(
-            TraceOutcome::Ok,
-            TraceFields::new().usize("sourceCount", metadata.len()),
-        ),
-        Err(_) => metadata_trace.finish(TraceOutcome::Error, TraceFields::new()),
-    }
-    let mut metadata_before = metadata_result?;
-    metadata_before
-        .sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
-    // Account quota is global and intentionally loaded once, independently
-    // of how many local or SSH sources participate.
-    let account_trace = process_trace_log().span("history.v2.account_load", TraceFields::new());
-    let account_result = store.load_account_since_with_budget(evidence_since, read_budget);
-    match &account_result {
-        Ok(account) => account_trace.finish(
-            TraceOutcome::Ok,
-            TraceFields::new().usize("recordCount", account.quota_points.len()),
-        ),
-        Err(_) => account_trace.finish(TraceOutcome::Error, TraceFields::new()),
-    }
-    let mut account = account_result?;
-    let quota_trace = process_trace_log().span(
-        "history.v2.quota_merge",
-        TraceFields::new().usize("localPointCount", account.quota_points.len()),
-    );
-    let mut remote_quota_points = Vec::new();
-    let mut quota_source_count = 0;
-    // Quota is an account-wide projection, independent of the token source
-    // selector. Only explicit same-account, included, attached sources qualify.
-    for source in metadata_before.iter().filter(|source| {
-        source.kind() == SourceKind::Ssh
-            && source.quota_matches_local_account()
-            && source.include_in_aggregates()
-            && !source.detached()
-    }) {
-        let redaction = source.aggregate_redaction_profile();
-        if query_redaction == RedactionProfile::Redacted
-            && redaction == RedactionProfile::PreviewEnabled
-        {
-            continue;
-        }
-        quota_source_count += 1;
-        remote_quota_points.extend(store.load_remote_quota_since_with_budget(
-            source.source_id(),
-            redaction,
-            evidence_since,
-            read_budget,
-        )?);
-    }
-    let remote_quota_count = remote_quota_points.len();
-    if !remote_quota_points.is_empty() {
-        account.quota_points.extend(remote_quota_points);
-        account.quota_points = crate::quota_merge::merge_quota_points(account.quota_points);
-    }
-    quota_trace.finish(
-        TraceOutcome::Ok,
-        TraceFields::new()
-            .usize("confirmedSourceCount", quota_source_count)
-            .usize("remotePointCount", remote_quota_count)
-            .usize("mergedPointCount", account.quota_points.len()),
-    );
+    let metadata_before = query.metadata;
+    let account = query.account;
     let mut slices = Vec::new();
     let mut replica_evidence = Vec::new();
     let mut included_sources = Vec::new();
@@ -982,7 +1183,7 @@ fn load_v2_history_since_inner(
     }
     let mut metadata_after = metadata_result?;
     metadata_after.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
-    if metadata_before != metadata_after {
+    if metadata_before != metadata_after.as_slice() {
         return Ok(None);
     }
 
@@ -1058,8 +1259,9 @@ fn load_v2_history_since_inner(
     let mut history = HistoryData {
         quota_points: account
             .quota_points
-            .into_iter()
+            .iter()
             .filter(|point| point.observed_at >= since)
+            .cloned()
             .collect(),
         half_hour_buckets: bucket_projection
             .buckets
@@ -1167,6 +1369,214 @@ mod tests {
     const SOURCE_A: &str = "node-0123456789abcdef0123456789abcdef";
     const SOURCE_B: &str = "node-fedcba9876543210fedcba9876543210";
     const SOURCE_C: &str = "node-11111111111111111111111111111111";
+
+    #[test]
+    fn request_context_reuses_quota_and_invalidates_source_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+        );
+        let local = source(
+            SOURCE_A,
+            "local",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        store.save_source_metadata(&local).unwrap();
+        store
+            .record_account_points(&[quota(at(2, 9, 0), at(8, 0, 0))])
+            .unwrap();
+        activate_v2(&ownership);
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        for selection in [
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Local(local.source_id().clone()),
+        ] {
+            let result = query_with_context(
+                &ownership,
+                &mut legacy,
+                &store,
+                LoadedProjectMappingProjection::default,
+                None,
+                Some(local.source_id()),
+                &selection,
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(result.account_quota.as_ref().unwrap().quota_points.len(), 1);
+            assert_eq!(
+                result.into_snapshot().unwrap().history.quota_points.len(),
+                1
+            );
+        }
+        assert_eq!(context.quota_loads, 1);
+        store
+            .update_source_metadata(local.source_id(), |source| {
+                source.set_include_in_aggregates(false);
+                Ok(())
+            })
+            .unwrap();
+        let changed = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            LoadedProjectMappingProjection::default,
+            None,
+            Some(local.source_id()),
+            &HistorySourceSelection::Local(local.source_id().clone()),
+            &mut context,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert_eq!(context.quota_loads, 2);
+        assert_eq!(
+            changed.source_selection_status,
+            HistorySourceSelectionStatus::AppliedExcludedFromAggregates
+        );
+    }
+
+    #[test]
+    fn request_context_quota_failure_keeps_original_error_and_usage_failure_is_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+        );
+        let local = source(
+            SOURCE_A,
+            "local",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        store.save_source_metadata(&local).unwrap();
+        store
+            .record_account_points(&[quota(at(2, 9, 0), at(8, 0, 0))])
+            .unwrap();
+        activate_v2(&ownership);
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        context.budget = SourceHistoryReadBudget::with_limits(0, 100, 100);
+        let failed = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            LoadedProjectMappingProjection::default,
+            None,
+            Some(local.source_id()),
+            &HistorySourceSelection::AllIncluded,
+            &mut context,
+        )
+        .unwrap();
+        assert!(failed.account_quota.is_err());
+        let error = failed.into_snapshot().unwrap_err();
+        assert!(
+            SourceHistoryReadBudget::is_exhaustion(&error),
+            "compatibility must retain the typed quota error"
+        );
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        context.budget = SourceHistoryReadBudget::with_limits(u64::MAX, 100, 0);
+        let failed = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            LoadedProjectMappingProjection::default,
+            None,
+            Some(local.source_id()),
+            &HistorySourceSelection::AllIncluded,
+            &mut context,
+        )
+        .unwrap();
+        assert!(failed.account_quota.is_ok());
+        assert!(SourceHistoryReadBudget::is_exhaustion(
+            failed.usage.as_ref().unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn request_context_mapping_changes_retry_with_one_shared_budget() {
+        use std::cell::Cell;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+        );
+        let local = source(
+            SOURCE_A,
+            "local",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        store.save_source_metadata(&local).unwrap();
+        activate_v2(&ownership);
+        let calls = Cell::new(0);
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        // One source read is available for the whole request. The first attempt
+        // becomes stale, so its retry must exhaust, rather than reset, that budget.
+        context.budget = SourceHistoryReadBudget::with_limits(u64::MAX, 100, 1);
+        let result = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                LoadedProjectMappingProjection {
+                    unavailable: call > 0,
+                    ..LoadedProjectMappingProjection::default()
+                }
+            },
+            None,
+            Some(local.source_id()),
+            &HistorySourceSelection::AllIncluded,
+            &mut context,
+        )
+        .unwrap();
+        assert_eq!(context.quota_loads, 2);
+        assert!(SourceHistoryReadBudget::is_exhaustion(
+            result.usage.as_ref().unwrap_err()
+        ));
+        assert_eq!(calls.get(), 4, "only the changed attempt is retried");
+    }
+
+    #[test]
+    fn request_context_repeated_input_changes_stop_after_four_attempts() {
+        use std::cell::Cell;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+        );
+        activate_v2(&ownership);
+        let calls = Cell::new(0);
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        let error = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                LoadedProjectMappingProjection {
+                    unavailable: call % 2 == 1,
+                    ..LoadedProjectMappingProjection::default()
+                }
+            },
+            None,
+            None,
+            &HistorySourceSelection::AllIncluded,
+            &mut context,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(context.quota_loads, MAX_STABLE_QUERY_ATTEMPTS);
+        assert_eq!(calls.get(), 2 * MAX_STABLE_QUERY_ATTEMPTS);
+    }
 
     fn observed(hex: char) -> ObservedProjectKey {
         format!("opk-hmac-sha256-v1-{}", hex.to_string().repeat(64))

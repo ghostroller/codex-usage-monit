@@ -92,13 +92,17 @@ use crate::event_log::{EventLog, LogLevel};
 #[cfg(test)]
 use crate::history::{HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION};
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
+use crate::history_application::{
+    HistoryProjectionRevision, history_projection_revision, query_runtime_history,
+    stage_runtime_collection,
+};
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
 use crate::history_profile_lease::{
     HistoryProfileLeaseGuard, TryHistoryProfileLease, try_acquire_history_profile_lease,
 };
 use crate::history_query::{
-    HistorySourceSelection, HistorySourceSelectionStatus, HistorySourceUnavailableReason,
-    UnifiedHistoryBackend,
+    HistoryQueryContext, HistorySourceSelection, HistorySourceSelectionStatus,
+    HistorySourceUnavailableReason, UnifiedHistoryBackend,
 };
 use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
 use crate::open_config::{OpenConfig, OpenConfigStore};
@@ -139,8 +143,7 @@ use crate::snapshot::{
 };
 use crate::source_export::LocalSessionDigestEvidence;
 use crate::source_history::{
-    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
-    SourceRemoteLiveSnapshot,
+    SourceHistoryStore, SourceKind, SourceMetadata, SourceRemoteLiveSnapshot,
 };
 use crate::source_identity::NodeId;
 use crate::source_model::{LogicalProjectId, ProjectDisplayLabel, ProjectInstanceId};
@@ -222,33 +225,17 @@ enum DeferredTuiHistoryPreparation {
 
 #[derive(Debug, Default)]
 struct TuiRemoteOverviewCache {
-    revisions: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
+    revision: Option<HistoryProjectionRevision>,
     history: RemoteOverviewHistory,
     loaded_at: Option<Instant>,
     initialized: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TuiHistoryProjectionRevision {
-    ownership: OwnershipManifestStatus,
-    project_mapping_revision: u64,
-    local_observation_revision: u64,
-    sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
-}
-
-impl TuiHistoryProjectionRevision {
-    fn same_query_inputs_except_local_revision(&self, other: &Self) -> bool {
-        self.ownership == other.ownership
-            && self.project_mapping_revision == other.project_mapping_revision
-            && self.sources == other.sources
-    }
 }
 
 #[derive(Clone, Debug)]
 struct TuiHistoryProjectionCache {
     selection: HistorySourceSelection,
     since: DateTime<Utc>,
-    revision: TuiHistoryProjectionRevision,
+    revision: HistoryProjectionRevision,
     projection: TuiHistoryProjection,
     loaded_at: Instant,
 }
@@ -267,6 +254,9 @@ struct TuiHistoryStore {
     setup_warnings: Vec<String>,
     last_runtime_load_at: Option<Instant>,
     projection_cache: Option<TuiHistoryProjectionCache>,
+    // Only populated inside a single startup/background refresh. It is dropped
+    // after Overview consumes the same request, never reused by a later refresh.
+    query_context: Option<HistoryQueryContext>,
     #[cfg(test)]
     projection_cache_delivery_clones: usize,
     #[cfg(test)]
@@ -283,6 +273,20 @@ struct TuiHistoryProjection {
 }
 
 impl TuiHistoryStore {
+    fn with_query_request<R>(
+        &mut self,
+        now: DateTime<Utc>,
+        query: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.query_context = Some(HistoryQueryContext::new(history_view_since(now)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| query(self)));
+        self.query_context = None;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     fn runtime(
         runtime: HistoryRuntime,
         profile_lease: Option<HistoryProfileLeaseGuard>,
@@ -295,6 +299,7 @@ impl TuiHistoryStore {
             setup_warnings,
             last_runtime_load_at: None,
             projection_cache: None,
+            query_context: None,
             #[cfg(test)]
             projection_cache_delivery_clones: 0,
             #[cfg(test)]
@@ -317,6 +322,7 @@ impl TuiHistoryStore {
             setup_warnings,
             last_runtime_load_at: None,
             projection_cache: None,
+            query_context: None,
             #[cfg(test)]
             projection_cache_delivery_clones: 0,
             #[cfg(test)]
@@ -431,19 +437,31 @@ impl TuiHistoryStore {
             .into_iter()
             .filter(|source| source.kind() == SourceKind::Ssh && source.include_in_aggregates())
             .collect::<Vec<_>>();
+        if metadata.is_empty()
+            && let Some(history) = unified_seed
+        {
+            // The selected All query already supplied the complete projection.
+            // With no remote sources, keep its buckets and warnings without
+            // probing revisions for a cache entry that will never be reused.
+            // A later call still enumerates sources before taking this path.
+            self.remote_overview_cache = TuiRemoteOverviewCache::default();
+            return Ok(RemoteOverviewHistory::from_unified(
+                history,
+                std::iter::empty(),
+                now,
+            ));
+        }
         metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
-        let revisions = metadata
-            .iter()
-            .map(|source| {
-                store
-                    .active_remote_history_ref(
-                        source.source_id(),
-                        source.aggregate_redaction_profile(),
-                    )
-                    .map(|active| (source.clone(), active))
-            })
-            .collect::<io::Result<Vec<_>>>()
-            .map_err(|error| format!("remote Overview revision is unavailable: {error}"))?;
+        // Preserve the existing visible revision-error boundary. Additional
+        // local/mapping stamps below only control cache reuse.
+        for source in &metadata {
+            store
+                .active_remote_history_ref(source.source_id(), source.aggregate_redaction_profile())
+                .map_err(|error| format!("remote Overview revision is unavailable: {error}"))?;
+        }
+        let revision = history_projection_revision(runtime, &HistorySourceSelection::AllIncluded)
+            .ok()
+            .flatten();
         let remote_sources = metadata.iter().map(|source| {
             (
                 source.source_id().clone(),
@@ -451,7 +469,7 @@ impl TuiHistoryStore {
             )
         });
         if let Some(history) = unified_seed {
-            self.remote_overview_cache.revisions = revisions;
+            self.remote_overview_cache.revision = revision.clone();
             self.remote_overview_cache.history =
                 RemoteOverviewHistory::from_unified(history, remote_sources, now);
             self.remote_overview_cache.loaded_at = Some(Instant::now());
@@ -459,7 +477,8 @@ impl TuiHistoryStore {
             return Ok(self.remote_overview_cache.history.clone());
         }
         if self.remote_overview_cache.initialized
-            && self.remote_overview_cache.revisions == revisions
+            && revision.is_some()
+            && self.remote_overview_cache.revision == revision
             && self
                 .remote_overview_cache
                 .loaded_at
@@ -467,13 +486,17 @@ impl TuiHistoryStore {
         {
             return Ok(self.remote_overview_cache.history.clone());
         }
-        let snapshot = runtime
-            .load_unified_history_since_with_staged_selected(
-                &HistorySourceSelection::AllIncluded,
-                history_view_since(now),
-            )
-            .map_err(|error| format!("remote Overview history query failed: {error}"))?;
-        self.remote_overview_cache.revisions = revisions;
+        let snapshot = query_runtime_history(
+            runtime,
+            &HistorySourceSelection::AllIncluded,
+            history_view_since(now),
+            self.query_context.as_mut(),
+        )
+        .map_err(|error| format!("remote Overview history query failed: {error}"))?;
+        let after = history_projection_revision(runtime, &HistorySourceSelection::AllIncluded)
+            .ok()
+            .flatten();
+        self.remote_overview_cache.revision = (revision == after).then_some(after).flatten();
         self.remote_overview_cache.history =
             RemoteOverviewHistory::from_unified(&snapshot.history, remote_sources, now);
         self.remote_overview_cache.loaded_at = Some(Instant::now());
@@ -561,13 +584,10 @@ impl TuiHistoryStore {
     ) {
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => {
-                if let Err(error) = runtime.stage_local_collection(observation, tasks, evidence) {
-                    let normalized =
-                        runtime.prepare_local_collection_observation(observation, tasks);
-                    runtime.stage(&normalized);
-                    self.setup_warnings.push(format!(
-                        "local session digest evidence could not be staged: {error}"
-                    ));
+                if let Some(warning) =
+                    stage_runtime_collection(runtime, observation, tasks, evidence, false)
+                {
+                    self.setup_warnings.push(warning);
                 }
             }
             TuiHistoryBackend::LegacyFallback(store) => store.stage(observation),
@@ -592,15 +612,10 @@ impl TuiHistoryStore {
     ) {
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => {
-                if let Err(error) =
-                    runtime.stage_full_local_collection(observation, tasks, evidence)
+                if let Some(warning) =
+                    stage_runtime_collection(runtime, observation, tasks, evidence, true)
                 {
-                    let normalized =
-                        runtime.prepare_local_collection_observation(observation, tasks);
-                    runtime.stage_full_observation(&normalized);
-                    self.setup_warnings.push(format!(
-                        "local session digest evidence could not be staged for reconciliation: {error}"
-                    ));
+                    self.setup_warnings.push(warning);
                 }
             }
             TuiHistoryBackend::LegacyFallback(store) => {
@@ -656,74 +671,14 @@ impl TuiHistoryStore {
             .history
     }
 
-    /// Cheap, content-free generation vector for one source projection. The
-    /// local revision covers account/bucket/weekly/digest writes, while each
-    /// SSH active-generation reference covers an atomic remote replacement.
-    /// Metadata and project-mapping revisions complete the query inputs.
     fn projection_revision(
         &self,
         selection: &HistorySourceSelection,
-    ) -> io::Result<Option<TuiHistoryProjectionRevision>> {
-        let Some(before) = self.projection_revision_once(selection)? else {
-            return Ok(None);
-        };
-        let Some(after) = self.projection_revision_once(selection)? else {
-            return Ok(None);
-        };
-        Ok((before == after).then_some(after))
-    }
-
-    fn projection_revision_once(
-        &self,
-        selection: &HistorySourceSelection,
-    ) -> io::Result<Option<TuiHistoryProjectionRevision>> {
-        let TuiHistoryBackend::Runtime(runtime) = &self.backend else {
-            return Ok(None);
-        };
-        let ownership = runtime.ownership().load_manifest()?;
-        if !matches!(
-            &ownership,
-            OwnershipManifestStatus::Initialized(manifest)
-                if manifest.state() == HistoryOwnershipState::V2Active
-        ) {
-            return Ok(None);
+    ) -> io::Result<Option<HistoryProjectionRevision>> {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => history_projection_revision(runtime, selection),
+            TuiHistoryBackend::LegacyFallback(_) => Ok(None),
         }
-        let project_mapping_revision = match runtime.project_mapping_store().load() {
-            Ok(mappings) => mappings.revision(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        let local_observation_revision = runtime.source_history().load_local_observation_revision(
-            runtime.source_identity(),
-            runtime.redaction_profile(),
-        )?;
-        let mut metadata = runtime.source_history().list_source_metadata()?;
-        metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
-        let selected = metadata.into_iter().filter(|source| match selection {
-            HistorySourceSelection::AllIncluded => source.include_in_aggregates(),
-            HistorySourceSelection::Local(source_id)
-            | HistorySourceSelection::Remote(source_id) => source.source_id() == source_id,
-        });
-        let sources = selected
-            .map(|source| {
-                let active = (source.kind() == SourceKind::Ssh)
-                    .then(|| {
-                        runtime.source_history().active_remote_history_ref(
-                            source.source_id(),
-                            source.aggregate_redaction_profile(),
-                        )
-                    })
-                    .transpose()?
-                    .flatten();
-                Ok((source, active))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(Some(TuiHistoryProjectionRevision {
-            ownership,
-            project_mapping_revision,
-            local_observation_revision,
-            sources,
-        }))
     }
 
     /// Validates (and, for a proven no-op write, rebases) the cache without
@@ -796,8 +751,8 @@ impl TuiHistoryStore {
         selection: &HistorySourceSelection,
         since: DateTime<Utc>,
         projection: &TuiHistoryProjection,
-        revision_before: Option<TuiHistoryProjectionRevision>,
-        revision_after: Option<TuiHistoryProjectionRevision>,
+        revision_before: Option<HistoryProjectionRevision>,
+        revision_after: Option<HistoryProjectionRevision>,
     ) -> bool {
         let Some(revision) =
             revision_before.filter(|before| Some(before) == revision_after.as_ref())
@@ -834,7 +789,8 @@ impl TuiHistoryStore {
             .flatten();
         let (mut history, status, query_error, cacheable) = match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => {
-                match runtime.load_unified_history_since_with_staged_selected(selection, since) {
+                match query_runtime_history(runtime, selection, since, self.query_context.as_mut())
+                {
                     Ok(snapshot) => {
                         let cacheable = snapshot.backend == UnifiedHistoryBackend::V2;
                         (
@@ -10298,27 +10254,29 @@ fn collect_initial_refresh_completion(
         let mut history_store = history_store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (projection, recorder_health) = stage_and_load_history_selected(
-            &mut history_store,
-            history_observation.as_ref(),
-            &result.snapshot.tasks,
-            &result.local_session_digests,
-            result.snapshot.as_of,
-            &config.perf_log,
-            false,
-            history_source_selection,
-        );
-        let remote_live = history_store.load_remote_live_states();
-        let unified_seed = matches!(projection.selection, HistorySourceSelection::AllIncluded)
-            .then_some(&projection.history);
-        let remote_overview_history =
-            history_store.load_remote_overview_history(unified_seed, result.snapshot.as_of);
-        (
-            projection,
-            recorder_health,
-            remote_live,
-            remote_overview_history,
-        )
+        history_store.with_query_request(result.snapshot.as_of, |history_store| {
+            let (projection, recorder_health) = stage_and_load_history_selected(
+                history_store,
+                history_observation.as_ref(),
+                &result.snapshot.tasks,
+                &result.local_session_digests,
+                result.snapshot.as_of,
+                &config.perf_log,
+                false,
+                history_source_selection,
+            );
+            let remote_live = history_store.load_remote_live_states();
+            let unified_seed = matches!(projection.selection, HistorySourceSelection::AllIncluded)
+                .then_some(&projection.history);
+            let remote_overview_history =
+                history_store.load_remote_overview_history(unified_seed, result.snapshot.as_of);
+            (
+                projection,
+                recorder_health,
+                remote_live,
+                remote_overview_history,
+            )
+        })
     };
     history_span.finish_with(|| {
         format!(
@@ -10691,36 +10649,41 @@ fn start_refresh_if_due(
                     let mut history_store = worker_history
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let history = match result.as_ref() {
-                        Some(result) => {
-                            let history_observation =
-                                collection_history_observation(result, worker_config.offline);
-                            Some(stage_and_load_history_selected(
-                                &mut history_store,
-                                history_observation.as_ref(),
-                                &result.snapshot.tasks,
-                                &result.local_session_digests,
-                                result.snapshot.as_of,
+                    let query_now = result
+                        .as_ref()
+                        .map_or_else(Utc::now, |result| result.snapshot.as_of);
+                    history_store.with_query_request(query_now, |history_store| {
+                        let history = match result.as_ref() {
+                            Some(result) => {
+                                let history_observation =
+                                    collection_history_observation(result, worker_config.offline);
+                                Some(stage_and_load_history_selected(
+                                    history_store,
+                                    history_observation.as_ref(),
+                                    &result.snapshot.tasks,
+                                    &result.local_session_digests,
+                                    result.snapshot.as_of,
+                                    &worker_config.perf_log,
+                                    false,
+                                    &history_source_selection,
+                                ))
+                            }
+                            None => flush_or_reload_history_if_due(
+                                history_store,
+                                query_now,
                                 &worker_config.perf_log,
-                                false,
                                 &history_source_selection,
-                            ))
-                        }
-                        None => flush_or_reload_history_if_due(
-                            &mut history_store,
-                            Utc::now(),
-                            &worker_config.perf_log,
-                            &history_source_selection,
-                        ),
-                    };
-                    let remote_live = history_store.load_remote_live_states();
-                    let unified_seed = history.as_ref().and_then(|(projection, _)| {
-                        matches!(projection.selection, HistorySourceSelection::AllIncluded)
-                            .then_some(&projection.history)
-                    });
-                    let remote_overview_history =
-                        history_store.load_remote_overview_history(unified_seed, Utc::now());
-                    (history, Some(remote_live), Some(remote_overview_history))
+                            ),
+                        };
+                        let remote_live = history_store.load_remote_live_states();
+                        let unified_seed = history.as_ref().and_then(|(projection, _)| {
+                            matches!(projection.selection, HistorySourceSelection::AllIncluded)
+                                .then_some(&projection.history)
+                        });
+                        let remote_overview_history =
+                            history_store.load_remote_overview_history(unified_seed, query_now);
+                        (history, Some(remote_live), Some(remote_overview_history))
+                    })
                 };
                 let (history, recorder_health) =
                     history_and_recorder.map_or((None, None), |(projection, recorder_health)| {

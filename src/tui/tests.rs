@@ -10680,6 +10680,222 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
 }
 
 #[test]
+fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_old_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let mut runtime = HistoryRuntime::new(
+        directory.path().join("state/history-v1"),
+        &codex_home,
+        false,
+    )
+    .unwrap();
+    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    assert!(matches!(
+        prepare_tui_history_runtime(&mut runtime, &lease, now),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    let remote_id: NodeId = "node-fedcba9876543210fedcba9876543210".parse().unwrap();
+    let remote = SourceMetadata::new_with_redaction_profile(
+        remote_id.clone(),
+        SourceKind::Ssh,
+        "remote",
+        RedactionProfile::PreviewEnabled,
+    )
+    .unwrap();
+    let source_store = runtime.source_history().clone();
+    source_store.save_source_metadata(&remote).unwrap();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
+    let seed = HistoryData {
+        half_hour_buckets: vec![tui_runtime_test_bucket(
+            now - ChronoDuration::minutes(20),
+            42,
+        )],
+        warnings: vec!["seed usage is incomplete".to_owned()],
+        ..HistoryData::default()
+    };
+    store
+        .load_remote_overview_history(Some(&seed), now)
+        .unwrap();
+    assert!(store.remote_overview_cache.initialized);
+    assert!(store.remote_overview_cache.revision.is_some());
+
+    source_store
+        .update_source_metadata(&remote_id, |source| {
+            source.set_include_in_aggregates(false);
+            Ok(())
+        })
+        .unwrap();
+    let expected = RemoteOverviewHistory::from_unified(&seed, std::iter::empty(), now);
+    assert_ne!(expected, RemoteOverviewHistory::default());
+    store.with_query_request(now, |store| {
+        let history = store
+            .load_remote_overview_history(Some(&seed), now)
+            .unwrap();
+        assert_eq!(history, expected, "retain all seed buckets and warnings");
+        assert_eq!(store.query_context.as_ref().unwrap().quota_loads, 0);
+    });
+    assert!(!store.remote_overview_cache.initialized);
+    assert!(store.remote_overview_cache.revision.is_none());
+    assert!(store.remote_overview_cache.loaded_at.is_none());
+    assert_eq!(
+        store.remote_overview_cache.history,
+        RemoteOverviewHistory::default(),
+        "a removed remote must not retain a reusable old projection"
+    );
+
+    // Without a seed, even an empty remote list must still execute the unified
+    // query so its errors and warnings are preserved.
+    store.with_query_request(now, |store| {
+        store.load_remote_overview_history(None, now).unwrap();
+        assert_eq!(store.query_context.as_ref().unwrap().quota_loads, 1);
+    });
+
+    let added_id: NodeId = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
+    source_store
+        .save_source_metadata(
+            &SourceMetadata::new_with_redaction_profile(
+                added_id.clone(),
+                SourceKind::Ssh,
+                "added remote",
+                RedactionProfile::PreviewEnabled,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store.with_query_request(now, |store| {
+        store.load_remote_overview_history(None, now).unwrap();
+        assert_eq!(
+            store.query_context.as_ref().unwrap().quota_loads,
+            1,
+            "a newly added remote invalidates the preceding empty-source query"
+        );
+    });
+    assert!(store.remote_overview_cache.initialized);
+    assert!(
+        store
+            .remote_overview_cache
+            .revision
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .any(|(source, _)| source.source_id() == &added_id)
+    );
+    store.with_query_request(now, |store| {
+        store.load_remote_overview_history(None, now).unwrap();
+        assert_eq!(
+            store.query_context.as_ref().unwrap().quota_loads,
+            0,
+            "unchanged remote inputs still permit normal cache reuse"
+        );
+    });
+}
+
+#[test]
+fn application_refresh_shares_quota_with_background_overview_and_invalidates_quota_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let mut runtime = HistoryRuntime::new(
+        directory.path().join("state/history-v1"),
+        &codex_home,
+        false,
+    )
+    .unwrap();
+    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    assert!(matches!(
+        prepare_tui_history_runtime(&mut runtime, &lease, now),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
+    let remote_id: NodeId = "node-fedcba9876543210fedcba9876543210".parse().unwrap();
+    let remote = SourceMetadata::new_with_redaction_profile(
+        remote_id.clone(),
+        SourceKind::Ssh,
+        "remote",
+        RedactionProfile::PreviewEnabled,
+    )
+    .unwrap();
+    runtime
+        .source_history()
+        .save_source_metadata(&remote)
+        .unwrap();
+    let source_store = runtime.source_history().clone();
+    let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
+    let since = history_view_since(now);
+    let observation = tui_runtime_test_observation(now - ChronoDuration::minutes(20), 10);
+    let stages_before = crate::history_application::stage_calls();
+    store.with_query_request(now, |store| {
+        let (projection, _) = stage_and_load_history_selected(
+            store,
+            &observation,
+            &[],
+            &LocalSessionDigestEvidence::empty(observation.observed_at),
+            now,
+            &PerfLog::default(),
+            true,
+            &selection,
+        );
+        assert!(projection.query_error.is_none());
+        store.load_remote_overview_history(None, now).unwrap();
+        assert_eq!(
+            store.query_context.as_ref().unwrap().quota_loads,
+            1,
+            "selected report and off-page Overview share the account query"
+        );
+        assert_eq!(crate::history_application::stage_calls() - stages_before, 1);
+    });
+    assert!(store.projection_cache_valid(&selection, since, false));
+    source_store
+        .update_source_metadata(&remote_id, |source| {
+            source.set_quota_matches_local_account(true);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        !store.projection_cache_valid(&selection, since, false),
+        "another source's quota policy invalidates an exact-local cache"
+    );
+    let reloaded = store
+        .reload_since_if_stale_with_staged_selected(&selection, since)
+        .unwrap();
+    assert!(reloaded.query_error.is_none());
+    assert_eq!(reloaded.selection, selection);
+    assert!(
+        store.query_context.is_none(),
+        "a later refresh cannot reuse an earlier request's quota"
+    );
+    store.load_remote_overview_history(None, now).unwrap();
+    if let TuiHistoryBackend::Runtime(runtime) = &mut store.backend {
+        runtime
+            .record_local_observation(
+                &tui_runtime_test_observation(now - ChronoDuration::minutes(20), 20),
+                LocalObservationMode::Incremental,
+            )
+            .unwrap();
+    }
+    store.with_query_request(now, |store| {
+        store.load_remote_overview_history(None, now).unwrap();
+        assert_eq!(
+            store.query_context.as_ref().unwrap().quota_loads,
+            1,
+            "local revision changes must invalidate non-current-page Overview as well"
+        );
+    });
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.with_query_request(now, |_| panic!("injected refresh failure"));
+    }));
+    assert!(panic.is_err());
+    assert!(
+        store.query_context.is_none(),
+        "a failed worker must discard its request context"
+    );
+}
+
+#[test]
 fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
