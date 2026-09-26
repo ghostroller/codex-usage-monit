@@ -29,6 +29,33 @@ permissions on the user's actual state just to make tests pass. Keep this test
 TEMP outside any Git checkout: repository-discovery tests intentionally inspect
 all ancestor directories, so a checkout-local TEMP is not a non-repository fixture.
 
+`verify.ps1 -TestTempDir C:\path\to\private-temp` optionally selects an existing
+test directory for both `TEMP` and `TMP`. Without this option it inherits the
+caller's environment. Before tests or smoke checks, the runner rejects a missing
+directory, a Git checkout ancestor, or fixture ACLs inherited by identities other
+than the executing account, SYSTEM and Administrators. It prints the effective
+account, temporary path and shell environment; it never repairs that directory's
+ACL or grants token privileges. Use a newly created private directory for the
+test account, not the user's application state. Keep the path short: the immutable
+agent installation adds a version/hash path, and Windows PowerShell 5.1 cannot
+execute that fixture when the resulting path reaches its legacy 260-character
+limit, even if direct native execution succeeds.
+
+Run each shell from the intended account with separate local Cargo directories,
+for example:
+
+```powershell
+pwsh.exe -NoProfile -File .\scripts\windows\verify.ps1 -TestTempDir C:\private-test-temp -CargoTargetDir C:\build\monit-target -CargoBuildDir C:\build\monit-build
+powershell.exe -NoProfile -File .\scripts\windows\verify.ps1 -TestTempDir C:\private-test-temp -ScriptContractsOnly
+```
+
+The Windows PowerShell entry scopes `PSModulePath` to that engine's built-in
+modules so a parent PowerShell 7 module path cannot select incompatible cmdlets.
+`TEMP`, `TMP` and `PSModulePath` are restored on success and failure. Registry,
+symbolic-link and ACL-repair fixtures still require their actual permissions;
+this preflight does not make a restricted sandbox equivalent to the normal
+Windows account. Record any separate normal-account supplement explicitly.
+
 To start the development TUI on a native Windows machine with comprehensive
 application logging, run `& .\scripts\windows\dev.ps1`. See the
 [Windows TUI logging instructions](../README.md#tui-warnings-and-errors-on-windows)
@@ -122,10 +149,10 @@ no persistent PATH changes. The runner does not download, update or delete this
 runtime.
 
 This mode prepares the same MSVC environment and compiles only small native
-fixtures. Each engine runs 60 verification-wrapper cases (both native-error
+fixtures. Each engine runs 78 verification-wrapper cases (both native-error
 preferences through GitHub-style `-Command`, `-File`, and UTM wrappers), 17
-development-launcher cases, and 10 permission-repair cases: **87 per engine,
-174 total**. It skips project Cargo tests, format, Clippy, application builds and
+development-launcher cases, and 10 permission-repair cases: **105 per engine,
+210 total**. It skips project Cargo tests, format, Clippy, application builds and
 the real CLI smoke. It cannot be combined with focused/test-filter, target,
 release-profile or doctor options. Results explicitly record `scope: shell-contracts`
 and each engine's executable, actual version, architecture, status, total case

@@ -15,7 +15,7 @@ must also use local fixed drives.
 
 [CmdletBinding()]
 param(
-    [string]$RepositoryPath = (Join-Path $PSScriptRoot "..\.."),
+    [string]$RepositoryPath,
 
     [ValidateSet("debug", "release")]
     [string]$Profile = "debug",
@@ -25,6 +25,8 @@ param(
     [string]$CargoTargetDir,
 
     [string]$CargoBuildDir,
+
+    [string]$TestTempDir,
 
     [string]$TestFilter,
 
@@ -82,6 +84,44 @@ function Invoke-InstallerContracts {
         Write-Host "==> Test $pattern (PowerShell 5.1 and 7 where applicable)"
         & python -B -m unittest discover -s tests -p $pattern -v
         Assert-NativeSuccess "Test $pattern"
+    }
+}
+
+function Assert-TestTemporaryEnvironment {
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if (-not (Test-Path -LiteralPath $temporaryRoot -PathType Container)) {
+        throw "Test TEMP must be an existing directory: $temporaryRoot"
+    }
+    for ($ancestor = [IO.DirectoryInfo]::new($temporaryRoot); $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+        if (Test-Path -LiteralPath (Join-Path $ancestor.FullName '.git')) {
+            throw "Test TEMP must be outside any Git checkout: $temporaryRoot. Select a short private directory with -TestTempDir."
+        }
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    Write-Host "Windows verification account: $($identity.Name) [$($identity.User.Value)]"
+    Write-Host "Windows effective test temp: $temporaryRoot (TEMP=$env:TEMP; TMP=$env:TMP)"
+    Write-Host "PowerShell: $($PSVersionTable.PSVersion); PSModulePath: $env:PSModulePath"
+    # Inspect the permissions a real fixture inherits, without repairing the
+    # caller's TEMP or granting any account privileges. Inherit-only ACEs on
+    # the parent need not be permissions on the fixture itself.
+    $probe = Join-Path $temporaryRoot ('monit-temp-probe-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $probe | Out-Null
+    try {
+        $allowed = @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')
+        $acl = Get-Acl -LiteralPath $probe
+        $unexpected = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+            $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 -and
+            $_.IdentityReference.Value -notin $allowed
+        })
+        if ($unexpected.Count -gt 0) {
+            $principals = ($unexpected | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) -join ', '
+            throw "Test TEMP fixtures inherit access for other identities ($principals). Select a private directory owned by the test account with -TestTempDir; verification does not change its ACL."
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -337,6 +377,9 @@ if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo was not found. Run scripts\\windows\\bootstrap.ps1 first."
 }
 
+if (-not $PSBoundParameters.ContainsKey('RepositoryPath')) {
+    $RepositoryPath = Join-Path $PSScriptRoot '..\..'
+}
 $repositoryRoot = (Resolve-Path -LiteralPath $RepositoryPath).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -PathType Leaf)) {
     throw "RepositoryPath does not contain Cargo.toml: $repositoryRoot"
@@ -363,11 +406,26 @@ foreach ($directory in @($CargoTargetDir, $CargoBuildDir)) {
 }
 $originalCargoTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DIR", "Process")
 $originalCargoBuildDir = [Environment]::GetEnvironmentVariable("CARGO_BUILD_BUILD_DIR", "Process")
+$originalTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
+$originalTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+$originalModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
 $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($CargoTargetDir)
 $env:CARGO_BUILD_BUILD_DIR = [System.IO.Path]::GetFullPath($CargoBuildDir)
 
 Push-Location $repositoryRoot
 try {
+    if (-not [string]::IsNullOrWhiteSpace($TestTempDir)) {
+        $env:TEMP = [IO.Path]::GetFullPath($TestTempDir)
+        $env:TMP = $env:TEMP
+    }
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        # A Windows PowerShell child of pwsh can inherit PowerShell 7 modules.
+        # These contracts use only the engine's own built-in modules.
+        $env:PSModulePath = Join-Path $PSHOME 'Modules'
+    }
+    if ($ScriptContractsOnly -or -not $SkipTests -or -not $SkipSmoke) {
+        Assert-TestTemporaryEnvironment
+    }
     Import-VisualStudioDeveloperEnvironment $Target
 
     $rustcVersion = & rustc -vV
@@ -457,6 +515,18 @@ catch {
 }
 finally {
     Pop-Location
+    foreach ($entry in @(
+        @{ Name = 'TEMP'; Value = $originalTemp },
+        @{ Name = 'TMP'; Value = $originalTmp },
+        @{ Name = 'PSModulePath'; Value = $originalModulePath }
+    )) {
+        if ($null -eq $entry.Value) {
+            Remove-Item -Path ('Env:' + $entry.Name) -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item -Path ('Env:' + $entry.Name) -Value $entry.Value
+        }
+    }
     if ($null -eq $originalCargoBuildDir) {
         Remove-Item -Path "Env:CARGO_BUILD_BUILD_DIR" -ErrorAction SilentlyContinue
     }

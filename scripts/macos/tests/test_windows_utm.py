@@ -19,10 +19,10 @@ class WindowsRunnerTests(unittest.TestCase):
     @staticmethod
     def engine_evidence():
         return [
-            dict(engine="windows-powershell", version="5.1.26100.1", executable="C:\\Windows\\powershell.exe", status="passed", casesPassed=87,
-                 contractCases={"verification": 60, "launcher": 17, "permissions": 10}),
-            dict(engine="powershell-7", version="7.6.2", executable="C:\\Program Files\\PowerShell\\7\\pwsh.exe", status="passed", casesPassed=87,
-                 contractCases={"verification": 60, "launcher": 17, "permissions": 10}),
+            dict(engine="windows-powershell", version="5.1.26100.1", executable="C:\\Windows\\powershell.exe", status="passed", casesPassed=105,
+                 contractCases={"verification": 78, "launcher": 17, "permissions": 10}),
+            dict(engine="powershell-7", version="7.6.2", executable="C:\\Program Files\\PowerShell\\7\\pwsh.exe", status="passed", casesPassed=105,
+                 contractCases={"verification": 78, "launcher": 17, "permissions": 10}),
         ]
 
     def test_zero_transport_exit_with_utm_event_error_is_failure(self):
@@ -61,8 +61,8 @@ class WindowsRunnerTests(unittest.TestCase):
         invalid = [dict(scope="full"), dict(engines=[]), dict(engines=[valid["engines"][0]]),
                    dict(engines=[valid["engines"][0], valid["engines"][0]]), dict(engines=[None, None])]
         for mutation in [dict(version="5.1.26100.1"), dict(casesPassed=60), dict(status="failed"),
-                         dict(contractCases=None), dict(contractCases={"verification": 60}),
-                         dict(contractCases={"verification": 60, "launcher": 16, "permissions": 11}),
+                         dict(contractCases=None), dict(contractCases={"verification": 78}),
+                         dict(contractCases={"verification": 78, "launcher": 16, "permissions": 11}),
                          dict(executable=""), dict(engine="unexpected")]:
             invalid.append(dict(engines=[valid["engines"][0], valid["engines"][1] | mutation]))
         for mutation in invalid:

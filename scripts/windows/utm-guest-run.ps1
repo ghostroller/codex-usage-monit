@@ -105,7 +105,7 @@ if ($Child) {
         if ($childExitCode -eq 0) {
             $transcript = Get-Content -LiteralPath $logPath -Raw
             $contracts = @(
-                @{ name = 'verification'; count = 60; pattern = 'Windows verification regression: (\d+) cases passed under PowerShell ([0-9.]+)\.' },
+                @{ name = 'verification'; count = 78; pattern = 'Windows verification regression: (\d+) cases passed under PowerShell ([0-9.]+)\.' },
                 @{ name = 'launcher'; count = 17; pattern = 'Windows development launcher: (\d+) cases passed under PowerShell ([0-9.]+)\.' },
                 @{ name = 'permissions'; count = 10; pattern = 'PASS: (\d+) permission-repair contracts; PowerShell ([0-9.]+);' }
             )

@@ -379,6 +379,13 @@ impl GitProjectEvidenceResolver {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_runner(runner: GitCommandRunner) -> Self {
+        let mut resolver = Self::default();
+        resolver.runner = runner;
+        resolver
+    }
+
+    #[cfg(test)]
     fn with_runner_and_budget(
         runner: GitCommandRunner,
         total_budget: Duration,
@@ -1574,9 +1581,21 @@ mod tests {
 
     #[test]
     fn confirmed_non_repository_is_cached_across_collection_refreshes() {
+        fn confirmed_absent(
+            _cwd: &Path,
+            arguments: &[&str],
+            _timeout: Duration,
+        ) -> io::Result<Vec<u8>> {
+            assert_eq!(arguments, &["rev-parse", "--show-toplevel"]);
+            Err(io::Error::other(GitCommandExit(128)))
+        }
         let directory = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(directory.path()).unwrap();
-        let mut resolver = GitProjectEvidenceResolver::default();
+        assert!(
+            filesystem_confirms_no_git_marker(&canonical).unwrap(),
+            "non-repository fixture requires TEMP outside every Git checkout"
+        );
+        let mut resolver = GitProjectEvidenceResolver::with_runner(confirmed_absent);
         resolver.begin_collection();
         assert_eq!(
             resolver.inspect(&canonical),

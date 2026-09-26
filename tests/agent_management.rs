@@ -100,6 +100,16 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
         use base64::Engine;
         use std::os::windows::process::CommandExt;
 
+        assert!(
+            installed
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&installed)
+                .encode_utf16()
+                .count()
+                < 260,
+            "Windows PowerShell 5.1 requires a short fixture path; use a short private TEMP outside the checkout: {installed}"
+        );
+
         // Match the production SSH command: cmd cannot directly execute a
         // canonical \\?\ path, so invoke it through encoded PowerShell. Pass
         // cmd's command text literally rather than applying CRT argv quoting.

@@ -897,16 +897,6 @@ pub fn normalize_observation_project_keys(
 /// task cwd evidence is still available. Git probing is deliberately
 /// best-effort: failure removes only the merge suggestion metadata and never
 /// blocks usage registration.
-#[cfg(test)]
-pub(crate) fn local_project_descriptors(
-    tasks: &[TaskRecord],
-    observation: &HistoryObservation,
-) -> Vec<RemoteProjectDescriptor> {
-    let mut git = GitProjectEvidenceResolver::default();
-    git.begin_collection();
-    local_project_descriptors_with_resolver(tasks, observation, &mut git)
-}
-
 pub(crate) fn local_project_descriptors_with_resolver(
     tasks: &[TaskRecord],
     observation: &HistoryObservation,
@@ -2995,6 +2985,56 @@ mod tests {
         )
     }
 
+    fn prepare_git_evidence_fixture(repository: &std::path::Path, workspace: &std::path::Path) {
+        // Keep real Git discovery/configuration coverage in fixture setup.
+        // Replay those exact bytes for materialization assertions so OS spawn
+        // scheduling is not confused with a failure of redaction or caching.
+        for (cwd, arguments, filename) in [
+            (
+                workspace,
+                vec!["rev-parse", "--show-toplevel"],
+                ".test-git-root",
+            ),
+            (
+                repository,
+                vec!["rev-parse", "--show-toplevel"],
+                ".test-git-root",
+            ),
+            (
+                repository,
+                vec!["config", "--local", "--get", "remote.origin.url"],
+                ".test-git-origin",
+            ),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "real Git fixture preparation failed"
+            );
+            fs::write(cwd.join(filename), output.stdout).unwrap();
+        }
+    }
+
+    fn recorded_git_resolver() -> GitProjectEvidenceResolver {
+        fn runner(
+            cwd: &std::path::Path,
+            arguments: &[&str],
+            _timeout: std::time::Duration,
+        ) -> io::Result<Vec<u8>> {
+            let filename = match arguments {
+                ["rev-parse", "--show-toplevel"] => ".test-git-root",
+                ["config", "--local", "--get", "remote.origin.url"] => ".test-git-origin",
+                _ => panic!("unexpected Git operation in materialization fixture"),
+            };
+            fs::read(cwd.join(filename))
+        }
+        GitProjectEvidenceResolver::with_runner(runner)
+    }
+
     #[test]
     fn rekeys_root_and_descendant_with_the_same_private_observed_key() {
         let directory = tempdir().unwrap();
@@ -3057,8 +3097,10 @@ mod tests {
         let mut normalized_observation = observation(vec![group("root", None)]);
         let identity = identity("node-0123456789abcdef0123456789abcdef", &"12".repeat(32));
         normalize_observation_project_keys(&identity, &tasks, &mut normalized_observation);
-
-        let descriptors = local_project_descriptors(&tasks, &normalized_observation);
+        prepare_git_evidence_fixture(&repository, &workspace);
+        let mut git = recorded_git_resolver();
+        let descriptors =
+            local_project_descriptors_with_resolver(&tasks, &normalized_observation, &mut git);
         assert_eq!(descriptors.len(), 1);
         let descriptor = &descriptors[0];
         assert!(descriptor.git_evidence.fingerprint().is_some());
@@ -3076,7 +3118,8 @@ mod tests {
         let root_tasks = vec![task("root", None, Some(canonical_repository))];
         let mut root_observation = observation(vec![group("root", None)]);
         normalize_observation_project_keys(&identity, &root_tasks, &mut root_observation);
-        let root_descriptors = local_project_descriptors(&root_tasks, &root_observation);
+        let root_descriptors =
+            local_project_descriptors_with_resolver(&root_tasks, &root_observation, &mut git);
         assert_eq!(
             root_descriptors[0]
                 .git_evidence
@@ -3120,7 +3163,8 @@ mod tests {
         let source_observation = observation(vec![group("root", None)]);
         let captured_at = source_observation.observed_at;
         let identity = identity("node-0123456789abcdef0123456789abcdef", &"13".repeat(32));
-        let mut git = GitProjectEvidenceResolver::default();
+        prepare_git_evidence_fixture(&repository, &repository);
+        let mut git = recorded_git_resolver();
         git.begin_collection();
 
         let live = materialize_live_snapshot_with_git_resolver(
@@ -3142,6 +3186,8 @@ mod tests {
         // If aggregate materialization created a second resolver or spawned
         // Git again, the repository would no longer be discoverable here.
         fs::rename(repository.join(".git"), repository.join(".git-hidden")).unwrap();
+        fs::remove_file(repository.join(".test-git-root")).unwrap();
+        fs::remove_file(repository.join(".test-git-origin")).unwrap();
         let aggregate = materialize_source_observation_with_git_resolver(
             &identity,
             RedactionProfile::PreviewEnabled,
@@ -3156,6 +3202,37 @@ mod tests {
             aggregate.project_descriptors[0].git_evidence.fingerprint(),
             live.project_descriptors[0].git_evidence.fingerprint()
         );
+        assert_eq!(git.collection_stats().commands, 2);
+        assert!(git.collection_stats().cache_hits > 0);
+    }
+
+    #[test]
+    fn project_descriptors_keep_project_when_git_probe_times_out() {
+        fn timed_out(
+            _cwd: &std::path::Path,
+            _arguments: &[&str],
+            _timeout: std::time::Duration,
+        ) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "controlled Git deadline",
+            ))
+        }
+        let directory = tempdir().unwrap();
+        let canonical = fs::canonicalize(directory.path()).unwrap();
+        let tasks = vec![task("root", None, Some(canonical))];
+        let mut source_observation = observation(vec![group("root", None)]);
+        let identity = identity("node-0123456789abcdef0123456789abcdef", &"14".repeat(32));
+        normalize_observation_project_keys(&identity, &tasks, &mut source_observation);
+        let mut git = GitProjectEvidenceResolver::with_runner(timed_out);
+        let descriptors =
+            local_project_descriptors_with_resolver(&tasks, &source_observation, &mut git);
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(
+            descriptors[0].git_evidence,
+            crate::remote_protocol::RemoteGitRepositoryEvidence::Unavailable
+        );
+        assert_eq!(git.collection_stats().commands, 1);
     }
 
     #[test]

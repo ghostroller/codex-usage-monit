@@ -21,7 +21,7 @@ import zipfile
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 DEFAULT_VM = "codex-usage-monit-windows"
-SHELL_CONTRACT_CASES = {"verification": 60, "launcher": 17, "permissions": 10}
+SHELL_CONTRACT_CASES = {"verification": 78, "launcher": 17, "permissions": 10}
 
 
 class GuestError(RuntimeError):

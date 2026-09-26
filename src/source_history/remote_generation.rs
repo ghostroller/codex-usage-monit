@@ -950,6 +950,7 @@ impl SourceHistoryStore {
         })
     }
 
+    #[cfg_attr(test, allow(clippy::too_many_arguments))]
     fn activate_remote_history_generation_unfenced(
         &self,
         source_id: &NodeId,
@@ -958,6 +959,7 @@ impl SourceHistoryStore {
         candidate_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
         activated_at: DateTime<Utc>,
+        #[cfg(test)] before_manifest: Option<&dyn Fn()>,
     ) -> io::Result<()> {
         if let Some(expected_active) = expected_active {
             expected_active.validate_namespace(source_id)?;
@@ -1057,6 +1059,10 @@ impl SourceHistoryStore {
             binding: candidate_binding.clone(),
             activated_at,
         };
+        #[cfg(test)]
+        if let Some(before_manifest) = before_manifest {
+            before_manifest();
+        }
         write_private_atomically(
             &root.join(REMOTE_ACTIVE_MANIFEST_FILE),
             &encode_pretty_bounded(&manifest, MAX_REMOTE_GENERATION_FILE_BYTES)?,
@@ -1742,6 +1748,7 @@ impl SourceHistoryStore {
             candidate_generation,
             candidate_binding,
             activated_at,
+            None,
         )
     }
 
@@ -1872,6 +1879,8 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 candidate_generation,
                 candidate_binding,
                 activated_at,
+                #[cfg(test)]
+                None,
             )
         })
     }
@@ -2989,9 +2998,6 @@ fn validate_binding_does_not_roll_back(
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration as StdDuration;
 
     use chrono::{Duration, TimeZone};
     use tempfile::tempdir;
@@ -4100,58 +4106,30 @@ mod tests {
             )
             .unwrap();
 
-        let (between_sender, between_receiver) = mpsc::channel();
-        let (continue_sender, continue_receiver) = mpsc::channel();
-        let reader_history = history.clone();
-        let reader_source = source.clone();
-        let reader = thread::spawn(move || {
-            reader_history.load_remote_history_snapshot_since_with_between_families(
-                &reader_source,
+        // Open the same root-lock object used by activation through an
+        // independent descriptor. Probe actual contention at the family
+        // boundary, rather than treating an unscheduled publisher as blocked.
+        let root = history.source_remote_history_directory(&source, redaction);
+        let publisher_lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE).unwrap();
+        let read_boundary_checked = std::cell::Cell::new(false);
+        let before = history
+            .load_remote_history_snapshot_since_with_between_families(
+                &source,
                 redaction,
                 at(9, 0),
                 || {
-                    between_sender.send(()).unwrap();
-                    continue_receiver
-                        .recv_timeout(StdDuration::from_secs(5))
-                        .expect("snapshot test did not release the family boundary");
+                    assert!(
+                        matches!(publisher_lock.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                        "manifest publication must contend with the snapshot's root lock"
+                    );
+                    read_boundary_checked.set(true);
                 },
             )
-        });
-        between_receiver
-            .recv_timeout(StdDuration::from_secs(5))
-            .expect("snapshot did not reach the boundary between record families");
-
-        let (started_sender, started_receiver) = mpsc::channel();
-        let (activated_sender, activated_receiver) = mpsc::channel();
-        let activation_history = history.clone();
-        let activation_source = source.clone();
-        let activation_binding = binding.clone();
-        let activation_replacement = replacement.clone();
-        let activation = thread::spawn(move || {
-            started_sender.send(()).unwrap();
-            let result = activation_history.activate_remote_history_generation(
-                &activation_source,
-                redaction,
-                Some(&first_active),
-                &activation_replacement,
-                &activation_binding,
-                at(11, 15),
-            );
-            activated_sender.send(()).unwrap();
-            result
-        });
-        started_receiver
-            .recv_timeout(StdDuration::from_secs(5))
-            .expect("activation thread did not start");
+            .unwrap();
         assert!(
-            activated_receiver
-                .recv_timeout(StdDuration::from_millis(100))
-                .is_err(),
-            "manifest activation must wait for the combined snapshot root lock"
+            read_boundary_checked.get(),
+            "snapshot must reach the boundary between both record families"
         );
-
-        continue_sender.send(()).unwrap();
-        let before = reader.join().unwrap().unwrap();
         assert_eq!(before.active_ref.as_ref().unwrap().generation(), &first);
         assert_eq!(before.bucket_records.len(), 1);
         assert_eq!(bucket_total(&before.bucket_records[0]), 10);
@@ -4164,10 +4142,35 @@ mod tests {
             vec!["old-thread"]
         );
 
-        activation.join().unwrap().unwrap();
-        activated_receiver
-            .recv_timeout(StdDuration::from_secs(5))
-            .expect("activation did not finish after the snapshot released its lock");
+        publisher_lock
+            .try_lock()
+            .expect("snapshot must release its root lock after both families");
+        publisher_lock.unlock().unwrap();
+        let publication_checked = std::cell::Cell::new(false);
+        history
+            .activate_remote_history_generation_unfenced(
+                &source,
+                redaction,
+                Some(&first_active),
+                &replacement,
+                &binding,
+                at(11, 15),
+                Some(&|| {
+                    assert!(
+                        matches!(
+                            publisher_lock.try_lock_shared(),
+                            Err(fs::TryLockError::WouldBlock)
+                        ),
+                        "actual manifest publication must hold the exclusive root lock"
+                    );
+                    publication_checked.set(true);
+                }),
+            )
+            .unwrap();
+        assert!(
+            publication_checked.get(),
+            "activation must reach publication"
+        );
         let after = history
             .load_remote_history_snapshot_since(&source, redaction, at(9, 0))
             .unwrap();
