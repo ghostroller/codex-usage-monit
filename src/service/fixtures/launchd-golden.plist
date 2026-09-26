@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ghostroller.codex-usage-monit.recorder</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/Codex &amp; tools/monitor</string>
+        <string>--codex-home</string>
+        <string>/home/test/Codex Home</string>
+        <string>--days</string>
+        <string>7</string>
+        <string>--max-files</string>
+        <string>500</string>
+        <string>--active-grace-minutes</string>
+        <string>5</string>
+        <string>record</string>
+        <string>--foreground</string>
+        <string>--service-cutover-protocol</string>
+        <string>source-aware-v2</string>
+        <string>--service-definition-id</string>
+        <string>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</string>
+        <string>--history-dir</string>
+        <string>/home/test/history-v1</string>
+        <string>--status-file</string>
+        <string>/home/test/status.json</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/a &amp; b:/usr/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

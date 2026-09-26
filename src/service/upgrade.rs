@@ -752,9 +752,10 @@ fn read_registration_definition() -> Result<Option<Registration>> {
             let Some(bytes) = read(&launchd_registration_path()?)? else {
                 return Ok(None);
             };
+            let definition = launchd_plist::parse(&bytes)?;
             (
-                launchd_definition_arguments(&bytes)?,
-                launchd_definition_environment_path(&bytes)?,
+                definition.arguments,
+                definition.environment_path,
                 !launchd_disabled()?,
                 service_definition_fingerprint(&bytes),
             )

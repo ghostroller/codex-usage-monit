@@ -26,6 +26,7 @@ use crate::history::HistoryStore;
 #[cfg(windows)]
 use crate::source_identity::validate_windows_private_file;
 
+mod launchd_plist;
 mod recorder_coordination;
 mod upgrade;
 mod windows_host;
@@ -1269,8 +1270,9 @@ pub(crate) fn current_user_service_definition_observation() -> Result<ServiceDef
                 "launchd service definition",
             ) {
                 Ok(contents) => {
-                    let expected_arguments = launchd_definition_arguments(&contents)?;
-                    let expected_path = launchd_definition_environment_path(&contents)?;
+                    let definition = launchd_plist::parse(&contents)?;
+                    let expected_arguments = definition.arguments;
+                    let expected_path = definition.environment_path;
                     let definition_id = verify_service_contract_arguments(
                         &expected_arguments
                             .iter()
@@ -1569,47 +1571,14 @@ fn launchd_definition_id(contents: &[u8]) -> Result<String> {
     .map(str::to_string)
 }
 
+#[cfg(test)]
 fn launchd_definition_arguments(contents: &[u8]) -> Result<Vec<String>> {
-    let document = std::str::from_utf8(contents).context("launchd definition is not UTF-8")?;
-    let program_arguments_key = "<key>ProgramArguments</key>";
-    if document.matches(program_arguments_key).count() != 1 {
-        bail!("launchd definition lacks one exact ProgramArguments key");
-    }
-    let remainder = document
-        .split_once(program_arguments_key)
-        .expect("the unique key was counted")
-        .1;
-    let array_start = remainder
-        .find("<array>")
-        .ok_or_else(|| anyhow!("launchd ProgramArguments lacks an array"))?;
-    let array = &remainder[array_start + "<array>".len()..];
-    let array_end = array
-        .find("</array>")
-        .ok_or_else(|| anyhow!("launchd ProgramArguments array is unterminated"))?;
-    xml_text_values(&array[..array_end], "string")?
-        .into_iter()
-        .map(|value| {
-            quick_xml::escape::unescape(value)
-                .map(|value| value.into_owned())
-                .map_err(Into::into)
-        })
-        .collect()
+    Ok(launchd_plist::parse(contents)?.arguments)
 }
 
+#[cfg(test)]
 fn launchd_definition_environment_path(contents: &[u8]) -> Result<Option<String>> {
-    let document = std::str::from_utf8(contents).context("launchd definition is not UTF-8")?;
-    let marker = "<key>PATH</key>";
-    if document.matches(marker).count() > 1 {
-        bail!("launchd definition contains duplicate PATH keys");
-    }
-    let Some(remainder) = document.split_once(marker).map(|(_, rest)| rest) else {
-        return Ok(None);
-    };
-    let values = xml_text_values(remainder, "string")?;
-    let value = values
-        .first()
-        .ok_or_else(|| anyhow!("launchd PATH lacks a string value"))?;
-    Ok(Some(quick_xml::escape::unescape(value)?.into_owned()))
+    Ok(launchd_plist::parse(contents)?.environment_path)
 }
 
 #[cfg(test)]
@@ -3587,22 +3556,6 @@ fn decode_windows_task_xml(contents: &[u8]) -> Result<String> {
     String::from_utf8(contents.to_vec()).context("Task Scheduler returned invalid UTF-8 XML")
 }
 
-fn xml_text_values<'a>(document: &'a str, element: &str) -> Result<Vec<&'a str>> {
-    let open = format!("<{element}>");
-    let close = format!("</{element}>");
-    let mut values = Vec::new();
-    let mut remainder = document;
-    while let Some(start) = remainder.find(&open) {
-        remainder = &remainder[start + open.len()..];
-        let end = remainder
-            .find(&close)
-            .ok_or_else(|| anyhow!("Task Scheduler definition has an unterminated <{element}>"))?;
-        values.push(&remainder[..end]);
-        remainder = &remainder[end + close.len()..];
-    }
-    Ok(values)
-}
-
 fn windows_recorder_arguments(options: &ServiceOptions) -> String {
     let mut arguments = Vec::new();
     if let Some(path) = options.environment_path.as_ref() {
@@ -4487,6 +4440,37 @@ mod tests {
         assert_eq!(
             systemd_quote(OsStr::new("/tmp/$cash/%profile")),
             r#""/tmp/$$cash/%%profile""#
+        );
+    }
+
+    #[test]
+    fn launchd_plist_generation_matches_golden_bytes_and_fingerprint() {
+        // Literal paths keep this macOS definition fixture portable to the
+        // native Windows parser tests. Only the platform-bound ID is normalized.
+        let mut options = ServiceOptions::new(
+            PathBuf::from("/opt/Codex & tools/monitor"),
+            PathBuf::from("/home/test/Codex Home"),
+            PathBuf::from("/home/test/history-v1"),
+            PathBuf::from("/home/test/status.json"),
+            None,
+        );
+        options.environment_path = Some(OsString::from("/opt/a & b:/usr/bin"));
+        let generated = launchd_plist(&options);
+        let normalized = generated.replace(&options.service_definition_id(), &"a".repeat(64));
+        let golden = include_str!("service/fixtures/launchd-golden.plist").replace("\r\n", "\n");
+        assert_eq!(normalized, golden);
+        assert_eq!(xml_escape("&<>\"'\n\r"), "&amp;&lt;&gt;&quot;&apos;\n\r");
+        assert_eq!(
+            service_definition_fingerprint(normalized.as_bytes()),
+            "90ffe2d45a3c77ca6597af92ddc64bda97f7e08e586be4bebc14a5535a054fdd"
+        );
+        assert_eq!(
+            launchd_definition_id(generated.as_bytes()).unwrap(),
+            options.service_definition_id()
+        );
+        assert_eq!(
+            launchd_definition_environment_path(generated.as_bytes()).unwrap(),
+            Some("/opt/a & b:/usr/bin".to_string())
         );
     }
 
