@@ -866,7 +866,7 @@ fn open_locked_lock_file(directory: &Path) -> io::Result<FileLock> {
 }
 
 fn lock_opened_lock_file(directory: &Path, file: File) -> io::Result<FileLock> {
-    fs2::FileExt::lock_exclusive(&file)?;
+    std::fs::File::lock(&file)?;
     let file = FileLock::from_locked(file);
 
     // A lock path replaced between open and lock acquisition would otherwise
@@ -2422,10 +2422,10 @@ mod tests {
         let inherited = file.try_clone().unwrap();
         let guard = lock_opened_lock_file(&directory, file).unwrap();
         let contender = open_lock_file(&directory).unwrap();
-        assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+        assert!(std::fs::File::try_lock(&contender).is_err());
 
         drop(guard);
-        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        let acquired = std::fs::File::try_lock(&contender);
         drop(inherited);
         acquired.expect("completed identity operations must release inherited locks");
         drop(FileLock::from_locked(contender));
@@ -2453,7 +2453,7 @@ mod tests {
             .write(true)
             .open(displaced)
             .unwrap();
-        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        let acquired = std::fs::File::try_lock(&contender);
         drop(inherited);
         acquired.expect("identity validation errors must release inherited locks");
         drop(FileLock::from_locked(contender));
@@ -2471,7 +2471,7 @@ mod tests {
         store.load_or_create().unwrap();
 
         let holder = open_lock_file(&state_directory).unwrap();
-        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        std::fs::File::lock(&holder).unwrap();
         let holder = FileLock::from_locked(holder);
 
         let (opened_sender, opened_receiver) = mpsc::channel();

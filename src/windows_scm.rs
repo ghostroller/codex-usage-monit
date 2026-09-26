@@ -261,7 +261,7 @@ fn validate_recorder(options: &MachineRecorderOptions, account_sid: &str) -> Res
 struct MachineLock(fs::File);
 impl Drop for MachineLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        let _ = std::fs::File::unlock(&self.0);
     }
 }
 fn lock(root: &Path, account_sid: &str) -> Result<MachineLock> {
@@ -273,8 +273,15 @@ fn lock(root: &Path, account_sid: &str) -> Result<MachineLock> {
     } else {
         security::create_file(&path, account_sid)?
     };
-    fs2::FileExt::try_lock_exclusive(&file)
-        .context("machine_busy: another machine service mutation is active")?;
+    match std::fs::File::try_lock(&file) {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("machine_busy: another machine service mutation is active");
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).context("machine_lock_failed: cannot acquire machine service lock");
+        }
+    }
     Ok(MachineLock(file))
 }
 

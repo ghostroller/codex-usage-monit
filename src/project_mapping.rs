@@ -2121,8 +2121,8 @@ fn open_lock_file(directory: &Path) -> io::Result<File> {
 fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<FileLock> {
     let file = open_lock_file(directory)?;
     match mode {
-        LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
-        LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
+        LockMode::Shared => std::fs::File::lock_shared(&file)?,
+        LockMode::Exclusive => std::fs::File::lock(&file)?,
     }
     let file = FileLock::from_locked(file);
     validate_private_directory(directory)?;
@@ -2145,8 +2145,8 @@ fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<FileLoc
 fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<FileLock>> {
     let file = open_lock_file(directory)?;
     let result = match mode {
-        LockMode::Shared => fs2::FileExt::try_lock_shared(&file),
-        LockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&file),
+        LockMode::Shared => std::fs::File::try_lock_shared(&file),
+        LockMode::Exclusive => std::fs::File::try_lock(&file),
     };
     match result {
         Ok(()) => {
@@ -2167,17 +2167,9 @@ fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Opt
             )?;
             Ok(Some(file))
         }
-        Err(error) if lock_is_contended(&error) => Ok(None),
-        Err(error) => Err(error),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn add_nofollow_flags(options: &mut OpenOptions) {

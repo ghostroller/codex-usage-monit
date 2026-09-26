@@ -234,7 +234,7 @@ impl SourceHistoryStore {
         // the lock before the same-parent rename; config + writer fencing keeps
         // cooperative writers out, and a racing reader can only make rename
         // fail without deleting anything.
-        fs2::FileExt::unlock(_lock.as_file())?;
+        std::fs::File::unlock(_lock.as_file())?;
         drop(_lock);
         self.validate_private_path(&source)?;
         rename_purge_namespace(&source, &trash)?;

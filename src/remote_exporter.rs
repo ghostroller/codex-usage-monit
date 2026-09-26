@@ -955,22 +955,14 @@ fn try_lock_existing_exporter(path: &Path) -> io::Result<Option<RemoteExportLock
     }
     let file = options.open(path)?;
     validate_open_revision_lock(path, &file, &before)?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file) {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => return Ok(None),
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     let lock = RemoteExportLock::from_locked(file);
     validate_open_revision_lock(path, lock.as_file(), &before)?;
     Ok(Some(lock))
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn validate_open_revision_lock(path: &Path, file: &File, _before: &fs::Metadata) -> io::Result<()> {

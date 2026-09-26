@@ -417,7 +417,7 @@ impl RemoteExportLock {
 
 impl Drop for RemoteExportLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
     }
 }
 
@@ -470,18 +470,18 @@ pub(crate) fn try_acquire_revision_fence(
         .map_err(|error| map_nofollow_error(error, "remote revision fence"))?;
     validate_opened_private_file(&path, &lock, "remote revision fence")?;
     let result = match mode {
-        RemoteRevisionFenceMode::Shared => fs2::FileExt::try_lock_shared(&lock),
-        RemoteRevisionFenceMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock),
+        RemoteRevisionFenceMode::Shared => std::fs::File::try_lock_shared(&lock),
+        RemoteRevisionFenceMode::Exclusive => std::fs::File::try_lock(&lock),
     };
     match result {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "remote export revision is active",
             ));
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     let lock = RemoteExportLock::from_locked(lock);
     prepare_private_root(root)?;
@@ -2577,29 +2577,21 @@ fn try_open_source_lock(
         .open(&path)
         .map_err(|error| map_nofollow_error(error, "remote export lock"))?;
     validate_opened_private_file(&path, &file, "remote export lock")?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file) {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             validate_opened_private_file(&path, &file, "remote export lock")?;
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "remote exporter is already running for this source generation",
             ));
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     let lock = RemoteExportLock::from_locked(file);
     store.prepare_source_directory()?;
     validate_opened_private_file(&path, lock.as_file(), "remote export lock")?;
     Ok(lock)
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn read_private_json_file<T: for<'de> Deserialize<'de>>(

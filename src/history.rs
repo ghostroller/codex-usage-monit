@@ -1155,7 +1155,7 @@ impl HistoryStore {
 
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        std::fs::File::lock(&lock)?;
         let _lock = FileLock::from_locked(lock);
         self.validate_v1_authority_if_present(authority)?;
 
@@ -1413,7 +1413,7 @@ impl HistoryStore {
         let complete = complete && self.staged_observation.is_none();
         create_private_directory(directory)?;
         let lock = open_lock_file(directory)?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        std::fs::File::lock(&lock)?;
         let _lock = FileLock::from_locked(lock);
         self.validate_v1_authority_if_present(authority)?;
 
@@ -1599,7 +1599,7 @@ impl HistoryStore {
                 return data;
             }
         };
-        if let Err(error) = fs2::FileExt::lock_shared(&lock) {
+        if let Err(error) = std::fs::File::lock_shared(&lock) {
             let mut data = HistoryData::default();
             data.warnings.push(format!(
                 "could not lock history in {}: {error}",
@@ -1636,7 +1636,7 @@ impl HistoryStore {
         })?;
         create_private_directory(&directory)?;
         let lock = open_lock_file(&directory)?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        std::fs::File::lock(&lock)?;
         let _lock = FileLock::from_locked(lock);
         let data = self.load_since_locked(&directory, since);
         consume(&data)

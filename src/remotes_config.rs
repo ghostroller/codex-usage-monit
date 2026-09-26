@@ -1748,28 +1748,20 @@ fn open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<FileLoc
 fn try_open_locked_lock_file(directory: &Path, mode: LockMode) -> io::Result<Option<FileLock>> {
     let file = open_lock_file(directory)?;
     let result = match mode {
-        LockMode::Shared => fs2::FileExt::try_lock_shared(&file),
-        LockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&file),
+        LockMode::Shared => std::fs::File::try_lock_shared(&file),
+        LockMode::Exclusive => std::fs::File::try_lock(&file),
     };
     match result {
         Ok(()) => validate_locked_lock_file(directory, FileLock::from_locked(file)).map(Some),
-        Err(error) if lock_is_contended(&error) => Ok(None),
-        Err(error) => Err(error),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn lock_opened_lock_file(directory: &Path, file: File, mode: LockMode) -> io::Result<FileLock> {
     match mode {
-        LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
-        LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
+        LockMode::Shared => std::fs::File::lock_shared(&file)?,
+        LockMode::Exclusive => std::fs::File::lock(&file)?,
     }
 
     validate_locked_lock_file(directory, FileLock::from_locked(file))
@@ -2033,7 +2025,7 @@ mod tests {
         // creating/updating the config. A latency-sensitive reader must not
         // wait and must not publish the default through the shared path.
         let holder = open_lock_file(directory.path()).unwrap();
-        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        std::fs::File::lock(&holder).unwrap();
         let holder = FileLock::from_locked(holder);
         assert_eq!(store.try_load().unwrap(), TryLoadRemotesConfig::Busy);
         assert_eq!(
@@ -3145,7 +3137,7 @@ mod tests {
         store.load_or_create().unwrap();
 
         let holder = open_lock_file(&config_directory).unwrap();
-        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        std::fs::File::lock(&holder).unwrap();
         let holder = FileLock::from_locked(holder);
 
         let (opened_sender, opened_receiver) = mpsc::channel();

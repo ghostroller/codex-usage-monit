@@ -15,7 +15,6 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
-fs2 = "0.4"
 flate2 = "1.1"
 getrandom = "0.4"
 hmac = "0.12"
@@ -59,6 +58,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+fs2 = "0.4"
 insta = "1.48"
 portable-pty = "0.9"
 pretty_assertions = "1.4"

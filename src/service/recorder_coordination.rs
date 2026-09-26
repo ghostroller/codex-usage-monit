@@ -205,7 +205,7 @@ impl fmt::Debug for RecorderInstanceLockGuard {
 
 impl Drop for RecorderInstanceLockGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
         held_recorder_locks().remove(&self.identity);
     }
 }
@@ -504,14 +504,6 @@ fn recorder_lock_identity(_file: &File) -> io::Result<RecorderLockIdentity> {
     ))
 }
 
-fn recorder_lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
-}
-
 pub(super) fn map_recorder_nofollow_error(error: io::Error) -> io::Error {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::ELOOP) {
@@ -549,15 +541,15 @@ fn try_acquire_named_private_root_lock(
     }
 
     let lock_result = match mode {
-        CoordinationLockMode::Shared => fs2::FileExt::try_lock_shared(&file),
-        CoordinationLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&file),
+        CoordinationLockMode::Shared => std::fs::File::try_lock_shared(&file),
+        CoordinationLockMode::Exclusive => std::fs::File::try_lock(&file),
     };
     match lock_result {
         Ok(()) => {
             if let Err(error) =
                 validate_opened_recorder_lock(state_root, file_name, &file, identity)
             {
-                let _ = fs2::FileExt::unlock(&file);
+                let _ = std::fs::File::unlock(&file);
                 held_recorder_locks().remove(&identity);
                 return Err(error);
             }
@@ -569,13 +561,13 @@ fn try_acquire_named_private_root_lock(
                 },
             ))
         }
-        Err(error) if recorder_lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             let validation = validate_opened_recorder_lock(state_root, file_name, &file, identity);
             held_recorder_locks().remove(&identity);
             validation?;
             Ok(TryRecorderInstanceLock::Busy)
         }
-        Err(error) => {
+        Err(std::fs::TryLockError::Error(error)) => {
             held_recorder_locks().remove(&identity);
             Err(error)
         }

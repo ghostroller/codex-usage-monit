@@ -73,7 +73,7 @@ impl Write for LockedPrivateFile {
 
 impl Drop for LockedPrivateFile {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
     }
 }
 
@@ -344,22 +344,14 @@ fn open_private_regular_file(path: &Path, description: &str) -> io::Result<File>
 }
 
 fn lock_file(file: &File, description: &str) -> io::Result<()> {
-    match fs2::FileExt::try_lock_exclusive(file) {
+    match std::fs::File::try_lock(file) {
         Ok(()) => Ok(()),
-        Err(error) if lock_is_contended(&error) => Err(io::Error::new(
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!("{description} is already in use by another process"),
         )),
-        Err(error) => Err(error),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 #[cfg(windows)]

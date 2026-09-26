@@ -153,7 +153,7 @@ impl fmt::Debug for RemoteHostSyncLease {
 
 impl Drop for RemoteHostSyncLease {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
     }
 }
 
@@ -185,17 +185,17 @@ pub fn try_acquire_remote_host_sync_lease(
     validate_remote_host_sync_directory(&directory)?;
     let path = directory.join(remote_host_sync_lock_name(host_id));
     let file = open_remote_host_sync_lock(&path)?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file) {
         Ok(()) => {
             let lease = RemoteHostSyncLease { file, path };
             validate_opened_remote_host_sync_lock(&lease.path, &lease.file)?;
             Ok(TryRemoteHostSyncLease::Acquired(lease))
         }
-        Err(error) if remote_host_sync_lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             validate_opened_remote_host_sync_lock(&path, &file)?;
             Ok(TryRemoteHostSyncLease::Busy)
         }
-        Err(error) => Err(error),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -370,14 +370,6 @@ fn remote_host_sync_metadata_is_link(metadata: &fs::Metadata) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn remote_host_sync_metadata_is_link(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
-}
-
-fn remote_host_sync_lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 /// Per-invocation network bounds.  Durable ingest state makes a continuation
@@ -2372,7 +2364,7 @@ mod tests {
             .write(true)
             .open(mapping_path.parent().unwrap().join("project-mappings.lock"))
             .unwrap();
-        fs2::FileExt::lock_exclusive(&mapping_lock).unwrap();
+        std::fs::File::lock(&mapping_lock).unwrap();
 
         let binding = build_remote_delta_ingest_binding(&selected, profile.clone()).unwrap();
         let request = build_delta_request(
@@ -2457,7 +2449,7 @@ mod tests {
         mutation_thread.join().unwrap();
         assert!(changed.config_revision() > expected_revision);
 
-        fs2::FileExt::unlock(&mapping_lock).unwrap();
+        std::fs::File::unlock(&mapping_lock).unwrap();
         drop(mapping_lock);
         let commit = sync_result_rx
             .recv_timeout(StdDuration::from_secs(2))

@@ -3262,14 +3262,14 @@ fn lock_exclusive(
     directory: &Path,
     name: &str,
 ) -> io::Result<crate::file_lock::FileLock> {
-    fs2::FileExt::lock_exclusive(&file)?;
+    std::fs::File::lock(&file)?;
     let lock = crate::file_lock::FileLock::from_locked(file);
     validate_locked_file(&lock, directory, name)?;
     Ok(lock)
 }
 
 fn lock_shared(file: File, directory: &Path, name: &str) -> io::Result<crate::file_lock::FileLock> {
-    fs2::FileExt::lock_shared(&file)?;
+    std::fs::File::lock_shared(&file)?;
     let lock = crate::file_lock::FileLock::from_locked(file);
     validate_locked_file(&lock, directory, name)?;
     Ok(lock)

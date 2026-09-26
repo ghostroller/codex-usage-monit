@@ -25,7 +25,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -712,7 +711,7 @@ fn purge_ingest_namespace(
         let lock = open_private_lock(&lock_path)?;
         let lock = try_lock_private_lock(&lock_path, lock)?;
         validate_purge_ingest_source(history_store, source, source_id, redaction_profile, true)?;
-        FileExt::unlock(lock.as_file())?;
+        std::fs::File::unlock(lock.as_file())?;
         drop(lock);
         history_store.validate_private_path(source)?;
         rename_ingest_purge_namespace(source, trash)?;
@@ -921,7 +920,7 @@ fn purge_ingest_retirement_namespace(
         let lock = open_private_lock(&lock_path)?;
         let lock = try_lock_private_lock(&lock_path, lock)?;
         validate_purge_retirement_directory(history_store, source, source_id, true)?;
-        FileExt::unlock(lock.as_file())?;
+        std::fs::File::unlock(lock.as_file())?;
         drop(lock);
         rename_ingest_purge_namespace(source, trash)?;
         sync_directory(parent)?;
@@ -2791,7 +2790,7 @@ fn remove_remote_preview_ingest_source_bounded(
     // to remove the stable lock and its parent directory.
     drop(entries);
     validate_private_file(&paths.preview_lock, &lock, "remote ingest lock")?;
-    FileExt::unlock(lock.as_file())?;
+    std::fs::File::unlock(lock.as_file())?;
     drop(lock);
 
     let lock = open_existing_private_file(&paths.preview_lock, "remote ingest lock")?;
@@ -3235,14 +3234,6 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
-}
-
 fn open_private_lock(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -3259,15 +3250,15 @@ fn open_private_lock(path: &Path) -> io::Result<File> {
 }
 
 fn try_lock_private_lock(path: &Path, file: File) -> io::Result<FileLock> {
-    match file.try_lock_exclusive() {
+    match file.try_lock() {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "remote delta ingest is already running for this source",
             ));
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     let lock = FileLock::from_locked(file);
 
@@ -5743,7 +5734,7 @@ mod tests {
         assert!(error.to_string().contains("changed while open"));
 
         let released = open_private_lock(&displaced_path).unwrap();
-        let acquired = released.try_lock_exclusive();
+        let acquired = released.try_lock();
         drop(inherited);
         acquired.expect("post-lock validation must release the inherited lock on error");
         drop(FileLock::from_locked(released));

@@ -180,7 +180,7 @@ impl fmt::Debug for HistoryProfileLeaseGuard {
 
 impl Drop for HistoryProfileLeaseGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
         release_local_shared(self.identity, self.redaction_profile);
     }
 }
@@ -209,7 +209,7 @@ pub fn try_acquire_history_profile_lease(
         return Ok(TryHistoryProfileLease::Busy { active_profile });
     }
 
-    match fs2::FileExt::try_lock_shared(&file) {
+    match std::fs::File::try_lock_shared(&file) {
         Ok(()) => {
             let observed = (|| {
                 validate_opened_lock(&directory, &file, identity)?;
@@ -220,7 +220,7 @@ pub fn try_acquire_history_profile_lease(
             let (initialization, active) = match observed {
                 Ok(observed) => observed,
                 Err(error) => {
-                    let _ = fs2::FileExt::unlock(&file);
+                    let _ = std::fs::File::unlock(&file);
                     return Err(error);
                 }
             };
@@ -238,25 +238,25 @@ pub fn try_acquire_history_profile_lease(
                     );
                 }
                 (LockInitialization::Initialized, None) => {
-                    fs2::FileExt::unlock(&file)?;
+                    std::fs::File::unlock(&file)?;
                     return Err(invalid_data(
                         "active history profile marker is missing after completed initialization; explicit repair is required",
                     ));
                 }
                 (LockInitialization::Uninitialized, Some(_)) => {
-                    fs2::FileExt::unlock(&file)?;
+                    std::fs::File::unlock(&file)?;
                     return Err(invalid_data(
                         "active history profile marker exists without a stable lock initialization record",
                     ));
                 }
-                _ => fs2::FileExt::unlock(&file)?,
+                _ => std::fs::File::unlock(&file)?,
             }
         }
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             validate_opened_lock(&directory, &file, identity)?;
             return busy_result(&directory, &profile_id);
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
 
     try_switch_profile(
@@ -282,13 +282,13 @@ fn try_switch_profile(
         return busy_result(&directory, &profile_id);
     };
 
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file) {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             validate_opened_lock(&directory, &file, identity)?;
             return busy_result(&directory, &profile_id);
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
 
     let exclusive_result = (|| {
@@ -364,18 +364,18 @@ fn try_switch_profile(
         validate_opened_lock(&directory, &file, identity)
     })();
     if let Err(error) = exclusive_result {
-        let _ = fs2::FileExt::unlock(&file);
+        let _ = std::fs::File::unlock(&file);
         return Err(error);
     }
-    fs2::FileExt::unlock(&file)?;
+    std::fs::File::unlock(&file)?;
 
-    match fs2::FileExt::try_lock_shared(&file) {
+    match std::fs::File::try_lock_shared(&file) {
         Ok(()) => {}
-        Err(error) if lock_is_contended(&error) => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             validate_opened_lock(&directory, &file, identity)?;
             return busy_result(&directory, &profile_id);
         }
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
 
     let shared_result = (|| {
@@ -397,7 +397,7 @@ fn try_switch_profile(
     match shared_result {
         Ok(None) => {
             if let Err(error) = transition.finish_with_shared(redaction_profile) {
-                let _ = fs2::FileExt::unlock(&file);
+                let _ = std::fs::File::unlock(&file);
                 return Err(error);
             }
             Ok(TryHistoryProfileLease::Acquired(HistoryProfileLeaseGuard {
@@ -411,13 +411,13 @@ fn try_switch_profile(
             }))
         }
         Ok(Some(active_profile)) => {
-            fs2::FileExt::unlock(&file)?;
+            std::fs::File::unlock(&file)?;
             Ok(TryHistoryProfileLease::Busy {
                 active_profile: Some(active_profile),
             })
         }
         Err(error) => {
-            let _ = fs2::FileExt::unlock(&file);
+            let _ = std::fs::File::unlock(&file);
             Err(error)
         }
     }
@@ -441,12 +441,12 @@ fn finish_shared_acquisition(
                 .shared_profile
                 .map(|active| active_profile(profile_id.clone(), active));
             drop(leases);
-            fs2::FileExt::unlock(&file)?;
+            std::fs::File::unlock(&file)?;
             return Ok(TryHistoryProfileLease::Busy { active_profile });
         }
         let Some(next_count) = state.shared_count.checked_add(1) else {
             drop(leases);
-            let _ = fs2::FileExt::unlock(&file);
+            let _ = std::fs::File::unlock(&file);
             return Err(invalid_data(
                 "process-local history profile lease count overflowed",
             ));
@@ -1422,14 +1422,6 @@ fn stable_file_identity(_file: &File) -> io::Result<StableFileIdentity> {
     ))
 }
 
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
-}
-
 fn map_nofollow_error(error: io::Error) -> io::Error {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::ELOOP) {
@@ -1734,7 +1726,7 @@ mod tests {
                 .unwrap()
                 .to_path_buf();
             let file = open_stable_lock(&profile_directory).unwrap();
-            fs2::FileExt::try_lock_exclusive(&file).unwrap();
+            std::fs::File::try_lock(&file).unwrap();
             let mut stored = StoredLockSlot::new(
                 if failure == "mismatched" {
                     OTHER_PROFILE.parse().unwrap()
@@ -1750,7 +1742,7 @@ mod tests {
                 stored.checksum = stored.expected_checksum().unwrap();
             }
             write_lock_slot(&file, &stored).unwrap();
-            fs2::FileExt::unlock(&file).unwrap();
+            std::fs::File::unlock(&file).unwrap();
 
             let error =
                 try_acquire_history_profile_lease(&state, profile(), RedactionProfile::Redacted)
@@ -1824,7 +1816,7 @@ mod tests {
         let directory = prepare_profile_directory(&state, &profile_id).unwrap();
         let file = open_stable_lock(&directory).unwrap();
         if matches!(crash_point.as_str(), "initializing" | "marker-published") {
-            fs2::FileExt::try_lock_exclusive(&file).unwrap();
+            std::fs::File::try_lock(&file).unwrap();
             write_lock_slot(
                 &file,
                 &StoredLockSlot::new(

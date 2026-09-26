@@ -396,7 +396,10 @@ fn update_holds_mutation_lock_during_recorder_cutover() {
                 .write(true)
                 .open(root.join(STORE.lock_file_name))
                 .unwrap();
-            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            assert!(matches!(
+                contender.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
             Ok(absent(&target))
         },
     )
@@ -407,7 +410,7 @@ fn update_holds_mutation_lock_during_recorder_cutover() {
         .write(true)
         .open(root.join(STORE.lock_file_name))
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+    contender.try_lock().unwrap();
     drop(crate::file_lock::FileLock::from_locked(contender));
 }
 

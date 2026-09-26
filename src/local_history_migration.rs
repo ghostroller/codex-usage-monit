@@ -1667,14 +1667,14 @@ fn open_lock_file_with_create(directory: &Path, create: bool) -> io::Result<File
 }
 
 fn lock_exclusive(file: File, directory: &Path) -> io::Result<FileLock> {
-    fs2::FileExt::lock_exclusive(&file)?;
+    std::fs::File::lock(&file)?;
     let lock = FileLock::from_locked(file);
     validate_locked_file(lock.as_file(), directory)?;
     Ok(lock)
 }
 
 fn lock_shared(file: File, directory: &Path) -> io::Result<FileLock> {
-    fs2::FileExt::lock_shared(&file)?;
+    std::fs::File::lock_shared(&file)?;
     let lock = FileLock::from_locked(file);
     validate_locked_file(lock.as_file(), directory)?;
     Ok(lock)
@@ -1959,10 +1959,10 @@ mod tests {
                 lock_exclusive(file, &directory).unwrap()
             };
             let contender = open_lock_file(&directory).unwrap();
-            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            assert!(std::fs::File::try_lock(&contender).is_err());
 
             drop(guard);
-            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            let acquired = std::fs::File::try_lock(&contender);
             drop(inherited);
             acquired.expect("completed migration operations must release inherited locks");
             drop(FileLock::from_locked(contender));
@@ -1995,7 +1995,7 @@ mod tests {
                 .write(true)
                 .open(displaced)
                 .unwrap();
-            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            let acquired = std::fs::File::try_lock(&contender);
             drop(inherited);
             acquired.expect("migration validation errors must release inherited locks");
             drop(FileLock::from_locked(contender));

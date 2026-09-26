@@ -493,7 +493,7 @@ impl fmt::Debug for HistoryWriterLease {
 
 impl Drop for HistoryWriterLease {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
     }
 }
 
@@ -639,11 +639,11 @@ impl HistoryOwnershipStore {
         let file = open_stable_lock_file(&directory, WRITER_LOCK_FILE, "history writer lock")?;
         let identity = stable_file_identity(&file, "history writer lock")?;
 
-        match fs2::FileExt::try_lock_exclusive(&file) {
+        match std::fs::File::try_lock(&file) {
             Ok(()) => self
                 .finish_writer_lease_acquisition(&directory, path, file, identity, diagnostic)
                 .map(TryWriterLease::Acquired),
-            Err(error) if lock_is_contended(&error) => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 // Returning Busy for a displaced inode would let a caller
                 // trust the wrong coordination domain, so revalidate even on
                 // the non-owning path.
@@ -665,7 +665,7 @@ impl HistoryOwnershipStore {
                     diagnostic_warning,
                 }))
             }
-            Err(error) => Err(error),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
     }
 
@@ -690,7 +690,7 @@ impl HistoryOwnershipStore {
         let path = directory.join(WRITER_LOCK_FILE);
         let file = open_stable_lock_file(&directory, WRITER_LOCK_FILE, "history writer lock")?;
         let identity = stable_file_identity(&file, "history writer lock")?;
-        fs2::FileExt::lock_exclusive(&file)?;
+        std::fs::File::lock(&file)?;
         self.finish_writer_lease_acquisition(&directory, path, file, identity, diagnostic)
     }
 
@@ -907,7 +907,7 @@ impl HistoryOwnershipStore {
         let file =
             open_stable_lock_file(&directory, TRANSITION_LOCK_FILE, "history transition lock")?;
         let identity = stable_file_identity(&file, "history transition lock")?;
-        fs2::FileExt::lock_exclusive(&file)?;
+        std::fs::File::lock(&file)?;
         let lock = LockedFile { file };
         validate_locked_file(
             &directory,
@@ -953,7 +953,7 @@ struct LockedFile {
 
 impl Drop for LockedFile {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = std::fs::File::unlock(&self.file);
     }
 }
 
@@ -1366,14 +1366,6 @@ fn stable_file_identity(_file: &File, subject: &str) -> io::Result<StableFileIde
         io::ErrorKind::Unsupported,
         format!("{subject} locking requires stable file identity support"),
     ))
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 fn add_nofollow_flags(options: &mut OpenOptions) {
@@ -1857,7 +1849,7 @@ mod tests {
         let path = directory.join(WRITER_LOCK_FILE);
         let file = open_stable_lock_file(&directory, WRITER_LOCK_FILE, "test writer lock").unwrap();
         let identity = stable_file_identity(&file, "test writer lock").unwrap();
-        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        std::fs::File::try_lock(&file).unwrap();
         let inherited = file.try_clone().unwrap();
         let result = store.finish_writer_lease_acquisition(&directory, path, file, identity, None);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -1865,7 +1857,7 @@ mod tests {
 
         let contender =
             open_stable_lock_file(&directory, WRITER_LOCK_FILE, "test writer lock").unwrap();
-        let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+        let acquired = std::fs::File::try_lock(&contender);
         drop(inherited);
         acquired.expect("failed writer initialization must release its inherited lock");
         drop(crate::file_lock::FileLock::from_locked(contender));

@@ -188,8 +188,8 @@ impl PrivateStoreLayout {
         validate_opened_private_file(&path, &file, self.lock_subject)?;
 
         match mode {
-            LockMode::Shared => fs2::FileExt::lock_shared(&file)?,
-            LockMode::Exclusive => fs2::FileExt::lock_exclusive(&file)?,
+            LockMode::Shared => std::fs::File::lock_shared(&file)?,
+            LockMode::Exclusive => std::fs::File::lock(&file)?,
         }
         let file = FileLock::from_locked(file);
 
@@ -632,9 +632,9 @@ mod tests {
                 .write(true)
                 .open(directory.join(TEST_LAYOUT.lock_file_name))
                 .unwrap();
-            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            assert!(std::fs::File::try_lock(&contender).is_err());
             drop(owner);
-            let acquired = fs2::FileExt::try_lock_exclusive(&contender);
+            let acquired = std::fs::File::try_lock(&contender);
             drop(inherited);
             acquired.expect("completed private-store operation left its inherited lock held");
             drop(FileLock::from_locked(contender));

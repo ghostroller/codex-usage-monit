@@ -3274,26 +3274,18 @@ fn try_lock_exclusive_for_fact_publication(
     directory: &Path,
     name: &str,
 ) -> io::Result<crate::file_lock::FileLock> {
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file) {
         Ok(()) => {
             let lock = crate::file_lock::FileLock::from_locked(file);
             validate_locked_file(&lock, directory, name)?;
             Ok(lock)
         }
-        Err(error) if lock_is_contended(&error) => Err(io::Error::new(
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "fact publication lock is busy; retry later",
         )),
-        Err(error) => Err(error),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
-}
-
-fn lock_is_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    error.kind() == expected.kind()
-        && (error.raw_os_error().is_none()
-            || expected.raw_os_error().is_none()
-            || error.raw_os_error() == expected.raw_os_error())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
