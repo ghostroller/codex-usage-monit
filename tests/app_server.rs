@@ -6,8 +6,6 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(any(unix, windows))]
-use std::sync::Mutex;
 #[cfg(unix)]
 use std::time::Instant;
 
@@ -25,28 +23,8 @@ use codex_usage_monit::snapshot::collect_snapshot_cached;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-#[cfg(any(unix, windows))]
-static PATH_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(any(unix, windows))]
-struct PathRestore(Option<OsString>);
-
-#[cfg(any(unix, windows))]
-impl Drop for PathRestore {
-    fn drop(&mut self) {
-        // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
-        unsafe {
-            match &self.0 {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-}
-
 #[cfg(unix)]
-fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> T {
-    let _lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path, OsString) -> T) -> T {
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("codex");
     fs::write(&executable, script).unwrap();
@@ -60,16 +38,11 @@ fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> 
         path.push(":");
         path.push(old_path);
     }
-    // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
-    unsafe { std::env::set_var("PATH", path) };
-    let _restore = PathRestore(old_path);
-
-    run(directory.path())
+    run(directory.path(), path)
 }
 
 #[cfg(windows)]
-fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> T {
-    let _lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path, OsString) -> T) -> T {
     let directory = tempfile::tempdir().unwrap();
     // npm's Windows cmd-shim creates all three siblings. The bare one is a
     // POSIX shell script and must not shadow the executable `.cmd` shim.
@@ -87,11 +60,7 @@ fn with_mock_codex<T>(script: &str, run: impl FnOnce(&std::path::Path) -> T) -> 
         ),
     )
     .unwrap();
-    // SAFETY: PATH mutations in this test module are serialized by PATH_LOCK.
-    unsafe { std::env::set_var("PATH", path) };
-    let _restore = PathRestore(old_path);
-
-    run(directory.path())
+    run(directory.path(), path)
 }
 
 #[test]
@@ -535,6 +504,70 @@ fn offline_mode_returns_without_starting_codex() {
     assert!(snapshot.warnings[0].contains("offline mode"));
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn isolates_concurrent_app_server_paths() {
+    #[cfg(unix)]
+    let script = r#"#!/bin/sh
+IFS= read -r initialize || exit 41
+printf '%s\n' '{"id":1,"result":{"userAgent":"mock"}}'
+IFS= read -r initialized || exit 42
+IFS= read -r limits || exit 43
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":__USED_PERCENT__,"windowDurationMins":300}},"rateLimitsByLimitId":null}}'
+IFS= read -r usage || exit 44
+printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
+while IFS= read -r ignored; do :; done
+"#;
+    #[cfg(windows)]
+    let script = r#"@echo off
+set /p initialize=
+echo {"id":1,"result":{"userAgent":"mock"}}
+set /p account_requests=
+echo {"id":3,"error":{"code":-32601,"message":"usage disabled"}}
+echo {"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":__USED_PERCENT__,"windowDurationMins":300}},"rateLimitsByLimitId":null}}
+more >nul
+"#;
+    let parent_path = std::env::var_os("PATH");
+    with_mock_codex(
+        &script.replace("__USED_PERCENT__", "17"),
+        |first_directory, first_path| {
+            assert_eq!(std::env::var_os("PATH"), parent_path);
+            with_mock_codex(
+                &script.replace("__USED_PERCENT__", "83"),
+                |second_directory, second_path| {
+                    assert_eq!(std::env::var_os("PATH"), parent_path);
+                    let first_config = CollectConfig {
+                        codex_home: first_directory.join("home"),
+                        app_server_path: Some(first_path),
+                        app_server_timeout: Duration::from_secs(5),
+                        ..CollectConfig::default()
+                    };
+                    let second_config = CollectConfig {
+                        codex_home: second_directory.join("home"),
+                        app_server_path: Some(second_path),
+                        app_server_timeout: Duration::from_secs(5),
+                        ..CollectConfig::default()
+                    };
+
+                    std::thread::scope(|scope| {
+                        let first = scope.spawn(|| fetch_account_snapshot(&first_config));
+                        let second = scope.spawn(|| fetch_account_snapshot(&second_config));
+                        for (task, expected) in [(first, 17.0), (second, 83.0)] {
+                            let snapshot = task.join().unwrap().unwrap();
+                            assert_eq!(snapshot.limits.len(), 1);
+                            assert_eq!(
+                                snapshot.limits[0].primary.as_ref().unwrap().used_percent,
+                                expected
+                            );
+                        }
+                    });
+                },
+            );
+        },
+    );
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+}
+
 #[cfg(windows)]
 #[test]
 fn fetches_limits_through_a_codex_cmd_shim() {
@@ -551,9 +584,10 @@ rem A redirected set /p can read ahead and consume multiple LF-delimited message
 more >nul
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(5),
             ..CollectConfig::default()
         };
@@ -591,11 +625,12 @@ case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 50 ;; esac
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let trace =
             codex_usage_monit::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             startup_trace: trace.clone(),
             ..CollectConfig::default()
@@ -675,11 +710,12 @@ IFS= read -r usage || exit 45
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let codex_home = directory.join("home");
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
         let config = CollectConfig {
             codex_home,
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
@@ -733,9 +769,10 @@ IFS= read -r usage || exit 74
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
@@ -769,9 +806,10 @@ IFS= read -r usage || exit 84
 printf '%s\n' '{"id":3,"error":{"code":-32601,"message":"usage disabled"}}'
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
@@ -805,9 +843,10 @@ case "$usage" in *'"method":"account/usage/read"'*) ;; *) exit 66 ;; esac
 while IFS= read -r ignored; do :; done
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(5),
             ..CollectConfig::default()
         };
@@ -853,9 +892,10 @@ printf '%s\n' '{"id":3,"result":{"summary":{"lifetimeTokens":1234,"currentStreak
 while IFS= read -r ignored; do :; done
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
@@ -890,11 +930,12 @@ exit 0
     .replace("__PRIMARY_RESET__", &primary_reset.to_string())
     .replace("__WEEKLY_RESET__", &weekly_reset.to_string());
 
-    with_mock_codex(&script, |directory| {
+    with_mock_codex(&script, |directory, path| {
         let codex_home = directory.join("home");
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
         let config = CollectConfig {
             codex_home,
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_secs(2),
             ..CollectConfig::default()
         };
@@ -929,11 +970,12 @@ printf '%s\n' 'mock app-server stalled' >&2
 while IFS= read -r ignored; do :; done
 "#;
 
-    with_mock_codex(script, |directory| {
+    with_mock_codex(script, |directory, path| {
         let trace =
             codex_usage_monit::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
         let config = CollectConfig {
             codex_home: directory.join("home"),
+            app_server_path: Some(path),
             app_server_timeout: Duration::from_millis(80),
             startup_trace: trace.clone(),
             ..CollectConfig::default()

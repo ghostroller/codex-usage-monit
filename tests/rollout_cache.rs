@@ -109,7 +109,7 @@ fn stable_file_identity(path: &Path) -> (u64, [u8; 16]) {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)
         .unwrap();
-    let mut information: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let mut information = FILE_ID_INFO::default();
     let result = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle() as HANDLE,

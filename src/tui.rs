@@ -1052,7 +1052,7 @@ impl TerminalInputMonitor {
         // Mirror that choice so POLLHUP/POLLERR can be observed before calling
         // crossterm's reader. Crossterm 0.28 loops on a zero-byte TTY read, so
         // entering it after a PTY hangup can otherwise consume a full CPU core.
-        let fd = if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        let fd = if io::stdin().is_terminal() {
             TerminalInputFd::Stdin
         } else {
             TerminalInputFd::Tty(File::options().read(true).write(true).open("/dev/tty")?)
@@ -22555,7 +22555,7 @@ fn wait_for_windows_terminal_restore() {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn windows_console_ctrl_handler(control: u32) -> i32 {
+extern "system" fn windows_console_ctrl_handler(control: u32) -> i32 {
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     };

@@ -28,6 +28,7 @@ use windows_sys::Win32::{
     },
     System::Services::*,
 };
+use zeroize::Zeroizing;
 
 mod process;
 mod runtime;
@@ -392,15 +393,7 @@ fn prepare_version(root: &Path, account_sid: &str) -> Result<MachineVersion> {
     })
 }
 
-struct Secret(Vec<u16>);
-impl Drop for Secret {
-    fn drop(&mut self) {
-        for value in &mut self.0 {
-            unsafe { ptr::write_volatile(value, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }
-}
+struct Secret(Zeroizing<Vec<u16>>);
 fn password_from_stdin(enabled: bool) -> Result<Secret> {
     ensure!(
         enabled,
@@ -410,28 +403,30 @@ fn password_from_stdin(enabled: bool) -> Result<Secret> {
 }
 
 fn read_password(reader: impl BufRead) -> Result<Secret> {
-    let mut bytes = Vec::new();
+    // Protect partial reads too, and reserve the full input bound so growing
+    // the buffer cannot leave password bytes in an old allocation.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(8193));
     reader.take(8193).read_until(b'\n', &mut bytes)?;
-    let result = (|| {
-        ensure!(
-            bytes.len() <= 8192,
-            "machine_password_invalid: password is oversized"
-        );
-        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-            bytes.pop();
-        }
-        let text = std::str::from_utf8(&bytes)
-            .context("machine_password_invalid: expected UTF-8 stdin")?;
-        ensure!(
-            !text.is_empty(),
-            "machine_password_invalid: empty passwords are not supported"
-        );
-        Ok(Secret(security::wide(text)?))
-    })();
-    for byte in &mut bytes {
-        unsafe { ptr::write_volatile(byte, 0) };
+    ensure!(
+        bytes.len() <= 8192,
+        "machine_password_invalid: password is oversized"
+    );
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
     }
-    result
+    let text =
+        std::str::from_utf8(&bytes).context("machine_password_invalid: expected UTF-8 stdin")?;
+    ensure!(
+        !text.is_empty(),
+        "machine_password_invalid: empty passwords are not supported"
+    );
+    ensure!(!text.contains('\0'), "machine_invalid: NUL is not allowed");
+    // UTF-16 uses no more code units than the input's UTF-8 byte count.
+    // Include the Windows terminator without reallocating secret storage.
+    let mut wide = Zeroizing::new(Vec::with_capacity(text.len() + 1));
+    wide.extend(text.encode_utf16());
+    wide.push(0);
+    Ok(Secret(wide))
 }
 
 fn manager(create: bool) -> Result<ServiceManager> {
@@ -1175,10 +1170,11 @@ mod tests {
 
     #[test]
     fn service_password_accepts_unicode_stdin_and_rejects_invalid_input() {
-        let secret = read_password(io::Cursor::new("密码 with spaces\r\n".as_bytes())).unwrap();
+        let secret = read_password(io::Cursor::new("密码 🔒 with spaces\r\n".as_bytes())).unwrap();
+        assert_eq!(secret.0.last(), Some(&0));
         assert_eq!(
             String::from_utf16(&secret.0[..secret.0.len() - 1]).unwrap(),
-            "密码 with spaces"
+            "密码 🔒 with spaces"
         );
         for bytes in [
             vec![],
@@ -1189,6 +1185,41 @@ mod tests {
         ] {
             assert!(read_password(io::Cursor::new(bytes)).is_err());
         }
+    }
+
+    #[test]
+    fn service_password_propagates_read_errors_after_partial_input() {
+        struct FailedInput;
+        impl Read for FailedInput {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("password input failed"))
+            }
+        }
+        impl BufRead for FailedInput {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Err(io::Error::other("password input failed"))
+            }
+
+            fn consume(&mut self, _amount: usize) {}
+        }
+
+        let reader = io::Cursor::new(b"partial password").chain(FailedInput);
+        let error = read_password(reader)
+            .err()
+            .expect("input failure must propagate");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(error.to_string(), "password input failed");
+    }
+
+    #[test]
+    fn service_password_accepts_the_input_limit_without_truncation() {
+        let secret = read_password(io::Cursor::new(vec![b'x'; 8192])).unwrap();
+        assert_eq!(secret.0.len(), 8193);
+        assert!(secret.0[..8192].iter().all(|unit| *unit == u16::from(b'x')));
+        assert_eq!(secret.0[8192], 0);
     }
 
     fn recorder_fixture() -> MachineRecorderOptions {

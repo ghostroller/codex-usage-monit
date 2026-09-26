@@ -7,7 +7,7 @@ mod windows {
     use std::ffi::{OsStr, OsString, c_void};
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read};
-    use std::mem::{size_of, size_of_val, zeroed};
+    use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
@@ -27,6 +27,7 @@ mod windows {
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
     const INFINITE: u32 = u32::MAX;
 
+    #[derive(Default)]
     #[repr(C)]
     struct StartupInfo {
         cb: u32,
@@ -48,11 +49,13 @@ mod windows {
         stdout: Handle,
         stderr: Handle,
     }
+    #[derive(Default)]
     #[repr(C)]
     struct StartupInfoEx {
         startup: StartupInfo,
         attributes: *mut c_void,
     }
+    #[derive(Default)]
     #[repr(C)]
     struct ProcessInformation {
         process: Handle,
@@ -60,6 +63,7 @@ mod windows {
         process_id: u32,
         thread_id: u32,
     }
+    #[derive(Default)]
     #[repr(C)]
     struct BasicLimitInformation {
         process_time: i64,
@@ -72,6 +76,7 @@ mod windows {
         priority_class: u32,
         scheduling_class: u32,
     }
+    #[derive(Default)]
     #[repr(C)]
     struct ExtendedLimitInformation {
         basic: BasicLimitInformation,
@@ -419,7 +424,7 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         let job = OwnedHandle(job);
-        let mut limits: ExtendedLimitInformation = unsafe { zeroed() };
+        let mut limits = ExtendedLimitInformation::default();
         limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         unsafe {
             check(SetInformationJobObject(
@@ -468,7 +473,7 @@ mod windows {
                 null_mut(),
             ))?;
         }
-        let mut startup: StartupInfoEx = unsafe { zeroed() };
+        let mut startup = StartupInfoEx::default();
         startup.startup.cb = size_of::<StartupInfoEx>() as u32;
         startup.startup.flags = STARTF_USESTDHANDLES;
         startup.startup.stdin = stdin.0;
@@ -491,7 +496,7 @@ mod windows {
                 .ok_or_else(|| invalid("recorder has no directory"))?
                 .as_os_str(),
         )?;
-        let mut process: ProcessInformation = unsafe { zeroed() };
+        let mut process = ProcessInformation::default();
         unsafe {
             check(CreateProcessW(
                 application.as_ptr(),

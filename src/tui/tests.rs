@@ -1603,7 +1603,7 @@ fn windows_close_handler_waits_until_terminal_restoration() {
 
     let _signal_test_guard = WINDOWS_TERMINATION_TEST_LOCK.lock().unwrap();
     let termination = TerminationSignal::for_test();
-    let handler = thread::spawn(|| unsafe { windows_console_ctrl_handler(CTRL_CLOSE_EVENT) });
+    let handler = thread::spawn(|| windows_console_ctrl_handler(CTRL_CLOSE_EVENT));
     let deadline = Instant::now() + Duration::from_secs(1);
     while !WINDOWS_TERMINATION_REQUESTED.load(Ordering::SeqCst) {
         assert!(Instant::now() < deadline, "console handler did not start");

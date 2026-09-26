@@ -1906,7 +1906,7 @@ pub fn maybe_run_proxy() -> Result<Option<i32>> {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn proxy_console_control(event: u32) -> i32 {
+extern "system" fn proxy_console_control(event: u32) -> i32 {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
     // The child shares the console and receives these events directly. The
     // launcher must keep waiting instead of abandoning an interactive child.

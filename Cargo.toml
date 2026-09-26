@@ -33,6 +33,7 @@ libc = "0.2"
 signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
+zeroize = "1.9"
 windows-service = "0.8.1"
 winreg = "0.56"
 windows-sys = { version = "0.61", features = [

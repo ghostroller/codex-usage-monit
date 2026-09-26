@@ -1866,21 +1866,17 @@ fn reject_windows_reparse_components_before_create(path: &Path, subject: &str) -
 
 #[cfg(windows)]
 fn windows_file_identity(file: &File, subject: &str) -> io::Result<(u32, u64)> {
-    use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the live handle and output pointer remain valid for this call.
-    let success =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
     if success == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the API reported success and initialized the full structure.
-    let information = unsafe { information.assume_init() };
     let file_index =
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
     require_stable_file_identity(

@@ -710,9 +710,9 @@ fn aliased_install_parent_registers_physical_launcher_path() {
 #[test]
 fn windows_proxy_leaves_console_close_to_default_handler() {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT};
-    assert_eq!(unsafe { proxy_console_control(CTRL_C_EVENT) }, 1);
-    assert_eq!(unsafe { proxy_console_control(CTRL_BREAK_EVENT) }, 1);
-    assert_eq!(unsafe { proxy_console_control(CTRL_CLOSE_EVENT) }, 0);
+    assert_eq!(proxy_console_control(CTRL_C_EVENT), 1);
+    assert_eq!(proxy_console_control(CTRL_BREAK_EVENT), 1);
+    assert_eq!(proxy_console_control(CTRL_CLOSE_EVENT), 0);
 }
 
 #[test]

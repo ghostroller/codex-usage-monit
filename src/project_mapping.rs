@@ -2286,21 +2286,17 @@ fn ensure_opened_file_matches_path(
 
 #[cfg(windows)]
 fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
-    use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the live raw handle remains owned for this call and the API
     // initializes the output structure on success.
-    let success =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
     if success == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the API reported success, so the structure is initialized.
-    let information = unsafe { information.assume_init() };
     let file_index =
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
     Ok((information.dwVolumeSerialNumber, file_index))

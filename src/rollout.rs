@@ -182,7 +182,7 @@ impl Eq for FileFingerprint {}
 
 #[cfg(windows)]
 fn windows_stable_file_identity(path: &Path) -> std::io::Result<(u64, [u8; 16])> {
-    use std::mem::{size_of, zeroed};
+    use std::mem::size_of;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -197,7 +197,7 @@ fn windows_stable_file_identity(path: &Path) -> std::io::Result<(u64, [u8; 16])>
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     let file = options.open(path)?;
-    let mut info: FILE_ID_INFO = unsafe { zeroed() };
+    let mut info = FILE_ID_INFO::default();
     let result = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle() as HANDLE,

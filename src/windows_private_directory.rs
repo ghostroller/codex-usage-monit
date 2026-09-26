@@ -114,7 +114,7 @@ pub(crate) fn open_private_file(path: &Path) -> io::Result<fs::File> {
     // SAFETY: CreateFileW returned a valid, owned file handle.
     let file = unsafe { fs::File::from_raw_handle(handle) };
     crate::source_identity::validate_windows_private_file(path, &file, "diagnostic log")?;
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the file owns handle and information is a valid output pointer.
     if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
         return Err(io::Error::last_os_error());
