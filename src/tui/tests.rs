@@ -10850,9 +10850,7 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
         warnings: vec!["seed usage is incomplete".to_owned()],
         ..HistoryData::default()
     };
-    store
-        .load_remote_overview_history(Some(&seed), now)
-        .unwrap();
+    store.load_remote_overview_history(None, now).unwrap();
     assert!(store.remote_overview_cache.initialized);
     assert!(store.remote_overview_cache.revision.is_some());
 
@@ -10926,6 +10924,115 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
             "unchanged remote inputs still permit normal cache reuse"
         );
     });
+}
+
+#[test]
+fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cache_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let mut runtime = HistoryRuntime::new(
+        directory.path().join("state/history-v1"),
+        &codex_home,
+        false,
+    )
+    .unwrap();
+    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
+    assert!(matches!(
+        prepare_tui_history_runtime(&mut runtime, &lease, now),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    let source_store = runtime.source_history().clone();
+    let mut sources = Vec::new();
+    let mut seed = HistoryData {
+        warnings: vec!["seed usage is incomplete".to_owned()],
+        ..HistoryData::default()
+    };
+    for index in (1..=3).rev() {
+        let node: NodeId = format!("node-{index:032x}").parse().unwrap();
+        let label = format!("remote-{index}");
+        source_store
+            .save_source_metadata(
+                &SourceMetadata::new_with_redaction_profile(
+                    node.clone(),
+                    SourceKind::Ssh,
+                    label.clone(),
+                    RedactionProfile::PreviewEnabled,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut bucket = tui_runtime_test_bucket(now - ChronoDuration::minutes(20), index * 10);
+        bucket.project_groups[0].thread_id = format!("remote-thread-{index}@{node}");
+        seed.half_hour_buckets.push(bucket);
+        sources.push((node, label));
+    }
+    let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
+    store.load_remote_overview_history(None, now).unwrap();
+    assert!(store.remote_overview_cache.initialized);
+    assert!(store.remote_overview_cache.revision.is_some());
+    let expected = RemoteOverviewHistory::from_unified(&seed, sources.clone(), now);
+    assert_ne!(expected, RemoteOverviewHistory::default());
+    store.with_query_request(now, |store| {
+        assert_eq!(
+            store
+                .load_remote_overview_history(Some(&seed), now)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(store.query_context.as_ref().unwrap().quota_loads, 0);
+    });
+    assert!(!store.remote_overview_cache.initialized);
+    assert!(store.remote_overview_cache.revision.is_none());
+    assert!(store.remote_overview_cache.loaded_at.is_none());
+    assert_eq!(
+        store.remote_overview_cache.history,
+        RemoteOverviewHistory::default()
+    );
+    store.with_query_request(now, |store| {
+        let loaded = store.load_remote_overview_history(None, now).unwrap();
+        assert_ne!(
+            loaded, expected,
+            "a later query must not reuse supplied seed data"
+        );
+        assert_eq!(store.query_context.as_ref().unwrap().quota_loads, 1);
+    });
+    assert!(store.remote_overview_cache.initialized);
+    assert!(store.remote_overview_cache.revision.is_some());
+
+    // Supplying an already successful query never conceals source-list or
+    // active-generation errors that the Overview path previously surfaced.
+    let metadata_path = source_store
+        .source_directory(&sources[0].0)
+        .join("source.json");
+    let metadata_bytes = std::fs::read(&metadata_path).unwrap();
+    std::fs::write(&metadata_path, b"invalid metadata").unwrap();
+    for supplied in [Some(&seed), None] {
+        let error = store
+            .load_remote_overview_history(supplied, now)
+            .unwrap_err();
+        assert!(
+            error.starts_with("remote Overview source list is unavailable:"),
+            "{error}"
+        );
+    }
+    std::fs::write(&metadata_path, metadata_bytes).unwrap();
+    let remote_root = source_store
+        .source_remote_history_directory(&sources[1].0, RedactionProfile::PreviewEnabled);
+    source_store
+        .prepare_private_directory(&remote_root)
+        .unwrap();
+    std::fs::write(remote_root.join("active.json"), b"invalid manifest").unwrap();
+    for supplied in [Some(&seed), None] {
+        let error = store
+            .load_remote_overview_history(supplied, now)
+            .unwrap_err();
+        assert!(
+            error.starts_with("remote Overview revision is unavailable:"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

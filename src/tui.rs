@@ -437,20 +437,6 @@ impl TuiHistoryStore {
             .into_iter()
             .filter(|source| source.kind() == SourceKind::Ssh && source.include_in_aggregates())
             .collect::<Vec<_>>();
-        if metadata.is_empty()
-            && let Some(history) = unified_seed
-        {
-            // The selected All query already supplied the complete projection.
-            // With no remote sources, keep its buckets and warnings without
-            // probing revisions for a cache entry that will never be reused.
-            // A later call still enumerates sources before taking this path.
-            self.remote_overview_cache = TuiRemoteOverviewCache::default();
-            return Ok(RemoteOverviewHistory::from_unified(
-                history,
-                std::iter::empty(),
-                now,
-            ));
-        }
         metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
         // Preserve the existing visible revision-error boundary. Additional
         // local/mapping stamps below only control cache reuse.
@@ -459,9 +445,6 @@ impl TuiHistoryStore {
                 .active_remote_history_ref(source.source_id(), source.aggregate_redaction_profile())
                 .map_err(|error| format!("remote Overview revision is unavailable: {error}"))?;
         }
-        let revision = history_projection_revision(runtime, &HistorySourceSelection::AllIncluded)
-            .ok()
-            .flatten();
         let remote_sources = metadata.iter().map(|source| {
             (
                 source.source_id().clone(),
@@ -469,13 +452,20 @@ impl TuiHistoryStore {
             )
         });
         if let Some(history) = unified_seed {
-            self.remote_overview_cache.revision = revision.clone();
-            self.remote_overview_cache.history =
-                RemoteOverviewHistory::from_unified(history, remote_sources, now);
-            self.remote_overview_cache.loaded_at = Some(Instant::now());
-            self.remote_overview_cache.initialized = true;
-            return Ok(self.remote_overview_cache.history.clone());
+            // The selected All query already supplied this projection. Preserve
+            // source-list and active-ref errors above, but do not probe additional
+            // revisions merely to cache a supplied result. A later unseeded call
+            // rebuilds the optional cache with the usual consistency checks.
+            self.remote_overview_cache = TuiRemoteOverviewCache::default();
+            return Ok(RemoteOverviewHistory::from_unified(
+                history,
+                remote_sources,
+                now,
+            ));
         }
+        let revision = history_projection_revision(runtime, &HistorySourceSelection::AllIncluded)
+            .ok()
+            .flatten();
         if self.remote_overview_cache.initialized
             && revision.is_some()
             && self.remote_overview_cache.revision == revision
