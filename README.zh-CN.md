@@ -78,7 +78,7 @@ codex-usage-monit update status --format json
 
 64 位 Windows 用户可在 PowerShell 中运行用户安装器。它会校验发布清单和程序、建立受管安装，并将命令目录注册到用户 `PATH`，不需要管理员权限：
 
-下列下载命令需要先发布包含 Windows 安装器的版本；发布前请使用当前源码中的脚本及匹配的本地发布包。
+Windows PowerShell 安装器从 v0.5.2 起随 Release 提供。使用本地发布包安装时，安装器与应用程序的版本应匹配。
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/ghostroller/codex-usage-monit/releases/latest/download/install.ps1' -OutFile .\install.ps1
@@ -380,9 +380,9 @@ TUI 中的重置和 turn 时间使用本地时间；Collection/Snapshot 的 `asO
 | `MESSAGE` | turn 消息的本地短摘要，最多 72 个字符。 |
 | `SOURCE` | 记录的任务来源。TUI 筛选器包括 All（不限制来源）、Desktop（包含 `vscode`）、Subagent 和 CLI。 |
 
-估算器依据 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)。GPT-6 Astra 使用每百万 token `(250, 25, 1250)` 的 input/cached-input/output credits。`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 和 Daybreak Blue 当前的 `daybreak-blue-latest` / `gpt-daybreak-blue-latest` 别名使用 `(100, 10, 500)`；OpenAI 说明该 Sol 促销费率至少持续到 2026-11-21。Daybreak Red 当前的 `daybreak-red-latest` / `gpt-daybreak-red-latest` 别名与 `gpt-5.6-cyber` ID 使用 `(312.5, 31.25, 1875)`，旧 `gpt-5.5-cyber` slug 仅为历史 rollout 兼容而继续映射到同一行。当前费率卡还提供 GPT-5.6 Terra/Luna、GPT-5.5、GPT-5.4 和 GPT-5.4 mini；GPT-5.3-Codex、GPT-5.2 与历史 `gpt-5.2-codex` slug 继续使用早期兼容权重，但不再表述为当前官方费率卡行。
+估算器依据 OpenAI 当前的 [Codex token-based rate card](https://learn.chatgpt.com/docs/pricing)。精确模型 ID `gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna` 分别使用每百万 token `(250, 25, 1250)`、`(50, 5, 250)`、`(2.5, 0.25, 12.5)` 的 input/cached-input/output credits，费率核对日期为 2026-09-26。`gpt-5.6`（Sol 别名）、`gpt-5.6-sol` 和 Daybreak Blue 当前的 `daybreak-blue-latest` / `gpt-daybreak-blue-latest` 别名使用 `(100, 10, 500)`；OpenAI 说明该 Sol 促销费率至少持续到 2026-11-21。Daybreak Red 当前的 `daybreak-red-latest` / `gpt-daybreak-red-latest` 别名与 `gpt-5.6-cyber` ID 使用 `(312.5, 31.25, 1875)`，旧 `gpt-5.5-cyber` slug 仅为历史 rollout 兼容而继续映射到同一行。当前费率卡还提供 GPT-5.6 Terra/Luna、GPT-5.5、GPT-5.4 和 GPT-5.4 mini；GPT-5.3-Codex、GPT-5.2 与历史 `gpt-5.2-codex` slug 继续使用早期兼容权重，但不再表述为当前官方费率卡行。
 
-对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-6 Astra、GPT-5.6 和 GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用当前目录显式配置的 credit 后备模型，并把 scope 标为 partial。
+对于识别为 ChatGPT Fast 的调用，估算器按官方 [Speed](https://learn.chatgpt.com/docs/agent-configuration/speed) 说明应用倍率：GPT-6 Astra/Sol/Luna、GPT-5.6 和 GPT-5.5 为 `2.5x`，GPT-5.4 为 `2x`。本地登录态 rollout 中兼容的 `serviceTier=priority` 值在本归因中按 Fast 处理；它不是官方 Speed 页面另行说明的 API Priority 计费。精确匹配的 `gpt-5.3-codex-spark` 仍不参与归因，因为其 credit 费率尚处于 research preview；未列出或缺失的非 Spark 模型使用当前目录显式配置的 credit 后备模型，并把 scope 标为 partial。
 
 可选 Longx 投影**默认关闭**。在 TUI 中可用 `[L]EST Longx` 持久开启，也可在某次 CLI 查询中传入 `--long-context`。开启后，程序才会对支持的模型在 Codex 额度 `~EST` 投影中额外套用 OpenAI API 公布的长上下文规则。OpenAI 的 Codex 订阅 credit 卡只说明 context 会影响 credits，并未公布完全相同的逐请求公式，因此 Longx 只是可选代理假设，不是订阅制计费事实。TUI 开关会随其他偏好保存；CLI 参数不会读取或改变该偏好。recorder 始终同时保存基础权重与可选附加权重，因此在任一界面切换都无需重装后台服务。
 
@@ -396,7 +396,7 @@ GPT-Image-2.0 不会直接套用公告中的任一行：官方费率卡分别列
 
 每次进程启动时，程序会在常规配置目录查找 `model-catalog.json`：macOS 为 `~/Library/Application Support/codex-usage-monit`，Linux 为 `$XDG_CONFIG_HOME/codex-usage-monit` 或 `~/.config/codex-usage-monit`，Windows 为 `%LOCALAPPDATA%\codex-usage-monit`。`CODEX_USAGE_MONIT_CONFIG_DIR` 会和其他配置文件一样覆盖该目录。这个文件可选，程序不会自动创建：文件不存在时使用内置目录；文件存在但无法读取或校验失败时，需要计算价格或协商价格 revision 的命令会直接报错，不会静默切到另一套费率。
 
-可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 6 和 3）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v4 会在合并数据前拒绝任何不匹配。
+可从[完整示例目录](docs/model-catalog.example.json)开始修改。外部文件会完整替换内置目录，其中包括模型别名、Codex Standard/Fast credit 费率、未知模型 credit 后备项、API Standard/Fast 短/长上下文价格、cache-write 支持、元数据和长上下文阈值。费率支持十进制字符串，从而精确表示 `31.25` 等数值。首次使用时，`estimatorRevision` 和 `apiPricingCatalogRevision` 必须高于内置 revision（目前分别为 7 和 4）；之后每次修改对应映射或费率都必须递增相应 revision。编辑后重启 TUI 和 recorder 即可，无需重新编译。参与同步的全部机器必须使用相同 revision 和规范化目录指纹；远程协议 v5 会在合并数据前拒绝任何不匹配。
 
 ### 状态标识
 
@@ -423,7 +423,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 6；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 7；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和值，而不是从图表坐标反推。对于 Trends 中的 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。Summary 的 Inspect 则显示当前 `1h` 到 `1d` 粒度下所选派生本地聚合桶的起点、区间和值；它不是原始事件时间戳。
 

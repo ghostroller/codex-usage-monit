@@ -78,7 +78,7 @@ The command entry is a stable launcher that reads a version selection from `inst
 
 On 64-bit Windows, run the user installer from PowerShell. It verifies the release manifest and executable, creates a managed installation, and registers its command directory in your user `PATH`; no administrator account is needed:
 
-These download commands require the first release containing the Windows installer; before publication, use this checkout's script with a matching local release bundle.
+The Windows PowerShell installer is included in v0.5.2 and later releases. Use a matching installer and application version when installing from a local release bundle.
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/ghostroller/codex-usage-monit/releases/latest/download/install.ps1' -OutFile .\install.ps1

@@ -14,10 +14,10 @@ the [testing workflow](testing.md) and the
 
 ## Install for your user
 
-The download commands require a release containing this installer and the new
-installation commands. Until that release is published, use this checkout's
-`scripts/install.ps1` with a matching verified local release bundle. An older
-release executable cannot run the new installer commands.
+The PowerShell installer and installation commands are included in v0.5.2 and
+later releases. For offline installation, use `scripts/install.ps1` from the
+same version as the verified local release bundle. Older executables cannot run
+the new installer commands.
 
 In Windows PowerShell 5.1 or PowerShell 7:
 

@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.2] - 2026-09-26
+
+### Added
+
+- Recognize GPT-6 Sol and Luna using the official Codex credit rates and API Standard/Fast prices, including cache writes and short/long-context requests. Preserve fractional rates exactly and retain the existing GPT-5.6 aliases and unknown-model fallback.
+- Publish the Windows PowerShell user installer with managed installation, user PATH registration, optional on-logon recording, repair and uninstall commands. The Windows application embeds its version-bound recorder host, so desktop recording runs without a console window.
+- Add an explicitly configured Windows machine-service mode for unattended recording, with installation ownership, process identity and recovery checks.
+
+### Fixed
+
+- Preserve an already-running Windows recorder when another start is requested, and retain recovery state when machine-service installation is incomplete.
+- Render the remote update dialog background consistently with the selected TUI theme.
+
+### Compatibility
+
+- The bundled estimator revision is now 7 and the API pricing catalog revision is 4, with rates checked on September 26, 2026. External catalogs must use higher revisions; the complete example uses 8/5. Update synchronized nodes together so their source build and model-catalog fingerprint match. Task-level quota attribution remains an estimate.
+- Windows release binaries remain x64. This release includes `install.ps1` and the application executable; it does not include a signed graphical User Setup installer. See [Windows installation and background recording](docs/windows-installation.md) for supported installation modes and recovery.
+
 ## [0.5.1] - 2026-09-21
 
 ### Added
