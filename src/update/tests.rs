@@ -452,6 +452,88 @@ fn semantic_downgrade_is_never_enabled_by_development_override() {
 }
 
 #[test]
+fn semantic_versions_reject_invalid_complete_input_on_either_side() {
+    for invalid in [
+        "",
+        "1.0",
+        "v1.0.0",
+        "01.0.0",
+        "1.00.0",
+        "1.0.00",
+        "1.0.0-01",
+        "1.0.0-rc.01",
+        "1.0.0-",
+        "1.0.0+",
+        "1.0.0+foo..bar",
+        "1.0.0+bad_name",
+        "1.0.0+meta+extra",
+        "1.0.0+build\n",
+        "18446744073709551616.0.0",
+    ] {
+        for (target, installed) in [(invalid, "1.0.0"), ("1.0.0", invalid)] {
+            let error =
+                ensure_not_downgrade(target, "same", installed, Some("same"), true).unwrap_err();
+            assert!(
+                error.to_string().contains("update_version_invalid"),
+                "{invalid:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_versions_preserve_precedence_without_narrow_prerelease_numbers() {
+    let ordered = [
+        "1.0.0-alpha",
+        "1.0.0-alpha.1",
+        "1.0.0-alpha.beta",
+        "1.0.0-beta",
+        "1.0.0-beta.2",
+        "1.0.0-beta.11",
+        "1.0.0-rc.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "2.0.0",
+        "18446744073709551615.0.0",
+    ];
+    for pair in ordered.windows(2) {
+        assert_eq!(
+            compare_versions(pair[0], pair[1]).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions(pair[1], pair[0]).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+    }
+    let smaller = format!("1.0.0-{}", "9".repeat(100));
+    let larger = format!("1.0.0-1{}", "0".repeat(100));
+    assert_eq!(
+        compare_versions(&smaller, &larger).unwrap(),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        compare_versions(&larger, "1.0.0-alpha").unwrap(),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[test]
+fn semantic_metadata_does_not_bypass_source_build_identity() {
+    let target = "1.0.0+001.new-build";
+    let installed = "1.0.0+old-build";
+    assert_eq!(
+        compare_versions(target, installed).unwrap(),
+        std::cmp::Ordering::Equal
+    );
+    ensure_not_downgrade(target, "same", installed, Some("same"), false).unwrap();
+    let error = ensure_not_downgrade(target, "new", installed, Some("old"), false).unwrap_err();
+    assert!(error.to_string().contains("update_build_conflict"));
+    ensure_not_downgrade(target, "new", installed, Some("old"), true).unwrap();
+}
+
+#[test]
 fn sync_cannot_downgrade_shared_state_below_managed_cli_version() {
     let (temp, root, mut target) = fixture();
     let directory = temp.path().join("bin");

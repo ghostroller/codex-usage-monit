@@ -753,70 +753,12 @@ pub(crate) fn ensure_not_downgrade(
 }
 
 fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    fn parts(version: &str) -> Result<([u64; 3], Option<&str>)> {
-        let version = version.split('+').next().context("missing version")?;
-        let (main, pre) = version
-            .split_once('-')
-            .map_or((version, None), |(main, pre)| (main, Some(pre)));
-        let words = main.split('.').collect::<Vec<_>>();
-        ensure!(
-            words.len() == 3,
-            "update_version_invalid: expected semantic package version"
-        );
-        let mut numeric = [0; 3];
-        for (slot, word) in numeric.iter_mut().zip(words) {
-            ensure!(
-                !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()),
-                "update_version_invalid: invalid numeric version"
-            );
-            *slot = word
-                .parse()
-                .context("update_version_invalid: version component overflow")?;
-        }
-        if let Some(pre) = pre {
-            ensure!(
-                !pre.is_empty()
-                    && pre.split('.').all(|part| !part.is_empty()
-                        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-                "update_version_invalid: invalid prerelease"
-            );
-        }
-        Ok((numeric, pre))
-    }
-    let (left, left_pre) = parts(left)?;
-    let (right, right_pre) = parts(right)?;
-    let main = left.cmp(&right);
-    if main != Ordering::Equal {
-        return Ok(main);
-    }
-    let (left, right) = match (left_pre, right_pre) {
-        (None, None) => return Ok(Ordering::Equal),
-        (None, Some(_)) => return Ok(Ordering::Greater),
-        (Some(_), None) => return Ok(Ordering::Less),
-        (Some(left), Some(right)) => (left, right),
-    };
-    let mut left = left.split('.');
-    let mut right = right.split('.');
-    loop {
-        let (a, b) = match (left.next(), right.next()) {
-            (None, None) => return Ok(Ordering::Equal),
-            (None, Some(_)) => return Ok(Ordering::Less),
-            (Some(_), None) => return Ok(Ordering::Greater),
-            (Some(a), Some(b)) => (a, b),
-        };
-        let a_numeric = a.bytes().all(|c| c.is_ascii_digit());
-        let b_numeric = b.bytes().all(|c| c.is_ascii_digit());
-        let comparison = match (a_numeric, b_numeric) {
-            (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => a.cmp(b),
-        };
-        if comparison != Ordering::Equal {
-            return Ok(comparison);
-        }
-    }
+    let left = semver::Version::parse(left)
+        .context("update_version_invalid: invalid target semantic package version")?;
+    let right = semver::Version::parse(right)
+        .context("update_version_invalid: invalid installed semantic package version")?;
+    // Build metadata is validated, but source identity is checked separately.
+    Ok(left.cmp_precedence(&right))
 }
 
 fn package_manager_path(path: &Path) -> bool {
