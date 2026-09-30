@@ -58,6 +58,15 @@ fn write_custom_catalog(config_dir: &std::path::Path) {
 }
 
 fn write_catalog_rollout(codex_home: &std::path::Path) {
+    write_model_rollout(codex_home, " CUSTOM-MODEL-LATEST ", "unknown-model", false);
+}
+
+fn write_model_rollout(
+    codex_home: &std::path::Path,
+    first_model: &str,
+    second_model: &str,
+    all_cached: bool,
+) {
     let sessions = codex_home.join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     let started_at = Utc::now() - Duration::minutes(10);
@@ -65,7 +74,7 @@ fn write_catalog_rollout(codex_home: &std::path::Path) {
     let usage = |input_tokens: u64| {
         serde_json::json!({
             "input_tokens": input_tokens,
-            "cached_input_tokens": 0,
+            "cached_input_tokens": if all_cached { input_tokens } else { 0 },
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
             "total_tokens": input_tokens
@@ -114,7 +123,7 @@ fn write_catalog_rollout(codex_home: &std::path::Path) {
             "type": "turn_context",
             "payload": {
                 "turn_id": "alias-turn",
-                "model": " CUSTOM-MODEL-LATEST "
+                "model": first_model
             }
         }),
         event(
@@ -139,7 +148,7 @@ fn write_catalog_rollout(codex_home: &std::path::Path) {
         serde_json::json!({
             "timestamp": started_at + Duration::seconds(7),
             "type": "turn_context",
-            "payload": {"turn_id": "fallback-turn", "model": "unknown-model"}
+            "payload": {"turn_id": "fallback-turn", "model": second_model}
         }),
         event(
             8,
@@ -295,6 +304,53 @@ fn missing_catalog_uses_the_bundled_metadata() {
     let output = monitor_command(&config_dir, &codex_home).output().unwrap();
     assert!(output.status.success() || output.status.code() == Some(2));
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["apiPricing"]["catalogRevision"], 4);
-    assert_eq!(document["apiPricing"]["ratesAsOf"], "2026-09-26");
+    assert_eq!(document["apiPricing"]["catalogRevision"], 5);
+    assert_eq!(document["apiPricing"]["ratesAsOf"], "2026-10-01");
+}
+
+#[test]
+fn bundled_gpt_6_1_sol_is_priced_in_a_fresh_process_without_guessing_aliases() {
+    let directory = tempdir().unwrap();
+    let config_dir = directory.path().join("empty-config");
+    let codex_home = directory.path().join("codex");
+    fs::create_dir_all(&config_dir).unwrap();
+    write_model_rollout(&codex_home, " GPT-6.1-SOL ", "gpt-6.1-sol-latest", true);
+
+    let output = monitor_command(&config_dir, &codex_home).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "offline/unknown-alias fixture is intentionally partial; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let five_hour = document["windowAnalyses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|analysis| analysis["durationMins"] == 300)
+        .expect("fixture must produce a five-hour analysis");
+    assert_eq!(five_hour["apiPricing"]["catalogRevision"], 5);
+    let turns = five_hour["turns"].as_array().unwrap();
+    let usage_for = |turn_id: &str| {
+        &turns
+            .iter()
+            .find(|turn| turn["turnId"] == turn_id)
+            .unwrap_or_else(|| panic!("missing {turn_id}: {turns:?}"))["usage"]
+    };
+    let exact = usage_for("alias-turn");
+    let unknown = usage_for("fallback-turn");
+
+    // Each request is fully cached. The exact new model's 2.5 credit rate
+    // versus the unchanged Luna fallback's 0.5 splits the gauge 5:1.
+    let estimated = |usage: &Value| usage["estimatedQuotaPercent"].as_f64().unwrap();
+    assert!((estimated(exact) - 55.0 * 5.0 / 6.0).abs() < 1e-9);
+    assert!((estimated(unknown) - 55.0 / 6.0).abs() < 1e-9);
+    assert_eq!(exact["tokenUsage"]["cachedInputTokens"], 1_000_000);
+    assert_eq!(exact["apiEquivalentCost"]["minimumPicoUsd"], "200000000000");
+    assert_eq!(exact["apiEquivalentCost"]["maximumPicoUsd"], "200000000000");
+    assert_eq!(exact["apiEquivalentCost"]["pricedTokens"], 1_000_000);
+    assert_eq!(unknown["apiEquivalentCost"]["minimumPicoUsd"], "0");
+    assert_eq!(unknown["apiEquivalentCost"]["pricedTokens"], 0);
+    assert_eq!(unknown["apiEquivalentCost"]["observedTokens"], 1_000_000);
 }

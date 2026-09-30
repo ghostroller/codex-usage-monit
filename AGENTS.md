@@ -2,6 +2,10 @@
 
 - If `.agent/environment.local.md` exists, read it before running tests, builds, or CI-related operations. It only supplements machine-specific environment differences and does not override project-level rules.
 
+## Model catalog maintenance
+
+- For new models or changed pricing rules, follow [the model catalog maintenance workflow](docs/model-catalog-maintenance.md): retrieve current official sources, record the supporting rows and dates, then update bundled mappings, the complete example, affected revisions, regressions, and documentation together. Do not infer aliases or billing multipliers from model-discovery metadata.
+
 ## Verification: local first, hosted at checkpoints
 
 - Read [the testing workflow](docs/testing.md) before choosing a test environment. During implementation, run affected tests locally. For a completed batch of platform-sensitive changes, use the local Docker Linux and UTM Windows runners before considering hosted CI; use native macOS for macOS behavior.

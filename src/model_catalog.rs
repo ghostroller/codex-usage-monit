@@ -8,9 +8,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub(crate) const MODEL_CATALOG_VERSION: u32 = 1;
-pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 7;
-pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 4;
-pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-09-26";
+pub(crate) const BUNDLED_ESTIMATOR_REVISION: u32 = 8;
+pub(crate) const BUNDLED_API_PRICING_CATALOG_REVISION: u32 = 5;
+pub(crate) const BUNDLED_API_PRICING_RATES_AS_OF: &str = "2026-10-01";
 pub(crate) const BUNDLED_API_PRICING_SOURCE_URL: &str =
     "https://developers.openai.com/api/docs/pricing";
 
@@ -1069,6 +1069,40 @@ fn bundled_catalog() -> ModelCatalog {
             }),
         },
     );
+    // GPT-6.1 Sol has its own cached-input rates; it is not an alias of GPT-6 Sol.
+    // Sources checked 2026-10-01: API pricing.md, Codex pricing.md, and Speed.
+    // Fast credits retain the estimator's included-subscription 2.5x basis;
+    // long_context_pricing enables the existing optional API Longx projection.
+    catalog.insert_builtin(
+        &["gpt-6.1-sol"],
+        ModelEntry {
+            credit: credit_model(
+                CreditTokenRates::new(400, 20, 2_000),
+                Some(CreditTokenRates::new(1_000, 50, 5_000)),
+                true,
+            ),
+            api: Some(ApiModelRates {
+                standard: api_tier(
+                    ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        4_000_000,
+                        200_000,
+                        Some(5_000_000),
+                        15_000_000,
+                    )),
+                ),
+                fast: Some(api_tier(
+                    ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 20_000_000),
+                    ApiLongContextRates::Published(ApiTokenRates::new(
+                        8_000_000,
+                        400_000,
+                        Some(10_000_000),
+                        30_000_000,
+                    )),
+                )),
+            }),
+        },
+    );
     catalog.insert_builtin(
         &["gpt-6-sol"],
         ModelEntry {
@@ -1388,6 +1422,15 @@ mod tests {
         let catalog = bundled_catalog();
         let cases = [
             (
+                "gpt-6.1-sol",
+                CreditTokenRates::new(400, 20, 2_000),
+                CreditTokenRates::new(1_000, 50, 5_000),
+                ApiTokenRates::new(2_000_000, 100_000, Some(2_500_000), 10_000_000),
+                ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 15_000_000),
+                ApiTokenRates::new(4_000_000, 200_000, Some(5_000_000), 20_000_000),
+                ApiTokenRates::new(8_000_000, 400_000, Some(10_000_000), 30_000_000),
+            ),
+            (
                 "gpt-6-sol",
                 CreditTokenRates::new(400, 40, 2_000),
                 CreditTokenRates::new(1_000, 100, 5_000),
@@ -1425,7 +1468,13 @@ mod tests {
                 Some(*entry)
             );
         }
-        for unlisted in ["gpt-6", "gpt-6-sol-latest", "gpt-6-luna-latest"] {
+        for unlisted in [
+            "gpt-6",
+            "gpt-6.1",
+            "gpt-6.1-sol-latest",
+            "gpt-6-sol-latest",
+            "gpt-6-luna-latest",
+        ] {
             assert_eq!(lookup(Some(unlisted)), None, "{unlisted}");
         }
     }
@@ -1543,7 +1592,7 @@ mod tests {
     fn documented_complete_catalog_is_valid_and_contains_current_aliases() {
         let catalog = parse_catalog(include_bytes!("../docs/model-catalog.example.json")).unwrap();
 
-        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
             assert!(catalog.models.contains_key(model), "{model}");
         }
         assert_eq!(

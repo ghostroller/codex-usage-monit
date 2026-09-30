@@ -667,6 +667,7 @@ mod tests {
         };
         let cases = [
             ("gpt-6-astra", 40_600, 101_500),
+            ("gpt-6.1-sol", 8_060, 20_150),
             ("gpt-6-sol", 8_120, 20_300),
             ("gpt-6-luna", 406, 1_015),
             ("gpt-5.6-sol", 16_240, 40_600),
@@ -828,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_and_luna_preserve_fractional_credits_with_optional_long_context() {
+    fn gpt_6_sol_profiles_and_luna_preserve_fractional_credits_with_optional_long_context() {
         let tokens = TokenUsage {
             input_tokens: 272_001,
             cached_input_tokens: 200_000,
@@ -841,6 +842,8 @@ mod tests {
         // eighth-credit units, including Luna Fast's 0.625 cached rate and
         // its optional long-context 46.875 output rate.
         for (model, fast, base, with_long) in [
+            ("gpt-6.1-sol", false, 32_802_400, 65_603_800),
+            ("gpt-6.1-sol", true, 82_006_000, 164_009_500),
             ("gpt-6-sol", false, 36_802_400, 73_603_800),
             ("gpt-6-sol", true, 92_006_000, 184_009_500),
             ("gpt-6-luna", false, 1_840_120, 3_680_190),
@@ -852,6 +855,59 @@ mod tests {
             assert!(weight.used_long_context_pricing);
             assert!(!weight.used_model_fallback);
             assert!(!weight.used_long_context_detection_fallback);
+        }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_exact_id_uses_fractional_fast_cache_rates_without_new_aliases() {
+        let tokens = TokenUsage {
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            total_tokens: 1,
+            ..TokenUsage::default()
+        };
+        for (tier, expected) in [(None, 20), (Some("fast"), 50), (Some("priority"), 50)] {
+            let mut call = rated_call(" GPT-6.1-SOL ", false, tokens);
+            call.service_tier = tier.map(str::to_owned);
+            let weight = estimate_call_weight(&call);
+            assert_eq!(weight.units, expected, "{tier:?}");
+            assert!(!weight.used_model_fallback);
+            assert!(!weight.used_token_breakdown_fallback);
+        }
+        for model in ["gpt-6.1", "gpt-6.1-sol-latest"] {
+            let weight = estimate_call_weight(&rated_call(model, false, tokens));
+            assert!(weight.used_model_fallback, "{model}");
+            // Unknown slugs retain the GPT-5.6 Luna fallback's 0.5 cached rate.
+            assert_eq!(weight.units, 4, "{model}");
+        }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_long_context_requires_exact_request_above_the_strict_threshold() {
+        for (fast, at_boundary, above_boundary, with_long) in [
+            (false, 5_440_000, 5_440_020, 10_880_040),
+            (true, 13_600_000, 13_600_050, 27_200_100),
+        ] {
+            let tokens = |input_tokens| TokenUsage {
+                input_tokens,
+                cached_input_tokens: input_tokens,
+                total_tokens: input_tokens,
+                ..TokenUsage::default()
+            };
+            let boundary = estimate_call_weight(&rated_call("gpt-6.1-sol", fast, tokens(272_000)));
+            assert_eq!(boundary.units, at_boundary);
+            assert!(!boundary.used_long_context_pricing);
+            let mut above = rated_call("gpt-6.1-sol", fast, tokens(272_001));
+            let exact = estimate_call_weight(&above);
+            assert_eq!(exact.units, above_boundary);
+            assert_eq!(exact.units_with_api_long_context(), with_long);
+            assert!(exact.used_long_context_pricing);
+            above.request_usage_exact = false;
+            let ambiguous = estimate_call_weight(&above);
+            assert_eq!(ambiguous.units, above_boundary);
+            assert_eq!(ambiguous.units_with_api_long_context(), above_boundary);
+            assert!(!ambiguous.used_long_context_pricing);
+            assert!(ambiguous.used_long_context_detection_fallback);
         }
     }
 
@@ -902,6 +958,7 @@ mod tests {
 
         for model in [
             "gpt-6-astra",
+            "gpt-6.1-sol",
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6",

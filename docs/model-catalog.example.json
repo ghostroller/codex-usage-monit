@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "estimatorRevision": 8,
-  "apiPricingCatalogRevision": 5,
-  "ratesAsOf": "2026-09-26",
+  "estimatorRevision": 9,
+  "apiPricingCatalogRevision": 6,
+  "ratesAsOf": "2026-10-01",
   "sourceUrl": "https://developers.openai.com/api/docs/pricing",
   "longContextInputThreshold": 272000,
   "creditFallbackModel": "gpt-5.6-luna",
@@ -27,6 +27,30 @@
           "long": {
             "mode": "published",
             "rates": { "input": 40, "cachedInput": 4, "cacheWrite": 50, "output": 150 }
+          }
+        }
+      }
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "credit": {
+        "standard": { "input": 50, "cachedInput": "2.5", "output": 250 },
+        "fast": { "input": 125, "cachedInput": "6.25", "output": 625 },
+        "longContextPricing": true
+      },
+      "api": {
+        "standard": {
+          "short": { "input": 2, "cachedInput": "0.1", "cacheWrite": "2.5", "output": 10 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 4, "cachedInput": "0.2", "cacheWrite": 5, "output": 15 }
+          }
+        },
+        "fast": {
+          "short": { "input": 4, "cachedInput": "0.2", "cacheWrite": 5, "output": 20 },
+          "long": {
+            "mode": "published",
+            "rates": { "input": 8, "cachedInput": "0.4", "cacheWrite": 10, "output": 30 }
           }
         }
       }

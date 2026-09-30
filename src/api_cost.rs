@@ -514,6 +514,13 @@ mod tests {
                 11_900_000_000_000,
             ),
             (
+                "gpt-6.1-sol",
+                217_000_000_000,
+                434_000_000_000,
+                1_170_000_000_000,
+                2_340_000_000_000,
+            ),
+            (
                 "gpt-6-sol",
                 219_000_000_000,
                 438_000_000_000,
@@ -739,6 +746,12 @@ mod tests {
                 1_088_004_000_000,
                 544_002_000_000,
             ),
+            (
+                "gpt-6.1-sol",
+                544_000_000_000,
+                1_088_004_000_000,
+                544_002_000_000,
+            ),
             ("gpt-6-luna", 27_200_000_000, 54_400_200_000, 27_200_100_000),
         ] {
             let short = price_call(&call(model, None, tokens(272_000)));
@@ -753,6 +766,69 @@ mod tests {
             assert_eq!(ambiguous.maximum_pico_usd, long_price, "{model}");
             assert_eq!(ambiguous.partial_reason, Some(LONG_CONTEXT_AMBIGUOUS));
         }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_cached_input_prices_preserve_exact_boundary_and_ambiguous_range() {
+        for (tier, short_price, long_price, ambiguous_min) in [
+            (None, 27_200_000_000, 54_400_200_000, 27_200_100_000),
+            (
+                Some("fast"),
+                54_400_000_000,
+                108_800_400_000,
+                54_400_200_000,
+            ),
+        ] {
+            let tokens = |input_tokens| TokenUsage {
+                input_tokens,
+                cached_input_tokens: input_tokens,
+                total_tokens: input_tokens,
+                ..TokenUsage::default()
+            };
+            assert_exact_price("gpt-6.1-sol", tier, tokens(272_000), short_price);
+            assert_exact_price("gpt-6.1-sol", tier, tokens(272_001), long_price);
+            let mut call = call("gpt-6.1-sol", tier, tokens(272_001));
+            call.request_usage_exact = false;
+            let cost = price_call(&call);
+            assert!(cost.priced);
+            assert_eq!(cost.minimum_pico_usd, ambiguous_min);
+            assert_eq!(cost.maximum_pico_usd, long_price);
+            assert_eq!(cost.partial_reason, Some(LONG_CONTEXT_AMBIGUOUS));
+        }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_mapping_does_not_price_guessed_aliases_or_incomplete_breakdowns() {
+        let cached = TokenUsage {
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            total_tokens: 1,
+            ..TokenUsage::default()
+        };
+        assert_exact_price(" GPT-6.1-SOL ", None, cached, 100_000);
+        assert_exact_price("gpt-6.1-sol", Some("priority"), cached, 200_000);
+        for model in ["gpt-6.1", "gpt-6.1-sol-latest"] {
+            assert_unpriced_price(model, None, cached, MODEL_UNKNOWN);
+        }
+        assert_unpriced_price(
+            "gpt-6.1-sol",
+            None,
+            TokenUsage {
+                unclassified_tokens: 100,
+                total_tokens: 100,
+                ..TokenUsage::default()
+            },
+            TOKEN_BREAKDOWN_MISSING,
+        );
+        assert_unpriced_price(
+            "gpt-6.1-sol",
+            Some("fast"),
+            TokenUsage {
+                cached_input_tokens: 2,
+                ..cached
+            },
+            TOKEN_BREAKDOWN_INCONSISTENT,
+        );
     }
 
     #[test]
