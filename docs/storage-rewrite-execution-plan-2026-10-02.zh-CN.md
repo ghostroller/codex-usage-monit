@@ -77,6 +77,46 @@ S1 统一管理数据库接口与依赖；S2、S3、S4 可在接口冻结后按�
 - 本地 revision 高水位与已提交数据版本分开保存：预留编号单独提交，projection stamp 随数据事务发布，避免跨 selector 缓存把「编号已预留、数据尚未提交」当作新快照。迁移初始化中断可恢复自己的空库发布；已激活的丢库/空库仍拒绝重建。另一 privacy namespace 首次导入只更新该新本地 namespace 的 policy，重复旧副本不能覆盖当前策略。
 - SQL 查询和外层 TUI projection 缓存同时监测两种 privacy 的已提交版本：配额按 profile 共享，另一 privacy 写者提交后也必须失效。远端 generation 枚举只解码 `generation.json`，不会将同 namespace 的 quota header 混读为 generation；回归覆盖带配额的多页 bootstrap、增量重放、tombstone 与代清理。
 
+### 7.1 冻结源码与平台检查
+
+存储实现提交为 `188726780a45672bc27f87dc3feb0a06f7c270bb`。以下检查均针对该提交，开始时工作树干净；后续仅补本文档，不修改构建输入。三平台 Rust 均为 1.97.0。
+
+| 平台与范围 | 结果 | 日志与身份 |
+| --- | --- | --- |
+| 原生 macOS 15.7.2 / ARM64，完整 Unix 流程 | 通过：1900 项 lib、2 项真实 PTY、其余 Rust target、90 项 Python、format/Clippy、preview、installer 与 CLI smoke；默认忽略 3 项测量测试 | `target/sqlite-storage-2026-10-02/macos-full-20261002T175011/{result.json,verify-unix.log}`；构建输入 SHA-256 `639b5bd1dce9f2f47edad92aaf2125e24e165be4d3f3d96e4a778c7e30bac333`，前后相同 |
+| Docker Linux / ARM64，完整 Unix 流程 | 通过：1897 项 lib、2 项真实 PTY及其余完整流程；默认测量测试未执行 | `/Volumes/File/codex-usage-monit-docker-build/runs/20261002T095019Z-arm64-92946/{result.json,verify.log}`；隔离快照 SHA-256 `262cc9d381dbf381ce71c9b0437dba6812aa317a02b270c338363decd6dd2a65` |
+| UTM Windows 11 ARM64，实际执行 x64 MSVC target，完整流程 | **未全绿**：1842 项 lib、2 项 ConPTY、format/Clippy、Python 和 PowerShell 契约通过；Rust 总计 1960 通过、1 失败、4 忽略，停止于下述旧启动器问题 | `target/sqlite-storage-2026-10-02/windows-full-x64/729b4d245eb149b393bbdf36f547e8d3/{result.json,verify.log,interactive-context.json,task-cleanup.json}`；source ZIP SHA-256 `3dd3f811f2a39e633348eb901dfe87aa33ad9fb78843954540ce107a7ab7e45a` |
+
+完整命令：
+
+```sh
+# 原生 macOS：此证据 wrapper 记录前后源码 hash，并调用下面的原生入口。
+python3 -B target/sqlite-storage-2026-10-02/verify_native.py
+# 实际原生入口及环境：
+CARGO_TARGET_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage \
+CARGO_BUILD_BUILD_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage-build \
+CARGO_NET_OFFLINE=true sh scripts/verify-unix.sh
+
+# Docker 默认 native architecture，此机为 Linux ARM64。
+sh scripts/test-linux-docker.sh
+
+# 调用现有 UTM runner，临时 InteractiveToken 任务使实际测试在登录用户下执行。
+python3 -B target/orchestration-convergence-2026-10-02/verify_windows_interactive.py \
+  --interactive-user 'WIN-MM0JRLGM2Q3\user' \
+  --python-dir 'C:\Tools\codex-usage-monit\python-3.13.16-arm64' \
+  --private-temp 'C:\Users\user\AppData\Local\Temp' \
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
+  --target x86_64-pc-windows-msvc --timeout 1800 \
+  --output-dir target/sqlite-storage-2026-10-02/windows-full-x64
+```
+
+Windows run 的实际身份为 `WIN-MM0JRLGM2Q3\user`、session 1，使用其私有 TEMP；临时任务已确认删除且无残留进程。34 个带 SQLite 名称的 Windows 回归均通过；Unix 专用 fd/硬链接回归在 macOS/Linux 执行，不能将 Windows 条件编译跳过的分支计作原生覆盖。
+
+Windows 失败为 `tests/update_cli.rs:210` 的 `running_portable_launcher_with_different_bytes_passes_real_proxy_contract`：兼容性探测结束后残留 `.launcher-probe-*`。该失败在此前编排批次已经复现；`src/update.rs` 与该测试相对本次基线 `10ddd7b` 无变化。归类为既有启动器清理问题：清理代码忽略删除错误，确切 Windows 错误码尚未采集，不归因于 ARM64，也不称偶发。因 cargo test 在这里停止，后续 `verify_fixtures` target 与独立 Windows CLI build/smoke 未执行；真实 CLI 数据集成测试已通过。此次未重跑完整套件、未改超时、未删断言掩盖失败。
+
+本批没有运行 hosted CI、Linux x64/musl 发布验证、真实 SSH、真实用户历史性能基准或服务部署；本地流程不等于发布验收。S0—S5 已完成生产接入，S6 已完成正常运行路径替换而保留必要旧格式代码，S7 的本地检查已执行并保留上述 Windows 未通过项。未宣称全平台全绿或净代码量减负。
+
 ## 8. 参考
 
 - [此前提案](refactoring-proposal-2026-09-26.zh-CN.md)、[审核](refactoring-review-2026-09-26.zh-CN.md)、[执行与验证记录](refactoring-execution-plan-2026-09-26.zh-CN.md)。
