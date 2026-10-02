@@ -6,7 +6,7 @@
 
 use crate::config::CollectConfig;
 use crate::domain::{Provenance, TaskRecord};
-use crate::history::{HistoryData, HistoryObservation, HistoryStore};
+use crate::history::{HistoryData, HistoryObservation, HistoryStore, SummaryBackfillAttempt};
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
 use crate::history_profile_lease::{
     HistoryProfileLeaseGuard, TryHistoryProfileLease, try_acquire_history_profile_lease,
@@ -31,6 +31,7 @@ use crate::summary_report::{
     summary_backfill_scan_complete, summary_history_coverage_complete,
 };
 use chrono::{DateTime, Utc};
+use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -170,7 +171,7 @@ pub(crate) fn prepare_report_history(
                 Ok(None)
             };
             apply_runtime_write_metrics(&mut metrics, &write);
-            merge_runtime_history_write_result(&mut preparation, write, "history persistence");
+            merge_runtime_history_write_result(&mut preparation, &write, "history persistence");
         }
         ReportHistoryStore::LegacyFallback { store, .. } => {
             let write = if write_permitted {
@@ -490,7 +491,7 @@ fn apply_legacy_write_metrics(
     }
 }
 
-fn apply_runtime_write_metrics(
+pub(crate) fn apply_runtime_write_metrics(
     metrics: &mut HistoryMetrics,
     write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
 ) {
@@ -530,18 +531,19 @@ fn apply_runtime_write_metrics(
 pub(crate) fn report_history_observation(
     result: &CollectionResult,
     offline: bool,
-) -> HistoryObservation {
-    let mut observation = result.history_observation.clone();
+) -> Cow<'_, HistoryObservation> {
     let account_limits_are_fresh = result
         .account
         .limits
         .iter()
         .any(|limit| limit.provenance == Provenance::ServerSnapshot);
-    if !offline && !account_limits_are_fresh {
-        observation.quota_points.clear();
-        observation.weekly_local_points.clear();
+    if offline || account_limits_are_fresh {
+        return Cow::Borrowed(&result.history_observation);
     }
-    observation
+    let mut observation = result.history_observation.clone();
+    observation.quota_points.clear();
+    observation.weekly_local_points.clear();
+    Cow::Owned(observation)
 }
 
 fn merge_history_write_result(
@@ -560,15 +562,15 @@ fn merge_history_write_result(
     }
 }
 
-fn merge_runtime_history_write_result(
+pub(crate) fn merge_runtime_history_write_result(
     history: &mut HistoryData,
-    write_result: io::Result<Option<HistoryRuntimeWriteReport>>,
+    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
     operation: &str,
 ) {
     match write_result {
         Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
             history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings);
+            history.warnings.extend(report.warnings.iter().cloned());
         }
         Ok(Some(HistoryRuntimeWriteReport::V2(_))) | Ok(None) => {}
         Err(error) => history
@@ -577,23 +579,74 @@ fn merge_runtime_history_write_result(
     }
 }
 
+/// Normalizes a Summary scan without importing fallback account quota.
+/// Collection and scheduling remain with the one-shot or interactive caller.
+pub(crate) struct SummaryBackfillObservation {
+    pub scan_complete: bool,
+    pub observed_at: DateTime<Utc>,
+    pub tasks: Vec<TaskRecord>,
+    pub local_session_digests: LocalSessionDigestEvidence,
+    pub observation: HistoryObservation,
+}
+
+impl SummaryBackfillObservation {
+    pub(crate) fn from_collection(result: CollectionResult) -> Self {
+        let scan_complete = summary_backfill_scan_complete(&result.snapshot);
+        let mut observation = result.history_observation;
+        observation.quota_points.clear();
+        observation.weekly_local_points.clear();
+        retain_summary_backfill_evidence_buckets(&mut observation);
+        Self {
+            scan_complete,
+            observed_at: result.snapshot.as_of,
+            tasks: result.snapshot.tasks,
+            local_session_digests: result.local_session_digests,
+            observation,
+        }
+    }
+}
+
+pub(crate) fn summary_backfill_attempt(
+    history: &HistoryData,
+    observed_at: DateTime<Utc>,
+    scan_complete: bool,
+) -> SummaryBackfillAttempt {
+    SummaryBackfillAttempt {
+        completed_at: observed_at,
+        complete: scan_complete && summary_history_coverage_complete(history, observed_at),
+    }
+}
+
+/// Keep an in-memory cooldown even when persisting the marker fails, so a
+/// read-only or full state directory does not trigger an immediate rescan.
+pub(crate) fn apply_summary_backfill_marker(
+    history: &mut HistoryData,
+    requested: SummaryBackfillAttempt,
+    marker: io::Result<SummaryBackfillAttempt>,
+) {
+    let marker = marker.unwrap_or_else(|error| {
+        history
+            .warnings
+            .push(format!("summary backfill marker failed: {error}"));
+        requested
+    });
+    history.summary_backfill_attempted_at = Some(marker.completed_at);
+    history.summary_backfill_attempt_complete = Some(marker.complete);
+}
+
 pub(crate) fn backfill_summary_history_selected(
     config: &CollectConfig,
     store: &mut ReportHistoryStore,
     source_selector: &HistorySourceSelector,
 ) -> (HistoryData, DateTime<Utc>) {
     let worker_config = summary_backfill_config(config);
-    let result = collect_snapshot(&worker_config, None, false);
-    let scan_complete = summary_backfill_scan_complete(&result.snapshot);
-    let observed_at = result.snapshot.as_of;
-    let tasks = result.snapshot.tasks.clone();
-    let local_session_digests = result.local_session_digests;
-    let mut observation = result.history_observation;
-    // Summary reconstruction is local-only. Offline fallback quota samples
-    // must never replace server-backed quota history.
-    observation.quota_points.clear();
-    observation.weekly_local_points.clear();
-    retain_summary_backfill_evidence_buckets(&mut observation);
+    let SummaryBackfillObservation {
+        scan_complete,
+        observed_at,
+        tasks,
+        local_session_digests,
+        observation,
+    } = SummaryBackfillObservation::from_collection(collect_snapshot(&worker_config, None, false));
     let since = history_view_since(observed_at);
     let (write_permitted, mut profile_validation_warning) = match store.validated_write_permitted()
     {
@@ -639,7 +692,7 @@ pub(crate) fn backfill_summary_history_selected(
             };
             merge_runtime_history_write_result(
                 &mut history,
-                write_result,
+                &write_result,
                 "summary backfill persistence",
             );
             history
@@ -680,8 +733,8 @@ pub(crate) fn backfill_summary_history_selected(
     if let Some(warning) = profile_validation_warning {
         history.warnings.push(warning);
     }
-    let requested_complete =
-        scan_complete && summary_history_coverage_complete(&history, observed_at);
+    let requested = summary_backfill_attempt(&history, observed_at, scan_complete);
+    let requested_complete = requested.complete;
     let marker_write_permitted = match store.validated_write_permitted() {
         Ok(permitted) => permitted,
         Err(error) => {
@@ -709,25 +762,12 @@ pub(crate) fn backfill_summary_history_selected(
             complete: requested_complete,
         }),
     };
-    let marker = match marker {
-        Ok(marker) => marker,
-        Err(error) => {
-            history
-                .warnings
-                .push(format!("summary backfill marker failed: {error}"));
-            crate::history::SummaryBackfillAttempt {
-                completed_at: observed_at,
-                complete: requested_complete,
-            }
-        }
-    };
-    history.summary_backfill_attempted_at = Some(marker.completed_at);
-    history.summary_backfill_attempt_complete = Some(marker.complete);
+    apply_summary_backfill_marker(&mut history, requested, marker);
     normalize_history_warnings(&mut history);
     (history, observed_at)
 }
 
-fn normalize_history_warnings(history: &mut HistoryData) {
+pub(crate) fn normalize_history_warnings(history: &mut HistoryData) {
     history.warnings.sort();
     history.warnings.dedup();
 }
@@ -817,4 +857,96 @@ fn history_projection_revision_once(
         local_observation_revision,
         sources,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AccountSnapshot, CollectionStats, Snapshot, TokenUsage, UsageCall};
+    use crate::summary_report::summary_history_backfill_needed;
+
+    #[test]
+    fn summary_backfill_scan_keeps_usage_and_tasks_without_importing_account_history() {
+        let mut snapshot: Snapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/snapshots/normal.json")).unwrap();
+        snapshot.stats = CollectionStats {
+            discovered_files: 1,
+            scanned_files: 1,
+            ..CollectionStats::default()
+        };
+        let now = snapshot.as_of;
+        let call = UsageCall {
+            timestamp: now - chrono::Duration::minutes(15),
+            thread_id: snapshot.tasks[0].thread_id.clone(),
+            turn_id: None,
+            usage_event_id: None,
+            usage_event_identity_exact: false,
+            model: Some("gpt-5.6-sol".to_owned()),
+            service_tier: None,
+            tokens: TokenUsage {
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+            request_usage_exact: true,
+        };
+        let observation = HistoryObservation::from_sources_with_tasks_and_coverage(
+            now,
+            &[call],
+            &[],
+            &snapshot.limits,
+            &[],
+            Some(now - chrono::Duration::days(30)),
+        );
+        assert!(!observation.quota_points.is_empty());
+        assert!(!observation.weekly_local_points.is_empty());
+        let original_bucket_count = observation.half_hour_buckets.len();
+        let expected_tasks = snapshot.tasks.clone();
+        let backfill = SummaryBackfillObservation::from_collection(CollectionResult {
+            snapshot,
+            account: AccountSnapshot::default(),
+            history_observation: observation,
+            local_session_digests: LocalSessionDigestEvidence::default(),
+        });
+
+        assert!(backfill.scan_complete);
+        assert_eq!(backfill.tasks, expected_tasks);
+        assert!(backfill.observation.quota_points.is_empty());
+        assert!(backfill.observation.weekly_local_points.is_empty());
+        assert!(backfill.observation.half_hour_buckets.len() < original_bucket_count);
+        assert_eq!(backfill.observation.half_hour_buckets.len(), 1);
+        assert_eq!(backfill.observation.half_hour_buckets[0].call_count, 1);
+        assert_eq!(
+            backfill.observation.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+    }
+
+    #[test]
+    fn summary_backfill_marker_failure_prevents_an_immediate_rescan() {
+        let now = DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut history = HistoryData::default();
+        assert!(summary_history_backfill_needed(&history, now));
+        let requested = summary_backfill_attempt(&history, now, true);
+        assert!(!requested.complete);
+        apply_summary_backfill_marker(
+            &mut history,
+            requested,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only fixture",
+            )),
+        );
+
+        assert!(!summary_history_backfill_needed(&history, now));
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|warning| { warning == "summary backfill marker failed: read-only fixture" })
+        );
+    }
 }

@@ -93,13 +93,13 @@ use crate::event_log::{EventLog, LogLevel};
 use crate::history::{HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION};
 use crate::history::{HistoryData, HistoryObservation, HistoryStore, LOCAL_BUCKET_MINUTES};
 use crate::history_application::{
-    HistoryProjectionRevision, history_projection_revision, query_runtime_history,
-    stage_runtime_collection,
+    HistoryProjectionRevision, SummaryBackfillObservation, acquire_runtime_profile_lease,
+    apply_runtime_write_metrics, apply_summary_backfill_marker, history_projection_revision,
+    merge_runtime_history_write_result, normalize_history_warnings, query_runtime_history,
+    report_history_observation, stage_runtime_collection, summary_backfill_attempt,
 };
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
-use crate::history_profile_lease::{
-    HistoryProfileLeaseGuard, TryHistoryProfileLease, try_acquire_history_profile_lease,
-};
+use crate::history_profile_lease::HistoryProfileLeaseGuard;
 use crate::history_query::{
     HistoryQueryContext, HistorySourceSelection, HistorySourceSelectionStatus,
     HistorySourceUnavailableReason, UnifiedHistoryBackend,
@@ -157,15 +157,14 @@ use crate::summary_report::{
     PreparedSummary, SummaryChartBucket, SummaryChartData,
     SummaryCoverageState as SummaryDailyState, SummaryGrain, SummaryMetric, SummaryRange,
     history_view_since, prepare_summary_chart,
-    prepare_summary_with_local_time as prepare_shared_summary,
-    retain_summary_backfill_evidence_buckets, summary_backfill_config,
-    summary_backfill_scan_complete, summary_history_backfill_needed,
-    summary_history_coverage_complete,
+    prepare_summary_with_local_time as prepare_shared_summary, summary_backfill_config,
+    summary_history_backfill_needed, summary_history_coverage_complete,
 };
 #[cfg(test)]
 use crate::summary_report::{
     SUMMARY_BACKFILL_MAX_FILES, SUMMARY_BACKFILL_RETRY_DAYS, SUMMARY_HISTORY_DAYS,
-    SummaryDailyCoverage, expected_summary_coverage, summary_api_cost_for_catalog,
+    SummaryDailyCoverage, expected_summary_coverage, retain_summary_backfill_evidence_buckets,
+    summary_api_cost_for_catalog, summary_backfill_scan_complete,
 };
 use crate::trace::{TraceFields, TraceLog, TraceOutcome, process_trace_log};
 use crate::trends::{
@@ -929,11 +928,6 @@ fn legacy_fallback_write_error() -> io::Error {
         io::ErrorKind::PermissionDenied,
         "history persistence is disabled while the source-aware runtime is unavailable",
     )
-}
-
-fn normalize_history_warnings(history: &mut HistoryData) {
-    history.warnings.sort();
-    history.warnings.dedup();
 }
 
 fn compact_node_id(node_id: &NodeId) -> &str {
@@ -2756,19 +2750,6 @@ fn account_refresh_is_complete(result: &CollectionResult) -> bool {
     account_limits_are_fresh(result)
         && !result.account.rate_limit_reset_credits_partial
         && reset_credits_complete
-}
-
-fn collection_history_observation(
-    result: &CollectionResult,
-    offline: bool,
-) -> Cow<'_, HistoryObservation> {
-    if offline || account_limits_are_fresh(result) {
-        return Cow::Borrowed(&result.history_observation);
-    }
-    let mut observation = result.history_observation.clone();
-    observation.quota_points.clear();
-    observation.weekly_local_points.clear();
-    Cow::Owned(observation)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -9073,7 +9054,7 @@ fn prepare_deferred_initial_tui(
 
 fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
     match HistoryRuntime::discover(&config.codex_home, config.redact_content) {
-        Ok(runtime) => match acquire_tui_history_profile_lease(&runtime) {
+        Ok(runtime) => match acquire_runtime_profile_lease(&runtime) {
             Ok(profile_lease) => TuiHistoryStore::deferred_runtime(runtime, profile_lease),
             Err(error) => TuiHistoryStore::runtime(
                 runtime,
@@ -9089,33 +9070,6 @@ fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
                 "source-aware history runtime unavailable; using legacy history only: {error}"
             )],
         ),
-    }
-}
-
-fn acquire_tui_history_profile_lease(
-    runtime: &HistoryRuntime,
-) -> io::Result<HistoryProfileLeaseGuard> {
-    match try_acquire_history_profile_lease(
-        runtime.state_root(),
-        runtime.profile_id().clone(),
-        runtime.redaction_profile(),
-    )? {
-        TryHistoryProfileLease::Acquired(guard) => Ok(guard),
-        TryHistoryProfileLease::Busy { active_profile } => {
-            let detail = active_profile.map_or_else(
-                || "a profile transition is in progress".to_owned(),
-                |active| {
-                    format!(
-                        "the active history selection uses {:?}",
-                        active.redaction_profile()
-                    )
-                },
-            );
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("{detail}; retry after the other process exits"),
-            ))
-        }
     }
 }
 
@@ -9231,60 +9185,6 @@ fn prepare_tui_history_runtime(
         return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
     }
     TuiHistoryRuntimePreparation::Ready(warnings)
-}
-
-fn apply_tui_history_write_metrics(
-    metrics: &mut HistoryMetrics,
-    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
-) {
-    match write_result {
-        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
-            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-            metrics.read_only = report.read_only;
-        }
-        Ok(Some(HistoryRuntimeWriteReport::V2(report))) => {
-            metrics.shards_written = u64::try_from(
-                report
-                    .account
-                    .shards_written
-                    .saturating_add(report.buckets.shards_written)
-                    .saturating_add(report.weekly.shards_written)
-                    .saturating_add(report.session_digests.shards_written),
-            )
-            .unwrap_or(u64::MAX);
-            metrics.shards_skipped = u64::try_from(
-                report
-                    .account
-                    .shards_skipped
-                    .saturating_add(report.buckets.shards_skipped)
-                    .saturating_add(report.weekly.shards_skipped)
-                    .saturating_add(report.session_digests.shards_skipped),
-            )
-            .unwrap_or(u64::MAX);
-        }
-        Ok(None) => {}
-        Err(_) => metrics.warnings = 1,
-    }
-}
-
-fn merge_tui_history_write_result(
-    history: &mut HistoryData,
-    write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
-    operation: &str,
-) {
-    match write_result {
-        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
-            history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings.iter().cloned());
-        }
-        Ok(Some(HistoryRuntimeWriteReport::V2(_))) | Ok(None) => {}
-        Err(error) => history
-            .warnings
-            .push(format!("{operation} failed: {error}")),
-    }
 }
 
 #[cfg(test)]
@@ -9491,13 +9391,13 @@ fn stage_and_load_history_selected_with_mode(
         Ok(report) => report.is_some(),
         Err(_) => true,
     };
-    apply_tui_history_write_metrics(&mut metrics, &write_result);
+    apply_runtime_write_metrics(&mut metrics, &write_result);
     metrics.quota_points = u64::try_from(projection.history.quota_points.len()).unwrap_or(u64::MAX);
     metrics.local_buckets =
         u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    merge_tui_history_write_result(
+    merge_runtime_history_write_result(
         &mut projection.history,
         &write_result,
         "history persistence",
@@ -9609,13 +9509,13 @@ fn flush_or_reload_history_if_due(
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_elapsed, load_elapsed);
     metrics.record_performed = record_performed;
-    apply_tui_history_write_metrics(&mut metrics, &write_result);
+    apply_runtime_write_metrics(&mut metrics, &write_result);
     metrics.quota_points = u64::try_from(projection.history.quota_points.len()).unwrap_or(u64::MAX);
     metrics.local_buckets =
         u64::try_from(projection.history.half_hour_buckets.len()).unwrap_or(u64::MAX);
     metrics.weekly_local_points =
         u64::try_from(projection.history.weekly_local_points.len()).unwrap_or(u64::MAX);
-    merge_tui_history_write_result(
+    merge_runtime_history_write_result(
         &mut projection.history,
         &write_result,
         "history persistence",
@@ -9656,7 +9556,7 @@ fn flush_staged_history_on_exit(
     let mut metrics =
         HistoryMetrics::with_durations(total_started.elapsed(), record_started.elapsed(), None);
     metrics.record_performed = true;
-    apply_tui_history_write_metrics(&mut metrics, &write_result);
+    apply_runtime_write_metrics(&mut metrics, &write_result);
     perf_log.record_history(metrics);
 }
 
@@ -10238,7 +10138,7 @@ fn collect_initial_refresh_completion(
         )
     });
 
-    let history_observation = collection_history_observation(&result, config.offline);
+    let history_observation = report_history_observation(&result, config.offline);
     let history_span = config.startup_trace.span("tui.initial_history");
     let (projection, recorder_health, remote_live, remote_overview_history) = {
         let mut history_store = history_store
@@ -10485,22 +10385,13 @@ fn start_refresh_if_due(
                 || {
                     let mut cache = RolloutCache::new();
                     let result = collect_snapshot_cached(&worker_config, None, false, &mut cache);
-                    let scan_complete = summary_backfill_scan_complete(&result.snapshot);
-                    let CollectionResult {
-                        snapshot,
-                        account,
-                        mut history_observation,
+                    let SummaryBackfillObservation {
+                        scan_complete,
+                        observed_at,
+                        tasks,
                         local_session_digests,
-                    } = result;
-                    let observed_at = snapshot.as_of;
-                    let tasks = snapshot.tasks.clone();
-                    // Summary reconstruction is deliberately local-only. Never let
-                    // offline fallback quota/weekly points replace server history.
-                    history_observation.quota_points.clear();
-                    history_observation.weekly_local_points.clear();
-                    retain_summary_backfill_evidence_buckets(&mut history_observation);
-                    drop(snapshot);
-                    drop(account);
+                        observation,
+                    } = SummaryBackfillObservation::from_collection(result);
                     drop(cache);
                     let (mut projection, recorder_health) = {
                         let mut history_store = worker_history
@@ -10509,44 +10400,26 @@ fn start_refresh_if_due(
                         let (mut projection, recorder_health) =
                             stage_full_and_load_history_selected(
                                 &mut history_store,
-                                &history_observation,
+                                &observation,
                                 &tasks,
                                 &local_session_digests,
                                 observed_at,
                                 &worker_config.perf_log,
                                 &history_source_selection,
                             );
-                        let coverage_complete =
-                            summary_history_coverage_complete(&projection.history, observed_at);
-                        let requested_complete = scan_complete && coverage_complete;
-                        match history_store
-                            .mark_summary_backfill_attempt(observed_at, requested_complete)
-                        {
-                            Ok(marker) => {
-                                projection.history.summary_backfill_attempted_at =
-                                    Some(marker.completed_at);
-                                projection.history.summary_backfill_attempt_complete =
-                                    Some(marker.complete);
-                            }
-                            Err(error) => {
-                                // Keep an in-memory cooldown even when the durable
-                                // marker cannot be written, otherwise a read-only or
-                                // full state directory would trigger an immediate
-                                // expensive rescan loop.
-                                projection.history.summary_backfill_attempted_at =
-                                    Some(observed_at);
-                                projection.history.summary_backfill_attempt_complete =
-                                    Some(requested_complete);
-                                projection
-                                    .history
-                                    .warnings
-                                    .push(format!("summary backfill marker failed: {error}"));
-                            }
-                        }
+                        let requested = summary_backfill_attempt(
+                            &projection.history,
+                            observed_at,
+                            scan_complete,
+                        );
+                        let marker = history_store.mark_summary_backfill_attempt(
+                            requested.completed_at,
+                            requested.complete,
+                        );
+                        apply_summary_backfill_marker(&mut projection.history, requested, marker);
                         (projection, recorder_health)
                     };
-                    projection.history.warnings.sort();
-                    projection.history.warnings.dedup();
+                    normalize_history_warnings(&mut projection.history);
                     RefreshCompletion {
                         result: None,
                         remote_live: None,
@@ -10646,7 +10519,7 @@ fn start_refresh_if_due(
                         let history = match result.as_ref() {
                             Some(result) => {
                                 let history_observation =
-                                    collection_history_observation(result, worker_config.offline);
+                                    report_history_observation(result, worker_config.offline);
                                 Some(stage_and_load_history_selected(
                                     history_store,
                                     history_observation.as_ref(),

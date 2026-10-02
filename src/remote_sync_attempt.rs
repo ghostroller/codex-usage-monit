@@ -11,13 +11,101 @@ use chrono::{DateTime, Utc};
 
 use crate::history_profile_lease::HistoryProfileLeaseGuard;
 use crate::history_runtime::HistoryRuntime;
-use crate::remote_bandwidth_budget::{RemoteBandwidthBudgetStore, RemoteBandwidthReservation};
+use crate::remote_bandwidth_budget::{
+    RemoteBandwidthAdmission, RemoteBandwidthBudgetStore, RemoteBandwidthReservation,
+    RemoteBandwidthTransferKind,
+};
+use crate::remote_ingest_state::{RemoteDeltaIngestBinding, RemoteDeltaNextRequestPosition};
 use crate::remote_source_metadata::finalize_remote_source_metadata;
 use crate::remote_sync::{
-    RemoteDeltaLocalPhases, RemoteDeltaTransport, RemoteSyncError, RemoteSyncHostSnapshot,
-    RemoteSyncLimits, RemoteSyncReport, sync_remote_delta_bounded,
+    FilesystemRemoteDeltaLocalPhases, RemoteDeltaLocalPhases, RemoteDeltaTransport,
+    RemoteSyncError, RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport,
+    build_remote_delta_ingest_binding, preflight_remote_delta_position, sync_remote_delta_bounded,
 };
 use crate::remotes_config::RemotesConfigStore;
+
+/// Binds local recovery and bandwidth admission to one selected host/runtime.
+/// Callers first establish their own profile/cutover/host leases and metadata.
+/// Construction and preflight remain separate so manual sync can preserve its
+/// distinct binding-error and preflight-error health recording policies.
+pub(crate) struct PreparedRemoteAggregateLocal<'a> {
+    config_store: &'a RemotesConfigStore,
+    selected: &'a RemoteSyncHostSnapshot,
+    runtime: &'a HistoryRuntime,
+    binding: RemoteDeltaIngestBinding,
+    local: FilesystemRemoteDeltaLocalPhases<'a>,
+}
+
+impl<'a> PreparedRemoteAggregateLocal<'a> {
+    pub(crate) fn new(
+        config_store: &'a RemotesConfigStore,
+        selected: &'a RemoteSyncHostSnapshot,
+        runtime: &'a HistoryRuntime,
+    ) -> Result<Self, RemoteSyncError> {
+        let binding = build_remote_delta_ingest_binding(selected, runtime.profile_id().clone())?;
+        let local =
+            FilesystemRemoteDeltaLocalPhases::new(runtime.ownership(), runtime.source_history());
+        Ok(Self {
+            config_store,
+            selected,
+            runtime,
+            binding,
+            local,
+        })
+    }
+
+    /// Recovers the persisted cursor under the original exact selection fence.
+    /// This runs before any network reservation; its position lets automatic
+    /// sync choose its existing bulk/incremental admission policy.
+    pub(crate) fn preflight(
+        &mut self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<RemoteDeltaNextRequestPosition, RemoteSyncError> {
+        preflight_remote_delta_position(
+            self.config_store,
+            self.selected,
+            &self.binding,
+            &mut self.local,
+            observed_at,
+        )
+    }
+
+    /// The caller chooses manual/override/automatic policy and handles pauses;
+    /// host identity and the page/response reservation envelope stay paired.
+    pub(crate) fn begin_budget_attempt(
+        &self,
+        budget: &RemoteBandwidthBudgetStore,
+        attempted_at: DateTime<Utc>,
+        kind: RemoteBandwidthTransferKind,
+        limits: RemoteSyncLimits,
+    ) -> io::Result<RemoteBandwidthAdmission> {
+        budget.begin_sync_attempt(
+            self.selected.host().id(),
+            Some(&self.binding.source().node_id),
+            attempted_at,
+            kind,
+            limits.max_response_bytes,
+            limits.max_pages.get(),
+        )
+    }
+
+    pub(crate) fn admitted_attempt<'b, T>(
+        &'b mut self,
+        transport: &'b mut T,
+        bandwidth_budget: &'b RemoteBandwidthBudgetStore,
+        reservation: &'b RemoteBandwidthReservation,
+    ) -> AdmittedRemoteAggregateAttempt<'b, FilesystemRemoteDeltaLocalPhases<'a>, T> {
+        AdmittedRemoteAggregateAttempt {
+            config_store: self.config_store,
+            selected: self.selected,
+            runtime: self.runtime,
+            local: &mut self.local,
+            transport,
+            bandwidth_budget,
+            reservation,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum RemoteAggregateAttemptError {
@@ -46,26 +134,6 @@ where
     L: RemoteDeltaLocalPhases,
     T: RemoteDeltaTransport,
 {
-    pub(crate) fn new(
-        config_store: &'a RemotesConfigStore,
-        selected: &'a RemoteSyncHostSnapshot,
-        runtime: &'a HistoryRuntime,
-        local: &'a mut L,
-        transport: &'a mut T,
-        bandwidth_budget: &'a RemoteBandwidthBudgetStore,
-        reservation: &'a RemoteBandwidthReservation,
-    ) -> Self {
-        Self {
-            config_store,
-            selected,
-            runtime,
-            local,
-            transport,
-            bandwidth_budget,
-            reservation,
-        }
-    }
-
     /// Runs transport and persistence, settles transferred bytes, then applies
     /// the caller-owned selection fence. Automatic sync uses that fence for
     /// exact host/config eligibility; an explicit manual selection has no

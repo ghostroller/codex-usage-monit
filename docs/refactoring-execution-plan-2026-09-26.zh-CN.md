@@ -799,6 +799,61 @@ N4 已增补第 9、10 节：A/C 独立/复制/分叉/缺失 facts/quota 例子�
 
 本轮没有执行 N5：当前 Windows 本机未使用相应 Unix/macOS 原生环境；按委托不运行 Docker、UTM、远端或 hosted CI。真实服务安装、真实历史基准及断电实验仍未执行。A 产品决策、SQLite 原型委托及生产迁移的门继续关闭。
 
+## 14. CLI/TUI 共同编排收敛（2026-10-02）
+
+本批以 `70c26ef` 为基线，按用户明确委托收敛已识别的重复流程，延续 M3 的应用层边界；不改变 A/C 产品选择或启动 SQLite 路线。
+
+- `history_application` 统一 profile lease 获取、采集 observation 的 quota 新鲜度处理、写入指标/警告与警告去重。新鲜及离线 observation 使用借用，保持 TUI 的无克隆路径。
+- Summary 回填共用扫描结果规范化、覆盖完成判定及 marker 失败后的内存冷却。保留 CLI 同步执行与 TUI 后台线程、选择 generation、缓存和提交策略；两端仍在每次写入前验证自己的 profile authority。
+- `PreparedRemoteAggregateLocal` 将选中的 config/host/runtime、本地 ingest 预检和预算参数绑定在同一对象中，手动和自动入口都从它生成已入场的聚合同步。手动切换、自动 `RequireV2Active`、预算类型、错误/health 时序与最终 fence 保持各自既有策略。
+- 新增回填不导入账户历史、marker 失败不立即重扫、准备后配置变化不创建 ingest 状态的回归，并沿用两端的真实持久化、租约、缓存及同步测试。
+
+### 14.1 收敛收益与边界
+
+共同规则现在各有一个实现位置：修改 quota 新鲜度、回填完成/冷却规则或远端聚合同步的本地准备流程时，两端可沿用同一修改。TUI 的后台调度、缓存、generation fencing 和延迟持久化，以及 CLI 的同步执行仍由各自入口负责。本批没有新增生产依赖，也没有改变存储格式。
+
+相对 `70c26ef`，按上一轮模块统计的口径（非空、非整行 `//` 注释，排除测试文件和 `cfg(test)` 项，保留平台分支），生产 Rust **净减 65 行**，测试及辅助代码 **净增 142 行**；六个 Rust 文件的原始物理行数合计净增 93 行。新增 3 项行为回归，既有测试只调整共用 helper 的调用并补强借用/克隆断言。这是共同规则的维护收敛，不是运行时性能测量，也不据此推导复杂度下降比例。统计与独立复核见本批 `read-only-doc-review/doc-review-and-loc.json` 和 `independent-review.json`。
+
+### 14.2 本批验证与源码身份
+
+执行时分支为 `codex/cli-tui-orchestration`，HEAD 为 `70c26efb97e461d92c8fa0f178a6a267bf4afc38`，上述六个 Rust 文件及本记录尚未提交。验证绑定同一批 **197 个 Cargo/构建配置、源码、测试及脚本输入**，源码输入清单 SHA-256 为 `da11ba1553b7c7565b0565e9d6d9ee9178958cdf6600fe688f0ab7af1576a544`。macOS 执行前后字节相同；Linux 隔离快照、Windows 最终 x64 完整验证及单项复现中的这 197 个文件均逐项匹配。文档不计入该输入清单，检查完成后只补本节验证记录，单独检查链接与 diff。
+
+本地证据根目录为 `target/orchestration-convergence-2026-10-02/`，汇总 `verification-summary.json` 保存完整命令、环境、run ID、源码身份、结果和日志路径；不是沿用旧批次的通过结果。
+
+| 平台与范围 | 本次结果 | 证据位置 |
+| --- | --- | --- |
+| 原生 macOS 15.7.2 / arm64，完整 `verify-unix.sh` | **通过**；Rust 1980 passed / 0 failed / 3 ignored | 本批 `macos-full-20261002T011556/` 的 result、source-before/after 和 log |
+| Docker Linux / arm64，完整 `verify-unix.sh` | **通过**；Rust 1977 passed / 0 failed / 3 ignored | `/Volumes/File/codex-usage-monit-docker-build/runs/20261001T171609Z-arm64-22636/` 的 result、source 和 log |
+| UTM Windows 11 ARM64 宿主，执行 `x86_64-pc-windows-msvc` 二进制，完整验证尝试 | **未全绿**；库测试 1788 passed / 0 failed / 1 ignored，真实 ConPTY 2 项通过；到停止处合计 1906 passed / 1 failed / 4 ignored | 本批 `windows-full-x64/b2ae8ada7b4546829eb88a3a06b26e0b/` |
+| 同一 Windows x64 源码，启动器失败项精确复现 | **失败复现**；0 passed / 1 failed，未再次运行整套 | 本批 `windows-launcher-focused/4f9cc4f5f0534b9a94e0113072be3dbc/` |
+
+macOS/Linux 均通过格式、Clippy（`-D warnings`）、Python 契约、安装器契约、构建及版本/离线夹具 smoke；各自 Python 共 90 项，其中 6 项按既有条件跳过。Windows x64 在停止前通过格式、Clippy、25 项 Python 测试及 PowerShell 契约，库测试包含本批三项新回归及两端既有租约、持久化和缓存验证。各平台的 Rust 计数保留 `cfg` 差异，过滤执行的 preview/子进程测试不重复计入全量统计。
+
+macOS 的完整命令为 `sh scripts/verify-unix.sh`，运行环境覆盖为 `CARGO_TARGET_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage`、`CARGO_BUILD_BUILD_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage-build`、`CARGO_NET_OFFLINE=true`。Linux 命令为 `sh scripts/test-linux-docker.sh`，快照 SHA-256 为 `4f03581c50231acff5b1a03c1c4bd2178707e6c0300816aa34f97e37a9205952`。两者使用本机已有的 Rust 1.97.0 工具链，未补做 Linux x64。
+
+Windows 完整运行的宿主命令如下；忽略目录中的 wrapper 调用项目既有 UTM runner，绑定其原始源码 ZIP、请求和结果，只补进程级 Python PATH、临时目录及真实用户执行上下文：
+
+```sh
+python3 -B target/orchestration-convergence-2026-10-02/verify_windows_interactive.py \
+  --interactive-user 'WIN-MM0JRLGM2Q3\user' \
+  --python-dir 'C:\Tools\codex-usage-monit\python-3.13.16-arm64' \
+  --private-temp 'C:\Users\user\AppData\Local\Temp' \
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
+  --target x86_64-pc-windows-msvc --timeout 1800 \
+  --output-dir target/orchestration-convergence-2026-10-02/windows-full-x64
+```
+
+单项复现沿用全部环境/target 参数，增加 `--focused --test-filter running_portable_launcher_with_different_bytes_passes_real_proxy_contract`，超时改为 600 秒，输出目录改为 `windows-launcher-focused`；完整 argv 另存汇总。两次源码 ZIP SHA-256 均为 `ec0d324c3a1b25d9e51ebb497e1219df91e92b302113f1e2fa42b4f31718cf06`。执行为真实已登录管理员用户的高完整性会话；x64 二进制由 Windows ARM64 执行，不计作原生 x64 宿主验证。各次任务/进程树清理结果均为 `cleaned`，没有遗留本批计划任务。
+
+### 14.3 Windows 限制及未执行项
+
+Windows x64 的失败是既有 `running_portable_launcher_with_different_bytes_passes_real_proxy_contract` 在 `tests/update_cli.rs:210` 的 `.launcher-probe-*` 临时目录清理断言。对应 `verify_compatible_launcher` 函数和测试正文与 v0.5.2 一致，本批未改动该清理路径；完整验证及同源码单项复现都失败。保留目录中只剩临时启动器可执行文件，但原始删除错误未记录，不能断言具体句柄释放原因或将它标为偶发失败。完整 runner 在此停止，后续 `usage_graph` 集成测试及最终独立 Windows CLI smoke **未执行**；库及 ConPTY 通过不能替代整套通过。
+
+较早的 Windows 尝试也保留在汇总中：SYSTEM 缺少 Python、SYSTEM 临时目录行为与夹具不符，均在产品测试开始前停止；恢复真实用户上下文后，原生 ARM64 完整运行又因既有 release fixture 不支持 `aarch64-pc-windows-msvc` 而出现 7 项 `remote_agent_manager` 库测试失败（1781 passed / 7 failed / 1 ignored）。随后使用已有 x64 工具链得到上表结果，不覆盖或改写早期失败。
+
+既有手动/合成基准仍 ignored；未运行真实历史基准、真实 SSH/服务安装、断电实验或 hosted CI。工作区尚未提交、push、创建 tag 或发布。该批完成的是共同编排收敛，不据此宣称 A 方案、SQLite 迁移或全部平台验证完成。
+
 [E1]: https://docs.rs/semver/1.0.28/semver/struct.Version.html#method.cmp_precedence "semver 的升级优先级比较"
 [E2]: https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock "标准库锁、竞争错误与句柄生命周期"
 [E3]: https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist "persist 不等于完整持久化发布"

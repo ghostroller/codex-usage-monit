@@ -1453,7 +1453,7 @@ fn deferred_history_activation_observes_the_completed_first_frame() {
     let history_root = directory.path().join("state/history-v1");
     let runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let ownership = runtime.ownership().clone();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let startup_trace = crate::startup::StartupTrace::enabled(Instant::now(), None).unwrap();
     let hook_trace = startup_trace.clone();
     let first_frame_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1796,7 +1796,7 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
 
     let mut failed_refresh = account_refresh_result("error", None, true);
     failed_refresh.history_observation = observation.clone();
-    let deferred = collection_history_observation(&failed_refresh, false);
+    let deferred = report_history_observation(&failed_refresh, false);
 
     assert_eq!(deferred.observed_at, now);
     assert!(deferred.quota_points.is_empty());
@@ -1804,7 +1804,7 @@ fn bootstrap_history_defers_server_points_online_and_preserves_them_offline() {
     assert!(deferred.weekly_local_points.is_empty());
     assert!(matches!(&deferred, Cow::Owned(_)));
 
-    let offline = collection_history_observation(&failed_refresh, true);
+    let offline = report_history_observation(&failed_refresh, true);
     assert_eq!(offline.as_ref(), &observation);
     assert!(matches!(&offline, Cow::Borrowed(_)));
 }
@@ -10568,7 +10568,7 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let warnings = match prepare_tui_history_runtime(
         &mut runtime,
         &profile_lease,
@@ -10705,7 +10705,7 @@ fn prepare_synthetic_history_measurement_fixture() {
         crate::project_mapping::ProjectMappingStore::new(root.join("config/project-mappings.json")),
     )
     .unwrap();
-    let _profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let _profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let active = runtime.ensure_v2_active().unwrap();
     let quota = QuotaPoint {
         observed_at: now,
@@ -10825,7 +10825,7 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
         false,
     )
     .unwrap();
-    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
@@ -10937,7 +10937,7 @@ fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cach
         false,
     )
     .unwrap();
-    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
@@ -11046,7 +11046,7 @@ fn application_refresh_shares_quota_with_background_overview_and_invalidates_quo
         false,
     )
     .unwrap();
-    let lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 20, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(&mut runtime, &lease, now),
@@ -11144,7 +11144,7 @@ fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(
@@ -11219,7 +11219,7 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
     assert!(matches!(
         prepare_tui_history_runtime(
@@ -11341,7 +11341,7 @@ fn v2_projection_cache_reloads_after_metadata_only_journal_recovery() {
             false,
         )
         .unwrap();
-        let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+        let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
         let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
         let now = starts_at + ChronoDuration::minutes(20);
         assert!(matches!(
@@ -11418,7 +11418,7 @@ fn recent_legacy_recorder_defers_tui_v2_cutover() {
     )
     .unwrap();
 
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, now) {
         TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
         TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
@@ -11443,7 +11443,7 @@ fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
     let history_root = directory.path().join("state/history-v1");
     let runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let ownership = runtime.ownership().clone();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let _recorder_guard =
         match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
             TryRecorderInstanceLock::Acquired(guard) => guard,
@@ -11481,7 +11481,7 @@ fn same_profile_recorder_on_v2_allows_tui_persistence() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
         TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
@@ -11489,7 +11489,7 @@ fn same_profile_recorder_on_v2_allows_tui_persistence() {
         }
     };
     assert!(warnings.is_empty());
-    let _recorder_profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let _recorder_profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let _recorder_guard =
         match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap() {
             TryRecorderInstanceLock::Acquired(guard) => guard,
@@ -11515,7 +11515,7 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
         TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
@@ -11527,7 +11527,7 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
     let observed_at = starts_at + ChronoDuration::minutes(20);
     store.stage_full_observation(&tui_runtime_test_observation(starts_at, 73));
 
-    let _recorder_profile_lease = acquire_tui_history_profile_lease(match &store.backend {
+    let _recorder_profile_lease = acquire_runtime_profile_lease(match &store.backend {
         TuiHistoryBackend::Runtime(runtime) => runtime,
         TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
     })
@@ -11557,7 +11557,7 @@ fn tui_revalidates_profile_lease_before_each_runtime_write() {
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let profile_lease = acquire_tui_history_profile_lease(&runtime).unwrap();
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
         TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
@@ -11595,7 +11595,7 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
     let history_root = directory.path().join("state/history-v1");
     let mut preview_runtime =
         HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-    let preview_lease = acquire_tui_history_profile_lease(&preview_runtime).unwrap();
+    let preview_lease = acquire_runtime_profile_lease(&preview_runtime).unwrap();
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
     match prepare_tui_history_runtime(&mut preview_runtime, &preview_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
@@ -11612,8 +11612,8 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
     drop(preview_lease);
 
     let redacted_runtime = HistoryRuntime::new(history_root, &codex_home, true).unwrap();
-    let _opposite_profile_lease = acquire_tui_history_profile_lease(&redacted_runtime).unwrap();
-    let selection_error = acquire_tui_history_profile_lease(&preview_runtime).unwrap_err();
+    let _opposite_profile_lease = acquire_runtime_profile_lease(&redacted_runtime).unwrap();
+    let selection_error = acquire_runtime_profile_lease(&preview_runtime).unwrap_err();
     assert_eq!(selection_error.kind(), io::ErrorKind::WouldBlock);
 
     let mut store = TuiHistoryStore::runtime(

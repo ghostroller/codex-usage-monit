@@ -56,15 +56,14 @@ use crate::remote_source_metadata::{
     set_remote_source_in_aggregates, unpair_remote_host_with_source_policy,
 };
 use crate::remote_sync::{
-    FilesystemRemoteDeltaLocalPhases, RemoteSyncCompletion, RemoteSyncError,
-    RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport, SshRemoteDeltaTransport,
-    TryRemoteHostSyncLease, build_remote_delta_ingest_binding, preflight_remote_delta_position,
+    RemoteSyncCompletion, RemoteSyncError, RemoteSyncHostSnapshot, RemoteSyncLimits,
+    RemoteSyncReport, SshRemoteDeltaTransport, TryRemoteHostSyncLease,
     try_acquire_remote_host_sync_lease,
 };
 #[cfg(test)]
 use crate::remote_sync_attempt::remote_sync_error_proves_transport_not_started;
 use crate::remote_sync_attempt::{
-    AdmittedRemoteAggregateAttempt, RemoteAggregateAttemptError, RemoteSyncAttemptFinalizeError,
+    PreparedRemoteAggregateLocal, RemoteAggregateAttemptError, RemoteSyncAttemptFinalizeError,
     finalize_remote_sync_attempt,
 };
 use crate::remote_sync_health::{
@@ -2126,13 +2125,9 @@ fn execute_remote_sync_at_state_root_with_transports(
     };
     let mut limits = RemoteSyncLimits::default();
     let fact_limits = RemoteFactSyncLimits::default();
-    let binding = build_remote_delta_ingest_binding(&selected, runtime.profile_id().clone())
+    let mut prepared = PreparedRemoteAggregateLocal::new(store, &selected, &runtime)
         .map_err(anyhow::Error::new)?;
-    let mut local =
-        FilesystemRemoteDeltaLocalPhases::new(runtime.ownership(), runtime.source_history());
-    if let Err(error) =
-        preflight_remote_delta_position(store, &selected, &binding, &mut local, attempted_at)
-    {
+    if let Err(error) = prepared.preflight(attempted_at) {
         let health_write = if health_ready {
             health_store
                 .record_sync_error_for_config(
@@ -2150,13 +2145,11 @@ fn execute_remote_sync_at_state_root_with_transports(
         finish_manual_remote_sync_health(&health_store, store, health_write.map(|_| ()));
         return Err(anyhow::Error::new(error));
     }
-    let reservation = match bandwidth_budget.begin_sync_attempt(
-        host.id(),
-        node_id,
+    let reservation = match prepared.begin_budget_attempt(
+        &bandwidth_budget,
         attempted_at,
         transfer_kind,
-        limits.max_response_bytes,
-        limits.max_pages.get(),
+        limits,
     )? {
         RemoteBandwidthAdmission::Granted(reservation) => reservation,
         RemoteBandwidthAdmission::Paused(pause) => {
@@ -2185,16 +2178,9 @@ fn execute_remote_sync_at_state_root_with_transports(
     limits.max_response_bytes = reservation
         .granted_response_bytes()?
         .min(limits.max_response_bytes);
-    let sync_result = AdmittedRemoteAggregateAttempt::new(
-        store,
-        &selected,
-        &runtime,
-        &mut local,
-        transport,
-        &bandwidth_budget,
-        &reservation,
-    )
-    .execute(attempted_at, limits, Utc::now, || Ok(()));
+    let sync_result = prepared
+        .admitted_attempt(transport, &bandwidth_budget, &reservation)
+        .execute(attempted_at, limits, Utc::now, || Ok(()));
     let report = match sync_result {
         Ok(report) => report,
         Err(RemoteAggregateAttemptError::Sync(error)) => {
@@ -9640,11 +9626,10 @@ mod tests {
     #[test]
     fn report_history_observation_persists_fresh_account_samples_online() {
         let result = report_history_collection_result(Provenance::ServerSnapshot);
+        let observation = report_history_observation(&result, false);
 
-        assert_eq!(
-            report_history_observation(&result, false),
-            result.history_observation
-        );
+        assert!(matches!(observation, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(observation.as_ref(), &result.history_observation);
     }
 
     #[test]
@@ -9653,13 +9638,16 @@ mod tests {
         let expected = result.history_observation.clone();
 
         let online = report_history_observation(&result, false);
+        assert!(matches!(online, std::borrow::Cow::Owned(_)));
         assert_eq!(online.observed_at, expected.observed_at);
         assert!(online.quota_points.is_empty());
         assert!(online.weekly_local_points.is_empty());
         assert_eq!(online.half_hour_buckets, expected.half_hour_buckets);
         assert_eq!(result.history_observation, expected);
 
-        assert_eq!(report_history_observation(&result, true), expected);
+        let offline = report_history_observation(&result, true);
+        assert!(matches!(offline, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(offline.as_ref(), &expected);
     }
 
     #[test]

@@ -29,13 +29,12 @@ use crate::remote_fact_sync::{RemoteFactSyncLimits, RemoteFactTransport, SshRemo
 use crate::remote_protocol::MIN_REMOTE_RESPONSE_ENCODED_BYTES;
 use crate::remote_source_metadata::prepare_remote_source_metadata;
 use crate::remote_sync::{
-    FilesystemRemoteDeltaLocalPhases, RemoteDeltaTransport, RemoteSyncError,
-    RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport, SshRemoteDeltaTransport,
-    TryRemoteHostSyncLease, build_remote_delta_ingest_binding, preflight_remote_delta_position,
+    RemoteDeltaTransport, RemoteSyncError, RemoteSyncHostSnapshot, RemoteSyncLimits,
+    RemoteSyncReport, SshRemoteDeltaTransport, TryRemoteHostSyncLease,
     try_acquire_remote_host_sync_lease,
 };
 use crate::remote_sync_attempt::{
-    AdmittedRemoteAggregateAttempt, RemoteAggregateAttemptError, finalize_remote_sync_attempt,
+    PreparedRemoteAggregateLocal, RemoteAggregateAttemptError, finalize_remote_sync_attempt,
 };
 #[cfg(test)]
 use crate::remote_sync_attempt::{
@@ -443,29 +442,14 @@ where
         // cursor with no pagination fence is incremental while bootstrap or
         // continuation positions remain bulk. The orchestrator repeats this
         // short preflight after admission to fence concurrent changes.
-        let binding = build_remote_delta_ingest_binding(selected, runtime.profile_id().clone())?;
-        let mut local =
-            FilesystemRemoteDeltaLocalPhases::new(runtime.ownership(), runtime.source_history());
-        let position = preflight_remote_delta_position(
-            &self.config_store,
-            selected,
-            &binding,
-            &mut local,
-            Utc::now(),
-        )?;
+        let mut prepared =
+            PreparedRemoteAggregateLocal::new(&self.config_store, selected, &runtime)?;
+        let position = prepared.preflight(Utc::now())?;
         let transfer_kind = automatic_transfer_kind_for_position(&position);
         let budget_now = Utc::now();
         let fact_limits = RemoteFactSyncLimits::default();
-        let reservation = match self
-            .bandwidth_budget
-            .begin_sync_attempt(
-                selected.host().id(),
-                Some(&expected_source.node_id),
-                budget_now,
-                transfer_kind,
-                limits.max_response_bytes,
-                limits.max_pages.get(),
-            )
+        let reservation = match prepared
+            .begin_budget_attempt(&self.bandwidth_budget, budget_now, transfer_kind, limits)
             .map_err(RemoteSyncError::Local)?
         {
             RemoteBandwidthAdmission::Granted(reservation) => reservation,
@@ -487,18 +471,11 @@ where
 
         // Local phases acquire and release their own short writer/config
         // guards. No guard exists while the transport performs one-shot SSH.
-        let report = match AdmittedRemoteAggregateAttempt::new(
-            &self.config_store,
-            selected,
-            &runtime,
-            &mut local,
-            &mut self.transport,
-            &self.bandwidth_budget,
-            &reservation,
-        )
-        .execute(Utc::now(), budgeted_limits, Utc::now, || {
-            ensure_automatic_selection_current(&self.config_store, selected)
-        }) {
+        let report = match prepared
+            .admitted_attempt(&mut self.transport, &self.bandwidth_budget, &reservation)
+            .execute(Utc::now(), budgeted_limits, Utc::now, || {
+                ensure_automatic_selection_current(&self.config_store, selected)
+            }) {
             Ok(report) => report,
             Err(RemoteAggregateAttemptError::Sync(error)) => {
                 if RemoteSyncErrorCategory::from_sync_error(&error)
@@ -1962,6 +1939,61 @@ mod tests {
             RemoteSyncError::Local(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
         assert_eq!(executor.transport.calls, 0);
+    }
+
+    #[test]
+    fn prepared_aggregate_rejects_changed_host_before_ingest_recovery() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let mut runtime =
+            HistoryRuntime::new(state_root.join("history-v1"), &codex_home, false).unwrap();
+        runtime.ensure_v2_active().unwrap();
+        let remote_node = if runtime.source_identity().node_id().as_str() == NODE_A {
+            NODE_B
+        } else {
+            NODE_A
+        };
+        let (store, config) = configured_store(
+            directory.path().join("config/remotes.json"),
+            source(remote_node),
+        );
+        let selected =
+            RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
+                .unwrap();
+        let binding = crate::remote_sync::build_remote_delta_ingest_binding(
+            &selected,
+            runtime.profile_id().clone(),
+        )
+        .unwrap();
+        let ingest = crate::remote_ingest_state::RemoteDeltaIngestStateStore::new(
+            runtime.source_history().clone(),
+            binding,
+        )
+        .unwrap();
+        let mut prepared = PreparedRemoteAggregateLocal::new(&store, &selected, &runtime).unwrap();
+        store
+            .update(
+                config.config_revision(),
+                RemotesConfigMutation::edit_host(
+                    "dev",
+                    RemoteHostEdit {
+                        ssh_host: Some("changed-alias".to_owned()),
+                        agent_executable: None,
+                        redact_content: None,
+                    },
+                ),
+            )
+            .unwrap();
+
+        let error = prepared.preflight(Utc::now()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RemoteSyncError::PreTransportConfigurationChanged { ref host_id } if host_id == "dev"
+        ));
+        assert!(!ingest.namespace_directory().exists());
     }
 
     #[test]
