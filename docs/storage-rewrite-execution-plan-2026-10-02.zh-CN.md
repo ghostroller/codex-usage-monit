@@ -113,9 +113,68 @@ python3 -B target/orchestration-convergence-2026-10-02/verify_windows_interactiv
 
 Windows run 的实际身份为 `WIN-MM0JRLGM2Q3\user`、session 1，使用其私有 TEMP；临时任务已确认删除且无残留进程。34 个带 SQLite 名称的 Windows 回归均通过；Unix 专用 fd/硬链接回归在 macOS/Linux 执行，不能将 Windows 条件编译跳过的分支计作原生覆盖。
 
-Windows 失败为 `tests/update_cli.rs:210` 的 `running_portable_launcher_with_different_bytes_passes_real_proxy_contract`：兼容性探测结束后残留 `.launcher-probe-*`。该失败在此前编排批次已经复现；`src/update.rs` 与该测试相对本次基线 `10ddd7b` 无变化。归类为既有启动器清理问题：清理代码忽略删除错误，确切 Windows 错误码尚未采集，不归因于 ARM64，也不称偶发。因 cargo test 在这里停止，后续 `verify_fixtures` target 与独立 Windows CLI build/smoke 未执行；真实 CLI 数据集成测试已通过。此次未重跑完整套件、未改超时、未删断言掩盖失败。
+Windows 失败为 `tests/update_cli.rs:210` 的 `running_portable_launcher_with_different_bytes_passes_real_proxy_contract`：兼容性探测结束后残留 `.launcher-probe-*`。该失败在此前编排批次已经复现；`src/update.rs` 与该测试相对本次基线 `10ddd7b` 无变化。归类为既有启动器清理问题：清理代码忽略删除错误，确切 Windows 错误码尚未采集，不归因于 ARM64，也不称偶发。因 cargo test 在这里停止，后续 `tests/usage_evidence.rs` target 与独立 Windows CLI build/smoke 未执行；真实 CLI 数据集成测试已通过。此次未重跑完整套件、未改超时、未删断言掩盖失败。以上是 `1887267` 检查当时的记录；后续错误码诊断、修复及验证见 [7.2](#72-启动器跟进修复与验证)。
 
 本批没有运行 hosted CI、Linux x64/musl 发布验证、真实 SSH、真实用户历史性能基准或服务部署；本地流程不等于发布验收。S0—S5 已完成生产接入，S6 已完成正常运行路径替换而保留必要旧格式代码，S7 的本地检查已执行并保留上述 Windows 未通过项。未宣称全平台全绿或净代码量减负。
+
+### 7.2 启动器跟进修复与验证
+
+启动器修复提交为 `3fa8f28ebbc9ce81b54520cec5a59686221aa957`，仅修改 `Cargo.toml`、`src/update.rs` 和 `src/update/tests.rs`。这是 7.1 所列既有失败的独立跟进，不改写 `1887267` 的历史检查结果。
+
+诊断 run `0b7100a4e2f64df3b2bb2cd8b413cb93` 在真实代理测试中采集到两个探测 `.exe` 删除失败的 OS 5，探测元数据和锁文件删除成功，随后目录删除为 OS 145。直接使用 `SetFileInformationByHandle(FileDispositionInfoEx, DELETE | POSIX_SEMANTICS)` 的候选方案，在真实 `SEC_IMAGE` 映像夹具与原代理测试中仍返回 OS 5，故已撤回；实验记录保留于 `target/windows-launcher-fix-2026-10-02/{diagnostic/0b7100a4e2f64df3b2bb2cd8b413cb93,windows-focused/250fdf8ffab14ab79c10edc00a61b8d6,proxy-api-diagnostic/319eaa8005c0463cac816578b897f8f6}/{result.json,verify.log}`。这组结果不证明 ARM64 是根因，也不将 Rust 的 `fs::remove_file` 简化为仅调用传统 `DeleteFileW`。
+
+最终继续使用 `fs::remove_file`，仅对实际文件删除返回的 OS 5/32 等待并重试。一次显式清理中的全部已知文件共用 **1 秒等待预算**，每次等待最多 10ms；不增加原有 **15 秒探测执行超时**。每次删除前保留 reparse 路径检查；不存在的对象视为成功。显式清理失败返回带路径的 `update_probe_cleanup_failed`，保留原始 `io::Error` 和 OS 错误码，不能继续报告兼容成功；`Drop` 只执行一次不等待的兜底清理。目录仅用 `remove_dir` 删除，所有目录删除错误均不重试；不递归处理未知内容，非空目录的 OS 145 保持可观察。
+
+新增四项确定性 Windows 回归：真实映像映射、禁止 DELETE 共享的句柄、缺失对象及重复清理、未知文件与目录保留。映像夹具用传统 `DeleteFileW` 确认 OS 5 基线；若标准库能直接 unlink，则保留映像 view 并验证其 `MZ` 可读，若删除失败则只在失败回调中释放映像后重试。共享句柄夹具确保至少一次真实失败后释放句柄重试成功，另用持久 blocker 和有限回调预算验证 OS 32 可观察且能够终止。测试不依赖固定 sleep；原 `running_portable_launcher_with_different_bytes_passes_real_proxy_contract` 的真实代理及无残留断言保持不变。
+
+定向检查在 `deacede416db8e20d9f4bd4bc05a97393f5fde91` 加上述三个未提交文件的冻结快照上执行，随后保存为 `3fa8f28`。原生 macOS 构建输入 SHA-256 为 `d4e6523fcc7d190425f1a22e65f193b174e8cb9d6487e9c25a980b04294864c2`，检查前后相同；Windows 定向和最终全量 run 的 source ZIP SHA-256 均为 `f2f43b057f93725b62b83d07fd0deb014689e4fe3e110000c73f7e5429350853`。独立复核确认这些快照的构建输入逐文件匹配 `3fa8f28`。两种摘要的统计范围不同，不将其字符串互相比对。
+
+| 平台与范围 | 结果 | 日志与身份 |
+| --- | --- | --- |
+| 原生 macOS 15.7.2 / ARM64，format、全 target Clippy、`update` 定向检查 | 通过，exit 0：53 项匹配 Rust 测试；Windows 专用四项回归在此条件编译跳过 | `target/windows-launcher-fix-2026-10-02/macos-focused-20261002T224744/{result.json,verify-unix.log,source-before.json,source-after.json}`；上述 dirty snapshot 与输入摘要 |
+| UTM Windows 11 ARM64，实际执行 x64 MSVC target，`launcher` 定向检查 | 通过：13 项测试、1 项既有忽略；含四项新回归和原真实代理测试 | `target/windows-launcher-fix-2026-10-02/windows-retry-focused/34635e11cc644526a05fd824e3fc5e53/{result.json,verify.log,interactive-context.json,task-cleanup.json}`；上述 dirty snapshot 与 source ZIP 摘要 |
+| UTM Windows 11 ARM64，实际执行 x64 MSVC target，完整流程 | **通过**：Rust 总计 1974 通过、0 失败、4 项既有忽略，含 1846 项 lib、2 项 ConPTY、原真实代理测试和此前未执行的 9 项 usage evidence；format/Clippy、25 项 Python、PowerShell 契约、CLI build 与两项 smoke 通过 | `target/windows-launcher-fix-2026-10-02/windows-full-x64/cc660dcbd73742d8a8b086d29bc781ee/{result.json,verify.log,interactive-context.json,task-cleanup.json}`；干净提交 `3fa8f28` 与上述 source ZIP；`2026-10-02T14:51:30Z`—`14:59:29Z` |
+
+完整命令：
+
+```sh
+# macOS wrapper 记录前后构建输入，执行 format、Clippy 和 update 定向检查。
+python3 -B target/windows-launcher-fix-2026-10-02/verify_native.py
+# wrapper 使用的环境及完整原生入口：
+export CARGO_TARGET_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage
+export CARGO_BUILD_BUILD_DIR=/Users/user/Workspace/codex-usage-monit/target/review-lock-storage-build
+export CARGO_NET_OFFLINE=true
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+sh scripts/verify-unix.sh --filter update
+
+# Windows launcher 定向检查；临时 InteractiveToken 任务使用登录用户及其私有 TEMP。
+python3 -B target/orchestration-convergence-2026-10-02/verify_windows_interactive.py \
+  --interactive-user 'WIN-MM0JRLGM2Q3\user' \
+  --python-dir 'C:\Tools\codex-usage-monit\python-3.13.16-arm64' \
+  --private-temp 'C:\Users\user\AppData\Local\Temp' \
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
+  --target x86_64-pc-windows-msvc --timeout 900 \
+  --focused --test-filter launcher \
+  --output-dir target/windows-launcher-fix-2026-10-02/windows-retry-focused
+
+# 最终干净提交的 Windows 完整检查。
+python3 -B target/orchestration-convergence-2026-10-02/verify_windows_interactive.py \
+  --interactive-user 'WIN-MM0JRLGM2Q3\user' \
+  --python-dir 'C:\Tools\codex-usage-monit\python-3.13.16-arm64' \
+  --private-temp 'C:\Users\user\AppData\Local\Temp' \
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
+  --target x86_64-pc-windows-msvc --timeout 1800 \
+  --output-dir target/windows-launcher-fix-2026-10-02/windows-full-x64
+```
+
+Windows 定向和全量 run 的实际身份均为 `WIN-MM0JRLGM2Q3\user`、session 1，Rust 1.97.0，使用私有 TEMP；任务已删除且无残留进程。全量的 guest 结果为 `passed`、`scope=full`，`sourceDirty` 的 tracked/untracked 均为 false，日志完成至版本输出及 offline JSON snapshot smoke。Python 中的 Windows installer/setup/bootstrap 契约均执行 PowerShell 5.1/7；独立 verification、development launcher、permission repair 脚本契约在 PowerShell 5.1 分别通过 78、17、10 项。
+
+四项忽略为三项既有测量用例及需要独立旧构建的 `different_build_running_portable_launcher_keeps_proxy_protocol`；PE overlay 真实代理测试已经通过，不能替代这个可选的不同构建验收。中途 run `88691bc45f7a408f8f11ee9f94be377e` 因 UTM 控制通道返回无关旧日志错误而取消、未启动 Rust 测试；延迟创建的唯一任务随后核对并清理，保留 `target/windows-launcher-fix-2026-10-02/handle-diagnostic/88691bc45f7a408f8f11ee9f94be377e/{result.json,result-recovered.json,task-cleanup-recovered.json}`，不计作通过或产品测试失败。
+
+本次跟进未执行新的 Linux 全量流程、hosted CI、Linux x64/musl 发布验证、真实 SSH、用户真实历史迁移或性能基准、服务部署。7.1 的 Unix 完整证据仍绑定 `1887267`；本次修改均限于 Windows 代码、Windows 专用回归及测试 feature，另执行了上述 macOS 定向检查。S7 的既有 Windows 清理阻塞已解除，当前 Windows 默认完整流程通过；后续仅更新本文档，不改变已验证构建输入。
 
 ## 8. 参考
 
