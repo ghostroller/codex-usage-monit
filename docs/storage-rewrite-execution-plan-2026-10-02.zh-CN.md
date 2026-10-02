@@ -244,6 +244,18 @@ Windows 身份为 `WIN-MM0JRLGM2Q3\user`、session 1，非 SYSTEM；私有 TEMP�
 
 定向业务回归已覆盖 SQL 初始化与配额保留、quota/weekly、复制/分叉/conflict、来源策略与未完成删除、只读/损坏、CLI/TUI/recorder/remote；macOS 和 Windows GNU 交叉目标的 all-target Clippy 也通过，交叉检查仅为补充，不代替原生 Windows 结果。上述完整结果为本地证据；提交并推送后，通过 `python3 scripts/run-ci.py --local-results '…'` 执行一次 hosted 集成检查点并核对其 `headSha`。未新增性能承诺；真实用户历史或性能基准、真实 SSH、服务部署、断电实验及 Linux x64/musl 发布验证未执行。
 
+#### 7.3 当前范围的后续边界修复（2026-10-03）
+
+真实 SSH 验收后的独立审查又发现初始化另一 privacy 所有权丢失、facts 查询版本失效、GC 整轮写锁/预算及 WAL/SHM 对象绑定四项遗漏，用户已要求修复。实现与重新绑定的证据见[实机验收记录第12节](sqlite-real-machine-sync-validation-2026-10-03.zh-CN.md)。前面的提交与平台检查仍是各自历史证据，不自动覆盖后续修改。
+
+- 已有 profile 数据库时，另一 privacy 的 manifest 与 anchor 同时丢失也拒绝重建 epoch。正常首次空库初始化与必要控制状态保留继续使用7.3口径。
+- facts/proof 激活和保留边界变化通过 profile 共享的 SQL publication stamp 使 CLI/TUI 投影失效；stamp 随 active manifest 同事务提交，no-op 与回滚不推进。
+- GC 每次处理一个累计有界的记录工作单元，在写事务外解码并准备，再以短事务核对记录、来源、进度及 active manifest 后提交。候选 facts 分页复制、完整核对后激活，再分页回收旧代；未激活候选不进入查询。续跑进度保存在 SQLite，未完成轮次可继续，不被普通六小时调度间隔阻挡。
+- ordinary facts 的512MiB payload预算保留。GC 唯一受控 candidate/retired generation 有独立512MiB暂存上限；retainedSince 元数据的实际 JSON 正增长另计每manifest最多64 bytes、每source/privacy合计最多16,000,000 bytes的有限额度。它不用于新增业务记录；SQLite 页、WAL、文件高水位不能据此称为严格物理空间上限。digest 日统计超有界集合时显式报告统计 partial，数据删除仍精确继续。
+- Unix 用 SQLite 公开 FILESTAT/JOURNAL_POINTER 绑定实际 main/WAL/SHM fd，仅 fstat，不另开或关闭该 inode 的 fd。Windows 用不可删除共享的 side guards 和实际 WAL HANDLE 检查。tracked `.cargo/config.toml` 启用 bundled SQLite 所需 FILESTAT，纳入 build ID 和平台源码快照；外部自定义 `LIBSQLITE3_FLAGS` 应包含该功能，未启用时明确拒绝历史访问。
+
+本批不增加旧派生历史兼容、A方案、生产部署或性能承诺。完整平台检查和修复后真实SSH场景的命令、退出码、构建身份、限制与日志逐项记录在上述验收文档，不以一次remote test或聚合sync exit0替代facts/proof核对。
+
 ## 8. 参考
 
 - [此前提案](refactoring-proposal-2026-09-26.zh-CN.md)、[审核](refactoring-review-2026-09-26.zh-CN.md)、[执行与验证记录](refactoring-execution-plan-2026-09-26.zh-CN.md)。
