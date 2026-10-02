@@ -1,0 +1,4 @@
+[env]
+# SQLite FILESTAT exposes the opened WAL/SHM handles for object identity checks.
+# An external LIBSQLITE3_FLAGS value must also include this required feature.
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_FILESTAT"

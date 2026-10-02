@@ -1390,6 +1390,21 @@ mod tests {
     fn sqlite_independent_gc_invalidates_request_and_projection_cache() {
         use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
 
+        fn complete_gc_pass(
+            writer: &crate::source_history::SourceHistoryWriter<'_, '_, '_>,
+            observed_at: DateTime<Utc>,
+        ) -> usize {
+            let mut shards_pruned = 0;
+            for _ in 0..64 {
+                let report = writer.garbage_collect(observed_at).unwrap();
+                shards_pruned += report.shards_pruned;
+                if !report.work_pending {
+                    return shards_pruned;
+                }
+            }
+            panic!("SQLite GC did not complete within 64 work units");
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex");
@@ -1435,11 +1450,16 @@ mod tests {
                 .authorize_v2_write(&lease, &active)
                 .unwrap();
             let writer = runtime.source_history().writer(&authority).unwrap();
+            // Finish the pass started by flush_staged before advancing its clock.
+            assert_eq!(
+                complete_gc_pass(&writer, starts_at + Duration::minutes(15)),
+                0
+            );
             for elapsed_days in [40, 41] {
-                let report = writer
-                    .garbage_collect(starts_at + Duration::days(elapsed_days))
-                    .unwrap();
-                assert_eq!(report.shards_pruned, 0);
+                assert_eq!(
+                    complete_gc_pass(&writer, starts_at + Duration::days(elapsed_days)),
+                    0
+                );
                 assert_eq!(
                     runtime
                         .source_history()
@@ -1448,13 +1468,7 @@ mod tests {
                     before.garbage_collection_revision
                 );
             }
-            assert!(
-                writer
-                    .garbage_collect(starts_at + Duration::days(42))
-                    .unwrap()
-                    .shards_pruned
-                    > 0
-            );
+            assert!(complete_gc_pass(&writer, starts_at + Duration::days(42)) > 0);
         }
         let after = crate::history_application::history_projection_revision(&runtime, &selection)
             .unwrap()
@@ -1485,13 +1499,7 @@ mod tests {
                 .authorize_v2_write(&lease, &active)
                 .unwrap();
             let writer = runtime.source_history().writer(&authority).unwrap();
-            assert_eq!(
-                writer
-                    .garbage_collect(starts_at + Duration::days(42))
-                    .unwrap()
-                    .shards_pruned,
-                0
-            );
+            assert_eq!(complete_gc_pass(&writer, starts_at + Duration::days(42)), 0);
         }
         let unchanged =
             crate::history_application::history_projection_revision(&runtime, &selection)
@@ -2459,6 +2467,17 @@ mod tests {
     }
 
     fn stores(
+        root: &Path,
+        codex_home: &Path,
+        redaction: RedactionProfile,
+    ) -> (HistoryOwnershipStore, SourceHistoryStore) {
+        let (ownership, _) = uninitialized_stores(root, codex_home, redaction);
+        let (_, source_history) =
+            crate::sqlite_history_initialization::initialize_for_test(&ownership).unwrap();
+        (ownership, source_history)
+    }
+
+    fn uninitialized_stores(
         root: &Path,
         codex_home: &Path,
         redaction: RedactionProfile,
@@ -5148,7 +5167,7 @@ mod tests {
     #[test]
     fn sqlite_initialization_phases_are_retryable_without_opening_a_database() {
         let directory = tempfile::tempdir().unwrap();
-        let (ownership, store) = stores(
+        let (ownership, store) = uninitialized_stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::PreviewEnabled,
@@ -5180,7 +5199,7 @@ mod tests {
         let other_root = directory.path().join("other-state");
         let codex_home = directory.path().join("codex-home");
         let (ownership, source_history) =
-            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
+            uninitialized_stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
 
         let uninitialized =
             load_unified_history_since(&ownership, &source_history, at(1, 0, 0)).unwrap_err();

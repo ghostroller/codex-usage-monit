@@ -7,8 +7,10 @@
 
 use std::cell::RefCell;
 use std::fs;
+#[cfg(any(unix, windows))]
+use std::fs::File;
 #[cfg(windows)]
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -16,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
+#[cfg(unix)]
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -45,6 +49,10 @@ struct Scope {
 // SQLite validates its own fd with HAS_MOVED. Windows handle locks do not
 // have that close-any-fd behavior, so an identity guard is safe there.
 struct OpenedDatabase {
+    // Drop side guards before SQLite closes the connection and removes its
+    // WAL/SHM. They deny DELETE sharing only while this connection is alive.
+    #[cfg(windows)]
+    side_file_guards: RefCell<Vec<(PathBuf, File)>>,
     connection: Connection,
     #[cfg(windows)]
     identity_guard: File,
@@ -211,6 +219,9 @@ impl HistoryDatabase {
             savepoint: None,
             completed: false,
         };
+        // BEGIN may be the first operation that opens WAL/SHM. Bind those
+        // objects before application code is allowed to use this snapshot.
+        opened.validate()?;
         SCOPES.with(|scopes| {
             scopes.borrow_mut().push(Scope {
                 path: self.path.clone(),
@@ -274,8 +285,12 @@ impl HistoryDatabase {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         }) | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        #[cfg(windows)]
+        let side_file_guards = RefCell::new(pin_windows_side_files(&path)?);
         let connection = Connection::open_with_flags(&path, flags).map_err(sql_error)?;
         let opened = OpenedDatabase {
+            #[cfg(windows)]
+            side_file_guards,
             connection,
             #[cfg(windows)]
             identity_guard,
@@ -546,7 +561,23 @@ impl OpenedDatabase {
             )?;
             validate_windows_sqlite_handle(&self.connection, &self.identity_guard)?;
         }
-        validate_side_files(&self.path)
+        validate_side_files(&self.path)?;
+        #[cfg(unix)]
+        validate_unix_sqlite_side_handles(&self.connection, &self.path)?;
+        #[cfg(windows)]
+        {
+            validate_windows_side_guards(&self.path, &self.side_file_guards)?;
+            if let Some(journal) = sqlite_journal_file(&self.connection)? {
+                let guards = self.side_file_guards.borrow();
+                let wal = side_file_path(&self.path, "-wal");
+                let guard = guards
+                    .iter()
+                    .find(|(path, _)| path == &wal)
+                    .ok_or_else(|| invalid_data("opened SQLite WAL path is missing"))?;
+                validate_windows_file_handle(journal, &guard.1)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -589,11 +620,15 @@ fn validate_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+fn side_file_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 fn validate_side_files(path: &Path) -> io::Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        let side = PathBuf::from(name);
+        let side = side_file_path(path, suffix);
         match fs::symlink_metadata(&side) {
             Ok(metadata) => validate_file(&side, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -603,13 +638,212 @@ fn validate_side_files(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Borrow SQLite's real journal object, without interpreting a VFS-private
+/// layout or taking ownership of any fd / HANDLE.
+fn sqlite_journal_file(
+    connection: &Connection,
+) -> io::Result<Option<*mut rusqlite::ffi::sqlite3_file>> {
+    let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            (&mut file as *mut *mut rusqlite::ffi::sqlite3_file).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK {
+        return Err(invalid_data("cannot inspect opened SQLite journal object"));
+    }
+    if file.is_null() || unsafe { (*file).pMethods.is_null() } {
+        Ok(None)
+    } else {
+        Ok(Some(file))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+struct SqliteFileStat {
+    h: i32,
+    #[serde(default)]
+    shm: Option<SqliteShmStat>,
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+struct SqliteShmStat {
+    h: i32,
+}
+
+#[cfg(unix)]
+fn sqlite_file_stat(
+    control: impl FnOnce(*mut rusqlite::ffi::sqlite3_str) -> i32,
+) -> io::Result<SqliteFileStat> {
+    struct StringGuard(*mut rusqlite::ffi::sqlite3_str);
+    impl Drop for StringGuard {
+        fn drop(&mut self) {
+            unsafe {
+                rusqlite::ffi::sqlite3_free(rusqlite::ffi::sqlite3_str_finish(self.0).cast())
+            };
+        }
+    }
+    let string = StringGuard(unsafe { rusqlite::ffi::sqlite3_str_new(std::ptr::null_mut()) });
+    if string.0.is_null() {
+        return Err(io::Error::other("cannot allocate SQLite file inspection"));
+    }
+    let result = control(string.0);
+    if result != rusqlite::ffi::SQLITE_OK {
+        return Err(invalid_data(
+            "SQLite FILESTAT is required to verify opened history WAL/SHM; build with SQLITE_ENABLE_FILESTAT",
+        ));
+    }
+    let length = unsafe { rusqlite::ffi::sqlite3_str_length(string.0) };
+    let value = unsafe { rusqlite::ffi::sqlite3_str_value(string.0) };
+    if length <= 0
+        || length > 64 * 1024
+        || value.is_null()
+        || unsafe { rusqlite::ffi::sqlite3_str_errcode(string.0) } != rusqlite::ffi::SQLITE_OK
+    {
+        return Err(invalid_data("invalid SQLite opened-file inspection"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), length as usize) };
+    serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))
+}
+
+#[cfg(unix)]
+fn validate_borrowed_unix_fd(path: &Path, fd: i32) -> io::Result<()> {
+    use std::mem::ManuallyDrop;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    if fd < 0 {
+        return Err(invalid_data(
+            "SQLite opened history side file has no descriptor",
+        ));
+    }
+    // metadata() is fstat on SQLite's borrowed fd. Do not dup/open/close it:
+    // closing even a different fd for this inode would release POSIX locks.
+    let borrowed = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    let opened = borrowed.metadata()?;
+    validate_file(path, &opened)?;
+    let current = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid_data("opened history side file disappeared")
+        } else {
+            error
+        }
+    })?;
+    validate_file(path, &current)?;
+    if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+        return Err(invalid_data("opened history side file identity changed"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_sqlite_side_handles(connection: &Connection, path: &Path) -> io::Result<()> {
+    let main = sqlite_file_stat(|output| unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_FILESTAT,
+            output.cast(),
+        )
+    })?;
+    validate_borrowed_unix_fd(path, main.h)?;
+    if let Some(shm) = main.shm {
+        validate_borrowed_unix_fd(&side_file_path(path, "-shm"), shm.h)?;
+    }
+    if let Some(journal) = sqlite_journal_file(connection)? {
+        let control = unsafe { (*(*journal).pMethods).xFileControl }
+            .ok_or_else(|| invalid_data("opened SQLite WAL has no file control"))?;
+        let wal = sqlite_file_stat(|output| unsafe {
+            control(journal, rusqlite::ffi::SQLITE_FCNTL_FILESTAT, output.cast())
+        })?;
+        validate_borrowed_unix_fd(&side_file_path(path, "-wal"), wal.h)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pin_windows_side_files(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
+    let guards = RefCell::new(Vec::new());
+    validate_windows_side_guards(path, &guards)?;
+    Ok(guards.into_inner())
+}
+
+#[cfg(windows)]
+fn validate_windows_side_guards(
+    path: &Path,
+    guards: &RefCell<Vec<(PathBuf, File)>>,
+) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let mut guards = guards.borrow_mut();
+    for suffix in ["-wal", "-shm"] {
+        let side = side_file_path(path, suffix);
+        let current = match fs::symlink_metadata(&side) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if guards.iter().any(|(path, _)| path == &side) {
+                    return Err(invalid_data("opened history side file disappeared"));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        validate_file(&side, &current)?;
+        if !guards.iter().any(|(path, _)| path == &side) {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+            super::add_nofollow_flags(&mut options);
+            guards.push((side.clone(), options.open(&side)?));
+        }
+        let guard = &guards
+            .iter()
+            .find(|(path, _)| path == &side)
+            .expect("guard inserted")
+            .1;
+        let opened = guard.metadata()?;
+        validate_file(&side, &opened)?;
+        super::ensure_opened_file_matches_path(
+            &side,
+            guard,
+            &current,
+            &opened,
+            "history side file",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_file_handle(
+    file: *mut rusqlite::ffi::sqlite3_file,
+    guard: &File,
+) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    let control = unsafe { (*(*file).pMethods).xFileControl }
+        .ok_or_else(|| invalid_data("opened SQLite file has no file control"))?;
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let result = unsafe {
+        control(
+            file,
+            rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            (&mut handle as *mut HANDLE).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || handle.is_null() {
+        return Err(invalid_data("cannot verify opened SQLite WAL handle"));
+    }
+    validate_windows_handle_identity(handle, guard)
+}
+
 #[cfg(windows)]
 fn validate_windows_sqlite_handle(connection: &Connection, guard: &File) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
     let mut handle: HANDLE = std::ptr::null_mut();
     // Borrow the actual SQLite HANDLE; never transfer ownership or close it.
     let result = unsafe {
@@ -623,6 +857,18 @@ fn validate_windows_sqlite_handle(connection: &Connection, guard: &File) -> io::
     if result != rusqlite::ffi::SQLITE_OK || handle.is_null() {
         return Err(invalid_data("cannot validate opened SQLite Windows handle"));
     }
+    validate_windows_handle_identity(handle, guard)
+}
+
+#[cfg(windows)]
+fn validate_windows_handle_identity(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    guard: &File,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
     let mut actual: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     let mut expected: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle, &mut actual) } == 0
@@ -950,6 +1196,39 @@ mod tests {
         assert!(!database.profile_root.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bundled_sqlite_includes_required_file_stat_support() {
+        let directory = tempfile::tempdir().unwrap();
+        database(directory.path())
+            .write(|connection| {
+                // SQLite does not list FILESTAT in sqlite_compileoption_used().
+                // Probe the required public file-control API itself.
+                let main = sqlite_file_stat(|output| unsafe {
+                    rusqlite::ffi::sqlite3_file_control(
+                        connection.handle(),
+                        c"main".as_ptr(),
+                        rusqlite::ffi::SQLITE_FCNTL_FILESTAT,
+                        output.cast(),
+                    )
+                })?;
+                assert!(main.h >= 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_file_stat_refuses_instead_of_using_a_path_only_fallback() {
+        let error = match sqlite_file_stat(|_| rusqlite::ffi::SQLITE_NOTFOUND) {
+            Ok(_) => panic!("unsupported SQLite file inspection was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("SQLITE_ENABLE_FILESTAT"));
+    }
+
     #[test]
     fn failed_multi_family_transaction_rolls_back_and_nested_failure_is_isolated() {
         let directory = tempfile::tempdir().unwrap();
@@ -1069,6 +1348,14 @@ mod tests {
                 })
                 .join()
                 .unwrap()?;
+                // Repeated fd/HANDLE inspections must not close SQLite's
+                // descriptors or release the writer's POSIX inode locks.
+                for _ in 0..8 {
+                    database.read(|connection| {
+                        assert_eq!(state::<u64>(connection, "quota")?, Some(2));
+                        Ok(())
+                    })?;
+                }
                 let child = std::process::Command::new(std::env::current_exe()?)
                     .args([
                         "--exact",
@@ -1136,6 +1423,94 @@ mod tests {
                 .unwrap(),
             Some(true)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_wal_and_shm_replacement_or_loss_refuses_nested_use_and_rolls_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for suffix in ["-wal", "-shm"] {
+            for replace in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let database = database(directory.path());
+                database
+                    .write(|connection| set_state(connection, "committed", &true))
+                    .unwrap();
+                let result = database.write(|connection| {
+                    set_state(connection, "uncommitted", &true)?;
+                    let side = side_file_path(database.path(), suffix);
+                    let displaced = side_file_path(database.path(), &format!("{suffix}.displaced"));
+                    assert!(side.exists(), "SQLite must have opened {suffix}");
+                    fs::rename(&side, &displaced)?;
+                    if replace {
+                        fs::write(&side, [])?;
+                        fs::set_permissions(&side, fs::Permissions::from_mode(0o600))?;
+                    }
+                    // Restore before SQLite closes its borrowed objects. The
+                    // application fence must reject the changed path while
+                    // the original WAL fd / SHM mmap is still open.
+                    let fenced = database.read(|_| Ok(()));
+                    if replace {
+                        fs::remove_file(&side)?;
+                    }
+                    fs::rename(&displaced, &side)?;
+                    fenced
+                });
+                let error = result.expect_err("an opened SQLite side object changed");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                database
+                    .read(|connection| {
+                        assert_eq!(state::<bool>(connection, "committed")?, Some(true));
+                        assert_eq!(state::<bool>(connection, "uncommitted")?, None);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_side_guards_deny_replacement_then_allow_normal_close_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database(directory.path());
+        database
+            .write(|connection| {
+                set_state(connection, "committed", &true)?;
+                database.read(|_| Ok(()))?;
+                for suffix in ["-wal", "-shm"] {
+                    let side = side_file_path(database.path(), suffix);
+                    assert!(side.exists());
+                    assert!(
+                        fs::rename(
+                            &side,
+                            side_file_path(database.path(), &format!("{suffix}.replaced"))
+                        )
+                        .is_err()
+                    );
+                    assert!(fs::remove_file(&side).is_err());
+                }
+                Ok(())
+            })
+            .unwrap();
+        // The final writer closes and removes its side files. Read-only
+        // connections may recreate WAL/SHM without cleaning them up on close.
+        for suffix in ["-wal", "-shm"] {
+            assert!(!side_file_path(database.path(), suffix).exists());
+        }
+        database
+            .read(|connection| {
+                assert_eq!(state::<bool>(connection, "committed")?, Some(true));
+                Ok(())
+            })
+            .unwrap();
+        // Guards are dropped before SQLite closes its final handle. An
+        // ordinary close must be able to remove its two auxiliary files.
+        database.write(|_| Ok(())).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            assert!(!side_file_path(database.path(), suffix).exists());
+        }
     }
 
     #[cfg(unix)]

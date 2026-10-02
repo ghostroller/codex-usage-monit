@@ -722,6 +722,7 @@ pub(crate) struct HistoryProjectionRevision {
     pub local_observation_revision: u64,
     pub other_local_observation_revision: u64,
     pub garbage_collection_revision: u64,
+    pub facts_revision: u64,
     pub sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>, u64)>,
 }
 
@@ -731,6 +732,7 @@ impl HistoryProjectionRevision {
             && self.project_mapping_revision == other.project_mapping_revision
             && self.other_local_observation_revision == other.other_local_observation_revision
             && self.garbage_collection_revision == other.garbage_collection_revision
+            && self.facts_revision == other.facts_revision
             && self.sources == other.sources
     }
 }
@@ -793,6 +795,7 @@ fn history_projection_revision_once(
     let garbage_collection_revision = runtime
         .source_history()
         .load_history_gc_projection_revision()?;
+    let facts_revision = runtime.source_history().load_facts_projection_revision()?;
     let mut metadata = runtime.source_history().list_source_metadata()?;
     metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     let selected = metadata.into_iter().filter(|source| {
@@ -837,6 +840,7 @@ fn history_projection_revision_once(
         local_observation_revision,
         other_local_observation_revision,
         garbage_collection_revision,
+        facts_revision,
         sources,
     }))
 }

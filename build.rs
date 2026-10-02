@@ -7,6 +7,7 @@ fn main() {
     let mut files = vec![
         PathBuf::from("Cargo.toml"),
         PathBuf::from("Cargo.lock"),
+        PathBuf::from(".cargo/config.toml"),
         PathBuf::from("build.rs"),
         PathBuf::from("src/remote_agent_manager/release_bootstrap.py"),
         PathBuf::from("src/remote_agent_manager/release_bootstrap.ps1"),

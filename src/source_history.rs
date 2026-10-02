@@ -27,6 +27,7 @@ use crate::source_identity::NodeId;
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
 
 mod session_evidence;
+mod sqlite_gc;
 pub use session_evidence::*;
 pub(crate) mod database;
 mod remote_generation;
@@ -61,6 +62,7 @@ const ACCOUNT_LOCK_FILE: &str = "account.lock";
 const RETENTION_CLOCK_FILE: &str = "retention-clock.json";
 const GARBAGE_COLLECTION_SCHEDULE_FILE: &str = "garbage-collection-schedule.json";
 const GARBAGE_COLLECTION_PUBLICATION_FILE: &str = "garbage-collection-publication.json";
+const FACTS_QUERY_PUBLICATION_FILE: &str = "facts-query-publication.json";
 const SOURCE_METADATA_ENVELOPE_FORMAT_VERSION: u32 = 1;
 const RETENTION_CLOCK_FORMAT_VERSION: u32 = 1;
 const GARBAGE_COLLECTION_SCHEDULE_FORMAT_VERSION: u32 = 1;
@@ -615,6 +617,13 @@ pub struct SourceHistoryGcReport {
     pub shards_pruned: usize,
     pub pruning_deferred: bool,
     pub trusted_at: Option<DateTime<Utc>>,
+    /// More bounded work remains in this durable retention pass.
+    pub work_pending: bool,
+    pub records_examined: usize,
+    pub decoded_bytes: u64,
+    /// Pathological day fan-out can make the diagnostic shard count a lower
+    /// bound; retention itself still visits and validates every record.
+    pub pruning_statistics_partial: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -756,8 +765,13 @@ impl SourceHistoryWriter<'_, '_, '_> {
 
     pub fn garbage_collect(&self, observed_at: DateTime<Utc>) -> io::Result<SourceHistoryGcReport> {
         let redaction_profile = self.redaction_profile();
-        self.transaction_fenced(|store| {
-            store.garbage_collect_unfenced(observed_at, std::slice::from_ref(&redaction_profile))
+        self.fenced(|store| {
+            sqlite_gc::collect_unit(
+                store,
+                observed_at,
+                std::slice::from_ref(&redaction_profile),
+                || self.validate(),
+            )
         })
     }
 
@@ -791,9 +805,13 @@ impl SourceHistoryWriter<'_, '_, '_> {
             )
         })?;
         if due {
-            self.transaction_fenced(|store| {
-                store
-                    .garbage_collect_unfenced(observed_at, std::slice::from_ref(&redaction_profile))
+            self.fenced(|store| {
+                sqlite_gc::collect_unit(
+                    store,
+                    observed_at,
+                    std::slice::from_ref(&redaction_profile),
+                    || self.validate(),
+                )
             })
             .map(Some)
         } else {
@@ -937,6 +955,35 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
+    /// Facts and their validated proof can change a logical-replica query
+    /// without publishing another local observation or remote aggregate page.
+    pub(crate) fn load_facts_projection_revision(&self) -> io::Result<u64> {
+        let database = self.sqlite_database().expect("SQLite history backend");
+        if !database.exists()? {
+            return Ok(0);
+        }
+        database.read(|connection| {
+            let key =
+                database.namespace(&self.profile_directory().join(FACTS_QUERY_PUBLICATION_FILE))?;
+            Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
+        })
+    }
+
+    /// Called in the same transaction that changes query-visible facts/proof.
+    pub(super) fn advance_facts_projection_revision(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> io::Result<()> {
+        let database = self.sqlite_database().expect("SQLite history backend");
+        let key =
+            database.namespace(&self.profile_directory().join(FACTS_QUERY_PUBLICATION_FILE))?;
+        let next = database::state::<u64>(connection, &key)?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("facts query publication revision overflow"))?;
+        database::set_state(connection, &key, &next)
+    }
+
     /// Changes only when a GC transaction actually removes persisted history.
     /// Unlike observation and remote-page stamps this also covers independent GC.
     pub(crate) fn load_history_gc_projection_revision(&self) -> io::Result<u64> {
@@ -1357,14 +1404,34 @@ impl SourceHistoryStore {
     /// `observed_at` must be supplied by the central machine's local clock,
     /// not by a remote bucket timestamp. Large clock jumps are persisted as a
     /// pending timeline and cannot immediately authorize destructive pruning.
+    #[cfg(test)]
     fn garbage_collect_unfenced(
         &self,
         observed_at: DateTime<Utc>,
         redaction_profiles: &[RedactionProfile],
     ) -> io::Result<SourceHistoryGcReport> {
         let database = self.sqlite_database().expect("SQLite history backend");
-
-        self.sqlite_garbage_collect(&database, observed_at, redaction_profiles)
+        // Legacy algorithm fixtures can start with a wholly unused store.
+        // Production writers always bind an already initialized SQL database.
+        if !database.exists()? {
+            database.write(|_| Ok(()))?;
+        }
+        let mut total = SourceHistoryGcReport::default();
+        for _ in 0..10_000 {
+            let report = self.sqlite_garbage_collect(&database, observed_at, redaction_profiles)?;
+            total.shards_pruned += report.shards_pruned;
+            total.pruning_deferred = report.pruning_deferred;
+            total.trusted_at = report.trusted_at;
+            total.records_examined += report.records_examined;
+            total.decoded_bytes += report.decoded_bytes;
+            total.pruning_statistics_partial |= report.pruning_statistics_partial;
+            if !report.work_pending {
+                return Ok(total);
+            }
+        }
+        Err(io::Error::other(
+            "test history GC did not finish within its bounded unit limit",
+        ))
     }
 
     pub(crate) fn record_account_points_unfenced(
@@ -1676,6 +1743,9 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
     ) -> io::Result<bool> {
         database.write(|connection| {
+            if sqlite_gc::has_pending(connection, database, self, redaction_profile)? {
+                return Ok(true);
+            }
             let key = database.namespace(
                 &self
                     .profile_directory()
@@ -1704,138 +1774,14 @@ impl SourceHistoryStore {
         })
     }
 
+    #[cfg(test)]
     fn sqlite_garbage_collect(
         &self,
-        database: &database::HistoryDatabase,
+        _database: &database::HistoryDatabase,
         observed_at: DateTime<Utc>,
         redactions: &[RedactionProfile],
     ) -> io::Result<SourceHistoryGcReport> {
-        database.write(|connection| {
-            let sources = self.list_source_metadata()?;
-            let key = database.namespace(&self.profile_directory().join(RETENTION_CLOCK_FILE))?;
-            let envelope = sqlite_state_bounded::<RetentionClockEnvelope>(connection, &key, MAX_METADATA_FILE_BYTES, None)?;
-            let current = envelope.map(|envelope| {
-                if envelope.format_version != RETENTION_CLOCK_FORMAT_VERSION || envelope.profile_id != self.profile_id { return Err(invalid_data("retention clock database envelope is invalid")); }
-                envelope.clock.validate()?;
-                Ok(envelope.clock)
-            }).transpose()?;
-            let namespaces = self.sqlite_retained_core_namespaces(database, connection, &sources, redactions)?;
-            let initial_anchor = if current.is_none() {
-                let mut earliest = None;
-                for namespace in &namespaces {
-                    let timestamp: Option<i64> = connection.query_row("SELECT min(sort_time) FROM history_records WHERE namespace=?1", [namespace], |row| row.get(0)).map_err(database::sql_error)?;
-                    if let Some(timestamp) = timestamp {
-                        let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp).ok_or_else(|| invalid_data("invalid persisted history timestamp"))?.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc();
-                        earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)));
-                    }
-                }
-                if let Some(timestamp) = session_evidence::earliest_session_evidence_time(self, &sources, redactions)? { earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp))); }
-                earliest.map(|timestamp| timestamp.min(observed_at))
-            } else { None };
-            let (clock, pruning_deferred) = next_retention_clock(current, initial_anchor, observed_at);
-            database::set_state(connection, &key, &RetentionClockEnvelope { format_version: RETENTION_CLOCK_FORMAT_VERSION, profile_id: self.profile_id.clone(), clock })?;
-            let cutoff = clock.trusted_at.checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS)).unwrap_or(DateTime::<Utc>::MIN_UTC).date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc();
-            let account = database.namespace(&self.account_directory())?;
-            let mut pruned = 0;
-            let mut visible_deleted = false;
-            let mut changed_remote = Vec::new();
-            for namespace in namespaces {
-                let mut statement = connection.prepare("SELECT record_key,sort_time,payload FROM history_records WHERE namespace=?1 AND sort_time<?2 ORDER BY sort_time,record_key").map_err(database::sql_error)?;
-                let mut rows = statement.query(rusqlite::params![&namespace, cutoff.timestamp_millis()]).map_err(database::sql_error)?;
-                let mut keys = Vec::new();
-                let mut days = std::collections::BTreeSet::new();
-                let mut budget = SourceHistoryReadBudget::for_query();
-                while let Some(row) = rows.next().map_err(database::sql_error)? {
-                    let bytes = row.get_ref(2).map_err(database::sql_error)?.as_blob().map_err(|error| invalid_data(error.to_string()))?;
-                    budget.charge_decoded_bytes(bytes.len() as u64)?;
-                    budget.charge_records(1)?;
-                    let actual = if namespace == account || namespace.ends_with("/retained-quota") {
-                        let record: QuotaPoint = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
-                        validate_account_quota_point(&record)?;
-                        record.observed_at
-                    } else if namespace.ends_with("/buckets") {
-                        let record: SourceBucketRecord = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
-                        record.validate()?;
-                        record.starts_at
-                    } else {
-                        let record: SourceWeeklyRecord = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
-                        record.validate()?;
-                        record.observed_at
-                    };
-                    if actual.timestamp_millis() != row.get::<_, i64>(1).map_err(database::sql_error)? { return Err(invalid_data("history database ordering timestamp does not match its record")); }
-                    keys.push(row.get::<_, String>(0).map_err(database::sql_error)?);
-                    days.insert(actual.date_naive());
-                }
-                drop(rows);
-                drop(statement);
-                for key in keys { database::delete_record(connection, &namespace, &key)?; }
-                pruned += days.len();
-                if !days.is_empty() {
-                    visible_deleted = true;
-                    for source in sources.iter().filter(|source| source.kind() == SourceKind::Ssh) {
-                        for &redaction in redactions {
-                            let prefix = format!("{}/", database.namespace(&self.source_directory(source.source_id()).join(redaction.directory_name()))?);
-                            if namespace.starts_with(&prefix) {
-                                let changed = (source.source_id().clone(), redaction);
-                                if !changed_remote.contains(&changed) { changed_remote.push(changed); }
-                            }
-                        }
-                    }
-                }
-            }
-            for source in &sources {
-                for &redaction in redactions {
-                    let (removed, changed) = session_evidence::garbage_collect_session_evidence_for_source_with_changes(self, source.source_id(), redaction, cutoff.date_naive(), clock.trusted_at)?;
-                    pruned += removed;
-                    visible_deleted |= changed;
-                    if changed && source.kind() == SourceKind::Ssh {
-                        let changed = (source.source_id().clone(), redaction);
-                        if !changed_remote.contains(&changed) { changed_remote.push(changed); }
-                    }
-                }
-            }
-            for (source, redaction) in changed_remote {
-                self.advance_remote_history_projection_revision(connection, &source, redaction)?;
-            }
-            if visible_deleted {
-                let key = database.namespace(&self.profile_directory().join(GARBAGE_COLLECTION_PUBLICATION_FILE))?;
-                let next = database::state::<u64>(connection, &key)?.unwrap_or(0).checked_add(1)
-                    .ok_or_else(|| invalid_data("history GC publication revision overflow"))?;
-                database::set_state(connection, &key, &next)?;
-            }
-            Ok(SourceHistoryGcReport { shards_pruned: pruned, pruning_deferred, trusted_at: Some(clock.trusted_at) })
-        })
-    }
-
-    fn sqlite_retained_core_namespaces(
-        &self,
-        database: &database::HistoryDatabase,
-        connection: &rusqlite::Connection,
-        sources: &[SourceMetadata],
-        redactions: &[RedactionProfile],
-    ) -> io::Result<Vec<String>> {
-        let account = database.namespace(&self.account_directory())?;
-        let mut namespaces = vec![account];
-        for source in sources {
-            for &redaction in redactions {
-                let prefix = format!(
-                    "{}/",
-                    database.namespace(
-                        &self
-                            .source_directory(source.source_id())
-                            .join(redaction.directory_name())
-                    )?
-                );
-                let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND (substr(namespace,-8)='/buckets' OR substr(namespace,-7)='/weekly' OR substr(namespace,-15)='/retained-quota') ORDER BY namespace").map_err(database::sql_error)?;
-                let values = statement
-                    .query_map([prefix], |row| row.get::<_, String>(0))
-                    .map_err(database::sql_error)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(database::sql_error)?;
-                namespaces.extend(values);
-            }
-        }
-        Ok(namespaces)
+        sqlite_gc::collect_unit(self, observed_at, redactions, || Ok(()))
     }
 }
 
@@ -2174,7 +2120,7 @@ impl SourceMetadataEnvelope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RetentionClock {
     trusted_at: DateTime<Utc>,
@@ -2220,7 +2166,7 @@ impl RetentionClock {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RetentionClockEnvelope {
     format_version: u32,
@@ -5651,6 +5597,156 @@ mod tests {
                 )
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn sqlite_gc_unit_shares_budget_across_namespaces_and_resumes_after_restart() {
+        let root = tempdir().unwrap();
+        let sql = store(root.path());
+        let now = at(30, 12, 0);
+        sql.garbage_collect(now).unwrap();
+        let source: NodeId = SOURCE_A.parse().unwrap();
+        sql.save_source_metadata(&metadata(SOURCE_A, "gc-budget"))
+            .unwrap();
+        let old = now - Duration::days(70);
+        let quota = quota_point(old);
+        sql.record_account_points(std::slice::from_ref(&quota))
+            .unwrap();
+        sql.record_source_bucket_changes(
+            &source,
+            RedactionProfile::Redacted,
+            &[
+                upsert_record(1, bucket(old, 10)),
+                upsert_record(1, bucket(old + Duration::minutes(15), 20)),
+            ],
+        )
+        .unwrap();
+        sql.record_source_weekly_changes(
+            &source,
+            RedactionProfile::Redacted,
+            &[SourceWeeklyRecord::upsert(1, weekly_point(old, 10)).unwrap()],
+        )
+        .unwrap();
+        let database = sql.sqlite_database().unwrap();
+        let quota_bytes = serde_json::to_vec(&quota).unwrap().len() as u64;
+        let first = sqlite_gc::collect_unit_with_budget(
+            &sql,
+            now,
+            &[RedactionProfile::Redacted],
+            sqlite_gc::Budget::with_limits(3, quota_bytes + "account".len() as u64 + 1),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(first.records_examined, 2);
+        assert_eq!(first.decoded_bytes, quota_bytes + "account".len() as u64);
+        assert!(first.work_pending);
+        assert_eq!(
+            sql.load_source_since(&source, RedactionProfile::Redacted, old)
+                .unwrap()
+                .buckets
+                .len(),
+            2
+        );
+        drop(sql);
+        let reopened = store(root.path());
+        // The schedule permits bounded continuation before the ordinary 6h
+        // interval, without resetting a row budget for each namespace.
+        assert!(
+            reopened
+                .sqlite_schedule_gc_if_due(
+                    &database,
+                    now + Duration::minutes(1),
+                    Duration::hours(6),
+                    RedactionProfile::Redacted
+                )
+                .unwrap()
+        );
+        let second = sqlite_gc::collect_unit_with_budget(
+            &reopened,
+            now,
+            &[RedactionProfile::Redacted],
+            sqlite_gc::Budget::with_limits(3, MAX_SHARD_FILE_BYTES),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(second.records_examined, 3);
+        assert!(second.work_pending);
+        let remaining: i64 = database
+            .read(|connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM history_records WHERE sort_time<?1",
+                        [(now - Duration::days(35)).timestamp_millis()],
+                        |row| row.get(0),
+                    )
+                    .map_err(database::sql_error)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+        reopened
+            .garbage_collect_unfenced(now, &[RedactionProfile::Redacted])
+            .unwrap();
+        assert!(
+            reopened
+                .load_source_since(&source, RedactionProfile::Redacted, old)
+                .unwrap()
+                .weekly_local_points
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_gc_preparation_does_not_hold_sql_writer_and_stale_page_rolls_back() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempdir().unwrap();
+        let sql = store(root.path());
+        let now = at(30, 12, 0);
+        sql.garbage_collect(now).unwrap();
+        let old = now - Duration::days(70);
+        let point = quota_point(old);
+        sql.record_account_points(std::slice::from_ref(&point))
+            .unwrap();
+        let database = sql.sqlite_database().unwrap();
+        let namespace = database.namespace(&sql.account_directory()).unwrap();
+        let key = sqlite_quota_key(&point).unwrap();
+        let changed = AtomicBool::new(false);
+        let result = sqlite_gc::collect_unit_with_budget(
+            &sql,
+            now,
+            &[RedactionProfile::Redacted],
+            sqlite_gc::Budget::with_limits(2, MAX_SHARD_FILE_BYTES),
+            || {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    // A separate writer can complete while GC prepares its page.
+                    // Its changed bytes cannot be removed by the prepared CAS.
+                    let mut changed = point.clone();
+                    changed.used_percent = 30.0;
+                    changed.remaining_percent = 70.0;
+                    let concurrent = database.clone();
+                    let namespace = namespace.clone();
+                    let key = key.clone();
+                    std::thread::spawn(move || {
+                        concurrent.write_nowait(|connection| {
+                            database::put_record(
+                                connection,
+                                &namespace,
+                                &key,
+                                old.timestamp_millis(),
+                                &changed,
+                            )
+                        })
+                    })
+                    .join()
+                    .expect("independent writer thread")?;
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            sql.load_account_since(old).unwrap().quota_points[0].used_percent,
+            30.0
         );
     }
 }

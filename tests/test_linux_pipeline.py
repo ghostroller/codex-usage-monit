@@ -267,7 +267,10 @@ class LinuxSnapshotTests(unittest.TestCase):
             snapshot = directory / "workspace"
             snapshot.mkdir()
             subprocess.run(["git", "init", "-q", str(source)], check=True)
-            (source / ".gitignore").write_text(".env\n.cargo/config.toml\n")
+            (source / ".gitignore").write_text((ROOT / ".gitignore").read_text() + ".env\n")
+            (source / ".cargo").mkdir()
+            config = (ROOT / ".cargo/config.toml").read_bytes()
+            (source / ".cargo/config.toml").write_bytes(config)
             (source / "tracked").write_text("initial")
             (source / "deleted").write_text("remove me")
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
@@ -278,8 +281,10 @@ class LinuxSnapshotTests(unittest.TestCase):
             (source / "deleted").unlink()
             (source / "new file").write_text("untracked")
             (source / ".env").write_text("private ignored data")
-            (source / ".cargo").mkdir()
-            (source / ".cargo/config.toml").write_text("host-only paths")
+            for name in ["config", "config.local.toml", "credentials.toml"]:
+                (source / ".cargo" / name).write_text("private host-only paths")
+            (source / ".agent").mkdir()
+            (source / ".agent/environment.local.md").write_text("private machine environment")
             helper = ROOT / "scripts/docker-linux-snapshot.py"
             subprocess.run([sys.executable, str(helper), "prepare", str(source), str(output),
                             "linux/arm64", "sha256:fixture", "verify", "--filter", "recorder"], check=True)
@@ -288,14 +293,20 @@ class LinuxSnapshotTests(unittest.TestCase):
             self.assertEqual(len(manifest["source_head"]), 40)
             self.assertEqual(manifest["command"], ["verify", "--filter", "recorder"])
             names = (output / "source-files").read_bytes().split(b"\0")[:-1]
-            self.assertEqual(names, [b".gitignore", b"new file", b"tracked"])
+            self.assertEqual(names, [b".cargo/config.toml", b".gitignore", b"new file", b"tracked"])
             for name in names:
-                shutil.copy2(source / os.fsdecode(name), snapshot / os.fsdecode(name))
+                destination = snapshot / os.fsdecode(name)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source / os.fsdecode(name), destination)
+            self.assertEqual((snapshot / ".cargo/config.toml").read_bytes(), config)
             stamp = [sys.executable, str(helper), "stamp", str(snapshot),
                      str(output / "source.json"), str(output / "source-files")]
             first = json.loads(subprocess.check_output(stamp, text=True))
             repeated = json.loads(subprocess.check_output(stamp, text=True))
             self.assertEqual(first["snapshot_sha256"], repeated["snapshot_sha256"])
+            (snapshot / ".cargo/config.toml").write_bytes(config + b"# changed build configuration\n")
+            configured = json.loads(subprocess.check_output(stamp, text=True))
+            self.assertNotEqual(first["snapshot_sha256"], configured["snapshot_sha256"])
             (snapshot / "tracked").write_text("different snapshot")
             changed = json.loads(subprocess.check_output(stamp, text=True))
             self.assertNotEqual(first["snapshot_sha256"], changed["snapshot_sha256"])

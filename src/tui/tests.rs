@@ -23,6 +23,7 @@ use crate::source_identity::NodeId;
 use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
+mod facts_projection;
 mod integration_scenarios;
 mod testkit;
 

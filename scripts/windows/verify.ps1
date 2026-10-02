@@ -384,8 +384,9 @@ $repositoryRoot = (Resolve-Path -LiteralPath $RepositoryPath).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "Cargo.toml") -PathType Leaf)) {
     throw "RepositoryPath does not contain Cargo.toml: $repositoryRoot"
 }
-# Both directories must be guest-local. A shared checkout can contain a host's
-# ignored .cargo/config.toml build-dir even when CARGO_TARGET_DIR is overridden.
+# Both directories must be guest-local. User Cargo configuration and explicit
+# local overrides may still set build-dir when CARGO_TARGET_DIR is overridden.
+# The versioned .cargo/config.toml supplies SQLite features, not host paths.
 $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
 if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
     $CargoTargetDir = Join-Path $localAppData "codex-usage-monit\cargo-target"

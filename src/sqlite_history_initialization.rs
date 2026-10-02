@@ -76,12 +76,22 @@ fn activate_sqlite_history_with_hook(
     };
     let other_manifest = Some(match other_store.load_manifest()? {
         OwnershipManifestStatus::Initialized(manifest) => manifest,
-        OwnershipManifestStatus::Uninitialized => match other_store
-            .initialize_v1_active(other_lease.as_ref().expect("other lease acquired"))?
-        {
-            crate::history_ownership::InitializeV1Outcome::Initialized(manifest)
-            | crate::history_ownership::InitializeV1Outcome::Existing(manifest) => manifest,
-        },
+        OwnershipManifestStatus::Uninitialized => {
+            // Both ownership namespaces are published before the shared database.
+            // Recreating either one could reuse an epoch from an existing receipt.
+            if db.exists()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history ownership manifest is missing for the other privacy namespace of an existing SQLite database",
+                ));
+            }
+            match other_store
+                .initialize_v1_active(other_lease.as_ref().expect("other lease acquired"))?
+            {
+                crate::history_ownership::InitializeV1Outcome::Initialized(manifest)
+                | crate::history_ownership::InitializeV1Outcome::Existing(manifest) => manifest,
+            }
+        }
     });
 
     let current = begin_if_needed(ownership, lease, expected)?;
@@ -595,6 +605,85 @@ mod tests {
         );
         let (other_active, _) = initialize_for_test(&other).unwrap();
         assert!(other_active.is_sqlite_backend());
+    }
+
+    #[test]
+    fn committed_receipts_refuse_lost_other_privacy_ownership() {
+        for remove_anchor in [false, true] {
+            let (_temp, ownership, store, _identity) = fixture();
+            old_v1_quota(&store);
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let expected = begin(&ownership, &lease);
+            let error =
+                activate_sqlite_history_with_hook(&ownership, &lease, &expected, &store, || {
+                    Err(io::Error::other("crash after receipts committed"))
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("crash after receipts committed"));
+            let OwnershipManifestStatus::Initialized(pending) = ownership.load_manifest().unwrap()
+            else {
+                panic!("current privacy namespace must remain initialized");
+            };
+            assert_eq!(pending.state(), HistoryOwnershipState::Migrating);
+
+            let other = HistoryOwnershipStore::new(
+                store.state_root().to_owned(),
+                store.profile_id().clone(),
+                RedactionProfile::Redacted,
+            );
+            let OwnershipManifestStatus::Initialized(other_pending) =
+                other.load_manifest().unwrap()
+            else {
+                panic!("other privacy namespace must have been fenced");
+            };
+            let database = store.sqlite_database().unwrap();
+            validate_receipt(&database, &pending).unwrap();
+            validate_receipt(&database, &other_pending).unwrap();
+            let receipts = database
+                .read(|connection| {
+                    [
+                        pending.redaction_profile(),
+                        other_pending.redaction_profile(),
+                    ]
+                    .map(|redaction| database::state::<Value>(connection, &receipt_key(redaction)))
+                    .into_iter()
+                    .collect::<io::Result<Vec<_>>>()
+                })
+                .unwrap();
+
+            fs::remove_file(other.manifest_path()).unwrap();
+            if remove_anchor {
+                fs::remove_file(other.initialization_anchor_path()).unwrap();
+            }
+            let error = activate_sqlite_history(&ownership, &lease, &pending, &store).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("ownership manifest is missing"));
+            assert!(!other.manifest_path().exists());
+            assert_eq!(other.initialization_anchor_path().exists(), !remove_anchor);
+            assert_eq!(
+                ownership.load_manifest().unwrap(),
+                OwnershipManifestStatus::Initialized(pending.clone())
+            );
+            let after = database
+                .read(|connection| {
+                    [
+                        pending.redaction_profile(),
+                        other_pending.redaction_profile(),
+                    ]
+                    .map(|redaction| database::state::<Value>(connection, &receipt_key(redaction)))
+                    .into_iter()
+                    .collect::<io::Result<Vec<_>>>()
+                })
+                .unwrap();
+            assert_eq!(after, receipts);
+            assert_eq!(
+                store
+                    .load_account_since(at() - Duration::days(1))
+                    .unwrap()
+                    .quota_points,
+                vec![point()]
+            );
+        }
     }
 
     #[test]

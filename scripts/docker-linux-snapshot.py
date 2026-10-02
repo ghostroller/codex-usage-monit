@@ -22,8 +22,6 @@ def prepare(root, output, target_platform, image_id, command):
     names = sorted(set(git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")) - {b""})
     copied = []
     for name in names:
-        if name == b".cargo/config.toml":
-            continue
         path = root / os.fsdecode(name)
         if not os.path.lexists(path):
             continue  # Keep tracked deletions deleted in the snapshot.

@@ -51,9 +51,14 @@ Internal storage requires explicit
 
 Source is mounted read-only, then Git's tracked and non-ignored untracked file
 inventory is copied into a new writable run directory, preserving current edits
-and deletions. Ignored files and `.cargo/config.toml` overrides are excluded.
-Tests use an initialized independent
-Git repository. Host Cargo/Rustup configuration is not mounted; both Cargo target
+and deletions. The versioned `.cargo/config.toml` follows the source and enables
+SQLite FILESTAT. Ignored machine state, including `.cargo/config.local.toml` and
+`.agent/environment.local.md`, is excluded. Keep machine overrides in user Cargo
+configuration or environment variables, or explicitly supply an ignored local
+file with `cargo --config .cargo/config.local.toml`; Cargo does not read that
+local filename automatically. External `LIBSQLITE3_FLAGS` values must include
+`SQLITE_ENABLE_FILESTAT`. Tests use an initialized independent Git repository.
+Host Cargo/Rustup configuration is not mounted; both Cargo target
 and Cargo build directories are explicitly container paths. Rustup caches and
 targets are separated by Linux architecture, while crate downloads are shared.
 

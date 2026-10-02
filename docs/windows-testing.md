@@ -167,8 +167,14 @@ under each engine when not using the host runner. The normal full pipeline and
 
 The host packages the current tracked and unignored untracked files, including
 working-tree changes and deletions, into a ZIP snapshot. It rejects symlinks and
-paths unsafe on Windows. Ignored state such as a host's `.cargo/config.toml`
-is excluded. The guest checks the archive SHA-256 and expands it into a unique
+paths unsafe on Windows. The versioned `.cargo/config.toml` follows the source
+and enables SQLite FILESTAT. Ignored machine state, including
+`.cargo/config.local.toml` and `.agent/environment.local.md`, is excluded. Keep
+machine overrides in user Cargo configuration or environment variables, or
+explicitly supply an ignored local file with
+`cargo --config .cargo/config.local.toml`; Cargo does not read that local filename
+automatically. External `LIBSQLITE3_FLAGS` values must include
+`SQLITE_ENABLE_FILESTAT`. The guest checks the archive SHA-256 and expands it into a unique
 local temporary directory, so compilation and tests do not depend on WebDAV
 locking or source files changing underneath them.
 

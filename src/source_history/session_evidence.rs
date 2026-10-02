@@ -12,6 +12,7 @@ use super::*;
 mod sqlite_evidence;
 use crate::domain::{ApiCostAmount, TokenUsage};
 use crate::source_model::{ObservedProjectKey, SessionReplicaKey, ThreadId, ThreadShardKey};
+pub(crate) use sqlite_evidence::prepare_gc_evidence_unit;
 
 pub(super) const DIGESTS_DIRECTORY: &str = "digests";
 const FACTS_DIRECTORY: &str = "facts";
@@ -1913,14 +1914,6 @@ fn validate_fact_namespace_usage(
     Ok(())
 }
 
-pub(super) fn earliest_session_evidence_time(
-    store: &SourceHistoryStore,
-    sources: &[SourceMetadata],
-    redaction_profiles: &[RedactionProfile],
-) -> io::Result<Option<DateTime<Utc>>> {
-    sqlite_evidence::earliest_session_evidence_time(store, sources, redaction_profiles)
-}
-
 #[cfg(test)]
 fn garbage_collect_session_evidence_for_source(
     store: &SourceHistoryStore,
@@ -1939,6 +1932,7 @@ fn garbage_collect_session_evidence_for_source(
     .map(|(pruned, _)| pruned)
 }
 
+#[cfg(test)]
 pub(super) fn garbage_collect_session_evidence_for_source_with_changes(
     store: &SourceHistoryStore,
     source_id: &NodeId,
@@ -4147,5 +4141,485 @@ mod tests {
             vec![crossing]
         );
         assert_eq!(collect(), (0, false));
+    }
+
+    #[test]
+    fn sqlite_gc_production_units_preserve_crossing_tombstone() {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let now = at(8, 30, 12);
+        store.garbage_collect(now).unwrap();
+        let start = at(7, 20, 0);
+        let crossing = SourceSessionDigestRecord::tombstone(
+            thread("thread-crossing-unit"),
+            start,
+            at(8, 1, 0),
+            at(8, 2, 0),
+            2,
+        )
+        .unwrap();
+        let expired = SourceSessionDigestRecord::upsert(
+            1,
+            digest("thread-expired-unit", start, at(7, 21, 0), 10),
+        )
+        .unwrap();
+        store
+            .record_source_session_digest_changes(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &[crossing.clone(), expired],
+            )
+            .unwrap();
+        let mut pruned = 0;
+        let mut complete = false;
+        for _ in 0..32 {
+            let report = crate::source_history::sqlite_gc::collect_unit(
+                &store,
+                now,
+                &[RedactionProfile::Redacted],
+                || Ok(()),
+            )
+            .unwrap();
+            pruned += report.shards_pruned;
+            assert!(report.records_examined <= 4096);
+            if !report.work_pending {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            store
+                .load_source_session_digest_records_since(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    start
+                )
+                .unwrap()
+                .records,
+            vec![crossing]
+        );
+        let database = store.sqlite_database().unwrap();
+        assert_eq!(
+            database
+                .read(|connection| database::state::<u64>(
+                    connection,
+                    &database.namespace(
+                        &store
+                            .profile_directory()
+                            .join(GARBAGE_COLLECTION_PUBLICATION_FILE)
+                    )?
+                ))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn sqlite_gc_units_keep_candidate_invisible_and_resume_after_restart() {
+        let root = tempdir().unwrap();
+        let mut sql = store(root.path());
+        let now = at(9, 5, 0);
+        sql.garbage_collect(now).unwrap();
+        let changes = (0..20)
+            .map(|index| {
+                UsageEventFactRecord::upsert(
+                    index + 1,
+                    fact(
+                        "thread-gc-pages",
+                        &format!("event-{index:02}"),
+                        if index < 10 {
+                            at(7, 20, 1)
+                        } else {
+                            at(8, 20, 1)
+                        },
+                        index + 1,
+                    ),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let id = FactBatchId::generate().unwrap();
+        let initial = batch(
+            id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-gc-pages",
+            None,
+            FactCursor::new(2, 20).unwrap(),
+            at(8, 21, 0),
+            changes.clone(),
+        );
+        sql.stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &initial)
+            .unwrap();
+        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &id)
+            .unwrap();
+        let before = sql
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-gc-pages"),
+            )
+            .unwrap()
+            .unwrap();
+        let stale_id = FactBatchId::generate().unwrap();
+        let stale = batch(
+            stale_id.clone(),
+            FactBatchKind::Delta,
+            "thread-gc-pages",
+            Some(before.version.clone()),
+            FactCursor::new(2, 21).unwrap(),
+            at(8, 21, 0),
+            vec![
+                UsageEventFactRecord::upsert(
+                    21,
+                    fact("thread-gc-pages", "event-stale", at(8, 21, 0), 999),
+                )
+                .unwrap(),
+            ],
+        );
+        sql.stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &stale)
+            .unwrap();
+        let stale_publication = sql
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &stale_id,
+            )
+            .unwrap();
+        let mut restarted = false;
+        let mut completed = false;
+        let progress_key = format!(
+            "sources/{}/redacted/fact-retention-progress.json",
+            source_id().as_str()
+        );
+        for step in 0..100 {
+            let report = crate::source_history::sqlite_gc::collect_unit_with_budget(
+                &sql,
+                now,
+                &[RedactionProfile::Redacted],
+                crate::source_history::sqlite_gc::Budget::with_limits(8, MAX_SHARD_FILE_BYTES),
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(report.records_examined <= 8);
+            if step == 0 {
+                assert!(
+                    report.work_pending,
+                    "an empty core page must continue through evidence"
+                );
+            }
+            let active = sql
+                .load_active_fact_set(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    &thread("thread-gc-pages"),
+                )
+                .unwrap()
+                .unwrap();
+            if active.version == before.version {
+                assert_eq!(active.records, changes);
+            } else {
+                assert_eq!(active.cursor, before.cursor);
+                assert_eq!(active.version.retained_since(), Some(at(8, 1, 0)));
+                assert_eq!(active.records.len(), 10);
+                assert!(
+                    active
+                        .records
+                        .iter()
+                        .all(|record| record.occurred_at() >= at(8, 1, 0))
+                );
+            }
+            let database = sql.sqlite_database().unwrap();
+            let progress = database
+                .read(|connection| database::state::<serde_json::Value>(connection, &progress_key))
+                .unwrap();
+            if !restarted
+                && progress
+                    .as_ref()
+                    .and_then(|p| p.get("job"))
+                    .is_some_and(|job| {
+                        job.get("retainedCount")
+                            .and_then(|count| count.as_u64())
+                            .is_some_and(|count| count > 0)
+                            && job
+                                .get("retireNamespace")
+                                .is_some_and(|namespace| namespace.is_null())
+                    })
+            {
+                assert_eq!(
+                    active.version, before.version,
+                    "candidate pages cannot activate a partial generation"
+                );
+                let state_root = sql.state_root().to_path_buf();
+                let profile = sql.profile_id().clone();
+                drop(sql);
+                sql = SourceHistoryStore::new(state_root, profile);
+                restarted = true;
+            }
+            if !report.work_pending {
+                completed = true;
+                break;
+            }
+        }
+        assert!(restarted && completed);
+        assert_eq!(
+            sql.publish_prevalidated_fact_batch_unfenced(&stale_publication)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            fact_generation_records(&sql, &before.replica, &id).is_empty(),
+            "retired generation must be reclaimed in bounded units"
+        );
+    }
+
+    #[test]
+    fn sqlite_gc_empty_evidence_page_cannot_recreate_source_after_other_privacy_purge() {
+        use crate::history_ownership::HistoryOwnershipStore;
+        let root = tempdir().unwrap();
+        let sql = store_with_kind(root.path(), SourceKind::Ssh);
+        sql.update_source_metadata(&source_id(), |metadata| {
+            metadata.set_detached(true);
+            Ok(())
+        })
+        .unwrap();
+        let mut budget =
+            crate::source_history::sqlite_gc::Budget::with_limits(8, MAX_SHARD_FILE_BYTES);
+        let prepared = prepare_gc_evidence_unit(
+            &sql,
+            &source_id(),
+            RedactionProfile::Redacted,
+            at(8, 1, 0),
+            at(9, 5, 0),
+            &mut budget,
+        )
+        .unwrap();
+        let preview_owner = HistoryOwnershipStore::new(
+            sql.state_root().to_path_buf(),
+            sql.profile_id().clone(),
+            RedactionProfile::PreviewEnabled,
+        );
+        let (preview_active, _) =
+            crate::sqlite_history_initialization::initialize_for_test(&preview_owner).unwrap();
+        let lease = preview_owner.acquire_writer_lease().unwrap();
+        let authority = preview_owner
+            .authorize_v2_write(&lease, &preview_active)
+            .unwrap();
+        let writer = sql.writer(&authority).unwrap();
+        writer
+            .prepare_detached_ssh_source_for_purge(&source_id())
+            .unwrap();
+        writer.purge_detached_ssh_source(&source_id()).unwrap();
+        let database = sql.sqlite_database().unwrap();
+        let error = database
+            .write(|connection| prepared.publish(&sql, &database, connection))
+            .err()
+            .expect("purge must invalidate an initially absent GC marker");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let count: i64 = database.read(|connection| connection.query_row("SELECT count(*) FROM history_state WHERE substr(state_key,1,length(?1))=?1", [format!("sources/{}/", source_id().as_str())], |row| row.get(0)).map_err(database::sql_error)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn sqlite_gc_full_fact_cap_reserves_only_retention_floor_metadata() {
+        let root = tempdir().unwrap();
+        let sql = store(root.path());
+        let id = FactBatchId::generate().unwrap();
+        let initial = batch(
+            id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-gc-cap",
+            None,
+            FactCursor::new(2, 1).unwrap(),
+            at(8, 21, 0),
+            vec![
+                UsageEventFactRecord::upsert(
+                    1,
+                    fact("thread-gc-cap", "event-one", at(8, 20, 0), 10),
+                )
+                .unwrap(),
+            ],
+        );
+        sql.stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &initial)
+            .unwrap();
+        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &id)
+            .unwrap();
+        let database = sql.sqlite_database().unwrap();
+        let prefix = format!("sources/{}/redacted/", source_id().as_str());
+        let cap: i64 = database.read(|connection| connection.query_row("SELECT (SELECT COALESCE(sum(length(payload)),0) FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,length(?1)+1,6)='facts/') + (SELECT COALESCE(sum(length(payload)),0) FROM history_state WHERE substr(state_key,1,length(?1))=?1 AND (substr(state_key,length(?1)+1,15)='fact-manifests/' OR substr(state_key,length(?1)+1,13)='fact-staging/'))", [&prefix], |row| row.get(0)).map_err(database::sql_error)).unwrap();
+        database
+            .read(|connection| {
+                sqlite_evidence::ensure_sql_fact_cap_for_test(
+                    &sql,
+                    &database,
+                    connection,
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    cap as u64,
+                )
+            })
+            .unwrap();
+        garbage_collect_session_evidence_for_source(
+            &sql,
+            &source_id(),
+            RedactionProfile::Redacted,
+            at(8, 1, 0).date_naive(),
+            at(8, 30, 0),
+        )
+        .unwrap();
+        let bookkeeping_key = format!("{prefix}fact-retention-bookkeeping.json");
+        let allowance = database
+            .read(|connection| database::state::<u64>(connection, &bookkeeping_key))
+            .unwrap()
+            .unwrap();
+        assert!(allowance > 0 && allowance <= 64);
+        database
+            .read(|connection| {
+                sqlite_evidence::ensure_sql_fact_cap_for_test(
+                    &sql,
+                    &database,
+                    connection,
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    cap as u64,
+                )
+            })
+            .unwrap();
+        garbage_collect_session_evidence_for_source(
+            &sql,
+            &source_id(),
+            RedactionProfile::Redacted,
+            at(8, 1, 0).date_naive(),
+            at(8, 30, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            database
+                .read(|connection| database::state::<u64>(connection, &bookkeeping_key))
+                .unwrap(),
+            Some(allowance)
+        );
+        let namespace = database
+            .namespace(
+                &sql.source_facts_directory(&source_id(), RedactionProfile::Redacted)
+                    .join(ThreadShardKey::from_replica(&replica("thread-gc-cap")).as_str())
+                    .join(id.as_str()),
+            )
+            .unwrap();
+        let extra =
+            UsageEventFactRecord::upsert(2, fact("thread-gc-cap", "event-two", at(8, 20, 0), 20))
+                .unwrap();
+        let error = database
+            .write(|connection| {
+                database::put_record(
+                    connection,
+                    &namespace,
+                    extra.event_id().as_str(),
+                    extra.occurred_at().timestamp_millis(),
+                    &extra,
+                )?;
+                sqlite_evidence::ensure_sql_fact_cap_for_test(
+                    &sql,
+                    &database,
+                    connection,
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    cap as u64,
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            sql.load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-gc-cap")
+            )
+            .unwrap()
+            .unwrap()
+            .records
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_gc_day_statistics_are_bounded_without_blocking_retention() {
+        let root = tempdir().unwrap();
+        let sql = store(root.path());
+        let database = sql.sqlite_database().unwrap();
+        let namespace = database
+            .namespace(&sql.source_digests_directory(&source_id(), RedactionProfile::Redacted))
+            .unwrap();
+        let start = Utc.with_ymd_and_hms(2010, 1, 1, 0, 0, 0).single().unwrap();
+        database
+            .write(|connection| {
+                for offset in 0..4100 {
+                    let day = start + Duration::days(offset);
+                    let record = SourceSessionDigestRecord::upsert(
+                        1,
+                        digest(
+                            &format!("old-day-{offset}"),
+                            day,
+                            day + Duration::hours(1),
+                            10,
+                        ),
+                    )
+                    .unwrap();
+                    database::put_record(
+                        connection,
+                        &namespace,
+                        &sqlite_record_key(&(record.thread_id(), record.range_start()))?,
+                        record.retention_through().timestamp_millis(),
+                        &record,
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let progress_key = format!(
+            "sources/{}/redacted/fact-retention-progress.json",
+            source_id().as_str()
+        );
+        let mut partial = false;
+        let mut complete = false;
+        for _ in 0..32 {
+            let mut budget =
+                crate::source_history::sqlite_gc::Budget::with_limits(4096, MAX_SHARD_FILE_BYTES);
+            let prepared = prepare_gc_evidence_unit(
+                &sql,
+                &source_id(),
+                RedactionProfile::Redacted,
+                at(8, 1, 0),
+                at(9, 5, 0),
+                &mut budget,
+            )
+            .unwrap();
+            let report = database
+                .write(|connection| prepared.publish(&sql, &database, connection))
+                .unwrap();
+            partial |= report.statistics_partial;
+            let marker_bytes: i64 = database.read(|connection| connection.query_row("SELECT COALESCE(max(length(payload)),0) FROM history_state WHERE state_key=?1", [&progress_key], |row| row.get(0)).map_err(database::sql_error)).unwrap();
+            assert!(marker_bytes <= 512 * 1024);
+            if report.complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(partial && complete);
+        let records: i64 = database
+            .read(|connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM history_records WHERE namespace=?1",
+                        [&namespace],
+                        |row| row.get(0),
+                    )
+                    .map_err(database::sql_error)
+            })
+            .unwrap();
+        assert_eq!(records, 0);
     }
 }

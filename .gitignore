@@ -1,5 +1,6 @@
 /target/
-/.cargo/config.toml
+/.cargo/*
+!/.cargo/config.toml
 /dist/
 /.codex-usage-monit/
 *.log

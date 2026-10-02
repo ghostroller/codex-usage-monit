@@ -153,7 +153,10 @@ class WindowsRunnerTests(unittest.TestCase):
             repository = Path(root) / "repository"
             repository.mkdir()
             subprocess.run(["git", "init", "-q", str(repository)], check=True)
-            (repository / ".gitignore").write_text("local-secret\n")
+            (repository / ".gitignore").write_text((runner.REPOSITORY / ".gitignore").read_text() + "local-secret\n")
+            (repository / ".cargo").mkdir()
+            config = (runner.REPOSITORY / ".cargo/config.toml").read_bytes()
+            (repository / ".cargo/config.toml").write_bytes(config)
             (repository / "tracked").write_text("old")
             (repository / "deleted").write_text("old")
             subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
@@ -161,13 +164,20 @@ class WindowsRunnerTests(unittest.TestCase):
             (repository / "deleted").unlink()
             (repository / "new source").write_text("new")
             (repository / "local-secret").write_text("do not copy")
+            for name in ["config", "config.local.toml", "credentials.toml"]:
+                (repository / ".cargo" / name).write_text("private host-only paths")
+            (repository / ".agent").mkdir()
+            (repository / ".agent/environment.local.md").write_text("private machine environment")
             archive_path = Path(root) / "source.zip"
             self.assertEqual(len(runner.source_archive(repository, archive_path)), 64)
             with zipfile.ZipFile(archive_path) as archive:
                 self.assertEqual(archive.read("tracked"), b"dirty")
                 self.assertEqual(archive.read("new source"), b"new")
+                self.assertEqual(archive.read(".cargo/config.toml"), config)
                 self.assertNotIn("deleted", archive.namelist())
                 self.assertNotIn("local-secret", archive.namelist())
+                for name in [".cargo/config", ".cargo/config.local.toml", ".cargo/credentials.toml", ".agent/environment.local.md"]:
+                    self.assertNotIn(name, archive.namelist())
                 self.assertFalse(any(name.startswith(".git/") for name in archive.namelist()))
 
     def test_snapshot_rejects_windows_path_traversal_and_symlinks(self):

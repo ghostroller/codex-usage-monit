@@ -3096,15 +3096,15 @@ mod tests {
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
         let ingest = store(root.path(), binding.clone());
-        drop(ingest.try_begin().unwrap());
         let source_namespace = ingest.source_namespace_directory();
-        assert!(source_namespace.is_dir());
 
         with_history_writer(
             root.path(),
             PROFILE,
             RedactionProfile::Redacted,
             |history, writer| {
+                drop(ingest.try_begin().unwrap());
+                assert!(source_namespace.is_dir());
                 let first = purge_remote_ingest_state_for_source(
                     history,
                     &binding.source().node_id,

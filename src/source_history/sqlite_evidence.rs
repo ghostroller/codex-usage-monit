@@ -4,6 +4,9 @@
 //! is invisible until the active manifest, digest proof and cursor are published
 //! together by a short compare-and-swap transaction.
 use super::*;
+#[path = "sqlite_evidence_gc.rs"]
+mod gc;
+pub(crate) use gc::prepare_gc_evidence_unit;
 
 fn generation_namespace(
     store: &SourceHistoryStore,
@@ -112,6 +115,24 @@ fn ensure_sql_fact_cap(
     source_id: &NodeId,
     redaction: RedactionProfile,
 ) -> io::Result<()> {
+    ensure_sql_fact_cap_with_limit(
+        store,
+        database,
+        connection,
+        source_id,
+        redaction,
+        MAX_FACT_NAMESPACE_BYTES,
+    )
+}
+
+fn ensure_sql_fact_cap_with_limit(
+    store: &SourceHistoryStore,
+    database: &database::HistoryDatabase,
+    connection: &rusqlite::Connection,
+    source_id: &NodeId,
+    redaction: RedactionProfile,
+    maximum_bytes: u64,
+) -> io::Result<()> {
     let root = format!(
         "{}/",
         database.namespace(
@@ -122,19 +143,23 @@ fn ensure_sql_fact_cap(
     );
     // Bound generation namespaces and state descriptors as well as bytes;
     // per-generation event limits are enforced separately.
+    let gc_exempt = gc::exempt_namespace(store, database, connection, source_id, redaction)?;
     let (record_bytes, generation_count): (i64, i64) = connection.query_row(
-        "SELECT COALESCE(sum(length(payload)),0),count(DISTINCT namespace) FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,length(?1)+1,6)='facts/'", [&root], |row| Ok((row.get(0)?, row.get(1)?)),
+        "SELECT COALESCE(sum(length(payload)),0),count(DISTINCT namespace) FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,length(?1)+1,6)='facts/' AND namespace<>?2", rusqlite::params![&root, gc_exempt.as_deref().unwrap_or("")], |row| Ok((row.get(0)?, row.get(1)?)),
     ).map_err(database::sql_error)?;
     let (state_bytes, state_count): (i64, i64) = connection.query_row(
         "SELECT COALESCE(sum(length(payload)),0),count(*) FROM history_state WHERE substr(state_key,1,length(?1))=?1 AND (substr(state_key,length(?1)+1,15)='fact-manifests/' OR substr(state_key,length(?1)+1,13)='fact-staging/')", [&root], |row| Ok((row.get(0)?, row.get(1)?)),
     ).map_err(database::sql_error)?;
+    let allowance = gc::bookkeeping_allowance(store, database, connection, source_id, redaction)?;
     let usage = FactNamespaceUsage {
         bytes: u64::try_from(
             record_bytes
                 .checked_add(state_bytes)
                 .ok_or_else(|| invalid_data("fact namespace size overflowed"))?,
         )
-        .map_err(|_| invalid_data("invalid SQL fact namespace size"))?,
+        .map_err(|_| invalid_data("invalid SQL fact namespace size"))?
+        .checked_sub(allowance)
+        .ok_or_else(|| invalid_data("GC bookkeeping allowance exceeds stored facts metadata"))?,
         entries: u64::try_from(
             generation_count
                 .checked_add(state_count)
@@ -142,7 +167,26 @@ fn ensure_sql_fact_cap(
         )
         .map_err(|_| invalid_data("invalid SQL fact namespace entry count"))?,
     };
-    validate_fact_namespace_usage(usage, MAX_FACT_NAMESPACE_BYTES, MAX_FACT_NAMESPACE_ENTRIES)
+    validate_fact_namespace_usage(usage, maximum_bytes, MAX_FACT_NAMESPACE_ENTRIES)
+}
+
+#[cfg(test)]
+pub(super) fn ensure_sql_fact_cap_for_test(
+    store: &SourceHistoryStore,
+    database: &database::HistoryDatabase,
+    connection: &rusqlite::Connection,
+    source_id: &NodeId,
+    redaction: RedactionProfile,
+    maximum_bytes: u64,
+) -> io::Result<()> {
+    ensure_sql_fact_cap_with_limit(
+        store,
+        database,
+        connection,
+        source_id,
+        redaction,
+        maximum_bytes,
+    )
 }
 
 impl SourceHistoryStore {
@@ -776,6 +820,7 @@ impl SourceHistoryStore {
                         &candidate,
                     )?;
                     database::delete_state(connection, &key)?;
+                    self.advance_facts_projection_revision(connection)?;
                     Ok(FactActivationReport {
                         activated: true,
                         cleanup_pending: false,
@@ -858,84 +903,7 @@ impl SourceHistoryStore {
     }
 }
 
-fn active_manifests(
-    store: &SourceHistoryStore,
-    database: &database::HistoryDatabase,
-    connection: &rusqlite::Connection,
-    source_id: &NodeId,
-    redaction: RedactionProfile,
-) -> io::Result<Vec<(String, ActiveFactManifest)>> {
-    let prefix = format!(
-        "{}/",
-        database.namespace(&store.source_fact_manifests_directory(source_id, redaction))?
-    );
-    let mut manifests = Vec::new();
-    for key in database::state_keys(connection, &prefix)? {
-        let Some(name) = key
-            .strip_prefix(&prefix)
-            .and_then(|name| name.strip_suffix(".json"))
-        else {
-            return Err(invalid_data("invalid SQL fact manifest key"));
-        };
-        let shard_key = name
-            .parse::<ThreadShardKey>()
-            .map_err(|error| invalid_data(error.to_string()))?;
-        let manifest = sqlite_state_bounded::<ActiveFactManifest>(
-            connection,
-            &key,
-            MAX_FACT_MANIFEST_BYTES,
-            None,
-        )?
-        .ok_or_else(|| invalid_data("fact manifest disappeared inside SQLite snapshot"))?;
-        validate_active_manifest(
-            &manifest,
-            &store.profile_id,
-            source_id,
-            redaction,
-            &manifest.replica,
-            &shard_key,
-        )?;
-        manifests.push((key, manifest));
-    }
-    Ok(manifests)
-}
-
-pub(super) fn earliest_session_evidence_time(
-    store: &SourceHistoryStore,
-    sources: &[SourceMetadata],
-    redactions: &[RedactionProfile],
-) -> io::Result<Option<DateTime<Utc>>> {
-    let database = store.sqlite_database().expect("SQLite backend");
-    if !database.exists()? {
-        return Ok(None);
-    }
-    database.read(|connection| {
-        let mut earliest = None;
-        for source in sources {
-            for &redaction in redactions {
-                let prefix = format!("{}/", database.namespace(&store.source_directory(source.source_id()).join(redaction.directory_name()))?);
-                let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,-8)='/digests'").map_err(database::sql_error)?;
-                let namespaces = statement.query_map([&prefix], |row| row.get::<_, String>(0)).map_err(database::sql_error)?.collect::<Result<Vec<_>, _>>().map_err(database::sql_error)?;
-                for namespace in namespaces {
-                    let mut budget = SourceHistoryReadBudget::for_query();
-                    for record in database::records::<SourceSessionDigestRecord>(connection, &namespace, i64::MIN, &mut budget)? {
-                        record.validate()?;
-                        let timestamp = record.range_start().date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc();
-                        earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)));
-                    }
-                }
-                for (_, manifest) in active_manifests(store, &database, connection, source.source_id(), redaction)? {
-                    if let Some(day) = manifest.shard_days.first() {
-                        let timestamp = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
-                        earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)));
-                    }
-                }
-            }
-        }
-        Ok(earliest)
-    })
-}
-
+#[cfg(test)]
 pub(super) fn garbage_collect_session_evidence(
     store: &SourceHistoryStore,
     source_id: &NodeId,
@@ -944,136 +912,24 @@ pub(super) fn garbage_collect_session_evidence(
     trusted_at: DateTime<Utc>,
 ) -> io::Result<(usize, bool)> {
     let database = store.sqlite_database().expect("SQLite backend");
-    database.write(|connection| {
-        let cutoff = cutoff_day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
-        let prefix = format!("{}/", database.namespace(&store.source_directory(source_id).join(redaction.directory_name()))?);
-        let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,-8)='/digests'").map_err(database::sql_error)?;
-        let namespaces = statement.query_map([&prefix], |row| row.get::<_, String>(0)).map_err(database::sql_error)?.collect::<Result<Vec<_>, _>>().map_err(database::sql_error)?;
-        let mut pruned = 0;
-        let mut query_visible_deleted = false;
-        for namespace in namespaces {
-            let mut budget = SourceHistoryReadBudget::for_query();
-            let records = database::records::<SourceSessionDigestRecord>(connection, &namespace, i64::MIN, &mut budget)?;
-            group_digest_records_by_day(source_id, &records)?;
-            let mut old_days = BTreeSet::new();
-            let mut retained_days = BTreeSet::new();
-            for record in records {
-                if record.range_start().date_naive() < cutoff_day && record.retention_through() < cutoff {
-                    database::delete_record(connection, &namespace, &sqlite_record_key(&(record.thread_id(), record.range_start()))?)?;
-                    query_visible_deleted = true;
-                    old_days.insert(record.range_start().date_naive());
-                } else { retained_days.insert(record.range_start().date_naive()); }
-            }
-            pruned += old_days.difference(&retained_days).count();
-        }
-        for (key, manifest) in active_manifests(store, &database, connection, source_id, redaction)? {
-            let retained_since = manifest.retained_since.map_or(cutoff, |current| current.max(cutoff));
-            if manifest.retained_since == Some(retained_since) { continue; }
-            let mut budget = SourceHistoryReadBudget::for_query();
-            let records = store.sqlite_read_fact_generation(source_id, redaction, &manifest, &mut budget)?;
-            let retained = records.iter().filter(|record| record.occurred_at() >= retained_since).cloned().collect::<Vec<_>>();
-            if retained.len() == records.len() {
-                database::set_state(connection, &key, &ActiveFactManifest { retained_since: Some(retained_since), ..manifest })?;
-                continue;
-            }
-            let replacement = FactBatchId::generate()?;
-            let namespace = generation_namespace(store, &database, source_id, redaction, &manifest.thread_shard_key, &replacement)?;
-            for record in &retained { database::put_record(connection, &namespace, record.event_id().as_str(), record.occurred_at().timestamp_millis(), record)?; }
-            let replacement_manifest = ActiveFactManifest { active_generation: replacement, retained_since: Some(retained_since), shard_days: record_days(&retained), record_count: retained.len(), ..manifest.clone() };
-            database::set_state(connection, &key, &replacement_manifest)?;
-            database::delete_namespace(connection, &generation_namespace(store, &database, source_id, redaction, &manifest.thread_shard_key, &manifest.active_generation)?)?;
-            query_visible_deleted = true;
-            pruned += manifest.shard_days.iter().filter(|day| **day < cutoff_day).count();
-        }
-        garbage_collect_artifacts(store, &database, connection, source_id, redaction, trusted_at)?;
-        ensure_sql_fact_cap(store, &database, connection, source_id, redaction)?;
-        Ok((pruned, query_visible_deleted))
-    })
-}
-
-fn garbage_collect_artifacts(
-    store: &SourceHistoryStore,
-    database: &database::HistoryDatabase,
-    connection: &rusqlite::Connection,
-    source_id: &NodeId,
-    redaction: RedactionProfile,
-    trusted_at: DateTime<Utc>,
-) -> io::Result<()> {
-    let expires_before = trusted_at
-        .checked_sub_signed(Duration::hours(FACT_STAGING_TTL_HOURS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let prefix = format!(
-        "{}/",
-        database.namespace(&store.source_fact_staging_directory(source_id, redaction))?
-    );
-    let mut referenced = BTreeSet::new();
-    for key in database::state_keys(connection, &prefix)? {
-        let Some(batch_name) = key
-            .strip_prefix(&prefix)
-            .and_then(|relative| relative.strip_suffix("/batch.json"))
-        else {
-            continue;
-        };
-        let batch_id = batch_name
-            .parse::<FactBatchId>()
-            .map_err(|error| invalid_data(error.to_string()))?;
-        let descriptor =
-            read_descriptor(store, database, connection, source_id, redaction, &batch_id)?;
-        let staged_at = database::state::<DateTime<Utc>>(
-            connection,
-            &staged_key(
-                store,
-                database,
-                source_id,
-                redaction,
-                &batch_id,
-                "staged-at.json",
-            )?,
-        )?
-        .ok_or_else(|| invalid_data("staged fact batch has no central staging timestamp"))?;
-        let namespace = generation_namespace(
-            store,
-            database,
-            source_id,
-            redaction,
-            &descriptor.thread_shard_key,
-            &batch_id,
-        )?;
-        if staged_at < expires_before {
-            for file in [STAGED_BATCH_FILE, STAGED_PUBLICATION_FILE, "staged-at.json"] {
-                database::delete_state(
-                    connection,
-                    &staged_key(store, database, source_id, redaction, &batch_id, file)?,
-                )?;
-            }
-        } else {
-            referenced.insert(namespace);
+    let cutoff = cutoff_day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+    let mut pruned = 0;
+    let mut changed = false;
+    // Legacy small-fixture helpers drive the same bounded production units.
+    // Production performs one unit per poll and releases its ownership lease.
+    for _ in 0..10_000 {
+        let mut budget =
+            crate::source_history::sqlite_gc::Budget::with_limits(4096, MAX_SHARD_FILE_BYTES);
+        let prepared =
+            prepare_gc_evidence_unit(store, source_id, redaction, cutoff, trusted_at, &mut budget)?;
+        let report = database.write(|connection| prepared.publish(store, &database, connection))?;
+        pruned += report.pruned;
+        changed |= report.visible_changed;
+        if report.complete {
+            return Ok((pruned, changed));
         }
     }
-    for (_, manifest) in active_manifests(store, database, connection, source_id, redaction)? {
-        referenced.insert(generation_namespace(
-            store,
-            database,
-            source_id,
-            redaction,
-            &manifest.thread_shard_key,
-            &manifest.active_generation,
-        )?);
-    }
-    let facts_prefix = format!(
-        "{}/",
-        database.namespace(&store.source_facts_directory(source_id, redaction))?
-    );
-    let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1").map_err(database::sql_error)?;
-    let namespaces = statement
-        .query_map([&facts_prefix], |row| row.get::<_, String>(0))
-        .map_err(database::sql_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database::sql_error)?;
-    for namespace in namespaces {
-        if !referenced.contains(&namespace) {
-            database::delete_namespace(connection, &namespace)?;
-        }
-    }
-    Ok(())
+    Err(io::Error::other(
+        "test evidence GC did not finish within its bounded unit limit",
+    ))
 }
