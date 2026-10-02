@@ -1039,6 +1039,303 @@ fn windows_adoption_held_process_fixture() {
 
 #[cfg(windows)]
 #[test]
+fn windows_launcher_probe_cleanup_handles_mapped_image_with_optional_release_retry() {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+        PAGE_READONLY, SEC_IMAGE, UnmapViewOfFile,
+    };
+
+    struct MappedImage {
+        section: HANDLE,
+        view: MEMORY_MAPPED_VIEW_ADDRESS,
+    }
+    impl Drop for MappedImage {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns both resources, including
+            // when a mapping or a later assertion fails.
+            unsafe {
+                if !self.view.Value.is_null() {
+                    UnmapViewOfFile(self.view);
+                }
+                CloseHandle(self.section);
+            }
+        }
+    }
+
+    let (_temp, root, _) = fixture();
+    let directory = root.join("probe-mapped-image");
+    STORE.create_directory_beneath(&root, &directory).unwrap();
+    let image_path = directory.join("probe-image.exe");
+    BINARIES
+        .write_atomically(&image_path, &fs::read(env::current_exe().unwrap()).unwrap())
+        .unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&image_path)
+        .unwrap();
+    // SEC_IMAGE retains a real PE image section, rather than an ordinary data
+    // mapping or a sleep that hopes a subprocess still has its image mapped.
+    // SAFETY: the file handle is live; no named mapping or custom ACL is used.
+    let section = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            PAGE_READONLY | SEC_IMAGE,
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert!(
+        !section.is_null(),
+        "image section: {}",
+        io::Error::last_os_error()
+    );
+    let mut image = MappedImage {
+        section,
+        view: MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: std::ptr::null_mut(),
+        },
+    };
+    // SAFETY: the section is owned by the guard; zero length maps its image.
+    image.view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0) };
+    assert!(
+        !image.view.Value.is_null(),
+        "image view: {}",
+        io::Error::last_os_error()
+    );
+    drop(file);
+    let wide_path = image_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Rust remove_file has its own POSIX fallback. Compare the traditional
+    // Windows API directly so it cannot unlink the fixture before cleanup.
+    // SAFETY: wide_path is a live, NUL-terminated Windows path.
+    let deleted = unsafe { DeleteFileW(wide_path.as_ptr()) };
+    let traditional_error = io::Error::last_os_error();
+    assert_eq!(
+        deleted, 0,
+        "traditional deletion unexpectedly removed a mapped image"
+    );
+    assert_eq!(
+        traditional_error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+    assert!(image_path.exists());
+
+    let mut image = Some(image);
+    let mut cleanup = LauncherProbeCleanup {
+        files: vec![image_path.clone()],
+        directories: vec![directory.clone()],
+    };
+    let mut failed_attempts = 0;
+    cleanup
+        .cleanup_with_wait(|| {
+            failed_attempts += 1;
+            assert!(
+                image_path.exists(),
+                "a failed delete must preserve the image path"
+            );
+            let view = image
+                .as_ref()
+                .expect("only one mapped-image release is needed")
+                .view;
+            // SAFETY: the guard still owns this image view until the explicit
+            // release below, and its PE header has two readable bytes.
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(view.Value.cast::<u8>(), 2) },
+                b"MZ"
+            );
+            // Release only after a real deletion failed. The next attempt
+            // exercises the production retry without a timing-based sleep.
+            drop(image.take());
+            true
+        })
+        .unwrap();
+    assert!(failed_attempts <= 1);
+    if let Some(image) = image.as_ref() {
+        assert_eq!(failed_attempts, 0);
+        // Some Windows filesystems allow the POSIX fallback to unlink an
+        // image immediately. The surviving mapped view must remain readable.
+        // SAFETY: this branch retains the guard that owns the live image view.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(image.view.Value.cast::<u8>(), 2) },
+            b"MZ"
+        );
+    } else {
+        assert_eq!(failed_attempts, 1);
+    }
+    assert_eq!(
+        fs::symlink_metadata(&image_path).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!directory.exists());
+    drop(image);
+    cleanup
+        .cleanup_with_wait(|| panic!("successful cleanup must be idempotent"))
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_launcher_probe_cleanup_reports_delete_sharing_failure_and_can_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let (_temp, root, _) = fixture();
+    let directory = root.join("probe-sharing");
+    STORE.create_directory_beneath(&root, &directory).unwrap();
+    let file_path = directory.join("owned.bin");
+    BINARIES
+        .write_atomically(&file_path, b"owned probe contents")
+        .unwrap();
+    let blocker = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&file_path)
+        .unwrap();
+    let mut blocker = Some(blocker);
+    let mut cleanup = LauncherProbeCleanup {
+        files: vec![file_path.clone()],
+        directories: vec![directory.clone()],
+    };
+    let mut failed_attempts = 0;
+    cleanup
+        .cleanup_with_wait(|| {
+            failed_attempts += 1;
+            assert_eq!(failed_attempts, 1);
+            assert!(file_path.exists());
+            assert_eq!(fs::read(&file_path).unwrap(), b"owned probe contents");
+            // This real handle forbids DELETE sharing, so the callback is
+            // reached only after a sharing violation. Release it before retry.
+            drop(blocker.take());
+            true
+        })
+        .unwrap();
+    assert_eq!(failed_attempts, 1);
+    assert!(blocker.is_none());
+    assert!(!directory.exists());
+
+    let directory = root.join("probe-sharing-budget");
+    STORE.create_directory_beneath(&root, &directory).unwrap();
+    let file_path = directory.join("owned.bin");
+    BINARIES
+        .write_atomically(&file_path, b"owned probe contents")
+        .unwrap();
+    let blocker = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&file_path)
+        .unwrap();
+    let mut cleanup = LauncherProbeCleanup {
+        files: vec![file_path.clone()],
+        directories: vec![directory.clone()],
+    };
+    let mut failed_attempts = 0;
+    let error = cleanup
+        .cleanup_with_wait(|| {
+            failed_attempts += 1;
+            failed_attempts < 2
+        })
+        .unwrap_err();
+    assert_eq!(failed_attempts, 2);
+    assert!(format!("{error:#}").contains(&file_path.display().to_string()));
+    assert_eq!(
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .find_map(io::Error::raw_os_error),
+        Some(ERROR_SHARING_VIOLATION as i32),
+    );
+    assert_eq!(fs::read(&file_path).unwrap(), b"owned probe contents");
+    drop(blocker);
+    cleanup
+        .cleanup_with_wait(|| panic!("released sharing handle must allow immediate cleanup"))
+        .unwrap();
+    assert!(!directory.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_launcher_probe_cleanup_accepts_missing_paths_and_repeated_cleanup() {
+    let (_temp, root, _) = fixture();
+    let directory = root.join("probe-never-created");
+    let mut cleanup = LauncherProbeCleanup {
+        files: vec![directory.join("never-created.bin")],
+        directories: vec![directory],
+    };
+    cleanup
+        .cleanup_with_wait(|| panic!("missing paths must not wait"))
+        .unwrap();
+    cleanup
+        .cleanup_with_wait(|| panic!("successful cleanup must be idempotent"))
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_launcher_probe_cleanup_preserves_unknown_files_and_directories() {
+    use windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY;
+
+    let (_temp, root, _) = fixture();
+    let directory = root.join("probe-unknown");
+    let unknown_directory = directory.join("foreign-directory");
+    STORE
+        .create_directory_beneath(&root, &unknown_directory)
+        .unwrap();
+    let owned = directory.join("owned.bin");
+    let unknown = directory.join("foreign.bin");
+    let nested_unknown = unknown_directory.join("foreign.bin");
+    for (path, bytes) in [
+        (&owned, b"owned".as_slice()),
+        (&unknown, b"foreign".as_slice()),
+        (&nested_unknown, b"nested foreign".as_slice()),
+    ] {
+        BINARIES.write_atomically(path, bytes).unwrap();
+    }
+    let mut cleanup = LauncherProbeCleanup {
+        files: vec![directory.join("never-created.bin"), owned.clone()],
+        directories: vec![directory.clone()],
+    };
+    let mut waits = 0;
+    let error = cleanup
+        .cleanup_with_wait(|| {
+            waits += 1;
+            false
+        })
+        .unwrap_err();
+    assert_eq!(waits, 0, "nonempty unknown directories are never retried");
+    assert!(format!("{error:#}").contains(&directory.display().to_string()));
+    assert_eq!(
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .find_map(io::Error::raw_os_error),
+        Some(ERROR_DIR_NOT_EMPTY as i32),
+    );
+    assert!(!owned.exists());
+    assert_eq!(fs::read(&unknown).unwrap(), b"foreign");
+    assert_eq!(fs::read(&nested_unknown).unwrap(), b"nested foreign");
+    assert!(unknown_directory.is_dir());
+    drop(cleanup);
+    assert_eq!(fs::read(unknown).unwrap(), b"foreign");
+    assert_eq!(fs::read(nested_unknown).unwrap(), b"nested foreign");
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_launcher_probe_rejects_malformed_pe_without_loader_dialogs() {
     use windows_sys::Win32::System::Diagnostics::Debug::GetThreadErrorMode;
     let (temp, root, target) = fixture();

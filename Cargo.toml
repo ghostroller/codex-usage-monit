@@ -66,6 +66,9 @@ pretty_assertions = "1.4"
 tempfile = "3.14"
 vt100 = "0.15"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
 [profile.dev]
 debug = 0
 incremental = false

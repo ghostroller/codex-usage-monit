@@ -932,6 +932,95 @@ fn plan_cli(
     })
 }
 
+#[cfg(windows)]
+struct LauncherProbeCleanup {
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+}
+
+#[cfg(windows)]
+impl LauncherProbeCleanup {
+    fn cleanup(&mut self) -> Result<()> {
+        // The child has exited, but Windows can briefly retain either probe
+        // image. All copies share one waiting budget; probe execution remains
+        // bounded separately and no unexpected entry is removed to make room.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        self.cleanup_with_wait(|| {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            std::time::Instant::now() < deadline
+        })
+    }
+
+    fn cleanup_with_wait(&mut self, mut wait: impl FnMut() -> bool) -> Result<()> {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+        let mut first_error = None;
+        // Delete only files created by this probe. Unexpected files are
+        // retained instead of recursively deleting executable-owned data.
+        for path in &self.files {
+            let removal: Result<()> = (|| {
+                loop {
+                    crate::source_identity::reject_windows_reparse_components(
+                        path,
+                        "launcher probe file",
+                    )
+                    .context("validate launcher probe path before deletion")?;
+                    match fs::remove_file(path) {
+                        Ok(()) => break Ok(()),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break Ok(()),
+                        Err(error)
+                            if error.raw_os_error().is_some_and(|code| {
+                                matches!(code as u32, ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                            }) && wait() => {}
+                        Err(error) => break Err(error.into()),
+                    }
+                }
+            })();
+            if let Err(error) = removal
+                && !error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                && first_error.is_none()
+            {
+                first_error = Some(error.context(format!(
+                    "update_probe_cleanup_failed: could not remove file {}",
+                    path.display()
+                )));
+            }
+        }
+        for path in &self.directories {
+            if let Err(error) = fs::remove_dir(path)
+                && error.kind() != io::ErrorKind::NotFound
+                && first_error.is_none()
+            {
+                first_error = Some(anyhow::Error::new(error).context(format!(
+                    "update_probe_cleanup_failed: could not remove directory {}",
+                    path.display()
+                )));
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.files.clear();
+        self.directories.clear();
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LauncherProbeCleanup {
+    fn drop(&mut self) {
+        // Error paths make one best-effort attempt. Only explicit cleanup after
+        // the bounded probe returns waits for Windows to release its images.
+        let _ = self.cleanup_with_wait(|| false);
+    }
+}
+
 /// Prove the old executable understands the frozen launcher contract without
 /// changing the live registration. Version strings alone are not evidence: a
 /// portable build may have different capabilities at the same package version.
@@ -955,28 +1044,12 @@ fn verify_compatible_launcher(
     let base = root.join(format!(".launcher-probe-{}", digest(&random)));
     let probe_root = base.join("codex-usage-monit");
     STORE.create_directory_beneath(root, &probe_root)?;
-    struct Cleanup {
-        files: Vec<PathBuf>,
-        directories: Vec<PathBuf>,
-    }
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            // Delete only files created by this probe. Unexpected files are
-            // retained rather than recursively deleting executable-owned data.
-            for path in &self.files {
-                let _ = fs::remove_file(path);
-            }
-            for path in &self.directories {
-                let _ = fs::remove_dir(path);
-            }
-        }
-    }
     let selected_path = version_path(&probe_root, &target.version, &target.sha256)?;
     let version_dir = selected_path
         .parent()
         .context("missing probe version directory")?;
     let probe_entry = probe_root.join(BINARY_NAME);
-    let _cleanup = Cleanup {
+    let mut cleanup = LauncherProbeCleanup {
         files: vec![
             probe_entry.clone(),
             probe_root.join(REGISTRATION),
@@ -1047,11 +1120,14 @@ fn verify_compatible_launcher(
         Duration::from_secs(15),
         MAX_METADATA as usize,
     ) else {
+        cleanup.cleanup()?;
         return Ok(false);
     };
     let Ok(actual) = serde_json::from_slice::<AgentInfo>(&output.stdout) else {
+        cleanup.cleanup()?;
         return Ok(false);
     };
+    cleanup.cleanup()?;
     Ok(output.status.success()
         && actual.schema_version == 1
         && actual.product == "codex-usage-monit"
