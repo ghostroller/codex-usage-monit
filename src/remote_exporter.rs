@@ -2074,15 +2074,16 @@ mod tests {
         }
     }
     #[test]
-    fn quota_history_is_journaled_incrementally_from_local_recorder_shards() {
+    fn quota_history_is_journaled_incrementally_from_local_sqlite_account() {
         let (_directory, config, store, identity, now) = fixture();
         let root = store.path().unwrap().parent().unwrap();
-        let runtime = crate::history_runtime::HistoryRuntime::new(
+        let mut runtime = crate::history_runtime::HistoryRuntime::new(
             root.join("history-v1"),
             &config.codex_home,
             config.redact_content,
         )
         .unwrap();
+        runtime.ensure_v2_active().unwrap();
         let point = crate::history::QuotaPoint {
             observed_at: now - Duration::minutes(5),
             limit_id: "codex".into(),
@@ -2107,6 +2108,12 @@ mod tests {
         )
         .unwrap();
         let (page, payload) = prepared.decode().unwrap();
+        assert!(
+            payload
+                .warnings
+                .iter()
+                .all(|warning| warning.code != "quota_history_unavailable")
+        );
         assert_eq!(payload.quota_changes.len(), 1);
         assert_eq!(payload.quota_changes[0].quota.points[0].to_local(), point);
         let mut continuation = request(now);
@@ -2124,5 +2131,11 @@ mod tests {
         .decode()
         .unwrap();
         assert!(unchanged.quota_changes.is_empty());
+        assert!(
+            unchanged
+                .warnings
+                .iter()
+                .all(|warning| warning.code != "quota_history_unavailable")
+        );
     }
 }

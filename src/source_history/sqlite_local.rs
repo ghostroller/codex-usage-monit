@@ -244,7 +244,6 @@ pub(super) fn record_observation(
         writer.validate()?;
         Ok(LocalObservationWriteReport {
             revision,
-            recovered_pending: false,
             account,
             buckets: bucket_history,
             weekly: weekly_history,
@@ -259,212 +258,6 @@ pub(super) fn record_observation(
             garbage_collection: LocalObservationGarbageCollectionReport::default(),
         })
     })
-}
-
-/// Imports an already-committed filesystem redo batch without allocating a
-/// new revision. The caller owns both migration leases and the outer import
-/// transaction; the original files remain recovery input and backup.
-pub(super) fn import_legacy_state(
-    store: &SourceHistoryStore,
-    legacy: &SourceHistoryStore,
-    epochs: &[(RedactionProfile, u64, u64)],
-) -> io::Result<()> {
-    if legacy.sqlite_database().is_some() || legacy.profile_id() != store.profile_id() {
-        return Err(invalid_data(
-            "local history import backend/profile mismatch",
-        ));
-    }
-    let database = database(store)?;
-    database.write(|connection| {
-        let already_imported = !crate::source_history::database::state_keys(connection, "database/migration/")?.is_empty();
-        for source in legacy.list_source_metadata()? {
-            let mut pending_profile = None;
-            for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-                let directory = local_state_directory(legacy, source.source_id(), redaction);
-                if !legacy.private_directory_exists(&directory)? {
-                    continue;
-                }
-                let current = read_optional_json_file::<LocalRevisionState>(
-                    &directory.join(STATE_FILE),
-                    MAX_STATE_BYTES,
-                )?;
-                let pending = read_optional_json_file::<PendingLocalObservation>(
-                    &directory.join(JOURNAL_FILE),
-                    MAX_JOURNAL_BYTES,
-                )?;
-                if source.kind() != SourceKind::Local {
-                    if current.is_some() || pending.is_some() {
-                        return Err(invalid_data(
-                            "local observation import source kind mismatch",
-                        ));
-                    }
-                    continue;
-                }
-                let Some(mut current) = current else {
-                    if pending.is_some() {
-                        return Err(invalid_data("local observation journal binding mismatch"));
-                    }
-                    continue;
-                };
-                validate_import_revision(legacy, source.source_id(), redaction, &current)?;
-                let key = revision_key(&database, store, source.source_id(), redaction)?;
-                let published_key = committed_key(&database, store, source.source_id(), redaction)?;
-                let existing = sqlite_state_bounded::<LocalRevisionState>(connection, &key, MAX_STATE_BYTES, None)?;
-                let published = sqlite_state_bounded::<LocalRevisionState>(connection, &published_key, MAX_STATE_BYTES, None)?;
-                if let Some(published) = &published {
-                    validate_import_revision(store, source.source_id(), redaction, published)?;
-                    if published.source_generation != current.source_generation {
-                        return Err(invalid_data("local observation revision state binding mismatch"));
-                    }
-                    if existing.as_ref().is_none_or(|high_water| published.last_reserved_revision > high_water.last_reserved_revision) {
-                        return Err(invalid_data("local observation committed revision exceeds its high-water"));
-                    }
-                }
-                if let Some(existing) = &existing {
-                    validate_import_revision(store, source.source_id(), redaction, existing)?;
-                    if existing.source_generation != current.source_generation {
-                        return Err(invalid_data("local observation revision state binding mismatch"));
-                    }
-                    if existing.last_reserved_revision < current.last_reserved_revision {
-                        return Err(invalid_data("local observation import cannot replace an established SQLite revision state"));
-                    }
-                }
-                // Keep the coordination directory for later independent
-                // reservations. Projection stamps live inside the SQL snapshot.
-                store.prepare_private_directory(&store.source_directory(source.source_id()))?;
-                let publish_pending_metadata = pending.is_some() && existing.is_none() && !already_imported;
-                let publish_new_namespace_policy = existing.is_none()
-                    && source.aggregate_redaction_profile() == redaction
-                    && epochs.iter().any(|(participant, _, _)| *participant == redaction);
-                if let Some(pending) = pending {
-                    if pending_profile.replace(redaction).is_some() {
-                        return Err(invalid_data(
-                            "local observation import has ambiguous profile journals",
-                        ));
-                    }
-                    let binding = &pending.binding;
-                    validate_import_revision(legacy, source.source_id(), redaction, binding)?;
-                    if binding.source_generation != current.source_generation
-                        || binding.last_reserved_revision == 0
-                        || binding.last_reserved_revision > current.last_reserved_revision
-                    {
-                        return Err(invalid_data("local observation journal binding mismatch"));
-                    }
-                    if source.display_label() != pending.display_label {
-                        return Err(invalid_data("local observation journal metadata mismatch"));
-                    }
-                    SourceMetadata::new_with_redaction_profile(
-                        source.source_id().clone(),
-                        SourceKind::Local,
-                        &pending.display_label,
-                        redaction,
-                    )?;
-                    validate_pending_records(source.source_id(), &pending)?;
-                    if existing.is_none() {
-                    store.record_account_points_unfenced(&pending.account_points)?;
-                    store.record_source_bucket_changes_unfenced(
-                        source.source_id(),
-                        redaction,
-                        &pending.bucket_records,
-                    )?;
-                    store.record_source_weekly_changes_unfenced(
-                        source.source_id(),
-                        redaction,
-                        &pending.weekly_records,
-                    )?;
-                    store.record_source_session_digest_changes_unfenced(
-                        source.source_id(),
-                        redaction,
-                        &pending.session_digest_records,
-                    )?;
-                    }
-                }
-                if publish_pending_metadata || publish_new_namespace_policy {
-                    // A newly imported local privacy namespace must be the
-                    // selected policy when its current file metadata says so.
-                    // Existing SQL namespaces retain their live policy even
-                    // when later migrations re-read the immutable backup.
-                    store.update_source_metadata_unfenced(source.source_id(), |metadata| {
-                        if metadata.kind() != SourceKind::Local
-                            || metadata.source_id() != source.source_id()
-                            || (publish_pending_metadata
-                                && metadata.display_label() != source.display_label())
-                        {
-                            return Err(invalid_data("local observation journal metadata mismatch"));
-                        }
-                        metadata.set_aggregate_redaction_profile(redaction);
-                        Ok(())
-                    })?;
-                }
-                if let Some(existing) = existing {
-                    current.last_reserved_revision = current
-                        .last_reserved_revision
-                        .max(existing.last_reserved_revision);
-                }
-                set_state(connection, &key, &current)?;
-                if published.is_none() {
-                    // The entire imported batch becomes visible with this
-                    // stamp in the migration transaction. Re-importing an
-                    // immutable backup preserves an established SQL stamp.
-                    set_state(connection, &published_key, &current)?;
-                }
-            }
-        }
-        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-            let directory = legacy.profile_directory().join(redaction.directory_name());
-            if !legacy.private_directory_exists(&directory)? {
-                continue;
-            }
-            let Some(mut marker) = read_optional_json_file::<BackfillMarker>(
-                &directory.join(MARKER_FILE),
-                MAX_STATE_BYTES,
-            )?
-            else {
-                continue;
-            };
-            let (_, old_epoch, new_epoch) = epochs
-                .iter()
-                .find(|(profile, _, _)| *profile == redaction)
-                .ok_or_else(|| {
-                    invalid_data("summary backfill marker authority binding mismatch")
-                })?;
-            validate_marker(legacy, redaction, *old_epoch, &marker)?;
-            if *old_epoch <= 1 || *new_epoch <= *old_epoch {
-                return Err(invalid_data(
-                    "summary backfill marker authority binding mismatch",
-                ));
-            }
-            marker.ownership_epoch = *new_epoch;
-            let key = marker_key(&database, store, redaction)?;
-            if let Some(existing) = sqlite_state_bounded::<BackfillMarker>(connection, &key, MAX_STATE_BYTES, None)? {
-                validate_marker(store, redaction, *new_epoch, &existing)?;
-                if existing.complete || (existing.completed_at, existing.complete) >= (marker.completed_at, marker.complete) {
-                    marker = existing;
-                }
-            }
-            set_state(connection, &key, &marker)?;
-        }
-        Ok(())
-    })
-}
-
-fn validate_import_revision(
-    store: &SourceHistoryStore,
-    source: &NodeId,
-    redaction: RedactionProfile,
-    current: &LocalRevisionState,
-) -> io::Result<()> {
-    if current.format_version != STATE_VERSION
-        || current.profile_id != *store.profile_id()
-        || current.source_id != *source
-        || current.redaction_profile != redaction
-        || current.source_generation == 0
-    {
-        return Err(invalid_data(
-            "local observation revision state binding mismatch",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn raise_revision_floor(
@@ -508,7 +301,9 @@ pub(super) fn load_revision(
     }
     let directory = store.source_directory(identity.node_id());
     if !store.private_directory_exists(&directory)? {
-        return Ok(0);
+        let key = revision_key(&database, store, identity.node_id(), redaction)?;
+        return database
+            .read(|connection| read_revision(connection, &key, store, identity, redaction));
     }
     #[cfg(test)]
     REVISION_READER_READY.with(|slot| {

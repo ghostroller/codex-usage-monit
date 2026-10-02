@@ -1,34 +1,21 @@
-//! Crash-safe center-side state for aggregate remote-delta ingestion.
+//! Transactional center-side remote-delta ingestion.
 //!
-//! The state machine intentionally separates durability from transport and
-//! scheduling.  A page is first persisted as a pending WAL record, then the
-//! caller applies and acknowledges the returned revisioned bucket/digest
-//! records through [`apply_and_commit_remote_delta_page`].
-//! Reopening a session exposes the same pending records, so an interrupted
-//! apply is replayed idempotently.
-//!
-//! Bootstrap is a distinct copy-on-write path.  Pages are directed to a fresh
-//! staging generation and the old active generation remains selected until the
-//! final staged page has been applied.  [`activate_remote_delta_bootstrap`]
-//! atomically switches the source-history manifest before committing the
-//! ingest cursor.  Repeating that ordering after a crash is safe because both
-//! operations are idempotent.
+//! Validated pages stay in memory until one SQLite transaction commits their
+//! records, live replacement, and cursor. Bootstrap pages remain invisible in
+//! a staging generation until an atomic activation selects the complete stream.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::atomic_file::replace_file;
 use crate::domain::{ApiCostAmount, PicoUsd};
 use crate::file_lock::FileLock;
 use crate::history::{
@@ -49,20 +36,14 @@ use crate::source_history::{
     RemoteHistoryGenerationSweepReport, SessionDigestFingerprint, SourceBucketRecord,
     SourceHistoryRemoteActiveRef, SourceHistoryRemoteBinding, SourceHistoryRemoteGenerationId,
     SourceHistoryStore, SourceHistoryWriter, SourceSessionDigest, SourceSessionDigestRecord,
-    sync_directory,
 };
 use crate::source_identity::NodeId;
 #[cfg(windows)]
 use crate::source_identity::validate_windows_private_file;
 use crate::source_model::{ObservedProjectKey, SessionReplicaKey};
 
-const INGEST_LAYOUT_DIRECTORY: &str = "remote-ingest-v1";
-const INGEST_STATE_FILE: &str = "ingest-state.json";
-const INGEST_ANCHOR_FILE: &str = "ingest-state.anchor";
+const INGEST_LAYOUT_DIRECTORY: &str = "remote-ingest-locks";
 const INGEST_LOCK_FILE: &str = "ingest.lock";
-const INGEST_RETIREMENTS_DIRECTORY: &str = "retirements-v1";
-const INGEST_RETIREMENT_LOCK_FILE: &str = "retirement.lock";
-const INGEST_RETIREMENT_MARKER_FILE: &str = "preview-to-redacted.json";
 const INGEST_STATE_FORMAT_VERSION: u32 = 4;
 const INGEST_ANCHOR_FORMAT_VERSION: u32 = 1;
 const INGEST_RETIREMENT_FORMAT_VERSION: u32 = 1;
@@ -70,19 +51,12 @@ const INGEST_GENERATION_PREFIX: &str = "ingest-gen-";
 const INGEST_GENERATION_RANDOM_BYTES: usize = 16;
 const BINDING_NAMESPACE_PREFIX: &str = "binding-sha256-";
 const PREPARED_PAGE_PREFIX: &str = "page-sha256-";
-const ACTIVE_REPLACEMENT_GENERATION_DOMAIN: &[u8] =
-    b"codex-usage-monit/remote-active-page-generation/v1\0";
 const SHA256_HEX_LEN: usize = 64;
 const MAX_WINDOW_MINUTES: u32 = 35 * 24 * 60;
 const MAX_OVERLAP_MINUTES: u16 = 24 * 60;
 const MAX_INGEST_STATE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_INGEST_ANCHOR_BYTES: u64 = 64 * 1024;
 const MAX_BINDING_NAMESPACES_PER_SOURCE: usize = 64;
 const REMOTE_GENERATION_SWEEP_WORK_LIMIT: usize = 8;
-const INGEST_RETIREMENT_WORK_LIMIT: usize = 128;
-const TEMP_FILE_ATTEMPTS: usize = 128;
-
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Fixed center policy for a rolling remote-delta range.
 ///
@@ -297,7 +271,7 @@ impl fmt::Display for RemoteHistoryGenerationId {
     }
 }
 
-/// Content identity for one persisted pending page.
+/// Content identity for one validated page.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PreparedRemoteDeltaPageId(String);
@@ -323,16 +297,12 @@ impl fmt::Display for PreparedRemoteDeltaPageId {
     }
 }
 
-/// The exact materialization namespace to which the WAL page must be applied.
+/// The exact SQL generation that receives one validated page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "targetKind", content = "target", rename_all = "snake_case")]
 pub enum RemoteDeltaApplyTarget {
-    ActiveNoop {
+    Active {
         expected_generation: RemoteHistoryGenerationId,
-    },
-    ActiveCow {
-        expected_generation: RemoteHistoryGenerationId,
-        replacement_generation: RemoteHistoryGenerationId,
     },
     Staging(RemoteHistoryGenerationId),
 }
@@ -340,78 +310,15 @@ pub enum RemoteDeltaApplyTarget {
 impl RemoteDeltaApplyTarget {
     pub fn resulting_generation(&self) -> &RemoteHistoryGenerationId {
         match self {
-            Self::ActiveNoop {
+            Self::Active {
                 expected_generation,
             } => expected_generation,
-            Self::ActiveCow {
-                replacement_generation,
-                ..
-            } => replacement_generation,
             Self::Staging(generation) => generation,
         }
     }
 
     fn validate(&self) -> io::Result<()> {
-        self.resulting_generation().validate()?;
-        if let Self::ActiveCow {
-            expected_generation,
-            replacement_generation,
-        } = self
-        {
-            expected_generation.validate()?;
-            if expected_generation == replacement_generation {
-                return Err(invalid_data(
-                    "remote active COW replacement must differ from its expected generation",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn seed(&self) -> RemoteDeltaApplyTargetSeed {
-        match self {
-            Self::ActiveNoop {
-                expected_generation,
-            } => RemoteDeltaApplyTargetSeed::ActiveNoop(expected_generation.clone()),
-            Self::ActiveCow {
-                expected_generation,
-                ..
-            } => RemoteDeltaApplyTargetSeed::ActiveCow(expected_generation.clone()),
-            Self::Staging(generation) => RemoteDeltaApplyTargetSeed::Staging(generation.clone()),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "targetKind", content = "generation", rename_all = "snake_case")]
-enum RemoteDeltaApplyTargetSeed {
-    ActiveNoop(RemoteHistoryGenerationId),
-    ActiveCow(RemoteHistoryGenerationId),
-    Staging(RemoteHistoryGenerationId),
-}
-
-impl RemoteDeltaApplyTargetSeed {
-    fn without_history_mutations(self) -> Self {
-        match self {
-            Self::ActiveCow(expected_generation) => Self::ActiveNoop(expected_generation),
-            target => target,
-        }
-    }
-
-    fn materialize(
-        &self,
-        page_id: &PreparedRemoteDeltaPageId,
-    ) -> io::Result<RemoteDeltaApplyTarget> {
-        Ok(match self {
-            Self::ActiveNoop(expected_generation) => RemoteDeltaApplyTarget::ActiveNoop {
-                expected_generation: expected_generation.clone(),
-            },
-            Self::ActiveCow(expected_generation) => RemoteDeltaApplyTarget::ActiveCow {
-                expected_generation: expected_generation.clone(),
-                replacement_generation: active_replacement_generation(page_id)?,
-            },
-            Self::Staging(generation) => RemoteDeltaApplyTarget::Staging(generation.clone()),
-        })
+        self.resulting_generation().validate()
     }
 }
 
@@ -423,15 +330,7 @@ pub struct RemoteDeltaHistoryRecords {
     pub quota_records: Vec<crate::remote_quota::RemoteQuotaChange>,
 }
 
-impl RemoteDeltaHistoryRecords {
-    fn is_empty(&self) -> bool {
-        self.bucket_records.is_empty()
-            && self.session_digest_records.is_empty()
-            && self.quota_records.is_empty()
-    }
-}
-
-/// Durable pending page plus its replay-safe local mutations.
+/// Validated in-memory page and its source-owned mutations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedRemoteDeltaPage {
     pub id: PreparedRemoteDeltaPageId,
@@ -492,7 +391,7 @@ pub struct RemoteDeltaNextRequestPosition {
     pub known_live_revision: Option<NonZeroU64>,
 }
 
-/// Center-side filesystem namespace for one profile/source/profile binding.
+/// Center-side SQL namespace for one profile/source/privacy binding.
 #[derive(Clone, Debug)]
 pub struct RemoteDeltaIngestStateStore {
     history_store: SourceHistoryStore,
@@ -545,11 +444,8 @@ impl StoredRemoteIngestProfileRetirement {
 }
 
 /// Durably queues retirement of every PreviewEnabled ingest binding for one
-/// source. The marker is outside the profile being retired, so removing the
-/// old cursor/WAL namespace can never remove its own recovery evidence. The
-/// marker remains as a small tombstone after completion and is removed only by
-/// an explicit source purge. That makes a rolled-back Windows directory unlink
-/// replayable without relying on unsupported directory-handle flushing.
+/// source. Its SQL marker lives outside the retired privacy namespace and
+/// remains until explicit source purge, so repeated retirement is idempotent.
 ///
 /// Callers must already hold the exact remotes-config fence. `writer` proves
 /// the redacted v2 ownership epoch and serializes this transition with every
@@ -559,60 +455,36 @@ pub(crate) fn queue_remote_preview_ingest_retirement(
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestProfileRetirementStatus> {
-    if let Some(db) = history_store.sqlite_database() {
-        validate_ingest_retirement_writer(history_store, writer)?;
-        return db.write_nowait(|connection| {
-            let prefix = sqlite_ingest_source_prefix(
-                history_store.profile_id(),
-                RedactionProfile::PreviewEnabled,
-                source_id,
-            );
-            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
-            let existing: Option<StoredRemoteIngestProfileRetirement> =
-                database::state(connection, &key)?;
-            if let Some(existing) = &existing {
-                existing.validate(history_store.profile_id(), source_id)?;
-            }
-            if existing.is_none()
-                && database::states::<StoredRemoteDeltaIngestState>(connection, &prefix)?.is_empty()
-            {
-                return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
-            }
-            database::set_state(
-                connection,
-                &key,
-                &StoredRemoteIngestProfileRetirement::preview_to_redacted(
-                    history_store.profile_id().clone(),
-                    source_id.clone(),
-                ),
-            )?;
-            writer.validate()?;
-            Ok(RemoteIngestProfileRetirementStatus::Pending)
-        });
-    }
+    let db = history_database(history_store)?;
     validate_ingest_retirement_writer(history_store, writer)?;
-    let paths = RemoteIngestRetirementPaths::new(history_store, source_id);
-    let source_exists = private_directory_exists(history_store, &paths.preview_source)?;
-    let marker_exists = private_file_exists(&paths.marker)?;
-    if !source_exists && !marker_exists {
-        return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
-    }
-
-    history_store.prepare_private_directory(&paths.marker_directory)?;
-    let marker_lock = open_private_lock(&paths.marker_lock)?;
-    let _marker_lock = try_lock_private_lock(&paths.marker_lock, marker_lock)?;
-    cleanup_remote_ingest_temporary_files(&paths.marker_directory)?;
-
-    let ingest_lock = if source_exists {
-        let lock = open_private_lock(&paths.preview_lock)?;
-        let lock = try_lock_private_lock(&paths.preview_lock, lock)?;
-        Some(lock)
-    } else {
-        None
-    };
-    ensure_remote_ingest_retirement_marker(&paths)?;
-    drop(ingest_lock);
-    Ok(RemoteIngestProfileRetirementStatus::Pending)
+    db.write_nowait(|connection| {
+        let prefix = sqlite_ingest_source_prefix(
+            history_store.profile_id(),
+            RedactionProfile::PreviewEnabled,
+            source_id,
+        );
+        let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+        let existing: Option<StoredRemoteIngestProfileRetirement> =
+            database::state(connection, &key)?;
+        if let Some(existing) = &existing {
+            existing.validate(history_store.profile_id(), source_id)?;
+        }
+        if existing.is_none()
+            && database::states::<StoredRemoteDeltaIngestState>(connection, &prefix)?.is_empty()
+        {
+            return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
+        }
+        database::set_state(
+            connection,
+            &key,
+            &StoredRemoteIngestProfileRetirement::preview_to_redacted(
+                history_store.profile_id().clone(),
+                source_id.clone(),
+            ),
+        )?;
+        writer.validate()?;
+        Ok(RemoteIngestProfileRetirementStatus::Pending)
+    })
 }
 
 /// Makes one bounded, crash-recoverable cleanup pass over a queued preview
@@ -626,83 +498,44 @@ pub(crate) fn retry_remote_preview_ingest_retirement(
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestProfileRetirementStatus> {
-    if let Some(db) = history_store.sqlite_database() {
-        validate_ingest_retirement_writer(history_store, writer)?;
-        return db.write_nowait(|connection| {
-            let metadata = history_store.load_source_metadata(source_id)?;
-            if metadata.kind() != crate::source_history::SourceKind::Ssh {
-                return Err(invalid_data(
-                    "remote SQL ingest retirement requires an SSH source",
-                ));
-            }
-            if metadata.aggregate_redaction_profile() != RedactionProfile::Redacted {
-                return Ok(RemoteIngestProfileRetirementStatus::Pending);
-            }
-            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
-            let marker: Option<StoredRemoteIngestProfileRetirement> =
-                database::state(connection, &key)?;
-            if let Some(marker) = &marker {
-                marker.validate(history_store.profile_id(), source_id)?;
-            }
-            let removed = sqlite_remove_ingest_namespace(
-                connection,
-                history_store.profile_id(),
-                source_id,
-                RedactionProfile::PreviewEnabled,
-            )?;
-            if marker.is_none() && !removed {
-                return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
-            }
-            database::set_state(
-                connection,
-                &key,
-                &StoredRemoteIngestProfileRetirement::preview_to_redacted(
-                    history_store.profile_id().clone(),
-                    source_id.clone(),
-                ),
-            )?;
-            writer.validate()?;
-            Ok(RemoteIngestProfileRetirementStatus::Complete)
-        });
-    }
+    let db = history_database(history_store)?;
     validate_ingest_retirement_writer(history_store, writer)?;
-    let metadata = history_store.load_source_metadata(source_id)?;
-    if metadata.kind() != crate::source_history::SourceKind::Ssh {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote ingest retirement is only valid for SSH sources",
-        ));
-    }
-    if metadata.aggregate_redaction_profile() != RedactionProfile::Redacted {
-        return Ok(RemoteIngestProfileRetirementStatus::Pending);
-    }
-
-    let paths = RemoteIngestRetirementPaths::new(history_store, source_id);
-    let source_exists = private_directory_exists(history_store, &paths.preview_source)?;
-    let marker_exists = private_file_exists(&paths.marker)?;
-    if !source_exists && !marker_exists {
-        return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
-    }
-
-    history_store.prepare_private_directory(&paths.marker_directory)?;
-    let marker_lock = open_private_lock(&paths.marker_lock)?;
-    let _marker_lock = try_lock_private_lock(&paths.marker_lock, marker_lock)?;
-    cleanup_remote_ingest_temporary_files(&paths.marker_directory)?;
-    ensure_remote_ingest_retirement_marker(&paths)?;
-
-    if private_directory_exists(history_store, &paths.preview_source)?
-        && !remove_remote_preview_ingest_source_bounded(history_store, &paths)?
-    {
-        return Ok(RemoteIngestProfileRetirementStatus::Pending);
-    }
-    if private_directory_exists(history_store, &paths.preview_source)? {
-        return Ok(RemoteIngestProfileRetirementStatus::Pending);
-    }
-    // Keep the out-of-namespace marker as a durable tombstone. If a Windows
-    // crash exposes a directory entry that appeared removed before shutdown,
-    // the next retry sees the marker and repeats the bounded cleanup.
-    sync_directory(&paths.preview_profile)?;
-    Ok(RemoteIngestProfileRetirementStatus::Complete)
+    db.write_nowait(|connection| {
+        let metadata = history_store.load_source_metadata(source_id)?;
+        if metadata.kind() != crate::source_history::SourceKind::Ssh {
+            return Err(invalid_data(
+                "remote SQL ingest retirement requires an SSH source",
+            ));
+        }
+        if metadata.aggregate_redaction_profile() != RedactionProfile::Redacted {
+            return Ok(RemoteIngestProfileRetirementStatus::Pending);
+        }
+        let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+        let marker: Option<StoredRemoteIngestProfileRetirement> =
+            database::state(connection, &key)?;
+        if let Some(marker) = &marker {
+            marker.validate(history_store.profile_id(), source_id)?;
+        }
+        let removed = sqlite_remove_ingest_namespace(
+            connection,
+            history_store.profile_id(),
+            source_id,
+            RedactionProfile::PreviewEnabled,
+        )?;
+        if marker.is_none() && !removed {
+            return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
+        }
+        database::set_state(
+            connection,
+            &key,
+            &StoredRemoteIngestProfileRetirement::preview_to_redacted(
+                history_store.profile_id().clone(),
+                source_id.clone(),
+            ),
+        )?;
+        writer.validate()?;
+        Ok(RemoteIngestProfileRetirementStatus::Complete)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -710,426 +543,38 @@ pub(crate) struct RemoteIngestSourcePurgeReport {
     pub namespaces_removed: usize,
 }
 
-/// Removes only cursor/WAL state owned by one explicitly purged SSH source.
-///
-/// Each source namespace is fully validated and then isolated with a
-/// same-parent deterministic rename before removal. A restart can therefore
-/// finish a partially removed trash namespace without ever considering any
-/// account or other-source path. The caller holds the remotes-config lock;
-/// `writer` serializes this operation with cooperative history/ingest writes.
+/// Removes only this SSH source's SQL cursor and ingest retirement state.
+/// The caller holds the configuration fence and matching writer authority.
 pub(crate) fn purge_remote_ingest_state_for_source(
     history_store: &SourceHistoryStore,
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestSourcePurgeReport> {
-    if let Some(db) = history_store.sqlite_database() {
-        writer.validate_store_binding(history_store)?;
-        return db.write_nowait(|connection| {
-            let mut report = RemoteIngestSourcePurgeReport::default();
-            for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-                if sqlite_remove_ingest_namespace(
-                    connection,
-                    history_store.profile_id(),
-                    source_id,
-                    redaction,
-                )? {
-                    report.namespaces_removed += 1;
-                }
-            }
-            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
-            if let Some(marker) =
-                database::state::<StoredRemoteIngestProfileRetirement>(connection, &key)?
-            {
-                marker.validate(history_store.profile_id(), source_id)?;
-                database::delete_state(connection, &key)?;
+    let db = history_database(history_store)?;
+    writer.validate_store_binding(history_store)?;
+    db.write_nowait(|connection| {
+        let mut report = RemoteIngestSourcePurgeReport::default();
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            if sqlite_remove_ingest_namespace(
+                connection,
+                history_store.profile_id(),
+                source_id,
+                redaction,
+            )? {
                 report.namespaces_removed += 1;
             }
-            writer.validate()?;
-            Ok(report)
-        });
-    }
-    writer.validate_store_binding(history_store)?;
-    let profile_root = history_store
-        .state_root()
-        .join(INGEST_LAYOUT_DIRECTORY)
-        .join(history_store.profile_id().as_str());
-    let mut report = RemoteIngestSourcePurgeReport::default();
-
-    for redaction_profile in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-        let parent = profile_root.join(redaction_profile.directory_name());
-        let source = parent.join(source_id.as_str());
-        let trash = parent.join(format!(".source-purge-{source_id}.trash"));
-        if purge_ingest_namespace(history_store, source_id, redaction_profile, &source, &trash)? {
+        }
+        let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+        if let Some(marker) =
+            database::state::<StoredRemoteIngestProfileRetirement>(connection, &key)?
+        {
+            marker.validate(history_store.profile_id(), source_id)?;
+            database::delete_state(connection, &key)?;
             report.namespaces_removed += 1;
         }
-    }
-
-    let retirement_parent = profile_root.join(INGEST_RETIREMENTS_DIRECTORY);
-    let retirement = retirement_parent.join(source_id.as_str());
-    let retirement_trash = retirement_parent.join(format!(".source-purge-{source_id}.trash"));
-    if purge_ingest_retirement_namespace(history_store, source_id, &retirement, &retirement_trash)?
-    {
-        report.namespaces_removed += 1;
-    }
-    writer.validate()?;
-    Ok(report)
-}
-
-fn purge_ingest_namespace(
-    history_store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    source: &Path,
-    trash: &Path,
-) -> io::Result<bool> {
-    let parent = source
-        .parent()
-        .ok_or_else(|| invalid_data("remote ingest source has no parent"))?;
-    if !private_directory_exists(history_store, parent)? {
-        return Ok(false);
-    }
-    // Unix persists the directory entry here. Windows publication uses the
-    // write-through rename below and recovers through deterministic trash.
-    sync_directory(parent)?;
-    let source_exists = private_directory_exists(history_store, source)?;
-    let trash_exists = private_directory_exists(history_store, trash)?;
-    if source_exists && trash_exists {
-        return Err(invalid_data(
-            "remote ingest purge found both a live namespace and recovery trash",
-        ));
-    }
-    if source_exists {
-        let lock_path = source.join(INGEST_LOCK_FILE);
-        if !private_file_exists(&lock_path)? {
-            return Err(invalid_data(
-                "remote ingest purge source is missing its stable lock",
-            ));
-        }
-        let lock = open_private_lock(&lock_path)?;
-        let lock = try_lock_private_lock(&lock_path, lock)?;
-        validate_purge_ingest_source(history_store, source, source_id, redaction_profile, true)?;
-        std::fs::File::unlock(lock.as_file())?;
-        drop(lock);
-        history_store.validate_private_path(source)?;
-        rename_ingest_purge_namespace(source, trash)?;
-        sync_directory(parent)?;
-    }
-    if private_directory_exists(history_store, trash)? {
-        validate_purge_ingest_source(history_store, trash, source_id, redaction_profile, false)?;
-        remove_purge_ingest_source(history_store, trash)?;
-        return Ok(true);
-    }
-    // Repeating this is a real directory barrier on Unix. On Windows an absent
-    // deterministic trash path is already an idempotent terminal state.
-    sync_directory(parent)?;
-    Ok(false)
-}
-
-fn validate_purge_ingest_source(
-    history_store: &SourceHistoryStore,
-    directory: &Path,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    require_complete: bool,
-) -> io::Result<()> {
-    history_store.validate_private_path(directory)?;
-    let mut lock_seen = false;
-    let mut binding_count = 0_usize;
-    for entry in fs::read_dir(directory)? {
-        history_store.validate_private_path(directory)?;
-        let entry = entry?;
-        let name = entry.file_name();
-        let path = entry.path();
-        if name == OsStr::new(INGEST_LOCK_FILE) {
-            lock_seen = true;
-            let file = open_existing_private_file(&path, "remote ingest purge lock")?;
-            drop(file);
-            continue;
-        }
-        let name = name
-            .to_str()
-            .ok_or_else(|| invalid_data("remote ingest purge entry is not UTF-8"))?;
-        validate_prefixed_hex(
-            name,
-            BINDING_NAMESPACE_PREFIX,
-            SHA256_HEX_LEN,
-            "remote ingest purge binding namespace",
-        )?;
-        binding_count += 1;
-        if binding_count > MAX_BINDING_NAMESPACES_PER_SOURCE {
-            return Err(invalid_data(
-                "remote ingest purge exceeds the binding namespace bound",
-            ));
-        }
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err(invalid_data(format!(
-                "remote ingest purge binding {} is not a real directory",
-                path.display()
-            )));
-        }
-        history_store.validate_private_path(&path)?;
-        validate_purge_ingest_binding(
-            &path,
-            history_store.profile_id(),
-            source_id,
-            redaction_profile,
-            name,
-            require_complete,
-        )?;
-    }
-    if require_complete && !lock_seen {
-        return Err(invalid_data(
-            "remote ingest purge source is missing its stable lock",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_purge_ingest_binding(
-    directory: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    namespace: &str,
-    require_complete: bool,
-) -> io::Result<()> {
-    let state = read_optional_retired_ingest_binding(
-        &directory.join(INGEST_STATE_FILE),
-        MAX_INGEST_STATE_BYTES,
-        "remote ingest purge state",
-    )?;
-    let anchor = read_optional_retired_ingest_binding(
-        &directory.join(INGEST_ANCHOR_FILE),
-        MAX_INGEST_ANCHOR_BYTES,
-        "remote ingest purge anchor",
-    )?;
-    if require_complete && (state.is_none() || anchor.is_none()) {
-        return Err(invalid_data(
-            "remote ingest purge binding is missing state or anchor",
-        ));
-    }
-    if let (Some(state), Some(anchor)) = (&state, &anchor)
-        && state != anchor
-    {
-        return Err(invalid_data(
-            "remote ingest purge state and anchor bindings disagree",
-        ));
-    }
-    if let Some(binding) = state.as_ref().or(anchor.as_ref())
-        && (binding.profile_id() != profile_id
-            || &binding.source().node_id != source_id
-            || binding.redaction_profile() != redaction_profile
-            || binding_namespace_component(binding)? != namespace)
-    {
-        return Err(invalid_data(
-            "remote ingest purge binding does not match its source/profile path",
-        ));
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name != OsStr::new(INGEST_STATE_FILE)
-            && name != OsStr::new(INGEST_ANCHOR_FILE)
-            && !is_remote_ingest_temporary_name(&name)
-        {
-            return Err(invalid_data(format!(
-                "remote ingest purge binding contains unexpected entry {}",
-                entry.path().display()
-            )));
-        }
-        let file = open_existing_private_file(&entry.path(), "remote ingest purge file")?;
-        drop(file);
-    }
-    Ok(())
-}
-
-fn remove_purge_ingest_source(
-    history_store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<()> {
-    history_store.validate_private_path(directory)?;
-    for entry in fs::read_dir(directory)? {
-        history_store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(invalid_data(format!(
-                "remote ingest purge refuses symbolic link {}",
-                path.display()
-            )));
-        }
-        if metadata.file_type().is_dir() {
-            history_store.validate_private_path(&path)?;
-            for file_entry in fs::read_dir(&path)? {
-                let file_entry = file_entry?;
-                let file = open_existing_private_file(
-                    &file_entry.path(),
-                    "remote ingest purge binding file",
-                )?;
-                drop(file);
-                fs::remove_file(file_entry.path())?;
-            }
-            sync_directory(&path)?;
-            fs::remove_dir(&path)?;
-        } else {
-            let file = open_existing_private_file(&path, "remote ingest purge source file")?;
-            drop(file);
-            fs::remove_file(&path)?;
-        }
-    }
-    sync_directory(directory)?;
-    let parent = directory
-        .parent()
-        .ok_or_else(|| invalid_data("remote ingest purge source has no parent"))?;
-    fs::remove_dir(directory)?;
-    sync_directory(parent)
-}
-
-fn purge_ingest_retirement_namespace(
-    history_store: &SourceHistoryStore,
-    source_id: &NodeId,
-    source: &Path,
-    trash: &Path,
-) -> io::Result<bool> {
-    let parent = source
-        .parent()
-        .ok_or_else(|| invalid_data("remote ingest retirement has no parent"))?;
-    if !private_directory_exists(history_store, parent)? {
-        return Ok(false);
-    }
-    sync_directory(parent)?;
-    let source_exists = private_directory_exists(history_store, source)?;
-    let trash_exists = private_directory_exists(history_store, trash)?;
-    if source_exists && trash_exists {
-        return Err(invalid_data(
-            "remote ingest purge found both retirement state and recovery trash",
-        ));
-    }
-    if source_exists {
-        let lock_path = source.join(INGEST_RETIREMENT_LOCK_FILE);
-        if !private_file_exists(&lock_path)? {
-            return Err(invalid_data(
-                "remote ingest purge retirement state is missing its lock",
-            ));
-        }
-        let lock = open_private_lock(&lock_path)?;
-        let lock = try_lock_private_lock(&lock_path, lock)?;
-        validate_purge_retirement_directory(history_store, source, source_id, true)?;
-        std::fs::File::unlock(lock.as_file())?;
-        drop(lock);
-        rename_ingest_purge_namespace(source, trash)?;
-        sync_directory(parent)?;
-    }
-    if private_directory_exists(history_store, trash)? {
-        validate_purge_retirement_directory(history_store, trash, source_id, false)?;
-        remove_purge_ingest_source(history_store, trash)?;
-        return Ok(true);
-    }
-    sync_directory(parent)?;
-    Ok(false)
-}
-
-#[cfg(not(windows))]
-fn rename_ingest_purge_namespace(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn rename_ingest_purge_namespace(source: &Path, destination: &Path) -> io::Result<()> {
-    use crate::atomic_file::windows_wide_path;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-    let source = windows_wide_path(source)?;
-    let destination = windows_wide_path(destination)?;
-    // No replace flag: a concurrently materialized/unknown destination must
-    // make the purge fail without displacing it.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_purge_retirement_directory(
-    history_store: &SourceHistoryStore,
-    directory: &Path,
-    source_id: &NodeId,
-    require_lock: bool,
-) -> io::Result<()> {
-    history_store.validate_private_path(directory)?;
-    let mut lock_seen = false;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == OsStr::new(INGEST_RETIREMENT_LOCK_FILE) {
-            lock_seen = true;
-        } else if name == OsStr::new(INGEST_RETIREMENT_MARKER_FILE) {
-            let marker: StoredRemoteIngestProfileRetirement = read_private_json(
-                &entry.path(),
-                MAX_INGEST_ANCHOR_BYTES,
-                "remote ingest purge retirement marker",
-            )?;
-            marker.validate(history_store.profile_id(), source_id)?;
-        } else if !is_remote_ingest_temporary_name(&name) {
-            return Err(invalid_data(format!(
-                "remote ingest purge retirement contains unexpected entry {}",
-                entry.path().display()
-            )));
-        }
-        let file =
-            open_existing_private_file(&entry.path(), "remote ingest purge retirement file")?;
-        drop(file);
-    }
-    if require_lock && !lock_seen {
-        return Err(invalid_data(
-            "remote ingest purge retirement state is missing its stable lock",
-        ));
-    }
-    Ok(())
-}
-
-struct RemoteIngestRetirementPaths {
-    profile_id: HistoryProfileId,
-    source_id: NodeId,
-    preview_profile: PathBuf,
-    preview_source: PathBuf,
-    preview_lock: PathBuf,
-    marker_directory: PathBuf,
-    marker_lock: PathBuf,
-    marker: PathBuf,
-}
-
-impl RemoteIngestRetirementPaths {
-    fn new(history_store: &SourceHistoryStore, source_id: &NodeId) -> Self {
-        let profile_root = history_store
-            .state_root()
-            .join(INGEST_LAYOUT_DIRECTORY)
-            .join(history_store.profile_id().as_str());
-        let preview_profile = profile_root.join(RedactionProfile::PreviewEnabled.directory_name());
-        let preview_source = preview_profile.join(source_id.as_str());
-        let marker_directory = profile_root
-            .join(INGEST_RETIREMENTS_DIRECTORY)
-            .join(source_id.as_str());
-        Self {
-            profile_id: history_store.profile_id().clone(),
-            source_id: source_id.clone(),
-            preview_profile,
-            preview_lock: preview_source.join(INGEST_LOCK_FILE),
-            preview_source,
-            marker_lock: marker_directory.join(INGEST_RETIREMENT_LOCK_FILE),
-            marker: marker_directory.join(INGEST_RETIREMENT_MARKER_FILE),
-            marker_directory,
-        }
-    }
+        writer.validate()?;
+        Ok(report)
+    })
 }
 
 impl RemoteDeltaIngestStateStore {
@@ -1176,14 +621,10 @@ impl RemoteDeltaIngestStateStore {
 
     /// Takes the source/profile ingest lock without waiting.
     pub fn try_begin(&self) -> io::Result<RemoteDeltaIngestSession<'_>> {
-        self.prepare_source_namespace()?;
+        self.history_store
+            .prepare_private_directory(&self.source_namespace_directory())?;
         let lock_path = self.lock_path();
-        let lock = open_private_lock(&lock_path)?;
-        let lock = try_lock_private_lock(&lock_path, lock)?;
-        if self.history_store.sqlite_database().is_none() {
-            self.prepare_binding_namespace_locked()?;
-            cleanup_remote_ingest_temporary_files(&self.namespace_directory())?;
-        }
+        let lock = try_lock_private_lock(&lock_path, open_private_lock(&lock_path)?)?;
         self.validate_namespace()?;
         let state = self.load_or_create_state()?;
         Ok(RemoteDeltaIngestSession {
@@ -1219,256 +660,69 @@ impl RemoteDeltaIngestStateStore {
         )
     }
 
-    fn state_path(&self) -> PathBuf {
-        self.namespace_directory().join(INGEST_STATE_FILE)
-    }
-
-    fn anchor_path(&self) -> PathBuf {
-        self.namespace_directory().join(INGEST_ANCHOR_FILE)
-    }
-
-    fn prepare_source_namespace(&self) -> io::Result<()> {
-        self.history_store
-            .prepare_private_directory(&self.source_namespace_directory())
-    }
-
-    fn prepare_binding_namespace_locked(&self) -> io::Result<()> {
-        let source_directory = self.source_namespace_directory();
-        self.history_store
-            .validate_private_path(&source_directory)?;
-        let mut count = 0_usize;
-        let mut requested_exists = false;
-        for entry in fs::read_dir(&source_directory)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == OsStr::new(INGEST_LOCK_FILE) {
-                continue;
-            }
-            let Some(name) = name.to_str() else {
-                return Err(invalid_data(
-                    "remote ingest source namespace contains a non-UTF-8 entry",
-                ));
-            };
-            validate_prefixed_hex(
-                name,
-                BINDING_NAMESPACE_PREFIX,
-                SHA256_HEX_LEN,
-                "remote ingest binding namespace",
-            )?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(invalid_data(format!(
-                    "remote ingest binding namespace {} is not a directory",
-                    path.display()
-                )));
-            }
-            self.history_store.validate_private_path(&path)?;
-            count = count.saturating_add(1);
-            requested_exists |= name == self.binding_namespace;
-        }
-        if count > MAX_BINDING_NAMESPACES_PER_SOURCE
-            || (!requested_exists && count == MAX_BINDING_NAMESPACES_PER_SOURCE)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                format!(
-                    "remote ingest source reached its {MAX_BINDING_NAMESPACES_PER_SOURCE}-binding namespace limit"
-                ),
-            ));
-        }
-        if requested_exists {
-            return Ok(());
-        }
-        self.history_store
-            .prepare_private_directory(&self.namespace_directory())
-    }
-
     fn validate_namespace(&self) -> io::Result<()> {
-        if self.history_store.sqlite_database().is_some() {
-            self.binding.validate()?;
-            return self
-                .history_store
-                .validate_private_path(&self.source_namespace_directory());
-        }
+        self.binding.validate()?;
         self.history_store
-            .validate_private_path(&self.namespace_directory())
+            .validate_private_path(&self.source_namespace_directory())
     }
 
     fn load_or_create_state(&self) -> io::Result<StoredRemoteDeltaIngestState> {
-        if let Some(db) = self.history_store.sqlite_database() {
-            if db.exists()? {
-                let ready = db.read(|connection| {
-                    let state: Option<StoredRemoteDeltaIngestState> =
-                        database::state(connection, &self.sqlite_state_key())?;
-                    let anchor: Option<StoredRemoteDeltaIngestAnchor> =
-                        database::state(connection, &self.sqlite_anchor_key())?;
-                    if let Some(anchor) = &anchor {
-                        anchor.validate(&self.binding)?;
-                    }
-                    match (state, anchor) {
-                        (Some(state), Some(_)) => {
-                            state.validate(&self.binding)?;
-                            Ok(Some(state))
-                        }
-                        (None, Some(_)) => Err(invalid_data(
-                            "remote SQL ingest state is missing from an initialized namespace",
-                        )),
-                        _ => Ok(None),
-                    }
-                })?;
-                if let Some(state) = ready {
-                    return Ok(state);
-                }
-            }
-            return db.write(|connection| {
-                let key = self.sqlite_state_key();
-                let existing: Option<StoredRemoteDeltaIngestState> =
-                    database::state(connection, &key)?;
+        let db = history_database(&self.history_store)?;
+        if db.exists()? {
+            let ready = db.read(|connection| {
+                let state: Option<StoredRemoteDeltaIngestState> =
+                    database::state(connection, &self.sqlite_state_key())?;
                 let anchor: Option<StoredRemoteDeltaIngestAnchor> =
                     database::state(connection, &self.sqlite_anchor_key())?;
                 if let Some(anchor) = &anchor {
                     anchor.validate(&self.binding)?;
                 }
-                if existing.is_none() && anchor.is_some() {
-                    return Err(invalid_data(
-                        "remote SQL ingest state is missing from an initialized namespace",
-                    ));
-                }
-                let existing_count = database::states::<StoredRemoteDeltaIngestState>(
-                    connection,
-                    &self.sqlite_source_prefix(),
-                )?
-                .len();
-                if existing.is_none() && existing_count >= MAX_BINDING_NAMESPACES_PER_SOURCE {
-                    return Err(invalid_data(
-                        "remote SQL ingest binding namespace count exceeds its bound",
-                    ));
-                }
-                let initialize = existing.is_none();
-                let state = existing
-                    .unwrap_or_else(|| StoredRemoteDeltaIngestState::new(self.binding.clone()));
-                state.validate(&self.binding)?;
-                if initialize {
-                    database::set_state(connection, &key, &state)?;
-                }
-                if anchor.is_none() {
-                    database::set_state(
-                        connection,
-                        &self.sqlite_anchor_key(),
-                        &StoredRemoteDeltaIngestAnchor {
-                            format_version: INGEST_ANCHOR_FORMAT_VERSION,
-                            binding: self.binding.clone(),
-                        },
-                    )?;
-                }
-                Ok(state)
-            });
-        }
-        match self.read_state() {
-            Ok(state) => {
-                self.ensure_anchor()?;
-                Ok(state)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match self.read_anchor() {
-                    Ok(_) => {
-                        return Err(invalid_data(
-                            "remote ingest state is missing from an initialized namespace",
-                        ));
+                match (state, anchor) {
+                    (Some(state), Some(_)) => {
+                        state.validate(&self.binding)?;
+                        Ok(Some(state))
                     }
-                    Err(anchor_error) if anchor_error.kind() == io::ErrorKind::NotFound => {}
-                    Err(anchor_error) => return Err(anchor_error),
+                    (None, Some(_)) => Err(invalid_data(
+                        "remote SQL ingest state is missing from an initialized namespace",
+                    )),
+                    _ => Ok(None),
                 }
-                let state = StoredRemoteDeltaIngestState::new(self.binding.clone());
-                self.write_state(&state)?;
-                self.ensure_anchor()?;
-                Ok(state)
+            })?;
+            if let Some(state) = ready {
+                return Ok(state);
             }
-            Err(error) => Err(error),
         }
-    }
-
-    fn read_state(&self) -> io::Result<StoredRemoteDeltaIngestState> {
-        if let Some(db) = self.history_store.sqlite_database() {
-            return db.read(|connection| {
-                let state: StoredRemoteDeltaIngestState =
-                    database::state(connection, &self.sqlite_state_key())?.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "remote SQL ingest state is missing",
-                        )
-                    })?;
-                state.validate(&self.binding)?;
-                Ok(state)
-            });
-        }
-        let state: StoredRemoteDeltaIngestState = read_private_json(
-            &self.state_path(),
-            MAX_INGEST_STATE_BYTES,
-            "remote ingest state",
-        )?;
-        state.validate(&self.binding)?;
-        Ok(state)
-    }
-
-    fn write_state(&self, state: &StoredRemoteDeltaIngestState) -> io::Result<()> {
-        if let Some(db) = self.history_store.sqlite_database() {
-            self.validate_namespace()?;
-            state.validate(&self.binding)?;
-            let encoded =
-                serde_json::to_vec(state).map_err(|error| invalid_data(error.to_string()))?;
-            if encoded.len() as u64 > MAX_INGEST_STATE_BYTES {
+        db.write(|connection| {
+            let key = self.sqlite_state_key();
+            let existing: Option<StoredRemoteDeltaIngestState> = database::state(connection, &key)?;
+            let anchor: Option<StoredRemoteDeltaIngestAnchor> =
+                database::state(connection, &self.sqlite_anchor_key())?;
+            if let Some(anchor) = &anchor {
+                anchor.validate(&self.binding)?;
+            }
+            if existing.is_none() && anchor.is_some() {
                 return Err(invalid_data(
-                    "remote SQL ingest state exceeds its size bound",
+                    "remote SQL ingest state is missing from an initialized namespace",
                 ));
             }
-            return db.write(|connection| {
-                database::set_state(connection, &self.sqlite_state_key(), state)
-            });
-        }
-        self.validate_namespace()?;
-        state.validate(&self.binding)?;
-        write_private_json_atomically(
-            &self.state_path(),
-            state,
-            MAX_INGEST_STATE_BYTES,
-            "remote ingest state",
-        )
-    }
-
-    fn read_anchor(&self) -> io::Result<StoredRemoteDeltaIngestAnchor> {
-        if let Some(db) = self.history_store.sqlite_database() {
-            return db.read(|connection| {
-                let anchor: StoredRemoteDeltaIngestAnchor =
-                    database::state(connection, &self.sqlite_anchor_key())?.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "remote SQL ingest anchor is missing",
-                        )
-                    })?;
-                anchor.validate(&self.binding)?;
-                Ok(anchor)
-            });
-        }
-        let anchor: StoredRemoteDeltaIngestAnchor = read_private_json(
-            &self.anchor_path(),
-            MAX_INGEST_ANCHOR_BYTES,
-            "remote ingest anchor",
-        )?;
-        anchor.validate(&self.binding)?;
-        Ok(anchor)
-    }
-
-    fn ensure_anchor(&self) -> io::Result<()> {
-        if let Some(db) = self.history_store.sqlite_database() {
-            return db.write(|connection| {
-                if let Some(anchor) = database::state::<StoredRemoteDeltaIngestAnchor>(
-                    connection,
-                    &self.sqlite_anchor_key(),
-                )? {
-                    return anchor.validate(&self.binding);
-                }
+            let existing_count = database::states::<StoredRemoteDeltaIngestState>(
+                connection,
+                &self.sqlite_source_prefix(),
+            )?
+            .len();
+            if existing.is_none() && existing_count >= MAX_BINDING_NAMESPACES_PER_SOURCE {
+                return Err(invalid_data(
+                    "remote SQL ingest binding namespace count exceeds its bound",
+                ));
+            }
+            let initialize = existing.is_none();
+            let state =
+                existing.unwrap_or_else(|| StoredRemoteDeltaIngestState::new(self.binding.clone()));
+            state.validate(&self.binding)?;
+            if initialize {
+                database::set_state(connection, &key, &state)?;
+            }
+            if anchor.is_none() {
                 database::set_state(
                     connection,
                     &self.sqlite_anchor_key(),
@@ -1476,36 +730,23 @@ impl RemoteDeltaIngestStateStore {
                         format_version: INGEST_ANCHOR_FORMAT_VERSION,
                         binding: self.binding.clone(),
                     },
-                )
-            });
-        }
-        let expected = StoredRemoteDeltaIngestAnchor {
-            format_version: INGEST_ANCHOR_FORMAT_VERSION,
-            binding: self.binding.clone(),
-        };
-        match self.read_anchor() {
-            Ok(anchor) if anchor == expected => Ok(()),
-            Ok(_) => Err(invalid_data(
-                "remote ingest anchor does not match its configured binding",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_private_json_once(
-                    &self.anchor_path(),
-                    &expected,
-                    MAX_INGEST_ANCHOR_BYTES,
-                    "remote ingest anchor",
                 )?;
-                let published = self.read_anchor()?;
-                if published == expected {
-                    Ok(())
-                } else {
-                    Err(invalid_data(
-                        "remote ingest anchor raced with an incompatible binding",
-                    ))
-                }
             }
-            Err(error) => Err(error),
+            Ok(state)
+        })
+    }
+
+    fn write_state(&self, state: &StoredRemoteDeltaIngestState) -> io::Result<()> {
+        let db = history_database(&self.history_store)?;
+        self.validate_namespace()?;
+        state.validate(&self.binding)?;
+        let encoded = serde_json::to_vec(state).map_err(|error| invalid_data(error.to_string()))?;
+        if encoded.len() as u64 > MAX_INGEST_STATE_BYTES {
+            return Err(invalid_data(
+                "remote SQL ingest state exceeds its size bound",
+            ));
         }
+        db.write(|connection| database::set_state(connection, &self.sqlite_state_key(), state))
     }
 }
 
@@ -1582,7 +823,7 @@ impl RemoteDeltaIngestSession<'_> {
         if self.state.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "a pending remote delta page must be replayed before another request",
+                "commit or discard the prepared page before another request",
             ));
         }
         if let Some(bootstrap) = &self.state.bootstrap {
@@ -1625,7 +866,7 @@ impl RemoteDeltaIngestSession<'_> {
         if self.state.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "cannot start bootstrap while a page WAL is pending",
+                "cannot start bootstrap while a page prepared page is pending",
             ));
         }
         if let Some(bootstrap) = &self.state.bootstrap {
@@ -1654,7 +895,7 @@ impl RemoteDeltaIngestSession<'_> {
         if self.state.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "cannot start bootstrap while a page WAL is pending",
+                "cannot start bootstrap while a page prepared page is pending",
             ));
         }
         let active_ref = self.store.history_store.active_remote_history_ref(
@@ -1714,8 +955,8 @@ impl RemoteDeltaIngestSession<'_> {
         Ok(generation)
     }
 
-    /// Persists a validated response as the pending-page WAL before returning
-    /// any records to the caller.
+    /// Validates a response and prepares its mutations in memory. No cursor or
+    /// data changes until the caller commits the whole page transaction.
     pub fn prepare_page(
         &mut self,
         request: &RemoteExportRequest,
@@ -1726,7 +967,7 @@ impl RemoteDeltaIngestSession<'_> {
         if self.state.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "a pending remote delta page must be replayed first",
+                "commit or discard the already prepared page first",
             ));
         }
         self.store.binding.validate_exchange(request, response)?;
@@ -1737,17 +978,11 @@ impl RemoteDeltaIngestSession<'_> {
             self.store.binding.redaction_profile,
             payload,
         )?;
-        let target_seed = if records.is_empty() {
-            self.prepare_target(delta_request)?
-                .without_history_mutations()
-        } else {
-            self.prepare_target(delta_request)?
-        };
-
-        let id = pending_page_id_from_parts(&target_seed, request, response, received_at)?;
+        let target = self.prepare_target(delta_request)?;
+        let id = pending_page_id_from_parts(&target, request, response, received_at)?;
         let pending = StoredPendingPage {
             id: id.clone(),
-            target: target_seed.materialize(&id)?,
+            target,
             request: request.clone(),
             response: response.clone(),
             received_at,
@@ -1761,13 +996,13 @@ impl RemoteDeltaIngestSession<'_> {
             bootstrap.exact_range = Some(delta_request.range.clone());
         }
         next.pending = Some(pending.clone());
-        self.publish(next)?;
+        next.validate(&self.store.binding)?;
+        self.state = next;
         Ok(prepared_from_pending(&pending, records, page))
     }
 
-    /// Returns the exact pending WAL page after restart. Applying its records
-    /// again is safe because their remote journal sequence is the local
-    /// revision.
+    /// Returns this session's prepared page. A process restart discards uncommitted
+    /// responses and requests them again from the unchanged durable cursor.
     pub fn pending_page(&self) -> io::Result<Option<PreparedRemoteDeltaPage>> {
         self.validate_fence()?;
         self.state
@@ -1785,8 +1020,7 @@ impl RemoteDeltaIngestSession<'_> {
             .transpose()
     }
 
-    /// Acknowledges that the pending records were durably applied. Ordinary
-    /// incremental pages advance the active cursor atomically with WAL removal.
+    /// Advances the cursor inside the page transaction after applying all records.
     /// Bootstrap pages advance only staging state; the final page transitions
     /// to `activation_required` while the old active generation remains intact.
     fn mark_page_applied(&mut self, id: &PreparedRemoteDeltaPageId) -> io::Result<()> {
@@ -1799,43 +1033,27 @@ impl RemoteDeltaIngestSession<'_> {
         if &pending.id != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "prepared page ID does not match the durable pending WAL",
+                "prepared page ID does not match the prepared page",
             ));
         }
         let delta_request = delta_request(&pending.request)?;
         let (page, _) = delta_response_page(&pending.response)?;
         let mut next = self.state.clone();
         match &pending.target {
-            RemoteDeltaApplyTarget::ActiveNoop {
+            RemoteDeltaApplyTarget::Active {
                 expected_generation,
             } => {
-                let active = next.active.as_mut().ok_or_else(|| {
-                    invalid_data("pending active page has no active history generation")
-                })?;
+                let active = next
+                    .active
+                    .as_mut()
+                    .ok_or_else(|| invalid_data("prepared active page has no active generation"))?;
                 if &active.generation != expected_generation {
                     return Err(invalid_data(
-                        "pending page targets the wrong active history generation",
+                        "prepared page targets the wrong active generation",
                     ));
                 }
                 active.cursor = page.next_delta_cursor;
                 active.continuation_range = page.has_more.then(|| delta_request.range.clone());
-            }
-            RemoteDeltaApplyTarget::ActiveCow {
-                expected_generation,
-                replacement_generation,
-            } => {
-                let active = next.active.as_mut().ok_or_else(|| {
-                    invalid_data("pending active page has no active history generation")
-                })?;
-                if &active.generation != expected_generation {
-                    return Err(invalid_data(
-                        "pending page targets the wrong active history generation",
-                    ));
-                }
-                active.generation = replacement_generation.clone();
-                active.cursor = page.next_delta_cursor;
-                active.continuation_range = page.has_more.then(|| delta_request.range.clone());
-                queue_retired_generation(&mut next, expected_generation);
             }
             RemoteDeltaApplyTarget::Staging(generation) => {
                 let bootstrap = next.bootstrap.as_mut().ok_or_else(|| {
@@ -1867,9 +1085,7 @@ impl RemoteDeltaIngestSession<'_> {
         }))
     }
 
-    /// Commits an already completed external atomic generation switch.
-    /// Calling this before the external switch would make readers trust data
-    /// which may not exist; callers must preserve that ordering.
+    /// Commits bootstrap state inside the same transaction as generation selection.
     fn commit_bootstrap_activation(
         &mut self,
         activation: &RemoteBootstrapActivation,
@@ -1878,7 +1094,7 @@ impl RemoteDeltaIngestSession<'_> {
         if self.state.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "cannot activate bootstrap while a page WAL is pending",
+                "cannot activate bootstrap while a page prepared page is pending",
             ));
         }
         let bootstrap =
@@ -1907,7 +1123,7 @@ impl RemoteDeltaIngestSession<'_> {
         self.publish(next)
     }
 
-    fn prepare_target(&self, request: &DeltaRequest) -> io::Result<RemoteDeltaApplyTargetSeed> {
+    fn prepare_target(&self, request: &DeltaRequest) -> io::Result<RemoteDeltaApplyTarget> {
         if let Some(bootstrap) = &self.state.bootstrap {
             if bootstrap.ready_to_activate {
                 return Err(io::Error::new(
@@ -1927,7 +1143,7 @@ impl RemoteDeltaIngestSession<'_> {
                     "remote bootstrap continuation changed its exact export range",
                 ));
             }
-            return Ok(RemoteDeltaApplyTargetSeed::Staging(
+            return Ok(RemoteDeltaApplyTarget::Staging(
                 bootstrap.generation.clone(),
             ));
         }
@@ -1944,9 +1160,9 @@ impl RemoteDeltaIngestSession<'_> {
                     "remote incremental continuation changed its exact export range",
                 ));
             }
-            return Ok(RemoteDeltaApplyTargetSeed::ActiveCow(
-                active.generation.clone(),
-            ));
+            return Ok(RemoteDeltaApplyTarget::Active {
+                expected_generation: active.generation.clone(),
+            });
         }
         if request.delta_cursor.is_some() {
             return Err(invalid_data(
@@ -1984,13 +1200,13 @@ impl RemoteDeltaIngestSession<'_> {
         let expected = self.pending_page()?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "remote delta page is not backed by a pending WAL",
+                "remote delta page is not backed by a prepared page",
             )
         })?;
         if &expected != page {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "remote delta page does not match the durable pending WAL",
+                "remote delta page does not match the prepared page",
             ));
         }
         Ok(())
@@ -2002,108 +1218,38 @@ impl RemoteDeltaIngestSession<'_> {
     fn protected_history_generations(
         &self,
     ) -> io::Result<BTreeSet<SourceHistoryRemoteGenerationId>> {
-        if let Some(db) = self.store.history_store.sqlite_database() {
-            return db.read(|connection| {
-                let states = database::states::<StoredRemoteDeltaIngestState>(
-                    connection,
-                    &self.store.sqlite_source_prefix(),
-                )?;
-                if states.len() > MAX_BINDING_NAMESPACES_PER_SOURCE {
+        let db = history_database(&self.store.history_store)?;
+        db.read(|connection| {
+            let states = database::states::<StoredRemoteDeltaIngestState>(
+                connection,
+                &self.store.sqlite_source_prefix(),
+            )?;
+            if states.len() > MAX_BINDING_NAMESPACES_PER_SOURCE {
+                return Err(invalid_data(
+                    "remote SQL ingest binding namespace count exceeds its bound",
+                ));
+            }
+            let mut protected = BTreeSet::new();
+            for (key, state) in states {
+                state.validate(&state.binding)?;
+                let expected_key = format!(
+                    "{}{}/state",
+                    sqlite_ingest_source_prefix(
+                        &state.binding.profile_id,
+                        state.binding.redaction_profile,
+                        &state.binding.source.node_id
+                    ),
+                    binding_namespace_component(&state.binding)?
+                );
+                if key != expected_key {
                     return Err(invalid_data(
-                        "remote SQL ingest binding namespace count exceeds its bound",
+                        "remote SQL ingest state key does not match its binding",
                     ));
                 }
-                let mut protected = BTreeSet::new();
-                for (key, state) in states {
-                    state.validate(&state.binding)?;
-                    let expected_key = format!(
-                        "{}{}/state",
-                        sqlite_ingest_source_prefix(
-                            &state.binding.profile_id,
-                            state.binding.redaction_profile,
-                            &state.binding.source.node_id
-                        ),
-                        binding_namespace_component(&state.binding)?
-                    );
-                    if key != expected_key {
-                        return Err(invalid_data(
-                            "remote SQL ingest state key does not match its binding",
-                        ));
-                    }
-                    collect_state_history_generations(&state, &mut protected)?;
-                }
-                Ok(protected)
-            });
-        }
-        self.validate_fence()?;
-        let source_directory = self.store.source_namespace_directory();
-        self.store
-            .history_store
-            .validate_private_path(&source_directory)?;
-        let mut protected = BTreeSet::new();
-        let mut binding_count = 0_usize;
-
-        for entry in fs::read_dir(&source_directory)? {
-            self.validate_fence()?;
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == OsStr::new(INGEST_LOCK_FILE) {
-                continue;
+                collect_state_history_generations(&state, &mut protected)?;
             }
-            let Some(name) = name.to_str() else {
-                return Err(invalid_data(
-                    "remote ingest source namespace contains a non-UTF-8 entry",
-                ));
-            };
-            validate_prefixed_hex(
-                name,
-                BINDING_NAMESPACE_PREFIX,
-                SHA256_HEX_LEN,
-                "remote ingest binding namespace",
-            )?;
-            binding_count = binding_count.saturating_add(1);
-            if binding_count > MAX_BINDING_NAMESPACES_PER_SOURCE {
-                return Err(invalid_data(format!(
-                    "remote ingest source exceeds {MAX_BINDING_NAMESPACES_PER_SOURCE} binding namespaces"
-                )));
-            }
-
-            let directory = entry.path();
-            let metadata = fs::symlink_metadata(&directory)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(invalid_data(format!(
-                    "remote ingest binding namespace {} is not a directory",
-                    directory.display()
-                )));
-            }
-            self.store.history_store.validate_private_path(&directory)?;
-            cleanup_remote_ingest_temporary_files(&directory)?;
-            validate_ingest_binding_namespace_entries(&directory)?;
-
-            let anchor: StoredRemoteDeltaIngestAnchor = read_private_json(
-                &directory.join(INGEST_ANCHOR_FILE),
-                MAX_INGEST_ANCHOR_BYTES,
-                "remote ingest anchor",
-            )?;
-            anchor.validate(&anchor.binding)?;
-            if anchor.binding.profile_id != self.store.binding.profile_id
-                || anchor.binding.source.node_id != self.store.binding.source.node_id
-                || anchor.binding.redaction_profile != self.store.binding.redaction_profile
-                || binding_namespace_component(&anchor.binding)? != name
-            {
-                return Err(invalid_data(
-                    "remote ingest binding namespace does not match its source/profile path",
-                ));
-            }
-            let state: StoredRemoteDeltaIngestState = read_private_json(
-                &directory.join(INGEST_STATE_FILE),
-                MAX_INGEST_STATE_BYTES,
-                "remote ingest state",
-            )?;
-            state.validate(&anchor.binding)?;
-            collect_state_history_generations(&state, &mut protected)?;
-        }
-        Ok(protected)
+            Ok(protected)
+        })
     }
 
     fn validate_fence(&self) -> io::Result<()> {
@@ -2112,11 +1258,8 @@ impl RemoteDeltaIngestSession<'_> {
     }
 }
 
-/// Applies exactly the pending WAL page to its revision-aware source-history
-/// generation. Active pages are fenced against the manifest selected at write
-/// time. Staging pages first materialize their invisible generation and then
-/// apply both record families there. Repeating either path after a crash is
-/// safe because equal-revision, byte-identical records are idempotent.
+/// Applies a validated page to its exact SQL generation. Active and staging
+/// pages both verify the selected generation before updating source-owned rows.
 fn apply_remote_delta_records(
     session: &RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
@@ -2129,42 +1272,17 @@ fn apply_remote_delta_records(
     let redaction_profile = session.store.binding.redaction_profile;
     let binding = source_history_binding(&session.store.binding)?;
     match &page.target {
-        RemoteDeltaApplyTarget::ActiveNoop {
+        RemoteDeltaApplyTarget::Active {
             expected_generation,
-        } => {
-            if !page.records.is_empty() {
-                return Err(invalid_data(
-                    "remote active no-op page unexpectedly contains history mutations",
-                ));
-            }
-            let expected_active = SourceHistoryRemoteActiveRef::new(
-                source_history_generation(expected_generation)?,
-                binding,
-            )?;
-            let actual_active = session
-                .store
-                .history_store
-                .active_remote_history_ref(source_id, redaction_profile)?;
-            if actual_active.as_ref() != Some(&expected_active) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "remote active history generation changed before no-op apply",
-                ));
-            }
-        }
-        RemoteDeltaApplyTarget::ActiveCow {
-            expected_generation,
-            replacement_generation,
         } => {
             let expected_active = SourceHistoryRemoteActiveRef::new(
                 source_history_generation(expected_generation)?,
                 binding.clone(),
             )?;
-            writer.apply_remote_history_active_page_cow(
+            writer.apply_remote_history_active_page(
                 source_id,
                 redaction_profile,
                 &expected_active,
-                &source_history_generation(replacement_generation)?,
                 &binding,
                 &page.records.bucket_records,
                 &page.records.session_digest_records,
@@ -2235,19 +1353,6 @@ fn apply_remote_live_state(
         }
         return Ok(());
     };
-    if live.snapshot.is_none()
-        && session
-            .store
-            .history_store
-            .load_remote_live_state(&session.store.binding.source.node_id)?
-            .is_some_and(|cached| cached.journal_generation.is_none())
-    {
-        // A pre-upgrade revision-only WAL cannot prove which journal owns the
-        // retained live rows. Commit its historical records without refreshing
-        // that cache. next_request_position advertises no baseline, forcing a
-        // full replacement on the immediately following exchange.
-        return Ok(());
-    }
     let referenced = live
         .snapshot
         .iter()
@@ -2294,26 +1399,23 @@ fn apply_remote_live_state(
     )
 }
 
-/// Replays exactly one pending WAL page into source history and only then
-/// commits its cursor/generation transition. Callers acquire the writer lease
-/// before the ingest session and release both before any SSH transport I/O.
+/// Commits one prepared page's records, live replacement, and cursor in one
+/// transaction. The writer and ingest locks never span SSH transport I/O.
 pub fn apply_and_commit_remote_delta_page(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     page: &PreparedRemoteDeltaPage,
     activated_at: chrono::DateTime<chrono::Utc>,
 ) -> io::Result<RemoteDeltaCommitReport> {
-    if let Some(db) = session.store.history_store.sqlite_database() {
-        let previous = session.state.clone();
-        let result = db.write_nowait(|_| {
-            apply_and_commit_remote_delta_page_inner(session, writer, page, activated_at)
-        });
-        if result.is_err() {
-            session.state = previous;
-        }
-        return result;
+    let db = history_database(&session.store.history_store)?;
+    let previous = session.state.clone();
+    let result = db.write_nowait(|_| {
+        apply_and_commit_remote_delta_page_inner(session, writer, page, activated_at)
+    });
+    if result.is_err() {
+        session.state = previous;
     }
-    apply_and_commit_remote_delta_page_inner(session, writer, page, activated_at)
+    result
 }
 
 fn apply_and_commit_remote_delta_page_inner(
@@ -2322,46 +1424,30 @@ fn apply_and_commit_remote_delta_page_inner(
     page: &PreparedRemoteDeltaPage,
     activated_at: chrono::DateTime<chrono::Utc>,
 ) -> io::Result<RemoteDeltaCommitReport> {
-    let retired_generation = match &page.target {
-        RemoteDeltaApplyTarget::ActiveCow {
-            expected_generation,
-            ..
-        } => Some(expected_generation.clone()),
-        RemoteDeltaApplyTarget::ActiveNoop { .. } | RemoteDeltaApplyTarget::Staging(_) => None,
-    };
     apply_remote_delta_records(session, writer, page, activated_at)?;
     apply_remote_live_state(session, writer, page)?;
     session.mark_page_applied(&page.id)?;
-    let cleanup = retired_generation
-        .as_ref()
-        .map_or(RemoteGenerationCleanup::NotRequired, |generation| {
-            cleanup_retired_generation_after_commit(session, writer, generation)
-        });
-    Ok(RemoteDeltaCommitReport { cleanup })
+    writer.validate()?;
+    Ok(RemoteDeltaCommitReport {
+        cleanup: RemoteGenerationCleanup::NotRequired,
+    })
 }
 
-/// Activates a fully applied bootstrap in strict crash-safe order.
-///
-/// The source-history manifest switch is idempotent and is always completed
-/// before the ingest cursor is committed. If a process exits between those two
-/// writes, reopening the session and calling this helper again observes the
-/// same ready bootstrap, repeats the already-completed manifest switch, and
-/// then commits the cursor.
+/// Atomically selects a fully applied bootstrap and commits its ingest cursor.
+/// On failure, both SQL changes and the session's state are rolled back.
 pub fn activate_remote_delta_bootstrap(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     activated_at: chrono::DateTime<chrono::Utc>,
 ) -> io::Result<Option<RemoteBootstrapActivationReport>> {
-    if let Some(db) = session.store.history_store.sqlite_database() {
-        let previous = session.state.clone();
-        let result = db
-            .write_nowait(|_| activate_remote_delta_bootstrap_inner(session, writer, activated_at));
-        if result.is_err() {
-            session.state = previous;
-        }
-        return result;
+    let db = history_database(&session.store.history_store)?;
+    let previous = session.state.clone();
+    let result =
+        db.write_nowait(|_| activate_remote_delta_bootstrap_inner(session, writer, activated_at));
+    if result.is_err() {
+        session.state = previous;
     }
-    activate_remote_delta_bootstrap_inner(session, writer, activated_at)
+    result
 }
 
 fn activate_remote_delta_bootstrap_inner(
@@ -2403,6 +1489,7 @@ fn activate_remote_delta_bootstrap_inner(
                     cleanup_retired_generation_after_commit(session, writer, &retired)
                 }
             });
+    writer.validate()?;
     Ok(Some(RemoteBootstrapActivationReport {
         activation,
         cleanup,
@@ -2437,7 +1524,6 @@ fn cleanup_retired_generation_after_commit(
             if matches!(
                 outcome,
                 RemoteHistoryGenerationGcOutcome::Deleted
-                    | RemoteHistoryGenerationGcOutcome::RecoveredTrash
                     | RemoteHistoryGenerationGcOutcome::NotFound
             ) {
                 let mut next = session.state.clone();
@@ -2578,11 +1664,11 @@ struct StoredRemoteDeltaIngestState {
     active: Option<StoredActiveGeneration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bootstrap: Option<StoredBootstrap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pending: Option<StoredPendingPage>,
     /// Generations retired by already-committed transitions. They are not
     /// reader roots; the queue only makes best-effort GC retryable after a
-    /// process exit or a fail-closed cross-binding scan.
+    /// process exit or a fail-closed SQL binding scan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_generations: Vec<RemoteHistoryGenerationId>,
 }
@@ -2635,12 +1721,8 @@ impl StoredRemoteDeltaIngestState {
         if let Some(pending) = &self.pending {
             pending.validate(expected)?;
             match &pending.target {
-                RemoteDeltaApplyTarget::ActiveNoop {
+                RemoteDeltaApplyTarget::Active {
                     expected_generation,
-                }
-                | RemoteDeltaApplyTarget::ActiveCow {
-                    expected_generation,
-                    ..
                 } => {
                     let active = self.active.as_ref().ok_or_else(|| {
                         invalid_data("pending active page has no active history generation")
@@ -2776,7 +1858,7 @@ struct StoredPendingPage {
     request: RemoteExportRequest,
     response: RemoteDeltaResponse,
     /// Center-clock time captured immediately after the SSH response arrived.
-    /// Replaying this WAL must never replace it with the later recovery time,
+    /// Replaying this prepared page must never replace it with the later recovery time,
     /// otherwise an old live snapshot can appear fresh again after a crash.
     received_at: DateTime<Utc>,
 }
@@ -2788,12 +1870,7 @@ impl StoredPendingPage {
         binding.validate_exchange(&self.request, &self.response)?;
         if pending_page_id(self)? != self.id {
             return Err(invalid_data(
-                "prepared remote delta page content hash does not match its WAL",
-            ));
-        }
-        if self.target.seed().materialize(&self.id)? != self.target {
-            return Err(invalid_data(
-                "pending active replacement generation does not match its page identity",
+                "prepared remote delta page content hash does not match its prepared page",
             ));
         }
         let (page, payload) = delta_response_page(&self.response)?;
@@ -2807,16 +1884,6 @@ impl StoredPendingPage {
                 observed_at: self.response.observed_at,
             })
             .map_err(|error| invalid_data(format!("pending delta payload is invalid: {error}")))?;
-        let records = history_records_from_payload(
-            &binding.source.node_id,
-            binding.redaction_profile,
-            payload,
-        )?;
-        if matches!(self.target, RemoteDeltaApplyTarget::ActiveNoop { .. }) && !records.is_empty() {
-            return Err(invalid_data(
-                "pending active no-op page contains history mutations",
-            ));
-        }
         Ok(())
     }
 }
@@ -2824,7 +1891,7 @@ impl StoredPendingPage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingPageHashInput<'a> {
-    target: RemoteDeltaApplyTargetSeed,
+    target: RemoteDeltaApplyTarget,
     request: &'a RemoteExportRequest,
     response: &'a RemoteDeltaResponse,
     received_at: DateTime<Utc>,
@@ -2832,7 +1899,7 @@ struct PendingPageHashInput<'a> {
 
 fn pending_page_id(pending: &StoredPendingPage) -> io::Result<PreparedRemoteDeltaPageId> {
     pending_page_id_from_parts(
-        &pending.target.seed(),
+        &pending.target,
         &pending.request,
         &pending.response,
         pending.received_at,
@@ -2840,7 +1907,7 @@ fn pending_page_id(pending: &StoredPendingPage) -> io::Result<PreparedRemoteDelt
 }
 
 fn pending_page_id_from_parts(
-    target: &RemoteDeltaApplyTargetSeed,
+    target: &RemoteDeltaApplyTarget,
     request: &RemoteExportRequest,
     response: &RemoteDeltaResponse,
     received_at: DateTime<Utc>,
@@ -2859,60 +1926,6 @@ fn pending_page_id_from_parts(
     Ok(PreparedRemoteDeltaPageId(value))
 }
 
-fn active_replacement_generation(
-    page_id: &PreparedRemoteDeltaPageId,
-) -> io::Result<RemoteHistoryGenerationId> {
-    page_id.validate()?;
-    let mut hasher = Sha256::new();
-    hasher.update(ACTIVE_REPLACEMENT_GENERATION_DOMAIN);
-    hasher.update(page_id.as_str().as_bytes());
-    let digest = hasher.finalize();
-    let bytes = &digest[..INGEST_GENERATION_RANDOM_BYTES];
-    if bytes.iter().all(|byte| *byte == 0) {
-        return Err(invalid_data(
-            "prepared page produced an unusable active replacement generation",
-        ));
-    }
-    let mut value = String::with_capacity(INGEST_GENERATION_PREFIX.len() + bytes.len() * 2);
-    value.push_str(INGEST_GENERATION_PREFIX);
-    append_lower_hex(&mut value, bytes);
-    let generation = RemoteHistoryGenerationId(value);
-    generation.validate()?;
-    Ok(generation)
-}
-
-fn validate_ingest_binding_namespace_entries(directory: &Path) -> io::Result<()> {
-    let mut state_seen = false;
-    let mut anchor_seen = false;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let label = if name == OsStr::new(INGEST_STATE_FILE) {
-            state_seen = true;
-            "remote ingest state"
-        } else if name == OsStr::new(INGEST_ANCHOR_FILE) {
-            anchor_seen = true;
-            "remote ingest anchor"
-        } else {
-            return Err(invalid_data(format!(
-                "remote ingest binding namespace contains unexpected entry {}",
-                entry.path().display()
-            )));
-        };
-        let mut options = OpenOptions::new();
-        options.read(true);
-        configure_private_open(&mut options, false);
-        let file = options.open(entry.path())?;
-        validate_private_file(&entry.path(), &file, label)?;
-    }
-    if !state_seen || !anchor_seen {
-        return Err(invalid_data(
-            "remote ingest binding namespace is missing its state or anchor",
-        ));
-    }
-    Ok(())
-}
-
 fn collect_state_history_generations(
     state: &StoredRemoteDeltaIngestState,
     protected: &mut BTreeSet<SourceHistoryRemoteGenerationId>,
@@ -2928,21 +1941,6 @@ fn collect_state_history_generations(
         insert(&bootstrap.generation)?;
         if let Some(expected_active) = &bootstrap.expected_active {
             insert(&expected_active.generation)?;
-        }
-    }
-    if let Some(pending) = &state.pending {
-        match &pending.target {
-            RemoteDeltaApplyTarget::ActiveNoop {
-                expected_generation,
-            } => insert(expected_generation)?,
-            RemoteDeltaApplyTarget::ActiveCow {
-                expected_generation,
-                replacement_generation,
-            } => {
-                insert(expected_generation)?;
-                insert(replacement_generation)?;
-            }
-            RemoteDeltaApplyTarget::Staging(generation) => insert(generation)?,
         }
     }
     Ok(())
@@ -2967,15 +1965,6 @@ fn sqlite_ingest_retirement_key(profile: &HistoryProfileId, source: &NodeId) -> 
         profile.as_str(),
         source.as_str()
     )
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StoredRemoteIngestImportMarker {
-    format_version: u32,
-    profile_id: HistoryProfileId,
-    source_id: NodeId,
-    redaction_profile: RedactionProfile,
 }
 
 fn sqlite_remove_ingest_namespace(
@@ -3037,189 +2026,6 @@ fn sqlite_remove_ingest_namespace(
     Ok(removed)
 }
 
-/// Imports every validated binding, including invisible bootstrap and pending
-/// pages. The caller holds the ownership lease and the encompassing SQL import
-/// transaction; old files remain available for recovery.
-pub(crate) fn import_legacy_remote_ingest_sqlite_state(
-    target: &SourceHistoryStore,
-    legacy: &SourceHistoryStore,
-) -> io::Result<()> {
-    let db = target
-        .sqlite_database()
-        .ok_or_else(|| invalid_data("remote ingest import requires SQL history"))?;
-    if target.profile_id() != legacy.profile_id() {
-        return Err(invalid_data("remote ingest import profile mismatch"));
-    }
-    db.write(|connection| {
-        let profile = legacy
-            .state_root()
-            .join(INGEST_LAYOUT_DIRECTORY)
-            .join(legacy.profile_id().as_str());
-        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-            let directory = profile.join(redaction.directory_name());
-            let mut source_names = legacy.list_source_metadata()?.into_iter()
-                .filter(|metadata| metadata.kind() == crate::source_history::SourceKind::Ssh)
-                .map(|metadata| metadata.source_id().as_str().to_owned())
-                .collect::<BTreeSet<_>>();
-            if private_directory_exists(legacy, &directory)? {
-                for entry in fs::read_dir(&directory)? {
-                    let entry = entry?;
-                    source_names.insert(entry.file_name().to_str()
-                        .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest source"))?.to_owned());
-                }
-            }
-            for source_name in source_names {
-                let source: NodeId = source_name.parse()
-                    .map_err(|_| invalid_data("invalid legacy ingest source namespace"))?;
-                let source_path = directory.join(source.as_str());
-                let import_key = format!(
-                    "remote-ingest-import/{}/{}/{}",
-                    target.profile_id().as_str(),
-                    redaction.directory_name(),
-                    source.as_str()
-                );
-                if let Some(marker) = database::state::<StoredRemoteIngestImportMarker>(connection, &import_key)? {
-                    if marker.format_version != 1
-                        || marker.profile_id != *target.profile_id()
-                        || marker.source_id != source
-                        || marker.redaction_profile != redaction
-                    {
-                        return Err(invalid_data("remote SQL ingest import marker mismatch"));
-                    }
-                    continue;
-                }
-                let state_prefix = sqlite_ingest_source_prefix(target.profile_id(), redaction, &source);
-                let anchor_prefix = format!(
-                    "remote-ingest-anchor/{}/{}/{}/",
-                    target.profile_id().as_str(), redaction.directory_name(), source.as_str()
-                );
-                let existing: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM history_state WHERE substr(state_key,1,length(?1))=?1 OR substr(state_key,1,length(?2))=?2)",
-                    rusqlite::params![state_prefix, anchor_prefix],
-                    |row| row.get(0),
-                ).map_err(database::sql_error)?;
-                if existing {
-                    return Err(invalid_data("remote SQL ingest namespace exists without an import marker"));
-                }
-                if private_directory_exists(legacy, &source_path)? {
-                let lock_path = source_path.join(INGEST_LOCK_FILE);
-                let lock = open_private_lock(&lock_path)?;
-                let _lock = try_lock_private_lock(&lock_path, lock)?;
-                let mut count = 0;
-                for entry in fs::read_dir(&source_path)? {
-                    let entry = entry?;
-                    if entry.file_name() == OsStr::new(INGEST_LOCK_FILE) {
-                        continue;
-                    }
-                    let name = entry
-                        .file_name()
-                        .to_str()
-                        .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest binding"))?
-                        .to_owned();
-                    validate_prefixed_hex(
-                        &name,
-                        BINDING_NAMESPACE_PREFIX,
-                        SHA256_HEX_LEN,
-                        "legacy ingest binding",
-                    )?;
-                    count += 1;
-                    if count > MAX_BINDING_NAMESPACES_PER_SOURCE {
-                        return Err(invalid_data(
-                            "legacy ingest namespace count exceeds its bound",
-                        ));
-                    }
-                    legacy.validate_private_path(&entry.path())?;
-                    validate_ingest_binding_namespace_entries(&entry.path())?;
-                    let anchor: Option<StoredRemoteDeltaIngestAnchor> = match read_private_json(
-                        &entry.path().join(INGEST_ANCHOR_FILE),
-                        MAX_INGEST_ANCHOR_BYTES,
-                        "legacy remote ingest anchor",
-                    ) {
-                        Ok(anchor) => Some(anchor),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                        Err(error) => return Err(error),
-                    };
-                    let state: StoredRemoteDeltaIngestState = match read_private_json(
-                        &entry.path().join(INGEST_STATE_FILE),
-                        MAX_INGEST_STATE_BYTES,
-                        "legacy remote ingest state",
-                    ) {
-                        Ok(state) => state,
-                        Err(error)
-                            if error.kind() == io::ErrorKind::NotFound && anchor.is_none() =>
-                        {
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let anchor = anchor.unwrap_or_else(|| StoredRemoteDeltaIngestAnchor {
-                        format_version: INGEST_ANCHOR_FORMAT_VERSION,
-                        binding: state.binding.clone(),
-                    });
-                    anchor.validate(&anchor.binding)?;
-                    state.validate(&anchor.binding)?;
-                    if anchor.binding.profile_id != *legacy.profile_id()
-                        || anchor.binding.source.node_id != source
-                        || anchor.binding.redaction_profile != redaction
-                        || binding_namespace_component(&anchor.binding)? != name
-                    {
-                        return Err(invalid_data(
-                            "legacy ingest binding does not match its namespace",
-                        ));
-                    }
-                    let store =
-                        RemoteDeltaIngestStateStore::new(target.clone(), anchor.binding.clone())?;
-                    database::set_state(connection, &store.sqlite_state_key(), &state)?;
-                    database::set_state(connection, &store.sqlite_anchor_key(), &anchor)?;
-                }
-                }
-                database::set_state(connection, &import_key, &StoredRemoteIngestImportMarker {
-                    format_version: 1,
-                    profile_id: target.profile_id().clone(),
-                    source_id: source,
-                    redaction_profile: redaction,
-                })?;
-            }
-        }
-        let retirements = profile.join(INGEST_RETIREMENTS_DIRECTORY);
-        if private_directory_exists(legacy, &retirements)? {
-            for entry in fs::read_dir(&retirements)? {
-                let entry = entry?;
-                let source: NodeId = entry
-                    .file_name()
-                    .to_str()
-                    .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest retirement"))?
-                    .parse()
-                    .map_err(|_| invalid_data("invalid legacy ingest retirement namespace"))?;
-                legacy.validate_private_path(&entry.path())?;
-                let marker: StoredRemoteIngestProfileRetirement = read_private_json(
-                    &entry.path().join(INGEST_RETIREMENT_MARKER_FILE),
-                    MAX_INGEST_ANCHOR_BYTES,
-                    "legacy remote ingest retirement",
-                )?;
-                marker.validate(legacy.profile_id(), &source)?;
-                let import_key = format!("remote-ingest-retirement-import/{}/{}", target.profile_id().as_str(), source.as_str());
-                if let Some(imported) = database::state::<StoredRemoteIngestProfileRetirement>(connection, &import_key)? {
-                    imported.validate(target.profile_id(), &source)?;
-                    continue;
-                }
-                let key = sqlite_ingest_retirement_key(legacy.profile_id(), &source);
-                if let Some(existing) = database::state::<StoredRemoteIngestProfileRetirement>(connection, &key)? {
-                    existing.validate(target.profile_id(), &source)?;
-                    return Err(invalid_data("remote SQL ingest retirement exists without an import marker"));
-                }
-                database::set_state(
-                    connection,
-                    &key,
-                    &marker,
-                )?;
-                database::set_state(connection, &import_key, &marker)?;
-            }
-        }
-        Ok(())
-    })
-}
-
 fn sqlite_ingest_source_prefix(
     profile: &HistoryProfileId,
     redaction: RedactionProfile,
@@ -3244,11 +2050,6 @@ fn binding_namespace_component(binding: &RemoteDeltaIngestBinding) -> io::Result
     Ok(value)
 }
 
-#[derive(Deserialize)]
-struct RetiredIngestBindingEnvelope {
-    binding: RemoteDeltaIngestBinding,
-}
-
 fn validate_ingest_retirement_writer(
     history_store: &SourceHistoryStore,
     writer: &SourceHistoryWriter<'_, '_, '_>,
@@ -3261,244 +2062,6 @@ fn validate_ingest_retirement_writer(
         ));
     }
     Ok(())
-}
-
-fn private_directory_exists(store: &SourceHistoryStore, path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err(invalid_data(format!(
-                    "remote ingest retirement path {} is not a directory",
-                    path.display()
-                )));
-            }
-            store.validate_private_path(path)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn private_file_exists(path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(invalid_data(format!(
-                    "remote ingest retirement path {} is not a regular file",
-                    path.display()
-                )));
-            }
-            let mut options = OpenOptions::new();
-            options.read(true);
-            configure_private_open(&mut options, false);
-            let file = options.open(path)?;
-            validate_private_file(path, &file, "remote ingest retirement marker")?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn ensure_remote_ingest_retirement_marker(paths: &RemoteIngestRetirementPaths) -> io::Result<()> {
-    if private_file_exists(&paths.marker)? {
-        let marker: StoredRemoteIngestProfileRetirement = read_private_json(
-            &paths.marker,
-            MAX_INGEST_ANCHOR_BYTES,
-            "remote ingest retirement marker",
-        )?;
-        return marker.validate(&paths.profile_id, &paths.source_id);
-    }
-    let marker = StoredRemoteIngestProfileRetirement::preview_to_redacted(
-        paths.profile_id.clone(),
-        paths.source_id.clone(),
-    );
-    write_private_json_atomically(
-        &paths.marker,
-        &marker,
-        MAX_INGEST_ANCHOR_BYTES,
-        "remote ingest retirement marker",
-    )
-}
-
-fn remove_remote_preview_ingest_source_bounded(
-    history_store: &SourceHistoryStore,
-    paths: &RemoteIngestRetirementPaths,
-) -> io::Result<bool> {
-    history_store.validate_private_path(&paths.preview_source)?;
-    let lock = open_private_lock(&paths.preview_lock)?;
-    let lock = try_lock_private_lock(&paths.preview_lock, lock)?;
-    // The external retirement marker remains until explicit source purge, so
-    // every partial or rolled-back deletion stays replayable on Windows.
-    sync_directory(&paths.preview_source)?;
-    let mut remaining = INGEST_RETIREMENT_WORK_LIMIT;
-    let mut binding_count = 0_usize;
-    let mut completed = true;
-    for entry in fs::read_dir(&paths.preview_source)? {
-        history_store.validate_private_path(&paths.preview_source)?;
-        let entry = entry?;
-        if entry.file_name() == OsStr::new(INGEST_LOCK_FILE) {
-            continue;
-        }
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| invalid_data("remote ingest retirement entry is not UTF-8"))?
-            .to_owned();
-        validate_prefixed_hex(
-            &name,
-            BINDING_NAMESPACE_PREFIX,
-            SHA256_HEX_LEN,
-            "retired remote ingest binding namespace",
-        )?;
-        binding_count = binding_count.saturating_add(1);
-        if binding_count > MAX_BINDING_NAMESPACES_PER_SOURCE {
-            return Err(invalid_data(format!(
-                "retired remote ingest source exceeds {MAX_BINDING_NAMESPACES_PER_SOURCE} binding namespaces"
-            )));
-        }
-        if remaining == 0 {
-            completed = false;
-            break;
-        }
-        if !remove_remote_ingest_binding_bounded(
-            history_store,
-            paths,
-            &entry.path(),
-            &name,
-            &mut remaining,
-        )? {
-            completed = false;
-            break;
-        }
-    }
-    if !completed {
-        return Ok(false);
-    }
-
-    // The iterator above completed, so the stable lock must be the only
-    // remaining path. Revalidate its opened identity before releasing it.
-    let mut entries = fs::read_dir(&paths.preview_source)?;
-    while let Some(entry) = entries.next().transpose()? {
-        if entry.file_name() != OsStr::new(INGEST_LOCK_FILE) {
-            return Ok(false);
-        }
-    }
-    // `ReadDir` owns a directory handle on Windows. Release it before trying
-    // to remove the stable lock and its parent directory.
-    drop(entries);
-    validate_private_file(&paths.preview_lock, &lock, "remote ingest lock")?;
-    std::fs::File::unlock(lock.as_file())?;
-    drop(lock);
-
-    let lock = open_existing_private_file(&paths.preview_lock, "remote ingest lock")?;
-    drop(lock);
-    fs::remove_file(&paths.preview_lock)?;
-    sync_directory(&paths.preview_source)?;
-    fs::remove_dir(&paths.preview_source)?;
-    sync_directory(&paths.preview_profile)?;
-    Ok(true)
-}
-
-fn remove_remote_ingest_binding_bounded(
-    history_store: &SourceHistoryStore,
-    paths: &RemoteIngestRetirementPaths,
-    directory: &Path,
-    namespace: &str,
-    remaining: &mut usize,
-) -> io::Result<bool> {
-    history_store.validate_private_path(directory)?;
-    let state_path = directory.join(INGEST_STATE_FILE);
-    let anchor_path = directory.join(INGEST_ANCHOR_FILE);
-    let state_binding = read_optional_retired_ingest_binding(
-        &state_path,
-        MAX_INGEST_STATE_BYTES,
-        "retired remote ingest state",
-    )?;
-    let anchor_binding = read_optional_retired_ingest_binding(
-        &anchor_path,
-        MAX_INGEST_ANCHOR_BYTES,
-        "retired remote ingest anchor",
-    )?;
-    if let (Some(state), Some(anchor)) = (&state_binding, &anchor_binding)
-        && state != anchor
-    {
-        return Err(invalid_data(
-            "retired remote ingest state and anchor bindings disagree",
-        ));
-    }
-    if let Some(binding) = state_binding.as_ref().or(anchor_binding.as_ref()) {
-        validate_retired_ingest_binding(paths, namespace, binding)?;
-    }
-
-    for entry in fs::read_dir(directory)? {
-        history_store.validate_private_path(directory)?;
-        if *remaining == 0 {
-            return Ok(false);
-        }
-        let entry = entry?;
-        let name = entry.file_name();
-        if name != OsStr::new(INGEST_STATE_FILE)
-            && name != OsStr::new(INGEST_ANCHOR_FILE)
-            && !is_remote_ingest_temporary_name(&name)
-        {
-            return Err(invalid_data(format!(
-                "retired remote ingest binding contains unexpected entry {}",
-                entry.path().display()
-            )));
-        }
-        let file = open_existing_private_file(&entry.path(), "retired remote ingest binding file")?;
-        drop(file);
-        fs::remove_file(entry.path())?;
-        *remaining -= 1;
-    }
-    if *remaining == 0 {
-        return Ok(false);
-    }
-    history_store.validate_private_path(directory)?;
-    fs::remove_dir(directory)?;
-    *remaining -= 1;
-    sync_directory(&paths.preview_source)?;
-    Ok(true)
-}
-
-fn read_optional_retired_ingest_binding(
-    path: &Path,
-    maximum_bytes: u64,
-    label: &str,
-) -> io::Result<Option<RemoteDeltaIngestBinding>> {
-    if !private_file_exists(path)? {
-        return Ok(None);
-    }
-    let envelope: RetiredIngestBindingEnvelope = read_private_json(path, maximum_bytes, label)?;
-    Ok(Some(envelope.binding))
-}
-
-fn validate_retired_ingest_binding(
-    paths: &RemoteIngestRetirementPaths,
-    namespace: &str,
-    binding: &RemoteDeltaIngestBinding,
-) -> io::Result<()> {
-    if binding.profile_id() != &paths.profile_id
-        || binding.source().node_id != paths.source_id
-        || binding.redaction_profile() != RedactionProfile::PreviewEnabled
-        || binding_namespace_component(binding)? != namespace
-    {
-        return Err(invalid_data(
-            "retired remote ingest binding does not match its source/profile namespace",
-        ));
-    }
-    Ok(())
-}
-
-fn open_existing_private_file(path: &Path, label: &str) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_private_open(&mut options, false);
-    let file = options.open(path)?;
-    validate_private_file(path, &file, label)?;
-    Ok(file)
 }
 
 fn validate_pending_continuation(
@@ -3884,169 +2447,6 @@ fn remote_ingest_lock_share_mode() -> u32 {
     }
 }
 
-fn read_private_json<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    maximum_bytes: u64,
-    label: &str,
-) -> io::Result<T> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_private_open(&mut options, false);
-    let mut file = options.open(path)?;
-    validate_private_file(path, &file, label)?;
-    let length = file.metadata()?.len();
-    if length > maximum_bytes {
-        return Err(invalid_data(format!("{label} exceeds its byte bound")));
-    }
-    let mut bytes = Vec::with_capacity(length as usize);
-    Read::by_ref(&mut file)
-        .take(maximum_bytes + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > maximum_bytes {
-        return Err(invalid_data(format!("{label} exceeds its byte bound")));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| invalid_data(format!("could not decode {label}: {error}")))
-}
-
-fn write_private_json_atomically<T: Serialize>(
-    path: &Path,
-    value: &T,
-    maximum_bytes: u64,
-    label: &str,
-) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| invalid_data(format!("could not encode {label}: {error}")))?;
-    if bytes.len() as u64 > maximum_bytes {
-        return Err(invalid_data(format!("{label} exceeds its byte bound")));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data(format!("{label} has no parent directory")))?;
-    let (temporary_path, mut temporary) = create_private_temp(parent, label)?;
-    let result = (|| {
-        temporary.write_all(&bytes)?;
-        temporary.sync_all()?;
-        replace_file(&temporary_path, path)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
-}
-
-fn create_private_json_once<T: Serialize>(
-    path: &Path,
-    value: &T,
-    maximum_bytes: u64,
-    label: &str,
-) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| invalid_data(format!("could not encode {label}: {error}")))?;
-    if bytes.len() as u64 > maximum_bytes {
-        return Err(invalid_data(format!("{label} exceeds its byte bound")));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data(format!("{label} has no parent directory")))?;
-    let (temporary_path, mut temporary) = create_private_temp(parent, label)?;
-    let result = (|| {
-        temporary.write_all(&bytes)?;
-        temporary.sync_all()?;
-        drop(temporary);
-
-        // Publishing a fully synced inode with a hard link gives portable
-        // create-if-absent semantics: unlike a direct create_new write, a
-        // crash can never expose a truncated final anchor; unlike rename on
-        // Unix, a racing existing final path is never overwritten.
-        match fs::hard_link(&temporary_path, path) {
-            Ok(()) => sync_directory(parent),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(error),
-        }
-    })();
-    let cleanup = fs::remove_file(&temporary_path);
-    match (result, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        (Ok(()), Err(error)) => Err(error),
-    }
-}
-
-fn cleanup_remote_ingest_temporary_files(directory: &Path) -> io::Result<usize> {
-    let mut removed = 0;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !is_remote_ingest_temporary_name(&entry.file_name()) {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(invalid_data(format!(
-                "remote ingest temporary path {} is not a regular file",
-                path.display()
-            )));
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        configure_private_open(&mut options, false);
-        let file = options.open(&path)?;
-        validate_private_file(&path, &file, "remote ingest temporary file")?;
-        drop(file);
-        fs::remove_file(&path)?;
-        removed += 1;
-    }
-    if removed > 0 {
-        sync_directory(directory)?;
-    }
-    Ok(removed)
-}
-
-fn is_remote_ingest_temporary_name(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(suffix) = name.strip_prefix(".remote-ingest.tmp.") else {
-        return false;
-    };
-    let Some((process_id, sequence)) = suffix.split_once('.') else {
-        return false;
-    };
-    !process_id.is_empty()
-        && !sequence.is_empty()
-        && process_id.bytes().all(|byte| byte.is_ascii_digit())
-        && sequence.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn create_private_temp(parent: &Path, label: &str) -> io::Result<(PathBuf, File)> {
-    for _ in 0..TEMP_FILE_ATTEMPTS {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".remote-ingest.tmp.{}.{}",
-            std::process::id(),
-            sequence
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        configure_private_open(&mut options, false);
-        match options.open(&path) {
-            Ok(file) => {
-                validate_private_file(&path, &file, label)?;
-                return Ok((path, file));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("could not allocate a temporary file for {label}"),
-    ))
-}
-
 fn validate_private_file(path: &Path, file: &File, label: &str) -> io::Result<()> {
     let opened = file.metadata()?;
     if !opened.is_file() {
@@ -4089,6 +2489,15 @@ fn configure_private_open(options: &mut OpenOptions, _directory: bool) {
     }
 }
 
+fn history_database(store: &SourceHistoryStore) -> io::Result<database::HistoryDatabase> {
+    store.sqlite_database().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "central remote ingestion requires SQLite history",
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
@@ -4097,9 +2506,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::history_ownership::{
-        HistoryOwnershipState, HistoryOwnershipStore, InitializeV1Outcome, OwnershipCasOutcome,
-    };
+    use crate::history_ownership::HistoryOwnershipStore;
     use crate::remote_protocol::{
         AcceptedRevisionRange, AcceptedRevisions, BinaryVersion, MAX_REMOTE_FRAME_ENCODED_BYTES,
         REMOTE_PROTOCOL_VERSION, RemoteApiCostAmount, RemoteDeltaCoverage, RemoteDeltaStats,
@@ -4368,7 +2775,22 @@ mod tests {
         redaction_profile: RedactionProfile,
         action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
     ) -> T {
-        with_history_writer_backend(root, profile, redaction_profile, false, action)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let ownership = HistoryOwnershipStore::new(
+            root.to_path_buf(),
+            profile.parse().unwrap(),
+            redaction_profile,
+        );
+        let (manifest, history) =
+            crate::sqlite_history_initialization::initialize_for_test(&ownership).unwrap();
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &manifest).unwrap();
+        let writer = history.writer(&authority).unwrap();
+        action(&history, &writer)
     }
 
     fn with_sqlite_history_writer<T>(
@@ -4376,78 +2798,7 @@ mod tests {
         redaction_profile: RedactionProfile,
         action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
     ) -> T {
-        with_history_writer_backend(root, PROFILE, redaction_profile, true, action)
-    }
-
-    fn with_history_writer_backend<T>(
-        root: &Path,
-        profile: &str,
-        redaction_profile: RedactionProfile,
-        sqlite: bool,
-        action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
-    ) -> T {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let history = if sqlite {
-            SourceHistoryStore::new_sqlite(root.to_path_buf(), profile.parse().unwrap())
-        } else {
-            SourceHistoryStore::new(root.to_path_buf(), profile.parse().unwrap())
-        };
-        let ownership = HistoryOwnershipStore::new(
-            root.to_path_buf(),
-            profile.parse().unwrap(),
-            redaction_profile,
-        );
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let v1 = match ownership.initialize_v1_active(&lease).unwrap() {
-            InitializeV1Outcome::Initialized(manifest)
-            | InitializeV1Outcome::Existing(manifest) => manifest,
-        };
-        let mut manifest = if v1.state() == HistoryOwnershipState::V1Active {
-            match ownership.begin_migration(&lease, &v1).unwrap() {
-                OwnershipCasOutcome::Applied(manifest) => manifest,
-                OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-            }
-        } else {
-            v1
-        };
-        if sqlite {
-            if !manifest.is_sqlite_backend() {
-                if manifest.state() == HistoryOwnershipState::Migrating {
-                    manifest = match ownership
-                        .compare_and_transition(&lease, &manifest, HistoryOwnershipState::V2Active)
-                        .unwrap()
-                    {
-                        OwnershipCasOutcome::Applied(manifest) => manifest,
-                        OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-                    };
-                }
-                manifest = match ownership.begin_sqlite_migration(&lease, &manifest).unwrap() {
-                    OwnershipCasOutcome::Applied(manifest) => manifest,
-                    OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-                };
-            }
-            if manifest.state() == HistoryOwnershipState::Migrating {
-                history
-                    .sqlite_database()
-                    .unwrap()
-                    .write(|_| Ok(()))
-                    .unwrap();
-                manifest = match ownership
-                    .complete_sqlite_migration(&lease, &manifest)
-                    .unwrap()
-                {
-                    OwnershipCasOutcome::Applied(manifest) => manifest,
-                    OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-                };
-            }
-        }
-        let authority = ownership.authorize_v2_write(&lease, &manifest).unwrap();
-        let writer = history.writer(&authority).unwrap();
-        action(&history, &writer)
+        with_history_writer(root, PROFILE, redaction_profile, action)
     }
 
     fn loaded_bucket_totals(
@@ -4690,200 +3041,9 @@ mod tests {
                 .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
                 .unwrap()
                 .unwrap();
-            assert_ne!(before.generation(), after.generation());
+            assert_eq!(before.generation(), after.generation());
             assert_eq!(before.binding(), after.binding());
         });
-    }
-
-    #[test]
-    fn sqlite_remote_import_preserves_staging_rows_and_exact_pending_page() {
-        let root = tempdir().unwrap();
-        let binding = binding_with(u64::MAX, 1, 60);
-        let legacy = SourceHistoryStore::new(root.path().to_path_buf(), PROFILE.parse().unwrap());
-        let ingest = RemoteDeltaIngestStateStore::new(legacy.clone(), binding.clone()).unwrap();
-        let range = export_range(at(30, 3, 0), 60);
-        let pending = with_history_writer(
-            root.path(),
-            PROFILE,
-            binding.redaction_profile,
-            |_history, writer| {
-                writer
-                    .save_source_metadata(
-                        &SourceMetadata::new(
-                            binding.source.node_id.clone(),
-                            SourceKind::Ssh,
-                            "remote",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                let mut session = ingest.try_begin().unwrap();
-                session.start_bootstrap(writer).unwrap();
-                let first = response(
-                    &binding,
-                    range.clone(),
-                    one_change_page(u64::MAX, 1, true),
-                    payload_for(
-                        range.clone(),
-                        vec![bucket_change(&binding, 1, at(30, 3, 0), 31)],
-                        Vec::new(),
-                    ),
-                );
-                let first_page = session
-                    .prepare_page(
-                        &request(&binding, None, range.clone()),
-                        &first,
-                        first.observed_at,
-                    )
-                    .unwrap();
-                apply_and_commit_remote_delta_page(&mut session, writer, &first_page, at(30, 4, 1))
-                    .unwrap();
-                let cursor = session.next_request_position().unwrap().delta_cursor;
-                let second = response(
-                    &binding,
-                    range.clone(),
-                    one_change_page(u64::MAX, 2, false),
-                    payload_for(
-                        range.clone(),
-                        vec![bucket_change(&binding, 2, at(30, 3, 15), 47)],
-                        Vec::new(),
-                    ),
-                );
-                session
-                    .prepare_page(
-                        &request(&binding, cursor, range.clone()),
-                        &second,
-                        second.observed_at,
-                    )
-                    .unwrap()
-            },
-        );
-        with_sqlite_history_writer(root.path(), binding.redaction_profile, |history, writer| {
-            writer
-                .save_source_metadata(
-                    &legacy
-                        .load_source_metadata(&binding.source.node_id)
-                        .unwrap(),
-                )
-                .unwrap();
-            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
-            let sql_ingest =
-                RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
-            let mut recovered = sql_ingest.try_begin().unwrap();
-            assert_eq!(recovered.pending_page().unwrap(), Some(pending.clone()));
-            assert!(loaded_bucket_totals(history, &binding).is_empty());
-            apply_and_commit_remote_delta_page(&mut recovered, writer, &pending, at(30, 4, 2))
-                .unwrap();
-            activate_remote_delta_bootstrap(&mut recovered, writer, at(30, 4, 2))
-                .unwrap()
-                .unwrap();
-            assert_eq!(loaded_bucket_totals(history, &binding), vec![31, 47]);
-            assert_eq!(
-                recovered.next_request_position().unwrap().delta_cursor,
-                Some(pending.next_cursor)
-            );
-            let committed_state = recovered.state.clone();
-            let active = history
-                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
-                .unwrap();
-            drop(recovered);
-            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
-            let recovered_again = sql_ingest.try_begin().unwrap();
-            assert_eq!(recovered_again.state, committed_state);
-            assert_eq!(
-                history
-                    .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
-                    .unwrap(),
-                active
-            );
-            assert_eq!(loaded_bucket_totals(history, &binding), vec![31, 47]);
-            drop(recovered_again);
-            purge_remote_ingest_state_for_source(history, &binding.source.node_id, writer).unwrap();
-            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
-            history
-                .sqlite_database()
-                .unwrap()
-                .read(|connection| {
-                    assert!(
-                        database::state::<StoredRemoteDeltaIngestState>(
-                            connection,
-                            &sql_ingest.sqlite_state_key()
-                        )?
-                        .is_none()
-                    );
-                    assert!(
-                        database::state::<StoredRemoteDeltaIngestAnchor>(
-                            connection,
-                            &sql_ingest.sqlite_anchor_key()
-                        )?
-                        .is_none()
-                    );
-                    Ok(())
-                })
-                .unwrap();
-            let unchanged_legacy = ingest.try_begin().unwrap();
-            assert_eq!(unchanged_legacy.pending_page().unwrap(), Some(pending));
-        });
-    }
-
-    #[test]
-    fn sqlite_remote_import_refuses_existing_unmarked_history_or_ingest() {
-        for history_conflict in [false, true] {
-            let root = tempdir().unwrap();
-            let binding = binding_with(1, 1, 60);
-            let legacy =
-                SourceHistoryStore::new(root.path().to_path_buf(), PROFILE.parse().unwrap());
-            with_history_writer(
-                root.path(),
-                PROFILE,
-                binding.redaction_profile,
-                |_history, writer| {
-                    writer
-                        .save_source_metadata(
-                            &SourceMetadata::new(
-                                binding.source.node_id.clone(),
-                                SourceKind::Ssh,
-                                "remote",
-                            )
-                            .unwrap(),
-                        )
-                        .unwrap();
-                },
-            );
-            with_sqlite_history_writer(
-                root.path(),
-                binding.redaction_profile,
-                |history, writer| {
-                    writer
-                        .save_source_metadata(
-                            &legacy
-                                .load_source_metadata(&binding.source.node_id)
-                                .unwrap(),
-                        )
-                        .unwrap();
-                    let ingest =
-                        RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
-                    let mut session = ingest.try_begin().unwrap();
-                    if history_conflict {
-                        session.start_bootstrap(writer).unwrap();
-                    }
-                    drop(session);
-                    let db = history.sqlite_database().unwrap();
-                    let before: Vec<(String, serde_json::Value)> = db
-                        .read(|connection| database::states(connection, ""))
-                        .unwrap();
-                    let error = history
-                        .import_legacy_remote_sqlite_state(&legacy)
-                        .unwrap_err();
-                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                    assert!(error.to_string().contains("without an import marker"));
-                    let after: Vec<(String, serde_json::Value)> = db
-                        .read(|connection| database::states(connection, ""))
-                        .unwrap();
-                    assert_eq!(after, before);
-                },
-            );
-        }
     }
 
     #[test]
@@ -4952,7 +3112,27 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(first.namespaces_removed, 1);
-                assert!(!source_namespace.exists());
+                assert!(source_namespace.is_dir());
+                history_database(history)
+                    .unwrap()
+                    .read(|connection| {
+                        assert!(
+                            database::state::<StoredRemoteDeltaIngestState>(
+                                connection,
+                                &ingest.sqlite_state_key()
+                            )?
+                            .is_none()
+                        );
+                        assert!(
+                            database::state::<StoredRemoteDeltaIngestAnchor>(
+                                connection,
+                                &ingest.sqlite_anchor_key()
+                            )?
+                            .is_none()
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
                 let replay = purge_remote_ingest_state_for_source(
                     history,
                     &binding.source().node_id,
@@ -4961,52 +3141,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(replay.namespaces_removed, 0);
             },
-        );
-    }
-
-    #[test]
-    fn source_purge_refuses_unknown_ingest_layout_without_removing_it() {
-        let root = tempdir().unwrap();
-        let binding = binding_with(1, 1, 60);
-        let ingest = store(root.path(), binding.clone());
-        drop(ingest.try_begin().unwrap());
-        let unexpected = ingest.source_namespace_directory().join("unexpected");
-        fs::write(&unexpected, b"keep").unwrap();
-
-        with_history_writer(
-            root.path(),
-            PROFILE,
-            RedactionProfile::Redacted,
-            |history, writer| {
-                let error = purge_remote_ingest_state_for_source(
-                    history,
-                    &binding.source().node_id,
-                    writer,
-                )
-                .unwrap_err();
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            },
-        );
-        assert!(unexpected.is_file());
-    }
-
-    #[test]
-    fn active_replacement_generation_is_stable_and_page_bound() {
-        let first = PreparedRemoteDeltaPageId(format!(
-            "{PREPARED_PAGE_PREFIX}{}",
-            "1".repeat(SHA256_HEX_LEN)
-        ));
-        let second = PreparedRemoteDeltaPageId(format!(
-            "{PREPARED_PAGE_PREFIX}{}",
-            "2".repeat(SHA256_HEX_LEN)
-        ));
-        let generation = active_replacement_generation(&first).unwrap();
-        assert_eq!(generation, active_replacement_generation(&first).unwrap());
-        assert_ne!(generation, active_replacement_generation(&second).unwrap());
-        assert!(generation.as_str().starts_with(INGEST_GENERATION_PREFIX));
-        assert_eq!(
-            generation.as_str().len(),
-            INGEST_GENERATION_PREFIX.len() + INGEST_GENERATION_RANDOM_BYTES * 2
         );
     }
 
@@ -5065,156 +3199,6 @@ mod tests {
                 exact_range: None,
                 known_live_revision: None,
             }
-        );
-    }
-
-    #[test]
-    fn upgrade_replays_saved_lower_live_revision_in_a_new_journal_without_deleting_history() {
-        let root = tempdir().unwrap();
-        let binding = live_binding_with(1, 1);
-        let ingest = store(root.path(), binding.clone());
-        let range = export_range(at(30, 3, 0), 60);
-        with_history_writer(
-            root.path(),
-            PROFILE,
-            binding.redaction_profile,
-            |history, writer| {
-                writer
-                    .save_source_metadata(
-                        &SourceMetadata::new(
-                            binding.source.node_id.clone(),
-                            SourceKind::Ssh,
-                            "remote",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                let full = |revision| RemoteLiveState {
-                    live_revision: nonzero64(revision),
-                    snapshot: Some(RemoteLiveSnapshot {
-                        captured_at: at(30, 3, 59),
-                        tasks: vec![],
-                        turns: vec![],
-                    }),
-                };
-                writer
-                    .record_remote_live_state(
-                        &binding.source,
-                        &binding.revisions,
-                        binding.redaction_profile,
-                        nonzero64(7),
-                        true,
-                        &full(2),
-                        &[],
-                        at(30, 4, 0),
-                        at(30, 4, 0),
-                        true,
-                        &[],
-                        &[],
-                    )
-                    .unwrap();
-                let mut session = ingest.try_begin().unwrap();
-                session.start_bootstrap(writer).unwrap();
-                assert_eq!(
-                    session.next_request_position().unwrap().known_live_revision,
-                    None
-                );
-                // This request was persisted by the pre-fix center, which leaked
-                // the previous journal's known revision into cursorless bootstrap.
-                let mut old_request = request(&binding, None, range.clone());
-                let RemoteExportRequestBody::Delta(delta) = &mut old_request.request else {
-                    unreachable!()
-                };
-                delta.known_live_revision = Some(nonzero64(2));
-                let mut payload = payload_for(range.clone(), vec![], vec![]);
-                payload.live = Some(full(1));
-                let response = response(&binding, range, empty_page(9, 0), payload);
-                session
-                    .prepare_page(&old_request, &response, at(30, 4, 1))
-                    .unwrap();
-                drop(session);
-                let mut recovered = ingest.try_begin().unwrap();
-                let page = recovered.pending_page().unwrap().unwrap();
-                apply_remote_delta_records(&recovered, writer, &page, at(30, 4, 2)).unwrap();
-                apply_remote_live_state(&recovered, writer, &page).unwrap();
-                drop(recovered); // Crash after live publication, before cursor acknowledgement.
-                recovered = ingest.try_begin().unwrap();
-                let page = recovered.pending_page().unwrap().unwrap();
-                apply_and_commit_remote_delta_page(&mut recovered, writer, &page, at(30, 4, 3))
-                    .unwrap();
-                activate_remote_delta_bootstrap(&mut recovered, writer, at(30, 4, 3)).unwrap();
-                assert_eq!(
-                    recovered
-                        .next_request_position()
-                        .unwrap()
-                        .known_live_revision,
-                    Some(nonzero64(1))
-                );
-                assert!(recovered.pending_page().unwrap().is_none());
-                let live = history
-                    .load_remote_live_state(&binding.source.node_id)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(live.journal_generation, Some(nonzero64(9)));
-                assert_eq!(
-                    live.received_at,
-                    at(30, 4, 1),
-                    "replay must not make old data look newly received"
-                );
-                // The other pre-upgrade WAL shape is revision-only. Keep its
-                // old display cache stale and force a full next exchange.
-                let path = history
-                    .source_directory(&binding.source.node_id)
-                    .join(binding.redaction_profile.directory_name())
-                    .join("remote-live.json");
-                let mut cached: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                cached.as_object_mut().unwrap().remove("journalGeneration");
-                cached["formatVersion"] = serde_json::json!(1);
-                std::fs::write(path, serde_json::to_vec(&cached).unwrap()).unwrap();
-                let next_range = export_range(at(30, 3, 0), 60);
-                let mut old_request = request(
-                    &binding,
-                    Some(DeltaCursor {
-                        generation: nonzero64(9),
-                        sequence: 0,
-                    }),
-                    next_range.clone(),
-                );
-                let RemoteExportRequestBody::Delta(delta) = &mut old_request.request else {
-                    unreachable!()
-                };
-                delta.known_live_revision = Some(nonzero64(1));
-                let mut payload = payload_for(next_range.clone(), vec![], vec![]);
-                payload.live = Some(RemoteLiveState {
-                    live_revision: nonzero64(1),
-                    snapshot: None,
-                });
-                let next_response = self::response(&binding, next_range, empty_page(9, 0), payload);
-                recovered
-                    .prepare_page(&old_request, &next_response, at(30, 4, 2))
-                    .unwrap();
-                drop(recovered);
-                let mut recovered = ingest.try_begin().unwrap();
-                let page = recovered.pending_page().unwrap().unwrap();
-                apply_and_commit_remote_delta_page(&mut recovered, writer, &page, at(30, 4, 3))
-                    .unwrap();
-                assert_eq!(
-                    recovered
-                        .next_request_position()
-                        .unwrap()
-                        .known_live_revision,
-                    None
-                );
-                assert_eq!(
-                    history
-                        .load_remote_live_state(&binding.source.node_id)
-                        .unwrap()
-                        .unwrap()
-                        .received_at,
-                    at(30, 4, 1)
-                );
-            },
         );
     }
 
@@ -5311,13 +3295,18 @@ mod tests {
                     .unwrap();
                 drop(unchanged);
 
-                std::fs::remove_file(
-                    history
-                        .source_directory(&binding.source.node_id)
-                        .join(binding.redaction_profile.directory_name())
-                        .join("remote-live.json"),
-                )
-                .unwrap();
+                let database = history_database(history).unwrap();
+                let live_key = database
+                    .namespace(
+                        &history
+                            .source_directory(&binding.source.node_id)
+                            .join(binding.redaction_profile.directory_name())
+                            .join("remote-live.json"),
+                    )
+                    .unwrap();
+                database
+                    .write(|connection| database::delete_state(connection, &live_key))
+                    .unwrap();
                 let missing = ingest.try_begin().unwrap();
                 let missing_position = missing.next_request_position().unwrap();
                 assert_eq!(missing_position.delta_cursor, position.delta_cursor);
@@ -5375,7 +3364,7 @@ mod tests {
     }
 
     #[test]
-    fn multipage_bootstrap_is_invisible_until_activation_and_replays_manifest_first() {
+    fn multipage_bootstrap_is_invisible_and_activation_rolls_back_atomically() {
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
         let ingest = store(root.path(), binding.clone());
@@ -5540,36 +3529,22 @@ mod tests {
                 )
                 .unwrap();
 
-                // Simulate a process exit after the atomic history switch but
-                // before the ingest cursor commit.
                 let ready = replacement_second
                     .bootstrap_activation_required()
                     .unwrap()
                     .unwrap();
-                let history_generation = source_history_generation(&ready.generation).unwrap();
-                let expected_active = replacement_second
-                    .state
-                    .bootstrap
-                    .as_ref()
-                    .unwrap()
-                    .expected_active
-                    .as_ref()
-                    .map(source_history_active_ref)
-                    .transpose()
-                    .unwrap();
-                let candidate_binding = source_history_binding(&binding).unwrap();
-                writer
-                    .activate_remote_history_generation(
-                        &binding.source.node_id,
-                        binding.redaction_profile,
-                        expected_active.as_ref(),
-                        &history_generation,
-                        &candidate_binding,
-                        at(30, 4, 3),
-                    )
-                    .unwrap();
+                let db = history_database(history).unwrap();
+                db.write(|connection| {
+                    let key = ingest.sqlite_state_key();
+                    connection.execute_batch(&format!("CREATE TRIGGER fail_ingest_activation BEFORE INSERT ON history_state WHEN NEW.state_key = '{key}' BEGIN SELECT RAISE(ABORT, 'injected ingest activation failure'); END;")).map_err(io::Error::other)?;
+                    let error = activate_remote_delta_bootstrap(&mut replacement_second, writer, at(30, 4, 4)).unwrap_err();
+                    assert!(error.to_string().contains("injected ingest activation failure"));
+                    assert_eq!(loaded_bucket_totals(history, &binding), vec![10, 20]);
+                    assert!(replacement_second.status().activation_required);
+                    connection.execute_batch("DROP TRIGGER fail_ingest_activation").map_err(io::Error::other)?;
+                    Ok(())
+                }).unwrap();
                 drop(replacement_second);
-                assert_eq!(loaded_bucket_totals(history, &binding), vec![30, 40]);
 
                 let mut recovered = ingest.try_begin().unwrap();
                 assert!(recovered.status().activation_required);
@@ -5582,7 +3557,16 @@ mod tests {
                     replayed.cleanup,
                     RemoteGenerationCleanup::Completed(RemoteHistoryGenerationGcOutcome::Deleted)
                 );
-                assert!(!first_active_directory.exists());
+                let old_key = db
+                    .namespace(&first_active_directory.join("generation.json"))
+                    .unwrap();
+                assert!(
+                    db.read(|connection| database::state::<serde_json::Value>(
+                        connection, &old_key
+                    ))
+                    .unwrap()
+                    .is_none()
+                );
                 assert_eq!(recovered.status().active_generation, Some(ready.generation));
                 assert_eq!(recovered.status().active_cursor, Some(ready.cursor));
                 assert!(!recovered.status().activation_required);
@@ -5804,7 +3788,7 @@ mod tests {
                 let error = apply_remote_delta_records(&session, writer, &tampered, at(30, 4, 0))
                     .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-                assert!(error.to_string().contains("pending WAL"));
+                assert!(error.to_string().contains("prepared page"));
                 page
             },
         );
@@ -5838,299 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_wal_replays_out_of_range_global_transition_before_cursor_commit() {
-        let root = tempdir().unwrap();
-        let binding = binding_with(1, 1, 60);
-        let history = SourceHistoryStore::new(root.path().to_path_buf(), PROFILE.parse().unwrap());
-        let ingest = store(root.path(), binding.clone());
-        let initial_range = export_range(at(30, 1, 0), 60);
-        let initial_request = request(&binding, None, initial_range.clone());
-        let initial_response = response(
-            &binding,
-            initial_range.clone(),
-            empty_page(9, 0),
-            payload_for(initial_range, Vec::new(), Vec::new()),
-        );
-
-        let ownership = HistoryOwnershipStore::new(
-            root.path().to_path_buf(),
-            PROFILE.parse().unwrap(),
-            RedactionProfile::Redacted,
-        );
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let v1 = match ownership.initialize_v1_active(&lease).unwrap() {
-            InitializeV1Outcome::Initialized(manifest)
-            | InitializeV1Outcome::Existing(manifest) => manifest,
-        };
-        let migrating = match ownership.begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-        };
-        let authority = ownership.authorize_v2_write(&lease, &migrating).unwrap();
-        let writer = history.writer(&authority).unwrap();
-        writer
-            .save_source_metadata(
-                &SourceMetadata::new(binding.source.node_id.clone(), SourceKind::Ssh, "remote")
-                    .unwrap(),
-            )
-            .unwrap();
-
-        let mut session = ingest.try_begin().unwrap();
-        session.start_bootstrap(&writer).unwrap();
-        let bootstrap = session
-            .prepare_page(
-                &initial_request,
-                &initial_response,
-                initial_response.observed_at,
-            )
-            .unwrap();
-        assert!(matches!(
-            bootstrap.target,
-            RemoteDeltaApplyTarget::Staging(_)
-        ));
-        apply_and_commit_remote_delta_page(&mut session, &writer, &bootstrap, at(30, 4, 1))
-            .unwrap();
-        let activation = activate_remote_delta_bootstrap(&mut session, &writer, at(30, 4, 2))
-            .unwrap()
-            .unwrap();
-        assert_eq!(activation.cleanup, RemoteGenerationCleanup::NotRequired);
-        let initial_active_generation = session.status().active_generation.unwrap();
-        let initial_active_directory = history.source_remote_history_generation_directory(
-            &binding.source.node_id,
-            binding.redaction_profile,
-            &source_history_generation(&initial_active_generation).unwrap(),
-        );
-        drop(session);
-
-        let next_range = export_range(at(30, 2, 0), 60);
-        let next_request = request(
-            &binding,
-            Some(DeltaCursor {
-                generation: nonzero64(9),
-                sequence: 0,
-            }),
-            next_range.clone(),
-        );
-        // This journal transition is intentionally outside the coverage range.
-        // A global cursor must still ingest it before advancing.
-        let outside_range = at(29, 0, 0);
-        let (page, changes) = tombstone_page(9, 1, outside_range);
-        let next_response = response(
-            &binding,
-            next_range.clone(),
-            page,
-            payload_for(next_range, changes, Vec::new()),
-        );
-
-        let mut session = ingest.try_begin().unwrap();
-        let prepared = session
-            .prepare_page(&next_request, &next_response, next_response.observed_at)
-            .unwrap();
-        assert!(matches!(
-            prepared.target,
-            RemoteDeltaApplyTarget::ActiveCow { .. }
-        ));
-        let RemoteDeltaApplyTarget::ActiveCow {
-            expected_generation,
-            replacement_generation,
-        } = &prepared.target
-        else {
-            unreachable!();
-        };
-        assert_eq!(expected_generation, &initial_active_generation);
-        assert_eq!(
-            replacement_generation,
-            &active_replacement_generation(&prepared.id).unwrap()
-        );
-        apply_remote_delta_records(&session, &writer, &prepared, at(30, 4, 3)).unwrap();
-        assert_eq!(
-            history
-                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
-                .unwrap()
-                .unwrap()
-                .generation()
-                .as_str(),
-            replacement_generation.as_str()
-        );
-        assert_eq!(
-            session.status().active_generation,
-            Some(initial_active_generation.clone())
-        );
-        assert!(initial_active_directory.exists());
-        drop(session); // Crash after history apply but before cursor commit.
-
-        let mut recovered = ingest.try_begin().unwrap();
-        let replay = recovered.pending_page().unwrap().unwrap();
-        assert_eq!(replay, prepared);
-        let unknown_namespace = ingest.source_namespace_directory().join("unexpected");
-        history
-            .prepare_private_directory(&unknown_namespace)
-            .unwrap();
-        let replay_report =
-            apply_and_commit_remote_delta_page(&mut recovered, &writer, &replay, at(30, 4, 4))
-                .unwrap();
-        assert!(matches!(
-            replay_report.cleanup,
-            RemoteGenerationCleanup::Deferred {
-                error_kind: io::ErrorKind::InvalidData,
-                ..
-            }
-        ));
-        assert!(initial_active_directory.exists());
-        assert_eq!(recovered.status().active_cursor.unwrap().sequence, 1);
-        assert_eq!(
-            recovered.status().active_generation,
-            Some(replacement_generation.clone())
-        );
-        assert_eq!(recovered.status().deferred_cleanup_count, 1);
-        drop(recovered);
-
-        fs::remove_dir(unknown_namespace).unwrap();
-        let mut cleanup = ingest.try_begin().unwrap();
-        assert_eq!(
-            retry_deferred_remote_generation_cleanup(&mut cleanup, &writer).unwrap(),
-            vec![RemoteGenerationCleanup::Completed(
-                RemoteHistoryGenerationGcOutcome::Deleted
-            )]
-        );
-        assert_eq!(cleanup.status().deferred_cleanup_count, 0);
-        assert!(!initial_active_directory.exists());
-        drop(cleanup);
-
-        let second_range = export_range(at(30, 3, 0), 60);
-        let second_request = request(
-            &binding,
-            Some(DeltaCursor {
-                generation: nonzero64(9),
-                sequence: 1,
-            }),
-            second_range.clone(),
-        );
-        let (second_delta_page, second_changes) = tombstone_page(9, 2, at(29, 0, 15));
-        let second_response = response(
-            &binding,
-            second_range.clone(),
-            second_delta_page,
-            payload_for(second_range, second_changes, Vec::new()),
-        );
-        let mut second = ingest.try_begin().unwrap();
-        let second_prepared = second
-            .prepare_page(
-                &second_request,
-                &second_response,
-                second_response.observed_at,
-            )
-            .unwrap();
-        let RemoteDeltaApplyTarget::ActiveCow {
-            expected_generation: second_expected,
-            replacement_generation: second_replacement,
-        } = &second_prepared.target
-        else {
-            unreachable!();
-        };
-        assert_eq!(second_expected, replacement_generation);
-        assert_ne!(second_replacement, replacement_generation);
-        let second_report = apply_and_commit_remote_delta_page(
-            &mut second,
-            &writer,
-            &second_prepared,
-            at(30, 4, 5),
-        )
-        .unwrap();
-        assert_eq!(
-            second_report.cleanup,
-            RemoteGenerationCleanup::Completed(RemoteHistoryGenerationGcOutcome::Deleted)
-        );
-        assert_eq!(second.status().active_cursor.unwrap().sequence, 2);
-        assert_eq!(
-            second.status().active_generation,
-            Some(second_replacement.clone())
-        );
-
-        let records = history
-            .load_source_records_since(
-                &binding.source.node_id,
-                binding.redaction_profile,
-                outside_range,
-            )
-            .unwrap()
-            .records;
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].starts_at(), outside_range);
-        assert_eq!(records[0].revision(), 1);
-
-        let stable_generation = second_replacement.clone();
-        let generations_directory = history
-            .source_remote_history_generation_directory(
-                &binding.source.node_id,
-                binding.redaction_profile,
-                &source_history_generation(&stable_generation).unwrap(),
-            )
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let generation_count_before = fs::read_dir(&generations_directory).unwrap().count();
-        drop(second);
-
-        let empty_range = export_range(at(30, 4, 0), 60);
-        let empty_request = request(
-            &binding,
-            Some(DeltaCursor {
-                generation: nonzero64(9),
-                sequence: 2,
-            }),
-            empty_range.clone(),
-        );
-        let empty_response = response(
-            &binding,
-            empty_range.clone(),
-            empty_page(9, 2),
-            payload_for(empty_range, Vec::new(), Vec::new()),
-        );
-        let mut empty = ingest.try_begin().unwrap();
-        let empty_prepared = empty
-            .prepare_page(&empty_request, &empty_response, empty_response.observed_at)
-            .unwrap();
-        assert_eq!(
-            empty_prepared.target,
-            RemoteDeltaApplyTarget::ActiveNoop {
-                expected_generation: stable_generation.clone(),
-            }
-        );
-        apply_remote_delta_records(&empty, &writer, &empty_prepared, at(30, 4, 6)).unwrap();
-        assert_eq!(
-            history
-                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
-                .unwrap()
-                .unwrap()
-                .generation(),
-            &source_history_generation(&stable_generation).unwrap()
-        );
-        assert_eq!(
-            fs::read_dir(&generations_directory).unwrap().count(),
-            generation_count_before
-        );
-        drop(empty); // Crash after the no-op active-ref check, before cursor/WAL commit.
-
-        let mut empty_replay = ingest.try_begin().unwrap();
-        let replay = empty_replay.pending_page().unwrap().unwrap();
-        assert_eq!(replay, empty_prepared);
-        apply_and_commit_remote_delta_page(&mut empty_replay, &writer, &replay, at(30, 4, 7))
-            .unwrap();
-        assert_eq!(
-            empty_replay.status().active_generation,
-            Some(stable_generation)
-        );
-        assert_eq!(empty_replay.status().active_cursor.unwrap().sequence, 2);
-        assert!(empty_replay.status().pending_page.is_none());
-        assert_eq!(
-            fs::read_dir(generations_directory).unwrap().count(),
-            generation_count_before
-        );
-    }
-
-    #[test]
-    fn repeated_active_cow_pages_stay_below_generation_capacity() {
+    fn repeated_active_pages_keep_one_generation() {
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
         let ingest = store(root.path(), binding.clone());
@@ -6210,12 +3902,7 @@ mod tests {
                         at(30, 4, 1),
                     )
                     .unwrap();
-                    assert_eq!(
-                        report.cleanup,
-                        RemoteGenerationCleanup::Completed(
-                            RemoteHistoryGenerationGcOutcome::Deleted
-                        )
-                    );
+                    assert_eq!(report.cleanup, RemoteGenerationCleanup::NotRequired);
                     assert_eq!(session.status().deferred_cleanup_count, 0);
                 }
 
@@ -6223,16 +3910,28 @@ mod tests {
                     .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
                     .unwrap()
                     .unwrap();
-                let generations = history
-                    .source_remote_history_generation_directory(
+                assert_eq!(loaded_bucket_totals(history, &binding), vec![40]);
+                let db = history_database(history).unwrap();
+                let generation_namespace = db
+                    .namespace(&history.source_remote_history_generation_directory(
                         &binding.source.node_id,
                         binding.redaction_profile,
                         active.generation(),
-                    )
-                    .parent()
-                    .unwrap()
-                    .to_path_buf();
-                assert_eq!(fs::read_dir(generations).unwrap().count(), 1);
+                    ))
+                    .unwrap();
+                db.read(|connection| {
+                    let metadata =
+                        database::states::<serde_json::Value>(connection, &generation_namespace)?;
+                    assert_eq!(
+                        metadata
+                            .iter()
+                            .filter(|(key, _)| key.ends_with("/generation.json"))
+                            .count(),
+                        1
+                    );
+                    Ok(())
+                })
+                .unwrap();
             },
         );
     }
@@ -6337,12 +4036,30 @@ mod tests {
                     binding.redaction_profile,
                     &source_history_generation(&expired_generation).unwrap(),
                 );
-                assert!(expired_directory.exists());
+                let db = history_database(history).unwrap();
+                let generation_key = db
+                    .namespace(&expired_directory.join("generation.json"))
+                    .unwrap();
+                assert!(
+                    db.read(|connection| database::state::<serde_json::Value>(
+                        connection,
+                        &generation_key
+                    ))
+                    .unwrap()
+                    .is_some()
+                );
                 let replacement = resumed
                     .restart_bootstrap_after_cursor_expiry(writer)
                     .unwrap();
                 assert_ne!(replacement, expired_generation);
-                assert!(!expired_directory.exists());
+                assert!(
+                    db.read(|connection| database::state::<serde_json::Value>(
+                        connection,
+                        &generation_key
+                    ))
+                    .unwrap()
+                    .is_none()
+                );
                 assert_eq!(resumed.status().deferred_cleanup_count, 0);
                 assert_eq!(
                     resumed.next_request_position().unwrap(),
@@ -6353,6 +4070,55 @@ mod tests {
                     }
                 );
                 assert!(resumed.bootstrap_activation_required().unwrap().is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn uncommitted_prepared_page_is_discarded_after_restart() {
+        let root = tempdir().unwrap();
+        let binding = binding_with(1, 1, 60);
+        with_history_writer(
+            root.path(),
+            PROFILE,
+            binding.redaction_profile,
+            |history, writer| {
+                writer
+                    .save_source_metadata(
+                        &SourceMetadata::new(
+                            binding.source.node_id.clone(),
+                            SourceKind::Ssh,
+                            "remote",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let ingest = store(root.path(), binding.clone());
+                let mut session = ingest.try_begin().unwrap();
+                let generation = session.start_bootstrap(writer).unwrap();
+                let range = export_range(at(30, 1, 0), 60);
+                let req = request(&binding, None, range.clone());
+                let rsp = response(
+                    &binding,
+                    range.clone(),
+                    one_change_page(9, 1, false),
+                    payload_for(
+                        range,
+                        vec![bucket_change(&binding, 1, at(30, 1, 0), 10)],
+                        Vec::new(),
+                    ),
+                );
+                session.prepare_page(&req, &rsp, rsp.observed_at).unwrap();
+                drop(session);
+                let recovered = ingest.try_begin().unwrap();
+                assert!(recovered.pending_page().unwrap().is_none());
+                assert_eq!(recovered.status().bootstrap_generation, Some(generation));
+                assert_eq!(
+                    recovered.next_request_position().unwrap().delta_cursor,
+                    None
+                );
+                assert!(!recovered.status().activation_required);
+                assert!(loaded_bucket_totals(history, &binding).is_empty());
             },
         );
     }
@@ -6513,141 +4279,6 @@ mod tests {
     }
 
     #[test]
-    fn ingest_create_once_publishes_complete_inode_without_clobbering() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("anchor.json");
-        let first = serde_json::json!({"winner": 1});
-        let second = serde_json::json!({"winner": 2});
-
-        create_private_json_once(&path, &first, 1024, "test anchor").unwrap();
-        create_private_json_once(&path, &second, 1024, "test anchor").unwrap();
-
-        let loaded: serde_json::Value = read_private_json(&path, 1024, "test anchor").unwrap();
-        assert_eq!(loaded, first);
-        assert!(
-            fs::read_dir(root.path())
-                .unwrap()
-                .all(|entry| !is_remote_ingest_temporary_name(&entry.unwrap().file_name()))
-        );
-    }
-
-    #[test]
-    fn ingest_session_recovers_only_exact_atomic_temporary_files() {
-        let root = tempdir().unwrap();
-        let ingest = store(root.path(), binding_with(1, 1, 60));
-        ingest.try_begin().unwrap();
-
-        let (temporary_path, mut temporary) =
-            create_private_temp(&ingest.namespace_directory(), "orphaned ingest write").unwrap();
-        temporary.write_all(b"partial").unwrap();
-        temporary.sync_all().unwrap();
-        drop(temporary);
-        let unknown = ingest
-            .namespace_directory()
-            .join(".remote-ingest.tmp.not-a-pid.1");
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        configure_private_open(&mut options, false);
-        options.open(&unknown).unwrap().sync_all().unwrap();
-
-        ingest.try_begin().unwrap();
-
-        assert!(!temporary_path.exists());
-        assert!(unknown.exists());
-        assert!(!is_remote_ingest_temporary_name(
-            unknown.file_name().unwrap()
-        ));
-    }
-
-    #[test]
-    fn generation_gc_scans_every_binding_and_fails_closed_on_unknown_namespaces() {
-        let root = tempdir().unwrap();
-        let binding = binding_with(1, 1, 60);
-        let other_binding = binding_with(1, 1, 120);
-        let ingest = store(root.path(), binding.clone());
-        let other_ingest = store(root.path(), other_binding.clone());
-
-        with_history_writer(
-            root.path(),
-            PROFILE,
-            binding.redaction_profile,
-            |history, writer| {
-                writer
-                    .save_source_metadata(
-                        &SourceMetadata::new(
-                            binding.source.node_id.clone(),
-                            SourceKind::Ssh,
-                            "remote",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-
-                let protected = {
-                    let mut other = other_ingest.try_begin().unwrap();
-                    other.start_bootstrap(writer).unwrap()
-                };
-                assert_eq!(
-                    garbage_collect_retired_remote_history_generation(&ingest, writer, &protected,)
-                        .unwrap(),
-                    RemoteHistoryGenerationGcOutcome::SkippedProtected
-                );
-                assert!(
-                    history
-                        .source_remote_history_generation_directory(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &source_history_generation(&protected).unwrap(),
-                        )
-                        .exists()
-                );
-
-                let retired = RemoteHistoryGenerationId::generate().unwrap();
-                writer
-                    .ensure_remote_history_generation(
-                        &binding.source.node_id,
-                        binding.redaction_profile,
-                        &source_history_generation(&retired).unwrap(),
-                        &source_history_binding(&binding).unwrap(),
-                    )
-                    .unwrap();
-                let unknown = ingest.source_namespace_directory().join("unexpected");
-                history.prepare_private_directory(&unknown).unwrap();
-                let error =
-                    garbage_collect_retired_remote_history_generation(&ingest, writer, &retired)
-                        .unwrap_err();
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert!(error.to_string().contains("binding namespace"));
-                assert!(
-                    history
-                        .source_remote_history_generation_directory(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &source_history_generation(&retired).unwrap(),
-                        )
-                        .exists()
-                );
-                fs::remove_dir(&unknown).unwrap();
-
-                assert_eq!(
-                    garbage_collect_retired_remote_history_generation(&ingest, writer, &retired)
-                        .unwrap(),
-                    RemoteHistoryGenerationGcOutcome::Deleted
-                );
-                assert!(
-                    !history
-                        .source_remote_history_generation_directory(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &source_history_generation(&retired).unwrap(),
-                        )
-                        .exists()
-                );
-            },
-        );
-    }
-
-    #[test]
     fn bounded_sweep_removes_orphans_but_keeps_other_binding_roots() {
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
@@ -6689,7 +4320,6 @@ mod tests {
                     sweep_unreferenced_remote_history_generations(&session, writer).unwrap(),
                     RemoteHistoryGenerationSweepReport {
                         deleted: 1,
-                        recovered: 0,
                         skipped: 1,
                         remaining: 0,
                     }
@@ -6703,15 +4333,25 @@ mod tests {
                         )
                         .exists()
                 );
-                assert!(
-                    history
-                        .source_remote_history_generation_directory(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &source_history_generation(&protected).unwrap(),
-                        )
-                        .exists()
-                );
+                let db = history_database(history).unwrap();
+                let namespace = db
+                    .namespace(
+                        &history
+                            .source_remote_history_generation_directory(
+                                &binding.source.node_id,
+                                binding.redaction_profile,
+                                &source_history_generation(&protected).unwrap(),
+                            )
+                            .join("generation.json"),
+                    )
+                    .unwrap();
+                db.read(|connection| {
+                    assert!(
+                        database::state::<serde_json::Value>(connection, &namespace)?.is_some()
+                    );
+                    Ok(())
+                })
+                .unwrap();
             },
         );
     }
@@ -6720,34 +4360,45 @@ mod tests {
     fn binding_namespace_cap_allows_recovery_but_rejects_new_bindings() {
         let root = tempdir().unwrap();
         let ingest = store(root.path(), binding_with(1, 1, 60));
-        ingest.prepare_source_namespace().unwrap();
-        ingest
-            .history_store
-            .prepare_private_directory(&ingest.namespace_directory())
-            .unwrap();
-
-        let mut created = 1_usize;
-        for index in 0_u64.. {
-            if created == MAX_BINDING_NAMESPACES_PER_SOURCE {
-                break;
+        drop(ingest.try_begin().unwrap());
+        let db = history_database(&ingest.history_store).unwrap();
+        db.write(|connection| {
+            for window in 61..(60 + MAX_BINDING_NAMESPACES_PER_SOURCE as u32) {
+                let binding = binding_with(1, 1, window);
+                let key = format!(
+                    "{}{}/state",
+                    ingest.sqlite_source_prefix(),
+                    binding_namespace_component(&binding)?
+                );
+                database::set_state(
+                    connection,
+                    &key,
+                    &StoredRemoteDeltaIngestState::new(binding),
+                )?;
             }
-            let name = format!("{BINDING_NAMESPACE_PREFIX}{index:064x}");
-            if name == ingest.binding_namespace {
-                continue;
-            }
-            ingest
-                .history_store
-                .prepare_private_directory(&ingest.source_namespace_directory().join(name))
-                .unwrap();
-            created += 1;
-        }
-
-        ingest.try_begin().unwrap();
-        let additional = store(root.path(), binding_with(1, 1, 120));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(|connection| {
+                Ok(database::states::<StoredRemoteDeltaIngestState>(
+                    connection,
+                    &ingest.sqlite_source_prefix(),
+                )?
+                .len())
+            })
+            .unwrap(),
+            MAX_BINDING_NAMESPACES_PER_SOURCE,
+        );
+        drop(ingest.try_begin().unwrap());
+        // The filled window range is 60..124; choose a genuinely new binding.
+        let additional = store(
+            root.path(),
+            binding_with(1, 1, 60 + MAX_BINDING_NAMESPACES_PER_SOURCE as u32),
+        );
         let error = additional.try_begin().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        assert!(error.to_string().contains("binding namespace limit"));
-        assert!(!additional.namespace_directory().exists());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace count"));
     }
 
     #[cfg(windows)]
@@ -6755,7 +4406,10 @@ mod tests {
     fn open_windows_ingest_lock_prevents_path_replacement() {
         let root = tempdir().unwrap();
         let ingest = store(root.path(), binding_with(1, 1, 60));
-        ingest.prepare_source_namespace().unwrap();
+        ingest
+            .history_store
+            .prepare_private_directory(&ingest.source_namespace_directory())
+            .unwrap();
         let lock_path = ingest.lock_path();
         let displaced_path = ingest
             .source_namespace_directory()
@@ -6774,7 +4428,10 @@ mod tests {
     fn ingest_lock_rejects_a_path_replaced_before_post_lock_validation() {
         let root = tempdir().unwrap();
         let ingest = store(root.path(), binding_with(1, 1, 60));
-        ingest.prepare_source_namespace().unwrap();
+        ingest
+            .history_store
+            .prepare_private_directory(&ingest.source_namespace_directory())
+            .unwrap();
         let lock_path = ingest.lock_path();
         let displaced = open_private_lock(&lock_path).unwrap();
         let inherited = displaced.try_clone().unwrap();
@@ -6800,30 +4457,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ingest_namespace_and_files_are_private() {
+    fn ingest_coordination_lock_is_private_and_data_files_are_absent() {
         use std::os::unix::fs::PermissionsExt;
-
         let root = tempdir().unwrap();
         let ingest = store(root.path(), binding_with(1, 1, 60));
-        ingest.try_begin().unwrap();
+        drop(ingest.try_begin().unwrap());
         assert_eq!(
-            fs::metadata(ingest.namespace_directory())
+            fs::metadata(ingest.source_namespace_directory())
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777,
             0o700
         );
-        for name in [INGEST_STATE_FILE, INGEST_ANCHOR_FILE] {
-            assert_eq!(
-                fs::metadata(ingest.namespace_directory().join(name))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
         assert_eq!(
             fs::metadata(ingest.lock_path())
                 .unwrap()
@@ -6832,121 +4478,21 @@ mod tests {
                 & 0o777,
             0o600
         );
-    }
-
-    #[test]
-    fn preview_ingest_retirement_marker_survives_prepublication_crash_boundary() {
-        let root = tempdir().unwrap();
-        let preview_binding = RemoteDeltaIngestBinding::new(
-            PROFILE.parse().unwrap(),
-            source(1),
-            RedactionProfile::PreviewEnabled,
-            revisions(1),
-            RemoteDeltaRangePolicy::new(nonzero32(60), 60, false).unwrap(),
-        )
-        .unwrap();
-        let ingest = store(root.path(), preview_binding.clone());
-        drop(ingest.try_begin().unwrap());
-        assert!(ingest.namespace_directory().is_dir());
-
-        with_history_writer(
-            root.path(),
-            PROFILE,
-            RedactionProfile::Redacted,
-            |history, writer| {
-                writer
-                    .save_source_metadata(
-                        &SourceMetadata::new_with_redaction_profile(
-                            preview_binding.source.node_id.clone(),
-                            SourceKind::Ssh,
-                            "remote",
-                            RedactionProfile::PreviewEnabled,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    queue_remote_preview_ingest_retirement(
-                        history,
-                        &preview_binding.source.node_id,
-                        writer,
-                    )
-                    .unwrap(),
-                    RemoteIngestProfileRetirementStatus::Pending
-                );
-                assert_eq!(
-                    retry_remote_preview_ingest_retirement(
-                        history,
-                        &preview_binding.source.node_id,
-                        writer,
-                    )
-                    .unwrap(),
-                    RemoteIngestProfileRetirementStatus::Pending,
-                    "a marker queued before metadata publication must not delete visible preview state"
-                );
-                assert!(ingest.namespace_directory().is_dir());
-
-                writer
-                    .publish_remote_source_redaction_profile(
-                        &preview_binding.source.node_id,
-                        RedactionProfile::Redacted,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    retry_remote_preview_ingest_retirement(
-                        history,
-                        &preview_binding.source.node_id,
-                        writer,
-                    )
-                    .unwrap(),
-                    RemoteIngestProfileRetirementStatus::Complete
-                );
-                assert!(!ingest.namespace_directory().exists());
-                let retirement =
-                    RemoteIngestRetirementPaths::new(history, &preview_binding.source.node_id);
-                assert!(retirement.marker.is_file());
-
-                // Simulate Windows exposing a directory entry that appeared
-                // removed before a crash. The retained tombstone makes the
-                // cleanup replayable instead of accepting reappeared preview
-                // state as a completed retirement.
-                drop(ingest.try_begin().unwrap());
-                assert!(ingest.namespace_directory().is_dir());
-                assert_eq!(
-                    retry_remote_preview_ingest_retirement(
-                        history,
-                        &preview_binding.source.node_id,
-                        writer,
-                    )
-                    .unwrap(),
-                    RemoteIngestProfileRetirementStatus::Complete
-                );
-                assert!(!ingest.namespace_directory().exists());
-                assert!(retirement.marker.is_file());
-            },
-        );
-    }
-    #[test]
-    fn quota_sync_bootstrap_cow_replay_and_tombstones_keep_local_account_separate() {
-        quota_sync_bootstrap_replay_and_tombstones(false);
+        assert!(!ingest.namespace_directory().exists());
     }
 
     #[test]
     fn sqlite_quota_pages_incremental_replay_and_generation_gc_keep_active_stream() {
-        quota_sync_bootstrap_replay_and_tombstones(true);
+        quota_sync_bootstrap_and_tombstones();
     }
 
-    fn quota_sync_bootstrap_replay_and_tombstones(sqlite: bool) {
+    fn quota_sync_bootstrap_and_tombstones() {
         use crate::domain::Provenance;
         use crate::history::QuotaPoint;
         use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
-        let history = if sqlite {
-            SourceHistoryStore::new_sqlite(root.path().to_owned(), PROFILE.parse().unwrap())
-        } else {
-            SourceHistoryStore::new(root.path().to_owned(), PROFILE.parse().unwrap())
-        };
+        let history = SourceHistoryStore::new(root.path().to_owned(), PROFILE.parse().unwrap());
         let ingest = RemoteDeltaIngestStateStore::new(history, binding.clone()).unwrap();
         let range = export_range(at(30, 3, 0), 60);
         let make_change = |sequence, observed_at: DateTime<Utc>, remaining| RemoteQuotaChange {
@@ -6976,11 +4522,10 @@ mod tests {
             payload.stats.quota_changes_emitted = 1;
             response(&binding, range.clone(), page, payload)
         };
-        with_history_writer_backend(
+        with_history_writer(
             root.path(),
             PROFILE,
             binding.redaction_profile,
-            sqlite,
             |history, writer| {
                 writer
                     .save_source_metadata(
@@ -7048,26 +4593,28 @@ mod tests {
                         incremental_response.observed_at,
                     )
                     .unwrap();
-                apply_remote_delta_records(&session, writer, &prepared, at(30, 4, 3)).unwrap();
-                drop(session); // Crash after COW publication, before advancing the ingest cursor.
-                assert_eq!(read()[1].remaining_percent, 94.8);
+                drop(session); // Uncommitted preparation cannot change SQL data or cursor.
+                assert_eq!(read()[1].remaining_percent, 95.0);
                 let mut recovered = ingest.try_begin().unwrap();
-                let replay = recovered.pending_page().unwrap().unwrap();
-                let replay_commit = apply_and_commit_remote_delta_page(
+                assert!(recovered.pending_page().unwrap().is_none());
+                assert_eq!(recovered.status().active_cursor.unwrap().sequence, 2);
+                let prepared_again = recovered
+                    .prepare_page(
+                        &incremental_request,
+                        &incremental_response,
+                        incremental_response.observed_at,
+                    )
+                    .unwrap();
+                assert_eq!(prepared.id, prepared_again.id);
+                let commit = apply_and_commit_remote_delta_page(
                     &mut recovered,
                     writer,
-                    &replay,
+                    &prepared_again,
                     at(30, 4, 4),
                 )
                 .unwrap();
-                if sqlite {
-                    assert_eq!(
-                        replay_commit.cleanup,
-                        RemoteGenerationCleanup::Completed(
-                            RemoteHistoryGenerationGcOutcome::Deleted
-                        )
-                    );
-                }
+                assert_eq!(commit.cleanup, RemoteGenerationCleanup::NotRequired);
+                assert_eq!(read()[1].remaining_percent, 94.8);
                 assert_eq!(read().len(), 2);
                 let deletion = RemoteQuotaChange {
                     sequence: nonzero64(4),
@@ -7096,74 +4643,72 @@ mod tests {
                     .unwrap();
                 assert_eq!(read().len(), 1);
                 assert!(loaded_bucket_totals(history, &binding).is_empty());
-                if sqlite {
-                    let orphan: SourceHistoryRemoteGenerationId =
-                        "ingest-gen-ffffffffffffffffffffffffffffffff"
-                            .parse()
-                            .unwrap();
-                    let history_binding = source_history_binding(&binding).unwrap();
-                    writer
-                        .ensure_remote_history_generation(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &orphan,
-                            &history_binding,
-                        )
+                let orphan: SourceHistoryRemoteGenerationId =
+                    "ingest-gen-ffffffffffffffffffffffffffffffff"
+                        .parse()
                         .unwrap();
-                    writer
-                        .apply_remote_history_generation_page(
-                            &binding.source.node_id,
-                            binding.redaction_profile,
-                            &orphan,
-                            &history_binding,
-                            &[],
-                            &[],
-                            &[make_change(1, at(30, 3, 50), 80.0)],
-                        )
-                        .unwrap();
-                    let db = history.sqlite_database().unwrap();
-                    let quota_namespace = db
-                        .namespace(
-                            &history
-                                .source_remote_history_generation_directory(
-                                    &binding.source.node_id,
-                                    binding.redaction_profile,
-                                    &orphan,
-                                )
-                                .join("quota.json"),
-                        )
-                        .unwrap();
-                    assert!(
-                        db.read(|connection| database::state::<serde_json::Value>(
-                            connection,
-                            &quota_namespace
-                        ))
-                        .unwrap()
-                        .is_some()
-                    );
-                    let swept =
-                        sweep_unreferenced_remote_history_generations(&recovered, writer).unwrap();
-                    assert_eq!(swept.deleted, 1);
-                    assert!(swept.skipped >= 1);
-                    db.read(|connection| {
-                        assert!(
-                            database::state::<serde_json::Value>(connection, &quota_namespace)?
-                                .is_none()
-                        );
-                        assert!(
-                            database::records::<serde_json::Value>(
-                                connection,
-                                &quota_namespace,
-                                i64::MIN,
-                                &mut crate::source_history::SourceHistoryReadBudget::for_query()
-                            )?
-                            .is_empty()
-                        );
-                        Ok(())
-                    })
+                let history_binding = source_history_binding(&binding).unwrap();
+                writer
+                    .ensure_remote_history_generation(
+                        &binding.source.node_id,
+                        binding.redaction_profile,
+                        &orphan,
+                        &history_binding,
+                    )
                     .unwrap();
-                    assert_eq!(read().len(), 1);
-                }
+                writer
+                    .apply_remote_history_generation_page(
+                        &binding.source.node_id,
+                        binding.redaction_profile,
+                        &orphan,
+                        &history_binding,
+                        &[],
+                        &[],
+                        &[make_change(1, at(30, 3, 50), 80.0)],
+                    )
+                    .unwrap();
+                let db = history.sqlite_database().unwrap();
+                let quota_namespace = db
+                    .namespace(
+                        &history
+                            .source_remote_history_generation_directory(
+                                &binding.source.node_id,
+                                binding.redaction_profile,
+                                &orphan,
+                            )
+                            .join("quota.json"),
+                    )
+                    .unwrap();
+                assert!(
+                    db.read(|connection| database::state::<serde_json::Value>(
+                        connection,
+                        &quota_namespace
+                    ))
+                    .unwrap()
+                    .is_some()
+                );
+                let swept =
+                    sweep_unreferenced_remote_history_generations(&recovered, writer).unwrap();
+                assert_eq!(swept.deleted, 1);
+                assert!(swept.skipped >= 1);
+                db.read(|connection| {
+                    assert!(
+                        database::state::<serde_json::Value>(connection, &quota_namespace)?
+                            .is_none()
+                    );
+                    assert!(
+                        database::records::<serde_json::Value>(
+                            connection,
+                            &quota_namespace,
+                            i64::MIN,
+                            &mut crate::source_history::SourceHistoryReadBudget::for_query()
+                        )?
+                        .is_empty()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(read().len(), 1);
             },
         );
     }

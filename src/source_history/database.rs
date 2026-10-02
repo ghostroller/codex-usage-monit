@@ -23,7 +23,9 @@ use super::{HistoryProfileId, SourceHistoryReadBudget, invalid_data};
 
 const DATABASE_FILE: &str = "history.sqlite3";
 const APPLICATION_ID: i64 = 0x4355_4d48;
-const SCHEMA_VERSION: i64 = 1;
+// Version 2 establishes rebuild-only history semantics. Preview version 1
+// databases may contain imported legacy usage and must never be adopted.
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_WAIT: Duration = Duration::from_millis(250);
 const MAX_VALUE_BYTES: usize = 128 * 1024 * 1024;
 static SAVEPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1158,5 +1160,36 @@ mod tests {
             })
             .unwrap_err();
         assert!(database.read(|_| Ok(())).is_err());
+    }
+    #[test]
+    fn sqlite_preview_schema_is_rejected_without_upgrading_or_adopting_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let db = database(root.path());
+        db.write(|connection| {
+            set_state(connection, "preview-derived", &42_u64)?;
+            connection
+                .pragma_update(None, "user_version", 1)
+                .map_err(sql_error)
+        })
+        .unwrap();
+        for readonly in [true, false] {
+            let result = if readonly {
+                db.read(|_| Ok(()))
+            } else {
+                db.write(|_| Ok(()))
+            };
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("version=1"));
+        }
+        let connection = Connection::open(db.path()).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(
+            state::<u64>(&connection, "preview-derived").unwrap(),
+            Some(42)
+        );
     }
 }

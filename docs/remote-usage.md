@@ -418,6 +418,36 @@ again. Do not copy another machine's monitor state directory as an installation
 method: the persistent identity belongs to that source. A version/catalog
 mismatch needs compatible installations, not repeated sync attempts.
 
+## SQLite history and rebuilding on demand
+
+CLI reports, TUI, recorders and central SSH ingest use the same production
+SQLite history backend. The existing `history-v1` CLI directory remains a
+binding path; its sibling `history-v2/{profile}/history.sqlite3` holds history.
+SSH sync still exports bounded source data and ingests it into the center's
+SQLite database, preserving cross-source deduplication and facts. It does not
+replicate database files bidirectionally or share one database across machines.
+
+Initialization retains old sampled quota, source policy, local revision
+high-water marks, and unfinished source-purge intent. An interrupted irreversible
+deletion remains blocked from re-pairing even if source metadata was already
+removed; this is retained user control state, not imported usage history. Identity/anchor, remotes and automatic-sync configuration,
+project mappings, and service/install state remain in their original files.
+Old usage buckets, digests, facts, backfill completion and ingest cursors are
+not imported. Existing collection, bounded Summary backfill and remote
+bootstrap rebuild the needed ranges; startup does not proactively parse all
+historical logs. Missing raw logs can leave partial coverage. Query APIs remain
+read-only and do not trigger collection themselves.
+
+An active SQLite database that is missing, corrupt or has no matching
+initialization receipt fails closed. The current database schema is version 2.
+Earlier schema-1 development databases and full-migration receipts are unsupported,
+including when an old initialization was interrupted; they are not automatically
+deleted or reinitialized. Sampled quota from older file-based releases can still be
+retained as described above. Read-only in-memory degradation shows only the current process's
+collection; it never reads old file history. See the
+[current storage plan](storage-rewrite-execution-plan-2026-10-02.zh-CN.md#73-sqlite-唯一后端与按需重建)
+for this batch's implementation and verification status.
+
 ## Rebuilding incompatible derived data
 
 The current implementation uses remote protocol v5, history metric revision 5,
@@ -454,9 +484,9 @@ queries have been checked.
 
 Back up the monitor's state before upgrading. Stop old foreground collectors and
 replace/reinstall existing recorder services with the new binary before the
-source-aware history cutover. Service/cutover checks prevent an old writer from
-silently corrupting the new history. The v1→v2 switch is one-way; an older binary
-does not understand v0.4's remote history. Existing SSH aliases are never imported
+SQLite history initialization. Service/ownership checks prevent an old writer
+from silently corrupting active SQL state. Older binaries cannot write the new
+SQLite namespace; there is no automatic downgrade or old-history read fallback. Existing SSH aliases are never imported
 or enabled automatically.
 
 For development verification, see [local-first testing](testing.md). The real

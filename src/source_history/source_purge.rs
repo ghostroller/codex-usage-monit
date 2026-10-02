@@ -1,17 +1,9 @@
-//! Explicit, crash-recoverable destruction of one detached SSH source.
-//!
-//! SQLite durably claims the source before related external state is removed,
-//! then deletes its records, metadata and claim in one transaction.
-//! In the legacy migration/fixture backend the directory is first claimed
-//! with a durable marker and then
-//! renamed to a deterministic sibling trash directory. The rename is the
-//! publication boundary: readers can no longer discover the source, while a
-//! restart can validate the marker in trash and finish removing it. The
-//! account namespace and every other source are outside the claimed subtree.
+//! Crash-safe destruction of one detached SSH source.
+//! A durable SQL claim fences reattach while external state is cleaned up;
+//! records, metadata and the claim are then removed in one transaction.
 
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,24 +11,21 @@ use super::*;
 
 const SOURCE_PURGE_MARKER_FILE: &str = "source-purge.json";
 const SOURCE_PURGE_MARKER_FORMAT_VERSION: u32 = 1;
-const SOURCE_PURGE_TRASH_PREFIX: &str = ".source-purge-";
-const SOURCE_PURGE_TRASH_SUFFIX: &str = ".trash";
-const MAX_SOURCE_PURGE_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceHistoryPurgeReport {
-    resumed_from_trash: bool,
+    resumed_claim: bool,
 }
 
 impl SourceHistoryPurgeReport {
-    pub fn resumed_from_trash(self) -> bool {
-        self.resumed_from_trash
+    pub fn resumed_claim(self) -> bool {
+        self.resumed_claim
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SourcePurgeMarker {
+pub(crate) struct SourcePurgeMarker {
     format_version: u32,
     profile_id: HistoryProfileId,
     source_id: NodeId,
@@ -53,7 +42,11 @@ impl SourcePurgeMarker {
         }
     }
 
-    fn validate(&self, profile_id: &HistoryProfileId, source_id: &NodeId) -> io::Result<()> {
+    pub(crate) fn validate(
+        &self,
+        profile_id: &HistoryProfileId,
+        source_id: &NodeId,
+    ) -> io::Result<()> {
         if self.format_version != SOURCE_PURGE_MARKER_FORMAT_VERSION
             || &self.profile_id != profile_id
             || &self.source_id != source_id
@@ -75,15 +68,17 @@ impl SourceHistoryWriter<'_, '_, '_> {
         &self,
         source_id: &NodeId,
     ) -> io::Result<()> {
-        if let Some(database) = self.store.sqlite_database() {
-            return self.fenced(|store| {
-                database.write(|_| {
-                    store.prepare_detached_ssh_source_for_purge_unfenced(source_id)?;
-                    self.validate()
-                })
-            });
-        }
-        self.fenced(|store| store.prepare_detached_ssh_source_for_purge_unfenced(source_id))
+        let database = self
+            .store
+            .sqlite_database()
+            .expect("SQLite history backend");
+
+        self.fenced(|store| {
+            database.write(|_| {
+                store.prepare_detached_ssh_source_for_purge_unfenced(source_id)?;
+                self.validate()
+            })
+        })
     }
 
     /// Irreversibly removes one detached SSH source and no other history
@@ -92,16 +87,18 @@ impl SourceHistoryWriter<'_, '_, '_> {
         &self,
         source_id: &NodeId,
     ) -> io::Result<SourceHistoryPurgeReport> {
-        if let Some(database) = self.store.sqlite_database() {
-            return self.fenced(|store| {
-                database.write(|_| {
-                    let report = store.purge_detached_ssh_source_unfenced(source_id)?;
-                    self.validate()?;
-                    Ok(report)
-                })
-            });
-        }
-        self.fenced(|store| store.purge_detached_ssh_source_unfenced(source_id))
+        let database = self
+            .store
+            .sqlite_database()
+            .expect("SQLite history backend");
+
+        self.fenced(|store| {
+            database.write(|_| {
+                let report = store.purge_detached_ssh_source_unfenced(source_id)?;
+                self.validate()?;
+                Ok(report)
+            })
+        })
     }
 }
 
@@ -110,207 +107,60 @@ impl SourceHistoryStore {
     /// claimed before a crash. Callers that mutate the allowlist must hold the
     /// remotes config lock before entering this source lock.
     pub(crate) fn ensure_source_not_pending_purge(&self, source_id: &NodeId) -> io::Result<()> {
-        if let Some(database) = self.sqlite_database() {
-            if !database.exists()? {
-                return Ok(());
-            }
-            return database.read(|connection| {
-                if sqlite_purge_marker(self, &database, connection, source_id)?.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "remote source cannot be paired while an irreversible purge is pending",
-                    ));
-                }
-                Ok(())
-            });
-        }
-        let source = self.source_directory(source_id);
-        let trash = source_purge_trash_path(self, source_id);
-        if checked_directory_exists(self, &trash, "source purge trash")? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote source cannot be paired while an irreversible purge is pending",
-            ));
-        }
-        if !checked_directory_exists(self, &source, "source purge source")? {
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        if !database.exists()? {
             return Ok(());
         }
-        let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-        let _lock = lock_shared(lock, &source, SOURCE_LOCK_FILE)?;
-        reject_source_metadata_update_during_purge(self, &source, source_id)
+        database.read(|connection| {
+            if sqlite_purge_marker(self, &database, connection, source_id)?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "remote source cannot be paired while an irreversible purge is pending",
+                ));
+            }
+            Ok(())
+        })
     }
 
     fn prepare_detached_ssh_source_for_purge_unfenced(&self, source_id: &NodeId) -> io::Result<()> {
-        if let Some(database) = self.sqlite_database() {
-            return database.write(|connection| {
-                let marker = sqlite_purge_marker(self, &database, connection, source_id)?;
-                require_sqlite_purge_eligible(self, source_id, marker.is_some())?;
-                if marker.is_none() {
-                    let key = database.namespace(
-                        &self
-                            .source_directory(source_id)
-                            .join(SOURCE_PURGE_MARKER_FILE),
-                    )?;
-                    database::set_state(
-                        connection,
-                        &key,
-                        &SourcePurgeMarker::ssh(self.profile_id.clone(), source_id.clone()),
-                    )?;
-                }
-                Ok(())
-            });
-        }
-        let source = self.source_directory(source_id);
-        let trash = source_purge_trash_path(self, source_id);
-        let source_exists = checked_directory_exists(self, &source, "source purge source")?;
-        let trash_exists = checked_directory_exists(self, &trash, "source purge trash")?;
-        match (source_exists, trash_exists) {
-            (true, true) => Err(invalid_data(
-                "source purge found both the live source and its recovery trash",
-            )),
-            (true, false) => {
-                let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-                let _lock = lock_exclusive(lock, &source, SOURCE_LOCK_FILE)?;
-                let metadata = read_source_metadata_file(
-                    &source.join(SOURCE_METADATA_FILE),
-                    self.profile_id(),
-                    source_id,
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        database.write(|connection| {
+            let marker = sqlite_purge_marker(self, &database, connection, source_id)?;
+            require_sqlite_purge_eligible(self, source_id, marker.is_some())?;
+            if marker.is_none() {
+                let key = database.namespace(
+                    &self
+                        .source_directory(source_id)
+                        .join(SOURCE_PURGE_MARKER_FILE),
                 )?;
-                if metadata.kind() != SourceKind::Ssh {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "only retained SSH sources can be purged",
-                    ));
-                }
-                if !metadata.detached() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "an attached SSH source cannot be purged; remove its configured host first",
-                    ));
-                }
-                validate_live_source_layout(self, &source, source_id)?;
-                validate_purge_tree(self, &source, 0)?;
-                let marker_path = source.join(SOURCE_PURGE_MARKER_FILE);
-                if marker_path.exists() {
-                    validate_purge_marker(self, &source, source_id)?;
-                } else {
-                    let marker =
-                        SourcePurgeMarker::ssh(self.profile_id().clone(), source_id.clone());
-                    let contents = encode_pretty_bounded(&marker, MAX_METADATA_FILE_BYTES)?;
-                    write_private_atomically(&marker_path, &contents)?;
-                }
-                validate_live_source_layout(self, &source, source_id)?;
-                validate_purge_tree(self, &source, 0)
+                database::set_state(
+                    connection,
+                    &key,
+                    &SourcePurgeMarker::ssh(self.profile_id.clone(), source_id.clone()),
+                )?;
             }
-            (false, true) if purge_trash_is_empty(self, &trash)? => Ok(()),
-            (false, true) => {
-                validate_purge_trash_layout(self, &trash, source_id)?;
-                validate_purge_tree(self, &trash, 0)
-            }
-            (false, false) => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("remote source {source_id} has no retained history"),
-            )),
-        }
+            Ok(())
+        })
     }
 
     fn purge_detached_ssh_source_unfenced(
         &self,
         source_id: &NodeId,
     ) -> io::Result<SourceHistoryPurgeReport> {
-        if let Some(database) = self.sqlite_database() {
-            return database.write(|connection| {
-                // A pre-existing claim is validated even though the source
-                // subtree and claim can now be removed in one transaction.
-                let marker = sqlite_purge_marker(self, &database, connection, source_id)?;
-                require_sqlite_purge_eligible(self, source_id, marker.is_some())?;
-                let namespace = database.namespace(&self.source_directory(source_id))?;
-                delete_sqlite_namespace_tree(connection, &namespace)?;
-                Ok(SourceHistoryPurgeReport {
-                    resumed_from_trash: false,
-                })
-            });
-        }
-        let source = self.source_directory(source_id);
-        let trash = source_purge_trash_path(self, source_id);
-        let source_exists = checked_directory_exists(self, &source, "source purge source")?;
-        let trash_exists = checked_directory_exists(self, &trash, "source purge trash")?;
+        let database = self.sqlite_database().expect("SQLite history backend");
 
-        if source_exists && trash_exists {
-            return Err(invalid_data(
-                "source purge found both the live source and its recovery trash",
-            ));
-        }
-        if trash_exists {
-            if purge_trash_is_empty(self, &trash)? {
-                fs::remove_dir(&trash)?;
-                sync_directory(&self.sources_directory())?;
-                return Ok(SourceHistoryPurgeReport {
-                    resumed_from_trash: true,
-                });
-            }
-            validate_purge_trash_layout(self, &trash, source_id)?;
-            validate_purge_tree(self, &trash, 0)?;
-            remove_purge_tree(self, &trash, 0)?;
-            return Ok(SourceHistoryPurgeReport {
-                resumed_from_trash: true,
-            });
-        }
-        if !source_exists {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("remote source {source_id} has no retained history"),
-            ));
-        }
-
-        let lock = open_lock_file(&source, SOURCE_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &source, SOURCE_LOCK_FILE)?;
-        let metadata = read_source_metadata_file(
-            &source.join(SOURCE_METADATA_FILE),
-            self.profile_id(),
-            source_id,
-        )?;
-        if metadata.kind() != SourceKind::Ssh {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only retained SSH sources can be purged",
-            ));
-        }
-        if !metadata.detached() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "an attached SSH source cannot be purged; remove its configured host first",
-            ));
-        }
-
-        validate_live_source_layout(self, &source, source_id)?;
-        validate_purge_tree(self, &source, 0)?;
-        let marker = SourcePurgeMarker::ssh(self.profile_id().clone(), source_id.clone());
-        let marker_path = source.join(SOURCE_PURGE_MARKER_FILE);
-        if marker_path.exists() {
-            validate_purge_marker(self, &source, source_id)?;
-        } else {
-            let contents = encode_pretty_bounded(&marker, MAX_METADATA_FILE_BYTES)?;
-            write_private_atomically(&marker_path, &contents)?;
-        }
-        validate_live_source_layout(self, &source, source_id)?;
-        validate_purge_tree(self, &source, 0)?;
-
-        // Stable history locks do not share delete access on Windows. Release
-        // the lock before the same-parent rename; config + writer fencing keeps
-        // cooperative writers out, and a racing reader can only make rename
-        // fail without deleting anything.
-        std::fs::File::unlock(_lock.as_file())?;
-        drop(_lock);
-        self.validate_private_path(&source)?;
-        rename_purge_namespace(&source, &trash)?;
-        sync_directory(&self.sources_directory())?;
-
-        validate_purge_trash_layout(self, &trash, source_id)?;
-        validate_purge_tree(self, &trash, 0)?;
-        remove_purge_tree(self, &trash, 0)?;
-        Ok(SourceHistoryPurgeReport {
-            resumed_from_trash: false,
+        database.write(|connection| {
+            // A pre-existing claim is validated even though the source
+            // subtree and claim can now be removed in one transaction.
+            let marker = sqlite_purge_marker(self, &database, connection, source_id)?;
+            require_sqlite_purge_eligible(self, source_id, marker.is_some())?;
+            let namespace = database.namespace(&self.source_directory(source_id))?;
+            delete_sqlite_namespace_tree(connection, &namespace)?;
+            Ok(SourceHistoryPurgeReport {
+                resumed_claim: marker.is_some(),
+            })
         })
     }
 }
@@ -322,7 +172,7 @@ fn require_sqlite_purge_eligible(
 ) -> io::Result<()> {
     let metadata = match store.load_source_metadata(source_id) {
         Ok(metadata) => metadata,
-        // A validated trash claim can outlive the old source.json. The
+        // A validated SQL claim can outlive its source metadata. The
         // irreversible SSH claim still authorizes finishing its removal.
         Err(error) if claimed && error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
@@ -340,100 +190,6 @@ fn require_sqlite_purge_eligible(
         ));
     }
     Ok(())
-}
-
-impl SourceHistoryStore {
-    /// Preserves irreversible claims from live or partially removed trash
-    /// namespaces. Migration never removes their original recovery files.
-    pub(crate) fn import_legacy_source_purge_sqlite_state(
-        &self,
-        legacy: &SourceHistoryStore,
-    ) -> io::Result<()> {
-        if legacy.sqlite_database().is_some() || legacy.profile_id() != self.profile_id() {
-            return Err(invalid_data("source purge import backend/profile mismatch"));
-        }
-        let database = self
-            .sqlite_database()
-            .ok_or_else(|| invalid_data("source purge import requires SQLite"))?;
-        database.write(|connection| {
-            let already_imported =
-                !database::state_keys(connection, "database/migration/")?.is_empty();
-            if !legacy.private_directory_exists(&legacy.sources_directory())? {
-                return Ok(());
-            }
-            let mut budget = SourceHistoryReadBudget::for_query();
-            for entry in fs::read_dir(legacy.sources_directory())? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                let trash_source = name
-                    .strip_prefix(SOURCE_PURGE_TRASH_PREFIX)
-                    .and_then(|value| value.strip_suffix(SOURCE_PURGE_TRASH_SUFFIX));
-                let source_id: NodeId = if let Some(value) = trash_source {
-                    value
-                        .parse()
-                        .map_err(|_| invalid_data("malformed source purge trash namespace"))?
-                } else if name.starts_with(SOURCE_PURGE_TRASH_PREFIX) {
-                    return Err(invalid_data("malformed source purge trash namespace"));
-                } else if let Ok(source) = name.parse::<NodeId>() {
-                    source
-                } else {
-                    continue;
-                };
-                budget.charge_source()?;
-                let directory = entry.path();
-                legacy.validate_private_path(&directory)?;
-                let marker_path = directory.join(SOURCE_PURGE_MARKER_FILE);
-                let marker = read_optional_json_file::<SourcePurgeMarker>(
-                    &marker_path,
-                    MAX_METADATA_FILE_BYTES,
-                )?;
-                let Some(marker) = marker else {
-                    if trash_source.is_some() && !purge_trash_is_empty(legacy, &directory)? {
-                        return Err(invalid_data(
-                            "source purge trash is missing its recovery marker",
-                        ));
-                    }
-                    continue;
-                };
-                marker.validate(legacy.profile_id(), &source_id)?;
-                if trash_source.is_some() {
-                    if checked_directory_exists(
-                        legacy,
-                        &legacy.source_directory(&source_id),
-                        "source purge source",
-                    )? {
-                        return Err(invalid_data(
-                            "source purge found both the live source and its recovery trash",
-                        ));
-                    }
-                    validate_purge_trash_layout(legacy, &directory, &source_id)?;
-                } else {
-                    require_sqlite_purge_eligible(legacy, &source_id, false)?;
-                    validate_live_source_layout(legacy, &directory, &source_id)?;
-                }
-                validate_purge_tree(legacy, &directory, 0)?;
-                if already_imported {
-                    continue;
-                }
-                let key = database.namespace(
-                    &self
-                        .source_directory(&source_id)
-                        .join(SOURCE_PURGE_MARKER_FILE),
-                )?;
-                if let Some(existing) =
-                    sqlite_purge_marker(self, &database, connection, &source_id)?
-                    && existing != marker
-                {
-                    return Err(invalid_data("source purge import claim conflict"));
-                }
-                database::set_state(connection, &key, &marker)?;
-            }
-            Ok(())
-        })
-    }
 }
 
 fn sqlite_purge_marker(
@@ -480,362 +236,25 @@ pub(super) fn delete_sqlite_namespace_tree(
     Ok(())
 }
 
-fn source_purge_trash_path(store: &SourceHistoryStore, source_id: &NodeId) -> PathBuf {
-    store.sources_directory().join(format!(
-        "{SOURCE_PURGE_TRASH_PREFIX}{source_id}{SOURCE_PURGE_TRASH_SUFFIX}"
-    ))
-}
-
-#[cfg(not(windows))]
-fn rename_purge_namespace(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn rename_purge_namespace(source: &Path, destination: &Path) -> io::Result<()> {
-    use crate::atomic_file::windows_wide_path;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-    let source = windows_wide_path(source)?;
-    let destination = windows_wide_path(destination)?;
-    // Omitting MOVEFILE_REPLACE_EXISTING is part of the fail-closed claim.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn checked_directory_exists(
-    store: &SourceHistoryStore,
-    path: &Path,
-    label: &str,
-) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
-                return Err(invalid_data(format!(
-                    "{label} {} must be a real directory",
-                    path.display()
-                )));
-            }
-            store.validate_private_path(path)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn validate_live_source_layout(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    source_id: &NodeId,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    let mut metadata_seen = false;
-    let mut lock_seen = false;
-    let mut purge_marker_seen = false;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let name = entry.file_name();
-        let path = entry.path();
-        let target = atomic_temporary_target_name(&name);
-        let known_file = match name.to_str() {
-            Some(SOURCE_METADATA_FILE) => {
-                metadata_seen = true;
-                true
-            }
-            Some(SOURCE_LOCK_FILE) => {
-                lock_seen = true;
-                true
-            }
-            Some("redaction-retirement.json") => true,
-            Some(SOURCE_PURGE_MARKER_FILE) => {
-                purge_marker_seen = true;
-                true
-            }
-            _ if matches!(
-                target,
-                Some(SOURCE_METADATA_FILE | "redaction-retirement.json" | SOURCE_PURGE_MARKER_FILE)
-            ) =>
-            {
-                true
-            }
-            _ => false,
-        };
-        let known_directory = matches!(
-            name.to_str(),
-            Some("redacted" | "preview-enabled" | "preview-enabled.retired-v1.trash")
-        );
-        let entry_metadata = fs::symlink_metadata(&path)?;
-        if metadata_is_link_or_reparse(&entry_metadata) {
-            return Err(invalid_data(format!(
-                "source purge refuses link or reparse point {}",
-                path.display()
-            )));
-        }
-        if known_file {
-            validate_data_file_metadata(&path, &entry_metadata)?;
-        } else if known_directory {
-            if !entry_metadata.file_type().is_dir() {
-                return Err(invalid_data(format!(
-                    "source purge expected a directory at {}",
-                    path.display()
-                )));
-            }
-            store.validate_private_path(&path)?;
-        } else {
-            return Err(invalid_data(format!(
-                "source purge refuses unexpected source layout entry {}",
-                path.display()
-            )));
-        }
-    }
-    if !metadata_seen || !lock_seen {
-        return Err(invalid_data(
-            "source purge source is missing source.json or source.lock",
-        ));
-    }
-    if purge_marker_seen {
-        validate_purge_marker(store, directory, source_id)?;
-    }
-    let metadata = read_source_metadata_file(
-        &directory.join(SOURCE_METADATA_FILE),
-        store.profile_id(),
-        source_id,
-    )?;
-    if metadata.kind() != SourceKind::Ssh || !metadata.detached() {
-        return Err(invalid_data(
-            "source purge source metadata is no longer a detached SSH source",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_purge_trash_layout(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    source_id: &NodeId,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    let mut marker_seen = false;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let name = entry.file_name();
-        let path = entry.path();
-        let target = atomic_temporary_target_name(&name);
-        let known_file = match name.to_str() {
-            Some(SOURCE_METADATA_FILE | SOURCE_LOCK_FILE | "redaction-retirement.json") => true,
-            Some(SOURCE_PURGE_MARKER_FILE) => {
-                marker_seen = true;
-                true
-            }
-            _ if matches!(
-                target,
-                Some(SOURCE_METADATA_FILE | "redaction-retirement.json" | SOURCE_PURGE_MARKER_FILE)
-            ) =>
-            {
-                true
-            }
-            _ => false,
-        };
-        let known_directory = matches!(
-            name.to_str(),
-            Some("redacted" | "preview-enabled" | "preview-enabled.retired-v1.trash")
-        );
-        let entry_metadata = fs::symlink_metadata(&path)?;
-        if metadata_is_link_or_reparse(&entry_metadata) {
-            return Err(invalid_data(format!(
-                "source purge refuses link or reparse point {}",
-                path.display()
-            )));
-        }
-        if known_file {
-            validate_data_file_metadata(&path, &entry_metadata)?;
-        } else if known_directory {
-            if !entry_metadata.file_type().is_dir() {
-                return Err(invalid_data(format!(
-                    "source purge expected a directory at {}",
-                    path.display()
-                )));
-            }
-            store.validate_private_path(&path)?;
-        } else {
-            return Err(invalid_data(format!(
-                "source purge refuses unexpected recovery layout entry {}",
-                path.display()
-            )));
-        }
-    }
-    if !marker_seen {
-        return Err(invalid_data(
-            "source purge recovery trash is missing its durable marker",
-        ));
-    }
-    validate_purge_marker(store, directory, source_id)?;
-    match read_source_metadata_file(
-        &directory.join(SOURCE_METADATA_FILE),
-        store.profile_id(),
-        source_id,
-    ) {
-        Ok(metadata) if metadata.kind() == SourceKind::Ssh && metadata.detached() => Ok(()),
-        Ok(_) => Err(invalid_data(
-            "source purge recovery metadata is not a detached SSH source",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn purge_trash_is_empty(store: &SourceHistoryStore, directory: &Path) -> io::Result<bool> {
-    store.validate_private_path(directory)?;
-    Ok(fs::read_dir(directory)?.next().transpose()?.is_none())
-}
-
-fn validate_purge_marker(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    source_id: &NodeId,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    let marker: SourcePurgeMarker = read_json_file(
-        &directory.join(SOURCE_PURGE_MARKER_FILE),
-        MAX_METADATA_FILE_BYTES,
-    )?;
-    marker.validate(store.profile_id(), source_id)
-}
-
 pub(super) fn reject_source_metadata_update_during_purge(
     store: &SourceHistoryStore,
-    directory: &Path,
+    _directory: &Path,
     source_id: &NodeId,
 ) -> io::Result<()> {
-    if let Some(database) = store.sqlite_database() {
-        if !database.exists()? {
-            return Ok(());
-        }
-        return database.read(|connection| {
-            if sqlite_purge_marker(store, &database, connection, source_id)?.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "source metadata cannot change while an irreversible purge is pending",
-                ));
-            }
-            Ok(())
-        });
-    }
-    store.validate_private_path(directory)?;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let name = entry.file_name();
-        let marker = name == OsStr::new(SOURCE_PURGE_MARKER_FILE);
-        let marker_temporary = atomic_temporary_target_name(&name)
-            .is_some_and(|target| target == SOURCE_PURGE_MARKER_FILE);
-        if !marker && !marker_temporary {
-            continue;
-        }
-        let path = entry.path();
-        validate_data_file_metadata(&path, &fs::symlink_metadata(&path)?)?;
-        if marker {
-            validate_purge_marker(store, directory, source_id)?;
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "source metadata cannot change while an irreversible purge is pending",
-        ));
-    }
-    Ok(())
-}
+    let database = store.sqlite_database().expect("SQLite history backend");
 
-fn validate_purge_tree(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    depth: usize,
-) -> io::Result<()> {
-    if depth > MAX_SOURCE_PURGE_DEPTH {
-        return Err(invalid_data("source purge tree exceeds its depth bound"));
+    if !database.exists()? {
+        return Ok(());
     }
-    store.validate_private_path(directory)?;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata_is_link_or_reparse(&metadata) {
-            return Err(invalid_data(format!(
-                "source purge refuses link or reparse point {}",
-                path.display()
-            )));
+    database.read(|connection| {
+        if sqlite_purge_marker(store, &database, connection, source_id)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "source metadata cannot change while an irreversible purge is pending",
+            ));
         }
-        if metadata.file_type().is_dir() {
-            ensure_private_directory(&metadata)?;
-            validate_purge_tree(store, &path, depth + 1)?;
-        } else {
-            validate_data_file_metadata(&path, &metadata)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_purge_tree(store: &SourceHistoryStore, directory: &Path, depth: usize) -> io::Result<()> {
-    if depth > MAX_SOURCE_PURGE_DEPTH {
-        return Err(invalid_data("source purge tree exceeds its depth bound"));
-    }
-    store.validate_private_path(directory)?;
-    let mut root_marker = None;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        if depth == 0 && entry.file_name() == OsStr::new(SOURCE_PURGE_MARKER_FILE) {
-            root_marker = Some(path);
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata_is_link_or_reparse(&metadata) {
-            return Err(invalid_data(format!(
-                "source purge refuses link or reparse point {}",
-                path.display()
-            )));
-        }
-        if metadata.file_type().is_dir() {
-            ensure_private_directory(&metadata)?;
-            remove_purge_tree(store, &path, depth + 1)?;
-        } else {
-            validate_data_file_metadata(&path, &metadata)?;
-            fs::remove_file(&path)?;
-        }
-    }
-    if let Some(marker) = root_marker {
-        // Persist removal of every ordinary entry while the durable recovery
-        // marker still exists. After a power loss, the namespace is therefore
-        // either recoverable from that marker or already empty except for it.
-        sync_directory(directory)?;
-        validate_data_file_metadata(&marker, &fs::symlink_metadata(&marker)?)?;
-        fs::remove_file(marker)?;
-        // Persist the marker unlink as a separate phase before removing the
-        // now-empty root namespace.
-        sync_directory(directory)?;
-    } else {
-        sync_directory(directory)?;
-    }
-    let parent = directory
-        .parent()
-        .ok_or_else(|| invalid_data("source purge directory has no parent"))?;
-    store.validate_private_path(parent)?;
-    fs::remove_dir(directory)?;
-    sync_directory(parent)
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -870,7 +289,7 @@ mod tests {
             .purge_detached_ssh_source_unfenced(&remote)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(store.source_directory(&remote).is_dir());
+        assert!(store.load_source_metadata(&remote).is_ok());
 
         let local: NodeId = OTHER.parse().unwrap();
         save_source(&store, &local, SourceKind::Local, true);
@@ -878,104 +297,7 @@ mod tests {
             .purge_detached_ssh_source_unfenced(&local)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(store.source_directory(&local).is_dir());
-    }
-
-    #[test]
-    fn purge_refuses_unknown_source_layout() {
-        let (_directory, store, remote) = fixture();
-        save_source(&store, &remote, SourceKind::Ssh, true);
-        let unexpected = store.source_directory(&remote).join("unexpected");
-        fs::write(&unexpected, b"do not delete").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let error = store
-            .purge_detached_ssh_source_unfenced(&remote)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(unexpected.is_file());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn purge_refuses_symlink_anywhere_in_source_tree() {
-        use std::os::unix::fs::symlink;
-
-        let (directory, store, remote) = fixture();
-        save_source(&store, &remote, SourceKind::Ssh, true);
-        let redacted = store
-            .source_directory(&remote)
-            .join(RedactionProfile::Redacted.directory_name());
-        store.prepare_private_directory(&redacted).unwrap();
-        symlink(directory.path(), redacted.join("escape")).unwrap();
-        let error = store
-            .purge_detached_ssh_source_unfenced(&remote)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(store.source_directory(&remote).is_dir());
-        assert!(
-            !store
-                .source_directory(&remote)
-                .join(SOURCE_PURGE_MARKER_FILE)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn purge_removes_only_selected_source_and_stays_gone_after_restart() {
-        let (_directory, store, remote) = fixture();
-        save_source(&store, &remote, SourceKind::Ssh, true);
-        let other: NodeId = OTHER.parse().unwrap();
-        save_source(&store, &other, SourceKind::Ssh, true);
-        store
-            .prepare_private_directory(&store.account_directory())
-            .unwrap();
-        let account_sentinel = store.account_directory().join("keep");
-        fs::write(&account_sentinel, b"account").unwrap();
-
-        let report = store.purge_detached_ssh_source_unfenced(&remote).unwrap();
-        assert!(!report.resumed_from_trash());
-        assert!(!store.source_directory(&remote).exists());
-        assert!(store.source_directory(&other).is_dir());
-        assert!(account_sentinel.is_file());
-
-        let restarted =
-            SourceHistoryStore::new(store.state_root().to_path_buf(), store.profile_id().clone());
-        assert_eq!(
-            restarted
-                .list_source_metadata()
-                .unwrap()
-                .into_iter()
-                .map(|source| source.source_id().clone())
-                .collect::<Vec<_>>(),
-            vec![other]
-        );
-        assert!(account_sentinel.is_file());
-    }
-
-    #[test]
-    fn purge_resumes_a_claimed_trash_namespace_after_restart() {
-        let (_directory, store, remote) = fixture();
-        save_source(&store, &remote, SourceKind::Ssh, true);
-        let source = store.source_directory(&remote);
-        let marker = SourcePurgeMarker::ssh(store.profile_id().clone(), remote.clone());
-        let contents = encode_pretty_bounded(&marker, MAX_METADATA_FILE_BYTES).unwrap();
-        write_private_atomically(&source.join(SOURCE_PURGE_MARKER_FILE), &contents).unwrap();
-        let trash = source_purge_trash_path(&store, &remote);
-        fs::rename(&source, &trash).unwrap();
-        fs::remove_file(trash.join(SOURCE_METADATA_FILE)).unwrap();
-
-        let restarted =
-            SourceHistoryStore::new(store.state_root().to_path_buf(), store.profile_id().clone());
-        let report = restarted
-            .purge_detached_ssh_source_unfenced(&remote)
-            .unwrap();
-        assert!(report.resumed_from_trash());
-        assert!(!trash.exists());
-        assert!(!source.exists());
+        assert!(store.load_source_metadata(&local).is_ok());
     }
 
     #[test]
@@ -986,12 +308,7 @@ mod tests {
         store
             .prepare_detached_ssh_source_for_purge_unfenced(&remote)
             .unwrap();
-        assert!(
-            store
-                .source_directory(&remote)
-                .join(SOURCE_PURGE_MARKER_FILE)
-                .is_file()
-        );
+        assert!(store.ensure_source_not_pending_purge(&remote).is_err());
         let error = store
             .update_source_metadata(&remote, |metadata| {
                 metadata.set_detached(false);
@@ -1002,7 +319,10 @@ mod tests {
         assert!(store.load_source_metadata(&remote).unwrap().detached());
 
         store.purge_detached_ssh_source_unfenced(&remote).unwrap();
-        assert!(!store.source_directory(&remote).exists());
+        assert_eq!(
+            store.load_source_metadata(&remote).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -1092,52 +412,5 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    fn sqlite_migration_preserves_purge_trash_claim_after_source_metadata_was_removed() {
-        let (_directory, legacy, remote) = fixture();
-        save_source(&legacy, &remote, SourceKind::Ssh, true);
-        legacy
-            .prepare_detached_ssh_source_for_purge_unfenced(&remote)
-            .unwrap();
-        let trash = source_purge_trash_path(&legacy, &remote);
-        fs::rename(legacy.source_directory(&remote), &trash).unwrap();
-        fs::remove_file(trash.join(SOURCE_METADATA_FILE)).unwrap();
-        let marker_bytes = fs::read(trash.join(SOURCE_PURGE_MARKER_FILE)).unwrap();
-        let target = SourceHistoryStore::new_sqlite(
-            legacy.state_root().to_owned(),
-            legacy.profile_id().clone(),
-        );
-        target
-            .import_legacy_source_purge_sqlite_state(&legacy)
-            .unwrap();
-        assert_eq!(
-            target
-                .ensure_source_not_pending_purge(&remote)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        target
-            .prepare_detached_ssh_source_for_purge_unfenced(&remote)
-            .unwrap();
-        target.purge_detached_ssh_source_unfenced(&remote).unwrap();
-        target.ensure_source_not_pending_purge(&remote).unwrap();
-        target
-            .sqlite_database()
-            .unwrap()
-            .write(|connection| {
-                database::set_state(connection, "database/migration/test-receipt", &true)
-            })
-            .unwrap();
-        target
-            .import_legacy_source_purge_sqlite_state(&legacy)
-            .unwrap();
-        target.ensure_source_not_pending_purge(&remote).unwrap();
-        assert_eq!(
-            fs::read(trash.join(SOURCE_PURGE_MARKER_FILE)).unwrap(),
-            marker_bytes
-        );
     }
 }

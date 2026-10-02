@@ -1,9 +1,8 @@
-//! Ownership-selected, source-aware history reads.
+//! Source-aware history reads from one SQLite snapshot.
 //!
-//! This module is deliberately read-only. It resolves the durable ownership
-//! manifest before every query and never combines v1 and v2 data in one
-//! result. During cutover an exact manifest change causes a bounded retry, so
-//! a `Migrating -> V2Active` transition cannot return an accidental hybrid.
+//! This module is deliberately read-only. Ownership and project mappings are
+//! checked around each query; an external change causes a bounded retry while
+//! all stored quota, usage and replica evidence share one database snapshot.
 
 mod aggregation;
 mod reconciliation;
@@ -20,7 +19,9 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use crate::domain::TokenUsage;
 use crate::domain::{ApiCostAmount, PicoUsd};
-use crate::history::{HistoryData, HistoryStore, LocalHalfHourBucket, WeeklyLocalPoint};
+#[cfg(test)]
+use crate::history::HistoryStore;
+use crate::history::{HistoryData, LocalHalfHourBucket, WeeklyLocalPoint};
 #[cfg(test)]
 use crate::history::{LocalProjectUsageGroup, LocalUsageGroup, QuotaPoint};
 use crate::history_ownership::{
@@ -31,10 +32,9 @@ use crate::project_mapping::{ProjectMappingProjection, ProjectMappingStore};
 #[cfg(test)]
 use crate::source_history::UsageEventFact;
 use crate::source_history::{
-    AccountHistoryData, ActiveFactSet, LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING,
-    RedactionProfile, SessionUsageMetrics, SourceBucketChange, SourceHistoryReadBudget,
-    SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind, SourceMetadata,
-    SourceSessionDigest, SourceSessionDigestChange, is_local_observation_recovery_pending,
+    AccountHistoryData, ActiveFactSet, RedactionProfile, SessionUsageMetrics, SourceBucketChange,
+    SourceHistoryReadBudget, SourceHistoryRemoteActiveRef, SourceHistoryStore, SourceKind,
+    SourceMetadata, SourceSessionDigest, SourceSessionDigestChange,
 };
 use crate::source_identity::{NodeId, SourceIdentity};
 #[cfg(test)]
@@ -59,7 +59,6 @@ use reconciliation::{
     digest_project_attribution_conflicts, replace_weekly_baselines_with_cycle_markers,
 };
 
-const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
 const RESET_DRIFT_SECONDS: i64 = 120;
 const QUERY_EVIDENCE_LOOKBACK_DAYS: i64 = 7;
@@ -170,8 +169,7 @@ pub enum HistorySourceUnavailableReason {
     RedactionIncompatible,
     KindMismatch,
     LocalIdentityMismatch,
-    UnsupportedByLegacy,
-    LocalObservationPending,
+    UnavailableInMemoryView,
 }
 
 impl HistorySourceUnavailableReason {
@@ -181,8 +179,7 @@ impl HistorySourceUnavailableReason {
             Self::RedactionIncompatible => "redaction_incompatible",
             Self::KindMismatch => "kind_mismatch",
             Self::LocalIdentityMismatch => "local_identity_mismatch",
-            Self::UnsupportedByLegacy => "unsupported_by_legacy",
-            Self::LocalObservationPending => "local_observation_pending",
+            Self::UnavailableInMemoryView => "unavailable_in_memory_view",
         }
     }
 }
@@ -206,7 +203,6 @@ impl HistorySourceSelectionStatus {
 /// Backend that durably owned the namespace for this query result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnifiedHistoryBackend {
-    V1,
     V2,
 }
 
@@ -220,29 +216,24 @@ pub struct UnifiedHistorySnapshot {
     pub source_selection_status: HistorySourceSelectionStatus,
     /// V2 source identities read into this projection, in stable lexical
     /// order. An exact source remains here even when it is excluded from
-    /// `AllIncluded`; this is empty for v1 because legacy history has no
-    /// source dimension.
+    /// `AllIncluded`.
     pub included_sources: Vec<NodeId>,
     /// Included sources rejected before data access because a redacted query
     /// must never open their preview-enabled namespace.
     pub redaction_skipped_sources: Vec<NodeId>,
 }
 
-/// Loads history from exactly one backend selected by durable ownership.
+/// Loads source-aware history from the active SQLite namespace.
 ///
-/// `legacy` and `source_history` must be the exact sibling stores of
-/// `ownership`. The mutable legacy reference exists only because v1 owns its
-/// read cache; this function never writes through it.
+/// `source_history` must match the ownership root and profile.
 pub fn load_unified_history_since(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
     let mapping = LoadedProjectMappingProjection::default();
     load_unified_history_since_inner(
         ownership,
-        legacy,
         source_history,
         &mapping,
         None,
@@ -257,14 +248,12 @@ pub fn load_unified_history_since(
 /// partial diagnostic.
 pub fn load_unified_history_since_with_project_mapping_store(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     project_mapping_store: &ProjectMappingStore,
     since: DateTime<Utc>,
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
-        legacy,
         source_history,
         || load_project_mapping_projection(project_mapping_store),
         None,
@@ -283,7 +272,6 @@ pub fn load_unified_history_since_with_project_mapping_store(
 /// status and warning, never an all-source or local-usage fallback.
 pub fn load_unified_history_since_selected(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     bound_local_source_id: &NodeId,
     selection: &HistorySourceSelection,
@@ -292,7 +280,6 @@ pub fn load_unified_history_since_selected(
     let mapping = LoadedProjectMappingProjection::default();
     load_unified_history_since_inner(
         ownership,
-        legacy,
         source_history,
         &mapping,
         Some(bound_local_source_id),
@@ -303,7 +290,6 @@ pub fn load_unified_history_since_selected(
 
 pub fn load_unified_history_since_selected_with_project_mapping_store(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     project_mapping_store: &ProjectMappingStore,
     bound_local_source_id: &NodeId,
@@ -312,7 +298,6 @@ pub fn load_unified_history_since_selected_with_project_mapping_store(
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
-        legacy,
         source_history,
         || load_project_mapping_projection(project_mapping_store),
         None,
@@ -371,7 +356,8 @@ struct QueryInputs {
     mapping: LoadedProjectMappingProjection,
     metadata: Vec<SourceMetadata>,
     local_revision: Option<(u64, u64)>,
-    remote_revisions: Vec<Option<SourceHistoryRemoteActiveRef>>,
+    remote_revisions: Vec<Option<(Option<SourceHistoryRemoteActiveRef>, u64)>>,
+    garbage_collection_revision: Option<u64>,
     revision_probes_valid: bool,
 }
 
@@ -414,75 +400,32 @@ fn query_inputs(
     mapping: LoadedProjectMappingProjection,
     local_identity: Option<&SourceIdentity>,
 ) -> io::Result<QueryInputs> {
-    let manifest = initialized_manifest(ownership)?;
-    if manifest.state() == HistoryOwnershipState::V2Active
-        && manifest.is_sqlite_backend() != source_history.sqlite_database().is_some()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "history backend changed; rebuild the runtime before querying",
-        ));
-    }
-    if manifest.is_sqlite_backend()
-        && manifest.state() == HistoryOwnershipState::V2Active
-        && source_history
-            .sqlite_database()
-            .is_some_and(|database| !database.is_transaction_active())
-    {
-        let database = source_history
-            .sqlite_database()
-            .expect("SQLite backend checked above");
-        if !database.exists()? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "active SQLite history database is missing",
-            ));
-        }
-    }
-    let mut metadata = if manifest.uses_source_history() {
-        source_history.list_source_metadata()?
-    } else {
-        Vec::new()
-    };
+    let manifest = sqlite_active_manifest(ownership)?;
+    let mut metadata = source_history.list_source_metadata()?;
     metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     let mut revision_probes_valid = true;
-    let local_revision = if manifest.uses_source_history() {
-        local_identity
-            .map(|identity| {
-                if source_history.sqlite_database().is_some() {
-                    // Account quota is profile-wide, and source metadata may
-                    // select the other privacy namespace for local usage.
-                    // Both committed stamps belong to this SQL read snapshot.
-                    Ok((
-                        source_history.load_local_observation_projection_revision(
-                            identity,
-                            RedactionProfile::Redacted,
-                        )?,
-                        source_history.load_local_observation_projection_revision(
-                            identity,
-                            RedactionProfile::PreviewEnabled,
-                        )?,
-                    ))
-                } else {
-                    source_history
-                        .load_local_observation_projection_revision(
-                            identity,
-                            ownership.redaction_profile(),
-                        )
-                        .map(|revision| (revision, 0))
-                }
-            })
-            .transpose()
-            .unwrap_or_else(|_| {
-                // A cache probe must not introduce a new global failure for an
-                // exact remote query. The actual quota/usage reads retain their
-                // established failure boundaries; only reuse is disabled.
-                revision_probes_valid = false;
-                None
-            })
-    } else {
-        None
-    };
+    let local_revision = local_identity
+        .map(|identity| {
+            // Account quota is shared, and metadata can select either local
+            // privacy namespace. Both committed stamps use this SQL snapshot.
+            Ok((
+                source_history.load_local_observation_projection_revision(
+                    identity,
+                    RedactionProfile::Redacted,
+                )?,
+                source_history.load_local_observation_projection_revision(
+                    identity,
+                    RedactionProfile::PreviewEnabled,
+                )?,
+            ))
+        })
+        .transpose()
+        .unwrap_or_else(|_: io::Error| {
+            // A cache probe cannot introduce a global failure for exact remote
+            // queries. Actual quota/usage reads retain their error boundaries.
+            revision_probes_valid = false;
+            None
+        });
     let remote_revisions = metadata
         .iter()
         .filter(|source| {
@@ -494,14 +437,32 @@ fn query_inputs(
                     && source.aggregate_redaction_profile() == RedactionProfile::PreviewEnabled)
         })
         .map(|source| {
-            source_history
-                .active_remote_history_ref(source.source_id(), source.aggregate_redaction_profile())
-                .unwrap_or_else(|_| {
-                    revision_probes_valid = false;
-                    None
-                })
+            (|| {
+                Ok((
+                    source_history.active_remote_history_ref(
+                        source.source_id(),
+                        source.aggregate_redaction_profile(),
+                    )?,
+                    source_history.load_remote_history_projection_revision(
+                        source.source_id(),
+                        source.aggregate_redaction_profile(),
+                    )?,
+                ))
+            })()
+            .map(Some)
+            .unwrap_or_else(|_: io::Error| {
+                revision_probes_valid = false;
+                None
+            })
         })
         .collect();
+    let garbage_collection_revision = source_history
+        .load_history_gc_projection_revision()
+        .map(Some)
+        .unwrap_or_else(|_: io::Error| {
+            revision_probes_valid = false;
+            None
+        });
     Ok(QueryInputs {
         state_root: ownership.state_root().to_owned(),
         ownership: manifest,
@@ -509,6 +470,7 @@ fn query_inputs(
         metadata,
         local_revision,
         remote_revisions,
+        garbage_collection_revision,
         revision_probes_valid,
     })
 }
@@ -516,7 +478,6 @@ fn query_inputs(
 #[allow(clippy::too_many_arguments)]
 fn query_with_context(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     mapping: impl Fn() -> LoadedProjectMappingProjection,
     local_identity: Option<&SourceIdentity>,
@@ -524,38 +485,31 @@ fn query_with_context(
     selection: &HistorySourceSelection,
     context: &mut HistoryQueryContext,
 ) -> io::Result<HistoryQueryResult> {
-    validate_store_bindings(ownership, legacy, source_history)?;
+    validate_store_bindings(ownership, source_history)?;
     for _ in 0..MAX_STABLE_QUERY_ATTEMPTS {
+        // An initialization phase can legitimately have no database yet.
+        // Gate it before opening storage; active database loss still fails closed.
+        sqlite_active_manifest(ownership)?;
         // All source inputs, quota and replica reconciliation use one SQL read
         // snapshot. An external ownership/mapping change starts a fresh snapshot
         // on retry, while the request's budget remains shared across attempts.
-        let result = if let Some(database) = source_history.sqlite_database()
-            && database.exists()?
-        {
-            database.read(|_| {
-                query_with_context_attempt(
-                    ownership,
-                    legacy,
-                    source_history,
-                    &mapping,
-                    local_identity,
-                    bound_local_source_id,
-                    selection,
-                    context,
-                )
-            })?
-        } else {
+        let database = source_history.sqlite_database().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history query requires SQLite storage",
+            )
+        })?;
+        let result = database.read(|_| {
             query_with_context_attempt(
                 ownership,
-                legacy,
                 source_history,
                 &mapping,
                 local_identity,
                 bound_local_source_id,
                 selection,
                 context,
-            )?
-        };
+            )
+        })?;
         if let Some(result) = result {
             return Ok(result);
         }
@@ -569,7 +523,6 @@ fn query_with_context(
 #[allow(clippy::too_many_arguments)]
 fn query_with_context_attempt(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     mapping: &impl Fn() -> LoadedProjectMappingProjection,
     local_identity: Option<&SourceIdentity>,
@@ -579,48 +532,6 @@ fn query_with_context_attempt(
 ) -> io::Result<Option<HistoryQueryResult>> {
     let since = context.since;
     let before = query_inputs(ownership, source_history, mapping(), local_identity)?;
-    let local_identity_mismatch = matches!(selection, HistorySourceSelection::Local(source_id) if bound_local_source_id != Some(source_id));
-    if !before.ownership.uses_source_history() {
-        // An ownership switch invalidates account data even if this request
-        // later returns to V2 with a different epoch.
-        context.quota = None;
-        let legacy_history = legacy.load_since(since);
-        let account_quota = Ok(AccountHistoryData {
-            quota_points: legacy_history.quota_points.clone(),
-        });
-        let status = if local_identity_mismatch {
-            HistorySourceSelectionStatus::Unavailable(
-                HistorySourceUnavailableReason::LocalIdentityMismatch,
-            )
-        } else if matches!(selection, HistorySourceSelection::Remote(_)) {
-            HistorySourceSelectionStatus::Unavailable(
-                HistorySourceUnavailableReason::UnsupportedByLegacy,
-            )
-        } else {
-            HistorySourceSelectionStatus::Applied
-        };
-        let history = match status {
-            HistorySourceSelectionStatus::Unavailable(reason) => {
-                unavailable_v1_history(legacy_history, selection, reason)
-            }
-            _ => legacy_history,
-        };
-        if before == query_inputs(ownership, source_history, mapping(), local_identity)? {
-            return Ok(Some(HistoryQueryResult {
-                account_quota,
-                usage: Ok(UnifiedHistorySnapshot {
-                    history,
-                    backend: UnifiedHistoryBackend::V1,
-                    ownership_epoch: before.ownership.epoch(),
-                    source_selection: selection.clone(),
-                    source_selection_status: status,
-                    included_sources: Vec::new(),
-                    redaction_skipped_sources: Vec::new(),
-                }),
-            }));
-        }
-        return Ok(None);
-    }
     if !before.revision_probes_valid
         || context
             .quota
@@ -655,19 +566,7 @@ fn query_with_context_attempt(
         Ok(account) => load_v2_history_since(
             &V2HistoryQuery {
                 query_redaction: ownership.redaction_profile(),
-                backfill_epoch: if before.ownership.is_sqlite_backend()
-                    && before.ownership.state() == HistoryOwnershipState::Migrating
-                    && source_history.sqlite_database().is_none()
-                {
-                    before.ownership.epoch().checked_sub(1).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "pending SQLite migration has no previous file ownership epoch",
-                        )
-                    })?
-                } else {
-                    before.ownership.epoch()
-                },
+                backfill_epoch: before.ownership.epoch(),
                 store: source_history,
                 project_mapping: &before.mapping,
                 bound_local_source_id,
@@ -710,7 +609,6 @@ fn query_with_context_attempt(
 
 pub(crate) fn load_unified_history_with_context(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     project_mapping_store: &ProjectMappingStore,
     identity: &SourceIdentity,
@@ -719,7 +617,6 @@ pub(crate) fn load_unified_history_with_context(
 ) -> io::Result<HistoryQueryResult> {
     query_with_context(
         ownership,
-        legacy,
         source_history,
         || load_project_mapping_projection(project_mapping_store),
         Some(identity),
@@ -731,7 +628,6 @@ pub(crate) fn load_unified_history_with_context(
 
 fn load_unified_history_since_inner(
     ownership: &HistoryOwnershipStore,
-    legacy: &mut HistoryStore,
     source_history: &SourceHistoryStore,
     project_mapping: &LoadedProjectMappingProjection,
     bound_local_source_id: Option<&NodeId>,
@@ -740,7 +636,6 @@ fn load_unified_history_since_inner(
 ) -> io::Result<UnifiedHistorySnapshot> {
     query_with_context(
         ownership,
-        legacy,
         source_history,
         || project_mapping.clone(),
         None,
@@ -749,25 +644,6 @@ fn load_unified_history_since_inner(
         &mut HistoryQueryContext::new(since),
     )?
     .into_snapshot()
-}
-
-fn unavailable_v1_history(
-    legacy_history: HistoryData,
-    selection: &HistorySourceSelection,
-    reason: HistorySourceUnavailableReason,
-) -> HistoryData {
-    let mut history = HistoryData {
-        // Legacy quota observations are account-global even though v1 stores
-        // them beside local usage. They remain valid in an unavailable remote
-        // projection; local buckets and weekly points must not cross over.
-        quota_points: legacy_history.quota_points,
-        read_only: legacy_history.read_only,
-        ..HistoryData::default()
-    };
-    history
-        .warnings
-        .push(source_selection_unavailable_warning(selection, reason));
-    history
 }
 
 fn source_selection_unavailable_warning(
@@ -791,27 +667,23 @@ fn initialized_manifest(ownership: &HistoryOwnershipStore) -> io::Result<History
     }
 }
 
-fn validate_store_bindings(
+fn sqlite_active_manifest(
     ownership: &HistoryOwnershipStore,
-    legacy: &HistoryStore,
-    source_history: &SourceHistoryStore,
-) -> io::Result<()> {
-    let expected_legacy_root = ownership.state_root().join(LEGACY_HISTORY_DIRECTORY);
-    let expected_redacted = ownership.redaction_profile() == RedactionProfile::Redacted;
-    let expected_namespace = if expected_redacted {
-        format!("{}-redacted", ownership.profile_id())
-    } else {
-        ownership.profile_id().as_str().to_owned()
-    };
-    if legacy.history_root() != Some(expected_legacy_root.as_path())
-        || legacy.namespace() != expected_namespace
-        || legacy.redact_content_enabled() != expected_redacted
-    {
+) -> io::Result<HistoryOwnershipManifest> {
+    let manifest = initialized_manifest(ownership)?;
+    if manifest.state() != HistoryOwnershipState::V2Active || !manifest.is_sqlite_backend() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "legacy history query store does not match ownership",
+            io::ErrorKind::WouldBlock,
+            "SQLite history initialization has not completed",
         ));
     }
+    Ok(manifest)
+}
+
+fn validate_store_bindings(
+    ownership: &HistoryOwnershipStore,
+    source_history: &SourceHistoryStore,
+) -> io::Result<()> {
     if source_history.state_root() != ownership.state_root()
         || source_history.profile_id() != ownership.profile_id()
     {
@@ -1069,7 +941,6 @@ fn load_v2_history_since_inner(
     let mut included_sources = Vec::new();
     let mut redaction_skipped_sources = Vec::new();
     let mut model_catalog_mismatch_sources = Vec::new();
-    let mut local_recovery_pending_sources = Vec::new();
     let mut source_selection_status = HistorySourceSelectionStatus::Applied;
     let detect_replicas = matches!(selection, HistorySourceSelection::AllIncluded);
 
@@ -1150,27 +1021,13 @@ fn load_v2_history_since_inner(
             let (mut buckets, weekly_local_points, digest_records, active_remote_ref) =
                 match metadata.kind() {
                     SourceKind::Local => {
-                        let snapshot = match store
-                            .load_local_observation_snapshot_since_with_budget(
-                                metadata.source_id(),
-                                source_redaction,
-                                evidence_since,
-                                detect_replicas,
-                                read_budget,
-                            ) {
-                            Ok(snapshot) => snapshot,
-                            Err(error) if is_local_observation_recovery_pending(&error) => {
-                                local_recovery_pending_sources.push(metadata.source_id().clone());
-                                if selection.source_id() == Some(metadata.source_id()) {
-                                    source_selection_status =
-                                        HistorySourceSelectionStatus::Unavailable(
-                                            HistorySourceUnavailableReason::LocalObservationPending,
-                                        );
-                                }
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
+                        let snapshot = store.load_local_observation_snapshot_since_with_budget(
+                            metadata.source_id(),
+                            source_redaction,
+                            evidence_since,
+                            detect_replicas,
+                            read_budget,
+                        )?;
                         if snapshot.source != *metadata {
                             return Ok(None);
                         }
@@ -1378,12 +1235,6 @@ fn load_v2_history_since_inner(
         history.summary_backfill_attempt_complete = Some(marker.complete);
     }
     history.warnings.extend(replica_report.warnings);
-    for source_id in &local_recovery_pending_sources {
-        history.warnings.push(format!(
-            "{LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING}:{}",
-            source_id.as_str()
-        ));
-    }
     for source_id in &model_catalog_mismatch_sources {
         history.warnings.push(format!(
             "{REMOTE_MODEL_CATALOG_MISMATCH_WARNING}:{}",
@@ -1454,9 +1305,6 @@ mod tests {
         HISTORY_ESTIMATOR_REVISION, HISTORY_METRIC_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION,
         HistoryObservation,
     };
-    use crate::history_ownership::{
-        InitializeV1Outcome, OwnershipCasOutcome, OwnershipManifestStatus,
-    };
     use crate::project_mapping::{ProjectMappingStore, ProjectObservation, SourceObservedProject};
     use crate::remote_protocol::{ProtocolRevisions, SourceGeneration};
     use crate::source_history::{
@@ -1475,7 +1323,7 @@ mod tests {
     #[test]
     fn request_context_reuses_quota_and_invalidates_source_policy() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
@@ -1498,7 +1346,6 @@ mod tests {
         ] {
             let result = query_with_context(
                 &ownership,
-                &mut legacy,
                 &store,
                 LoadedProjectMappingProjection::default,
                 None,
@@ -1522,7 +1369,6 @@ mod tests {
             .unwrap();
         let changed = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             LoadedProjectMappingProjection::default,
             None,
@@ -1541,6 +1387,233 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_independent_gc_invalidates_request_and_projection_cache() {
+        use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        fs::create_dir(&codex_home).unwrap();
+        let mut runtime = HistoryRuntime::new_with_project_mapping_store(
+            root.join("history-v1"),
+            &codex_home,
+            false,
+            ProjectMappingStore::new(directory.path().join("config/project-mappings.json")),
+        )
+        .unwrap();
+        let active = runtime.ensure_v2_active().unwrap();
+        let starts_at = at(2, 10, 0);
+        let point = quota(starts_at, starts_at + Duration::days(7));
+        runtime.stage(&HistoryObservation {
+            observed_at: starts_at + Duration::minutes(15),
+            quota_points: vec![point.clone()],
+            half_hour_buckets: vec![bucket(starts_at, 10, "local")],
+            ..HistoryObservation::default()
+        });
+        assert!(matches!(
+            runtime.flush_staged().unwrap(),
+            Some(HistoryRuntimeWriteReport::V2(_))
+        ));
+        let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
+        let before = crate::history_application::history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .unwrap();
+        let mut context = HistoryQueryContext::new(starts_at);
+        let initial = runtime
+            .query_history_selected(&HistorySourceSelection::AllIncluded, &mut context)
+            .unwrap();
+        assert_eq!(initial.history.quota_points, vec![point]);
+        assert_eq!(initial.history.half_hour_buckets.len(), 1);
+        assert_eq!(context.quota_loads, 1);
+
+        // Advance the trusted retention clock with its required confirmations.
+        // GC is independent of a new local observation or remote publication.
+        {
+            let lease = runtime.ownership().acquire_writer_lease().unwrap();
+            let authority = runtime
+                .ownership()
+                .authorize_v2_write(&lease, &active)
+                .unwrap();
+            let writer = runtime.source_history().writer(&authority).unwrap();
+            for elapsed_days in [40, 41] {
+                let report = writer
+                    .garbage_collect(starts_at + Duration::days(elapsed_days))
+                    .unwrap();
+                assert_eq!(report.shards_pruned, 0);
+                assert_eq!(
+                    runtime
+                        .source_history()
+                        .load_history_gc_projection_revision()
+                        .unwrap(),
+                    before.garbage_collection_revision
+                );
+            }
+            assert!(
+                writer
+                    .garbage_collect(starts_at + Duration::days(42))
+                    .unwrap()
+                    .shards_pruned
+                    > 0
+            );
+        }
+        let after = crate::history_application::history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.local_observation_revision,
+            after.local_observation_revision
+        );
+        assert_eq!(
+            before.other_local_observation_revision,
+            after.other_local_observation_revision
+        );
+        assert_eq!(before.sources, after.sources);
+        assert!(after.garbage_collection_revision > before.garbage_collection_revision);
+        assert!(!before.same_query_inputs_except_local_revision(&after));
+        let current = runtime
+            .query_history_selected(&selection, &mut context)
+            .unwrap();
+        assert!(current.history.quota_points.is_empty());
+        assert!(current.history.half_hour_buckets.is_empty());
+        assert_eq!(context.quota_loads, 2);
+
+        // A subsequent pass at the same cutoff removes nothing and is stable.
+        {
+            let lease = runtime.ownership().acquire_writer_lease().unwrap();
+            let authority = runtime
+                .ownership()
+                .authorize_v2_write(&lease, &active)
+                .unwrap();
+            let writer = runtime.source_history().writer(&authority).unwrap();
+            assert_eq!(
+                writer
+                    .garbage_collect(starts_at + Duration::days(42))
+                    .unwrap()
+                    .shards_pruned,
+                0
+            );
+        }
+        let unchanged =
+            crate::history_application::history_projection_revision(&runtime, &selection)
+                .unwrap()
+                .unwrap();
+        assert_eq!(after, unchanged);
+        assert!(
+            runtime
+                .query_history_selected(&HistorySourceSelection::AllIncluded, &mut context)
+                .unwrap()
+                .history
+                .quota_points
+                .is_empty()
+        );
+        assert_eq!(context.quota_loads, 2);
+    }
+
+    #[test]
+    fn sqlite_remote_incremental_publication_invalidates_request_and_projection_cache() {
+        use crate::history_runtime::HistoryRuntime;
+        use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex");
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
+        let active = activate_v2(&ownership);
+        let mut remote = source(
+            SOURCE_B,
+            "remote",
+            SourceKind::Ssh,
+            RedactionProfile::PreviewEnabled,
+        );
+        remote.set_quota_matches_local_account(true);
+        let starts_at = at(2, 10, 0);
+        install_remote_bucket(&ownership, &store, &active, &remote, starts_at, 20);
+        let initial_quota = quota(at(2, 9, 0), at(8, 0, 0));
+        let mut next_quota = initial_quota.clone();
+        next_quota.observed_at += Duration::seconds(1);
+        next_quota.used_percent = 60.0;
+        next_quota.remaining_percent = 40.0;
+        let publish = |sequence, point: &QuotaPoint| {
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+            let expected = store
+                .active_remote_history_ref(remote.source_id(), remote.aggregate_redaction_profile())
+                .unwrap()
+                .unwrap();
+            store
+                .writer(&authority)
+                .unwrap()
+                .apply_remote_history_active_page(
+                    remote.source_id(),
+                    remote.aggregate_redaction_profile(),
+                    &expected,
+                    expected.binding(),
+                    &[],
+                    &[],
+                    starts_at, // The clock is deliberately unchanged across both publications.
+                    &[RemoteQuotaChange {
+                        sequence: NonZeroU64::new(sequence).unwrap(),
+                        quota: RemoteQuotaDay {
+                            day: point.observed_at.date_naive(),
+                            points: vec![RemoteQuotaPoint::from_local(point).unwrap()],
+                        },
+                    }],
+                )
+                .unwrap();
+        };
+        publish(1, &initial_quota);
+        let mut runtime = HistoryRuntime::new_with_project_mapping_store(
+            root.join("history-v1"),
+            &codex_home,
+            false,
+            ProjectMappingStore::new(directory.path().join("config/project-mappings.json")),
+        )
+        .unwrap();
+        runtime.ensure_v2_active().unwrap();
+        let selection = HistorySourceSelection::Remote(remote.source_id().clone());
+        let projection_before =
+            crate::history_application::history_projection_revision(&runtime, &selection)
+                .unwrap()
+                .unwrap();
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        let previous = runtime
+            .query_history_selected(&HistorySourceSelection::AllIncluded, &mut context)
+            .unwrap();
+        assert_eq!(previous.history.quota_points, vec![initial_quota]);
+        assert_eq!(context.quota_loads, 1);
+
+        publish(2, &next_quota);
+        let projection_after =
+            crate::history_application::history_projection_revision(&runtime, &selection)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            projection_before.sources[0].0,
+            projection_after.sources[0].0
+        );
+        assert_eq!(
+            projection_before.sources[0].1, projection_after.sources[0].1,
+            "incremental SQL pages retain the active generation and binding"
+        );
+        assert_ne!(
+            projection_before.sources[0].2, projection_after.sources[0].2,
+            "publication revisions change even when the wall clock does not"
+        );
+        assert!(!projection_before.same_query_inputs_except_local_revision(&projection_after));
+        let current = runtime
+            .query_history_selected(&selection, &mut context)
+            .unwrap();
+        assert_eq!(current.history.quota_points, vec![next_quota]);
+        assert_eq!(
+            current.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert_eq!(context.quota_loads, 2);
+    }
+
+    #[test]
     fn sqlite_request_context_uses_committed_local_revision_across_selectors() {
         use std::sync::mpsc;
         use std::time::Duration as StdDuration;
@@ -1549,18 +1622,17 @@ mod tests {
         use crate::source_identity::SourceIdentityStore;
 
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores_for_backend(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
-            true,
         );
         let identity =
             SourceIdentityStore::at_path(directory.path().join("identity").join("source.json"))
                 .load_or_create()
                 .unwrap();
         store.sqlite_database().unwrap().write(|_| Ok(())).unwrap();
-        activate_for_backend(&ownership, true);
+        activate_v2(&ownership);
         let starts_at = at(2, 10, 0);
         let first_quota = quota(at(2, 9, 0), at(8, 0, 0));
         let mut next_quota = first_quota.clone();
@@ -1642,7 +1714,6 @@ mod tests {
                 );
                 let previous = query_with_context(
                     &ownership,
-                    &mut legacy,
                     &store,
                     LoadedProjectMappingProjection::default,
                     Some(&identity),
@@ -1664,7 +1735,6 @@ mod tests {
             .unwrap();
         let current = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             LoadedProjectMappingProjection::default,
             Some(&identity),
@@ -1689,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_first_redacted_migration_updates_local_query_policy_without_new_observation() {
+    fn sqlite_other_privacy_commits_invalidate_local_query_and_projection_cache() {
         use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
 
         let directory = tempfile::tempdir().unwrap();
@@ -1712,11 +1782,11 @@ mod tests {
             ..HistoryObservation::default()
         };
         let mut preview = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-        preview.ensure_ownership_initialized().unwrap();
+        preview.ensure_v2_active().unwrap();
         preview.stage(&observation(10, "preview-only"));
         assert!(matches!(
             preview.flush_staged().unwrap(),
-            Some(HistoryRuntimeWriteReport::V1(_))
+            Some(HistoryRuntimeWriteReport::V2(_))
         ));
         assert!(preview.ensure_v2_active().unwrap().is_sqlite_backend());
         let local_id = preview.source_identity().node_id().clone();
@@ -1732,19 +1802,15 @@ mod tests {
             10
         );
 
-        // Only the preview V2 namespace existed at the first profile import.
-        // This cooperating redacted V1 writer therefore still has its own
-        // history to upgrade through File V2 into the shared profile database.
+        // The two privacy namespaces share account quota and local policy.
         let mut redacted = HistoryRuntime::new(history_root.clone(), &codex_home, true).unwrap();
         assert_eq!(redacted.profile_id(), &profile);
         assert_eq!(redacted.source_identity().node_id(), &local_id);
-        let initial = redacted.ensure_ownership_initialized().unwrap();
-        assert_eq!(initial.state(), HistoryOwnershipState::V1Active);
-        assert!(!initial.is_sqlite_backend());
+        redacted.ensure_v2_active().unwrap();
         redacted.stage(&observation(20, "redacted-history"));
         assert!(matches!(
             redacted.flush_staged().unwrap(),
-            Some(HistoryRuntimeWriteReport::V1(_))
+            Some(HistoryRuntimeWriteReport::V2(_))
         ));
         let active = redacted.ensure_v2_active().unwrap();
         assert!(active.is_sqlite_backend());
@@ -1757,9 +1823,8 @@ mod tests {
                 .aggregate_redaction_profile(),
             RedactionProfile::Redacted
         );
-        // No live observation is written after migration to repair visibility.
-        // Both the exact local selector and the default aggregate must expose
-        // the newly imported redacted history immediately and after reopening.
+        // Exact and aggregate selectors expose the committed namespace both
+        // immediately and after reopening, without another live observation.
         for reopen in [false, true] {
             if reopen {
                 redacted = HistoryRuntime::new(history_root.clone(), &codex_home, true).unwrap();
@@ -1849,7 +1914,7 @@ mod tests {
     #[test]
     fn request_context_quota_failure_keeps_original_error_and_usage_failure_is_separate() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
@@ -1869,7 +1934,6 @@ mod tests {
         context.budget = SourceHistoryReadBudget::with_limits(0, 100, 100);
         let failed = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             LoadedProjectMappingProjection::default,
             None,
@@ -1888,7 +1952,6 @@ mod tests {
         context.budget = SourceHistoryReadBudget::with_limits(u64::MAX, 100, 0);
         let failed = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             LoadedProjectMappingProjection::default,
             None,
@@ -1907,7 +1970,7 @@ mod tests {
     fn request_context_mapping_changes_retry_with_one_shared_budget() {
         use std::cell::Cell;
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
@@ -1927,7 +1990,6 @@ mod tests {
         context.budget = SourceHistoryReadBudget::with_limits(u64::MAX, 100, 1);
         let result = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             || {
                 let call = calls.get();
@@ -1954,7 +2016,7 @@ mod tests {
     fn request_context_repeated_input_changes_stop_after_four_attempts() {
         use std::cell::Cell;
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
@@ -1964,7 +2026,6 @@ mod tests {
         let mut context = HistoryQueryContext::new(at(2, 0, 0));
         let error = query_with_context(
             &ownership,
-            &mut legacy,
             &store,
             || {
                 let call = calls.get();
@@ -2401,97 +2462,46 @@ mod tests {
         root: &Path,
         codex_home: &Path,
         redaction: RedactionProfile,
-    ) -> (HistoryStore, HistoryOwnershipStore, SourceHistoryStore) {
+    ) -> (HistoryOwnershipStore, SourceHistoryStore) {
         prepare_state_root(root);
         fs::create_dir_all(codex_home).unwrap();
         let redact = redaction == RedactionProfile::Redacted;
-        let legacy = HistoryStore::new_with_redaction(
-            root.join(LEGACY_HISTORY_DIRECTORY),
-            codex_home,
-            redact,
-        );
+        let staging = HistoryStore::memory_only(codex_home, redact);
         let profile_text = if redact {
-            legacy.namespace().strip_suffix("-redacted").unwrap()
+            staging.namespace().strip_suffix("-redacted").unwrap()
         } else {
-            legacy.namespace()
+            staging.namespace()
         };
         let profile = profile_text
             .parse::<crate::source_history::HistoryProfileId>()
             .unwrap();
         let ownership = HistoryOwnershipStore::new(root.to_path_buf(), profile.clone(), redaction);
         let source_history = SourceHistoryStore::new(root.to_path_buf(), profile);
-        (legacy, ownership, source_history)
+        (ownership, source_history)
     }
 
-    fn stores_for_backend(
-        root: &Path,
-        codex_home: &Path,
+    fn corrupt_bucket_namespace(
+        store: &SourceHistoryStore,
+        source_id: &NodeId,
         redaction: RedactionProfile,
-        sqlite: bool,
-    ) -> (HistoryStore, HistoryOwnershipStore, SourceHistoryStore) {
-        let (legacy, ownership, store) = stores(root, codex_home, redaction);
-        let store = if sqlite {
-            SourceHistoryStore::new_sqlite(
-                store.state_root().to_path_buf(),
-                store.profile_id().clone(),
-            )
-        } else {
-            store
-        };
-        (legacy, ownership, store)
-    }
-
-    fn activate_for_backend(ownership: &HistoryOwnershipStore, sqlite: bool) {
-        let active = activate_v2(ownership);
-        if sqlite {
-            let lease = ownership.acquire_writer_lease().unwrap();
-            let pending = match ownership.begin_sqlite_migration(&lease, &active).unwrap() {
-                OwnershipCasOutcome::Applied(manifest) => manifest,
-                OwnershipCasOutcome::Conflict(_) => panic!("unexpected SQLite migration conflict"),
-            };
-            assert!(matches!(
-                ownership
-                    .complete_sqlite_migration(&lease, &pending)
-                    .unwrap(),
-                OwnershipCasOutcome::Applied(_)
-            ));
-        }
-    }
-
-    fn initialize_v1(ownership: &HistoryOwnershipStore) -> HistoryOwnershipManifest {
-        let lease = ownership.acquire_writer_lease().unwrap();
-        match ownership.initialize_v1_active(&lease).unwrap() {
-            InitializeV1Outcome::Initialized(manifest)
-            | InitializeV1Outcome::Existing(manifest) => manifest,
-        }
+    ) {
+        let database = store.sqlite_database().unwrap();
+        let namespace = database
+            .namespace(&store.source_buckets_directory(source_id, redaction))
+            .unwrap();
+        database.write(|connection| {
+            connection.execute(
+                "INSERT INTO history_records(namespace,record_key,sort_time,payload) VALUES (?1,'corrupt',?2,?3)",
+                rusqlite::params![namespace, at(2, 10, 0).timestamp_millis(), b"not-json".as_slice()],
+            ).map_err(crate::source_history::database::sql_error)?;
+            Ok(())
+        }).unwrap();
     }
 
     fn activate_v2(ownership: &HistoryOwnershipStore) -> HistoryOwnershipManifest {
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let v1 = match ownership.load_manifest().unwrap() {
-            OwnershipManifestStatus::Initialized(manifest) => manifest,
-            OwnershipManifestStatus::Uninitialized => {
-                match ownership.initialize_v1_active(&lease).unwrap() {
-                    InitializeV1Outcome::Initialized(manifest)
-                    | InitializeV1Outcome::Existing(manifest) => manifest,
-                }
-            }
-        };
-        let migrating = match ownership.begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(current) => {
-                panic!("unexpected migration conflict: {current:?}")
-            }
-        };
-        match ownership
-            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+        crate::sqlite_history_initialization::initialize_for_test(ownership)
             .unwrap()
-        {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(current) => {
-                panic!("unexpected activation conflict: {current:?}")
-            }
-        }
+            .0
     }
 
     fn install_remote_bucket(
@@ -2859,23 +2869,15 @@ mod tests {
     }
 
     #[test]
-    fn identical_exact_replica_is_counted_once_and_source_only_stays_physical() {
-        identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(false);
-    }
-
-    #[test]
     fn sqlite_identical_exact_replica_is_counted_once_and_source_only_stays_physical() {
-        identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(true);
+        identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend();
     }
 
-    fn identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(
-        sqlite: bool,
-    ) {
+    fn identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) =
-            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -2906,9 +2908,9 @@ mod tests {
             session_digest(source_b.source_id(), range_start, 'a', 10, 1, project_b),
             Vec::new(),
         );
-        activate_for_backend(&ownership, sqlite);
+        activate_v2(&ownership);
 
-        let all = load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let all = load_unified_history_since(&ownership, &store, range_start).unwrap();
         assert_eq!(
             all.history.half_hour_buckets[0].token_usage.total_tokens,
             10
@@ -2929,15 +2931,11 @@ mod tests {
                 .warnings
                 .contains(&DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string())
         );
-        let (mut restarted_legacy, restarted_ownership, restarted_store) =
-            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
-        let after_restart = load_unified_history_since(
-            &restarted_ownership,
-            &mut restarted_legacy,
-            &restarted_store,
-            range_start,
-        )
-        .unwrap();
+        let (restarted_ownership, restarted_store) =
+            stores(&root, &codex_home, RedactionProfile::Redacted);
+        let after_restart =
+            load_unified_history_since(&restarted_ownership, &restarted_store, range_start)
+                .unwrap();
         assert_eq!(
             after_restart.history.half_hour_buckets,
             all.history.half_hour_buckets
@@ -2946,7 +2944,6 @@ mod tests {
 
         let source_b_only = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &store,
             source_b.source_id(),
             &HistorySourceSelection::Local(source_b.source_id().clone()),
@@ -2971,7 +2968,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3025,8 +3022,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let buckets = result
             .history
             .half_hour_buckets
@@ -3048,7 +3044,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3090,8 +3086,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 10);
         assert_eq!(bucket.project_groups.len(), 1);
@@ -3114,7 +3109,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3148,8 +3143,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 100);
         assert_eq!(bucket.estimated_cost_units, 100);
@@ -3177,7 +3171,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3208,8 +3202,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 10);
         assert_eq!(bucket.project_groups.len(), 1);
@@ -3233,7 +3226,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3268,8 +3261,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 100);
         assert_eq!(bucket.estimated_cost_units, 100);
@@ -3297,7 +3289,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3330,8 +3322,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 10);
         assert_eq!(bucket.project_groups.len(), 1);
@@ -3350,7 +3341,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3405,8 +3396,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 30);
         assert_eq!(bucket.project_groups.len(), 1);
@@ -3425,7 +3415,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let mut excluded = source(
             SOURCE_A,
             "excluded",
@@ -3462,8 +3452,7 @@ mod tests {
         }
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         assert_eq!(
             result.included_sources,
             vec![source_c.source_id().clone(), source_b.source_id().clone()]
@@ -3481,21 +3470,15 @@ mod tests {
     }
 
     #[test]
-    fn divergent_exact_facts_form_one_event_union_and_preserve_sources() {
-        divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(false);
-    }
-
-    #[test]
     fn sqlite_divergent_exact_facts_form_one_event_union_and_preserve_sources() {
-        divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(true);
+        divergent_exact_facts_form_one_event_union_and_preserve_sources_backend();
     }
 
-    fn divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(sqlite: bool) {
+    fn divergent_exact_facts_form_one_event_union_and_preserve_sources_backend() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) =
-            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3561,10 +3544,9 @@ mod tests {
                 ),
             ],
         );
-        activate_for_backend(&ownership, sqlite);
+        activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 30);
         assert_eq!(bucket.estimated_cost_units, 30);
@@ -3721,7 +3703,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3813,8 +3795,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 120);
         assert_eq!(bucket.estimated_cost_units, 120);
@@ -3844,7 +3825,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3932,8 +3913,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         let bucket = &result.history.half_hour_buckets[0];
         assert_eq!(bucket.token_usage.total_tokens, 120);
         assert_eq!(bucket.estimated_cost_units, 120);
@@ -3969,7 +3949,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -4075,7 +4055,7 @@ mod tests {
         );
         activate_v2(&ownership);
 
-        let result = load_unified_history_since(&ownership, &mut legacy, &store, day_two).unwrap();
+        let result = load_unified_history_since(&ownership, &store, day_two).unwrap();
         let totals = result
             .history
             .half_hour_buckets
@@ -4088,21 +4068,15 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_event_id_uses_deterministic_authority_and_warns() {
-        conflicting_event_id_uses_deterministic_authority_and_warns_backend(false);
-    }
-
-    #[test]
     fn sqlite_conflicting_event_id_uses_deterministic_authority_and_warns() {
-        conflicting_event_id_uses_deterministic_authority_and_warns_backend(true);
+        conflicting_event_id_uses_deterministic_authority_and_warns_backend();
     }
 
-    fn conflicting_event_id_uses_deterministic_authority_and_warns_backend(sqlite: bool) {
+    fn conflicting_event_id_uses_deterministic_authority_and_warns_backend() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) =
-            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -4159,10 +4133,9 @@ mod tests {
                 project_b,
             )],
         );
-        activate_for_backend(&ownership, sqlite);
+        activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
+        let result = load_unified_history_since(&ownership, &store, range_start).unwrap();
         assert_eq!(
             result.history.half_hour_buckets[0].token_usage.total_tokens,
             10
@@ -4540,77 +4513,13 @@ mod tests {
     }
 
     #[test]
-    fn v1_active_and_migrating_never_read_existing_v2_data() {
+    fn sqlite_aggregates_sources_and_account() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let starts_at = at(2, 10, 0);
-        legacy
-            .record(&HistoryObservation {
-                observed_at: starts_at + Duration::minutes(15),
-                half_hour_buckets: vec![bucket(starts_at, 10, "legacy")],
-                ..HistoryObservation::default()
-            })
-            .unwrap();
-        let v1 = initialize_v1(&ownership);
-
-        let remote = source(
-            SOURCE_A,
-            "future-v2",
-            SourceKind::Local,
-            RedactionProfile::Redacted,
-        );
-        source_history.save_source_metadata(&remote).unwrap();
-        source_history
-            .record_source_bucket_changes(
-                remote.source_id(),
-                RedactionProfile::Redacted,
-                &[SourceBucketRecord::upsert(1, bucket(starts_at, 99, "v2")).unwrap()],
-            )
-            .unwrap();
-
-        let active =
-            load_unified_history_since(&ownership, &mut legacy, &source_history, starts_at)
-                .unwrap();
-        assert_eq!(active.backend, UnifiedHistoryBackend::V1);
-        assert_eq!(
-            active.history.half_hour_buckets[0].token_usage.total_tokens,
-            10
-        );
-
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let migrating = match ownership.begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(current) => panic!("unexpected conflict: {current:?}"),
-        };
-        let during =
-            load_unified_history_since(&ownership, &mut legacy, &source_history, starts_at)
-                .unwrap();
-        assert_eq!(during.backend, UnifiedHistoryBackend::V1);
-        assert_eq!(during.ownership_epoch, migrating.epoch());
-        assert_eq!(
-            during.history.half_hour_buckets[0].token_usage.total_tokens,
-            10
-        );
-    }
-
-    #[test]
-    fn v2_active_aggregates_sources_and_account_without_v1_leakage() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("state");
-        let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
-            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
-        let starts_at = at(2, 10, 0);
-        legacy
-            .record(&HistoryObservation {
-                observed_at: starts_at + Duration::minutes(15),
-                half_hour_buckets: vec![bucket(starts_at, 1_000, "legacy")],
-                ..HistoryObservation::default()
-            })
-            .unwrap();
 
         for (id, label, total, redaction) in [
             (SOURCE_A, "alpha", 10, RedactionProfile::Redacted),
@@ -4643,9 +4552,7 @@ mod tests {
             .mark_v2_summary_backfill_attempt(at(2, 9, 30), true)
             .unwrap();
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &source_history, at(2, 0, 0))
-                .unwrap();
+        let result = load_unified_history_since(&ownership, &source_history, at(2, 0, 0)).unwrap();
         assert_eq!(result.backend, UnifiedHistoryBackend::V2);
         assert_eq!(result.ownership_epoch, active.epoch());
         assert_eq!(result.included_sources.len(), 2);
@@ -4686,7 +4593,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let starts_at = at(2, 10, 0);
         let local = source(
@@ -4721,11 +4628,9 @@ mod tests {
 
         let local_id = local.source_id().clone();
         let remote_id = remote.source_id().clone();
-        let all = load_unified_history_since(&ownership, &mut legacy, &source_history, at(2, 0, 0))
-            .unwrap();
+        let all = load_unified_history_since(&ownership, &source_history, at(2, 0, 0)).unwrap();
         let local_only = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Local(local_id.clone()),
@@ -4734,7 +4639,6 @@ mod tests {
         .unwrap();
         let remote_only = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Remote(remote_id.clone()),
@@ -4804,7 +4708,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let starts_at = at(2, 10, 0);
         let remote = source(
@@ -4832,7 +4736,6 @@ mod tests {
         let remote_id = remote.source_id().clone();
         let result = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &SOURCE_A.parse().unwrap(),
             &HistorySourceSelection::Remote(remote_id.clone()),
@@ -4881,7 +4784,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let starts_at = at(2, 10, 0);
         let local = source(
@@ -4907,7 +4810,6 @@ mod tests {
         let missing_id: NodeId = SOURCE_B.parse().unwrap();
         let missing = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Remote(missing_id.clone()),
@@ -4928,7 +4830,6 @@ mod tests {
 
         let kind_mismatch = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Remote(local_id.clone()),
@@ -4944,7 +4845,6 @@ mod tests {
 
         let stale_local = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Local(missing_id),
@@ -4962,12 +4862,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_local_observation_keeps_other_sources_and_global_quota_readable() {
+    fn sqlite_failed_local_observation_rolls_back_quota_and_keeps_remote_history_readable() {
         use crate::source_history::{LocalObservationMode, inject_local_observation_failure_after};
         use crate::source_identity::SourceIdentity;
 
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, source_history) = stores(
+        let (ownership, source_history) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex-home"),
             RedactionProfile::Redacted,
@@ -5007,22 +4907,16 @@ mod tests {
                     .is_err()
             );
         }
-        let all = load_unified_history_since(&ownership, &mut legacy, &source_history, starts_at)
-            .unwrap();
+        let all = load_unified_history_since(&ownership, &source_history, starts_at).unwrap();
         assert_eq!(all.included_sources, vec![remote.source_id().clone()]);
         assert_eq!(
             all.history.half_hour_buckets[0].token_usage.total_tokens,
             30
         );
-        assert_eq!(all.history.quota_points.len(), 1);
-        assert!(all.history.warnings.contains(&format!(
-            "{LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING}:{}",
-            identity.node_id()
-        )));
+        assert!(all.history.quota_points.is_empty());
 
         let selected = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             identity.node_id(),
             &HistorySourceSelection::Local(identity.node_id().clone()),
@@ -5031,13 +4925,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             selected.source_selection_status,
-            HistorySourceSelectionStatus::Unavailable(
-                HistorySourceUnavailableReason::LocalObservationPending,
-            )
+            HistorySourceSelectionStatus::Unavailable(HistorySourceUnavailableReason::NotFound,)
         );
         assert!(selected.included_sources.is_empty());
         assert!(selected.history.half_hour_buckets.is_empty());
-        assert_eq!(selected.history.quota_points.len(), 1);
+        assert!(selected.history.quota_points.is_empty());
     }
 
     #[test]
@@ -5045,8 +4937,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
-            stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, source_history) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let preview_local = source(
             SOURCE_A,
             "preview-local",
@@ -5069,11 +4960,12 @@ mod tests {
             .unwrap();
 
         // If selection policy were applied after source access this corrupt
-        // preview shard would fail the redacted query.
-        let preview_directory = source_history
-            .source_buckets_directory(preview_local.source_id(), RedactionProfile::PreviewEnabled);
-        prepare_state_root(&preview_directory);
-        fs::write(preview_directory.join("2026-08-02.json"), b"not-json").unwrap();
+        // preview record would fail the redacted query.
+        corrupt_bucket_namespace(
+            &source_history,
+            preview_local.source_id(),
+            RedactionProfile::PreviewEnabled,
+        );
         let active = activate_v2(&ownership);
         let starts_at = at(2, 10, 0);
         install_remote_bucket(
@@ -5088,7 +4980,6 @@ mod tests {
         let local_id = preview_local.source_id().clone();
         let redaction_blocked = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &local_id,
             &HistorySourceSelection::Local(local_id.clone()),
@@ -5108,7 +4999,6 @@ mod tests {
         let remote_id = excluded_remote.source_id().clone();
         let excluded = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             preview_local.source_id(),
             &HistorySourceSelection::Remote(remote_id.clone()),
@@ -5137,7 +5027,6 @@ mod tests {
 
         let all = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             preview_local.source_id(),
             &HistorySourceSelection::AllIncluded,
@@ -5157,7 +5046,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let starts_at = at(2, 10, 0);
         let selected = source(
@@ -5181,16 +5070,16 @@ mod tests {
                 &[SourceBucketRecord::upsert(1, bucket(starts_at, 10, "selected")).unwrap()],
             )
             .unwrap();
-        let corrupt_directory = source_history
-            .source_buckets_directory(corrupt.source_id(), RedactionProfile::PreviewEnabled);
-        prepare_state_root(&corrupt_directory);
-        fs::write(corrupt_directory.join("2026-08-02.json"), b"not-json").unwrap();
+        corrupt_bucket_namespace(
+            &source_history,
+            corrupt.source_id(),
+            RedactionProfile::PreviewEnabled,
+        );
         activate_v2(&ownership);
 
         let selected_id = selected.source_id().clone();
         let result = load_unified_history_since_selected(
             &ownership,
-            &mut legacy,
             &source_history,
             &selected_id,
             &HistorySourceSelection::Local(selected_id.clone()),
@@ -5209,90 +5098,11 @@ mod tests {
     }
 
     #[test]
-    fn v1_remote_and_stale_local_selections_never_leak_local_usage() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("state");
-        let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
-            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
-        let starts_at = at(2, 10, 0);
-        let observation = HistoryObservation {
-            observed_at: starts_at + Duration::minutes(15),
-            quota_points: vec![quota(at(2, 9, 0), at(8, 0, 0))],
-            half_hour_buckets: vec![bucket(starts_at, 99, "legacy-local")],
-            ..HistoryObservation::default()
-        };
-        legacy.record(&observation).unwrap();
-        initialize_v1(&ownership);
-        let local_id: NodeId = SOURCE_A.parse().unwrap();
-        let remote_id: NodeId = SOURCE_B.parse().unwrap();
-
-        let local = load_unified_history_since_selected(
-            &ownership,
-            &mut legacy,
-            &source_history,
-            &local_id,
-            &HistorySourceSelection::Local(local_id.clone()),
-            at(2, 0, 0),
-        )
-        .unwrap();
-        assert_eq!(
-            local.source_selection_status,
-            HistorySourceSelectionStatus::Applied
-        );
-        assert_eq!(
-            local.history.half_hour_buckets[0].token_usage.total_tokens,
-            99
-        );
-
-        let remote = load_unified_history_since_selected(
-            &ownership,
-            &mut legacy,
-            &source_history,
-            &local_id,
-            &HistorySourceSelection::Remote(remote_id.clone()),
-            at(2, 0, 0),
-        )
-        .unwrap();
-        assert_eq!(
-            remote.source_selection_status,
-            HistorySourceSelectionStatus::Unavailable(
-                HistorySourceUnavailableReason::UnsupportedByLegacy
-            )
-        );
-        assert!(remote.history.half_hour_buckets.is_empty());
-        assert!(remote.history.weekly_local_points.is_empty());
-        assert_eq!(remote.history.quota_points, local.history.quota_points);
-        assert!(remote.history.warnings.contains(&format!(
-            "{SOURCE_SELECTION_UNAVAILABLE_WARNING}:unsupported_by_legacy:{remote_id}"
-        )));
-
-        let stale_local = load_unified_history_since_selected(
-            &ownership,
-            &mut legacy,
-            &source_history,
-            &local_id,
-            &HistorySourceSelection::Local(remote_id),
-            at(2, 0, 0),
-        )
-        .unwrap();
-        assert_eq!(
-            stale_local.source_selection_status,
-            HistorySourceSelectionStatus::Unavailable(
-                HistorySourceUnavailableReason::LocalIdentityMismatch
-            )
-        );
-        assert!(stale_local.history.half_hour_buckets.is_empty());
-        assert_eq!(stale_local.history.quota_points, local.history.quota_points);
-    }
-
-    #[test]
     fn redacted_query_skips_preview_source_before_loading_its_namespace() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
-            stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (ownership, source_history) = stores(&root, &codex_home, RedactionProfile::Redacted);
         let starts_at = at(2, 10, 0);
         let redacted = source(
             SOURCE_A,
@@ -5315,17 +5125,16 @@ mod tests {
                 &[SourceBucketRecord::upsert(1, bucket(starts_at, 10, "safe")).unwrap()],
             )
             .unwrap();
-        // A corrupt preview shard would fail the query if the privacy gate
+        // A corrupt preview record would fail the query if the privacy gate
         // opened this namespace. It must remain untouched.
-        let preview_directory = source_history
-            .source_buckets_directory(preview.source_id(), RedactionProfile::PreviewEnabled);
-        prepare_state_root(&preview_directory);
-        fs::write(preview_directory.join("2026-08-02.json"), b"not-json").unwrap();
+        corrupt_bucket_namespace(
+            &source_history,
+            preview.source_id(),
+            RedactionProfile::PreviewEnabled,
+        );
         activate_v2(&ownership);
 
-        let result =
-            load_unified_history_since(&ownership, &mut legacy, &source_history, starts_at)
-                .unwrap();
+        let result = load_unified_history_since(&ownership, &source_history, starts_at).unwrap();
         assert_eq!(result.included_sources, vec![SOURCE_A.parse().unwrap()]);
         assert_eq!(
             result.redaction_skipped_sources,
@@ -5337,24 +5146,50 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_initialization_phases_are_retryable_without_opening_a_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let (ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::PreviewEnabled,
+        );
+        let database = store.sqlite_database().unwrap();
+        let lease = ownership.acquire_writer_lease().unwrap();
+        ownership.initialize_v1_active(&lease).unwrap();
+        let previous = initialized_manifest(&ownership).unwrap();
+        let before = load_unified_history_since(&ownership, &store, at(1, 0, 0)).unwrap_err();
+        assert_eq!(before.kind(), io::ErrorKind::WouldBlock);
+        assert!(!database.path().exists());
+
+        ownership
+            .begin_sqlite_initialization(&lease, &previous)
+            .unwrap();
+        assert_eq!(
+            initialized_manifest(&ownership).unwrap().state(),
+            HistoryOwnershipState::Migrating
+        );
+        let pending = load_unified_history_since(&ownership, &store, at(1, 0, 0)).unwrap_err();
+        assert_eq!(pending.kind(), io::ErrorKind::WouldBlock);
+        assert!(!database.path().exists());
+    }
+
+    #[test]
     fn uninitialized_ownership_and_cross_bound_stores_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let other_root = directory.path().join("other-state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, source_history) =
+        let (ownership, source_history) =
             stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
 
         let uninitialized =
-            load_unified_history_since(&ownership, &mut legacy, &source_history, at(1, 0, 0))
-                .unwrap_err();
+            load_unified_history_since(&ownership, &source_history, at(1, 0, 0)).unwrap_err();
         assert_eq!(uninitialized.kind(), io::ErrorKind::NotFound);
 
         prepare_state_root(&other_root);
         let other_source = SourceHistoryStore::new(other_root, ownership.profile_id().clone());
         let mismatched =
-            load_unified_history_since(&ownership, &mut legacy, &other_source, at(1, 0, 0))
-                .unwrap_err();
+            load_unified_history_since(&ownership, &other_source, at(1, 0, 0)).unwrap_err();
         assert_eq!(mismatched.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -5443,8 +5278,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) =
-            stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::PreviewEnabled);
         let reset = at(8, 0, 0);
         let local_point = quota(at(2, 9, 0), reset);
         store
@@ -5471,13 +5305,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             writer
-                .apply_remote_history_active_page_cow(
+                .apply_remote_history_active_page(
                     remote.source_id(),
                     remote.aggregate_redaction_profile(),
                     &expected,
-                    &"ingest-gen-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .parse()
-                        .unwrap(),
                     expected.binding(),
                     &[],
                     &[],
@@ -5495,8 +5326,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let initial =
-            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        let initial = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
         assert_eq!(initial.history.quota_points, vec![local_point.clone()]);
         remote.set_quota_matches_local_account(true);
         store
@@ -5513,7 +5343,6 @@ mod tests {
         ] {
             let read = load_unified_history_since_selected(
                 &ownership,
-                &mut legacy,
                 &store,
                 &local_id,
                 &selection,
@@ -5532,8 +5361,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let excluded =
-            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        let excluded = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
         assert_eq!(excluded.history.quota_points, vec![local_point.clone()]);
         remote.set_include_in_aggregates(true);
         remote.set_quota_matches_local_account(false);
@@ -5543,8 +5371,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let separate =
-            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0)).unwrap();
+        let separate = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
         assert_eq!(separate.history.quota_points, vec![local_point]);
         // Projection never modifies local account samples or their export input.
         assert_eq!(
@@ -5558,97 +5385,18 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_pending_migration_reads_file_v2_history_with_previous_backfill_epoch() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores(
-            &directory.path().join("state"),
-            &directory.path().join("codex"),
-            RedactionProfile::Redacted,
-        );
-        let local = source(
-            SOURCE_A,
-            "local",
-            SourceKind::Local,
-            RedactionProfile::Redacted,
-        );
-        store.save_source_metadata(&local).unwrap();
-        store
-            .record_source_bucket_changes(
-                local.source_id(),
-                RedactionProfile::Redacted,
-                &[SourceBucketRecord::upsert(1, bucket(at(2, 10, 0), 10, "local")).unwrap()],
-            )
-            .unwrap();
-        let active = activate_v2(&ownership);
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
-        store
-            .writer(&authority)
-            .unwrap()
-            .mark_v2_summary_backfill_attempt(at(2, 9, 30), true)
-            .unwrap();
-        let pending = match ownership.begin_sqlite_migration(&lease, &active).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected SQLite migration conflict"),
-        };
-        for selection in [
-            HistorySourceSelection::AllIncluded,
-            HistorySourceSelection::Local(local.source_id().clone()),
-        ] {
-            let history = load_unified_history_since_selected(
-                &ownership,
-                &mut legacy,
-                &store,
-                local.source_id(),
-                &selection,
-                at(2, 0, 0),
-            )
-            .unwrap();
-            assert_eq!(history.backend, UnifiedHistoryBackend::V2);
-            assert_eq!(history.ownership_epoch, pending.epoch());
-            assert_eq!(
-                history.history.half_hour_buckets[0]
-                    .token_usage
-                    .total_tokens,
-                10
-            );
-            assert_eq!(
-                history.history.summary_backfill_attempted_at,
-                Some(at(2, 9, 30))
-            );
-            assert_eq!(
-                history.history.summary_backfill_attempt_complete,
-                Some(true)
-            );
-        }
-        assert_eq!(
-            store
-                .load_v2_summary_backfill_attempt(RedactionProfile::Redacted, pending.epoch())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
     fn sqlite_active_query_fails_closed_when_database_is_missing() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut legacy, ownership, store) = stores_for_backend(
+        let (ownership, store) = stores(
             &directory.path().join("state"),
             &directory.path().join("codex"),
             RedactionProfile::Redacted,
-            true,
         );
-        legacy
-            .record(&HistoryObservation {
-                observed_at: at(2, 10, 15),
-                half_hour_buckets: vec![bucket(at(2, 10, 0), 123, "legacy")],
-                ..HistoryObservation::default()
-            })
-            .unwrap();
-        activate_for_backend(&ownership, true);
+        activate_v2(&ownership);
+        let database = store.sqlite_database().unwrap();
+        fs::remove_file(database.path()).unwrap();
         assert_eq!(
-            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0))
+            load_unified_history_since(&ownership, &store, at(2, 0, 0))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound

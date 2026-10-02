@@ -1,14 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::*;
@@ -22,18 +17,10 @@ pub(super) const DIGESTS_DIRECTORY: &str = "digests";
 const FACTS_DIRECTORY: &str = "facts";
 const FACT_MANIFESTS_DIRECTORY: &str = "fact-manifests";
 const FACT_STAGING_DIRECTORY: &str = "fact-staging";
-pub(super) const DIGESTS_LOCK_FILE: &str = "digests.lock";
-const FACT_STAGING_LOCK_FILE: &str = "fact-staging.lock";
 const STAGED_BATCH_FILE: &str = "batch.json";
-const STAGED_GENERATION_DIRECTORY: &str = "generation";
 const STAGED_PUBLICATION_FILE: &str = "publication.json";
-const SESSION_DIGEST_SHARD_FORMAT_VERSION: u32 = 3;
-const FACT_SHARD_FORMAT_VERSION: u32 = 2;
 const FACT_BATCH_FORMAT_VERSION: u32 = 5;
 const FACT_MANIFEST_FORMAT_VERSION: u32 = 4;
-const SESSION_EVIDENCE_METRIC_REVISION: u32 = 1;
-const MAX_EVIDENCE_SHARD_BYTES: u64 = 128 * 1024 * 1024;
-pub(super) const MAX_COMPRESSED_EVIDENCE_SHARD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FACT_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_FACT_BATCH_CHANGES: usize = 250_000;
 const MAX_FACT_GENERATION_RECORDS: usize = 1_000_000;
@@ -42,7 +29,6 @@ const MAX_FACT_RETENTION_DAYS: i64 = 35;
 // endpoints are not midnight. Record timestamps remain the authoritative
 // retention bound; this only caps the number of possible daily shards.
 const MAX_FACT_RETENTION_UTC_DAYS: usize = 36;
-const MAX_FACT_GENERATION_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FACT_NAMESPACE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FACT_NAMESPACE_ENTRIES: u64 = 250_000;
 const MAX_USAGE_EVENT_ID_BYTES: usize = 256;
@@ -937,8 +923,8 @@ pub struct ActiveFactVersion {
     /// set. Local facts have no remote binding.
     remote_binding: Option<SourceHistoryRemoteBinding>,
     /// Exact source digests revalidated by the complete scan which produced
-    /// this generation. Empty legacy manifests are safe but never satisfy a
-    /// current digest and therefore force a refresh.
+    /// this generation. An empty proof never satisfies a current digest and
+    /// therefore requires a refresh.
     #[serde(default)]
     validated_digests: Vec<FactDigestBinding>,
     /// Center-trusted lower bound established by retention GC. Including it in
@@ -1139,52 +1125,6 @@ pub struct FactActivationReport {
     pub cleanup_pending: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionDigestShard {
-    format_version: u32,
-    metric_revision: u32,
-    profile_id: HistoryProfileId,
-    source_id: NodeId,
-    redaction_profile: RedactionProfile,
-    utc_day: NaiveDate,
-    records: Vec<SourceSessionDigestRecord>,
-}
-
-impl SessionDigestShard {
-    fn new(
-        profile_id: HistoryProfileId,
-        source_id: NodeId,
-        redaction_profile: RedactionProfile,
-        utc_day: NaiveDate,
-    ) -> Self {
-        Self {
-            format_version: SESSION_DIGEST_SHARD_FORMAT_VERSION,
-            metric_revision: SESSION_EVIDENCE_METRIC_REVISION,
-            profile_id,
-            source_id,
-            redaction_profile,
-            utc_day,
-            records: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FactShard {
-    format_version: u32,
-    metric_revision: u32,
-    profile_id: HistoryProfileId,
-    source_id: NodeId,
-    redaction_profile: RedactionProfile,
-    replica: SessionReplicaKey,
-    thread_shard_key: ThreadShardKey,
-    generation: FactBatchId,
-    utc_day: NaiveDate,
-    records: Vec<UsageEventFactRecord>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StagedFactBatch {
@@ -1306,18 +1246,6 @@ impl SourceHistoryStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn acquire_fact_staging_lock_for_test(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-    ) -> io::Result<crate::file_lock::FileLock> {
-        let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&staging_root)?;
-        let lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        lock_exclusive(lock, &staging_root, FACT_STAGING_LOCK_FILE)
-    }
-
-    #[cfg(test)]
     pub(crate) fn record_source_session_digest_changes(
         &self,
         source_id: &NodeId,
@@ -1353,8 +1281,9 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         records: &[SourceSessionDigestRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
-        if let Some(database) = self.sqlite_database() {
-            return database.write(|_| {
+        self.sqlite_database()
+            .expect("source history is SQL-only")
+            .write(|_| {
                 self.load_source_metadata(source_id)?;
                 self.record_source_session_digest_changes_in_directory_unfenced(
                     source_id,
@@ -1362,15 +1291,7 @@ impl SourceHistoryStore {
                     &self.source_digests_directory(source_id, redaction_profile),
                     records,
                 )
-            });
-        }
-        let _ = self.load_source_metadata(source_id)?;
-        self.record_source_session_digest_changes_in_directory_unfenced(
-            source_id,
-            redaction_profile,
-            &self.source_digests_directory(source_id, redaction_profile),
-            records,
-        )
+            })
     }
 
     pub(super) fn record_source_session_digest_changes_in_directory_unfenced(
@@ -1380,54 +1301,7 @@ impl SourceHistoryStore {
         directory: &Path,
         records: &[SourceSessionDigestRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_record_digest_changes(
-                source_id,
-                redaction_profile,
-                directory,
-                records,
-            );
-        }
-        let additions = group_digest_records_by_day(source_id, records)?;
-        if additions.is_empty() {
-            return Ok(SourceHistoryWriteReport::default());
-        }
-        self.prepare_private_directory(directory)?;
-        let lock = open_lock_file(directory, DIGESTS_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, directory, DIGESTS_LOCK_FILE)?;
-        cleanup_atomic_shard_temporary_files(self, directory, AtomicShardFileKind::GzipJson)?;
-        let mut report = SourceHistoryWriteReport::default();
-        for (day, additions) in additions {
-            let path = evidence_shard_path(directory, day);
-            let mut shard = match read_digest_shard(
-                &path,
-                &self.profile_id,
-                source_id,
-                redaction_profile,
-                day,
-            )? {
-                Some(shard) => shard,
-                None => SessionDigestShard::new(
-                    self.profile_id.clone(),
-                    source_id.clone(),
-                    redaction_profile,
-                    day,
-                ),
-            };
-            let mut record_index = digest_record_index(&shard.records)?;
-            let mut changed = false;
-            for record in additions {
-                changed |= apply_digest_record(&mut shard.records, &mut record_index, record)?;
-            }
-            if !changed {
-                report.shards_skipped += 1;
-                continue;
-            }
-            sort_digest_records(&mut shard.records);
-            write_gzip_json_atomically(self, &path, &shard)?;
-            report.shards_written += 1;
-        }
-        Ok(report)
+        self.sqlite_record_digest_changes(source_id, redaction_profile, directory, records)
     }
 
     pub fn load_source_session_digest_records_since(
@@ -1491,41 +1365,12 @@ impl SourceHistoryStore {
     pub(super) fn load_source_session_digest_records_from_directory_with_budget(
         &self,
         source_id: &NodeId,
-        redaction_profile: RedactionProfile,
+        _redaction_profile: RedactionProfile,
         since: DateTime<Utc>,
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_load_digest_records(source_id, since, directory, budget);
-        }
-        if !self.private_directory_exists(directory)? {
-            return Ok(Vec::new());
-        }
-        let lock = open_lock_file(directory, DIGESTS_LOCK_FILE)?;
-        let _lock = lock_shared(lock, directory, DIGESTS_LOCK_FILE)?;
-        let mut records = Vec::new();
-        let mut record_index = HashMap::new();
-        for (day, path) in evidence_shard_entries_since(self, directory, since)? {
-            let Some(shard) = read_digest_shard_with_budget(
-                &path,
-                &self.profile_id,
-                source_id,
-                redaction_profile,
-                day,
-                budget,
-            )?
-            else {
-                continue;
-            };
-            for record in shard.records {
-                if digest_record_intersects_since(&record, since) {
-                    let _ = apply_digest_record(&mut records, &mut record_index, record)?;
-                }
-            }
-        }
-        sort_digest_records(&mut records);
-        Ok(records)
+        self.sqlite_load_digest_records(source_id, since, directory, budget)
     }
 
     pub(super) fn stage_complete_fact_batch_unfenced(
@@ -1534,136 +1379,10 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         batch: &CompleteFactBatch,
     ) -> io::Result<()> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_stage_fact_batch(source_id, redaction_profile, batch);
-        }
-        batch.validate()?;
-        if batch.replica.source_id() != source_id {
-            return Err(invalid_data(
-                "fact batch source does not match its namespace",
-            ));
-        }
-        let source = self.load_source_metadata(source_id)?;
-        validate_fact_remote_binding(source.kind(), source_id, batch.remote_binding.as_ref())?;
-        let shard_key = ThreadShardKey::from_replica(&batch.replica);
-        let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&staging_root)?;
-        let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
-        ensure_fact_namespace_within_cap(self, source_id, redaction_profile)?;
-        let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&manifests)?;
-        let lock_name = fact_lock_name(&shard_key);
-        let lock = open_lock_file(&manifests, &lock_name)?;
-        let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
-        let current = self.read_active_fact_manifest_unlocked(
-            source_id,
-            redaction_profile,
-            &batch.replica,
-            &shard_key,
-        )?;
-        if current.as_ref().map(ActiveFactManifest::version) != batch.expected_active_version {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "active fact version changed before staging",
-            ));
-        }
-        let retained_since = current
-            .as_ref()
-            .and_then(|manifest| manifest.retained_since);
-
-        let mut records = match batch.kind {
-            FactBatchKind::Snapshot => Vec::new(),
-            FactBatchKind::Delta => current
-                .as_ref()
-                .map(|manifest| {
-                    self.read_fact_generation_unlocked(source_id, redaction_profile, manifest)
-                })
-                .transpose()?
-                .unwrap_or_default(),
-        };
-        // Records only append or replace until the final sort; indices remain
-        // stable across the entire batch, including repeated incoming IDs.
-        let mut record_index = records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| (record.event_id.clone(), index))
-            .collect::<HashMap<_, _>>();
-        for change in batch.changes.iter().cloned() {
-            validate_fact_record_namespace(&change, &batch.replica)?;
-            if retained_since.is_some_and(|cutoff| change.occurred_at() < cutoff) {
-                // GC has already made this time range permanently invisible.
-                // Advancing the remote cursor is still safe, but retaining the
-                // stale change would allow a previously collected tombstone to
-                // resurrect after its record was pruned.
-                continue;
-            }
-            let _ = apply_fact_record(&mut records, &mut record_index, change)?;
-        }
-        sort_fact_records(&mut records);
-        validate_fact_generation_limits(&records)?;
-        let facts = records
-            .iter()
-            .filter_map(|record| match record.change() {
-                UsageEventFactChange::Upsert(fact) => Some(fact.as_ref()),
-                UsageEventFactChange::Tombstone => None,
-            })
-            .collect::<Vec<_>>();
-        crate::source_export::validate_fact_digest_bindings_against_facts(
-            &batch.replica,
-            &facts,
-            &batch.validated_digests,
-            retained_since,
-        )?;
-
-        let staging = staging_root.join(batch.batch_id.as_str());
-        create_new_private_directory(self, &staging)?;
-        let generation = staging.join(STAGED_GENERATION_DIRECTORY);
-        create_new_private_directory(self, &generation)?;
-        let result = (|| {
-            let binding = FactGenerationBinding {
-                profile_id: &self.profile_id,
-                source_id,
-                redaction_profile,
-                replica: &batch.replica,
-                shard_key: &shard_key,
-                generation: &batch.batch_id,
-            };
-            let shard_days = write_fact_generation(self, &generation, &binding, &records)?;
-            let descriptor = StagedFactBatch {
-                format_version: FACT_BATCH_FORMAT_VERSION,
-                profile_id: self.profile_id.clone(),
-                source_id: source_id.clone(),
-                redaction_profile,
-                thread_shard_key: shard_key,
-                batch_id: batch.batch_id.clone(),
-                kind: batch.kind,
-                replica: batch.replica.clone(),
-                expected_active_version: batch.expected_active_version.clone(),
-                remote_binding: batch.remote_binding.clone(),
-                validated_digests: batch.validated_digests.clone(),
-                retained_since,
-                activate_cursor: batch.activate_cursor,
-                completed_at: batch.completed_at,
-                shard_days,
-                change_count: batch.changes.len(),
-                record_count: records.len(),
-            };
-            write_private_atomically_beneath(
-                self,
-                &staging.join(STAGED_BATCH_FILE),
-                &encode_pretty_bounded(&descriptor, MAX_FACT_MANIFEST_BYTES)?,
-            )?;
-            sync_store_directory(self, &staging)?;
-            ensure_fact_namespace_within_cap(self, source_id, redaction_profile)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = remove_private_tree(self, &staging);
-        }
-        result
+        self.sqlite_stage_fact_batch(source_id, redaction_profile, batch)
     }
 
+    #[cfg(test)]
     pub(super) fn activate_staged_fact_batch_unfenced(
         &self,
         source_id: &NodeId,
@@ -1683,355 +1402,21 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         batch_id: &FactBatchId,
     ) -> io::Result<PrevalidatedFactPublication> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_prevalidate_fact_batch(source_id, redaction_profile, batch_id);
-        }
-        let source = self.load_source_metadata(source_id)?;
-        let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
-        self.validate_private_path(&staging_root)?;
-        let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
-        let staging = staging_root.join(batch_id.as_str());
-        self.validate_private_path(&staging)?;
-        let descriptor = read_staged_batch(
-            &staging.join(STAGED_BATCH_FILE),
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            batch_id,
-        )?;
-        validate_fact_remote_binding(source.kind(), source_id, descriptor.remote_binding.as_ref())?;
-        let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&manifests)?;
-        let lock_name = fact_lock_name(&descriptor.thread_shard_key);
-        let current = {
-            let lock = open_lock_file(&manifests, &lock_name)?;
-            let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
-            self.read_active_fact_manifest_unlocked(
-                source_id,
-                redaction_profile,
-                &descriptor.replica,
-                &descriptor.thread_shard_key,
-            )?
-        };
-        if current.as_ref().is_some_and(|manifest| {
-            manifest.active_generation == descriptor.batch_id
-                && manifest.cursor == descriptor.activate_cursor
-                && manifest.remote_binding == descriptor.remote_binding
-        }) {
-            return Ok(PrevalidatedFactPublication {
-                descriptor,
-                mode: PrevalidatedFactPublicationMode::NoOp,
-            });
-        }
-        if current.as_ref().map(ActiveFactManifest::version) != descriptor.expected_active_version {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "active fact version changed before activation",
-            ));
-        }
-        // An empty journal delta can still revalidate a changed digest
-        // identity or populate bindings missing from an older manifest.
-        // Publish that metadata before treating future deltas as no-ops.
-        if descriptor.kind == FactBatchKind::Delta
-            && descriptor
-                .expected_active_version
-                .as_ref()
-                .is_some_and(|expected| {
-                    expected.cursor == descriptor.activate_cursor
-                        && expected.validated_digests == descriptor.validated_digests
-                })
-        {
-            return Ok(PrevalidatedFactPublication {
-                descriptor,
-                mode: PrevalidatedFactPublicationMode::NoOp,
-            });
-        }
-
-        let staged_generation = staging.join(STAGED_GENERATION_DIRECTORY);
-        let facts_thread = self
-            .source_facts_directory(source_id, redaction_profile)
-            .join(descriptor.thread_shard_key.as_str());
-        self.prepare_private_directory(&facts_thread)?;
-        let active_generation = facts_thread.join(descriptor.batch_id.as_str());
-        if self.private_directory_exists(&staged_generation)? {
-            if self.private_directory_exists(&active_generation)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "fact generation already exists for staged batch",
-                ));
-            }
-            self.validate_private_path(&staged_generation)?;
-            self.validate_private_path(&staging)?;
-            self.validate_private_path(&facts_thread)?;
-            fs::rename(&staged_generation, &active_generation)?;
-            self.validate_private_path(&active_generation)?;
-            sync_store_directory(self, &facts_thread)?;
-            sync_store_directory(self, &staging)?;
-        } else {
-            self.validate_private_path(&active_generation)?;
-        }
-        let records = read_fact_generation(
-            self,
-            &active_generation,
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            &descriptor.replica,
-            &descriptor.thread_shard_key,
-            &descriptor.batch_id,
-            &descriptor.shard_days,
-        )?;
-        if records.len() != descriptor.record_count {
-            return Err(invalid_data(
-                "staged fact generation record count does not match its descriptor",
-            ));
-        }
-        let facts = records
-            .iter()
-            .filter_map(|record| match record.change() {
-                UsageEventFactChange::Upsert(fact) => Some(fact.as_ref()),
-                UsageEventFactChange::Tombstone => None,
-            })
-            .collect::<Vec<_>>();
-        crate::source_export::validate_fact_digest_bindings_against_facts(
-            &descriptor.replica,
-            &facts,
-            &descriptor.validated_digests,
-            descriptor.retained_since,
-        )?;
-
-        let manifest = ActiveFactManifest {
-            format_version: FACT_MANIFEST_FORMAT_VERSION,
-            profile_id: self.profile_id.clone(),
-            source_id: source_id.clone(),
-            redaction_profile,
-            thread_shard_key: descriptor.thread_shard_key.clone(),
-            replica: descriptor.replica.clone(),
-            active_generation: descriptor.batch_id.clone(),
-            cursor: descriptor.activate_cursor,
-            remote_binding: descriptor.remote_binding.clone(),
-            validated_digests: descriptor.validated_digests.clone(),
-            retained_since: descriptor.retained_since,
-            activated_at: descriptor.completed_at,
-            shard_days: descriptor.shard_days.clone(),
-            record_count: descriptor.record_count,
-        };
-        let candidate_manifest = staging.join(STAGED_PUBLICATION_FILE);
-        write_private_atomically_beneath(
-            self,
-            &candidate_manifest,
-            &encode_pretty_bounded(&manifest, MAX_FACT_MANIFEST_BYTES)?,
-        )?;
-        if let Err(error) = ensure_fact_namespace_within_cap(self, source_id, redaction_profile) {
-            let _ = fs::remove_file(&candidate_manifest);
-            let _ = sync_store_directory(self, &staging);
-            return Err(error);
-        }
-        Ok(PrevalidatedFactPublication {
-            descriptor,
-            mode: PrevalidatedFactPublicationMode::Publish {
-                manifest: Box::new(manifest),
-                previous_active_generation: current.map(|current| current.active_generation),
-            },
-        })
+        self.sqlite_prevalidate_fact_batch(source_id, redaction_profile, batch_id)
     }
 
     pub(super) fn publish_prevalidated_fact_batch_unfenced(
         &self,
         publication: &PrevalidatedFactPublication,
     ) -> io::Result<FactActivationReport> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_publish_fact_batch(publication);
-        }
-        let descriptor = &publication.descriptor;
-        let source_id = &descriptor.source_id;
-        let redaction_profile = descriptor.redaction_profile;
-        let source = self.load_source_metadata(source_id)?;
-        validate_fact_remote_binding(source.kind(), source_id, descriptor.remote_binding.as_ref())?;
-
-        // Publication is invoked while the exact remotes config shared fence
-        // is held. Never wait there for staging, GC, a long reader, or another
-        // publisher: a busy lock makes this attempt retryable instead.
-        let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
-        self.validate_private_path(&staging_root)?;
-        let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-        let _staging_lock = try_lock_exclusive_for_fact_publication(
-            staging_lock,
-            &staging_root,
-            FACT_STAGING_LOCK_FILE,
-        )?;
-        let staging = staging_root.join(descriptor.batch_id.as_str());
-        self.validate_private_path(&staging)?;
-        let persisted = read_staged_batch(
-            &staging.join(STAGED_BATCH_FILE),
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            &descriptor.batch_id,
-        )?;
-        if &persisted != descriptor {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "staged fact descriptor changed after prevalidation",
-            ));
-        }
-
-        let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&manifests)?;
-        let lock_name = fact_lock_name(&descriptor.thread_shard_key);
-        let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-        let _manifest_lock =
-            try_lock_exclusive_for_fact_publication(manifest_lock, &manifests, &lock_name)?;
-        let current = self.read_active_fact_manifest_unlocked(
-            source_id,
-            redaction_profile,
-            &descriptor.replica,
-            &descriptor.thread_shard_key,
-        )?;
-
-        match &publication.mode {
-            PrevalidatedFactPublicationMode::NoOp => {
-                let already_active = current.as_ref().is_some_and(|manifest| {
-                    manifest.active_generation == descriptor.batch_id
-                        && manifest.cursor == descriptor.activate_cursor
-                        && manifest.remote_binding == descriptor.remote_binding
-                });
-                let empty_delta = descriptor.kind == FactBatchKind::Delta
-                    && current.as_ref().map(ActiveFactManifest::version)
-                        == descriptor.expected_active_version
-                    && descriptor
-                        .expected_active_version
-                        .as_ref()
-                        .is_some_and(|expected| {
-                            expected.cursor == descriptor.activate_cursor
-                                && expected.validated_digests == descriptor.validated_digests
-                        });
-                if !already_active && !empty_delta {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "active fact version changed before no-op publication",
-                    ));
-                }
-                Ok(FactActivationReport {
-                    activated: false,
-                    cleanup_pending: false,
-                })
-            }
-            PrevalidatedFactPublicationMode::Publish { manifest, .. } => {
-                if current.as_ref().map(ActiveFactManifest::version)
-                    != descriptor.expected_active_version
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "active fact version changed before publication",
-                    ));
-                }
-                let active_generation = self
-                    .source_facts_directory(source_id, redaction_profile)
-                    .join(descriptor.thread_shard_key.as_str())
-                    .join(descriptor.batch_id.as_str());
-                self.validate_private_path(&active_generation)?;
-                if !self.private_directory_exists(&active_generation)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "prevalidated fact generation is missing",
-                    ));
-                }
-                let candidate_path = staging.join(STAGED_PUBLICATION_FILE);
-                let candidate = read_optional_json_file::<ActiveFactManifest>(
-                    &candidate_path,
-                    MAX_FACT_MANIFEST_BYTES,
-                )?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "prevalidated fact manifest is missing",
-                    )
-                })?;
-                validate_active_manifest(
-                    &candidate,
-                    &self.profile_id,
-                    source_id,
-                    redaction_profile,
-                    &descriptor.replica,
-                    &descriptor.thread_shard_key,
-                )?;
-                if &candidate != manifest.as_ref() {
-                    return Err(invalid_data(
-                        "prevalidated fact manifest changed before publication",
-                    ));
-                }
-                let manifest_path = fact_manifest_path(&manifests, &descriptor.thread_shard_key);
-                validate_data_file_metadata(
-                    &candidate_path,
-                    &fs::symlink_metadata(&candidate_path)?,
-                )?;
-                replace_file(&candidate_path, &manifest_path)?;
-                validate_data_file_metadata(
-                    &manifest_path,
-                    &fs::symlink_metadata(&manifest_path)?,
-                )?;
-                sync_store_directory(self, &manifests)?;
-                Ok(FactActivationReport {
-                    activated: true,
-                    cleanup_pending: false,
-                })
-            }
-        }
+        self.sqlite_publish_fact_batch(publication)
     }
 
     pub(super) fn cleanup_prevalidated_fact_publication_unfenced(
         &self,
         publication: &PrevalidatedFactPublication,
     ) -> bool {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_cleanup_fact_publication(publication).is_err();
-        }
-        (|| -> io::Result<()> {
-            let descriptor = &publication.descriptor;
-            let source_id = &descriptor.source_id;
-            let redaction_profile = descriptor.redaction_profile;
-            let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
-            self.prepare_private_directory(&staging_root)?;
-            let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-            let _staging_lock =
-                lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
-            let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
-            self.prepare_private_directory(&manifests)?;
-            let lock_name = fact_lock_name(&descriptor.thread_shard_key);
-            let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-            let _manifest_lock = lock_exclusive(manifest_lock, &manifests, &lock_name)?;
-            let current = self.read_active_fact_manifest_unlocked(
-                source_id,
-                redaction_profile,
-                &descriptor.replica,
-                &descriptor.thread_shard_key,
-            )?;
-            if let PrevalidatedFactPublicationMode::Publish {
-                previous_active_generation: Some(previous),
-                ..
-            } = &publication.mode
-                && current
-                    .as_ref()
-                    .is_some_and(|manifest| manifest.active_generation == descriptor.batch_id)
-                && previous != &descriptor.batch_id
-            {
-                let previous_path = self
-                    .source_facts_directory(source_id, redaction_profile)
-                    .join(descriptor.thread_shard_key.as_str())
-                    .join(previous.as_str());
-                remove_private_tree(self, &previous_path)?;
-            }
-            let staging = staging_root.join(descriptor.batch_id.as_str());
-            match remove_private_tree(self, &staging) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            ensure_fact_namespace_within_cap(self, source_id, redaction_profile)
-        })()
-        .is_err()
+        self.sqlite_cleanup_fact_publication(publication).is_err()
     }
 
     pub fn load_active_fact_set(
@@ -2052,217 +1437,7 @@ impl SourceHistoryStore {
         thread_id: &ThreadId,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Option<ActiveFactSet>> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_load_active_fact_set(
-                source_id,
-                redaction_profile,
-                thread_id,
-                budget,
-            );
-        }
-        let source = self.load_source_metadata_with_budget(source_id, budget)?;
-        let replica = SessionReplicaKey::new(source_id.clone(), thread_id.clone());
-        let shard_key = ThreadShardKey::from_replica(&replica);
-        let manifests = self.source_fact_manifests_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&manifests)? {
-            return Ok(None);
-        }
-        let lock_name = fact_lock_name(&shard_key);
-        let lock = open_lock_file(&manifests, &lock_name)?;
-        let _lock = lock_shared(lock, &manifests, &lock_name)?;
-        let Some(manifest) = self.read_active_fact_manifest_unlocked_with_budget(
-            source_id,
-            redaction_profile,
-            &replica,
-            &shard_key,
-            budget,
-        )?
-        else {
-            return Ok(None);
-        };
-        validate_fact_remote_binding(source.kind(), source_id, manifest.remote_binding.as_ref())?;
-        let records = self.read_fact_generation_unlocked_with_budget(
-            source_id,
-            redaction_profile,
-            &manifest,
-            budget,
-        )?;
-        Ok(Some(ActiveFactSet {
-            replica,
-            redaction_profile,
-            version: manifest.version(),
-            cursor: manifest.cursor,
-            remote_binding: manifest.remote_binding.clone(),
-            activated_at: manifest.activated_at,
-            records,
-        }))
-    }
-
-    fn read_active_fact_manifest_unlocked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        replica: &SessionReplicaKey,
-        shard_key: &ThreadShardKey,
-    ) -> io::Result<Option<ActiveFactManifest>> {
-        self.read_active_fact_manifest_unlocked_inner(
-            source_id,
-            redaction_profile,
-            replica,
-            shard_key,
-            None,
-        )
-    }
-
-    fn read_active_fact_manifest_unlocked_with_budget(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        replica: &SessionReplicaKey,
-        shard_key: &ThreadShardKey,
-        budget: &mut SourceHistoryReadBudget,
-    ) -> io::Result<Option<ActiveFactManifest>> {
-        self.read_active_fact_manifest_unlocked_inner(
-            source_id,
-            redaction_profile,
-            replica,
-            shard_key,
-            Some(budget),
-        )
-    }
-
-    fn read_active_fact_manifest_unlocked_inner(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        replica: &SessionReplicaKey,
-        shard_key: &ThreadShardKey,
-        mut budget: Option<&mut SourceHistoryReadBudget>,
-    ) -> io::Result<Option<ActiveFactManifest>> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_read_fact_manifest(
-                source_id,
-                redaction_profile,
-                replica,
-                shard_key,
-                budget,
-            );
-        }
-        let directory = self.source_fact_manifests_directory(source_id, redaction_profile);
-        self.validate_private_path(&directory)?;
-        let path = fact_manifest_path(&directory, shard_key);
-        let manifest = match budget.as_mut() {
-            Some(budget) => {
-                read_optional_json_file_with_budget(&path, MAX_FACT_MANIFEST_BYTES, budget)?
-            }
-            None => read_optional_json_file(&path, MAX_FACT_MANIFEST_BYTES)?,
-        };
-        let manifest: ActiveFactManifest = match manifest {
-            Some(manifest) => manifest,
-            None => return Ok(None),
-        };
-        validate_active_manifest(
-            &manifest,
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            replica,
-            shard_key,
-        )?;
-        Ok(Some(manifest))
-    }
-
-    fn read_fact_generation_unlocked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        manifest: &ActiveFactManifest,
-    ) -> io::Result<Vec<UsageEventFactRecord>> {
-        if self.sqlite_database().is_some() {
-            let mut budget = SourceHistoryReadBudget::for_query();
-            return self.sqlite_read_fact_generation(
-                source_id,
-                redaction_profile,
-                manifest,
-                &mut budget,
-            );
-        }
-        let directory = self
-            .source_facts_directory(source_id, redaction_profile)
-            .join(manifest.thread_shard_key.as_str())
-            .join(manifest.active_generation.as_str());
-        let records = read_fact_generation(
-            self,
-            &directory,
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            &manifest.replica,
-            &manifest.thread_shard_key,
-            &manifest.active_generation,
-            &manifest.shard_days,
-        )?;
-        if records.len() != manifest.record_count {
-            return Err(invalid_data(
-                "active fact generation record count does not match its manifest",
-            ));
-        }
-        if manifest
-            .retained_since
-            .is_some_and(|cutoff| records.iter().any(|record| record.occurred_at() < cutoff))
-        {
-            return Err(invalid_data(
-                "active fact generation contains a record below its retention floor",
-            ));
-        }
-        Ok(records)
-    }
-
-    fn read_fact_generation_unlocked_with_budget(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        manifest: &ActiveFactManifest,
-        budget: &mut SourceHistoryReadBudget,
-    ) -> io::Result<Vec<UsageEventFactRecord>> {
-        if self.sqlite_database().is_some() {
-            return self.sqlite_read_fact_generation(
-                source_id,
-                redaction_profile,
-                manifest,
-                budget,
-            );
-        }
-        let directory = self
-            .source_facts_directory(source_id, redaction_profile)
-            .join(manifest.thread_shard_key.as_str())
-            .join(manifest.active_generation.as_str());
-        let records = read_fact_generation_with_budget(
-            self,
-            &directory,
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            &manifest.replica,
-            &manifest.thread_shard_key,
-            &manifest.active_generation,
-            &manifest.shard_days,
-            budget,
-        )?;
-        if records.len() != manifest.record_count {
-            return Err(invalid_data(
-                "active fact generation record count does not match its manifest",
-            ));
-        }
-        if manifest
-            .retained_since
-            .is_some_and(|cutoff| records.iter().any(|record| record.occurred_at() < cutoff))
-        {
-            return Err(invalid_data(
-                "active fact generation contains a record below its retention floor",
-            ));
-        }
-        Ok(records)
+        self.sqlite_load_active_fact_set(source_id, redaction_profile, thread_id, budget)
     }
 }
 
@@ -2497,93 +1672,6 @@ fn digest_record_intersects_since(
     record.retention_through() >= since
 }
 
-fn read_digest_shard(
-    path: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    day: NaiveDate,
-) -> io::Result<Option<SessionDigestShard>> {
-    read_digest_shard_inner(path, profile_id, source_id, redaction_profile, day, None)
-}
-
-fn read_digest_shard_with_budget(
-    path: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    day: NaiveDate,
-    budget: &mut SourceHistoryReadBudget,
-) -> io::Result<Option<SessionDigestShard>> {
-    read_digest_shard_inner(
-        path,
-        profile_id,
-        source_id,
-        redaction_profile,
-        day,
-        Some(budget),
-    )
-}
-
-fn read_digest_shard_inner(
-    path: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    day: NaiveDate,
-    mut budget: Option<&mut SourceHistoryReadBudget>,
-) -> io::Result<Option<SessionDigestShard>> {
-    let shard = match budget.as_deref_mut() {
-        Some(budget) => read_optional_gzip_json_file_with_budget(path, budget)?,
-        None => read_optional_gzip_json_file(path)?,
-    };
-    let mut shard: SessionDigestShard = match shard {
-        Some(shard) => shard,
-        None => return Ok(None),
-    };
-    if let Some(budget) = budget.as_mut() {
-        budget.charge_records(shard.records.len())?;
-    }
-    if shard.format_version != SESSION_DIGEST_SHARD_FORMAT_VERSION
-        || shard.metric_revision != SESSION_EVIDENCE_METRIC_REVISION
-        || &shard.profile_id != profile_id
-        || &shard.source_id != source_id
-        || shard.redaction_profile != redaction_profile
-        || shard.utc_day != day
-    {
-        return Err(envelope_mismatch(path, "session digest envelope"));
-    }
-    let mut unique = Vec::new();
-    let mut record_index = HashMap::new();
-    for record in std::mem::take(&mut shard.records) {
-        record.validate()?;
-        if record.range_start().date_naive() != day {
-            return Err(envelope_mismatch(path, "session digest record UTC day"));
-        }
-        if let SourceSessionDigestChange::Upsert(digest) = record.change()
-            && digest.replica().source_id() != source_id
-        {
-            return Err(envelope_mismatch(path, "session digest replica source"));
-        }
-        let _ = apply_digest_record(&mut unique, &mut record_index, record)?;
-    }
-    sort_digest_records(&mut unique);
-    shard.records = unique;
-    Ok(Some(shard))
-}
-
-pub(super) fn validate_digest_shard_for_remote_clone(
-    path: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    day: NaiveDate,
-) -> io::Result<()> {
-    read_digest_shard(path, profile_id, source_id, redaction_profile, day)?
-        .ok_or_else(|| invalid_data("remote clone digest shard disappeared"))?;
-    Ok(())
-}
-
 fn validate_fact_record_namespace(
     record: &UsageEventFactRecord,
     replica: &SessionReplicaKey,
@@ -2679,226 +1767,6 @@ fn validate_fact_generation_limits(records: &[UsageEventFactRecord]) -> io::Resu
     validate_fact_record_span(records)
 }
 
-struct FactGenerationBinding<'a> {
-    profile_id: &'a HistoryProfileId,
-    source_id: &'a NodeId,
-    redaction_profile: RedactionProfile,
-    replica: &'a SessionReplicaKey,
-    shard_key: &'a ThreadShardKey,
-    generation: &'a FactBatchId,
-}
-
-fn write_fact_generation(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    binding: &FactGenerationBinding<'_>,
-    records: &[UsageEventFactRecord],
-) -> io::Result<Vec<NaiveDate>> {
-    store.validate_private_path(directory)?;
-    validate_fact_generation_limits(records)?;
-    let mut grouped = BTreeMap::<NaiveDate, Vec<UsageEventFactRecord>>::new();
-    for record in records {
-        validate_fact_record_namespace(record, binding.replica)?;
-        grouped
-            .entry(record.occurred_at().date_naive())
-            .or_default()
-            .push(record.clone());
-    }
-    let mut days = Vec::with_capacity(grouped.len());
-    let mut total_decoded_bytes = 0_u64;
-    for (day, mut records) in grouped {
-        sort_fact_records(&mut records);
-        let shard = FactShard {
-            format_version: FACT_SHARD_FORMAT_VERSION,
-            metric_revision: SESSION_EVIDENCE_METRIC_REVISION,
-            profile_id: binding.profile_id.clone(),
-            source_id: binding.source_id.clone(),
-            redaction_profile: binding.redaction_profile,
-            replica: binding.replica.clone(),
-            thread_shard_key: binding.shard_key.clone(),
-            generation: binding.generation.clone(),
-            utc_day: day,
-            records,
-        };
-        let remaining = MAX_FACT_GENERATION_DECODED_BYTES
-            .checked_sub(total_decoded_bytes)
-            .ok_or_else(|| invalid_data("fact generation decoded size exceeds its hard cap"))?;
-        if remaining == 0 {
-            return Err(invalid_data(
-                "fact generation decoded size exceeds its hard cap",
-            ));
-        }
-        let decoded_bytes = write_gzip_json_atomically_with_limit(
-            store,
-            &evidence_shard_path(directory, day),
-            &shard,
-            remaining.min(MAX_EVIDENCE_SHARD_BYTES),
-        )?;
-        total_decoded_bytes = total_decoded_bytes
-            .checked_add(decoded_bytes)
-            .ok_or_else(|| invalid_data("fact generation decoded size overflowed"))?;
-        days.push(day);
-    }
-    sync_store_directory(store, directory)?;
-    Ok(days)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_fact_generation(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    replica: &SessionReplicaKey,
-    shard_key: &ThreadShardKey,
-    generation: &FactBatchId,
-    expected_days: &[NaiveDate],
-) -> io::Result<Vec<UsageEventFactRecord>> {
-    read_fact_generation_inner(
-        store,
-        directory,
-        profile_id,
-        source_id,
-        redaction_profile,
-        replica,
-        shard_key,
-        generation,
-        expected_days,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_fact_generation_with_budget(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    replica: &SessionReplicaKey,
-    shard_key: &ThreadShardKey,
-    generation: &FactBatchId,
-    expected_days: &[NaiveDate],
-    budget: &mut SourceHistoryReadBudget,
-) -> io::Result<Vec<UsageEventFactRecord>> {
-    read_fact_generation_inner(
-        store,
-        directory,
-        profile_id,
-        source_id,
-        redaction_profile,
-        replica,
-        shard_key,
-        generation,
-        expected_days,
-        Some(budget),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_fact_generation_inner(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    replica: &SessionReplicaKey,
-    shard_key: &ThreadShardKey,
-    generation: &FactBatchId,
-    expected_days: &[NaiveDate],
-    mut budget: Option<&mut SourceHistoryReadBudget>,
-) -> io::Result<Vec<UsageEventFactRecord>> {
-    store.validate_private_path(directory)?;
-    validate_sorted_unique_days(expected_days)?;
-    let entries = evidence_shard_entries(store, directory)?;
-    let actual_days = entries.iter().map(|(day, _)| *day).collect::<Vec<_>>();
-    if actual_days != expected_days {
-        return Err(invalid_data(
-            "fact generation shard set does not match its manifest",
-        ));
-    }
-    let mut records = Vec::new();
-    let mut event_ids = BTreeSet::new();
-    let mut total_decoded_bytes = 0_u64;
-    for (day, path) in entries {
-        let remaining = MAX_FACT_GENERATION_DECODED_BYTES
-            .checked_sub(total_decoded_bytes)
-            .ok_or_else(|| invalid_data("fact generation decoded size exceeds its hard cap"))?;
-        if remaining == 0 {
-            return Err(invalid_data(
-                "fact generation decoded size exceeds its hard cap",
-            ));
-        }
-        let shard_limit = remaining.min(MAX_EVIDENCE_SHARD_BYTES);
-        let (shard, decoded_bytes): (FactShard, u64) = match budget.as_deref_mut() {
-            Some(budget) => read_gzip_json_file_inner(&path, shard_limit, Some(budget))?,
-            None => read_gzip_json_file_with_limit(&path, shard_limit)?,
-        };
-        total_decoded_bytes = total_decoded_bytes
-            .checked_add(decoded_bytes)
-            .ok_or_else(|| invalid_data("fact generation decoded size overflowed"))?;
-        if shard.format_version != FACT_SHARD_FORMAT_VERSION
-            || shard.metric_revision != SESSION_EVIDENCE_METRIC_REVISION
-            || &shard.profile_id != profile_id
-            || &shard.source_id != source_id
-            || shard.redaction_profile != redaction_profile
-            || &shard.replica != replica
-            || &shard.thread_shard_key != shard_key
-            || &shard.generation != generation
-            || shard.utc_day != day
-        {
-            return Err(envelope_mismatch(&path, "fact shard envelope"));
-        }
-        let next_record_count = records
-            .len()
-            .checked_add(shard.records.len())
-            .ok_or_else(|| invalid_data("fact generation record count overflowed"))?;
-        if next_record_count > MAX_FACT_GENERATION_RECORDS {
-            return Err(invalid_data("fact generation contains too many records"));
-        }
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.charge_records(shard.records.len())?;
-        }
-        records.try_reserve(shard.records.len()).map_err(|error| {
-            io::Error::other(format!("could not allocate fact record buffer: {error}"))
-        })?;
-        for record in shard.records {
-            validate_fact_record_namespace(&record, replica)?;
-            if record.occurred_at().date_naive() != day {
-                return Err(envelope_mismatch(&path, "fact record UTC day"));
-            }
-            if !event_ids.insert(record.event_id().clone()) {
-                return Err(invalid_data(
-                    "fact generation contains duplicate usage event IDs",
-                ));
-            }
-            records.push(record);
-        }
-    }
-    sort_fact_records(&mut records);
-    validate_fact_generation_limits(&records)?;
-    Ok(records)
-}
-
-fn read_staged_batch(
-    path: &Path,
-    profile_id: &HistoryProfileId,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    batch_id: &FactBatchId,
-) -> io::Result<StagedFactBatch> {
-    let descriptor: StagedFactBatch = read_json_file(path, MAX_FACT_MANIFEST_BYTES)?;
-    validate_staged_batch(
-        descriptor,
-        path,
-        profile_id,
-        source_id,
-        redaction_profile,
-        batch_id,
-    )
-}
-
 fn validate_staged_batch(
     descriptor: StagedFactBatch,
     path: &Path,
@@ -2915,7 +1783,10 @@ fn validate_staged_batch(
         || descriptor.replica.source_id() != source_id
         || ThreadShardKey::from_replica(&descriptor.replica) != descriptor.thread_shard_key
     {
-        return Err(envelope_mismatch(path, "staged fact batch envelope"));
+        return Err(invalid_data(format!(
+            "staged fact batch envelope does not match {}",
+            path.display()
+        )));
     }
     descriptor.activate_cursor.validate()?;
     validate_fact_digest_bindings(&descriptor.validated_digests)?;
@@ -3018,412 +1889,14 @@ fn validate_sorted_unique_days(days: &[NaiveDate]) -> io::Result<()> {
     Ok(())
 }
 
-fn fact_lock_name(shard_key: &ThreadShardKey) -> String {
-    format!("{}.lock", shard_key.as_str())
-}
-
 fn fact_manifest_path(directory: &Path, shard_key: &ThreadShardKey) -> PathBuf {
     directory.join(format!("{}.json", shard_key.as_str()))
-}
-
-fn evidence_shard_path(directory: &Path, day: NaiveDate) -> PathBuf {
-    directory.join(format!("{}.json.gz", day.format("%Y-%m-%d")))
-}
-
-fn evidence_shard_day(path: &Path) -> Option<NaiveDate> {
-    let name = path.file_name()?.to_str()?;
-    let date = name.strip_suffix(".json.gz")?;
-    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
-}
-
-fn is_atomic_evidence_temporary_file(name: &OsStr) -> bool {
-    is_atomic_shard_temporary_file(name, AtomicShardFileKind::GzipJson)
-}
-
-fn is_atomic_fact_manifest_temporary_file(name: &OsStr) -> bool {
-    atomic_temporary_target_name(name).is_some_and(|target| {
-        target
-            .strip_suffix(".json")
-            .is_some_and(|key| key.parse::<ThreadShardKey>().is_ok())
-    })
-}
-
-fn evidence_shard_entries(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
-    store.validate_private_path(directory)?;
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        if is_atomic_evidence_temporary_file(&entry.file_name()) {
-            validate_data_file_metadata(&path, &fs::symlink_metadata(&path)?)?;
-            continue;
-        }
-        let Some(day) = evidence_shard_day(&path) else {
-            return Err(invalid_data(format!(
-                "unexpected path in session evidence generation {}",
-                path.display()
-            )));
-        };
-        entries.push((day, path));
-    }
-    entries.sort_by_key(|(day, _)| *day);
-    Ok(entries)
-}
-
-fn evidence_shard_entries_since(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    _since: DateTime<Utc>,
-) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
-    // A digest can start before a query and still cover the query boundary.
-    // Retention bounds this directory to 35 days, so scanning all daily shards
-    // is both correct and bounded.
-    evidence_shard_entries_ignoring_lock(store, directory)
-}
-
-fn evidence_shard_entries_ignoring_lock(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
-    store.validate_private_path(directory)?;
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_name() == OsStr::new(DIGESTS_LOCK_FILE) {
-            continue;
-        }
-        if is_atomic_evidence_temporary_file(&entry.file_name()) {
-            validate_data_file_metadata(&path, &fs::symlink_metadata(&path)?)?;
-            continue;
-        }
-        let Some(day) = evidence_shard_day(&path) else {
-            return Err(invalid_data(format!(
-                "unexpected path in session digest directory {}",
-                path.display()
-            )));
-        };
-        entries.push((day, path));
-    }
-    entries.sort_by_key(|(day, _)| *day);
-    Ok(entries)
-}
-
-fn remove_atomic_evidence_temporary_files(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<()> {
-    cleanup_atomic_shard_temporary_files(store, directory, AtomicShardFileKind::GzipJson)
-        .map(|_| ())
-}
-
-fn write_gzip_json_atomically<T: Serialize>(
-    store: &SourceHistoryStore,
-    path: &Path,
-    value: &T,
-) -> io::Result<()> {
-    write_gzip_json_atomically_with_limit(store, path, value, MAX_EVIDENCE_SHARD_BYTES).map(|_| ())
-}
-
-fn write_gzip_json_atomically_with_limit<T: Serialize>(
-    store: &SourceHistoryStore,
-    path: &Path,
-    value: &T,
-    maximum_decoded_bytes: u64,
-) -> io::Result<u64> {
-    let encoded = encode_pretty_bounded(value, maximum_decoded_bytes)?;
-    let decoded_bytes = u64::try_from(encoded.len())
-        .map_err(|_| invalid_data("session evidence encoded size overflowed"))?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&encoded)?;
-    let compressed = encoder.finish()?;
-    if compressed.len() as u64 > MAX_COMPRESSED_EVIDENCE_SHARD_BYTES {
-        return Err(invalid_data(
-            "compressed session evidence shard is too large",
-        ));
-    }
-    write_private_atomically_beneath(store, path, &compressed)?;
-    Ok(decoded_bytes)
-}
-
-fn read_optional_gzip_json_file<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-) -> io::Result<Option<T>> {
-    match read_gzip_json_file(path) {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn read_optional_gzip_json_file_with_budget<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    budget: &mut SourceHistoryReadBudget,
-) -> io::Result<Option<T>> {
-    match read_gzip_json_file_inner(path, MAX_EVIDENCE_SHARD_BYTES, Some(budget)) {
-        Ok((value, _)) => Ok(Some(value)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn read_gzip_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
-    read_gzip_json_file_with_limit(path, MAX_EVIDENCE_SHARD_BYTES).map(|(value, _)| value)
-}
-
-fn read_gzip_json_file_with_limit<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    maximum_decoded_bytes: u64,
-) -> io::Result<(T, u64)> {
-    read_gzip_json_file_inner(path, maximum_decoded_bytes, None)
-}
-
-fn read_gzip_json_file_inner<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    maximum_decoded_bytes: u64,
-    mut budget: Option<&mut SourceHistoryReadBudget>,
-) -> io::Result<(T, u64)> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_data_file_metadata(path, &path_metadata)?;
-    if path_metadata.len() > MAX_COMPRESSED_EVIDENCE_SHARD_BYTES {
-        return Err(invalid_data(format!(
-            "compressed session evidence file {} is too large",
-            path.display()
-        )));
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let subject = format!("session evidence path {}", path.display());
-    let file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, &subject))?;
-    let metadata = file.metadata()?;
-    validate_data_file_metadata(path, &metadata)?;
-    ensure_opened_file_matches_path(path, &file, &path_metadata, &metadata, &subject)?;
-    if metadata.len() > MAX_COMPRESSED_EVIDENCE_SHARD_BYTES {
-        return Err(invalid_data(format!(
-            "compressed session evidence file {} is too large",
-            path.display()
-        )));
-    }
-    let mut decoded = Vec::new();
-    if let Some(budget) = budget.as_mut() {
-        let (decoded_limit, query_budget_is_binding) =
-            budget.shard_decoded_byte_allowance(maximum_decoded_bytes)?;
-        let mut decoder = GzDecoder::new(file);
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = decoder.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            let next_size = (decoded.len() as u64)
-                .checked_add(count as u64)
-                .ok_or_else(|| invalid_data("session evidence decoded size overflowed"))?;
-            if next_size > decoded_limit {
-                if query_budget_is_binding {
-                    return Err(history_query_budget_exceeded(format!(
-                        "decoded-byte budget exhausted while reading {}",
-                        path.display()
-                    )));
-                } else {
-                    return Err(invalid_data(format!(
-                        "decompressed session evidence file {} is too large",
-                        path.display()
-                    )));
-                }
-            }
-            budget.charge_decoded_bytes(count as u64)?;
-            decoded.try_reserve(count).map_err(|error| {
-                io::Error::other(format!(
-                    "could not allocate session evidence buffer: {error}"
-                ))
-            })?;
-            decoded.extend_from_slice(&buffer[..count]);
-        }
-    } else {
-        GzDecoder::new(file)
-            .take(maximum_decoded_bytes.saturating_add(1))
-            .read_to_end(&mut decoded)?;
-        if decoded.len() as u64 > maximum_decoded_bytes {
-            return Err(invalid_data(format!(
-                "decompressed session evidence file {} is too large",
-                path.display()
-            )));
-        }
-    }
-    let decoded_bytes = u64::try_from(decoded.len())
-        .map_err(|_| invalid_data("session evidence decoded size overflowed"))?;
-    let value = serde_json::from_slice(&decoded).map_err(|error| {
-        invalid_data(format!(
-            "session evidence file {} is invalid: {error}",
-            path.display()
-        ))
-    })?;
-    Ok((value, decoded_bytes))
-}
-
-fn write_private_atomically_beneath(
-    store: &SourceHistoryStore,
-    path: &Path,
-    contents: &[u8],
-) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data("private file has no parent"))?;
-    store.prepare_private_directory(parent)?;
-    write_private_atomically(path, contents)?;
-    store.validate_private_path(parent)
-}
-
-fn sync_store_directory(store: &SourceHistoryStore, path: &Path) -> io::Result<()> {
-    store.validate_private_path(path)?;
-    sync_directory(path)
-}
-
-fn create_new_private_directory(store: &SourceHistoryStore, path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data("private directory has no parent"))?;
-    store.prepare_private_directory(parent)?;
-    #[cfg(unix)]
-    let builder = {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder
-    };
-    #[cfg(not(unix))]
-    let builder = fs::DirBuilder::new();
-    builder.create(path)?;
-    store.validate_private_path(path)
-}
-
-fn remove_private_tree(store: &SourceHistoryStore, path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_data("session evidence cleanup path has no parent"))?;
-    store.validate_private_path(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
-                return Err(invalid_data(format!(
-                    "session evidence cleanup path {} is not a directory",
-                    path.display()
-                )));
-            }
-            ensure_private_directory(&metadata)?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    }
-    store.validate_private_path(path)?;
-    for entry in fs::read_dir(path)? {
-        store.validate_private_path(path)?;
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata_is_link_or_reparse(&metadata) {
-            return Err(invalid_data(format!(
-                "session evidence cleanup refuses link or reparse point {}",
-                child.display()
-            )));
-        }
-        if metadata.file_type().is_dir() {
-            store.validate_private_path(&child)?;
-            remove_private_tree(store, &child)?;
-        } else {
-            validate_data_file_metadata(&child, &metadata)?;
-            store.validate_private_path(path)?;
-            fs::remove_file(&child)?;
-        }
-    }
-    store.validate_private_path(path)?;
-    fs::remove_dir(path)?;
-    sync_store_directory(store, parent)?;
-    Ok(())
-}
-
-fn ensure_fact_namespace_within_cap(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-) -> io::Result<()> {
-    ensure_fact_namespace_with_reserve(store, source_id, redaction_profile, 0, 0)
-}
-
-fn try_lock_exclusive_for_fact_publication(
-    file: std::fs::File,
-    directory: &Path,
-    name: &str,
-) -> io::Result<crate::file_lock::FileLock> {
-    match std::fs::File::try_lock(&file) {
-        Ok(()) => {
-            let lock = crate::file_lock::FileLock::from_locked(file);
-            validate_locked_file(&lock, directory, name)?;
-            Ok(lock)
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "fact publication lock is busy; retry later",
-        )),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FactNamespaceUsage {
     bytes: u64,
     entries: u64,
-}
-
-fn ensure_fact_namespace_with_reserve(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    reserve_bytes: u64,
-    reserve_entries: u64,
-) -> io::Result<()> {
-    let usage = FactNamespaceUsage {
-        bytes: reserve_bytes,
-        entries: reserve_entries,
-    };
-    validate_fact_namespace_usage(usage, MAX_FACT_NAMESPACE_BYTES, MAX_FACT_NAMESPACE_ENTRIES)?;
-    fact_namespace_usage_bounded(
-        store,
-        source_id,
-        redaction_profile,
-        usage,
-        MAX_FACT_NAMESPACE_BYTES,
-        MAX_FACT_NAMESPACE_ENTRIES,
-    )?;
-    Ok(())
-}
-
-fn fact_namespace_usage_bounded(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    mut usage: FactNamespaceUsage,
-    maximum_bytes: u64,
-    maximum_entries: u64,
-) -> io::Result<FactNamespaceUsage> {
-    validate_fact_namespace_usage(usage, maximum_bytes, maximum_entries)?;
-    for directory in [
-        store.source_facts_directory(source_id, redaction_profile),
-        store.source_fact_staging_directory(source_id, redaction_profile),
-        store.source_fact_manifests_directory(source_id, redaction_profile),
-    ] {
-        usage =
-            private_tree_usage_bounded(store, &directory, usage, maximum_bytes, maximum_entries)?;
-    }
-    Ok(usage)
 }
 
 fn validate_fact_namespace_usage(
@@ -3440,482 +1913,46 @@ fn validate_fact_namespace_usage(
     Ok(())
 }
 
-fn private_tree_usage_bounded(
-    store: &SourceHistoryStore,
-    path: &Path,
-    mut usage: FactNamespaceUsage,
-    maximum_bytes: u64,
-    maximum_entries: u64,
-) -> io::Result<FactNamespaceUsage> {
-    if !store.private_directory_exists(path)? {
-        return Ok(usage);
-    }
-    for entry in fs::read_dir(path)? {
-        store.validate_private_path(path)?;
-        let child = entry?.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata_is_link_or_reparse(&metadata) {
-            return Err(invalid_data(format!(
-                "session evidence namespace refuses link or reparse point {}",
-                child.display()
-            )));
-        }
-        usage.entries = usage
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("fact namespace entry count overflowed"))?;
-        validate_fact_namespace_usage(usage, maximum_bytes, maximum_entries)?;
-        if metadata.file_type().is_dir() {
-            store.validate_private_path(&child)?;
-            usage =
-                private_tree_usage_bounded(store, &child, usage, maximum_bytes, maximum_entries)?;
-        } else {
-            validate_data_file_metadata(&child, &metadata)?;
-            usage.bytes = usage
-                .bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| invalid_data("fact namespace size overflowed"))?;
-            validate_fact_namespace_usage(usage, maximum_bytes, maximum_entries)?;
-        }
-    }
-    Ok(usage)
-}
-
-pub(super) fn import_sqlite_session_evidence(
-    target: &SourceHistoryStore,
-    legacy: &SourceHistoryStore,
-    sources: &[SourceMetadata],
-) -> io::Result<()> {
-    sqlite_evidence::import_legacy_evidence(target, legacy, sources)
-}
-
 pub(super) fn earliest_session_evidence_time(
     store: &SourceHistoryStore,
     sources: &[SourceMetadata],
     redaction_profiles: &[RedactionProfile],
 ) -> io::Result<Option<DateTime<Utc>>> {
-    if store.sqlite_database().is_some() {
-        return sqlite_evidence::earliest_session_evidence_time(store, sources, redaction_profiles);
-    }
-    let mut earliest = None;
-    for source in sources {
-        for &redaction_profile in redaction_profiles {
-            let digests = store.source_digests_directory(source.source_id(), redaction_profile);
-            if store.private_directory_exists(&digests)? {
-                let lock = open_lock_file(&digests, DIGESTS_LOCK_FILE)?;
-                let _lock = lock_shared(lock, &digests, DIGESTS_LOCK_FILE)?;
-                if let Some(day) = evidence_shard_entries_ignoring_lock(store, &digests)?
-                    .into_iter()
-                    .map(|(day, _)| day)
-                    .min()
-                {
-                    let timestamp = day
-                        .and_hms_opt(0, 0, 0)
-                        .expect("midnight is always valid")
-                        .and_utc();
-                    earliest = Some(
-                        earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)),
-                    );
-                }
-            }
-            let manifests =
-                store.source_fact_manifests_directory(source.source_id(), redaction_profile);
-            if !store.private_directory_exists(&manifests)? {
-                continue;
-            }
-            for (shard_key, path) in fact_manifest_entries(store, &manifests)? {
-                let manifest: ActiveFactManifest = read_json_file(&path, MAX_FACT_MANIFEST_BYTES)?;
-                validate_active_manifest(
-                    &manifest,
-                    &store.profile_id,
-                    source.source_id(),
-                    redaction_profile,
-                    &manifest.replica,
-                    &shard_key,
-                )?;
-                if let Some(day) = manifest.shard_days.first() {
-                    let timestamp = day
-                        .and_hms_opt(0, 0, 0)
-                        .expect("midnight is always valid")
-                        .and_utc();
-                    earliest = Some(
-                        earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)),
-                    );
-                }
-            }
-        }
-    }
-    Ok(earliest)
+    sqlite_evidence::earliest_session_evidence_time(store, sources, redaction_profiles)
 }
 
-pub(super) fn garbage_collect_session_evidence_for_source(
+#[cfg(test)]
+fn garbage_collect_session_evidence_for_source(
     store: &SourceHistoryStore,
     source_id: &NodeId,
     redaction_profile: RedactionProfile,
     cutoff_day: NaiveDate,
     trusted_at: DateTime<Utc>,
 ) -> io::Result<usize> {
-    if store.sqlite_database().is_some() {
-        return sqlite_evidence::garbage_collect_session_evidence(
-            store,
-            source_id,
-            redaction_profile,
-            cutoff_day,
-            trusted_at,
-        );
-    }
-    let mut pruned = prune_digest_evidence(store, source_id, redaction_profile, cutoff_day)?;
-    pruned += prune_active_fact_evidence(store, source_id, redaction_profile, cutoff_day)?;
-    garbage_collect_fact_artifacts(store, source_id, redaction_profile, trusted_at)?;
-    Ok(pruned)
-}
-
-fn prune_digest_evidence(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    cutoff_day: NaiveDate,
-) -> io::Result<usize> {
-    let directory = store.source_digests_directory(source_id, redaction_profile);
-    if !store.private_directory_exists(&directory)? {
-        return Ok(0);
-    }
-    let lock = open_lock_file(&directory, DIGESTS_LOCK_FILE)?;
-    let _lock = lock_exclusive(lock, &directory, DIGESTS_LOCK_FILE)?;
-    remove_atomic_evidence_temporary_files(store, &directory)?;
-    let cutoff = cutoff_day
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid")
-        .and_utc();
-    let mut pruned = 0;
-    for (day, path) in evidence_shard_entries_ignoring_lock(store, &directory)? {
-        if day >= cutoff_day {
-            continue;
-        }
-        let Some(mut shard) =
-            read_digest_shard(&path, &store.profile_id, source_id, redaction_profile, day)?
-        else {
-            continue;
-        };
-        let before = shard.records.len();
-        shard
-            .records
-            .retain(|record| record.retention_through() >= cutoff);
-        if shard.records.len() == before {
-            continue;
-        }
-        if shard.records.is_empty() {
-            store.validate_private_path(&directory)?;
-            fs::remove_file(&path)?;
-            pruned += 1;
-        } else {
-            sort_digest_records(&mut shard.records);
-            write_gzip_json_atomically(store, &path, &shard)?;
-        }
-    }
-    if pruned > 0 {
-        sync_store_directory(store, &directory)?;
-    }
-    Ok(pruned)
-}
-
-fn prune_active_fact_evidence(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    cutoff_day: NaiveDate,
-) -> io::Result<usize> {
-    let manifests = store.source_fact_manifests_directory(source_id, redaction_profile);
-    if !store.private_directory_exists(&manifests)? {
-        return Ok(0);
-    }
-    let cutoff = cutoff_day
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid")
-        .and_utc();
-    let mut pruned = 0;
-    for (shard_key, _) in fact_manifest_entries(store, &manifests)? {
-        let lock_name = fact_lock_name(&shard_key);
-        let lock = open_lock_file(&manifests, &lock_name)?;
-        let _lock = lock_exclusive(lock, &manifests, &lock_name)?;
-        let path = fact_manifest_path(&manifests, &shard_key);
-        let manifest: ActiveFactManifest = read_json_file(&path, MAX_FACT_MANIFEST_BYTES)?;
-        validate_active_manifest(
-            &manifest,
-            &store.profile_id,
-            source_id,
-            redaction_profile,
-            &manifest.replica,
-            &shard_key,
-        )?;
-        let retained_since = manifest
-            .retained_since
-            .map_or(cutoff, |existing| existing.max(cutoff));
-        if manifest.retained_since == Some(retained_since) {
-            continue;
-        }
-        let records =
-            store.read_fact_generation_unlocked(source_id, redaction_profile, &manifest)?;
-        let mut retained = records
-            .iter()
-            .filter(|record| record.occurred_at() >= retained_since)
-            .cloned()
-            .collect::<Vec<_>>();
-        if retained.len() == records.len() {
-            let replacement_manifest = ActiveFactManifest {
-                retained_since: Some(retained_since),
-                ..manifest
-            };
-            write_private_atomically_beneath(
-                store,
-                &path,
-                &encode_pretty_bounded(&replacement_manifest, MAX_FACT_MANIFEST_BYTES)?,
-            )?;
-            continue;
-        }
-        sort_fact_records(&mut retained);
-        let replacement = FactBatchId::generate()?;
-        let facts_thread = store
-            .source_facts_directory(source_id, redaction_profile)
-            .join(shard_key.as_str());
-        store.prepare_private_directory(&facts_thread)?;
-        let generation_directory = facts_thread.join(replacement.as_str());
-        create_new_private_directory(store, &generation_directory)?;
-        let binding = FactGenerationBinding {
-            profile_id: &store.profile_id,
-            source_id,
-            redaction_profile,
-            replica: &manifest.replica,
-            shard_key: &shard_key,
-            generation: &replacement,
-        };
-        let result = write_fact_generation(store, &generation_directory, &binding, &retained);
-        let shard_days = match result {
-            Ok(days) => days,
-            Err(error) => {
-                let _ = remove_private_tree(store, &generation_directory);
-                return Err(error);
-            }
-        };
-        let replacement_manifest = ActiveFactManifest {
-            active_generation: replacement,
-            retained_since: Some(retained_since),
-            shard_days,
-            record_count: retained.len(),
-            ..manifest.clone()
-        };
-        if let Err(error) = write_private_atomically_beneath(
-            store,
-            &path,
-            &encode_pretty_bounded(&replacement_manifest, MAX_FACT_MANIFEST_BYTES)?,
-        ) {
-            let _ = remove_private_tree(store, &generation_directory);
-            return Err(error);
-        }
-        let old_generation = facts_thread.join(manifest.active_generation.as_str());
-        remove_private_tree(store, &old_generation)?;
-        pruned += manifest
-            .shard_days
-            .iter()
-            .filter(|day| **day < cutoff_day)
-            .count();
-    }
-    Ok(pruned)
-}
-
-fn garbage_collect_fact_artifacts(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    trusted_at: DateTime<Utc>,
-) -> io::Result<()> {
-    let staging_root = store.source_fact_staging_directory(source_id, redaction_profile);
-    let facts_root = store.source_facts_directory(source_id, redaction_profile);
-    if !store.private_directory_exists(&staging_root)?
-        && !store.private_directory_exists(&facts_root)?
-    {
-        return Ok(());
-    }
-    store.prepare_private_directory(&staging_root)?;
-    let staging_lock = open_lock_file(&staging_root, FACT_STAGING_LOCK_FILE)?;
-    let _staging_lock = lock_exclusive(staging_lock, &staging_root, FACT_STAGING_LOCK_FILE)?;
-    let staged_references = garbage_collect_fact_staging_unlocked(
+    garbage_collect_session_evidence_for_source_with_changes(
         store,
         source_id,
         redaction_profile,
+        cutoff_day,
         trusted_at,
-        &staging_root,
-    )?;
-    garbage_collect_orphan_fact_generations_unlocked(
+    )
+    .map(|(pruned, _)| pruned)
+}
+
+pub(super) fn garbage_collect_session_evidence_for_source_with_changes(
+    store: &SourceHistoryStore,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    cutoff_day: NaiveDate,
+    trusted_at: DateTime<Utc>,
+) -> io::Result<(usize, bool)> {
+    sqlite_evidence::garbage_collect_session_evidence(
         store,
         source_id,
         redaction_profile,
-        &staged_references,
-    )?;
-    ensure_fact_namespace_within_cap(store, source_id, redaction_profile)
-}
-
-fn garbage_collect_fact_staging_unlocked(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    trusted_at: DateTime<Utc>,
-    staging_root: &Path,
-) -> io::Result<BTreeSet<(ThreadShardKey, FactBatchId)>> {
-    store.validate_private_path(staging_root)?;
-    let expires_before = trusted_at
-        .checked_sub_signed(Duration::hours(FACT_STAGING_TTL_HOURS))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let mut staged_references = BTreeSet::new();
-    for entry in fs::read_dir(staging_root)? {
-        store.validate_private_path(staging_root)?;
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if file_name == OsStr::new(FACT_STAGING_LOCK_FILE) {
-            validate_data_file_metadata(&entry.path(), &fs::symlink_metadata(entry.path())?)?;
-            continue;
-        }
-        let batch_id = file_name
-            .to_str()
-            .ok_or_else(|| invalid_data("fact staging directory name is not UTF-8"))?
-            .parse::<FactBatchId>()
-            .map_err(|error| invalid_data(error.to_string()))?;
-        let path = entry.path();
-        store.validate_private_path(&path)?;
-        let descriptor_path = path.join(STAGED_BATCH_FILE);
-        let descriptor = match read_staged_batch(
-            &descriptor_path,
-            &store.profile_id,
-            source_id,
-            redaction_profile,
-            &batch_id,
-        ) {
-            Ok(descriptor) => Some(descriptor),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        // TTL is based on the center's local filesystem timestamp, never a
-        // remote-provided event or completion timestamp.
-        let staged_at = DateTime::<Utc>::from(fs::symlink_metadata(&path)?.modified()?);
-        if staged_at < expires_before {
-            remove_private_tree(store, &path)?;
-        } else if let Some(descriptor) = descriptor {
-            staged_references.insert((descriptor.thread_shard_key, descriptor.batch_id));
-        }
-    }
-    Ok(staged_references)
-}
-
-fn garbage_collect_orphan_fact_generations_unlocked(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    staged_references: &BTreeSet<(ThreadShardKey, FactBatchId)>,
-) -> io::Result<()> {
-    let facts_root = store.source_facts_directory(source_id, redaction_profile);
-    if !store.private_directory_exists(&facts_root)? {
-        return Ok(());
-    }
-    let manifests = store.source_fact_manifests_directory(source_id, redaction_profile);
-    store.prepare_private_directory(&manifests)?;
-    for entry in fs::read_dir(&facts_root)? {
-        store.validate_private_path(&facts_root)?;
-        let entry = entry?;
-        let thread_path = entry.path();
-        store.validate_private_path(&thread_path)?;
-        let shard_key = entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| invalid_data("fact thread directory name is not UTF-8"))?
-            .parse::<ThreadShardKey>()
-            .map_err(|error| invalid_data(error.to_string()))?;
-        let lock_name = fact_lock_name(&shard_key);
-        let manifest_lock = open_lock_file(&manifests, &lock_name)?;
-        let _manifest_lock = lock_exclusive(manifest_lock, &manifests, &lock_name)?;
-
-        let manifest_path = fact_manifest_path(&manifests, &shard_key);
-        let active_generation = match read_optional_json_file::<ActiveFactManifest>(
-            &manifest_path,
-            MAX_FACT_MANIFEST_BYTES,
-        )? {
-            Some(manifest) => {
-                validate_active_manifest(
-                    &manifest,
-                    &store.profile_id,
-                    source_id,
-                    redaction_profile,
-                    &manifest.replica,
-                    &shard_key,
-                )?;
-                Some(manifest.active_generation)
-            }
-            None => None,
-        };
-
-        for generation_entry in fs::read_dir(&thread_path)? {
-            store.validate_private_path(&thread_path)?;
-            let generation_entry = generation_entry?;
-            let generation_path = generation_entry.path();
-            store.validate_private_path(&generation_path)?;
-            let generation = generation_entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| invalid_data("fact generation directory name is not UTF-8"))?
-                .parse::<FactBatchId>()
-                .map_err(|error| invalid_data(error.to_string()))?;
-            if active_generation.as_ref() == Some(&generation)
-                || staged_references.contains(&(shard_key.clone(), generation.clone()))
-            {
-                continue;
-            }
-            remove_private_tree(store, &generation_path)?;
-        }
-        if fs::read_dir(&thread_path)?.next().is_none() {
-            store.validate_private_path(&thread_path)?;
-            fs::remove_dir(&thread_path)?;
-            sync_store_directory(store, &facts_root)?;
-        }
-    }
-    Ok(())
-}
-
-fn fact_manifest_entries(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<Vec<(ThreadShardKey, PathBuf)>> {
-    store.validate_private_path(directory)?;
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| invalid_data("fact manifest path is not UTF-8"))?
-            .to_owned();
-        if is_atomic_fact_manifest_temporary_file(&entry.file_name()) {
-            validate_data_file_metadata(&path, &fs::symlink_metadata(&path)?)?;
-            continue;
-        }
-        if name.ends_with(".lock") {
-            let key = name
-                .strip_suffix(".lock")
-                .expect("checked suffix")
-                .parse::<ThreadShardKey>()
-                .map_err(|error| invalid_data(error.to_string()))?;
-            let _ = key;
-            continue;
-        }
-        let key = name
-            .strip_suffix(".json")
-            .ok_or_else(|| invalid_data("unexpected fact manifest path"))?
-            .parse::<ThreadShardKey>()
-            .map_err(|error| invalid_data(error.to_string()))?;
-        entries.push((key, path));
-    }
-    entries.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
-    Ok(entries)
+        cutoff_day,
+        trusted_at,
+    )
 }
 
 #[cfg(test)]
@@ -3944,41 +1981,17 @@ mod tests {
     }
 
     fn store_with_kind(root: &Path, kind: SourceKind) -> SourceHistoryStore {
-        let store = SourceHistoryStore::new(root.join("state-root"), PROFILE.parse().unwrap());
+        let ownership = crate::history_ownership::HistoryOwnershipStore::new(
+            root.join("state-root"),
+            PROFILE.parse().unwrap(),
+            RedactionProfile::Redacted,
+        );
+        let (_, store) =
+            crate::sqlite_history_initialization::initialize_for_test(&ownership).unwrap();
         store
             .save_source_metadata(&SourceMetadata::new(source_id(), kind, "build-host").unwrap())
             .unwrap();
         store
-    }
-
-    #[test]
-    fn gzip_query_budget_counts_decoded_bytes_before_buffer_growth() {
-        let directory = tempdir().unwrap();
-        let store = store(directory.path());
-        let digests = store.source_digests_directory(&source_id(), RedactionProfile::Redacted);
-        store.prepare_private_directory(&digests).unwrap();
-        let path = digests.join("budget-test.json.gz");
-        let payload = vec!["x".repeat(256 * 1024)];
-        let decoded_bytes =
-            write_gzip_json_atomically_with_limit(&store, &path, &payload, 512 * 1024).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() * 10 < decoded_bytes);
-
-        let mut exact = SourceHistoryReadBudget::with_limits(decoded_bytes, 1, 1);
-        let (decoded, measured): (Vec<String>, u64) =
-            read_gzip_json_file_inner(&path, MAX_EVIDENCE_SHARD_BYTES, Some(&mut exact)).unwrap();
-        assert_eq!(decoded, payload);
-        assert_eq!(measured, decoded_bytes);
-        assert_eq!(exact.decoded_bytes_remaining, 0);
-
-        let mut short = SourceHistoryReadBudget::with_limits(decoded_bytes - 1, 1, 1);
-        let error = read_gzip_json_file_inner::<Vec<String>>(
-            &path,
-            MAX_EVIDENCE_SHARD_BYTES,
-            Some(&mut short),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("decoded-byte budget"));
     }
 
     fn thread(value: &str) -> ThreadId {
@@ -4343,13 +2356,14 @@ mod tests {
             SourceSessionDigestChange::Tombstone
         ));
 
-        let shard = evidence_shard_path(
-            &store.source_digests_directory(&source_id(), RedactionProfile::Redacted),
-            start.date_naive(),
-        );
-        assert_eq!(shard.extension().and_then(OsStr::to_str), Some("gz"));
-        let decoded: serde_json::Value = read_gzip_json_file(&shard).unwrap();
-        let text = decoded.to_string();
+        let loaded = store
+            .load_source_session_digest_records_since(
+                &source_id(),
+                RedactionProfile::Redacted,
+                start,
+            )
+            .unwrap();
+        let text = serde_json::to_string(&loaded.records).unwrap();
         assert!(!text.contains("prompt") && !text.contains("messagePreview"));
     }
 
@@ -4444,11 +2458,12 @@ mod tests {
             )
             .unwrap();
 
-        prune_digest_evidence(
+        garbage_collect_session_evidence_for_source(
             &store,
             &source_id(),
             RedactionProfile::Redacted,
             at(7, 26, 0).date_naive(),
+            Utc::now(),
         )
         .unwrap();
         assert_eq!(
@@ -4517,11 +2532,12 @@ mod tests {
             .unwrap();
 
         let cutoff = at(7, 26, 0);
-        prune_digest_evidence(
+        garbage_collect_session_evidence_for_source(
             &store,
             &source_id(),
             RedactionProfile::Redacted,
             cutoff.date_naive(),
+            Utc::now(),
         )
         .unwrap();
         let retained = store
@@ -4584,11 +2600,12 @@ mod tests {
             )
             .unwrap();
         let cutoff = at(7, 26, 0);
-        prune_digest_evidence(
+        garbage_collect_session_evidence_for_source(
             &store,
             &source_id(),
             RedactionProfile::Redacted,
             cutoff.date_naive(),
+            Utc::now(),
         )
         .unwrap();
 
@@ -4649,8 +2666,20 @@ mod tests {
         let staging = store
             .source_fact_staging_directory(&source_id(), RedactionProfile::Redacted)
             .join(batch_id.as_str());
-        let descriptor = fs::read_to_string(staging.join(STAGED_BATCH_FILE)).unwrap();
-        assert!(!descriptor.contains("pageToken"));
+        let database = store.sqlite_database().unwrap();
+        let descriptor_key = database
+            .namespace(&staging.join(STAGED_BATCH_FILE))
+            .unwrap();
+        let descriptor = database
+            .read(|connection| database::state::<StagedFactBatch>(connection, &descriptor_key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(descriptor.batch_id, batch_id);
+        assert!(
+            !serde_json::to_string(&descriptor)
+                .unwrap()
+                .contains("pageToken")
+        );
         let report = store
             .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &batch_id)
             .unwrap();
@@ -4676,82 +2705,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[cfg(unix)]
-    fn assert_fact_publication_releases_inherited_lock(staging_lock: bool) {
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let cursor = FactCursor::new(7, 10).unwrap();
-        let batch_id = FactBatchId::generate().unwrap();
-        let snapshot = batch(
-            batch_id.clone(),
-            FactBatchKind::Snapshot,
-            "thread-inherited-lock",
-            None,
-            cursor,
-            at(8, 28, 2),
-            vec![
-                UsageEventFactRecord::upsert(
-                    1,
-                    fact("thread-inherited-lock", "event-1", at(8, 28, 1), 10),
-                )
-                .unwrap(),
-            ],
-        );
-        store
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &snapshot)
-            .unwrap();
-        let publication = store
-            .prevalidate_staged_fact_batch_unfenced(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &batch_id,
-            )
-            .unwrap();
-        let (directory, name) = if staging_lock {
-            (
-                store.source_fact_staging_directory(&source_id(), RedactionProfile::Redacted),
-                FACT_STAGING_LOCK_FILE.to_owned(),
-            )
-        } else {
-            (
-                store.source_fact_manifests_directory(&source_id(), RedactionProfile::Redacted),
-                fact_lock_name(&publication.descriptor.thread_shard_key),
-            )
-        };
-
-        // Model a prevalidation descriptor inherited by a concurrent fork.
-        // Its duplicate must not prolong the original owner's lock lifetime.
-        let owner = open_lock_file(&directory, &name).unwrap();
-        let owner = lock_exclusive(owner, &directory, &name).unwrap();
-        let inherited = owner.try_clone().unwrap();
-        drop(owner);
-        let published = store.publish_prevalidated_fact_batch_unfenced(&publication);
-        drop(inherited);
-        assert!(published.unwrap().activated);
-        let active = store
-            .load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-inherited-lock"),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(active.cursor, cursor);
-        assert_eq!(active.facts().len(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fact_publication_releases_inherited_staging_lock() {
-        assert_fact_publication_releases_inherited_lock(true);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fact_publication_releases_inherited_manifest_lock() {
-        assert_fact_publication_releases_inherited_lock(false);
     }
 
     #[test]
@@ -4882,7 +2835,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_is_copy_on_write_and_cursor_cas_rejects_stale_batches() {
+    fn staged_delta_and_cursor_cas_reject_stale_batches() {
         let root = tempdir().unwrap();
         let store = store(root.path());
         let first_cursor = FactCursor::new(3, 1).unwrap();
@@ -4948,13 +2901,7 @@ mod tests {
             .unwrap();
         assert_eq!(after.cursor, second_cursor);
         assert_eq!(after.facts().len(), 2);
-        assert!(
-            !store
-                .source_facts_directory(&source_id(), RedactionProfile::Redacted)
-                .join(ThreadShardKey::from_replica(&replica("thread-a")).as_str())
-                .join(first_id.as_str())
-                .exists()
-        );
+        assert!(fact_generation_records(&store, &replica("thread-a"), &first_id).is_empty());
 
         let stale = batch(
             FactBatchId::generate().unwrap(),
@@ -5142,56 +3089,6 @@ mod tests {
     }
 
     #[test]
-    fn activation_recovers_after_generation_move_before_manifest_publish() {
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let batch_id = FactBatchId::generate().unwrap();
-        let snapshot = batch(
-            batch_id.clone(),
-            FactBatchKind::Snapshot,
-            "thread-a",
-            None,
-            FactCursor::new(1, 1).unwrap(),
-            at(8, 28, 2),
-            vec![
-                UsageEventFactRecord::upsert(1, fact("thread-a", "event-1", at(8, 28, 1), 10))
-                    .unwrap(),
-            ],
-        );
-        store
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &snapshot)
-            .unwrap();
-        let shard_key = ThreadShardKey::from_replica(&replica("thread-a"));
-        let staging = store
-            .source_fact_staging_directory(&source_id(), RedactionProfile::Redacted)
-            .join(batch_id.as_str());
-        let destination = store
-            .source_facts_directory(&source_id(), RedactionProfile::Redacted)
-            .join(shard_key.as_str())
-            .join(batch_id.as_str());
-        store
-            .prepare_private_directory(destination.parent().unwrap())
-            .unwrap();
-        fs::rename(staging.join(STAGED_GENERATION_DIRECTORY), &destination).unwrap();
-        assert!(
-            store
-                .load_active_fact_set(
-                    &source_id(),
-                    RedactionProfile::Redacted,
-                    &thread("thread-a"),
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &batch_id,)
-                .unwrap()
-                .activated
-        );
-    }
-
-    #[test]
     fn gc_preserves_crossing_digest_and_atomically_rewrites_active_facts() {
         let root = tempdir().unwrap();
         let store = store(root.path());
@@ -5280,12 +3177,7 @@ mod tests {
         assert_eq!(active.cursor, cursor);
         assert_eq!(active.facts().len(), 1);
         assert_eq!(active.facts()[0].event_id().as_str(), "event-new");
-        assert!(
-            !store
-                .source_fact_staging_directory(&source_id(), RedactionProfile::Redacted)
-                .join(abandoned_id.as_str())
-                .exists()
-        );
+        assert!(staged_descriptor(&store, &abandoned_id).is_none());
     }
 
     #[test]
@@ -5479,158 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_gc_reclaims_orphans_but_preserves_moved_staging_generation() {
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let cursor = FactCursor::new(9, 1).unwrap();
-        let active_id = FactBatchId::generate().unwrap();
-        let initial = batch(
-            active_id.clone(),
-            FactBatchKind::Snapshot,
-            "thread-orphan",
-            None,
-            cursor,
-            at(8, 28, 2),
-            vec![
-                UsageEventFactRecord::upsert(1, fact("thread-orphan", "event-1", at(8, 28, 1), 10))
-                    .unwrap(),
-            ],
-        );
-        store
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &initial)
-            .unwrap();
-        store
-            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &active_id)
-            .unwrap();
-        let active = store
-            .load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-orphan"),
-            )
-            .unwrap()
-            .unwrap();
-
-        let moved_id = FactBatchId::generate().unwrap();
-        let moved = batch(
-            moved_id.clone(),
-            FactBatchKind::Delta,
-            "thread-orphan",
-            Some(active.version),
-            FactCursor::new(9, 2).unwrap(),
-            at(8, 28, 3),
-            Vec::new(),
-        );
-        store
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &moved)
-            .unwrap();
-        let shard_key = ThreadShardKey::from_replica(&replica("thread-orphan"));
-        let staging = store
-            .source_fact_staging_directory(&source_id(), RedactionProfile::Redacted)
-            .join(moved_id.as_str());
-        let facts_thread = store
-            .source_facts_directory(&source_id(), RedactionProfile::Redacted)
-            .join(shard_key.as_str());
-        let moved_destination = facts_thread.join(moved_id.as_str());
-        fs::rename(
-            staging.join(STAGED_GENERATION_DIRECTORY),
-            &moved_destination,
-        )
-        .unwrap();
-        let orphan_id = FactBatchId::generate().unwrap();
-        let orphan = facts_thread.join(orphan_id.as_str());
-        create_new_private_directory(&store, &orphan).unwrap();
-
-        garbage_collect_fact_artifacts(
-            &store,
-            &source_id(),
-            RedactionProfile::Redacted,
-            Utc::now(),
-        )
-        .unwrap();
-        assert!(moved_destination.exists());
-        assert!(!orphan.exists());
-        assert!(
-            store
-                .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &moved_id,)
-                .unwrap()
-                .activated
-        );
-    }
-
-    #[test]
-    fn digest_writer_recovers_only_exact_target_bound_atomic_temps() {
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let start = at(8, 28, 1);
-        let record = SourceSessionDigestRecord::upsert(
-            1,
-            digest("thread-temp", start, start + Duration::hours(1), 10),
-        )
-        .unwrap();
-        store
-            .record_source_session_digest_changes(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &[record],
-            )
-            .unwrap();
-        let directory = store.source_digests_directory(&source_id(), RedactionProfile::Redacted);
-        let temporary = directory.join(".2026-08-28.json.gz.123.456.tmp");
-        write_private_atomically_beneath(&store, &temporary, b"interrupted-write").unwrap();
-        assert!(is_atomic_evidence_temporary_file(
-            temporary.file_name().unwrap()
-        ));
-        assert!(!is_atomic_evidence_temporary_file(OsStr::new(
-            ".unrecognized.tmp"
-        )));
-        assert_eq!(
-            store
-                .load_source_session_digest_records_since(
-                    &source_id(),
-                    RedactionProfile::Redacted,
-                    start,
-                )
-                .unwrap()
-                .records
-                .len(),
-            1
-        );
-        store
-            .record_source_session_digest_changes(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &[SourceSessionDigestRecord::upsert(
-                    2,
-                    digest("thread-temp", start, start + Duration::hours(1), 20),
-                )
-                .unwrap()],
-            )
-            .unwrap();
-        assert!(!temporary.exists());
-
-        let unknown = directory.join(".2026-08-28.json.gz.bad.tmp");
-        write_private_atomically_beneath(&store, &unknown, b"not ours").unwrap();
-        let error = store
-            .record_source_session_digest_changes(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &[SourceSessionDigestRecord::upsert(
-                    3,
-                    digest("thread-temp", start, start + Duration::hours(1), 30),
-                )
-                .unwrap()],
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(unknown.exists());
-    }
-
-    #[test]
     fn fact_batch_span_count_and_namespace_limits_fail_closed() {
-        let root = tempdir().unwrap();
-        let cap_store =
-            SourceHistoryStore::new(root.path().join("cap-state"), PROFILE.parse().unwrap());
         assert!(validate_fact_batch_change_count(MAX_FACT_BATCH_CHANGES).is_ok());
         assert_eq!(
             validate_fact_batch_change_count(MAX_FACT_BATCH_CHANGES + 1)
@@ -5697,62 +3438,41 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        let namespace = cap_store.state_root().join("namespace-cap");
-        cap_store.prepare_private_directory(&namespace).unwrap();
-        write_private_atomically_beneath(&cap_store, &namespace.join("data"), b"four").unwrap();
-        assert_eq!(
-            private_tree_usage_bounded(
-                &cap_store,
-                &namespace,
-                FactNamespaceUsage::default(),
+        for (usage, bytes, entries) in [
+            (
+                FactNamespaceUsage {
+                    bytes: 4,
+                    entries: 0,
+                },
                 3,
                 u64::MAX,
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let manifests =
-            cap_store.source_fact_manifests_directory(&source_id(), RedactionProfile::Redacted);
-        cap_store.prepare_private_directory(&manifests).unwrap();
-        write_private_atomically_beneath(&cap_store, &manifests.join("manifest.json"), b"four")
-            .unwrap();
-        assert_eq!(
-            fact_namespace_usage_bounded(
-                &cap_store,
-                &source_id(),
-                RedactionProfile::Redacted,
-                FactNamespaceUsage::default(),
-                3,
-                u64::MAX,
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let entry_store =
-            SourceHistoryStore::new(root.path().join("entry-state"), PROFILE.parse().unwrap());
-        let entry_manifests =
-            entry_store.source_fact_manifests_directory(&source_id(), RedactionProfile::Redacted);
-        entry_store
-            .prepare_private_directory(&entry_manifests)
-            .unwrap();
-        write_private_atomically_beneath(&entry_store, &entry_manifests.join("zero.lock"), b"")
-            .unwrap();
-        assert_eq!(
-            fact_namespace_usage_bounded(
-                &entry_store,
-                &source_id(),
-                RedactionProfile::Redacted,
-                FactNamespaceUsage::default(),
+            ),
+            (
+                FactNamespaceUsage {
+                    bytes: 0,
+                    entries: 1,
+                },
                 u64::MAX,
                 0,
+            ),
+        ] {
+            assert_eq!(
+                validate_fact_namespace_usage(usage, bytes, entries)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(
+            validate_fact_namespace_usage(
+                FactNamespaceUsage {
+                    bytes: MAX_FACT_NAMESPACE_BYTES,
+                    entries: MAX_FACT_NAMESPACE_ENTRIES
+                },
+                MAX_FACT_NAMESPACE_BYTES,
+                MAX_FACT_NAMESPACE_ENTRIES,
             )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidData
+            .is_ok()
         );
     }
 
@@ -5830,29 +3550,6 @@ mod tests {
     }
 
     #[test]
-    fn private_tree_helpers_reject_paths_outside_the_store_root() {
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let outside = root.path().join("outside-tree");
-        fs::create_dir(&outside).unwrap();
-        for error in [
-            create_new_private_directory(&store, &outside.join("new")).unwrap_err(),
-            private_tree_usage_bounded(
-                &store,
-                &outside,
-                FactNamespaceUsage::default(),
-                1024,
-                u64::MAX,
-            )
-            .unwrap_err(),
-            remove_private_tree(&store, &outside).unwrap_err(),
-            write_private_atomically_beneath(&store, &outside.join("data"), b"x").unwrap_err(),
-        ] {
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        }
-    }
-
-    #[test]
     fn fact_payload_is_bound_to_source_thread_and_has_no_content_fields() {
         let value = serde_json::to_value(fact("thread-a", "event-1", at(8, 28, 1), 10)).unwrap();
         let object = value.as_object().unwrap();
@@ -5886,80 +3583,48 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn evidence_directories_reject_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let target = root.path().join("outside");
-        fs::create_dir(&target).unwrap();
-        let profile = store
-            .source_directory(&source_id())
-            .join(RedactionProfile::Redacted.directory_name());
-        store.prepare_private_directory(&profile).unwrap();
-        symlink(&target, profile.join(DIGESTS_DIRECTORY)).unwrap();
-        let start = at(8, 28, 1);
-        let record = SourceSessionDigestRecord::upsert(
-            1,
-            digest("thread-a", start, start + Duration::hours(1), 10),
-        )
-        .unwrap();
-        assert_eq!(
-            store
-                .record_source_session_digest_changes(
-                    &source_id(),
-                    RedactionProfile::Redacted,
-                    &[record],
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn evidence_directories_reject_an_ancestor_symlink_beneath_state_root() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempdir().unwrap();
-        let store = store(root.path());
-        let outside = root.path().join("outside-ancestor");
-        fs::create_dir(&outside).unwrap();
-        let redaction_directory = store
-            .source_directory(&source_id())
-            .join(RedactionProfile::PreviewEnabled.directory_name());
-        symlink(&outside, &redaction_directory).unwrap();
-        let start = at(8, 28, 1);
-        let record = SourceSessionDigestRecord::upsert(
-            1,
-            digest("thread-ancestor", start, start + Duration::hours(1), 10),
-        )
-        .unwrap();
-        assert_eq!(
-            store
-                .record_source_session_digest_changes(
-                    &source_id(),
-                    RedactionProfile::PreviewEnabled,
-                    &[record],
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(!outside.join(DIGESTS_DIRECTORY).exists());
-    }
-    fn sqlite_store(root: &Path) -> SourceHistoryStore {
-        let store =
-            SourceHistoryStore::new_sqlite(root.join("state-root"), PROFILE.parse().unwrap());
-        store
-            .save_source_metadata(
-                &SourceMetadata::new(source_id(), SourceKind::Local, "sql").unwrap(),
+    fn fact_generation_records(
+        store: &SourceHistoryStore,
+        replica: &SessionReplicaKey,
+        generation: &FactBatchId,
+    ) -> Vec<UsageEventFactRecord> {
+        let database = store.sqlite_database().unwrap();
+        let namespace = database
+            .namespace(
+                &store
+                    .source_facts_directory(replica.source_id(), RedactionProfile::Redacted)
+                    .join(ThreadShardKey::from_replica(replica).as_str())
+                    .join(generation.as_str()),
             )
             .unwrap();
-        store
+        database
+            .read(|connection| {
+                let mut budget = SourceHistoryReadBudget::for_query();
+                database::records(connection, &namespace, i64::MIN, &mut budget)
+            })
+            .unwrap()
+    }
+
+    fn staged_descriptor(
+        store: &SourceHistoryStore,
+        batch_id: &FactBatchId,
+    ) -> Option<StagedFactBatch> {
+        let database = store.sqlite_database().unwrap();
+        let key = database
+            .namespace(
+                &store
+                    .source_fact_staging_directory(&source_id(), RedactionProfile::Redacted)
+                    .join(batch_id.as_str())
+                    .join(STAGED_BATCH_FILE),
+            )
+            .unwrap();
+        database
+            .read(|connection| database::state(connection, &key))
+            .unwrap()
+    }
+
+    fn sqlite_store(root: &Path) -> SourceHistoryStore {
+        store(root)
     }
 
     #[test]
@@ -6077,10 +3742,9 @@ mod tests {
                 .iter()
                 .any(|record| record.event_id().as_str() == "event-right")
         );
-        assert!(
-            !store
-                .source_facts_directory(&source_id(), RedactionProfile::Redacted)
-                .exists()
+        assert_eq!(
+            fact_generation_records(&store, &active.replica, active.version.active_generation()),
+            active.records
         );
     }
 
@@ -6137,129 +3801,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
-    }
-
-    #[test]
-    fn sqlite_fact_import_keeps_active_and_prevalidated_staged_generations() {
-        let root = tempdir().unwrap();
-        let legacy = store(root.path());
-        let occurred = at(8, 28, 1);
-        let first = batch(
-            FactBatchId::generate().unwrap(),
-            FactBatchKind::Snapshot,
-            "thread-a",
-            None,
-            FactCursor::new(1, 1).unwrap(),
-            occurred,
-            vec![
-                UsageEventFactRecord::upsert(1, fact("thread-a", "event-1", occurred, 10)).unwrap(),
-            ],
-        );
-        legacy
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &first)
-            .unwrap();
-        legacy
-            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &first.batch_id)
-            .unwrap();
-        let active = legacy
-            .load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-a"),
-            )
-            .unwrap()
-            .unwrap();
-        let next = batch(
-            FactBatchId::generate().unwrap(),
-            FactBatchKind::Delta,
-            "thread-a",
-            Some(active.version.clone()),
-            FactCursor::new(1, 2).unwrap(),
-            occurred + Duration::minutes(1),
-            vec![
-                UsageEventFactRecord::upsert(2, fact("thread-a", "event-1", occurred, 20)).unwrap(),
-            ],
-        );
-        legacy
-            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &next)
-            .unwrap();
-        legacy
-            .prevalidate_staged_fact_batch_unfenced(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &next.batch_id,
-            )
-            .unwrap();
-        let sql = SourceHistoryStore::new_sqlite(
-            legacy.state_root().to_path_buf(),
-            legacy.profile_id().clone(),
-        );
-        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
-        assert_eq!(
-            sql.load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-a")
-            )
-            .unwrap()
-            .unwrap(),
-            active
-        );
-        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &next.batch_id)
-            .unwrap();
-        let activated = sql
-            .load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-a"),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(activated.cursor, FactCursor::new(1, 2).unwrap());
-        assert_eq!(activated.records[0].revision(), 2);
-        sql.update_source_metadata(&source_id(), |source| {
-            source.set_display_label("sql-updated")?;
-            source.set_include_in_aggregates(false);
-            Ok(())
-        })
-        .unwrap();
-        let latest = batch(
-            FactBatchId::generate().unwrap(),
-            FactBatchKind::Delta,
-            "thread-a",
-            Some(activated.version),
-            FactCursor::new(1, 3).unwrap(),
-            occurred + Duration::minutes(2),
-            vec![
-                UsageEventFactRecord::upsert(3, fact("thread-a", "event-1", occurred, 30)).unwrap(),
-            ],
-        );
-        sql.stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &latest)
-            .unwrap();
-        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &latest.batch_id)
-            .unwrap();
-        let before_reimport = sql
-            .load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-a"),
-            )
-            .unwrap()
-            .unwrap();
-        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
-        assert_eq!(
-            sql.load_active_fact_set(
-                &source_id(),
-                RedactionProfile::Redacted,
-                &thread("thread-a")
-            )
-            .unwrap()
-            .unwrap(),
-            before_reimport
-        );
-        let metadata = sql.load_source_metadata(&source_id()).unwrap();
-        assert_eq!(metadata.display_label(), "sql-updated");
-        assert!(!metadata.include_in_aggregates());
     }
 
     #[test]
@@ -6369,5 +3910,242 @@ mod tests {
                 .records
                 .is_empty()
         );
+    }
+    #[test]
+    fn sqlite_fact_gc_reclaims_orphans_and_preserves_prevalidated_staging() {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let first_id = FactBatchId::generate().unwrap();
+        let first = batch(
+            first_id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-orphan",
+            None,
+            FactCursor::new(2, 1).unwrap(),
+            at(8, 28, 2),
+            vec![
+                UsageEventFactRecord::upsert(
+                    1,
+                    fact("thread-orphan", "event-one", at(8, 28, 1), 10),
+                )
+                .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &first)
+            .unwrap();
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &first_id)
+            .unwrap();
+        garbage_collect_session_evidence_for_source(
+            &store,
+            &source_id(),
+            RedactionProfile::Redacted,
+            at(8, 1, 0).date_naive(),
+            Utc::now(),
+        )
+        .unwrap();
+        let before = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-orphan"),
+            )
+            .unwrap()
+            .unwrap();
+        let staged_id = FactBatchId::generate().unwrap();
+        let staged = batch(
+            staged_id.clone(),
+            FactBatchKind::Delta,
+            "thread-orphan",
+            Some(before.version.clone()),
+            FactCursor::new(2, 2).unwrap(),
+            at(8, 28, 3),
+            vec![
+                UsageEventFactRecord::upsert(
+                    2,
+                    fact("thread-orphan", "event-two", at(8, 28, 2), 20),
+                )
+                .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &staged)
+            .unwrap();
+        let publication = store
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &staged_id,
+            )
+            .unwrap();
+        let orphan_id = FactBatchId::generate().unwrap();
+        let database = store.sqlite_database().unwrap();
+        let namespace = database
+            .namespace(
+                &store
+                    .source_facts_directory(&source_id(), RedactionProfile::Redacted)
+                    .join(ThreadShardKey::from_replica(&before.replica).as_str())
+                    .join(orphan_id.as_str()),
+            )
+            .unwrap();
+        let orphan = UsageEventFactRecord::upsert(
+            1,
+            fact("thread-orphan", "event-orphan", at(8, 28, 1), 999),
+        )
+        .unwrap();
+        database
+            .write(|connection| {
+                database::put_record(
+                    connection,
+                    &namespace,
+                    orphan.event_id().as_str(),
+                    orphan.occurred_at().timestamp_millis(),
+                    &orphan,
+                )
+            })
+            .unwrap();
+        // Artifact cleanup cannot change a visible query or its cache stamp.
+        let (pruned, query_visible_deleted) =
+            garbage_collect_session_evidence_for_source_with_changes(
+                &store,
+                &source_id(),
+                RedactionProfile::Redacted,
+                at(8, 1, 0).date_naive(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(pruned, 0);
+        assert!(!query_visible_deleted);
+        assert!(fact_generation_records(&store, &before.replica, &orphan_id).is_empty());
+        assert!(staged_descriptor(&store, &staged_id).is_some());
+        let report = store
+            .publish_prevalidated_fact_batch_unfenced(&publication)
+            .unwrap();
+        assert!(report.activated);
+        let active = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-orphan"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.cursor, staged.activate_cursor);
+        assert_eq!(
+            active.records,
+            vec![first.changes[0].clone(), staged.changes[0].clone()]
+        );
+        assert_eq!(
+            fact_generation_records(&store, &before.replica, &staged_id),
+            active.records
+        );
+    }
+
+    #[test]
+    fn sqlite_evidence_round_trips_full_u128_costs() {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let mut event = fact("thread-u128", "event-u128", at(8, 28, 1), 10);
+        event.metrics.estimated_cost_units = u128::MAX;
+        event.metrics.api_long_context_extra_cost_units = Some(u128::MAX - 1);
+        let mut cost = event.metrics.api_equivalent_cost;
+        cost.minimum_pico_usd = PicoUsd::new(u128::MAX - 2);
+        cost.maximum_pico_usd = PicoUsd::new(u128::MAX);
+        event.metrics.api_equivalent_cost = cost;
+        let mut session = digest("thread-u128", at(8, 28, 1), at(8, 28, 2), 10);
+        session.metrics = event.metrics.clone();
+        let digest_record = SourceSessionDigestRecord::upsert(u64::MAX, session).unwrap();
+        store
+            .record_source_session_digest_changes(
+                &source_id(),
+                RedactionProfile::Redacted,
+                std::slice::from_ref(&digest_record),
+            )
+            .unwrap();
+        let fact_record = UsageEventFactRecord::upsert(u64::MAX, event).unwrap();
+        let id = FactBatchId::generate().unwrap();
+        let snapshot = batch(
+            id.clone(),
+            FactBatchKind::Snapshot,
+            "thread-u128",
+            None,
+            FactCursor::new(u64::MAX, u64::MAX).unwrap(),
+            at(8, 28, 2),
+            vec![fact_record.clone()],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &snapshot)
+            .unwrap();
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &id)
+            .unwrap();
+        let active = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-u128"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.records, vec![fact_record]);
+        assert_eq!(active.cursor, snapshot.activate_cursor);
+        assert_eq!(
+            store
+                .load_source_session_digest_records_since(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    at(8, 28, 0)
+                )
+                .unwrap()
+                .records,
+            vec![digest_record]
+        );
+    }
+    #[test]
+    fn sqlite_digest_gc_reports_partial_day_deletion_without_pruning_the_day() {
+        let root = tempdir().unwrap();
+        let store = store(root.path());
+        let start = at(7, 25, 1);
+        let expired = SourceSessionDigestRecord::upsert(
+            1,
+            digest("thread-expired", start, start + Duration::hours(1), 10),
+        )
+        .unwrap();
+        let crossing = SourceSessionDigestRecord::upsert(
+            1,
+            digest("thread-crossing", start, at(7, 27, 1), 20),
+        )
+        .unwrap();
+        store
+            .record_source_session_digest_changes(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &[expired, crossing.clone()],
+            )
+            .unwrap();
+        let collect = || {
+            garbage_collect_session_evidence_for_source_with_changes(
+                &store,
+                &source_id(),
+                RedactionProfile::Redacted,
+                at(7, 26, 0).date_naive(),
+                Utc::now(),
+            )
+            .unwrap()
+        };
+        assert_eq!(collect(), (0, true));
+        assert_eq!(
+            store
+                .load_source_session_digest_records_since(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    start,
+                )
+                .unwrap()
+                .records,
+            vec![crossing]
+        );
+        assert_eq!(collect(), (0, false));
     }
 }

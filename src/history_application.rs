@@ -1,8 +1,7 @@
 //! History application boundary shared by one-shot reports and TUI refreshes.
 //!
-//! Preparation owns staging, persistence and recovery/cutover. Queries accept an
-//! already prepared runtime and never collect, synchronize, migrate or flush.
-//! Compatibility adapters retain the existing report warnings and source rules.
+//! Preparation owns staging, persistence and initialization. Queries accept an
+//! already prepared runtime and never collect, synchronize, initialize or flush.
 
 use crate::config::CollectConfig;
 use crate::domain::{Provenance, TaskRecord};
@@ -41,17 +40,23 @@ pub(crate) enum ReportHistoryStore {
         runtime: Box<HistoryRuntime>,
         profile_lease: Option<HistoryProfileLeaseGuard>,
     },
-    LegacyFallback {
+    MemoryFallback {
         store: Box<HistoryStore>,
-        writable: bool,
     },
 }
 
 impl ReportHistoryStore {
-    pub(crate) fn legacy_history(&self) -> &HistoryStore {
+    pub(crate) fn history_root(&self) -> Option<&std::path::Path> {
         match self {
-            Self::Runtime { runtime, .. } => runtime.legacy_history(),
-            Self::LegacyFallback { store, .. } => store,
+            Self::Runtime { runtime, .. } => Some(runtime.history_root()),
+            Self::MemoryFallback { .. } => None,
+        }
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        match self {
+            Self::Runtime { runtime, .. } => runtime.namespace(),
+            Self::MemoryFallback { store } => store.namespace(),
         }
     }
 
@@ -68,7 +73,7 @@ impl ReportHistoryStore {
                 profile_lease: None,
                 ..
             } => Ok(false),
-            Self::LegacyFallback { writable, .. } => Ok(*writable),
+            Self::MemoryFallback { .. } => Ok(false),
         }
     }
 }
@@ -100,7 +105,7 @@ pub(crate) fn acquire_runtime_profile_lease(
     }
 }
 
-pub(crate) fn runtime_requires_v2_cutover(runtime: &HistoryRuntime) -> io::Result<bool> {
+pub(crate) fn runtime_requires_sqlite_initialization(runtime: &HistoryRuntime) -> io::Result<bool> {
     Ok(match runtime.ownership().load_manifest()? {
         OwnershipManifestStatus::Uninitialized => true,
         OwnershipManifestStatus::Initialized(manifest) => {
@@ -109,27 +114,24 @@ pub(crate) fn runtime_requires_v2_cutover(runtime: &HistoryRuntime) -> io::Resul
     })
 }
 
-/// File-based v2 is retained as upgrade input and a read-only snapshot.
-/// V1 may still be owned by the original recorder while cutover is deferred.
+/// Persistence requires an initialized SQLite namespace and the active profile lease.
 pub(crate) fn runtime_history_write_permitted(runtime: &HistoryRuntime) -> io::Result<bool> {
-    Ok(match runtime.ownership().load_manifest()? {
-        OwnershipManifestStatus::Initialized(manifest) => {
-            if manifest.state() == HistoryOwnershipState::V1Active {
-                true
-            } else if manifest.state() == HistoryOwnershipState::V2Active
-                && manifest.is_sqlite_backend()
-            {
-                let Some(database) = runtime.source_history().sqlite_database() else {
-                    return Ok(false);
-                };
-                crate::sqlite_history_migration::validate_receipt(&database, &manifest)?;
-                true
-            } else {
-                false
-            }
+    match runtime.ownership().load_manifest()? {
+        OwnershipManifestStatus::Initialized(manifest)
+            if manifest.state() == HistoryOwnershipState::V2Active
+                && manifest.is_sqlite_backend() =>
+        {
+            let database = runtime.source_history().sqlite_database().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history runtime is not bound to SQLite",
+                )
+            })?;
+            crate::sqlite_history_initialization::validate_receipt(&database, &manifest)?;
+            Ok(true)
         }
-        OwnershipManifestStatus::Uninitialized => false,
-    })
+        _ => Ok(false),
+    }
 }
 
 pub(crate) struct PreparedReportHistory {
@@ -169,7 +171,7 @@ pub(crate) fn prepare_report_history(
                 warnings.push(warning);
             }
         }
-        ReportHistoryStore::LegacyFallback { store, .. } => store.stage(&observation),
+        ReportHistoryStore::MemoryFallback { store, .. } => store.stage(&observation),
     }
     let stage_elapsed = stage_started.elapsed();
     let record_started = Instant::now();
@@ -199,15 +201,7 @@ pub(crate) fn prepare_report_history(
             apply_runtime_write_metrics(&mut metrics, &write);
             merge_runtime_history_write_result(&mut preparation, &write, "history persistence");
         }
-        ReportHistoryStore::LegacyFallback { store, .. } => {
-            let write = if write_permitted {
-                store.flush_staged()
-            } else {
-                Ok(None)
-            };
-            apply_legacy_write_metrics(&mut metrics, &write);
-            merge_history_write_result(&mut preparation, write);
-        }
+        ReportHistoryStore::MemoryFallback { .. } => {}
     }
     metrics.record_us = u64::try_from(record_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     metrics.stage_us = u64::try_from(stage_elapsed.as_micros()).unwrap_or(u64::MAX);
@@ -244,7 +238,7 @@ impl PreparedReportHistory {
                         let mut history = HistoryData::default();
                         if !matches!(selector, HistorySourceSelector::Remote(_)) {
                             runtime
-                                .legacy_history()
+                                .staging_history()
                                 .overlay_staged_since(&mut history, since);
                         }
                         history
@@ -254,8 +248,8 @@ impl PreparedReportHistory {
                     }
                 }
             }
-            ReportHistoryStore::LegacyFallback { store, .. } => {
-                legacy_history_for_source_selector(store.load_since_with_staged(since), selector)
+            ReportHistoryStore::MemoryFallback { store, .. } => {
+                memory_history_for_source_selector(store.load_since_with_staged(since), selector)
             }
         };
         history.read_only |= self.preparation.read_only;
@@ -342,7 +336,7 @@ pub(crate) fn query_runtime_history(
     }
 }
 
-pub(crate) fn legacy_history_for_source_selector(
+pub(crate) fn memory_history_for_source_selector(
     history: HistoryData,
     source_selector: &HistorySourceSelector,
 ) -> HistoryData {
@@ -356,7 +350,7 @@ pub(crate) fn legacy_history_for_source_selector(
     };
     selected.warnings.extend(history.warnings);
     selected.warnings.push(format!(
-        "{SOURCE_SELECTION_UNAVAILABLE_WARNING}:unsupported_by_legacy:{source_id}"
+        "{SOURCE_SELECTION_UNAVAILABLE_WARNING}:unavailable_in_memory_view:{source_id}"
     ));
     selected
 }
@@ -401,9 +395,8 @@ fn report_history_store(
         Err(error) => {
             let store = HistoryStore::memory_only(&config.codex_home, config.redact_content);
             (
-                ReportHistoryStore::LegacyFallback {
+                ReportHistoryStore::MemoryFallback {
                     store: Box::new(store),
-                    writable: false,
                 },
                 vec![format!(
                     "source-aware history runtime unavailable; showing only this process's collected history in a read-only memory view; no history will be persisted until the source-aware state is repaired: {error}"
@@ -415,7 +408,7 @@ fn report_history_store(
 
 fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
     let mut warnings = Vec::new();
-    match runtime_requires_v2_cutover(runtime) {
+    match runtime_requires_sqlite_initialization(runtime) {
         Ok(false) => {
             if let Err(error) = runtime.refresh_active_sqlite_backend() {
                 warnings.push(format!(
@@ -433,10 +426,7 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
         Ok(true) => {}
     }
 
-    let history_root = runtime
-        .legacy_history()
-        .history_root()
-        .expect("a bound runtime always has a legacy root");
+    let history_root = runtime.history_root();
     let _cutover_guard = match try_acquire_recorder_instance_lock(history_root) {
         Ok(TryRecorderInstanceLock::Acquired(guard)) => guard,
         Ok(TryRecorderInstanceLock::Busy) => {
@@ -444,7 +434,7 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
                 warnings.push(format!("history ownership initialization failed: {error}"));
             }
             warnings.push(
-                "source-aware history cutover deferred while another recorder owns this state"
+                "SQLite history initialization deferred while another recorder owns this state"
                     .to_owned(),
             );
             return warnings;
@@ -456,31 +446,28 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
                 ));
             }
             warnings.push(format!(
-                "source-aware history cutover deferred because its recorder lock could not be verified: {error}"
+                "SQLite history initialization deferred because its recorder lock could not be verified: {error}"
             ));
             return warnings;
         }
     };
 
     let status_path = default_status_file(history_root);
-    let incompatible = incompatible_recorder_for_cutover(
-        &status_path,
-        runtime.legacy_history().namespace(),
-        Utc::now(),
-    );
+    let incompatible =
+        incompatible_recorder_for_cutover(&status_path, runtime.namespace(), Utc::now());
     match incompatible {
         Ok(Some(status)) => {
             if let Err(error) = runtime.ensure_ownership_initialized() {
                 warnings.push(format!("history ownership initialization failed: {error}"));
             }
             warnings.push(format!(
-                "source-aware history cutover deferred while legacy recorder pid {} may still be active",
+                "SQLite history initialization deferred while legacy recorder pid {} may still be active",
                 status.pid
             ));
         }
         Ok(None) => {
             if let Err(error) = runtime.ensure_v2_active() {
-                warnings.push(format!("source-aware history cutover failed: {error}"));
+                warnings.push(format!("SQLite history initialization failed: {error}"));
             }
         }
         Err(error) => {
@@ -490,7 +477,7 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
                 ));
             }
             warnings.push(format!(
-                "source-aware history cutover deferred because recorder status could not be verified at {}: {error}",
+                "SQLite history initialization deferred because recorder status could not be verified at {}: {error}",
                 status_path.display()
             ));
         }
@@ -498,35 +485,11 @@ fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
     warnings
 }
 
-fn apply_legacy_write_metrics(
-    metrics: &mut HistoryMetrics,
-    write_result: &io::Result<Option<crate::history::HistoryWriteReport>>,
-) {
-    match write_result {
-        Ok(Some(report)) => {
-            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-            metrics.read_only = report.read_only;
-        }
-        Ok(None) => {}
-        Err(_) => metrics.warnings = 1,
-    }
-}
-
 pub(crate) fn apply_runtime_write_metrics(
     metrics: &mut HistoryMetrics,
     write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
 ) {
     match write_result {
-        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
-            metrics.shards_written = u64::try_from(report.shards_written).unwrap_or(u64::MAX);
-            metrics.shards_skipped = u64::try_from(report.shards_skipped).unwrap_or(u64::MAX);
-            metrics.shards_pruned = u64::try_from(report.shards_pruned).unwrap_or(u64::MAX);
-            metrics.warnings = u64::try_from(report.warnings.len()).unwrap_or(u64::MAX);
-            metrics.read_only = report.read_only;
-        }
         Ok(Some(HistoryRuntimeWriteReport::V2(report))) => {
             metrics.shards_written = u64::try_from(
                 report
@@ -570,32 +533,12 @@ pub(crate) fn report_history_observation(
     Cow::Owned(observation)
 }
 
-fn merge_history_write_result(
-    history: &mut HistoryData,
-    write_result: io::Result<Option<crate::history::HistoryWriteReport>>,
-) {
-    match write_result {
-        Ok(Some(report)) => {
-            history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings);
-        }
-        Ok(None) => {}
-        Err(error) => history
-            .warnings
-            .push(format!("history persistence failed: {error}")),
-    }
-}
-
 pub(crate) fn merge_runtime_history_write_result(
     history: &mut HistoryData,
     write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
     operation: &str,
 ) {
     match write_result {
-        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => {
-            history.read_only |= report.read_only;
-            history.warnings.extend(report.warnings.iter().cloned());
-        }
         Ok(Some(HistoryRuntimeWriteReport::V2(_))) | Ok(None) => {}
         Err(error) => history
             .warnings
@@ -705,7 +648,7 @@ pub(crate) fn backfill_summary_history_selected(
                     let mut history = HistoryData::default();
                     if !matches!(source_selector, HistorySourceSelector::Remote(_)) {
                         runtime
-                            .legacy_history()
+                            .staging_history()
                             .overlay_staged_since(&mut history, since);
                     }
                     history
@@ -721,28 +664,9 @@ pub(crate) fn backfill_summary_history_selected(
             );
             history
         }
-        ReportHistoryStore::LegacyFallback { store, writable } => {
+        ReportHistoryStore::MemoryFallback { store } => {
             store.stage_full_observation(&observation);
-            let write_result = if *writable {
-                store.flush_staged()
-            } else {
-                Ok(None)
-            };
-            let mut history = legacy_history_for_source_selector(
-                store.load_since_with_staged(since),
-                source_selector,
-            );
-            match write_result {
-                Ok(Some(report)) => {
-                    history.read_only |= report.read_only;
-                    history.warnings.extend(report.warnings);
-                }
-                Ok(None) => {}
-                Err(error) => history
-                    .warnings
-                    .push(format!("summary backfill persistence failed: {error}")),
-            }
-            history
+            memory_history_for_source_selector(store.load_since_with_staged(since), source_selector)
         }
     };
     if !write_permitted {
@@ -776,12 +700,7 @@ pub(crate) fn backfill_summary_history_selected(
             completed_at: observed_at,
             complete: requested_complete,
         }),
-        ReportHistoryStore::LegacyFallback { store, writable }
-            if marker_write_permitted && *writable =>
-        {
-            store.mark_summary_backfill_attempt(observed_at, requested_complete)
-        }
-        ReportHistoryStore::LegacyFallback { .. } => Ok(crate::history::SummaryBackfillAttempt {
+        ReportHistoryStore::MemoryFallback { .. } => Ok(crate::history::SummaryBackfillAttempt {
             completed_at: observed_at,
             complete: requested_complete,
         }),
@@ -802,7 +721,8 @@ pub(crate) struct HistoryProjectionRevision {
     pub project_mapping_revision: u64,
     pub local_observation_revision: u64,
     pub other_local_observation_revision: u64,
-    pub sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
+    pub garbage_collection_revision: u64,
+    pub sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>, u64)>,
 }
 
 impl HistoryProjectionRevision {
@@ -810,6 +730,7 @@ impl HistoryProjectionRevision {
         self.ownership == other.ownership
             && self.project_mapping_revision == other.project_mapping_revision
             && self.other_local_observation_revision == other.other_local_observation_revision
+            && self.garbage_collection_revision == other.garbage_collection_revision
             && self.sources == other.sources
     }
 }
@@ -840,18 +761,13 @@ fn history_projection_revision_once(
         return Ok(None);
     }
     if let OwnershipManifestStatus::Initialized(manifest) = &ownership {
-        if manifest.is_sqlite_backend() != runtime.source_history().sqlite_database().is_some() {
-            // A different process activated SQLite after this runtime was
-            // constructed. Force a query, which refreshes the facade, instead
-            // of stamping a cached file projection with the new ownership.
-            return Ok(None);
-        }
-        if manifest.is_sqlite_backend() {
-            crate::sqlite_history_migration::validate_receipt(
-                &runtime.source_history().sqlite_database().unwrap(),
-                manifest,
-            )?;
-        }
+        let database = runtime.source_history().sqlite_database().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history runtime is not bound to SQLite",
+            )
+        })?;
+        crate::sqlite_history_initialization::validate_receipt(&database, manifest)?;
     }
     let project_mapping_revision = match runtime.project_mapping_store().load() {
         Ok(mappings) => mappings.revision(),
@@ -867,17 +783,16 @@ fn history_projection_revision_once(
     // Account quota is shared by the profile. The other privacy writer may
     // update it without changing this runtime's own observation namespace or
     // source metadata, so it must also invalidate a cached projection.
-    let other_local_observation_revision = if runtime.source_history().sqlite_database().is_some() {
-        let redaction = match runtime.redaction_profile() {
-            RedactionProfile::Redacted => RedactionProfile::PreviewEnabled,
-            RedactionProfile::PreviewEnabled => RedactionProfile::Redacted,
-        };
-        runtime
-            .source_history()
-            .load_local_observation_projection_revision(runtime.source_identity(), redaction)?
-    } else {
-        0
+    let redaction = match runtime.redaction_profile() {
+        RedactionProfile::Redacted => RedactionProfile::PreviewEnabled,
+        RedactionProfile::PreviewEnabled => RedactionProfile::Redacted,
     };
+    let other_local_observation_revision = runtime
+        .source_history()
+        .load_local_observation_projection_revision(runtime.source_identity(), redaction)?;
+    let garbage_collection_revision = runtime
+        .source_history()
+        .load_history_gc_projection_revision()?;
     let mut metadata = runtime.source_history().list_source_metadata()?;
     metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     let selected = metadata.into_iter().filter(|source| {
@@ -894,18 +809,26 @@ fn history_projection_revision_once(
     });
     let sources = selected
         .map(|source| {
-            let active = (source.kind() == SourceKind::Ssh
+            let remote_selected = source.kind() == SourceKind::Ssh
                 && !(runtime.redaction_profile() == RedactionProfile::Redacted
-                    && source.aggregate_redaction_profile() == RedactionProfile::PreviewEnabled))
-                .then(|| {
+                    && source.aggregate_redaction_profile() == RedactionProfile::PreviewEnabled);
+            let (active, publication_revision) = if remote_selected {
+                (
                     runtime.source_history().active_remote_history_ref(
                         source.source_id(),
                         source.aggregate_redaction_profile(),
-                    )
-                })
-                .transpose()?
-                .flatten();
-            Ok((source, active))
+                    )?,
+                    runtime
+                        .source_history()
+                        .load_remote_history_projection_revision(
+                            source.source_id(),
+                            source.aggregate_redaction_profile(),
+                        )?,
+                )
+            } else {
+                (None, 0)
+            };
+            Ok((source, active, publication_revision))
         })
         .collect::<io::Result<Vec<_>>>()?;
     Ok(Some(HistoryProjectionRevision {
@@ -913,6 +836,7 @@ fn history_projection_revision_once(
         project_mapping_revision,
         local_observation_revision,
         other_local_observation_revision,
+        garbage_collection_revision,
         sources,
     }))
 }

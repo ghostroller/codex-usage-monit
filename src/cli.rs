@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::attribution::project_five_hour_analysis;
 use crate::automatic_remote_sync::{
-    AutomaticRemoteCutoverPolicy, AutomaticRemoteSyncStopToken, AutomaticRemoteSyncWorker,
+    AutomaticRemoteInitializationPolicy, AutomaticRemoteSyncStopToken, AutomaticRemoteSyncWorker,
     AutomaticRemoteSyncWorkerStep, FilesystemAutomaticRemoteSyncExecutor,
     InterruptibleRemoteSyncSleeper,
 };
@@ -25,17 +25,20 @@ use crate::domain::AccountSnapshot;
 use crate::domain::Provenance;
 use crate::event_log::{EventLog, LogLevel};
 use crate::health_report::HealthReport;
+#[cfg(test)]
+use crate::history::HistoryStore;
 use crate::history::default_history_root;
 #[cfg(test)]
-use crate::history::{HistoryData, HistoryObservation, HistoryStore};
+use crate::history::{HistoryData, HistoryObservation};
 use crate::history_application::{
     ReportHistoryStore, acquire_runtime_profile_lease, backfill_summary_history_selected,
-    prepare_report_history, runtime_requires_v2_cutover,
+    prepare_report_history, runtime_requires_sqlite_initialization,
 };
 #[cfg(test)]
-use crate::history_application::{legacy_history_for_source_selector, report_history_observation};
+use crate::history_application::{memory_history_for_source_selector, report_history_observation};
 #[cfg(test)]
 use crate::history_ownership::HistoryOwnershipState;
+#[cfg(test)]
 use crate::history_ownership::OwnershipManifestStatus;
 use crate::history_profile_lease::HistoryProfileLeaseGuard;
 use crate::history_query::HistorySourceSelector;
@@ -2071,9 +2074,9 @@ fn execute_remote_sync_at_state_root_with_transports(
             collect_config.redact_content,
         );
     }
-    let legacy_history_root = absolute_path(state_root).join("history-v1");
+    let history_root = absolute_path(state_root).join("history-v1");
     let mut runtime = HistoryRuntime::new(
-        legacy_history_root,
+        history_root,
         &collect_config.codex_home,
         collect_config.redact_content,
     )
@@ -2455,7 +2458,7 @@ fn warn_remote_sync_health_persistence_failed() {
 }
 
 fn ensure_remote_sync_runtime_v2(host_id: &str, runtime: &mut HistoryRuntime) -> Result<()> {
-    if !runtime_requires_v2_cutover(runtime).map_err(|error| {
+    if !runtime_requires_sqlite_initialization(runtime).map_err(|error| {
         anyhow::anyhow!(
             "remote sync for {host_id:?} could not inspect local history ownership: {error}; no SSH connection was opened"
         )
@@ -2466,14 +2469,10 @@ fn ensure_remote_sync_runtime_v2(host_id: &str, runtime: &mut HistoryRuntime) ->
         return Ok(());
     }
 
-    // Only cutover requires the singleton recorder slot. Normal v2 manual
+    // Only initialization requires the singleton recorder slot. Normal v2 manual
     // sync may coexist with a same-profile recorder because each local commit
     // is independently fenced by the ownership writer lease.
-    let history_root = runtime.legacy_history().history_root().ok_or_else(|| {
-        anyhow::anyhow!(
-            "remote sync for {host_id:?} has no local legacy history namespace; no SSH connection was opened"
-        )
-    })?;
+    let history_root = runtime.history_root();
     let _cutover_guard =
         match try_acquire_recorder_instance_lock(history_root).map_err(|error| {
             anyhow::anyhow!(
@@ -2483,7 +2482,7 @@ fn ensure_remote_sync_runtime_v2(host_id: &str, runtime: &mut HistoryRuntime) ->
             TryRecorderInstanceLock::Acquired(guard) => guard,
             TryRecorderInstanceLock::Busy => {
                 bail!(
-                    "remote sync for {host_id:?} cannot migrate history while a recorder owns this state; let that recorder finish the source-aware cutover or stop it, then retry; no SSH connection was opened"
+                    "remote sync for {host_id:?} cannot initialize SQLite history while a recorder owns this state; stop it, then retry; no SSH connection was opened"
                 );
             }
         };
@@ -2492,7 +2491,7 @@ fn ensure_remote_sync_runtime_v2(host_id: &str, runtime: &mut HistoryRuntime) ->
     reject_incompatible_recorder_before_cutover(host_id, runtime)?;
     runtime.ensure_v2_active().map_err(|error| {
         anyhow::anyhow!(
-            "remote sync for {host_id:?} could not migrate local history to source-aware v2: {error}; repair the local history state and retry; no SSH connection was opened"
+            "remote sync for {host_id:?} could not initialize local SQLite history: {error}; repair the local history state and retry; no SSH connection was opened"
         )
     })?;
     Ok(())
@@ -2511,15 +2510,11 @@ fn reject_incompatible_recorder_before_cutover(
     host_id: &str,
     runtime: &HistoryRuntime,
 ) -> Result<()> {
-    let legacy_history_root = runtime.legacy_history().history_root().ok_or_else(|| {
-        anyhow::anyhow!(
-            "remote sync for {host_id:?} has no local legacy history namespace; no SSH connection was opened"
-        )
-    })?;
-    let status_path = default_status_file(legacy_history_root);
+    let history_root = runtime.history_root();
+    let status_path = default_status_file(history_root);
     let incompatible = incompatible_recorder_for_cutover(
         &status_path,
-        runtime.legacy_history().namespace(),
+        runtime.namespace(),
         Utc::now(),
     )
     .map_err(|error| {
@@ -2533,8 +2528,8 @@ fn reject_incompatible_recorder_before_cutover(
             .last_history_heartbeat
             .unwrap_or(status.last_attempt_at);
         bail!(
-            "remote sync for {host_id:?} cannot migrate history while a recent legacy recorder may still be writing namespace {:?} (pid {}, last activity {}); run `codex-usage-monit service uninstall` to stop it, reinstall or update this application, then run `codex-usage-monit service install` to restart it with the current version before retrying; no SSH connection was opened",
-            runtime.legacy_history().namespace(),
+            "remote sync for {host_id:?} cannot initialize SQLite history while a recent legacy recorder may still be writing namespace {:?} (pid {}, last activity {}); run `codex-usage-monit service uninstall` to stop it, reinstall or update this application, then run `codex-usage-monit service install` to restart it with the current version before retrying; no SSH connection was opened",
+            runtime.namespace(),
             status.pid,
             last_activity.to_rfc3339()
         );
@@ -2908,12 +2903,9 @@ fn remote_source_lifecycle_runtime(
             "remote {operation} could not select the active local history profile: {error}; no source lifecycle change was published"
         )
     })?;
-    if matches!(runtime.ownership().load_manifest()?, OwnershipManifestStatus::Initialized(manifest) if manifest.uses_source_history())
-    {
-        ensure_remote_sync_runtime_v2(operation, &mut runtime).map_err(|error| {
-            anyhow::anyhow!("remote {operation} could not prepare active history storage: {error}; no source lifecycle change was published")
-        })?;
-    }
+    ensure_remote_sync_runtime_v2(operation, &mut runtime).map_err(|error| {
+        anyhow::anyhow!("remote {operation} could not prepare active history storage: {error}; no source lifecycle change was published")
+    })?;
     profile_lease.validate()?;
     Ok((runtime, profile_lease))
 }
@@ -3715,7 +3707,6 @@ fn collect_and_load_report_history(
 fn recorder_status_for_history(
     store: &ReportHistoryStore,
 ) -> (Option<RecorderStatusFile>, Option<String>) {
-    let store = store.legacy_history();
     let Some(history_root) = store.history_root() else {
         return (
             None,
@@ -3750,7 +3741,6 @@ fn service_status_for_history(
     perf_log: Option<&Path>,
     trace_log: Option<&Path>,
 ) -> (Option<crate::service::ServiceStatus>, Option<String>) {
-    let store = store.legacy_history();
     let Some(history_root) = store.history_root() else {
         return (
             None,
@@ -4094,7 +4084,7 @@ fn start_recorder_remote_sync_worker(
         state_root,
         remote_collect_config,
         config_store.clone(),
-        AutomaticRemoteCutoverPolicy::RequireV2Active,
+        AutomaticRemoteInitializationPolicy::RequireSqliteActive,
         SshRemoteDeltaTransport::new(environment.clone()),
         SshRemoteFactTransport::new(environment),
         project_mapping_store,
@@ -4691,12 +4681,7 @@ fn run_recorder(
         project_mapping_store.clone(),
     )
     .map_err(|error| anyhow::anyhow!("could not bind recorder history runtime: {error}"))?;
-    let default_recorder_status = default_status_file(
-        history_runtime
-            .legacy_history()
-            .history_root()
-            .expect("a bound recorder runtime always has a legacy history root"),
-    );
+    let default_recorder_status = default_status_file(history_runtime.history_root());
     let status_file = requested_status_file.unwrap_or_else(|| default_recorder_status.clone());
     let mut compatibility_status_files = vec![default_recorder_status];
     if compatibility_status_files[0] != status_file {
@@ -4732,7 +4717,7 @@ fn run_recorder(
     };
     let mut recorder_status = RecorderStatusFile::started_with_interval(
         Utc::now(),
-        history_runtime.legacy_history().namespace().to_string(),
+        history_runtime.namespace().to_string(),
         heartbeat_interval_seconds,
     );
     recorder_status.service_definition_id = args.service_definition_id.clone();
@@ -4922,7 +4907,7 @@ fn reject_incompatible_recorder_before_recorder_cutover(
                 status_path.display()
             )
         })? && status.writer_may_be_active(now)
-            && !(status.history_namespace.as_deref() == Some(runtime.legacy_history().namespace())
+            && !(status.history_namespace.as_deref() == Some(runtime.namespace())
                 && status.source_aware_v2_epoch().is_some())
         {
             let last_activity = status
@@ -4936,24 +4921,20 @@ fn reject_incompatible_recorder_before_recorder_cutover(
                 status_path.display(),
             );
         }
-        let incompatible = incompatible_recorder_for_cutover(
-            status_path,
-            runtime.legacy_history().namespace(),
-            now,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "could not verify recorder compatibility from {}: {error}",
-                status_path.display()
-            )
-        })?;
+        let incompatible = incompatible_recorder_for_cutover(status_path, runtime.namespace(), now)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not verify recorder compatibility from {}: {error}",
+                    status_path.display()
+                )
+            })?;
         if let Some(status) = incompatible {
             let last_activity = status
                 .last_history_heartbeat
                 .unwrap_or(status.last_attempt_at);
             bail!(
                 "cannot activate source-aware history while a recent legacy recorder may still be writing namespace {:?} (pid {}, last activity {}, status {}); stop or uninstall the old service, then reinstall it with the current application before retrying",
-                runtime.legacy_history().namespace(),
+                runtime.namespace(),
                 status.pid,
                 last_activity.to_rfc3339(),
                 status_path.display(),
@@ -5784,7 +5765,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v1_service_releases_global_gate_before_history_activation() {
+    fn fresh_service_releases_global_gate_before_sqlite_initialization() {
         let coordination_directory = tempfile::tempdir().unwrap();
         let coordination = coordination_directory.path().join("service-scope");
         let state = tempfile::tempdir().unwrap();
@@ -6494,8 +6475,7 @@ mod tests {
         runtime.ensure_v2_active().unwrap();
         let mut cache = RolloutCache::new();
         let mut local = RecorderLocalState::default();
-        let mut status =
-            RecorderStatusFile::started(now, runtime.legacy_history().namespace().to_owned());
+        let mut status = RecorderStatusFile::started(now, runtime.namespace().to_owned());
 
         assert!(local.poll(&config, &runtime, &mut cache, false));
         local.update_status(&mut status, now, None);
@@ -8536,11 +8516,7 @@ mod tests {
             paired.host("dev").unwrap().redact_content(),
         )
         .unwrap();
-        let _guard = match try_acquire_recorder_instance_lock(
-            runtime.legacy_history().history_root().unwrap(),
-        )
-        .unwrap()
-        {
+        let _guard = match try_acquire_recorder_instance_lock(runtime.history_root()).unwrap() {
             TryRecorderInstanceLock::Acquired(guard) => guard,
             TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
         };
@@ -8558,7 +8534,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cannot migrate history while a recorder owns")
+                .contains("cannot initialize SQLite history while a recorder owns")
         );
         assert!(error.to_string().contains("no SSH connection was opened"));
         let runtime = HistoryRuntime::new(
@@ -8591,14 +8567,11 @@ mod tests {
         .unwrap();
         runtime.ensure_v2_active().unwrap();
         let _profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-        let _recorder_guard = match try_acquire_recorder_instance_lock(
-            runtime.legacy_history().history_root().unwrap(),
-        )
-        .unwrap()
-        {
-            TryRecorderInstanceLock::Acquired(guard) => guard,
-            TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
-        };
+        let _recorder_guard =
+            match try_acquire_recorder_instance_lock(runtime.history_root()).unwrap() {
+                TryRecorderInstanceLock::Acquired(guard) => guard,
+                TryRecorderInstanceLock::Busy => panic!("test recorder lock was unexpectedly busy"),
+            };
         let mut transport = CompleteRemoteSyncTransport::default();
 
         let outcome = execute_remote_sync_at_state_root(
@@ -8689,13 +8662,10 @@ mod tests {
             paired.host("dev").unwrap().redact_content(),
         )
         .unwrap();
-        let status_path = default_status_file(runtime.legacy_history().history_root().unwrap());
+        let status_path = default_status_file(runtime.history_root());
         write_recorder_status(
             &status_path,
-            &RecorderStatusFile::started(
-                Utc::now(),
-                runtime.legacy_history().namespace().to_owned(),
-            ),
+            &RecorderStatusFile::started(Utc::now(), runtime.namespace().to_owned()),
         )
         .unwrap();
         assert!(matches!(
@@ -8731,7 +8701,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_remote_sync_does_not_open_ssh_when_local_migration_fails() {
+    fn manual_remote_sync_does_not_open_ssh_when_local_initialization_fails() {
         let directory = tempfile::tempdir().unwrap();
         let (store, paired) = paired_disabled_remote_config(directory.path());
         let collect_config = CollectConfig {
@@ -8746,7 +8716,33 @@ mod tests {
             paired.host("dev").unwrap().redact_content(),
         )
         .unwrap();
-        fs::write(runtime.source_history().layout_root(), b"not a directory").unwrap();
+        let quota_directory = runtime.history_root().join(runtime.namespace());
+        fs::create_dir_all(&quota_directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for directory in [runtime.history_root(), quota_directory.as_path()] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let quota_path = quota_directory.join("2026-08-30.json");
+        let old_input = serde_json::to_vec(&serde_json::json!({
+            "formatVersion": 2,
+            "namespace": "different-namespace",
+            "utcDay": "2026-08-30",
+            "quotaPoints": [],
+            "halfHourBuckets": "obsolete usage shape must not be decoded",
+            "weeklyLocalPoints": {"obsolete": "usage shape"},
+        }))
+        .unwrap();
+        fs::write(&quota_path, &old_input).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&quota_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         drop(runtime);
 
         let error = execute_remote_sync_at_state_root(
@@ -8759,8 +8755,19 @@ mod tests {
         .unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains("could not migrate local history"));
-        assert!(message.contains("no SSH connection was opened"));
+        assert!(
+            message.contains("could not initialize local SQLite history"),
+            "{message}"
+        );
+        assert!(
+            message.contains("retained v1 quota namespace mismatch"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no SSH connection was opened"),
+            "{message}"
+        );
+        assert_eq!(fs::read(quota_path).unwrap(), old_input);
     }
 
     #[test]
@@ -9607,7 +9614,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_remote_source_projection_keeps_global_quota_without_local_usage() {
+    fn memory_remote_source_projection_keeps_global_quota_without_local_usage() {
         let observation =
             report_history_collection_result(Provenance::ServerSnapshot).history_observation;
         let history = HistoryData {
@@ -9619,18 +9626,18 @@ mod tests {
             ..HistoryData::default()
         };
         let local =
-            legacy_history_for_source_selector(history.clone(), &HistorySourceSelector::Local);
+            memory_history_for_source_selector(history.clone(), &HistorySourceSelector::Local);
         assert_eq!(local, history);
 
         let source_id = "node-0123456789abcdef0123456789abcdef".parse().unwrap();
         let remote =
-            legacy_history_for_source_selector(history, &HistorySourceSelector::Remote(source_id));
+            memory_history_for_source_selector(history, &HistorySourceSelector::Remote(source_id));
         assert_eq!(remote.quota_points.len(), 1);
         assert!(remote.half_hour_buckets.is_empty());
         assert!(remote.weekly_local_points.is_empty());
         assert!(remote.read_only);
         assert!(remote.warnings.iter().any(|warning| {
-            warning.starts_with("source_selection_unavailable:unsupported_by_legacy:")
+            warning.starts_with("source_selection_unavailable:unavailable_in_memory_view:")
         }));
     }
 
@@ -9816,7 +9823,7 @@ mod tests {
     }
 
     #[test]
-    fn report_history_defers_cutover_while_a_cooperating_recorder_owns_the_state() {
+    fn report_history_defers_sqlite_initialization_while_a_recorder_owns_the_state() {
         let temp = tempfile::tempdir().unwrap();
         let history_root = temp.path().join("state/history-v1");
         let codex_home = temp.path().join("codex");
@@ -9846,7 +9853,7 @@ mod tests {
         assert_eq!(manifest.state(), HistoryOwnershipState::V1Active);
         assert_eq!(history.half_hour_buckets.len(), 1);
         assert!(history.warnings.iter().any(|warning| {
-            warning.contains("source-aware history cutover deferred while another recorder")
+            warning.contains("SQLite history initialization deferred while another recorder")
         }));
     }
 
@@ -9892,9 +9899,11 @@ mod tests {
             ..CollectConfig::default()
         };
         let result = report_history_collection_result(Provenance::ServerSnapshot);
-        let hidden_v1_shard = HistoryStore::new(history_root.clone(), &codex_home)
-            .namespace_dir()
-            .unwrap()
+        let namespace = HistoryStore::memory_only(&codex_home, false)
+            .namespace()
+            .to_owned();
+        let hidden_v1_shard = history_root
+            .join(namespace)
             .join(format!("{}.json", result.snapshot.as_of.date_naive()));
 
         let (_, history) = collect_and_load_report_history(&config, &result, Some(history_root));
@@ -9919,7 +9928,7 @@ mod tests {
         let status_path = default_status_file(&history_root);
         let mut previous = RecorderStatusFile::started_with_interval(
             Utc::now(),
-            runtime.legacy_history().namespace().to_owned(),
+            runtime.namespace().to_owned(),
             600,
         );
         previous.bind_source_aware_v2(active.epoch()).unwrap();
@@ -9973,7 +9982,7 @@ mod tests {
         let custom_path = temp.path().join("custom-recorder-status.json");
         let mut legacy = RecorderStatusFile::started_with_interval(
             Utc::now(),
-            runtime.legacy_history().namespace().to_owned(),
+            runtime.namespace().to_owned(),
             600,
         );
         legacy.record_success(Utc::now());
@@ -10006,8 +10015,8 @@ mod tests {
         };
         fs::create_dir_all(&config.codex_home).unwrap();
         let result = report_history_collection_result(Provenance::ServerSnapshot);
-        let probe = HistoryStore::new(history_root.clone(), &config.codex_home);
-        let namespace_dir = probe.namespace_dir().unwrap().to_path_buf();
+        let probe = HistoryStore::memory_only(&config.codex_home, false);
+        let namespace_dir = history_root.join(probe.namespace());
         std::fs::create_dir_all(&namespace_dir).unwrap();
         let shard_path = namespace_dir.join(format!("{}.json", result.snapshot.as_of.date_naive()));
         let future = serde_json::to_vec(&serde_json::json!({
@@ -10020,20 +10029,14 @@ mod tests {
         let (store, history) =
             collect_and_load_report_history(&config, &result, Some(history_root));
 
-        assert!(matches!(
-            store,
-            ReportHistoryStore::LegacyFallback {
-                writable: false,
-                ..
-            }
-        ));
+        assert!(matches!(store, ReportHistoryStore::MemoryFallback { .. }));
         assert!(history.read_only);
         assert!(
             history
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("read-only memory view")
-                    && warning.contains("legacy history root must end in history-v1"))
+                    && warning.contains("staging history root must end in history-v1"))
         );
         assert_eq!(
             history.quota_points,
@@ -10051,7 +10054,7 @@ mod tests {
     }
 
     #[test]
-    fn report_history_with_damaged_or_missing_ownership_excludes_persisted_v1_backup() {
+    fn report_history_with_damaged_or_missing_ownership_keeps_only_read_only_memory() {
         for missing in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let history_root = temp.path().join("state/history-v1");
@@ -10069,16 +10072,19 @@ mod tests {
             bucket.token_usage.total_tokens = 999;
             previous.quota_points.clear();
             previous.weekly_local_points.clear();
-            let mut legacy = HistoryStore::new(history_root.clone(), &config.codex_home);
-            legacy.record(&previous).unwrap();
-            let shard = legacy.namespace_dir().unwrap().join(format!(
+            let mut runtime =
+                HistoryRuntime::new(history_root.clone(), &config.codex_home, false).unwrap();
+            runtime.ensure_v2_active().unwrap();
+            let namespace = HistoryStore::memory_only(&config.codex_home, false)
+                .namespace()
+                .to_owned();
+            let shard = history_root.join(namespace).join(format!(
                 "{}.json",
                 previous.half_hour_buckets[0].starts_at.date_naive()
             ));
+            fs::create_dir_all(shard.parent().unwrap()).unwrap();
+            fs::write(&shard, b"inert old history backup").unwrap();
             let before = fs::read(&shard).unwrap();
-            let runtime =
-                HistoryRuntime::new(history_root.clone(), &config.codex_home, false).unwrap();
-            runtime.ensure_ownership_initialized().unwrap();
             let manifest = runtime.ownership().manifest_path();
             drop(runtime);
             if missing {
@@ -10088,13 +10094,7 @@ mod tests {
             }
             let (store, history) =
                 collect_and_load_report_history(&config, &result, Some(history_root));
-            assert!(matches!(
-                store,
-                ReportHistoryStore::LegacyFallback {
-                    writable: false,
-                    ..
-                }
-            ));
+            assert!(matches!(store, ReportHistoryStore::MemoryFallback { .. }));
             assert!(history.read_only);
             assert_eq!(
                 history.half_hour_buckets,
@@ -10131,22 +10131,17 @@ mod tests {
             ..CollectConfig::default()
         };
         let result = report_history_collection_result(Provenance::ServerSnapshot);
-        let legacy_probe = HistoryStore::new(history_root.clone(), &codex_home);
-        let hidden_v1_shard = legacy_probe
-            .namespace_dir()
-            .unwrap()
+        let namespace = HistoryStore::memory_only(&codex_home, false)
+            .namespace()
+            .to_owned();
+        let hidden_v1_shard = history_root
+            .join(namespace)
             .join(format!("{}.json", result.snapshot.as_of.date_naive()));
 
         let (store, history) =
             collect_and_load_report_history(&config, &result, Some(history_root));
 
-        assert!(matches!(
-            store,
-            ReportHistoryStore::LegacyFallback {
-                writable: false,
-                ..
-            }
-        ));
+        assert!(matches!(store, ReportHistoryStore::MemoryFallback { .. }));
         assert!(!hidden_v1_shard.exists());
         assert_eq!(history.half_hour_buckets.len(), 1);
         assert!(history.warnings.iter().any(|warning| {

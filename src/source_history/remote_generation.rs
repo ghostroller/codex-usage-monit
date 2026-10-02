@@ -5,23 +5,17 @@
 //! multi-page bootstrap can never expose a half-populated replacement or keep
 //! stale rows from the preceding generation alive after activation.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use sha2::{Digest, Sha256};
 
-use super::remote_quota::{MAX_REMOTE_QUOTA_BYTES, REMOTE_QUOTA_FILE, apply_remote_quota};
-use super::session_evidence::{
-    DIGESTS_DIRECTORY, DIGESTS_LOCK_FILE, MAX_COMPRESSED_EVIDENCE_SHARD_BYTES,
-    validate_digest_shard_for_remote_clone,
-};
+use super::remote_quota::{REMOTE_QUOTA_FILE, apply_remote_quota};
+use super::session_evidence::DIGESTS_DIRECTORY;
 use super::*;
 use crate::remote_protocol::{ModelCatalogFingerprint, ProtocolRevisions, SourceGeneration};
 use crate::remote_quota::RemoteQuotaChange;
@@ -30,23 +24,14 @@ const REMOTE_HISTORY_DIRECTORY: &str = "remote-history-v1";
 const REMOTE_GENERATIONS_DIRECTORY: &str = "generations";
 const REMOTE_GENERATION_METADATA_FILE: &str = "generation.json";
 const REMOTE_ACTIVE_MANIFEST_FILE: &str = "active.json";
-const REMOTE_HISTORY_LOCK_FILE: &str = "remote-history.lock";
-const REMOTE_GC_TRASH_DIRECTORY: &str = "gc-trash";
-const REMOTE_GC_TRASH_PREFIX: &str = "retired-";
-const REMOTE_GC_TRASH_SUFFIX: &str = ".trash";
+const REMOTE_PUBLICATION_REVISION_FILE: &str = "remote-publication-revision.json";
+const MAX_REMOTE_GENERATION_FILE_BYTES: u64 = 64 * 1024;
 const REMOTE_GENERATION_FORMAT_VERSION: u32 = 3;
 const REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION: u32 = 2;
-const MAX_REMOTE_GENERATION_FILE_BYTES: u64 = 64 * 1024;
 const MAX_REMOTE_BINDING_BYTES: u64 = 4 * 1024;
-const MAX_REMOTE_COW_FINGERPRINT_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_REMOTE_CLONE_SHARDS_PER_FAMILY: usize = 64;
-const MAX_REMOTE_CLONE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_REMOTE_HISTORY_GENERATIONS: usize = 32;
 const REMOTE_GENERATION_PREFIX: &str = "ingest-gen-";
 const REMOTE_GENERATION_HEX_LEN: usize = 32;
-const REMOTE_PAGE_FINGERPRINT_PREFIX: &str = "remote-page-sha256-v1-";
-const MAX_REMOTE_GC_TREE_ENTRIES: u64 = 256;
-const MAX_REMOTE_GC_TREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Opaque, path-safe center-owned identity for one SSH history generation.
 ///
@@ -267,7 +252,6 @@ pub struct RemoteHistoryPageWriteReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteHistoryGenerationGcOutcome {
     Deleted,
-    RecoveredTrash,
     SkippedActive,
     SkippedProtected,
     NotFound,
@@ -276,14 +260,12 @@ pub enum RemoteHistoryGenerationGcOutcome {
 /// Observable result of one bounded tracing sweep.
 ///
 /// `deleted` counts generations moved out of the live namespace and fully
-/// removed in this call. `recovered` counts deterministic trash trees left by
-/// an interrupted earlier deletion and completed in this call. `skipped`
-/// counts active or caller-protected roots, while `remaining` counts otherwise
+/// removed in this call. `skipped` counts active or caller-protected roots,
+/// while `remaining` counts otherwise
 /// collectible entries deferred solely by `max_work`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemoteHistoryGenerationSweepReport {
     pub deleted: usize,
-    pub recovered: usize,
     pub skipped: usize,
     pub remaining: usize,
 }
@@ -297,8 +279,6 @@ struct RemoteGenerationMetadata {
     redaction_profile: RedactionProfile,
     generation: SourceHistoryRemoteGenerationId,
     binding: SourceHistoryRemoteBinding,
-    origin: RemoteGenerationOrigin,
-    clone_complete: bool,
 }
 
 impl RemoteGenerationMetadata {
@@ -316,32 +296,6 @@ impl RemoteGenerationMetadata {
             redaction_profile,
             generation,
             binding,
-            origin: RemoteGenerationOrigin::Bootstrap,
-            clone_complete: true,
-        }
-    }
-
-    fn active_replacement(
-        profile_id: HistoryProfileId,
-        source_id: NodeId,
-        redaction_profile: RedactionProfile,
-        generation: SourceHistoryRemoteGenerationId,
-        binding: SourceHistoryRemoteBinding,
-        expected_active_generation: SourceHistoryRemoteGenerationId,
-        page_fingerprint: String,
-    ) -> Self {
-        Self {
-            format_version: REMOTE_GENERATION_FORMAT_VERSION,
-            profile_id,
-            source_id,
-            redaction_profile,
-            generation,
-            binding,
-            origin: RemoteGenerationOrigin::ActiveReplacement {
-                expected_active_generation,
-                page_fingerprint,
-            },
-            clone_complete: false,
         }
     }
 
@@ -354,7 +308,6 @@ impl RemoteGenerationMetadata {
     ) -> io::Result<()> {
         self.generation.validate()?;
         self.binding.validate_namespace(source_id)?;
-        self.origin.validate()?;
         if self.format_version != REMOTE_GENERATION_FORMAT_VERSION
             || &self.profile_id != profile_id
             || &self.source_id != source_id
@@ -363,11 +316,6 @@ impl RemoteGenerationMetadata {
         {
             return Err(invalid_data(
                 "remote history generation metadata does not match its namespace",
-            ));
-        }
-        if matches!(self.origin, RemoteGenerationOrigin::Bootstrap) && !self.clone_complete {
-            return Err(invalid_data(
-                "bootstrap remote history generation must be ready",
             ));
         }
         Ok(())
@@ -381,37 +329,7 @@ impl RemoteGenerationMetadata {
         generation: &SourceHistoryRemoteGenerationId,
     ) -> io::Result<()> {
         self.validate(profile_id, source_id, redaction_profile, generation)?;
-        if !self.clone_complete {
-            return Err(invalid_data(
-                "remote history generation baseline clone is incomplete",
-            ));
-        }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum RemoteGenerationOrigin {
-    Bootstrap,
-    ActiveReplacement {
-        expected_active_generation: SourceHistoryRemoteGenerationId,
-        page_fingerprint: String,
-    },
-}
-
-impl RemoteGenerationOrigin {
-    fn validate(&self) -> io::Result<()> {
-        match self {
-            Self::Bootstrap => Ok(()),
-            Self::ActiveReplacement {
-                expected_active_generation,
-                page_fingerprint,
-            } => {
-                expected_active_generation.validate()?;
-                validate_page_fingerprint(page_fingerprint)
-            }
-        }
     }
 }
 
@@ -433,16 +351,6 @@ struct RemoteActiveManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SqliteRemoteGeneration {
     metadata: RemoteGenerationMetadata,
-    data_generation: SourceHistoryRemoteGenerationId,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SqliteRemoteImportMarker {
-    format_version: u32,
-    profile_id: HistoryProfileId,
-    source_id: NodeId,
-    redaction_profile: RedactionProfile,
 }
 
 impl RemoteActiveManifest {
@@ -468,181 +376,47 @@ impl RemoteActiveManifest {
 }
 
 impl SourceHistoryStore {
-    /// Imports complete visible and staging streams plus their exact logical
-    /// generation identities. Incomplete legacy COW clones remain invisible;
-    /// their durable ingest page is replayed from the imported active stream.
-    pub(crate) fn import_legacy_remote_sqlite_state(
+    /// Revision of query-visible remote publication in the caller's SQL snapshot.
+    /// Incremental pages retain their generation identity, so it cannot be used
+    /// alone to decide whether a cached projection is still current.
+    pub(crate) fn load_remote_history_projection_revision(
         &self,
-        legacy: &SourceHistoryStore,
-    ) -> io::Result<()> {
-        let database = self
-            .sqlite_database()
-            .ok_or_else(|| invalid_data("remote import requires SQL history"))?;
-        if self.profile_id() != legacy.profile_id() {
-            return Err(invalid_data("remote SQL import profile mismatch"));
+        source: &NodeId,
+        redaction: RedactionProfile,
+    ) -> io::Result<u64> {
+        let database = self.sqlite_database().expect("SQLite history backend");
+        if !database.exists()? {
+            return Ok(0);
         }
-        database.write(|connection| {
-            for source in legacy.list_source_metadata()? {
-                if source.kind() != SourceKind::Ssh {
-                    continue;
-                }
-                let source_id = source.source_id();
-                for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
-                    // The retained files are a backup after the first import.
-                    // Re-entering migration for another privacy mode must not
-                    // overwrite a stream that SQL has already advanced/purged.
-                    let import_key = format!(
-                        "remote-history-import/{}/{}/{}",
-                        self.profile_id.as_str(),
-                        redaction.directory_name(),
-                        source_id.as_str()
-                    );
-                    if let Some(marker) =
-                        database::state::<SqliteRemoteImportMarker>(connection, &import_key)?
-                    {
-                        if marker.format_version != 1
-                            || marker.profile_id != self.profile_id
-                            || marker.source_id != *source_id
-                            || marker.redaction_profile != redaction
-                        {
-                            return Err(invalid_data("remote SQL import marker mismatch"));
-                        }
-                        continue;
-                    }
-                    let history_prefix = format!(
-                        "{}/",
-                        database.namespace(&self.source_remote_history_directory(source_id, redaction))?
-                    );
-                    let live_key = database.namespace(&self.remote_live_path(source_id, redaction))?;
-                    let existing: bool = connection.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM history_state WHERE state_key=?1 OR substr(state_key,1,length(?2))=?2 UNION ALL SELECT 1 FROM history_records WHERE substr(namespace,1,length(?2))=?2)",
-                        rusqlite::params![live_key, history_prefix],
-                        |row| row.get(0),
-                    ).map_err(database::sql_error)?;
-                    if existing {
-                        return Err(invalid_data("remote SQL namespace exists without an import marker"));
-                    }
-                    self.import_legacy_remote_live_sqlite(legacy, source_id, redaction)?;
-                    let root = legacy.source_remote_history_directory(source_id, redaction);
-                    if !legacy.private_directory_exists(&root)? {
-                        database::set_state(connection, &import_key, &SqliteRemoteImportMarker {
-                            format_version: 1,
-                            profile_id: self.profile_id.clone(),
-                            source_id: source_id.clone(),
-                            redaction_profile: redaction,
-                        })?;
-                        continue;
-                    }
-                    let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-                    let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-                    let catalog = load_remote_history_generation_catalog_locked(
-                        legacy, source_id, redaction, &root, true,
-                    )?;
-                    for (generation, directory) in catalog.generations {
-                        let metadata = legacy.read_remote_generation_metadata_locked(
-                            source_id,
-                            redaction,
-                            &generation,
-                        )?;
-                        metadata.validate(
-                            legacy.profile_id(),
-                            source_id,
-                            redaction,
-                            &generation,
-                        )?;
-                        if !metadata.clone_complete {
-                            continue;
-                        }
-                        let target_directory = self.source_remote_history_generation_directory(
-                            source_id,
-                            redaction,
-                            &generation,
-                        );
-                        let mut budget = SourceHistoryReadBudget::with_limits(
-                            MAX_REMOTE_CLONE_TOTAL_BYTES,
-                            usize::MAX,
-                            usize::MAX,
-                        );
-                        let buckets = legacy
-                            .load_source_bucket_records_from_directory_with_budget(
-                                source_id,
-                                redaction,
-                                DateTime::<Utc>::MIN_UTC,
-                                &directory.join(BUCKETS_DIRECTORY),
-                                &mut budget,
-                            )?;
-                        let digests = legacy
-                            .load_source_session_digest_records_from_directory_with_budget(
-                                source_id,
-                                redaction,
-                                DateTime::<Utc>::MIN_UTC,
-                                &directory.join(DIGESTS_DIRECTORY),
-                                &mut budget,
-                            )?;
-                        self.record_source_bucket_changes_in_directory_unfenced(
-                            source_id,
-                            redaction,
-                            &target_directory.join(BUCKETS_DIRECTORY),
-                            &buckets,
-                        )?;
-                        self.record_source_session_digest_changes_in_directory_unfenced(
-                            source_id,
-                            redaction,
-                            &target_directory.join(DIGESTS_DIRECTORY),
-                            &digests,
-                        )?;
-                        self.import_legacy_remote_quota_sqlite(
-                            legacy,
-                            source_id,
-                            redaction,
-                            &directory,
-                            &target_directory,
-                        )?;
-                        let value = SqliteRemoteGeneration {
-                            metadata,
-                            data_generation: generation.clone(),
-                        };
-                        database::set_state(
-                            connection,
-                            &self.sqlite_remote_generation_key(
-                                &database,
-                                source_id,
-                                redaction,
-                                &generation,
-                            )?,
-                            &value,
-                        )?;
-                    }
-                    if let Some(active) =
-                        legacy.read_remote_active_manifest_locked(source_id, redaction, &root)?
-                    {
-                        legacy.validate_remote_generation_binding_locked(
-                            source_id,
-                            redaction,
-                            &active.active_generation,
-                            &active.binding,
-                        )?;
-                        database::set_state(
-                            connection,
-                            &database.namespace(
-                                &self
-                                    .source_remote_history_directory(source_id, redaction)
-                                    .join(REMOTE_ACTIVE_MANIFEST_FILE),
-                            )?,
-                            &active,
-                        )?;
-                        self.sqlite_remote_active(connection, &database, source_id, redaction)?;
-                    }
-                    database::set_state(connection, &import_key, &SqliteRemoteImportMarker {
-                        format_version: 1,
-                        profile_id: self.profile_id.clone(),
-                        source_id: source_id.clone(),
-                        redaction_profile: redaction,
-                    })?;
-                }
-            }
-            crate::remote_ingest_state::import_legacy_remote_ingest_sqlite_state(self, legacy)
+        database.read(|connection| {
+            let key = database.namespace(
+                &self
+                    .source_directory(source)
+                    .join(redaction.directory_name())
+                    .join(REMOTE_PUBLICATION_REVISION_FILE),
+            )?;
+            Ok(database::state::<u64>(connection, &key)?.unwrap_or(0))
         })
+    }
+
+    pub(super) fn advance_remote_history_projection_revision(
+        &self,
+        connection: &rusqlite::Connection,
+        source: &NodeId,
+        redaction: RedactionProfile,
+    ) -> io::Result<()> {
+        let database = self.sqlite_database().expect("SQLite history backend");
+        let key = database.namespace(
+            &self
+                .source_directory(source)
+                .join(redaction.directory_name())
+                .join(REMOTE_PUBLICATION_REVISION_FILE),
+        )?;
+        let next = database::state::<u64>(connection, &key)?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("remote publication revision overflow"))?;
+        database::set_state(connection, &key, &next)
     }
 
     fn sqlite_remote_generation_key(
@@ -706,7 +480,7 @@ impl SourceHistoryStore {
         value
             .metadata
             .validate_ready(&self.profile_id, source, redaction, generation)?;
-        value.data_generation.validate()?;
+        value.metadata.generation.validate()?;
         Ok(value)
     }
 
@@ -757,7 +531,7 @@ impl SourceHistoryStore {
                 redaction,
                 &value.metadata.generation,
             )?;
-            value.data_generation.validate()?;
+            value.metadata.generation.validate()?;
             if *key
                 != self.sqlite_remote_generation_key(
                     database,
@@ -800,7 +574,11 @@ impl SourceHistoryStore {
         redaction: RedactionProfile,
         value: &SqliteRemoteGeneration,
     ) -> PathBuf {
-        self.source_remote_history_generation_directory(source, redaction, &value.data_generation)
+        self.source_remote_history_generation_directory(
+            source,
+            redaction,
+            &value.metadata.generation,
+        )
     }
 
     fn sqlite_ensure_remote_generation(
@@ -825,14 +603,12 @@ impl SourceHistoryStore {
                     redaction,
                     generation,
                 )?;
-                if existing.metadata.origin != RemoteGenerationOrigin::Bootstrap
-                    || &existing.metadata.binding != binding
-                {
+                if &existing.metadata.binding != binding {
                     return Err(invalid_data(
                         "remote SQL generation is bound to another bootstrap",
                     ));
                 }
-                existing.data_generation.validate()?;
+                existing.metadata.generation.validate()?;
                 return Ok(());
             }
             let value = SqliteRemoteGeneration {
@@ -843,7 +619,6 @@ impl SourceHistoryStore {
                     generation.clone(),
                     binding.clone(),
                 ),
-                data_generation: generation.clone(),
             };
             database::set_state(connection, &key, &value)
         })
@@ -909,23 +684,16 @@ impl SourceHistoryStore {
         source: &NodeId,
         redaction: RedactionProfile,
         expected: &SourceHistoryRemoteActiveRef,
-        replacement: &SourceHistoryRemoteGenerationId,
         binding: &SourceHistoryRemoteBinding,
         buckets: &[SourceBucketRecord],
         digests: &[SourceSessionDigestRecord],
         activated_at: DateTime<Utc>,
         quotas: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
-        let database = self
-            .sqlite_database()
-            .expect("SQL dispatch requires a database");
-        let origin = RemoteGenerationOrigin::ActiveReplacement {
-            expected_active_generation: expected.generation().clone(),
-            page_fingerprint: remote_page_fingerprint(buckets, digests, quotas)?,
-        };
+        let database = self.sqlite_database().expect("SQLite history backend");
         database.write(|connection| {
             require_ssh_source(&self.load_source_metadata(source)?)?;
-            let active = self
+            let mut active = self
                 .sqlite_remote_active(connection, &database, source, redaction)?
                 .ok_or_else(|| {
                     io::Error::new(
@@ -933,53 +701,29 @@ impl SourceHistoryStore {
                         "remote SQL active generation is missing",
                     )
                 })?;
-            let actual =
-                SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)?;
-            if actual.generation() == replacement && actual.binding() == binding {
-                let value = self.sqlite_remote_generation(
-                    connection,
-                    &database,
-                    source,
-                    redaction,
-                    replacement,
-                )?;
-                if value.metadata.origin != origin {
-                    return Err(invalid_data(
-                        "remote SQL replacement ID was reused for a different page",
-                    ));
-                }
-                return Ok(RemoteHistoryPageWriteReport::default());
-            }
+            let actual = SourceHistoryRemoteActiveRef::new(
+                active.active_generation.clone(),
+                active.binding.clone(),
+            )?;
             if &actual != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "remote SQL active generation changed before apply",
                 ));
             }
-            self.sqlite_remote_capacity(connection, &database, source, redaction, replacement)?;
-            let previous = self.sqlite_remote_generation(
+            if actual.binding() != binding {
+                return Err(invalid_data(
+                    "remote active page binding differs from its generation",
+                ));
+            }
+            let generation = self.sqlite_remote_generation(
                 connection,
                 &database,
                 source,
                 redaction,
                 expected.generation(),
             )?;
-            let key =
-                self.sqlite_remote_generation_key(&database, source, redaction, replacement)?;
-            if let Some(existing) = database::state::<SqliteRemoteGeneration>(connection, &key)? {
-                existing.metadata.validate_ready(
-                    &self.profile_id,
-                    source,
-                    redaction,
-                    replacement,
-                )?;
-                if existing.metadata.origin != origin || &existing.metadata.binding != binding {
-                    return Err(invalid_data(
-                        "remote SQL replacement is bound to another page",
-                    ));
-                }
-            }
-            let directory = self.sqlite_remote_data_directory(source, redaction, &previous);
+            let directory = self.sqlite_remote_data_directory(source, redaction, &generation);
             let bucket_history = self.record_source_bucket_changes_in_directory_unfenced(
                 source,
                 redaction,
@@ -992,30 +736,14 @@ impl SourceHistoryStore {
                 &directory.join(DIGESTS_DIRECTORY),
                 digests,
             )?;
-            apply_remote_quota(self, source, redaction, &directory, quotas)?;
-            let value = SqliteRemoteGeneration {
-                metadata: RemoteGenerationMetadata {
-                    format_version: REMOTE_GENERATION_FORMAT_VERSION,
-                    profile_id: self.profile_id.clone(),
-                    source_id: source.clone(),
-                    redaction_profile: redaction,
-                    generation: replacement.clone(),
-                    binding: binding.clone(),
-                    origin,
-                    clone_complete: true,
-                },
-                data_generation: previous.data_generation,
-            };
-            database::set_state(connection, &key, &value)?;
-            let manifest = RemoteActiveManifest {
-                format_version: REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION,
-                profile_id: self.profile_id.clone(),
-                source_id: source.clone(),
-                redaction_profile: redaction,
-                active_generation: replacement.clone(),
-                binding: binding.clone(),
-                activated_at,
-            };
+            let quota_changed = apply_remote_quota(self, source, redaction, &directory, quotas)?;
+            if bucket_history.shards_written > 0
+                || session_digests.shards_written > 0
+                || quota_changed
+            {
+                self.advance_remote_history_projection_revision(connection, source, redaction)?;
+            }
+            active.activated_at = activated_at;
             database::set_state(
                 connection,
                 &database.namespace(
@@ -1023,7 +751,7 @@ impl SourceHistoryStore {
                         .source_remote_history_directory(source, redaction)
                         .join(REMOTE_ACTIVE_MANIFEST_FILE),
                 )?,
-                &manifest,
+                &active,
             )?;
             Ok(RemoteHistoryPageWriteReport {
                 bucket_history,
@@ -1048,9 +776,7 @@ impl SourceHistoryStore {
             require_ssh_source(&self.load_source_metadata(source)?)?;
             let value =
                 self.sqlite_remote_generation(connection, &database, source, redaction, candidate)?;
-            if &value.metadata.binding != binding
-                || value.metadata.origin != RemoteGenerationOrigin::Bootstrap
-            {
+            if &value.metadata.binding != binding {
                 return Err(invalid_data(
                     "remote SQL bootstrap generation binding mismatch",
                 ));
@@ -1091,7 +817,8 @@ impl SourceHistoryStore {
                         .join(REMOTE_ACTIVE_MANIFEST_FILE),
                 )?,
                 &manifest,
-            )
+            )?;
+            self.advance_remote_history_projection_revision(connection, source, redaction)
         })
     }
 
@@ -1123,12 +850,12 @@ impl SourceHistoryStore {
             value
                 .metadata
                 .validate_ready(&self.profile_id, source, redaction, candidate)?;
-            value.data_generation.validate()?;
+            value.metadata.generation.validate()?;
             database::delete_state(connection, &key)?;
             let still_referenced = self
                 .sqlite_remote_catalog(connection, &database, source, redaction)?
                 .iter()
-                .any(|(_, retained)| retained.data_generation == value.data_generation);
+                .any(|(_, retained)| retained.metadata.generation == value.metadata.generation);
             if !still_referenced {
                 let directory = self.sqlite_remote_data_directory(source, redaction, &value);
                 for family in [BUCKETS_DIRECTORY, DIGESTS_DIRECTORY] {
@@ -1173,7 +900,7 @@ impl SourceHistoryStore {
 
     /// Returns the active SSH history generation, if one has been activated.
     /// A corrupt or mismatched manifest fails closed instead of falling back to
-    /// a legacy/direct namespace.
+    /// an unactivated direct namespace.
     pub fn active_remote_history_generation(
         &self,
         source_id: &NodeId,
@@ -1189,39 +916,16 @@ impl SourceHistoryStore {
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
     ) -> io::Result<Option<SourceHistoryRemoteActiveRef>> {
-        if let Some(database) = self.sqlite_database() {
-            return database.read(|connection| {
-                require_ssh_source(&self.load_source_metadata(source_id)?)?;
-                self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?
-                    .map(|active| {
-                        SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)
-                    })
-                    .transpose()
-            });
-        }
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Ok(None);
-        }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        let Some(manifest) =
-            self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
-        else {
-            return Ok(None);
-        };
-        self.validate_remote_generation_binding_locked(
-            source_id,
-            redaction_profile,
-            &manifest.active_generation,
-            &manifest.binding,
-        )?;
-        Ok(Some(SourceHistoryRemoteActiveRef {
-            generation: manifest.active_generation,
-            binding: manifest.binding,
-        }))
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        database.read(|connection| {
+            require_ssh_source(&self.load_source_metadata(source_id)?)?;
+            self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?
+                .map(|active| {
+                    SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)
+                })
+                .transpose()
+        })
     }
 
     /// Loads both revisioned history families from one active SSH generation.
@@ -1288,89 +992,44 @@ impl SourceHistoryStore {
         between_families: impl FnOnce(),
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
-        if let Some(database) = self.sqlite_database() {
-            return database.read(|_| {
-                self.with_source_metadata_shared(source_id, |source| {
-                    require_ssh_source(source)?;
-                    self.with_active_remote_history_generation(
-                        source_id,
-                        redaction_profile,
-                        |directory| {
-                            let Some(directory) = directory else {
-                                return Ok(SourceHistoryRemoteSnapshot::default());
-                            };
-                            let active_ref =
-                                self.active_remote_history_ref(source_id, redaction_profile)?;
-                            let bucket_records = self
-                                .load_source_bucket_records_from_directory_with_budget(
-                                    source_id,
-                                    redaction_profile,
-                                    since,
-                                    &directory.join(BUCKETS_DIRECTORY),
-                                    budget,
-                                )?;
-                            between_families();
-                            let session_digest_records = self
-                                .load_source_session_digest_records_from_directory_with_budget(
-                                    source_id,
-                                    redaction_profile,
-                                    since,
-                                    &directory.join(DIGESTS_DIRECTORY),
-                                    budget,
-                                )?;
-                            Ok(SourceHistoryRemoteSnapshot {
-                                active_ref,
-                                bucket_records,
-                                session_digest_records,
-                            })
-                        },
-                    )
-                })
-            });
-        }
-        self.with_source_metadata_shared(source_id, |source| {
-            require_ssh_source(source)?;
-            let root = self.source_remote_history_directory(source_id, redaction_profile);
-            if !self.private_directory_exists(&root)? {
-                return Ok(SourceHistoryRemoteSnapshot::default());
-            }
-            let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-            let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-            let Some(manifest) =
-                self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
-            else {
-                return Ok(SourceHistoryRemoteSnapshot::default());
-            };
-            let generation_directory = self.validate_remote_generation_binding_locked(
-                source_id,
-                redaction_profile,
-                &manifest.active_generation,
-                &manifest.binding,
-            )?;
-            let active_ref = SourceHistoryRemoteActiveRef {
-                generation: manifest.active_generation,
-                binding: manifest.binding,
-            };
-            let bucket_records = self.load_source_bucket_records_from_directory_with_budget(
-                source_id,
-                redaction_profile,
-                since,
-                &generation_directory.join(BUCKETS_DIRECTORY),
-                budget,
-            )?;
-            between_families();
-            let session_digest_records = self
-                .load_source_session_digest_records_from_directory_with_budget(
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        database.read(|_| {
+            self.with_source_metadata_shared(source_id, |source| {
+                require_ssh_source(source)?;
+                self.with_active_remote_history_generation(
                     source_id,
                     redaction_profile,
-                    since,
-                    &generation_directory.join(DIGESTS_DIRECTORY),
-                    budget,
-                )?;
-            Ok(SourceHistoryRemoteSnapshot {
-                active_ref: Some(active_ref),
-                bucket_records,
-                session_digest_records,
+                    |directory| {
+                        let Some(directory) = directory else {
+                            return Ok(SourceHistoryRemoteSnapshot::default());
+                        };
+                        let active_ref =
+                            self.active_remote_history_ref(source_id, redaction_profile)?;
+                        let bucket_records = self
+                            .load_source_bucket_records_from_directory_with_budget(
+                                source_id,
+                                redaction_profile,
+                                since,
+                                &directory.join(BUCKETS_DIRECTORY),
+                                budget,
+                            )?;
+                        between_families();
+                        let session_digest_records = self
+                            .load_source_session_digest_records_from_directory_with_budget(
+                                source_id,
+                                redaction_profile,
+                                since,
+                                &directory.join(DIGESTS_DIRECTORY),
+                                budget,
+                            )?;
+                        Ok(SourceHistoryRemoteSnapshot {
+                            active_ref,
+                            bucket_records,
+                            session_digest_records,
+                        })
+                    },
+                )
             })
         })
     }
@@ -1381,50 +1040,26 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         operation: impl FnOnce(Option<&Path>) -> io::Result<T>,
     ) -> io::Result<T> {
-        if let Some(database) = self.sqlite_database() {
-            return database.read(|connection| {
-                let directory = self
-                    .sqlite_remote_active(connection, &database, source_id, redaction_profile)?
-                    .map(|active| {
-                        self.sqlite_remote_generation(
-                            connection,
-                            &database,
-                            source_id,
-                            redaction_profile,
-                            &active.active_generation,
-                        )
-                        .map(|generation| {
-                            self.sqlite_remote_data_directory(
-                                source_id,
-                                redaction_profile,
-                                &generation,
-                            )
-                        })
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        database.read(|connection| {
+            let directory = self
+                .sqlite_remote_active(connection, &database, source_id, redaction_profile)?
+                .map(|active| {
+                    self.sqlite_remote_generation(
+                        connection,
+                        &database,
+                        source_id,
+                        redaction_profile,
+                        &active.active_generation,
+                    )
+                    .map(|generation| {
+                        self.sqlite_remote_data_directory(source_id, redaction_profile, &generation)
                     })
-                    .transpose()?;
-                operation(directory.as_deref())
-            });
-        }
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return operation(None);
-        }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        let manifest =
-            self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
-        let generation_directory = manifest
-            .as_ref()
-            .map(|manifest| {
-                self.validate_remote_generation_binding_locked(
-                    source_id,
-                    redaction_profile,
-                    &manifest.active_generation,
-                    &manifest.binding,
-                )
-            })
-            .transpose()?;
-        operation(generation_directory.as_deref())
+                })
+                .transpose()?;
+            operation(directory.as_deref())
+        })
     }
 
     fn ensure_remote_history_generation_unfenced(
@@ -1434,78 +1069,9 @@ impl SourceHistoryStore {
         generation: &SourceHistoryRemoteGenerationId,
         binding: &SourceHistoryRemoteBinding,
     ) -> io::Result<()> {
-        if self.sqlite_database().is_some() {
-            generation.validate()?;
-            binding.validate_namespace(source_id)?;
-            return self.sqlite_ensure_remote_generation(
-                source_id,
-                redaction_profile,
-                generation,
-                binding,
-            );
-        }
         generation.validate()?;
         binding.validate_namespace(source_id)?;
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        self.prepare_private_directory(&root)?;
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        validate_remote_generation_capacity_locked(
-            self,
-            source_id,
-            redaction_profile,
-            &root,
-            generation,
-        )?;
-        let directory = self.source_remote_history_generation_directory(
-            source_id,
-            redaction_profile,
-            generation,
-        );
-        self.prepare_private_directory(&directory)?;
-        cleanup_remote_atomic_temporary_files(self, &directory, REMOTE_GENERATION_METADATA_FILE)?;
-        let metadata_path = directory.join(REMOTE_GENERATION_METADATA_FILE);
-        let expected = RemoteGenerationMetadata::bootstrap(
-            self.profile_id.clone(),
-            source_id.clone(),
-            redaction_profile,
-            generation.clone(),
-            binding.clone(),
-        );
-        match read_optional_json_file::<RemoteGenerationMetadata>(
-            &metadata_path,
-            MAX_REMOTE_GENERATION_FILE_BYTES,
-        )? {
-            Some(existing) => {
-                existing.validate_ready(
-                    &self.profile_id,
-                    source_id,
-                    redaction_profile,
-                    generation,
-                )?;
-                if existing.origin != RemoteGenerationOrigin::Bootstrap {
-                    return Err(invalid_data(
-                        "remote history generation ID is already bound to a replacement",
-                    ));
-                }
-                if &existing.binding != binding {
-                    return Err(invalid_data(
-                        "remote history generation is bound to another exporter revision",
-                    ));
-                }
-            }
-            None => write_private_atomically(
-                &metadata_path,
-                &encode_pretty_bounded(&expected, MAX_REMOTE_GENERATION_FILE_BYTES)?,
-            )?,
-        }
-        self.prepare_private_directory(&directory.join(BUCKETS_DIRECTORY))?;
-        self.prepare_private_directory(&directory.join(DIGESTS_DIRECTORY))?;
-        self.validate_remote_generation_root_entries(&directory)?;
-        Ok(())
+        self.sqlite_ensure_remote_generation(source_id, redaction_profile, generation, binding)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1520,98 +1086,27 @@ impl SourceHistoryStore {
         digest_records: &[SourceSessionDigestRecord],
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
-        if self.sqlite_database().is_some() {
-            generation.validate()?;
-            binding.validate_namespace(source_id)?;
-            return self.sqlite_apply_remote_generation_page(
-                source_id,
-                redaction_profile,
-                generation,
-                binding,
-                require_active,
-                bucket_records,
-                digest_records,
-                quota_records,
-            );
-        }
         generation.validate()?;
         binding.validate_namespace(source_id)?;
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote history generation has not been staged",
-            ));
-        }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        let candidate_directory = self.source_remote_history_generation_directory(
-            source_id,
-            redaction_profile,
-            generation,
-        );
-        if self.private_directory_exists(&candidate_directory)? {
-            cleanup_remote_atomic_temporary_files(
-                self,
-                &candidate_directory,
-                REMOTE_GENERATION_METADATA_FILE,
-            )?;
-        }
-        let active = self
-            .read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
-            .map(|manifest| manifest.active_generation);
-        if active.as_ref() == Some(generation) || require_active {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote active history generations are immutable; use a COW replacement",
-            ));
-        }
-        let directory = self.validate_remote_generation_binding_locked(
+        self.sqlite_apply_remote_generation_page(
             source_id,
             redaction_profile,
             generation,
             binding,
-        )?;
-        let bucket_history = self.record_source_bucket_changes_in_directory_unfenced(
-            source_id,
-            redaction_profile,
-            &directory.join(BUCKETS_DIRECTORY),
+            require_active,
             bucket_records,
-        )?;
-        let session_digests = self.record_source_session_digest_changes_in_directory_unfenced(
-            source_id,
-            redaction_profile,
-            &directory.join(DIGESTS_DIRECTORY),
             digest_records,
-        )?;
-        cleanup_remote_atomic_temporary_files(self, &directory, REMOTE_QUOTA_FILE)?;
-        apply_remote_quota(
-            self,
-            source_id,
-            redaction_profile,
-            &directory,
             quota_records,
-        )?;
-        Ok(RemoteHistoryPageWriteReport {
-            bucket_history,
-            session_digests,
-        })
+        )
     }
 
-    /// Crash-safe active incremental apply. The active generation is never
-    /// edited in place: its immutable shards are cloned into the caller's
-    /// deterministic replacement, the complete page is applied there, and a
-    /// single manifest replace publishes both data families.
+    /// Atomically applies an active page in its selected SQL generation.
     #[allow(clippy::too_many_arguments)]
-    fn apply_remote_history_active_page_cow_unfenced(
+    fn apply_remote_history_active_page_unfenced(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         expected_active: &SourceHistoryRemoteActiveRef,
-        replacement_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
@@ -1619,146 +1114,17 @@ impl SourceHistoryStore {
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         expected_active.validate_namespace(source_id)?;
-        replacement_generation.validate()?;
         candidate_binding.validate_namespace(source_id)?;
-        if candidate_binding != expected_active.binding() {
-            return Err(invalid_data(
-                "active COW replacement binding must match the active generation",
-            ));
-        }
-        if expected_active.generation() == replacement_generation {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "remote active replacement must use a distinct generation",
-            ));
-        }
-        if self.sqlite_database().is_some() {
-            return self.sqlite_apply_remote_active_page(
-                source_id,
-                redaction_profile,
-                expected_active,
-                replacement_generation,
-                candidate_binding,
-                bucket_records,
-                digest_records,
-                activated_at,
-                quota_records,
-            );
-        }
-        let page_fingerprint =
-            remote_page_fingerprint(bucket_records, digest_records, quota_records)?;
-        let expected_origin = RemoteGenerationOrigin::ActiveReplacement {
-            expected_active_generation: expected_active.generation().clone(),
-            page_fingerprint,
-        };
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote history has no active generation",
-            ));
-        }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        let active_manifest = self
-            .read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "remote history has no active generation",
-                )
-            })?;
-        let active = SourceHistoryRemoteActiveRef {
-            generation: active_manifest.active_generation,
-            binding: active_manifest.binding,
-        };
-
-        if active.generation() == replacement_generation && active.binding() == candidate_binding {
-            self.validate_remote_replacement_locked(
-                source_id,
-                redaction_profile,
-                replacement_generation,
-                candidate_binding,
-                &expected_origin,
-            )?;
-            return Ok(RemoteHistoryPageWriteReport::default());
-        }
-        if &active != expected_active {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote active history generation changed before COW apply",
-            ));
-        }
-
-        let expected_directory = self.validate_remote_generation_binding_locked(
+        self.sqlite_apply_remote_active_page(
             source_id,
             redaction_profile,
-            expected_active.generation(),
-            expected_active.binding(),
-        )?;
-        let replacement_directory = self.prepare_remote_replacement_locked(
-            source_id,
-            redaction_profile,
-            replacement_generation,
+            expected_active,
             candidate_binding,
-            &expected_origin,
-            &expected_directory,
-        )?;
-
-        // Per-family writes may fail independently, but the replacement is
-        // invisible until both finish and the manifest is switched below.
-        let bucket_history = self.record_source_bucket_changes_in_directory_unfenced(
-            source_id,
-            redaction_profile,
-            &replacement_directory.join(BUCKETS_DIRECTORY),
             bucket_records,
-        )?;
-        let session_digests = self.record_source_session_digest_changes_in_directory_unfenced(
-            source_id,
-            redaction_profile,
-            &replacement_directory.join(DIGESTS_DIRECTORY),
             digest_records,
-        )?;
-
-        cleanup_remote_atomic_temporary_files(self, &replacement_directory, REMOTE_QUOTA_FILE)?;
-        apply_remote_quota(
-            self,
-            source_id,
-            redaction_profile,
-            &replacement_directory,
-            quota_records,
-        )?;
-
-        // Revalidate the exact replacement binding after nested shard writes.
-        // The root lock prevents another cooperative activation, while this
-        // catches namespace corruption before publication.
-        self.validate_remote_replacement_locked(
-            source_id,
-            redaction_profile,
-            replacement_generation,
-            candidate_binding,
-            &expected_origin,
-        )?;
-        let manifest = RemoteActiveManifest {
-            format_version: REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION,
-            profile_id: self.profile_id.clone(),
-            source_id: source_id.clone(),
-            redaction_profile,
-            active_generation: replacement_generation.clone(),
-            binding: candidate_binding.clone(),
             activated_at,
-        };
-        write_private_atomically(
-            &root.join(REMOTE_ACTIVE_MANIFEST_FILE),
-            &encode_pretty_bounded(&manifest, MAX_REMOTE_GENERATION_FILE_BYTES)?,
-        )?;
-        Ok(RemoteHistoryPageWriteReport {
-            bucket_history,
-            session_digests,
-        })
+            quota_records,
+        )
     }
 
     #[cfg_attr(test, allow(clippy::too_many_arguments))]
@@ -1770,128 +1136,20 @@ impl SourceHistoryStore {
         candidate_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
         activated_at: DateTime<Utc>,
-        #[cfg(test)] before_manifest: Option<&dyn Fn()>,
+        #[cfg(test)] _before_manifest: Option<&dyn Fn()>,
     ) -> io::Result<()> {
-        if self.sqlite_database().is_some() {
-            candidate_generation.validate()?;
-            candidate_binding.validate_namespace(source_id)?;
-            if let Some(expected) = expected_active {
-                expected.validate_namespace(source_id)?;
-            }
-            return self.sqlite_activate_remote_generation(
-                source_id,
-                redaction_profile,
-                expected_active,
-                candidate_generation,
-                candidate_binding,
-                activated_at,
-            );
-        }
-        if let Some(expected_active) = expected_active {
-            expected_active.validate_namespace(source_id)?;
-        }
         candidate_generation.validate()?;
         candidate_binding.validate_namespace(source_id)?;
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote history generation has not been staged",
-            ));
+        if let Some(expected) = expected_active {
+            expected.validate_namespace(source_id)?;
         }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        let candidate_directory = self.source_remote_history_generation_directory(
+        self.sqlite_activate_remote_generation(
             source_id,
             redaction_profile,
-            candidate_generation,
-        );
-        if self.private_directory_exists(&candidate_directory)? {
-            cleanup_remote_atomic_temporary_files(
-                self,
-                &candidate_directory,
-                REMOTE_GENERATION_METADATA_FILE,
-            )?;
-        }
-        let metadata = self.read_remote_generation_metadata_locked(
-            source_id,
-            redaction_profile,
-            candidate_generation,
-        )?;
-        metadata.validate_ready(
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            candidate_generation,
-        )?;
-        if &metadata.binding != candidate_binding {
-            return Err(invalid_data(
-                "bootstrap candidate binding does not match its generation metadata",
-            ));
-        }
-        if metadata.origin != RemoteGenerationOrigin::Bootstrap {
-            return Err(invalid_data(
-                "active replacement generations require the COW CAS activation path",
-            ));
-        }
-        self.validate_remote_generation_binding_locked(
-            source_id,
-            redaction_profile,
+            expected_active,
             candidate_generation,
             candidate_binding,
-        )?;
-        let actual_manifest =
-            self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
-        let actual = if let Some(manifest) = actual_manifest {
-            let active = SourceHistoryRemoteActiveRef {
-                generation: manifest.active_generation,
-                binding: manifest.binding,
-            };
-            self.validate_remote_generation_binding_locked(
-                source_id,
-                redaction_profile,
-                active.generation(),
-                active.binding(),
-            )?;
-            Some(active)
-        } else {
-            None
-        };
-        let candidate = SourceHistoryRemoteActiveRef {
-            generation: candidate_generation.clone(),
-            binding: candidate_binding.clone(),
-        };
-        if actual.as_ref() == Some(&candidate) {
-            return Ok(());
-        }
-        if actual.as_ref() != expected_active {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote active history generation changed before bootstrap activation",
-            ));
-        }
-        if let Some(active) = &actual {
-            validate_binding_does_not_roll_back(active.binding(), candidate_binding)?;
-        }
-        let manifest = RemoteActiveManifest {
-            format_version: REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION,
-            profile_id: self.profile_id.clone(),
-            source_id: source_id.clone(),
-            redaction_profile,
-            active_generation: candidate_generation.clone(),
-            binding: candidate_binding.clone(),
             activated_at,
-        };
-        #[cfg(test)]
-        if let Some(before_manifest) = before_manifest {
-            before_manifest();
-        }
-        write_private_atomically(
-            &root.join(REMOTE_ACTIVE_MANIFEST_FILE),
-            &encode_pretty_bounded(&manifest, MAX_REMOTE_GENERATION_FILE_BYTES)?,
         )
     }
 
@@ -1903,37 +1161,20 @@ impl SourceHistoryStore {
         generation: &SourceHistoryRemoteGenerationId,
     ) -> io::Result<()> {
         generation.validate()?;
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote history has no active generation",
-            ));
-        }
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        let manifest = self
-            .read_remote_active_manifest_locked(source_id, redaction_profile, &root)?
+        let active = self
+            .active_remote_history_ref(source_id, redaction_profile)?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "remote history has no active generation",
                 )
             })?;
-        if &manifest.active_generation != generation {
+        if active.generation() != generation {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "remote active history generation does not match",
             ));
         }
-        self.validate_remote_generation_binding_locked(
-            source_id,
-            redaction_profile,
-            generation,
-            &manifest.binding,
-        )?;
         Ok(())
     }
 
@@ -1944,116 +1185,11 @@ impl SourceHistoryStore {
         candidate: &SourceHistoryRemoteGenerationId,
         protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
     ) -> io::Result<RemoteHistoryGenerationGcOutcome> {
-        if self.sqlite_database().is_some() {
-            candidate.validate()?;
-            for generation in protected {
-                generation.validate()?;
-            }
-            return self.sqlite_gc_remote_generation(
-                source_id,
-                redaction_profile,
-                candidate,
-                protected,
-            );
-        }
         candidate.validate()?;
         for generation in protected {
             generation.validate()?;
         }
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Ok(RemoteHistoryGenerationGcOutcome::NotFound);
-        }
-
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        validate_remote_gc_root_namespace(self, &root)?;
-
-        let active_manifest =
-            self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
-        if let Some(active) = &active_manifest {
-            // Do not trust only the generation string in the manifest. Its
-            // complete binding to generation metadata must still be valid
-            // while the exclusive root lock is held.
-            self.validate_remote_generation_binding_locked(
-                source_id,
-                redaction_profile,
-                &active.active_generation,
-                &active.binding,
-            )?;
-        }
-
-        if active_manifest
-            .as_ref()
-            .is_some_and(|active| &active.active_generation == candidate)
-        {
-            return Ok(RemoteHistoryGenerationGcOutcome::SkippedActive);
-        }
-        if protected.contains(candidate) {
-            return Ok(RemoteHistoryGenerationGcOutcome::SkippedProtected);
-        }
-
-        let generations = root.join(REMOTE_GENERATIONS_DIRECTORY);
-        let trash = root.join(REMOTE_GC_TRASH_DIRECTORY);
-        validate_remote_gc_generation_parent(self, &generations)?;
-        if self.private_directory_exists(&trash)? {
-            validate_remote_gc_trash_parent(self, &trash)?;
-        }
-
-        let candidate_directory = generations.join(candidate.as_str());
-        let trash_directory = trash.join(remote_gc_trash_name(candidate));
-        let candidate_exists = self.private_directory_exists(&candidate_directory)?;
-        let trash_exists = self.private_directory_exists(&trash_directory)?;
-        if candidate_exists && trash_exists {
-            return Err(invalid_data(
-                "remote history generation exists in both active and GC trash namespaces",
-            ));
-        }
-
-        if trash_exists {
-            validate_remote_gc_trash_generation_directory(
-                self,
-                source_id,
-                redaction_profile,
-                candidate,
-                &trash_directory,
-            )?;
-            remove_remote_gc_generation_tree(self, &trash_directory)?;
-            sync_directory(&trash)?;
-            return Ok(RemoteHistoryGenerationGcOutcome::RecoveredTrash);
-        }
-        if !candidate_exists {
-            return Ok(RemoteHistoryGenerationGcOutcome::NotFound);
-        }
-
-        validate_remote_gc_generation_directory(
-            self,
-            source_id,
-            redaction_profile,
-            candidate,
-            &candidate_directory,
-        )?;
-        self.prepare_private_directory(&trash)?;
-        validate_remote_gc_trash_parent(self, &trash)?;
-        rename_remote_generation_to_trash(&candidate_directory, &trash_directory)?;
-        sync_directory(&generations)?;
-        sync_directory(&trash)?;
-
-        // Revalidate the moved tree before any pathname-based removal. A
-        // crash from here leaves a deterministic, recoverable trash name.
-        validate_remote_gc_trash_generation_directory(
-            self,
-            source_id,
-            redaction_profile,
-            candidate,
-            &trash_directory,
-        )?;
-        remove_remote_gc_generation_tree(self, &trash_directory)?;
-        sync_directory(&trash)?;
-        Ok(RemoteHistoryGenerationGcOutcome::Deleted)
+        self.sqlite_gc_remote_generation(source_id, redaction_profile, candidate, protected)
     }
 
     /// Sweeps every generation not reachable from the active manifest or the
@@ -2067,476 +1203,39 @@ impl SourceHistoryStore {
         protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
         max_work: usize,
     ) -> io::Result<RemoteHistoryGenerationSweepReport> {
-        if let Some(database) = self.sqlite_database() {
-            for generation in protected {
-                generation.validate()?;
-            }
-            return database.write(|connection| {
-                let catalog = self.sqlite_remote_catalog(
-                    connection,
-                    &database,
-                    source_id,
-                    redaction_profile,
-                )?;
-                let active =
-                    self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?;
-                let mut report = RemoteHistoryGenerationSweepReport::default();
-                for (_, generation) in catalog {
-                    let candidate = &generation.metadata.generation;
-                    if protected.contains(candidate)
-                        || active
-                            .as_ref()
-                            .is_some_and(|active| &active.active_generation == candidate)
-                    {
-                        report.skipped += 1;
-                    } else if report.deleted >= max_work {
-                        report.remaining += 1;
-                    } else if self.sqlite_gc_remote_generation(
-                        source_id,
-                        redaction_profile,
-                        candidate,
-                        protected,
-                    )? == RemoteHistoryGenerationGcOutcome::Deleted
-                    {
-                        report.deleted += 1;
-                    }
-                }
-                Ok(report)
-            });
-        }
+        let database = self.sqlite_database().expect("SQLite history backend");
+
         for generation in protected {
             generation.validate()?;
         }
-        let source = self.load_source_metadata(source_id)?;
-        require_ssh_source(&source)?;
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        if !self.private_directory_exists(&root)? {
-            return Ok(RemoteHistoryGenerationSweepReport::default());
-        }
-
-        let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
-        cleanup_remote_atomic_temporary_files(self, &root, REMOTE_ACTIVE_MANIFEST_FILE)?;
-        let active_manifest =
-            self.read_remote_active_manifest_locked(source_id, redaction_profile, &root)?;
-        if let Some(active) = &active_manifest {
-            self.validate_remote_generation_binding_locked(
-                source_id,
-                redaction_profile,
-                &active.active_generation,
-                &active.binding,
-            )?;
-        }
-        let active = active_manifest
-            .as_ref()
-            .map(|manifest| &manifest.active_generation);
-        let catalog = load_remote_history_generation_catalog_locked(
-            self,
-            source_id,
-            redaction_profile,
-            &root,
-            true,
-        )?;
-
-        let generations = root.join(REMOTE_GENERATIONS_DIRECTORY);
-        let trash = root.join(REMOTE_GC_TRASH_DIRECTORY);
-        let mut report = RemoteHistoryGenerationSweepReport::default();
-
-        // Complete interrupted deterministic removals before starting new
-        // ones. Each completed tree consumes one work unit.
-        for (generation, directory) in &catalog.trash {
-            if active == Some(generation) || protected.contains(generation) {
-                report.skipped += 1;
-                continue;
-            }
-            if report.deleted + report.recovered >= max_work {
-                report.remaining += 1;
-                continue;
-            }
-            validate_remote_gc_trash_generation_directory(
-                self,
-                source_id,
-                redaction_profile,
-                generation,
-                directory,
-            )?;
-            remove_remote_gc_generation_tree(self, directory)?;
-            sync_directory(&trash)?;
-            report.recovered += 1;
-        }
-
-        for (generation, directory) in &catalog.generations {
-            if active == Some(generation) || protected.contains(generation) {
-                report.skipped += 1;
-                continue;
-            }
-            if report.deleted + report.recovered >= max_work {
-                report.remaining += 1;
-                continue;
-            }
-
-            validate_remote_gc_generation_directory_mode(
-                self,
-                source_id,
-                redaction_profile,
-                generation,
-                directory,
-                false,
-            )?;
-            self.prepare_private_directory(&trash)?;
-            validate_remote_gc_trash_parent(self, &trash)?;
-            let trash_directory = trash.join(remote_gc_trash_name(generation));
-            if self.private_directory_exists(&trash_directory)? {
-                return Err(invalid_data(
-                    "remote history generation appeared in GC trash during sweep",
-                ));
-            }
-            rename_remote_generation_to_trash(directory, &trash_directory)?;
-            sync_directory(&generations)?;
-            sync_directory(&trash)?;
-            validate_remote_gc_trash_generation_directory(
-                self,
-                source_id,
-                redaction_profile,
-                generation,
-                &trash_directory,
-            )?;
-            remove_remote_gc_generation_tree(self, &trash_directory)?;
-            sync_directory(&trash)?;
-            report.deleted += 1;
-        }
-        Ok(report)
-    }
-
-    fn prepare_remote_replacement_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        replacement_generation: &SourceHistoryRemoteGenerationId,
-        candidate_binding: &SourceHistoryRemoteBinding,
-        expected_origin: &RemoteGenerationOrigin,
-        expected_directory: &Path,
-    ) -> io::Result<PathBuf> {
-        let directory = self.source_remote_history_generation_directory(
-            source_id,
-            redaction_profile,
-            replacement_generation,
-        );
-        let root = self.source_remote_history_directory(source_id, redaction_profile);
-        let directory_exists = validate_remote_generation_capacity_locked(
-            self,
-            source_id,
-            redaction_profile,
-            &root,
-            replacement_generation,
-        )?;
-        if directory_exists {
-            cleanup_remote_atomic_temporary_files(
-                self,
-                &directory,
-                REMOTE_GENERATION_METADATA_FILE,
-            )?;
-        }
-        let metadata_path = directory.join(REMOTE_GENERATION_METADATA_FILE);
-        let mut metadata = if directory_exists {
-            match read_optional_json_file::<RemoteGenerationMetadata>(
-                &metadata_path,
-                MAX_REMOTE_GENERATION_FILE_BYTES,
-            )? {
-                Some(metadata) => metadata,
-                None => {
-                    ensure_recoverable_empty_generation_directory(self, &directory)?;
-                    let RemoteGenerationOrigin::ActiveReplacement {
-                        expected_active_generation,
-                        page_fingerprint,
-                    } = expected_origin
-                    else {
-                        return Err(invalid_data("replacement origin is not active COW"));
-                    };
-                    let metadata = RemoteGenerationMetadata::active_replacement(
-                        self.profile_id.clone(),
-                        source_id.clone(),
-                        redaction_profile,
-                        replacement_generation.clone(),
-                        candidate_binding.clone(),
-                        expected_active_generation.clone(),
-                        page_fingerprint.clone(),
-                    );
-                    write_private_atomically(
-                        &metadata_path,
-                        &encode_pretty_bounded(&metadata, MAX_REMOTE_GENERATION_FILE_BYTES)?,
-                    )?;
-                    metadata
+        database.write(|connection| {
+            let catalog =
+                self.sqlite_remote_catalog(connection, &database, source_id, redaction_profile)?;
+            let active =
+                self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?;
+            let mut report = RemoteHistoryGenerationSweepReport::default();
+            for (_, generation) in catalog {
+                let candidate = &generation.metadata.generation;
+                if protected.contains(candidate)
+                    || active
+                        .as_ref()
+                        .is_some_and(|active| &active.active_generation == candidate)
+                {
+                    report.skipped += 1;
+                } else if report.deleted >= max_work {
+                    report.remaining += 1;
+                } else if self.sqlite_gc_remote_generation(
+                    source_id,
+                    redaction_profile,
+                    candidate,
+                    protected,
+                )? == RemoteHistoryGenerationGcOutcome::Deleted
+                {
+                    report.deleted += 1;
                 }
             }
-        } else {
-            self.prepare_private_directory(&directory)?;
-            let RemoteGenerationOrigin::ActiveReplacement {
-                expected_active_generation,
-                page_fingerprint,
-            } = expected_origin
-            else {
-                return Err(invalid_data("replacement origin is not active COW"));
-            };
-            let metadata = RemoteGenerationMetadata::active_replacement(
-                self.profile_id.clone(),
-                source_id.clone(),
-                redaction_profile,
-                replacement_generation.clone(),
-                candidate_binding.clone(),
-                expected_active_generation.clone(),
-                page_fingerprint.clone(),
-            );
-            write_private_atomically(
-                &metadata_path,
-                &encode_pretty_bounded(&metadata, MAX_REMOTE_GENERATION_FILE_BYTES)?,
-            )?;
-            metadata
-        };
-        metadata.validate(
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            replacement_generation,
-        )?;
-        if &metadata.origin != expected_origin {
-            return Err(invalid_data(
-                "remote replacement generation is bound to another active page",
-            ));
-        }
-        if &metadata.binding != candidate_binding {
-            return Err(invalid_data(
-                "remote replacement generation is bound to another exporter revision",
-            ));
-        }
-
-        let replacement_buckets = directory.join(BUCKETS_DIRECTORY);
-        let replacement_digests = directory.join(DIGESTS_DIRECTORY);
-        if metadata.clone_complete {
-            self.validate_remote_replacement_locked(
-                source_id,
-                redaction_profile,
-                replacement_generation,
-                candidate_binding,
-                expected_origin,
-            )?;
-            return Ok(directory);
-        }
-        self.prepare_private_directory(&replacement_buckets)?;
-        self.prepare_private_directory(&replacement_digests)?;
-        self.validate_remote_generation_root_entries(&directory)?;
-
-        clone_remote_generation_family(
-            self,
-            source_id,
-            redaction_profile,
-            &expected_directory.join(BUCKETS_DIRECTORY),
-            &replacement_buckets,
-            RemoteCloneFamily::Buckets,
-        )?;
-        clone_remote_generation_family(
-            self,
-            source_id,
-            redaction_profile,
-            &expected_directory.join(DIGESTS_DIRECTORY),
-            &replacement_digests,
-            RemoteCloneFamily::Digests,
-        )?;
-
-        cleanup_remote_atomic_temporary_files(self, &directory, REMOTE_QUOTA_FILE)?;
-        let quota_source = expected_directory.join(REMOTE_QUOTA_FILE);
-        let quota_destination = directory.join(REMOTE_QUOTA_FILE);
-        if quota_source.try_exists()? {
-            super::remote_quota::validate_remote_quota_file(
-                self,
-                source_id,
-                redaction_profile,
-                &quota_source,
-            )?;
-            if quota_destination.try_exists()? {
-                ensure_private_files_equal(
-                    &quota_source,
-                    &quota_destination,
-                    MAX_REMOTE_QUOTA_BYTES,
-                )?;
-            } else if fs::hard_link(&quota_source, &quota_destination).is_err() {
-                let contents = read_private_file_bounded(&quota_source, MAX_REMOTE_QUOTA_BYTES)?;
-                write_private_atomically(&quota_destination, &contents)?;
-            }
-            validate_published_private_file(&quota_destination)?;
-        }
-        metadata.clone_complete = true;
-        write_private_atomically(
-            &metadata_path,
-            &encode_pretty_bounded(&metadata, MAX_REMOTE_GENERATION_FILE_BYTES)?,
-        )?;
-        self.validate_remote_replacement_locked(
-            source_id,
-            redaction_profile,
-            replacement_generation,
-            candidate_binding,
-            expected_origin,
-        )?;
-        Ok(directory)
-    }
-
-    fn validate_remote_replacement_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        replacement_generation: &SourceHistoryRemoteGenerationId,
-        candidate_binding: &SourceHistoryRemoteBinding,
-        expected_origin: &RemoteGenerationOrigin,
-    ) -> io::Result<PathBuf> {
-        let metadata = self.read_remote_generation_metadata_locked(
-            source_id,
-            redaction_profile,
-            replacement_generation,
-        )?;
-        metadata.validate_ready(
-            &self.profile_id,
-            source_id,
-            redaction_profile,
-            replacement_generation,
-        )?;
-        if &metadata.origin != expected_origin {
-            return Err(invalid_data(
-                "remote replacement generation is bound to another active page",
-            ));
-        }
-        if &metadata.binding != candidate_binding {
-            return Err(invalid_data(
-                "remote replacement generation is bound to another exporter revision",
-            ));
-        }
-        self.validate_remote_generation_binding_locked(
-            source_id,
-            redaction_profile,
-            replacement_generation,
-            candidate_binding,
-        )
-    }
-
-    fn read_remote_active_manifest_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        root: &Path,
-    ) -> io::Result<Option<RemoteActiveManifest>> {
-        let manifest = read_optional_json_file::<RemoteActiveManifest>(
-            &root.join(REMOTE_ACTIVE_MANIFEST_FILE),
-            MAX_REMOTE_GENERATION_FILE_BYTES,
-        )?;
-        if let Some(manifest) = &manifest {
-            manifest.validate(&self.profile_id, source_id, redaction_profile)?;
-        }
-        Ok(manifest)
-    }
-
-    fn read_remote_generation_metadata_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        generation: &SourceHistoryRemoteGenerationId,
-    ) -> io::Result<RemoteGenerationMetadata> {
-        let directory = self.source_remote_history_generation_directory(
-            source_id,
-            redaction_profile,
-            generation,
-        );
-        self.validate_private_path(&directory)?;
-        let metadata: RemoteGenerationMetadata = read_json_file(
-            &directory.join(REMOTE_GENERATION_METADATA_FILE),
-            MAX_REMOTE_GENERATION_FILE_BYTES,
-        )?;
-        metadata.validate(&self.profile_id, source_id, redaction_profile, generation)?;
-        Ok(metadata)
-    }
-
-    fn validate_remote_generation_root_entries(&self, directory: &Path) -> io::Result<()> {
-        self.validate_private_path(directory)?;
-        let mut metadata = false;
-        let mut buckets = false;
-        let mut digests = false;
-        for entry in fs::read_dir(directory)? {
-            self.validate_private_path(directory)?;
-            let entry = entry?;
-            if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_GENERATION_METADATA_FILE)
-                || is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE)
-            {
-                validate_published_private_file(&entry.path())?;
-                continue;
-            }
-            match entry.file_name().to_str() {
-                Some(REMOTE_GENERATION_METADATA_FILE) if !metadata => {
-                    validate_published_private_file(&entry.path())?;
-                    metadata = true;
-                }
-                Some(REMOTE_QUOTA_FILE) => {
-                    validate_remote_gc_regular_file(&entry.path(), MAX_REMOTE_QUOTA_BYTES, None)?;
-                }
-                Some(BUCKETS_DIRECTORY) if !buckets => {
-                    self.validate_private_path(&entry.path())?;
-                    buckets = true;
-                }
-                Some(DIGESTS_DIRECTORY) if !digests => {
-                    self.validate_private_path(&entry.path())?;
-                    digests = true;
-                }
-                _ => {
-                    return Err(invalid_data(format!(
-                        "unexpected path in remote history generation {}",
-                        entry.path().display()
-                    )));
-                }
-            }
-        }
-        if !metadata || !buckets || !digests {
-            return Err(invalid_data(
-                "remote history generation namespace is incomplete",
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_remote_generation_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        generation: &SourceHistoryRemoteGenerationId,
-    ) -> io::Result<PathBuf> {
-        let directory = self.source_remote_history_generation_directory(
-            source_id,
-            redaction_profile,
-            generation,
-        );
-        self.validate_remote_generation_root_entries(&directory)?;
-        let metadata =
-            self.read_remote_generation_metadata_locked(source_id, redaction_profile, generation)?;
-        metadata.validate_ready(&self.profile_id, source_id, redaction_profile, generation)?;
-        self.validate_private_path(&directory.join(BUCKETS_DIRECTORY))?;
-        self.validate_private_path(&directory.join(DIGESTS_DIRECTORY))?;
-        Ok(directory)
-    }
-
-    fn validate_remote_generation_binding_locked(
-        &self,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        generation: &SourceHistoryRemoteGenerationId,
-        binding: &SourceHistoryRemoteBinding,
-    ) -> io::Result<PathBuf> {
-        binding.validate_namespace(source_id)?;
-        let directory =
-            self.validate_remote_generation_locked(source_id, redaction_profile, generation)?;
-        let metadata =
-            self.read_remote_generation_metadata_locked(source_id, redaction_profile, generation)?;
-        if &metadata.binding != binding {
-            return Err(invalid_data(
-                "remote history manifest binding does not match generation metadata",
-            ));
-        }
-        Ok(directory)
+            Ok(report)
+        })
     }
 
     #[cfg(test)]
@@ -2581,23 +1280,21 @@ impl SourceHistoryStore {
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_remote_history_active_page_cow(
+    pub(crate) fn apply_remote_history_active_page(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         expected_active: &SourceHistoryRemoteActiveRef,
-        replacement_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
         activated_at: DateTime<Utc>,
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
-        self.apply_remote_history_active_page_cow_unfenced(
+        self.apply_remote_history_active_page_unfenced(
             source_id,
             redaction_profile,
             expected_active,
-            replacement_generation,
             candidate_binding,
             bucket_records,
             digest_records,
@@ -2669,7 +1366,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         binding: &SourceHistoryRemoteBinding,
     ) -> io::Result<()> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.ensure_remote_history_generation_unfenced(
                 source_id,
                 redaction_profile,
@@ -2691,7 +1388,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.apply_remote_history_generation_page_unfenced(
                 source_id,
                 redaction_profile,
@@ -2705,15 +1402,13 @@ impl SourceHistoryWriter<'_, '_, '_> {
         })
     }
 
-    /// Applies one active incremental page through an immutable, deterministic
-    /// replacement generation and atomically publishes it on success.
+    /// Applies one active incremental page atomically to its selected SQL generation.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_remote_history_active_page_cow(
+    pub(crate) fn apply_remote_history_active_page(
         &self,
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
         expected_active: &SourceHistoryRemoteActiveRef,
-        replacement_generation: &SourceHistoryRemoteGenerationId,
         candidate_binding: &SourceHistoryRemoteBinding,
         bucket_records: &[SourceBucketRecord],
         digest_records: &[SourceSessionDigestRecord],
@@ -2721,12 +1416,11 @@ impl SourceHistoryWriter<'_, '_, '_> {
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
-            store.apply_remote_history_active_page_cow_unfenced(
+        self.transaction_fenced(|store| {
+            store.apply_remote_history_active_page_unfenced(
                 source_id,
                 redaction_profile,
                 expected_active,
-                replacement_generation,
                 candidate_binding,
                 bucket_records,
                 digest_records,
@@ -2746,7 +1440,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         activated_at: DateTime<Utc>,
     ) -> io::Result<()> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.activate_remote_history_generation_unfenced(
                 source_id,
                 redaction_profile,
@@ -2772,7 +1466,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
     ) -> io::Result<RemoteHistoryGenerationGcOutcome> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.garbage_collect_remote_history_generation_unfenced(
                 source_id,
                 redaction_profile,
@@ -2794,7 +1488,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         max_work: usize,
     ) -> io::Result<RemoteHistoryGenerationSweepReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.sweep_remote_history_generations_unfenced(
                 source_id,
                 redaction_profile,
@@ -2802,1036 +1496,6 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 max_work,
             )
         })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RemoteCloneFamily {
-    Buckets,
-    Digests,
-}
-
-fn cleanup_remote_atomic_temporary_files(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    target: &str,
-) -> io::Result<usize> {
-    store.validate_private_path(directory)?;
-    let mut removed = 0;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        if !is_remote_atomic_temporary_file(&entry.file_name(), target) {
-            continue;
-        }
-        validate_published_private_file(&entry.path())?;
-        store.validate_private_path(directory)?;
-        fs::remove_file(entry.path())?;
-        removed += 1;
-    }
-    if removed > 0 {
-        sync_directory(directory)?;
-    }
-    Ok(removed)
-}
-
-fn is_remote_atomic_temporary_file(name: &OsStr, target: &str) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(body) = name
-        .strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let Some((body, sequence)) = body.rsplit_once('.') else {
-        return false;
-    };
-    let Some((actual_target, process_id)) = body.rsplit_once('.') else {
-        return false;
-    };
-    actual_target == target
-        && !process_id.is_empty()
-        && process_id.bytes().all(|byte| byte.is_ascii_digit())
-        && !sequence.is_empty()
-        && sequence.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn remote_atomic_temporary_target(name: &OsStr) -> Option<&str> {
-    let name = name.to_str()?;
-    let body = name.strip_prefix('.')?.strip_suffix(".tmp")?;
-    let (body, sequence) = body.rsplit_once('.')?;
-    let (target, process_id) = body.rsplit_once('.')?;
-    if target.is_empty()
-        || process_id.is_empty()
-        || !process_id.bytes().all(|byte| byte.is_ascii_digit())
-        || sequence.is_empty()
-        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    Some(target)
-}
-
-fn remote_gc_trash_name(generation: &SourceHistoryRemoteGenerationId) -> String {
-    format!(
-        "{REMOTE_GC_TRASH_PREFIX}{}{REMOTE_GC_TRASH_SUFFIX}",
-        generation.as_str()
-    )
-}
-
-fn parse_remote_gc_trash_name(name: &OsStr) -> Option<SourceHistoryRemoteGenerationId> {
-    name.to_str()?
-        .strip_prefix(REMOTE_GC_TRASH_PREFIX)?
-        .strip_suffix(REMOTE_GC_TRASH_SUFFIX)?
-        .parse()
-        .ok()
-}
-
-#[derive(Debug, Default)]
-struct RemoteHistoryGenerationCatalog {
-    generations: BTreeMap<SourceHistoryRemoteGenerationId, PathBuf>,
-    trash: BTreeMap<SourceHistoryRemoteGenerationId, PathBuf>,
-}
-
-impl RemoteHistoryGenerationCatalog {
-    fn len(&self) -> usize {
-        self.generations.len() + self.trash.len()
-    }
-}
-
-/// Strictly catalogs both live and deterministic-trash namespaces. A
-/// generation may occur in exactly one of them: counting the union keeps a
-/// crash after rename from freeing capacity before its tree is removed.
-fn load_remote_history_generation_catalog_locked(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    root: &Path,
-    validate_generation_trees: bool,
-) -> io::Result<RemoteHistoryGenerationCatalog> {
-    validate_remote_gc_root_namespace(store, root)?;
-    let mut catalog = RemoteHistoryGenerationCatalog::default();
-
-    let generations = root.join(REMOTE_GENERATIONS_DIRECTORY);
-    if store.private_directory_exists(&generations)? {
-        store.validate_private_path(&generations)?;
-        for entry in fs::read_dir(&generations)? {
-            store.validate_private_path(&generations)?;
-            let entry = entry?;
-            let generation = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| invalid_data("remote history generation name is not UTF-8"))?
-                .parse::<SourceHistoryRemoteGenerationId>()
-                .map_err(|_| {
-                    invalid_data(format!(
-                        "unexpected path in remote history generation parent {}",
-                        entry.path().display()
-                    ))
-                })?;
-            let directory = entry.path();
-            validate_remote_generation_capacity_entry_locked(
-                store,
-                source_id,
-                redaction_profile,
-                &generation,
-                &directory,
-            )?;
-            if validate_generation_trees {
-                validate_remote_gc_generation_directory_mode(
-                    store,
-                    source_id,
-                    redaction_profile,
-                    &generation,
-                    &directory,
-                    false,
-                )?;
-            }
-            if catalog.generations.insert(generation, directory).is_some() {
-                return Err(invalid_data(
-                    "duplicate remote history generation namespace entry",
-                ));
-            }
-        }
-    }
-
-    let trash = root.join(REMOTE_GC_TRASH_DIRECTORY);
-    if store.private_directory_exists(&trash)? {
-        store.validate_private_path(&trash)?;
-        for entry in fs::read_dir(&trash)? {
-            store.validate_private_path(&trash)?;
-            let entry = entry?;
-            let generation = parse_remote_gc_trash_name(&entry.file_name()).ok_or_else(|| {
-                invalid_data(format!(
-                    "unexpected path in remote history GC trash {}",
-                    entry.path().display()
-                ))
-            })?;
-            let directory = entry.path();
-            validate_remote_gc_trash_generation_directory(
-                store,
-                source_id,
-                redaction_profile,
-                &generation,
-                &directory,
-            )?;
-            if catalog.generations.contains_key(&generation)
-                || catalog.trash.insert(generation, directory).is_some()
-            {
-                return Err(invalid_data(
-                    "remote history generation exists in multiple live or GC trash entries",
-                ));
-            }
-        }
-    }
-    Ok(catalog)
-}
-
-/// Reserves capacity for `candidate` while the caller holds the exclusive
-/// remote-history root lock. Returning `true` means the candidate's live
-/// directory already exists, so a crash replay remains legal at the cap.
-fn validate_remote_generation_capacity_locked(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    root: &Path,
-    candidate: &SourceHistoryRemoteGenerationId,
-) -> io::Result<bool> {
-    candidate.validate()?;
-    if let Some(active) =
-        store.read_remote_active_manifest_locked(source_id, redaction_profile, root)?
-    {
-        store.validate_remote_generation_binding_locked(
-            source_id,
-            redaction_profile,
-            &active.active_generation,
-            &active.binding,
-        )?;
-    }
-    let catalog = load_remote_history_generation_catalog_locked(
-        store,
-        source_id,
-        redaction_profile,
-        root,
-        false,
-    )?;
-    if catalog.generations.contains_key(candidate) {
-        return Ok(true);
-    }
-    if catalog.trash.contains_key(candidate) {
-        return Err(invalid_data(
-            "remote history generation ID is still being collected",
-        ));
-    }
-    if catalog.len() >= MAX_REMOTE_HISTORY_GENERATIONS {
-        return Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            format!("remote history generation limit of {MAX_REMOTE_HISTORY_GENERATIONS} reached"),
-        ));
-    }
-    Ok(false)
-}
-
-/// Accepts the bounded set of generation-root states that our atomic create
-/// and COW flows can leave behind. It intentionally does not require a ready
-/// generation: an empty directory, a metadata temporary, or a partially
-/// cloned replacement are recoverable crash states and must still consume a
-/// slot. Unknown entries or metadata bound to another namespace fail closed.
-fn validate_remote_generation_capacity_entry_locked(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    generation: &SourceHistoryRemoteGenerationId,
-    directory: &Path,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    let mut metadata = None;
-    let mut buckets = false;
-    let mut digests = false;
-    let mut quota = false;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        match entry.file_name().to_str() {
-            Some(REMOTE_GENERATION_METADATA_FILE) if metadata.is_none() => {
-                validate_remote_gc_regular_file(&path, MAX_REMOTE_GENERATION_FILE_BYTES, None)?;
-                let stored: RemoteGenerationMetadata =
-                    read_json_file(&path, MAX_REMOTE_GENERATION_FILE_BYTES)?;
-                stored.validate(&store.profile_id, source_id, redaction_profile, generation)?;
-                metadata = Some(stored);
-            }
-            Some(REMOTE_QUOTA_FILE) => {
-                quota = true;
-                validate_remote_gc_regular_file(&entry.path(), MAX_REMOTE_QUOTA_BYTES, None)?;
-            }
-            Some(BUCKETS_DIRECTORY) if !buckets => {
-                store.validate_private_path(&path)?;
-                buckets = true;
-            }
-            Some(DIGESTS_DIRECTORY) if !digests => {
-                store.validate_private_path(&path)?;
-                digests = true;
-            }
-            _ if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE) => {
-                validate_remote_gc_regular_file(&path, MAX_REMOTE_QUOTA_BYTES, None)?;
-            }
-            _ if is_remote_atomic_temporary_file(
-                &entry.file_name(),
-                REMOTE_GENERATION_METADATA_FILE,
-            ) =>
-            {
-                validate_remote_gc_regular_file(&path, MAX_REMOTE_GENERATION_FILE_BYTES, None)?;
-            }
-            _ => {
-                return Err(invalid_data(format!(
-                    "unexpected path in remote history generation {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    if metadata.is_none() && (buckets || digests || quota) {
-        return Err(invalid_data(
-            "remote history generation families exist without generation metadata",
-        ));
-    }
-    if digests && !buckets {
-        return Err(invalid_data(
-            "remote history generation digest family exists before its bucket family",
-        ));
-    }
-    if metadata.as_ref().is_some_and(|metadata| {
-        matches!(
-            metadata.origin,
-            RemoteGenerationOrigin::ActiveReplacement { .. }
-        ) && metadata.clone_complete
-            && (!buckets || !digests)
-    }) {
-        return Err(invalid_data(
-            "completed remote replacement generation is missing a history family",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_root_namespace(store: &SourceHistoryStore, root: &Path) -> io::Result<()> {
-    store.validate_private_path(root)?;
-    for entry in fs::read_dir(root)? {
-        store.validate_private_path(root)?;
-        let entry = entry?;
-        let path = entry.path();
-        match entry.file_name().to_str() {
-            Some(REMOTE_HISTORY_LOCK_FILE) => {
-                validate_lock_metadata(&path, &fs::symlink_metadata(&path)?)?;
-            }
-            Some(REMOTE_ACTIVE_MANIFEST_FILE) => {
-                validate_remote_gc_regular_file(&path, MAX_REMOTE_GENERATION_FILE_BYTES, None)?;
-            }
-            Some(REMOTE_GENERATIONS_DIRECTORY) | Some(REMOTE_GC_TRASH_DIRECTORY) => {
-                store.validate_private_path(&path)?;
-            }
-            _ => {
-                return Err(invalid_data(format!(
-                    "unexpected path in remote history GC root {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_generation_parent(
-    store: &SourceHistoryStore,
-    generations: &Path,
-) -> io::Result<()> {
-    if !store.private_directory_exists(generations)? {
-        return Ok(());
-    }
-    store.validate_private_path(generations)?;
-    for entry in fs::read_dir(generations)? {
-        store.validate_private_path(generations)?;
-        let entry = entry?;
-        entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| invalid_data("remote history generation name is not UTF-8"))?
-            .parse::<SourceHistoryRemoteGenerationId>()
-            .map_err(|_| {
-                invalid_data(format!(
-                    "unexpected path in remote history generation parent {}",
-                    entry.path().display()
-                ))
-            })?;
-        store.validate_private_path(&entry.path())?;
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_trash_parent(store: &SourceHistoryStore, trash: &Path) -> io::Result<()> {
-    store.validate_private_path(trash)?;
-    for entry in fs::read_dir(trash)? {
-        store.validate_private_path(trash)?;
-        let entry = entry?;
-        parse_remote_gc_trash_name(&entry.file_name()).ok_or_else(|| {
-            invalid_data(format!(
-                "unexpected path in remote history GC trash {}",
-                entry.path().display()
-            ))
-        })?;
-        store.validate_private_path(&entry.path())?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct RemoteGcTreeUsage {
-    entries: u64,
-    bytes: u64,
-}
-
-impl RemoteGcTreeUsage {
-    fn add_directory(&mut self) -> io::Result<()> {
-        self.entries = self
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("remote history GC entry count overflowed"))?;
-        self.validate()
-    }
-
-    fn add_file(&mut self, bytes: u64) -> io::Result<()> {
-        self.entries = self
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("remote history GC entry count overflowed"))?;
-        self.bytes = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or_else(|| invalid_data("remote history GC byte count overflowed"))?;
-        self.validate()
-    }
-
-    fn validate(self) -> io::Result<()> {
-        if self.entries > MAX_REMOTE_GC_TREE_ENTRIES {
-            return Err(invalid_data(
-                "remote history generation exceeds the GC entry bound",
-            ));
-        }
-        if self.bytes > MAX_REMOTE_GC_TREE_BYTES {
-            return Err(invalid_data(
-                "remote history generation exceeds the GC byte bound",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn validate_remote_gc_generation_directory(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    generation: &SourceHistoryRemoteGenerationId,
-    directory: &Path,
-) -> io::Result<()> {
-    validate_remote_gc_generation_directory_mode(
-        store,
-        source_id,
-        redaction_profile,
-        generation,
-        directory,
-        true,
-    )
-}
-
-fn validate_remote_gc_trash_generation_directory(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    generation: &SourceHistoryRemoteGenerationId,
-    directory: &Path,
-) -> io::Result<()> {
-    validate_remote_gc_generation_directory_mode(
-        store,
-        source_id,
-        redaction_profile,
-        generation,
-        directory,
-        false,
-    )
-}
-
-fn validate_remote_gc_generation_directory_mode(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    generation: &SourceHistoryRemoteGenerationId,
-    directory: &Path,
-    require_complete: bool,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    let mut usage = RemoteGcTreeUsage::default();
-    usage.add_directory()?;
-    let mut metadata = false;
-    let mut buckets = false;
-    let mut digests = false;
-    let mut quota = false;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        match entry.file_name().to_str() {
-            Some(REMOTE_GENERATION_METADATA_FILE) if !metadata => {
-                validate_remote_gc_regular_file(
-                    &path,
-                    MAX_REMOTE_GENERATION_FILE_BYTES,
-                    Some(&mut usage),
-                )?;
-                metadata = true;
-            }
-            Some(REMOTE_QUOTA_FILE) => {
-                quota = true;
-                validate_remote_gc_regular_file(
-                    &entry.path(),
-                    MAX_REMOTE_QUOTA_BYTES,
-                    Some(&mut usage),
-                )?;
-            }
-            Some(BUCKETS_DIRECTORY) if !buckets => {
-                store.validate_private_path(&path)?;
-                usage.add_directory()?;
-                validate_remote_gc_family(store, &path, RemoteCloneFamily::Buckets, &mut usage)?;
-                buckets = true;
-            }
-            Some(DIGESTS_DIRECTORY) if !digests => {
-                store.validate_private_path(&path)?;
-                usage.add_directory()?;
-                validate_remote_gc_family(store, &path, RemoteCloneFamily::Digests, &mut usage)?;
-                digests = true;
-            }
-            _ if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE) => {
-                validate_remote_gc_regular_file(&path, MAX_REMOTE_QUOTA_BYTES, Some(&mut usage))?;
-            }
-            _ if is_remote_atomic_temporary_file(
-                &entry.file_name(),
-                REMOTE_GENERATION_METADATA_FILE,
-            ) =>
-            {
-                validate_remote_gc_regular_file(
-                    &path,
-                    MAX_REMOTE_GENERATION_FILE_BYTES,
-                    Some(&mut usage),
-                )?;
-            }
-            _ => {
-                return Err(invalid_data(format!(
-                    "unexpected path in remote history GC generation {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    if require_complete && (!metadata || !buckets || !digests) {
-        return Err(invalid_data(
-            "remote history GC candidate namespace is incomplete",
-        ));
-    }
-    if !metadata && (buckets || digests || quota) {
-        return Err(invalid_data(
-            "partially deleted remote history GC trash lost its metadata out of order",
-        ));
-    }
-    if metadata {
-        let stored: RemoteGenerationMetadata = read_json_file(
-            &directory.join(REMOTE_GENERATION_METADATA_FILE),
-            MAX_REMOTE_GENERATION_FILE_BYTES,
-        )?;
-        if require_complete {
-            stored.validate_ready(&store.profile_id, source_id, redaction_profile, generation)?;
-        } else {
-            stored.validate(&store.profile_id, source_id, redaction_profile, generation)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_family(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    family: RemoteCloneFamily,
-    usage: &mut RemoteGcTreeUsage,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_name() == family.lock_name() {
-            let metadata = fs::symlink_metadata(&path)?;
-            validate_lock_metadata(&path, &metadata)?;
-            if metadata.len() > MAX_REMOTE_GENERATION_FILE_BYTES {
-                return Err(invalid_data("remote history GC lock file is too large"));
-            }
-            usage.add_file(metadata.len())?;
-            continue;
-        }
-        let published = family.shard_day(&path).is_some();
-        let temporary = remote_atomic_temporary_target(&entry.file_name())
-            .is_some_and(|target| family.shard_day(Path::new(target)).is_some());
-        if !published && !temporary {
-            return Err(invalid_data(format!(
-                "unexpected path in remote history GC family {}",
-                path.display()
-            )));
-        }
-        validate_remote_gc_regular_file(&path, family.maximum_shard_bytes(), Some(usage))?;
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_regular_file(
-    path: &Path,
-    maximum: u64,
-    usage: Option<&mut RemoteGcTreeUsage>,
-) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    validate_published_private_file(path)?;
-    if metadata.len() > maximum {
-        return Err(invalid_data(
-            "remote history GC file exceeds its family byte bound",
-        ));
-    }
-    if let Some(usage) = usage {
-        usage.add_file(metadata.len())?;
-    }
-    Ok(())
-}
-
-fn remove_remote_gc_generation_tree(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    for family_name in [BUCKETS_DIRECTORY, DIGESTS_DIRECTORY] {
-        let family = directory.join(family_name);
-        match fs::symlink_metadata(&family) {
-            Ok(metadata) => {
-                if metadata_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
-                    return Err(invalid_data(format!(
-                        "remote history GC family {} is not a real directory",
-                        family.display()
-                    )));
-                }
-                store.validate_private_path(&family)?;
-                for entry in fs::read_dir(&family)? {
-                    store.validate_private_path(&family)?;
-                    let path = entry?.path();
-                    let metadata = fs::symlink_metadata(&path)?;
-                    validate_data_file_metadata(&path, &metadata)?;
-                    fs::remove_file(&path)?;
-                }
-                store.validate_private_path(&family)?;
-                fs::remove_dir(&family)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-
-    store.validate_private_path(directory)?;
-    let mut metadata_temps = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        if is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_GENERATION_METADATA_FILE)
-            || is_remote_atomic_temporary_file(&entry.file_name(), REMOTE_QUOTA_FILE)
-        {
-            metadata_temps.push(entry.path());
-        }
-    }
-    for path in metadata_temps {
-        validate_published_private_file(&path)?;
-        fs::remove_file(path)?;
-    }
-    let quota_path = directory.join(REMOTE_QUOTA_FILE);
-    if quota_path.try_exists()? {
-        validate_remote_gc_regular_file(&quota_path, MAX_REMOTE_QUOTA_BYTES, None)?;
-        fs::remove_file(&quota_path)?;
-    }
-    let metadata_path = directory.join(REMOTE_GENERATION_METADATA_FILE);
-    match fs::symlink_metadata(&metadata_path) {
-        Ok(metadata) => {
-            validate_data_file_metadata(&metadata_path, &metadata)?;
-            fs::remove_file(&metadata_path)?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    store.validate_private_path(directory)?;
-    if fs::read_dir(directory)?.next().transpose()?.is_some() {
-        return Err(invalid_data(
-            "remote history GC trash contains unexpected remaining entries",
-        ));
-    }
-    fs::remove_dir(directory)
-}
-
-#[cfg(not(windows))]
-fn rename_remote_generation_to_trash(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn rename_remote_generation_to_trash(source: &Path, destination: &Path) -> io::Result<()> {
-    use crate::atomic_file::windows_wide_path;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
-    let source = windows_wide_path(source)?;
-    let destination = windows_wide_path(destination)?;
-    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            remote_gc_windows_move_flags(),
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(any(windows, test))]
-fn remote_gc_windows_move_flags() -> u32 {
-    // MOVEFILE_WRITE_THROUGH. Deliberately omit MOVEFILE_REPLACE_EXISTING so a
-    // pre-existing trash namespace can never be overwritten.
-    0x0000_0008
-}
-
-impl RemoteCloneFamily {
-    fn lock_name(self) -> &'static OsStr {
-        match self {
-            Self::Buckets => OsStr::new(BUCKETS_LOCK_FILE),
-            Self::Digests => OsStr::new(DIGESTS_LOCK_FILE),
-        }
-    }
-
-    fn maximum_shard_bytes(self) -> u64 {
-        match self {
-            Self::Buckets => MAX_SHARD_FILE_BYTES,
-            Self::Digests => MAX_COMPRESSED_EVIDENCE_SHARD_BYTES,
-        }
-    }
-
-    fn atomic_shard_kind(self) -> AtomicShardFileKind {
-        match self {
-            Self::Buckets => AtomicShardFileKind::Json,
-            Self::Digests => AtomicShardFileKind::GzipJson,
-        }
-    }
-
-    fn shard_day(self, path: &Path) -> Option<NaiveDate> {
-        match self {
-            Self::Buckets => shard_day_from_path(path),
-            Self::Digests => {
-                let name = path.file_name()?.to_str()?;
-                NaiveDate::parse_from_str(name.strip_suffix(".json.gz")?, "%Y-%m-%d").ok()
-            }
-        }
-    }
-
-    fn validate_shard(
-        self,
-        path: &Path,
-        profile_id: &HistoryProfileId,
-        source_id: &NodeId,
-        redaction_profile: RedactionProfile,
-        day: NaiveDate,
-    ) -> io::Result<()> {
-        match self {
-            Self::Buckets => {
-                read_source_bucket_shard(path, profile_id, source_id, redaction_profile, day)?
-                    .ok_or_else(|| invalid_data("remote clone bucket shard disappeared"))?;
-                Ok(())
-            }
-            Self::Digests => validate_digest_shard_for_remote_clone(
-                path,
-                profile_id,
-                source_id,
-                redaction_profile,
-                day,
-            ),
-        }
-    }
-}
-
-fn clone_remote_generation_family(
-    store: &SourceHistoryStore,
-    source_id: &NodeId,
-    redaction_profile: RedactionProfile,
-    source_directory: &Path,
-    destination_directory: &Path,
-    family: RemoteCloneFamily,
-) -> io::Result<()> {
-    if source_directory == destination_directory {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote history clone source and destination must differ",
-        ));
-    }
-    store.validate_private_path(source_directory)?;
-    store.validate_private_path(destination_directory)?;
-
-    // An interrupted atomic shard write leaves a target-bound temporary in
-    // the family directory. Recover it before enumerating the immutable
-    // baseline, and keep both family locks for the complete clone so a writer
-    // cannot introduce a new temporary between cleanup and enumeration.
-    let source_lock_name = family
-        .lock_name()
-        .to_str()
-        .expect("remote family lock names are ASCII");
-    let source_lock = open_lock_file(source_directory, source_lock_name)?;
-    let _source_lock = lock_exclusive(source_lock, source_directory, source_lock_name)?;
-    cleanup_atomic_shard_temporary_files(store, source_directory, family.atomic_shard_kind())?;
-    let destination_lock = open_lock_file(destination_directory, source_lock_name)?;
-    let _destination_lock =
-        lock_exclusive(destination_lock, destination_directory, source_lock_name)?;
-    cleanup_atomic_shard_temporary_files(store, destination_directory, family.atomic_shard_kind())?;
-
-    let source_entries = remote_clone_shard_entries(store, source_directory, family, true)?;
-    let destination_entries =
-        remote_clone_shard_entries(store, destination_directory, family, true)?;
-    if source_entries.len() > MAX_REMOTE_CLONE_SHARDS_PER_FAMILY
-        || destination_entries.len() > MAX_REMOTE_CLONE_SHARDS_PER_FAMILY
-    {
-        return Err(invalid_data(
-            "remote history generation has too many shards to clone",
-        ));
-    }
-    if destination_entries
-        .keys()
-        .any(|name| !source_entries.contains_key(name))
-    {
-        return Err(invalid_data(
-            "remote replacement contains a shard outside its expected baseline",
-        ));
-    }
-
-    let mut total_bytes = 0_u64;
-    for (name, (day, source_path, source_bytes)) in source_entries {
-        total_bytes = total_bytes
-            .checked_add(source_bytes)
-            .ok_or_else(|| invalid_data("remote history generation clone byte count overflowed"))?;
-        if total_bytes > MAX_REMOTE_CLONE_TOTAL_BYTES {
-            return Err(invalid_data(
-                "remote history generation is too large to clone",
-            ));
-        }
-        let destination_path = destination_directory.join(&name);
-        if destination_entries.contains_key(&name) {
-            ensure_private_files_equal(
-                &source_path,
-                &destination_path,
-                family.maximum_shard_bytes(),
-            )?;
-        } else if fs::hard_link(&source_path, &destination_path).is_err() {
-            let contents = read_private_file_bounded(&source_path, family.maximum_shard_bytes())?;
-            write_private_atomically(&destination_path, &contents)?;
-        }
-        validate_published_private_file(&destination_path)?;
-        family.validate_shard(
-            &destination_path,
-            &store.profile_id,
-            source_id,
-            redaction_profile,
-            day,
-        )?;
-    }
-    sync_directory(destination_directory)
-}
-
-fn remote_clone_shard_entries(
-    store: &SourceHistoryStore,
-    directory: &Path,
-    family: RemoteCloneFamily,
-    allow_lock: bool,
-) -> io::Result<BTreeMap<OsString, (NaiveDate, PathBuf, u64)>> {
-    store.validate_private_path(directory)?;
-    let mut entries = BTreeMap::new();
-    for entry in fs::read_dir(directory)? {
-        store.validate_private_path(directory)?;
-        let entry = entry?;
-        let name = entry.file_name();
-        if allow_lock && name == family.lock_name() {
-            validate_lock_metadata(&entry.path(), &fs::symlink_metadata(entry.path())?)?;
-            continue;
-        }
-        let path = entry.path();
-        let day = family.shard_day(&path).ok_or_else(|| {
-            invalid_data(format!(
-                "unexpected path in remote history clone source {}",
-                path.display()
-            ))
-        })?;
-        validate_published_private_file(&path)?;
-        let bytes = fs::symlink_metadata(&path)?.len();
-        if bytes > family.maximum_shard_bytes() {
-            return Err(invalid_data(
-                "remote history clone shard exceeds its byte bound",
-            ));
-        }
-        if entries.insert(name, (day, path, bytes)).is_some() {
-            return Err(invalid_data(
-                "duplicate path in remote history clone namespace",
-            ));
-        }
-    }
-    Ok(entries)
-}
-
-fn ensure_recoverable_empty_generation_directory(
-    store: &SourceHistoryStore,
-    directory: &Path,
-) -> io::Result<()> {
-    store.validate_private_path(directory)?;
-    if fs::read_dir(directory)?.next().transpose()?.is_some() {
-        return Err(invalid_data(
-            "remote replacement generation is missing metadata but is not empty",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_private_files_equal(left: &Path, right: &Path, maximum: u64) -> io::Result<()> {
-    let left = read_private_file_bounded(left, maximum)?;
-    let right = read_private_file_bounded(right, maximum)?;
-    if left != right {
-        return Err(invalid_data(
-            "remote replacement baseline shard conflicts with its active origin",
-        ));
-    }
-    Ok(())
-}
-
-fn read_private_file_bounded(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
-    let path_metadata = fs::symlink_metadata(path)?;
-    validate_data_file_metadata(path, &path_metadata)?;
-    if path_metadata.len() > maximum {
-        return Err(invalid_data("remote history clone shard is too large"));
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    add_nofollow_flags(&mut options);
-    let subject = format!("remote history clone shard {}", path.display());
-    let mut file = options
-        .open(path)
-        .map_err(|error| map_nofollow_error(error, &subject))?;
-    let metadata = file.metadata()?;
-    validate_data_file_metadata(path, &metadata)?;
-    ensure_opened_file_matches_path(path, &file, &path_metadata, &metadata, &subject)?;
-    if metadata.len() > maximum {
-        return Err(invalid_data("remote history clone shard is too large"));
-    }
-    let mut contents = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(maximum + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() as u64 > maximum {
-        return Err(invalid_data("remote history clone shard is too large"));
-    }
-    Ok(contents)
-}
-
-fn remote_page_fingerprint(
-    bucket_records: &[SourceBucketRecord],
-    digest_records: &[SourceSessionDigestRecord],
-    quota_records: &[RemoteQuotaChange],
-) -> io::Result<String> {
-    let mut writer = BoundedHashWriter::new(MAX_REMOTE_COW_FINGERPRINT_BYTES);
-    writer.write_all(b"codex-usage-monit/remote-active-page/v1\0")?;
-    serde_json::to_writer(
-        &mut writer,
-        &(bucket_records, digest_records, quota_records),
-    )
-    .map_err(|error| {
-        invalid_data(format!(
-            "could not fingerprint remote active history page: {error}"
-        ))
-    })?;
-    let digest = writer.finish();
-    let mut result = String::with_capacity(REMOTE_PAGE_FINGERPRINT_PREFIX.len() + 64);
-    result.push_str(REMOTE_PAGE_FINGERPRINT_PREFIX);
-    append_lower_hex(&mut result, &digest);
-    Ok(result)
-}
-
-fn validate_page_fingerprint(value: &str) -> io::Result<()> {
-    let Some(hex) = value.strip_prefix(REMOTE_PAGE_FINGERPRINT_PREFIX) else {
-        return Err(invalid_data("remote active page fingerprint is invalid"));
-    };
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(invalid_data("remote active page fingerprint is invalid"));
-    }
-    Ok(())
-}
-
-fn append_lower_hex(output: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-}
-
-struct BoundedHashWriter {
-    hasher: Sha256,
-    written: u64,
-    maximum: u64,
-}
-
-impl BoundedHashWriter {
-    fn new(maximum: u64) -> Self {
-        Self {
-            hasher: Sha256::new(),
-            written: 0,
-            maximum,
-        }
-    }
-
-    fn finish(self) -> [u8; 32] {
-        self.hasher.finalize().into()
-    }
-}
-
-impl Write for BoundedHashWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let length = u64::try_from(buffer.len())
-            .map_err(|_| invalid_data("remote active page fingerprint size overflowed"))?;
-        self.written = self
-            .written
-            .checked_add(length)
-            .ok_or_else(|| invalid_data("remote active page fingerprint size overflowed"))?;
-        if self.written > self.maximum {
-            return Err(invalid_data(
-                "remote active history page exceeds its fingerprint byte bound",
-            ));
-        }
-        Digest::update(&mut self.hasher, buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -4116,118 +1780,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_generation_cap_allows_existing_replays_and_rejects_new_bootstrap_and_cow() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let binding = default_binding();
-        let active = numbered_generation(1);
-        let active_ref =
-            activate_initial_generation(&history, &source, redaction, &active, &binding);
-        let replacement = numbered_generation(2);
-        let bucket_page = vec![bucket(at(10, 15), 20)];
-        let digest_page = vec![digest("new-thread", at(10, 15), 20)];
-        history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &bucket_page,
-                &digest_page,
-                at(11, 15),
-                &[],
-            )
-            .unwrap();
-
-        // These structural root entries are deliberately present before
-        // filling the cap. Only controlled generation identities beneath
-        // generations/ or gc-trash/ count toward the bound.
-        let root = history.source_remote_history_directory(&source, redaction);
-        history
-            .prepare_private_directory(&root.join(REMOTE_GC_TRASH_DIRECTORY))
-            .unwrap();
-        assert!(root.join(REMOTE_HISTORY_LOCK_FILE).is_file());
-        assert!(root.join(REMOTE_ACTIVE_MANIFEST_FILE).is_file());
-
-        for value in 3..=MAX_REMOTE_HISTORY_GENERATIONS {
-            history
-                .ensure_remote_history_generation(
-                    &source,
-                    redaction,
-                    &numbered_generation(value),
-                    &binding,
-                )
-                .unwrap();
-        }
-
-        // An exact generation replay must remain usable at capacity.
-        history
-            .ensure_remote_history_generation(&source, redaction, &active, &binding)
-            .unwrap();
-        let replay = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &bucket_page,
-                &digest_page,
-                at(11, 15),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(replay, RemoteHistoryPageWriteReport::default());
-
-        let bootstrap_overflow = numbered_generation(MAX_REMOTE_HISTORY_GENERATIONS + 1);
-        let error = history
-            .ensure_remote_history_generation(&source, redaction, &bootstrap_overflow, &binding)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        assert!(
-            !history
-                .source_remote_history_generation_directory(
-                    &source,
-                    redaction,
-                    &bootstrap_overflow,
-                )
-                .exists()
-        );
-
-        let cow_overflow = numbered_generation(MAX_REMOTE_HISTORY_GENERATIONS + 2);
-        let replacement_active =
-            SourceHistoryRemoteActiveRef::new(replacement.clone(), binding.clone()).unwrap();
-        let error = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &replacement_active,
-                &cow_overflow,
-                &binding,
-                &[bucket(at(10, 30), 30)],
-                &[digest("newer-thread", at(10, 30), 30)],
-                at(11, 30),
-                &[],
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        assert!(
-            !history
-                .source_remote_history_generation_directory(&source, redaction, &cow_overflow)
-                .exists()
-        );
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(replacement)
-        );
-    }
-
-    #[test]
     fn bounded_sweep_reclaims_thirty_two_orphans_and_restores_capacity() {
         let temporary = tempdir().unwrap();
         let history = store(temporary.path().join("state"), SourceKind::Ssh);
@@ -4251,7 +1803,6 @@ mod tests {
                 .unwrap(),
             RemoteHistoryGenerationSweepReport {
                 deleted: 0,
-                recovered: 0,
                 skipped: 0,
                 remaining: MAX_REMOTE_HISTORY_GENERATIONS,
             }
@@ -4262,10 +1813,9 @@ mod tests {
                 .sweep_remote_history_generations(&source, redaction, &BTreeSet::new(), 8)
                 .unwrap();
             assert_eq!(report.deleted, 8);
-            assert_eq!(report.recovered, 0);
             assert_eq!(report.skipped, 0);
             assert_eq!(report.remaining, expected_remaining);
-            assert!(report.deleted + report.recovered <= 8);
+            assert!(report.deleted <= 8);
         }
 
         history
@@ -4312,7 +1862,6 @@ mod tests {
                 .unwrap(),
             RemoteHistoryGenerationSweepReport {
                 deleted: 0,
-                recovered: 0,
                 skipped: MAX_REMOTE_HISTORY_GENERATIONS,
                 remaining: 0,
             }
@@ -4327,117 +1876,8 @@ mod tests {
                 )
                 .unwrap_err()
                 .kind(),
-            io::ErrorKind::StorageFull
+            io::ErrorKind::WouldBlock
         );
-    }
-
-    #[test]
-    fn deterministic_trash_consumes_capacity_and_sweep_recovers_it_first() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let binding = default_binding();
-        for value in 1..=MAX_REMOTE_HISTORY_GENERATIONS {
-            history
-                .ensure_remote_history_generation(
-                    &source,
-                    redaction,
-                    &numbered_generation(value),
-                    &binding,
-                )
-                .unwrap();
-        }
-
-        let retired = numbered_generation(1);
-        let root = history.source_remote_history_directory(&source, redaction);
-        let generations = root.join(REMOTE_GENERATIONS_DIRECTORY);
-        let trash = root.join(REMOTE_GC_TRASH_DIRECTORY);
-        history.prepare_private_directory(&trash).unwrap();
-        let original =
-            history.source_remote_history_generation_directory(&source, redaction, &retired);
-        let trash_generation = trash.join(remote_gc_trash_name(&retired));
-        rename_remote_generation_to_trash(&original, &trash_generation).unwrap();
-        sync_directory(&generations).unwrap();
-        sync_directory(&trash).unwrap();
-
-        let next = numbered_generation(MAX_REMOTE_HISTORY_GENERATIONS + 1);
-        assert_eq!(
-            history
-                .ensure_remote_history_generation(&source, redaction, &next, &binding)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::StorageFull
-        );
-        assert_eq!(
-            history
-                .ensure_remote_history_generation(&source, redaction, &retired, &binding)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        assert_eq!(
-            history
-                .sweep_remote_history_generations(&source, redaction, &BTreeSet::new(), 1)
-                .unwrap(),
-            RemoteHistoryGenerationSweepReport {
-                deleted: 0,
-                recovered: 1,
-                skipped: 0,
-                remaining: MAX_REMOTE_HISTORY_GENERATIONS - 1,
-            }
-        );
-        assert!(!trash_generation.exists());
-        history
-            .ensure_remote_history_generation(&source, redaction, &next, &binding)
-            .unwrap();
-    }
-
-    #[test]
-    fn remote_generation_capacity_fails_closed_on_unknown_or_non_directory_entries() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::PreviewEnabled;
-        let binding = default_binding();
-        let first = numbered_generation(1);
-        history
-            .ensure_remote_history_generation(&source, redaction, &first, &binding)
-            .unwrap();
-        let generations = history
-            .source_remote_history_directory(&source, redaction)
-            .join(REMOTE_GENERATIONS_DIRECTORY);
-
-        let unknown = generations.join("unknown-generation");
-        history.prepare_private_directory(&unknown).unwrap();
-        let error = history
-            .ensure_remote_history_generation(&source, redaction, &numbered_generation(2), &binding)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        fs::remove_dir(&unknown).unwrap();
-
-        let malformed = generations.join(numbered_generation(4).as_str());
-        history.prepare_private_directory(&malformed).unwrap();
-        let unexpected = malformed.join("unexpected-entry");
-        write_private_atomically(&unexpected, b"not a generation root entry\n").unwrap();
-        let error = history
-            .ensure_remote_history_generation(&source, redaction, &numbered_generation(2), &binding)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        fs::remove_file(unexpected).unwrap();
-        fs::remove_dir(malformed).unwrap();
-
-        // A syntactically valid generation name must still be a real private
-        // directory. This rejects regular files, Unix links, and Windows
-        // reparse points through validate_private_path.
-        let non_directory = generations.join(numbered_generation(3).as_str());
-        write_private_atomically(&non_directory, b"not a generation directory\n").unwrap();
-        let error = history
-            .ensure_remote_history_generation(&source, redaction, &numbered_generation(2), &binding)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(non_directory.is_file());
     }
 
     #[test]
@@ -4465,11 +1905,11 @@ mod tests {
                 .unwrap(),
             RemoteHistoryGenerationGcOutcome::SkippedActive
         );
-        assert!(
-            history
-                .source_remote_history_generation_directory(&source, redaction, &active)
-                .is_dir()
-        );
+        let db = history.sqlite_database().unwrap();
+        db.read(|connection| {
+            history.sqlite_remote_generation(connection, &db, &source, redaction, &active)
+        })
+        .unwrap();
 
         let protected = BTreeSet::from([protected_generation.clone()]);
         assert_eq!(
@@ -4483,15 +1923,17 @@ mod tests {
                 .unwrap(),
             RemoteHistoryGenerationGcOutcome::SkippedProtected
         );
-        assert!(
-            history
-                .source_remote_history_generation_directory(
-                    &source,
-                    redaction,
-                    &protected_generation,
-                )
-                .is_dir()
-        );
+        let db = history.sqlite_database().unwrap();
+        db.read(|connection| {
+            history.sqlite_remote_generation(
+                connection,
+                &db,
+                &source,
+                redaction,
+                &protected_generation,
+            )
+        })
+        .unwrap();
     }
 
     #[test]
@@ -4544,186 +1986,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_generation_gc_resumes_its_exact_partially_deleted_trash() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::PreviewEnabled;
-        let candidate = generation(GENERATION_A);
-        let binding = default_binding();
-        history
-            .ensure_remote_history_generation(&source, redaction, &candidate, &binding)
-            .unwrap();
-        history
-            .apply_remote_history_generation_page(
-                &source,
-                redaction,
-                &candidate,
-                &binding,
-                &[bucket(at(10, 0), 5)],
-                &[digest("trash-thread", at(10, 0), 5)],
-                &[],
-            )
-            .unwrap();
-
-        let root = history.source_remote_history_directory(&source, redaction);
-        let generations = root.join(REMOTE_GENERATIONS_DIRECTORY);
-        let trash = root.join(REMOTE_GC_TRASH_DIRECTORY);
-        history.prepare_private_directory(&trash).unwrap();
-        let original =
-            history.source_remote_history_generation_directory(&source, redaction, &candidate);
-        let trash_generation = trash.join(remote_gc_trash_name(&candidate));
-        rename_remote_generation_to_trash(&original, &trash_generation).unwrap();
-        // Model a crash halfway through deletion: one family is already gone,
-        // but generation metadata remains as the recovery authority.
-        let buckets = trash_generation.join(BUCKETS_DIRECTORY);
-        for entry in fs::read_dir(&buckets).unwrap() {
-            fs::remove_file(entry.unwrap().path()).unwrap();
-        }
-        fs::remove_dir(&buckets).unwrap();
-        sync_directory(&generations).unwrap();
-        sync_directory(&trash).unwrap();
-
-        assert_eq!(
-            history
-                .garbage_collect_remote_history_generation(
-                    &source,
-                    redaction,
-                    &candidate,
-                    &BTreeSet::new(),
-                )
-                .unwrap(),
-            RemoteHistoryGenerationGcOutcome::RecoveredTrash
-        );
-        assert!(!trash_generation.exists());
-    }
-
-    #[test]
-    fn remote_generation_gc_rejects_unknown_generation_and_trash_entries() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let candidate = generation(GENERATION_A);
-        let binding = default_binding();
-        history
-            .ensure_remote_history_generation(&source, redaction, &candidate, &binding)
-            .unwrap();
-        let candidate_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &candidate);
-        let unknown = candidate_directory
-            .join(BUCKETS_DIRECTORY)
-            .join(".unknown-gc-file");
-        write_private_atomically(&unknown, b"unknown\n").unwrap();
-        assert_eq!(
-            history
-                .garbage_collect_remote_history_generation(
-                    &source,
-                    redaction,
-                    &candidate,
-                    &BTreeSet::new(),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            history
-                .sweep_remote_history_generations(&source, redaction, &BTreeSet::new(), 8)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(candidate_directory.is_dir());
-
-        fs::remove_file(unknown).unwrap();
-        let trash = history
-            .source_remote_history_directory(&source, redaction)
-            .join(REMOTE_GC_TRASH_DIRECTORY);
-        history.prepare_private_directory(&trash).unwrap();
-        write_private_atomically(&trash.join(".unknown"), b"unknown\n").unwrap();
-        assert_eq!(
-            history
-                .garbage_collect_remote_history_generation(
-                    &source,
-                    redaction,
-                    &candidate,
-                    &BTreeSet::new(),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            history
-                .sweep_remote_history_generations(&source, redaction, &BTreeSet::new(), 8)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(candidate_directory.is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_generation_gc_refuses_symlinks_before_rename() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let candidate = generation(GENERATION_A);
-        let binding = default_binding();
-        history
-            .ensure_remote_history_generation(&source, redaction, &candidate, &binding)
-            .unwrap();
-        let candidate_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &candidate);
-        let outside = temporary.path().join("outside");
-        fs::write(&outside, b"outside\n").unwrap();
-        symlink(
-            &outside,
-            candidate_directory
-                .join(BUCKETS_DIRECTORY)
-                .join("2026-08-30.json"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            history
-                .garbage_collect_remote_history_generation(
-                    &source,
-                    redaction,
-                    &candidate,
-                    &BTreeSet::new(),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            history
-                .sweep_remote_history_generations(&source, redaction, &BTreeSet::new(), 8)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(candidate_directory.is_dir());
-        assert_eq!(fs::read(outside).unwrap(), b"outside\n");
-    }
-
-    #[test]
-    fn windows_gc_rename_policy_is_write_through_and_never_replaces() {
-        const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-
-        let flags = remote_gc_windows_move_flags();
-        assert_ne!(flags & MOVEFILE_WRITE_THROUGH, 0);
-        assert_eq!(flags & MOVEFILE_REPLACE_EXISTING, 0);
-    }
-
-    #[test]
     fn local_source_keeps_direct_bucket_layout_and_query_behavior() {
         let temporary = tempdir().unwrap();
         let history = store(temporary.path().join("state"), SourceKind::Local);
@@ -4760,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_legacy_direct_rows_are_invisible_without_an_active_manifest() {
+    fn ssh_unactivated_direct_rows_are_invisible_without_an_active_manifest() {
         let temporary = tempdir().unwrap();
         let history = store(temporary.path().join("state"), SourceKind::Ssh);
         let source = source_id();
@@ -4816,11 +2078,13 @@ mod tests {
             .unwrap();
         assert_eq!(report, RemoteHistoryPageWriteReport::default());
 
-        let directory =
-            history.source_remote_history_generation_directory(&source, redaction, &generation);
-        assert!(directory.join(REMOTE_GENERATION_METADATA_FILE).is_file());
-        assert!(directory.join(BUCKETS_DIRECTORY).is_dir());
-        assert!(directory.join(DIGESTS_DIRECTORY).is_dir());
+        let db = history.sqlite_database().unwrap();
+        let persisted = db
+            .read(|connection| {
+                history.sqlite_remote_generation(connection, &db, &source, redaction, &generation)
+            })
+            .unwrap();
+        assert_eq!(persisted.metadata.binding, binding);
         assert_eq!(
             history
                 .active_remote_history_generation(&source, redaction)
@@ -4961,444 +2225,64 @@ mod tests {
         let source = source_id();
         let redaction = RedactionProfile::Redacted;
         let first = generation(GENERATION_A);
-        let replacement = generation(GENERATION_B);
+        let second = generation(GENERATION_B);
         let binding = default_binding();
-        let first_active =
-            activate_initial_generation(&history, &source, redaction, &first, &binding);
-
+        let active = activate_initial_generation(&history, &source, redaction, &first, &binding);
         history
-            .ensure_remote_history_generation(&source, redaction, &replacement, &binding)
+            .ensure_remote_history_generation(&source, redaction, &second, &binding)
             .unwrap();
         history
             .apply_remote_history_generation_page(
                 &source,
                 redaction,
-                &replacement,
+                &second,
                 &binding,
                 &[bucket(at(10, 15), 20)],
                 &[digest("new-thread", at(10, 15), 20)],
                 &[],
             )
             .unwrap();
-
-        // Open the same root-lock object used by activation through an
-        // independent descriptor. Probe actual contention at the family
-        // boundary, rather than treating an unscheduled publisher as blocked.
-        let root = history.source_remote_history_directory(&source, redaction);
-        let publisher_lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE).unwrap();
-        let read_boundary_checked = std::cell::Cell::new(false);
+        let writer = history.clone();
+        let writer_source = source.clone();
+        let writer_second = second.clone();
+        let writer_binding = binding.clone();
         let before = history
             .load_remote_history_snapshot_since_with_between_families(
                 &source,
                 redaction,
                 at(9, 0),
                 || {
-                    assert!(
-                        matches!(publisher_lock.try_lock(), Err(fs::TryLockError::WouldBlock)),
-                        "manifest publication must contend with the snapshot's root lock"
-                    );
-                    read_boundary_checked.set(true);
+                    std::thread::spawn(move || {
+                        writer.activate_remote_history_generation(
+                            &writer_source,
+                            redaction,
+                            Some(&active),
+                            &writer_second,
+                            &writer_binding,
+                            at(11, 15),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+                    .unwrap();
                 },
             )
             .unwrap();
-        assert!(
-            read_boundary_checked.get(),
-            "snapshot must reach the boundary between both record families"
-        );
         assert_eq!(before.active_ref.as_ref().unwrap().generation(), &first);
-        assert_eq!(before.bucket_records.len(), 1);
         assert_eq!(bucket_total(&before.bucket_records[0]), 10);
         assert_eq!(
-            before
-                .session_digest_records
-                .iter()
-                .map(digest_thread)
-                .collect::<Vec<_>>(),
-            vec!["old-thread"]
-        );
-
-        publisher_lock
-            .try_lock()
-            .expect("snapshot must release its root lock after both families");
-        publisher_lock.unlock().unwrap();
-        let publication_checked = std::cell::Cell::new(false);
-        history
-            .activate_remote_history_generation_unfenced(
-                &source,
-                redaction,
-                Some(&first_active),
-                &replacement,
-                &binding,
-                at(11, 15),
-                Some(&|| {
-                    assert!(
-                        matches!(
-                            publisher_lock.try_lock_shared(),
-                            Err(fs::TryLockError::WouldBlock)
-                        ),
-                        "actual manifest publication must hold the exclusive root lock"
-                    );
-                    publication_checked.set(true);
-                }),
-            )
-            .unwrap();
-        assert!(
-            publication_checked.get(),
-            "activation must reach publication"
+            digest_thread(&before.session_digest_records[0]),
+            "old-thread"
         );
         let after = history
             .load_remote_history_snapshot_since(&source, redaction, at(9, 0))
             .unwrap();
-        assert_eq!(
-            after.active_ref.as_ref().unwrap().generation(),
-            &replacement
-        );
-        assert_eq!(after.bucket_records.len(), 1);
+        assert_eq!(after.active_ref.as_ref().unwrap().generation(), &second);
         assert_eq!(bucket_total(&after.bucket_records[0]), 20);
         assert_eq!(
-            after
-                .session_digest_records
-                .iter()
-                .map(digest_thread)
-                .collect::<Vec<_>>(),
-            vec!["new-thread"]
+            digest_thread(&after.session_digest_records[0]),
+            "new-thread"
         );
-    }
-
-    #[test]
-    fn cow_digest_failure_keeps_both_active_families_unchanged() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let active = generation(GENERATION_A);
-        let replacement = generation(GENERATION_B);
-        let binding = default_binding();
-        let active_ref =
-            activate_initial_generation(&history, &source, redaction, &active, &binding);
-
-        // The bucket addition is valid, while the digest intentionally
-        // conflicts at an equal revision after the bucket family was written.
-        let bucket_page = vec![bucket(at(10, 15), 20)];
-        let digest_page = vec![digest("old-thread", at(10, 0), 99)];
-        let error = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &bucket_page,
-                &digest_page,
-                at(11, 15),
-                &[],
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(active.clone())
-        );
-
-        let visible_buckets = history
-            .load_source_records_since(&source, redaction, at(9, 0))
-            .unwrap();
-        let visible_digests = history
-            .load_source_session_digest_records_since(&source, redaction, at(9, 0))
-            .unwrap();
-        assert_eq!(visible_buckets.records.len(), 1);
-        assert_eq!(bucket_total(&visible_buckets.records[0]), 10);
-        assert_eq!(visible_digests.records.len(), 1);
-        assert_eq!(digest_total(&visible_digests.records[0]), 10);
-
-        // The invisible replacement retained the already-applied bucket page.
-        // Replaying the same deterministic WAL target must not overwrite it
-        // with the baseline clone, even though the digest still fails.
-        let replacement_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &replacement);
-        let staged_buckets = history
-            .load_source_bucket_records_from_directory(
-                &source,
-                redaction,
-                at(9, 0),
-                &replacement_directory.join(BUCKETS_DIRECTORY),
-            )
-            .unwrap();
-        assert_eq!(staged_buckets.len(), 2);
-        assert!(
-            history
-                .apply_remote_history_active_page_cow(
-                    &source,
-                    redaction,
-                    &active_ref,
-                    &replacement,
-                    &binding,
-                    &bucket_page,
-                    &digest_page,
-                    at(11, 15),
-                    &[],
-                )
-                .is_err()
-        );
-        let replayed_buckets = history
-            .load_source_bucket_records_from_directory(
-                &source,
-                redaction,
-                at(9, 0),
-                &replacement_directory.join(BUCKETS_DIRECTORY),
-            )
-            .unwrap();
-        assert_eq!(replayed_buckets.len(), 2);
-        assert_eq!(
-            history
-                .activate_remote_history_generation(
-                    &source,
-                    redaction,
-                    Some(&active_ref),
-                    &replacement,
-                    &binding,
-                    at(11, 30),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn cow_success_switches_buckets_and_digests_once_and_replays() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::PreviewEnabled;
-        let active = generation(GENERATION_A);
-        let replacement = generation(GENERATION_B);
-        let binding = default_binding();
-        let active_ref =
-            activate_initial_generation(&history, &source, redaction, &active, &binding);
-        let bucket_page = vec![bucket(at(10, 15), 20)];
-        let digest_page = vec![digest("new-thread", at(10, 15), 20)];
-
-        let report = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &bucket_page,
-                &digest_page,
-                at(11, 15),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(report.bucket_history.shards_written, 1);
-        assert_eq!(report.session_digests.shards_written, 1);
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(replacement.clone())
-        );
-        let buckets = history
-            .load_source_records_since(&source, redaction, at(9, 0))
-            .unwrap();
-        let digests = history
-            .load_source_session_digest_records_since(&source, redaction, at(9, 0))
-            .unwrap();
-        assert_eq!(buckets.records.len(), 2);
-        assert_eq!(digests.records.len(), 2);
-
-        let replay = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &bucket_page,
-                &digest_page,
-                at(11, 45),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(replay, RemoteHistoryPageWriteReport::default());
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(replacement)
-        );
-    }
-
-    #[test]
-    fn cow_clone_recovers_exact_shard_temps_and_rejects_unknown_hidden_files() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::PreviewEnabled;
-        let active = generation(GENERATION_A);
-        let replacement = generation(GENERATION_B);
-        let binding = default_binding();
-        let active_ref =
-            activate_initial_generation(&history, &source, redaction, &active, &binding);
-        let active_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &active);
-        let bucket_temp = active_directory
-            .join(BUCKETS_DIRECTORY)
-            .join(".2026-08-30.json.201.1.tmp");
-        let digest_temp = active_directory
-            .join(DIGESTS_DIRECTORY)
-            .join(".2026-08-30.json.gz.202.2.tmp");
-        write_private_atomically(&bucket_temp, b"interrupted bucket write\n").unwrap();
-        write_private_atomically(&digest_temp, b"interrupted digest write\n").unwrap();
-
-        history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &active_ref,
-                &replacement,
-                &binding,
-                &[bucket(at(10, 15), 20)],
-                &[digest("new-thread", at(10, 15), 20)],
-                at(11, 15),
-                &[],
-            )
-            .unwrap();
-        assert!(!bucket_temp.exists());
-        assert!(!digest_temp.exists());
-
-        let replacement_ref =
-            SourceHistoryRemoteActiveRef::new(replacement.clone(), binding.clone()).unwrap();
-        let replacement_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &replacement);
-        let unknown = replacement_directory
-            .join(BUCKETS_DIRECTORY)
-            .join(".2026-08-30.json.bad.tmp");
-        write_private_atomically(&unknown, b"not one of our temps\n").unwrap();
-        let next = generation(GENERATION_C);
-        assert_eq!(
-            history
-                .apply_remote_history_active_page_cow(
-                    &source,
-                    redaction,
-                    &replacement_ref,
-                    &next,
-                    &binding,
-                    &[bucket_revision(2, at(10, 30), 30)],
-                    &[],
-                    at(11, 30),
-                    &[],
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(unknown.exists());
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(replacement.clone())
-        );
-
-        // A crash can also strand a temporary in the partially materialized
-        // replacement. Once the operator removes the unrelated unknown file,
-        // replay of the exact same page cleans the destination temp and
-        // completes the COW generation.
-        fs::remove_file(&unknown).unwrap();
-        let next_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &next);
-        let destination_temp = next_directory
-            .join(BUCKETS_DIRECTORY)
-            .join(".2026-08-30.json.203.3.tmp");
-        write_private_atomically(&destination_temp, b"interrupted baseline clone\n").unwrap();
-        history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &replacement_ref,
-                &next,
-                &binding,
-                &[bucket_revision(2, at(10, 30), 30)],
-                &[],
-                at(11, 30),
-                &[],
-            )
-            .unwrap();
-        assert!(!destination_temp.exists());
-        assert_eq!(
-            history
-                .active_remote_history_generation(&source, redaction)
-                .unwrap(),
-            Some(next)
-        );
-    }
-
-    #[test]
-    fn cow_rejects_stale_active_cas_and_replacement_reuse() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let first = generation(GENERATION_A);
-        let second = generation(GENERATION_B);
-        let stale_replacement = generation(GENERATION_C);
-        let binding = default_binding();
-        let first_ref = activate_initial_generation(&history, &source, redaction, &first, &binding);
-        history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &first_ref,
-                &second,
-                &binding,
-                &[bucket(at(10, 15), 20)],
-                &[digest("new-thread", at(10, 15), 20)],
-                at(11, 15),
-                &[],
-            )
-            .unwrap();
-
-        let stale = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &first_ref,
-                &stale_replacement,
-                &binding,
-                &[bucket(at(10, 30), 30)],
-                &[],
-                at(11, 30),
-                &[],
-            )
-            .unwrap_err();
-        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
-        assert!(
-            !history
-                .source_remote_history_generation_directory(&source, redaction, &stale_replacement,)
-                .exists()
-        );
-
-        // An already-published deterministic target can only replay the exact
-        // page fingerprint and expected generation stored in its metadata.
-        let collision = history
-            .apply_remote_history_active_page_cow(
-                &source,
-                redaction,
-                &first_ref,
-                &second,
-                &binding,
-                &[bucket(at(10, 30), 31)],
-                &[],
-                at(11, 45),
-                &[],
-            )
-            .unwrap_err();
-        assert_eq!(collision.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -5532,109 +2416,6 @@ mod tests {
     }
 
     #[test]
-    fn generation_binding_is_exact_and_cow_cannot_change_it() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::PreviewEnabled;
-        let active_generation = generation(GENERATION_A);
-        let replacement = generation(GENERATION_B);
-        let active_binding = binding(7, [1; 5]);
-        let changed_binding = binding(8, [2; 5]);
-        let active = activate_initial_generation(
-            &history,
-            &source,
-            redaction,
-            &active_generation,
-            &active_binding,
-        );
-
-        assert_eq!(
-            history
-                .ensure_remote_history_generation(
-                    &source,
-                    redaction,
-                    &active_generation,
-                    &changed_binding,
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            history
-                .apply_remote_history_active_page_cow(
-                    &source,
-                    redaction,
-                    &active,
-                    &replacement,
-                    &changed_binding,
-                    &[bucket(at(10, 15), 20)],
-                    &[],
-                    at(11, 15),
-                    &[],
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(
-            !history
-                .source_remote_history_generation_directory(&source, redaction, &replacement)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn exact_atomic_metadata_temps_are_recovered_but_unknown_dotfiles_fail() {
-        let temporary = tempdir().unwrap();
-        let history = store(temporary.path().join("state"), SourceKind::Ssh);
-        let source = source_id();
-        let redaction = RedactionProfile::Redacted;
-        let candidate = generation(GENERATION_A);
-        let binding = default_binding();
-        let generation_directory =
-            history.source_remote_history_generation_directory(&source, redaction, &candidate);
-        history
-            .prepare_private_directory(&generation_directory)
-            .unwrap();
-        let generation_temp = generation_directory.join(".generation.json.123.7.tmp");
-        write_private_atomically(&generation_temp, b"orphan generation metadata\n").unwrap();
-        history
-            .ensure_remote_history_generation(&source, redaction, &candidate, &binding)
-            .unwrap();
-        assert!(!generation_temp.exists());
-
-        let root = history.source_remote_history_directory(&source, redaction);
-        let active_temp = root.join(".active.json.456.8.tmp");
-        write_private_atomically(&active_temp, b"orphan active manifest\n").unwrap();
-        let next = generation(GENERATION_B);
-        history
-            .ensure_remote_history_generation(&source, redaction, &next, &binding)
-            .unwrap();
-        assert!(!active_temp.exists());
-
-        let unknown = generation_directory.join(".generation.json.bad.tmp");
-        write_private_atomically(&unknown, b"not ours\n").unwrap();
-        assert_eq!(
-            history
-                .apply_remote_history_generation_page(
-                    &source,
-                    redaction,
-                    &candidate,
-                    &binding,
-                    &[],
-                    &[],
-                    &[],
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(unknown.exists());
-    }
-
-    #[test]
     fn explicit_and_active_generation_fences_fail_closed() {
         let temporary = tempdir().unwrap();
         let history = store(temporary.path().join("state"), SourceKind::Ssh);
@@ -5747,5 +2528,83 @@ mod tests {
 
         #[cfg(windows)]
         assert_eq!(stable_lock_share_mode_for_test(), 0x1 | 0x2);
+    }
+    #[test]
+    fn active_sql_page_is_atomic_idempotent_and_does_not_allocate_generations() {
+        let temporary = tempdir().unwrap();
+        let history = store(temporary.path().join("state"), SourceKind::Ssh);
+        let source = source_id();
+        let redaction = RedactionProfile::Redacted;
+        let current_generation = generation(GENERATION_A);
+        let binding = default_binding();
+        let active = activate_initial_generation(
+            &history,
+            &source,
+            redaction,
+            &current_generation,
+            &binding,
+        );
+        let apply = |buckets: &[SourceBucketRecord], digests: &[SourceSessionDigestRecord]| {
+            history.apply_remote_history_active_page(
+                &source,
+                redaction,
+                &active,
+                &binding,
+                buckets,
+                digests,
+                at(12, 0),
+                &[],
+            )
+        };
+        assert!(
+            apply(
+                &[bucket_revision(2, at(10, 0), 20)],
+                &[digest_revision(1, "old-thread", at(10, 0), 20)]
+            )
+            .is_err()
+        );
+        let old = history
+            .load_remote_history_snapshot_since(&source, redaction, at(9, 0))
+            .unwrap();
+        assert_eq!(bucket_total(&old.bucket_records[0]), 10);
+        assert_eq!(digest_total(&old.session_digest_records[0]), 10);
+        let buckets = [bucket_revision(2, at(10, 0), 20)];
+        let digests = [digest_revision(2, "old-thread", at(10, 0), 20)];
+        apply(&buckets, &digests).unwrap();
+        let replay = apply(&buckets, &digests).unwrap();
+        assert_eq!(replay.bucket_history.shards_written, 0);
+        assert_eq!(replay.session_digests.shards_written, 0);
+        let after = history
+            .load_remote_history_snapshot_since(&source, redaction, at(9, 0))
+            .unwrap();
+        assert_eq!(after.active_ref.as_ref(), Some(&active));
+        assert_eq!(bucket_total(&after.bucket_records[0]), 20);
+        assert_eq!(digest_total(&after.session_digest_records[0]), 20);
+        let db = history.sqlite_database().unwrap();
+        assert_eq!(
+            db.read(|connection| history
+                .sqlite_remote_catalog(connection, &db, &source, redaction)
+                .map(|rows| rows.len()))
+                .unwrap(),
+            1
+        );
+        let stale =
+            SourceHistoryRemoteActiveRef::new(generation(GENERATION_B), binding.clone()).unwrap();
+        assert_eq!(
+            history
+                .apply_remote_history_active_page(
+                    &source,
+                    redaction,
+                    &stale,
+                    &binding,
+                    &[],
+                    &[],
+                    at(12, 1),
+                    &[]
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

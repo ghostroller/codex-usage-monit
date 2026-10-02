@@ -34,7 +34,6 @@ pub const SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION: u32 = 2;
 pub const WRITER_LEASE_DIAGNOSTIC_VERSION: u32 = 1;
 
 const OWNERSHIP_DIRECTORY: &str = "history-ownership";
-const LEGACY_HISTORY_DIRECTORY: &str = "history-v1";
 const WRITER_LOCK_FILE: &str = "writer.lock";
 const TRANSITION_LOCK_FILE: &str = "transition.lock";
 const INITIALIZATION_ANCHOR_FILE: &str = "initialization-anchor.json";
@@ -381,13 +380,6 @@ pub struct HistoryWriterLease {
     _not_sync: PhantomData<Cell<()>>,
 }
 
-/// History backend authorized by a writer-lease and durable ownership epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryWriteBackend {
-    V1,
-    V2,
-}
-
 /// Non-forgeable, short-lived authority for one history persistence backend.
 ///
 /// Holding the OS writer lease alone is not enough: every write must also be
@@ -399,14 +391,9 @@ pub struct HistoryWriteAuthority<'a> {
     store: &'a HistoryOwnershipStore,
     lease: &'a HistoryWriterLease,
     expected: &'a HistoryOwnershipManifest,
-    backend: HistoryWriteBackend,
 }
 
 impl HistoryWriteAuthority<'_> {
-    pub fn backend(&self) -> HistoryWriteBackend {
-        self.backend
-    }
-
     pub fn expected_manifest(&self) -> &HistoryOwnershipManifest {
         self.expected
     }
@@ -415,18 +402,16 @@ impl HistoryWriteAuthority<'_> {
     pub fn validate(&self) -> io::Result<()> {
         self.expected.validate_binding(self.store)?;
         self.store.validate_writer_lease(self.lease)?;
-        match (self.backend, self.expected.state()) {
-            (HistoryWriteBackend::V1, HistoryOwnershipState::V1Active)
-            | (
-                HistoryWriteBackend::V2,
-                HistoryOwnershipState::Migrating | HistoryOwnershipState::V2Active,
-            ) => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "history write authority does not match the active backend phase",
-                ));
-            }
+        if !self.expected.is_sqlite_backend()
+            || !matches!(
+                self.expected.state(),
+                HistoryOwnershipState::Migrating | HistoryOwnershipState::V2Active
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "history writes require SQLite ownership",
+            ));
         }
         match self.store.load_manifest()? {
             OwnershipManifestStatus::Initialized(current) if current == *self.expected => {}
@@ -449,51 +434,13 @@ impl HistoryWriteAuthority<'_> {
         profile_id: &HistoryProfileId,
         redaction_profile: RedactionProfile,
     ) -> io::Result<()> {
-        if self.backend != HistoryWriteBackend::V2
-            || self.store.state_root() != state_root
+        if self.store.state_root() != state_root
             || self.store.profile_id() != profile_id
             || self.store.redaction_profile() != redaction_profile
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "history write authority does not belong to this v2 namespace",
-            ));
-        }
-        self.validate()
-    }
-
-    /// Checks that a legacy v1 store is the exact profile/redaction namespace
-    /// fenced by this authority.
-    ///
-    /// The legacy root must be the literal `history-v1` child of the
-    /// ownership state root. Exact lexical equality is deliberate: accepting
-    /// aliases here could place the v1 shard lock and the ownership writer
-    /// lease in different coordination domains.
-    pub fn validate_v1_namespace(
-        &self,
-        legacy_root: &Path,
-        namespace: &str,
-        redact_content: bool,
-    ) -> io::Result<()> {
-        let expected_redaction = if redact_content {
-            RedactionProfile::Redacted
-        } else {
-            RedactionProfile::PreviewEnabled
-        };
-        let expected_namespace = if redact_content {
-            format!("{}-redacted", self.store.profile_id())
-        } else {
-            self.store.profile_id().as_str().to_owned()
-        };
-        if self.backend != HistoryWriteBackend::V1
-            || legacy_root.file_name() != Some(OsStr::new(LEGACY_HISTORY_DIRECTORY))
-            || legacy_root.parent() != Some(self.store.state_root())
-            || self.store.redaction_profile() != expected_redaction
-            || namespace != expected_namespace
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "history write authority does not belong to this v1 namespace",
             ));
         }
         self.validate()
@@ -573,38 +520,24 @@ impl HistoryOwnershipStore {
         self.ownership_directory().join(TRANSITION_LOCK_FILE)
     }
 
-    /// Authorizes one v1 write only while the exact initial manifest remains
-    /// active. Once migration begins, old v1 writers cannot obtain or reuse a
-    /// valid authority.
-    pub fn authorize_v1_write<'a>(
-        &'a self,
-        lease: &'a HistoryWriterLease,
-        expected: &'a HistoryOwnershipManifest,
-    ) -> io::Result<HistoryWriteAuthority<'a>> {
-        self.authorize_write(lease, expected, HistoryWriteBackend::V1)
-    }
-
-    /// Authorizes v2 migration/import writes and post-cutover v2 runtime
-    /// writes. The exact manifest/epoch remains pinned for the guard lifetime.
+    /// Authorizes SQLite writes under the exact manifest and ownership epoch.
     pub fn authorize_v2_write<'a>(
         &'a self,
         lease: &'a HistoryWriterLease,
         expected: &'a HistoryOwnershipManifest,
     ) -> io::Result<HistoryWriteAuthority<'a>> {
-        self.authorize_write(lease, expected, HistoryWriteBackend::V2)
+        self.authorize_write(lease, expected)
     }
 
     fn authorize_write<'a>(
         &'a self,
         lease: &'a HistoryWriterLease,
         expected: &'a HistoryOwnershipManifest,
-        backend: HistoryWriteBackend,
     ) -> io::Result<HistoryWriteAuthority<'a>> {
         let authority = HistoryWriteAuthority {
             store: self,
             lease,
             expected,
-            backend,
         };
         authority.validate()?;
         Ok(authority)
@@ -851,7 +784,8 @@ impl HistoryOwnershipStore {
     /// deliberately not exposed here because it requires epoch-bound,
     /// lease-protected migration verification; use the local migration
     /// activation API for that final transition.
-    pub fn begin_migration(
+    #[cfg(test)]
+    fn begin_migration(
         &self,
         lease: &HistoryWriterLease,
         expected_v1: &HistoryOwnershipManifest,
@@ -868,7 +802,8 @@ impl HistoryOwnershipStore {
     /// Internal state-machine primitive. `Migrating -> V2Active` must only be
     /// called by the migration module while holding its verified frozen-v1
     /// activation critical section.
-    pub(crate) fn compare_and_transition(
+    #[cfg(test)]
+    fn compare_and_transition(
         &self,
         lease: &HistoryWriterLease,
         expected: &HistoryOwnershipManifest,
@@ -922,17 +857,17 @@ impl HistoryOwnershipStore {
         Ok(OwnershipCasOutcome::Applied(published))
     }
 
-    /// Fence old file writers before importing the source-aware namespace.
-    /// The exclusive writer lease must span import and final activation.
-    pub(crate) fn begin_sqlite_migration(
+    /// Fence old writers before initializing SQLite. No usage data is imported.
+    /// The exclusive writer lease spans initialization and final activation.
+    pub(crate) fn begin_sqlite_initialization(
         &self,
         lease: &HistoryWriterLease,
         expected: &HistoryOwnershipManifest,
     ) -> io::Result<OwnershipCasOutcome> {
-        if expected.is_sqlite_backend() || expected.state() != HistoryOwnershipState::V2Active {
+        if expected.is_sqlite_backend() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "SQLite cutover requires active file-based v2 history",
+                "SQLite initialization requires a file ownership marker",
             ));
         }
         let mut next = expected.clone();
@@ -945,7 +880,7 @@ impl HistoryOwnershipStore {
         self.publish_sqlite_transition(lease, expected, next)
     }
 
-    pub(crate) fn complete_sqlite_migration(
+    pub(crate) fn complete_sqlite_initialization(
         &self,
         lease: &HistoryWriterLease,
         expected: &HistoryOwnershipManifest,
@@ -1785,58 +1720,13 @@ mod tests {
         let store = store(directory.path());
         let lease = acquire(&store);
         let v1 = initialize(&store, &lease);
-
-        let v1_authority = store.authorize_v1_write(&lease, &v1).unwrap();
-        assert_eq!(v1_authority.backend(), HistoryWriteBackend::V1);
-        v1_authority.validate().unwrap();
-        v1_authority
-            .validate_v1_namespace(
-                &store.state_root().join(LEGACY_HISTORY_DIRECTORY),
-                PROFILE,
-                false,
-            )
-            .unwrap();
-        assert!(
-            v1_authority
-                .validate_v1_namespace(
-                    &store.state_root().join("history-v1-alias"),
-                    PROFILE,
-                    false,
-                )
-                .is_err()
-        );
-        assert!(
-            v1_authority
-                .validate_v1_namespace(
-                    &store.state_root().join(LEGACY_HISTORY_DIRECTORY),
-                    "different-profile",
-                    false,
-                )
-                .is_err()
-        );
-        assert!(
-            v1_authority
-                .validate_v1_namespace(
-                    &store.state_root().join(LEGACY_HISTORY_DIRECTORY),
-                    PROFILE,
-                    true,
-                )
-                .is_err()
-        );
         assert!(store.authorize_v2_write(&lease, &v1).is_err());
-
-        let migrating = match store.begin_migration(&lease, &v1).unwrap() {
+        let initializing = match store.begin_sqlite_initialization(&lease, &v1).unwrap() {
             OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected migration conflict"),
+            _ => panic!("unexpected initialization conflict"),
         };
-        assert_eq!(
-            v1_authority.validate().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert!(store.authorize_v1_write(&lease, &migrating).is_err());
-
-        let v2_authority = store.authorize_v2_write(&lease, &migrating).unwrap();
-        v2_authority
+        let authority = store.authorize_v2_write(&lease, &initializing).unwrap();
+        authority
             .validate_v2_namespace(
                 store.state_root(),
                 store.profile_id(),
@@ -1844,24 +1734,23 @@ mod tests {
             )
             .unwrap();
         assert!(
-            v2_authority
+            authority
                 .validate_v2_namespace(
                     &store.state_root().join("alias"),
                     store.profile_id(),
-                    RedactionProfile::PreviewEnabled,
+                    RedactionProfile::PreviewEnabled
                 )
                 .is_err()
         );
-
         let active = match store
-            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+            .complete_sqlite_initialization(&lease, &initializing)
             .unwrap()
         {
             OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected activation conflict"),
+            _ => panic!("unexpected activation conflict"),
         };
         assert_eq!(
-            v2_authority.validate().unwrap_err().kind(),
+            authority.validate().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         store
@@ -1869,34 +1758,6 @@ mod tests {
             .unwrap()
             .validate()
             .unwrap();
-    }
-
-    #[test]
-    fn redacted_v1_authority_requires_the_legacy_namespace_suffix() {
-        let directory = tempdir().unwrap();
-        let store = HistoryOwnershipStore::new(
-            directory.path().join("state"),
-            PROFILE.parse().unwrap(),
-            RedactionProfile::Redacted,
-        );
-        let lease = acquire(&store);
-        let manifest = initialize(&store, &lease);
-        let authority = store.authorize_v1_write(&lease, &manifest).unwrap();
-        let legacy_root = store.state_root().join(LEGACY_HISTORY_DIRECTORY);
-
-        authority
-            .validate_v1_namespace(&legacy_root, &format!("{PROFILE}-redacted"), true)
-            .unwrap();
-        assert!(
-            authority
-                .validate_v1_namespace(&legacy_root, PROFILE, true)
-                .is_err()
-        );
-        assert!(
-            authority
-                .validate_v1_namespace(&legacy_root, &format!("{PROFILE}-redacted"), false)
-                .is_err()
-        );
     }
 
     #[test]

@@ -18,8 +18,8 @@ use crate::remote_bandwidth_budget::{
 use crate::remote_ingest_state::{RemoteDeltaIngestBinding, RemoteDeltaNextRequestPosition};
 use crate::remote_source_metadata::finalize_remote_source_metadata;
 use crate::remote_sync::{
-    FilesystemRemoteDeltaLocalPhases, RemoteDeltaLocalPhases, RemoteDeltaTransport,
-    RemoteSyncError, RemoteSyncHostSnapshot, RemoteSyncLimits, RemoteSyncReport,
+    RemoteDeltaLocalPhases, RemoteDeltaTransport, RemoteSyncError, RemoteSyncHostSnapshot,
+    RemoteSyncLimits, RemoteSyncReport, SqliteRemoteDeltaLocalPhases,
     build_remote_delta_ingest_binding, preflight_remote_delta_position, sync_remote_delta_bounded,
 };
 use crate::remotes_config::RemotesConfigStore;
@@ -33,7 +33,7 @@ pub(crate) struct PreparedRemoteAggregateLocal<'a> {
     selected: &'a RemoteSyncHostSnapshot,
     runtime: &'a HistoryRuntime,
     binding: RemoteDeltaIngestBinding,
-    local: FilesystemRemoteDeltaLocalPhases<'a>,
+    local: SqliteRemoteDeltaLocalPhases<'a>,
 }
 
 impl<'a> PreparedRemoteAggregateLocal<'a> {
@@ -44,7 +44,7 @@ impl<'a> PreparedRemoteAggregateLocal<'a> {
     ) -> Result<Self, RemoteSyncError> {
         let binding = build_remote_delta_ingest_binding(selected, runtime.profile_id().clone())?;
         let local =
-            FilesystemRemoteDeltaLocalPhases::new(runtime.ownership(), runtime.source_history());
+            SqliteRemoteDeltaLocalPhases::new(runtime.ownership(), runtime.source_history());
         Ok(Self {
             config_store,
             selected,
@@ -94,7 +94,7 @@ impl<'a> PreparedRemoteAggregateLocal<'a> {
         transport: &'b mut T,
         bandwidth_budget: &'b RemoteBandwidthBudgetStore,
         reservation: &'b RemoteBandwidthReservation,
-    ) -> AdmittedRemoteAggregateAttempt<'b, FilesystemRemoteDeltaLocalPhases<'a>, T> {
+    ) -> AdmittedRemoteAggregateAttempt<'b, SqliteRemoteDeltaLocalPhases<'a>, T> {
         AdmittedRemoteAggregateAttempt {
             config_store: self.config_store,
             selected: self.selected,

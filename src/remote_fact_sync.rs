@@ -1153,7 +1153,8 @@ fn preflight_local_state(
         .map_err(RemoteFactSyncError::Local)?
     {
         OwnershipManifestStatus::Initialized(manifest)
-            if manifest.state() == HistoryOwnershipState::V2Active => {}
+            if manifest.is_sqlite_backend()
+                && manifest.state() == HistoryOwnershipState::V2Active => {}
         OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized => {
             return Err(RemoteFactSyncError::Local(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1505,7 +1506,8 @@ fn publish_under_fresh_writer(
     };
     let manifest = match ownership_store.load_manifest()? {
         OwnershipManifestStatus::Initialized(manifest)
-            if manifest.state() == HistoryOwnershipState::V2Active =>
+            if manifest.is_sqlite_backend()
+                && manifest.state() == HistoryOwnershipState::V2Active =>
         {
             manifest
         }
@@ -1563,7 +1565,8 @@ fn stage_and_prevalidate_under_fresh_writer_with_hook(
     };
     let manifest = match ownership_store.load_manifest()? {
         OwnershipManifestStatus::Initialized(manifest)
-            if manifest.state() == HistoryOwnershipState::V2Active =>
+            if manifest.is_sqlite_backend()
+                && manifest.state() == HistoryOwnershipState::V2Active =>
         {
             manifest
         }
@@ -2824,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_real_fact_staging_does_not_block_config_changes_or_publish_late() {
+    fn paused_fact_staging_does_not_block_config_changes_or_publish_late() {
         for change in ["disable", "remove", "edit", "global-off"] {
             let fixture = Fixture::new();
             let mut config = fixture.config_store.load().unwrap();
@@ -2862,26 +2865,23 @@ mod tests {
                         .unwrap(),
                 ],
             };
-            let source_id: NodeId = SOURCE.parse().unwrap();
-            let staging_guard = fixture
-                .runtime
-                .source_history()
-                .acquire_fact_staging_lock_for_test(&source_id, RedactionProfile::Redacted)
-                .unwrap();
-
             let worker_store = fixture.config_store.clone();
             let worker_ownership = fixture.runtime.ownership().clone();
             let worker_history = fixture.runtime.source_history().clone();
             let worker_selected = selected.clone();
             let worker_binding = binding.clone();
             let (stage_started_tx, stage_started_rx) = mpsc::channel();
+            let (resume_stage_tx, resume_stage_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
                 let publication = stage_and_prevalidate_under_fresh_writer_with_hook(
                     &worker_ownership,
                     &worker_history,
                     &worker_binding,
                     &batch,
-                    || stage_started_tx.send(()).unwrap(),
+                    || {
+                        stage_started_tx.send(()).unwrap();
+                        resume_stage_rx.recv().unwrap();
+                    },
                 )
                 .map_err(RemoteFactSyncError::Local)?;
                 let entered = Cell::new(false);
@@ -2906,11 +2906,11 @@ mod tests {
                 }
             });
             let changed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Readiness includes filesystem validation and thread scheduling;
-                // its elapsed time says nothing about config lock contention.
+                // Pause before the SQL staging work, outside the config fence.
+                // The handshake measures ordering without relying on timing.
                 stage_started_rx
                     .recv()
-                    .expect("the production fact stage should reach its real staging lock");
+                    .expect("the production fact stage should reach its staging hook");
                 let config_guard = fixture
                     .config_store
                     .try_lock_exclusive_for_test()
@@ -2936,9 +2936,9 @@ mod tests {
                     .update(selected.config_revision(), mutation)
                     .unwrap();
             }));
-            // Release the real staging lock before joining, including assertion
-            // failures, so a failed regression cannot strand the worker.
-            drop(staging_guard);
+            // Release staging before joining, including assertion failures, so
+            // a failed regression cannot strand the worker.
+            resume_stage_tx.send(()).unwrap();
             let worker_result = worker.join();
             if let Err(error) = changed {
                 std::panic::resume_unwind(error);

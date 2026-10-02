@@ -574,23 +574,23 @@ pub trait RemoteDeltaLocalPhases {
     ) -> io::Result<RemoteDeltaNextRequestPosition>;
 }
 
-pub struct FilesystemRemoteDeltaPreparedPage {
+pub struct SqliteRemoteDeltaPreparedPage {
     project_mapping: Option<PreparedProjectMappingBatch>,
     received_at: DateTime<Utc>,
 }
 
-/// Filesystem-backed local phases used by manual and automatic synchronization.
+/// SQLite local phases used by manual and automatic synchronization.
 /// It refuses to write until ownership is V2Active and the source has already
 /// been registered as an SSH [`SourceMetadata`](crate::source_history::SourceMetadata)
 /// by the runtime integration.
-pub struct FilesystemRemoteDeltaLocalPhases<'a> {
+pub struct SqliteRemoteDeltaLocalPhases<'a> {
     ownership_store: &'a HistoryOwnershipStore,
     history_store: &'a SourceHistoryStore,
     project_mapping_store: ProjectMappingStore,
     published_project_mapping: Option<PublishedProjectMappingBatch>,
 }
 
-impl<'a> FilesystemRemoteDeltaLocalPhases<'a> {
+impl<'a> SqliteRemoteDeltaLocalPhases<'a> {
     pub fn new(
         ownership_store: &'a HistoryOwnershipStore,
         history_store: &'a SourceHistoryStore,
@@ -700,14 +700,15 @@ impl<'a> FilesystemRemoteDeltaLocalPhases<'a> {
         };
         let manifest = match self.ownership_store.load_manifest()? {
             OwnershipManifestStatus::Initialized(manifest)
-                if manifest.state() == HistoryOwnershipState::V2Active =>
+                if manifest.state() == HistoryOwnershipState::V2Active
+                    && manifest.is_sqlite_backend() =>
             {
                 manifest
             }
             OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "remote sync requires active v2 history ownership",
+                    "remote sync requires active SQLite history ownership",
                 ));
             }
         };
@@ -724,9 +725,6 @@ impl<'a> FilesystemRemoteDeltaLocalPhases<'a> {
         writer: &crate::source_history::SourceHistoryWriter<'_, '_, '_>,
         observed_at: DateTime<Utc>,
     ) -> io::Result<()> {
-        if let Some(page) = session.pending_page()? {
-            apply_and_commit_remote_delta_page(session, writer, &page, observed_at)?;
-        }
         let _ = activate_remote_delta_bootstrap(session, writer, observed_at)?;
         let _ = retry_deferred_remote_generation_cleanup(session, writer)?;
         let _ = sweep_unreferenced_remote_history_generations(session, writer)?;
@@ -790,8 +788,8 @@ fn validate_center_descriptor_references(payload: &DeltaPayload) -> io::Result<(
     Ok(())
 }
 
-impl RemoteDeltaLocalPhases for FilesystemRemoteDeltaLocalPhases<'_> {
-    type PreparedPage = FilesystemRemoteDeltaPreparedPage;
+impl RemoteDeltaLocalPhases for SqliteRemoteDeltaLocalPhases<'_> {
+    type PreparedPage = SqliteRemoteDeltaPreparedPage;
 
     fn recover_and_position(
         &mut self,
@@ -834,7 +832,7 @@ impl RemoteDeltaLocalPhases for FilesystemRemoteDeltaLocalPhases<'_> {
                 "a prior remote mapping publication was not finalized",
             ));
         }
-        Ok(FilesystemRemoteDeltaPreparedPage {
+        Ok(SqliteRemoteDeltaPreparedPage {
             project_mapping: self.prepare_project_descriptors(binding, request, response)?,
             received_at,
         })
@@ -1393,7 +1391,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::history_ownership::{InitializeV1Outcome, OwnershipCasOutcome};
     use crate::project_mapping::SourceObservedProject;
     use crate::remote_protocol::{
         BinaryVersion, DeltaCursor, DeltaPage, ProtocolRevisions, RemoteApiCostAmount,
@@ -1405,7 +1402,6 @@ mod tests {
     use crate::remotes_config::{
         RemoteHostConfig, RemoteHostEdit, RemotesConfigMutation, RemotesConfigStore,
     };
-    use crate::source_history::{SourceKind, SourceMetadata};
 
     const PROFILE: &str = "0123456789abcdef";
     const SOURCE: &str = "node-0123456789abcdef0123456789abcdef";
@@ -2006,103 +2002,6 @@ mod tests {
     }
 
     #[test]
-    fn delayed_pending_wal_recovery_preserves_original_center_receive_time() {
-        let temp = TempDir::new().unwrap();
-        let (_, _, _, selected) = paired_config(&temp);
-        let profile: HistoryProfileId = PROFILE.parse().unwrap();
-        let state_root = temp.path().join("state");
-        let ownership = HistoryOwnershipStore::new(
-            state_root.clone(),
-            profile.clone(),
-            RedactionProfile::Redacted,
-        );
-        let history = SourceHistoryStore::new(state_root, profile.clone());
-
-        let lease = ownership.acquire_writer_lease().unwrap();
-        let v1 = match ownership.initialize_v1_active(&lease).unwrap() {
-            InitializeV1Outcome::Initialized(manifest)
-            | InitializeV1Outcome::Existing(manifest) => manifest,
-        };
-        let migrating = match ownership.begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-        };
-        let authority = ownership.authorize_v2_write(&lease, &migrating).unwrap();
-        let writer = history.writer(&authority).unwrap();
-        writer
-            .save_source_metadata(
-                &SourceMetadata::new(
-                    selected.host().expected_source().unwrap().node_id.clone(),
-                    SourceKind::Ssh,
-                    "remote",
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let active = match ownership
-            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
-            .unwrap()
-        {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-        };
-        assert_eq!(active.state(), HistoryOwnershipState::V2Active);
-        drop(lease);
-
-        let mappings =
-            ProjectMappingStore::new(temp.path().join("mapping-config/project-mappings.json"));
-        let binding = build_remote_delta_ingest_binding(&selected, profile).unwrap();
-        let mut initial = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
-            &ownership,
-            &history,
-            mappings.clone(),
-        );
-        assert_eq!(
-            initial.recover_and_position(&binding, at(30, 12)).unwrap(),
-            RemoteDeltaNextRequestPosition {
-                delta_cursor: None,
-                exact_range: None,
-                known_live_revision: None,
-            }
-        );
-        drop(initial);
-
-        let range = rolling_range(at(30, 12)).unwrap();
-        let request = build_delta_request(
-            &binding,
-            None,
-            None,
-            range,
-            MAX_REMOTE_FRAME_ENCODED_BYTES as u32,
-        )
-        .unwrap();
-        let response = fake_response(&request, FakeReply::EmptyDelta);
-        let received_at = response.observed_at + Duration::minutes(2);
-        let recovered_at = received_at + Duration::hours(24);
-        let ingest = RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
-        let mut pending = ingest.try_begin().unwrap();
-        pending
-            .prepare_page(&request, &response, received_at)
-            .unwrap();
-        drop(pending); // Crash after the WAL publish and before local apply.
-
-        let mut recovered = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
-            &ownership, &history, mappings,
-        );
-        recovered
-            .recover_and_position(&binding, recovered_at)
-            .unwrap();
-        let live = history
-            .load_remote_live_state(&binding.source().node_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(live.remote_observed_at, response.observed_at);
-        assert_eq!(live.received_at, received_at);
-        assert_ne!(live.received_at, recovered_at);
-        assert!(recovered_at.signed_duration_since(live.received_at) > Duration::minutes(15));
-    }
-
-    #[test]
     fn filesystem_phase_registers_exact_source_descriptors_and_refreshes_metadata() {
         let temp = TempDir::new().unwrap();
         let (_, _, _, selected) = paired_config(&temp);
@@ -2116,7 +2015,7 @@ mod tests {
         let history = SourceHistoryStore::new(state_root, profile.clone());
         let mappings =
             ProjectMappingStore::new(temp.path().join("mapping-config/project-mappings.json"));
-        let phases = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
+        let phases = SqliteRemoteDeltaLocalPhases::new_with_project_mapping_store(
             &ownership,
             &history,
             mappings.clone(),
@@ -2187,7 +2086,7 @@ mod tests {
 
         let blocked_parent = temp.path().join("mapping-parent-is-a-file");
         std::fs::write(&blocked_parent, b"blocked").unwrap();
-        let blocked = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
+        let blocked = SqliteRemoteDeltaLocalPhases::new_with_project_mapping_store(
             &ownership,
             &history,
             ProjectMappingStore::new(blocked_parent.join("project-mappings.json")),
@@ -2214,7 +2113,7 @@ mod tests {
         let history = SourceHistoryStore::new(temp.path().join("state"), profile.clone());
         let mappings =
             ProjectMappingStore::new(temp.path().join("mapping-config/project-mappings.json"));
-        let phases = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
+        let phases = SqliteRemoteDeltaLocalPhases::new_with_project_mapping_store(
             &ownership,
             &history,
             mappings.clone(),
@@ -2279,7 +2178,7 @@ mod tests {
         let history = SourceHistoryStore::new(state_root, profile.clone());
         let mappings =
             ProjectMappingStore::new(temp.path().join("mapping-config/project-mappings.json"));
-        let mut phases = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
+        let mut phases = SqliteRemoteDeltaLocalPhases::new_with_project_mapping_store(
             &ownership,
             &history,
             mappings.clone(),
@@ -2396,7 +2295,7 @@ mod tests {
                 RedactionProfile::Redacted,
             );
             let history = SourceHistoryStore::new(sync_state_root, profile);
-            let mut phases = FilesystemRemoteDeltaLocalPhases::new_with_project_mapping_store(
+            let mut phases = SqliteRemoteDeltaLocalPhases::new_with_project_mapping_store(
                 &ownership,
                 &history,
                 ProjectMappingStore::new(sync_mapping_path),

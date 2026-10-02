@@ -109,20 +109,20 @@ impl AutomaticRemoteProbeTransport for SshRemoteDeltaTransport {
     }
 }
 
-/// Whether this adapter may perform the one-time history backend cutover.
+/// Whether startup has authorized initialization of the SQLite namespace.
 ///
-/// `RequireV2Active` is the safe default for a background worker. The second
+/// `RequireSqliteActive` is the safe default for a background worker. The second
 /// variant is an explicit assertion made by startup orchestration after it has
 /// stopped or otherwise proven the absence of legacy writers that do not
 /// participate in the ownership lease.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AutomaticRemoteCutoverPolicy {
+pub enum AutomaticRemoteInitializationPolicy {
     #[default]
-    RequireV2Active,
-    LegacyWritersQuiescedAndPrevalidated,
+    RequireSqliteActive,
+    WritersQuiescedAndPrevalidated,
 }
 
-/// Filesystem-backed automatic executor. `SshRemoteDeltaTransport` is the
+/// SQLite-backed automatic history executor. `SshRemoteDeltaTransport` is the
 /// production default; the generic transport boundary also supports focused
 /// tests without opening a network connection.
 pub struct FilesystemAutomaticRemoteSyncExecutor<
@@ -133,7 +133,7 @@ pub struct FilesystemAutomaticRemoteSyncExecutor<
     codex_home: PathBuf,
     config_store: RemotesConfigStore,
     local_redact_content: bool,
-    cutover_policy: AutomaticRemoteCutoverPolicy,
+    initialization_policy: AutomaticRemoteInitializationPolicy,
     bandwidth_budget: RemoteBandwidthBudgetStore,
     durable_schedule_seeds: Option<BTreeMap<String, RemoteSyncScheduleSeed>>,
     process_containment_uncertain: bool,
@@ -149,13 +149,13 @@ impl FilesystemAutomaticRemoteSyncExecutor<SshRemoteDeltaTransport, SshRemoteFac
         codex_home: PathBuf,
         config_store: RemotesConfigStore,
         local_redact_content: bool,
-        cutover_policy: AutomaticRemoteCutoverPolicy,
+        initialization_policy: AutomaticRemoteInitializationPolicy,
     ) -> Self {
         Self::with_transports(
             state_root,
             local_collect_config(codex_home, local_redact_content),
             config_store,
-            cutover_policy,
+            initialization_policy,
             SshRemoteDeltaTransport::default(),
             SshRemoteFactTransport::default(),
         )
@@ -168,14 +168,14 @@ impl<T> FilesystemAutomaticRemoteSyncExecutor<T, DeferredRemoteFactTransport> {
         codex_home: PathBuf,
         config_store: RemotesConfigStore,
         local_redact_content: bool,
-        cutover_policy: AutomaticRemoteCutoverPolicy,
+        initialization_policy: AutomaticRemoteInitializationPolicy,
         transport: T,
     ) -> Self {
         Self::with_transports(
             state_root,
             local_collect_config(codex_home, local_redact_content),
             config_store,
-            cutover_policy,
+            initialization_policy,
             transport,
             DeferredRemoteFactTransport,
         )
@@ -187,7 +187,7 @@ impl<T, F> FilesystemAutomaticRemoteSyncExecutor<T, F> {
         state_root: PathBuf,
         collect_config: CollectConfig,
         config_store: RemotesConfigStore,
-        cutover_policy: AutomaticRemoteCutoverPolicy,
+        initialization_policy: AutomaticRemoteInitializationPolicy,
         transport: T,
         fact_transport: F,
     ) -> Self {
@@ -195,7 +195,7 @@ impl<T, F> FilesystemAutomaticRemoteSyncExecutor<T, F> {
             state_root,
             collect_config,
             config_store,
-            cutover_policy,
+            initialization_policy,
             transport,
             fact_transport,
             ProjectMappingStore::discover(),
@@ -206,7 +206,7 @@ impl<T, F> FilesystemAutomaticRemoteSyncExecutor<T, F> {
         state_root: PathBuf,
         collect_config: CollectConfig,
         config_store: RemotesConfigStore,
-        cutover_policy: AutomaticRemoteCutoverPolicy,
+        initialization_policy: AutomaticRemoteInitializationPolicy,
         transport: T,
         fact_transport: F,
         project_mapping_store: ProjectMappingStore,
@@ -217,7 +217,7 @@ impl<T, F> FilesystemAutomaticRemoteSyncExecutor<T, F> {
             codex_home: collect_config.codex_home.clone(),
             config_store,
             local_redact_content: collect_config.redact_content,
-            cutover_policy,
+            initialization_policy,
             bandwidth_budget,
             durable_schedule_seeds: None,
             process_containment_uncertain: false,
@@ -364,9 +364,9 @@ where
             )));
         }
 
-        let legacy_history_root = self.state_root.join("history-v1");
+        let history_root = self.state_root.join("history-v1");
         let mut runtime = HistoryRuntime::new_with_project_mapping_store(
-            legacy_history_root,
+            history_root,
             &self.codex_home,
             self.local_redact_content,
             self.project_mapping_store.clone(),
@@ -409,22 +409,21 @@ where
                 if manifest.state() == HistoryOwnershipState::V2Active
                     && manifest.is_sqlite_backend() =>
             {
-                // A cooperating process may have activated SQL after runtime
-                // construction. Bind its reader without taking a writer lease.
+                // Verify the active database and receipt without a writer lease.
                 runtime
                     .refresh_active_sqlite_backend()
                     .map_err(RemoteSyncError::Local)?;
             }
             OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized
-                if self.cutover_policy
-                    == AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated =>
+                if self.initialization_policy
+                    == AutomaticRemoteInitializationPolicy::WritersQuiescedAndPrevalidated =>
             {
                 runtime.ensure_v2_active().map_err(RemoteSyncError::Local)?;
             }
             OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized => {
                 return Err(RemoteSyncError::Local(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "automatic remote sync requires SQLite v2-active history; startup must first quiesce legacy writers and perform the explicit cutover",
+                    "automatic remote sync requires initialized SQLite history; startup must first quiesce incompatible writers and initialize storage",
                 )));
             }
         }
@@ -1793,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn production_executor_requires_explicit_cutover_before_transport() {
+    fn production_executor_requires_sqlite_initialization_before_transport() {
         let directory = tempdir().unwrap();
         let state_root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
@@ -1808,7 +1807,7 @@ mod tests {
             codex_home,
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
 
@@ -1822,93 +1821,6 @@ mod tests {
                 if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(executor.transport.calls, 0);
-    }
-
-    #[test]
-    fn production_executor_requires_sqlite_cutover_for_active_legacy_v2() {
-        use crate::history_ownership::{InitializeV1Outcome, OwnershipCasOutcome};
-
-        let directory = tempdir().unwrap();
-        let state_root = directory.path().join("state");
-        let codex_home = directory.path().join("codex-home");
-        std::fs::create_dir(&codex_home).unwrap();
-        let runtime =
-            HistoryRuntime::new(state_root.join("history-v1"), &codex_home, false).unwrap();
-        let lease = runtime.ownership().acquire_writer_lease().unwrap();
-        let v1 = match runtime.ownership().initialize_v1_active(&lease).unwrap() {
-            InitializeV1Outcome::Initialized(manifest)
-            | InitializeV1Outcome::Existing(manifest) => manifest,
-        };
-        let migrating = match runtime.ownership().begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-        };
-        let active = match runtime
-            .ownership()
-            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
-            .unwrap()
-        {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
-        };
-        assert!(!active.is_sqlite_backend());
-        drop(lease);
-        let remote_node = if runtime.source_identity().node_id().as_str() == NODE_A {
-            NODE_B
-        } else {
-            NODE_A
-        };
-        let (store, config) = configured_store(
-            directory.path().join("config/remotes.json"),
-            source(remote_node),
-        );
-        let selected =
-            RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
-                .unwrap();
-        let mut executor = FilesystemAutomaticRemoteSyncExecutor::with_transport(
-            state_root,
-            codex_home,
-            store,
-            false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
-            RejectingTransport::default(),
-        );
-        let error = executor
-            .sync_host(&selected, RemoteSyncLimits::default())
-            .unwrap_err();
-        assert!(
-            matches!(error, RemoteSyncError::Local(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
-        );
-        assert_eq!(executor.transport.calls, 0);
-        assert_eq!(
-            runtime.ownership().load_manifest().unwrap(),
-            OwnershipManifestStatus::Initialized(active)
-        );
-        executor.cutover_policy =
-            AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated;
-        let error = executor
-            .sync_host(&selected, RemoteSyncLimits::default())
-            .unwrap_err();
-        assert!(matches!(error, RemoteSyncError::Transport(_)), "{error:?}");
-        assert_eq!(executor.transport.calls, 1);
-        let OwnershipManifestStatus::Initialized(sqlite_active) =
-            runtime.ownership().load_manifest().unwrap()
-        else {
-            panic!("ownership missing after SQLite cutover")
-        };
-        assert_eq!(sqlite_active.state(), HistoryOwnershipState::V2Active);
-        assert!(sqlite_active.is_sqlite_backend());
-        let sql = crate::source_history::SourceHistoryStore::new_sqlite(
-            runtime.state_root().to_path_buf(),
-            runtime.profile_id().clone(),
-        );
-        assert!(sql.sqlite_database().unwrap().exists().unwrap());
-        assert_eq!(
-            sql.load_source_metadata(&source(remote_node).node_id)
-                .unwrap()
-                .kind(),
-            crate::source_history::SourceKind::Ssh
-        );
     }
 
     #[test]
@@ -1927,7 +1839,7 @@ mod tests {
             codex_home,
             store,
             true,
-            AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated,
+            AutomaticRemoteInitializationPolicy::WritersQuiescedAndPrevalidated,
             RejectingTransport::default(),
         );
 
@@ -1984,7 +1896,7 @@ mod tests {
             codex_home,
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
 
@@ -2021,7 +1933,7 @@ mod tests {
             codex_home,
             store,
             false,
-            AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated,
+            AutomaticRemoteInitializationPolicy::WritersQuiescedAndPrevalidated,
             RejectingTransport::default(),
         );
 
@@ -2118,7 +2030,7 @@ mod tests {
             codex_home.clone(),
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
 
@@ -2173,7 +2085,7 @@ mod tests {
             codex_home,
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             CompleteAutomaticTransport::default(),
         );
 
@@ -2447,7 +2359,7 @@ mod tests {
             codex_home.clone(),
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             transport,
         );
 
@@ -2529,7 +2441,7 @@ mod tests {
             codex_home,
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let error = executor
@@ -2568,7 +2480,7 @@ mod tests {
             directory.path().join("codex-home"),
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             ProbeTestTransport::new(true),
         );
 
@@ -2602,7 +2514,7 @@ mod tests {
                 directory.path().join("codex-home"),
                 store,
                 false,
-                AutomaticRemoteCutoverPolicy::RequireV2Active,
+                AutomaticRemoteInitializationPolicy::RequireSqliteActive,
                 ProbeTestTransport::new(succeeds),
             );
 
@@ -2664,7 +2576,7 @@ mod tests {
             directory.path().join("codex-home"),
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             ProbeTestTransport::new(false).with_process_containment_uncertain(),
         );
 
@@ -2700,7 +2612,7 @@ mod tests {
             directory.path().join("codex-home"),
             store.clone(),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             transport,
         );
 
@@ -2771,7 +2683,7 @@ mod tests {
             codex_home.clone(),
             store,
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let error = executor
@@ -2869,7 +2781,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let seed = executor.restore_host_schedule(host).unwrap().unwrap();
@@ -2901,7 +2813,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let mut scheduler = RemoteSyncScheduler::new(FakeClock::default());
@@ -2957,7 +2869,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let seed = executor.restore_host_schedule(host).unwrap().unwrap();
@@ -3007,7 +2919,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let seed = executor.restore_host_schedule(host).unwrap().unwrap();
@@ -3049,7 +2961,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         let seed = executor.restore_host_schedule(host).unwrap().unwrap();
@@ -3096,7 +3008,7 @@ mod tests {
             codex_home,
             RemotesConfigStore::new(directory.path().join("config/remotes.json")),
             false,
-            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            AutomaticRemoteInitializationPolicy::RequireSqliteActive,
             RejectingTransport::default(),
         );
         assert!(executor.restore_host_schedule(host).unwrap().is_none());

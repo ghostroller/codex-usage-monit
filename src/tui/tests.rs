@@ -1412,8 +1412,8 @@ fn headless_initial_refresh_uses_the_deferred_data_ready_path() {
         ..CollectConfig::default()
     };
     let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
-    let history_store = Arc::new(Mutex::new(TuiHistoryStore::legacy_fallback(
-        HistoryStore::new(directory.path().join("history"), &codex_home),
+    let history_store = Arc::new(Mutex::new(TuiHistoryStore::memory_fallback(
+        HistoryStore::memory_only(&codex_home, false),
         Vec::new(),
     )));
     let mut app = App::new(initial_loading_result(&config), Theme::Dark);
@@ -1562,8 +1562,8 @@ fn online_initial_data_ready_defers_account_rpc_and_keeps_refresh_due() {
         ..CollectConfig::default()
     };
     let rollout_cache = Arc::new(Mutex::new(RolloutCache::new()));
-    let history_store = Arc::new(Mutex::new(TuiHistoryStore::legacy_fallback(
-        HistoryStore::new(directory.path().join("history"), &codex_home),
+    let history_store = Arc::new(Mutex::new(TuiHistoryStore::memory_fallback(
+        HistoryStore::memory_only(&codex_home, false),
         Vec::new(),
     )));
     let mut app = App::new(initial_loading_result(&config), Theme::Dark);
@@ -10569,16 +10569,11 @@ fn canonical_tui_history_runtime_activates_v2_and_aggregates_remote_history() {
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let warnings = match prepare_tui_history_runtime(
+    let TuiHistoryRuntimePreparation::Ready(warnings) = prepare_tui_history_runtime(
         &mut runtime,
         &profile_lease,
         starts_at + ChronoDuration::minutes(20),
-    ) {
-        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("unexpected legacy fallback: {warnings:?}")
-        }
-    };
+    );
     assert!(
         warnings.is_empty(),
         "unexpected setup warnings: {warnings:?}"
@@ -10914,7 +10909,7 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
             .unwrap()
             .sources
             .iter()
-            .any(|(source, _)| source.source_id() == &added_id)
+            .any(|(source, _, _)| source.source_id() == &added_id)
     );
     store.with_query_request(now, |store| {
         store.load_remote_overview_history(None, now).unwrap();
@@ -11226,7 +11221,7 @@ fn v2_projection_cache_matches_a_fresh_query_while_new_data_is_only_staged() {
                 .unwrap()
                 .history
         }
-        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+        TuiHistoryBackend::MemoryFallback(_) => unreachable!(),
     };
     assert_eq!(cached.history, fresh);
     assert_eq!(
@@ -11300,14 +11295,6 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
         tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(gc_change)))),
         TuiHistoryCacheEffect::Invalidate
     );
-    let mut recovered_change = report.clone();
-    recovered_change.recovered_pending = true;
-    assert_eq!(
-        tui_history_cache_effect(&Ok(Some(HistoryRuntimeWriteReport::V2(recovered_change)))),
-        TuiHistoryCacheEffect::Invalidate,
-        "clearing a pending journal changes visibility even when every shard is a no-op"
-    );
-
     let mut mapping_changed = rebased_revision.clone();
     mapping_changed.project_mapping_revision =
         mapping_changed.project_mapping_revision.saturating_add(1);
@@ -11317,7 +11304,7 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
     assert!(!rebased_revision.same_query_inputs_except_local_revision(&sources_changed));
     let local_source_id = match &store.backend {
         TuiHistoryBackend::Runtime(runtime) => runtime.source_identity().node_id().clone(),
-        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+        TuiHistoryBackend::MemoryFallback(_) => unreachable!(),
     };
     assert!(
         store
@@ -11399,9 +11386,7 @@ fn v2_projection_cache_reloads_after_sqlite_batch_rollback_and_retry() {
                 .total_tokens,
             10
         );
-        assert!(previous.history.warnings.iter().all(|warning| {
-            !warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
-        }));
+        assert!(previous.query_error.is_none());
         assert!(store.projection_cache_valid(&selection, since, false));
 
         let (recovered, _) = stage_and_load_history_selected_with_mode(
@@ -11422,9 +11407,7 @@ fn v2_projection_cache_reloads_after_sqlite_batch_rollback_and_retry() {
             20
         );
         assert!(recovered.status.is_some_and(|status| status.is_applied()));
-        assert!(recovered.history.warnings.iter().all(|warning| {
-            !warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
-        }));
+        assert!(recovered.query_error.is_none());
         assert_eq!(
             store.projection_cache_delivery_clones, 0,
             "retry must reload immediately without serving the cached previous observation"
@@ -11433,21 +11416,22 @@ fn v2_projection_cache_reloads_after_sqlite_batch_rollback_and_retry() {
 }
 
 #[test]
-fn tui_history_with_damaged_or_missing_ownership_excludes_persisted_v1_backup() {
+fn tui_history_with_damaged_or_missing_ownership_keeps_only_read_only_memory() {
     for missing in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let codex_home = directory.path().join("codex-home");
         std::fs::create_dir(&codex_home).unwrap();
         let history_root = directory.path().join("state/history-v1");
         let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
-        let mut legacy = HistoryStore::new(history_root.clone(), &codex_home);
-        legacy
-            .record(&tui_runtime_test_observation(starts_at, 999))
-            .unwrap();
-        let shard = legacy.namespace_dir().unwrap().join("2026-08-30.json");
+        let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+        runtime.ensure_v2_active().unwrap();
+        let namespace = HistoryStore::memory_only(&codex_home, false)
+            .namespace()
+            .to_owned();
+        let shard = history_root.join(namespace).join("2026-08-30.json");
+        std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        std::fs::write(&shard, b"inert old history backup").unwrap();
         let before = std::fs::read(&shard).unwrap();
-        let runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-        runtime.ensure_ownership_initialized().unwrap();
         let manifest = runtime.ownership().manifest_path();
         drop(runtime);
         if missing {
@@ -11482,213 +11466,6 @@ fn tui_history_with_damaged_or_missing_ownership_excludes_persisted_v1_backup() 
 }
 
 #[test]
-fn file_v2_tui_defers_writes_while_busy_then_upgrades_preserving_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let codex_home = directory.path().join("codex-home");
-    std::fs::create_dir(&codex_home).unwrap();
-    let history_root = directory.path().join("state/history-v1");
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
-    let now = starts_at + ChronoDuration::minutes(20);
-    let mut runtime = tui_file_v2_runtime(
-        history_root.clone(),
-        &codex_home,
-        &tui_runtime_test_observation(starts_at, 10),
-    );
-    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let local_id = runtime.source_identity().node_id().clone();
-    let legacy_source_directory = runtime.source_history().source_directory(&local_id);
-    let legacy_bytes = || {
-        walkdir::WalkDir::new(&legacy_source_directory)
-            .into_iter()
-            .map(Result::unwrap)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .map(|entry| {
-                (
-                    entry.path().to_path_buf(),
-                    std::fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let before = legacy_bytes();
-    assert!(!before.is_empty());
-    let recorder = match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap()
-    {
-        TryRecorderInstanceLock::Acquired(guard) => guard,
-        TryRecorderInstanceLock::Busy => panic!("fixture recorder lock is busy"),
-    };
-    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, now) {
-        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("file v2 must retain its source-aware snapshot: {warnings:?}")
-        }
-    };
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("upgrade is deferred"))
-    );
-    let selection = HistorySourceSelection::Local(local_id);
-    let since = starts_at - ChronoDuration::hours(1);
-    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
-    let existing = store.load_since_with_staged_selected(&selection, since);
-    assert!(existing.query_error.is_none(), "{:?}", existing.query_error);
-    assert!(existing.history.read_only);
-    assert_eq!(
-        existing.history.half_hour_buckets[0]
-            .token_usage
-            .total_tokens,
-        10
-    );
-    store.stage(&tui_runtime_test_observation(starts_at, 20));
-    assert!(store.flush_staged().unwrap().is_none());
-    assert_eq!(legacy_bytes(), before);
-    drop(recorder);
-
-    let (TuiHistoryBackend::Runtime(runtime), Some(profile_lease)) =
-        (&mut store.backend, &store.profile_lease)
-    else {
-        panic!("deferred file v2 must retain its runtime and lease");
-    };
-    assert!(matches!(
-        prepare_tui_history_runtime(runtime, profile_lease, now),
-        TuiHistoryRuntimePreparation::Ready(_)
-    ));
-    assert!(runtime.source_history().sqlite_database().is_some());
-    assert!(store.write_permitted());
-    assert!(matches!(
-        store.flush_staged().unwrap(),
-        Some(HistoryRuntimeWriteReport::V2(_))
-    ));
-    let upgraded = store.load_since_with_staged_selected(&selection, since);
-    assert!(upgraded.query_error.is_none(), "{:?}", upgraded.query_error);
-    assert!(!upgraded.history.read_only);
-    assert_eq!(
-        upgraded.history.half_hour_buckets[0]
-            .token_usage
-            .total_tokens,
-        20
-    );
-    assert_eq!(
-        legacy_bytes(),
-        before,
-        "SQL commits must preserve the file backup"
-    );
-}
-
-#[test]
-fn file_v2_projection_cache_refreshes_after_another_runtime_activates_sqlite() {
-    let directory = tempfile::tempdir().unwrap();
-    let codex_home = directory.path().join("codex-home");
-    std::fs::create_dir(&codex_home).unwrap();
-    let history_root = directory.path().join("state/history-v1");
-    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
-    let runtime = tui_file_v2_runtime(
-        history_root.clone(),
-        &codex_home,
-        &tui_runtime_test_observation(starts_at, 10),
-    );
-    let lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
-    let since = starts_at - ChronoDuration::hours(1);
-    let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
-    let existing = store.load_since_with_staged_selected(&selection, since);
-    assert!(existing.query_error.is_none(), "{:?}", existing.query_error);
-    assert_eq!(
-        existing.history.half_hour_buckets[0]
-            .token_usage
-            .total_tokens,
-        10
-    );
-    assert!(store.projection_cache_valid(&selection, since, false));
-
-    let mut writer_runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-    let _writer_profile_lease = acquire_runtime_profile_lease(&writer_runtime).unwrap();
-    writer_runtime.ensure_v2_active().unwrap();
-    writer_runtime
-        .record_local_observation(
-            &tui_runtime_test_observation(starts_at, 20),
-            LocalObservationMode::Incremental,
-        )
-        .unwrap();
-    assert!(store.cached_projection(&selection, since, false).is_none());
-    let refreshed = store.load_since_with_staged_selected(&selection, since);
-    assert!(
-        refreshed.query_error.is_none(),
-        "{:?}",
-        refreshed.query_error
-    );
-    assert_eq!(
-        refreshed.history.half_hour_buckets[0]
-            .token_usage
-            .total_tokens,
-        20
-    );
-    assert!(!refreshed.history.read_only);
-    assert!(
-        store
-            .source_history_store()
-            .unwrap()
-            .sqlite_database()
-            .is_some()
-    );
-}
-
-fn tui_file_v2_runtime(
-    history_root: PathBuf,
-    codex_home: &Path,
-    observation: &HistoryObservation,
-) -> HistoryRuntime {
-    use crate::history_ownership::{InitializeV1Outcome, OwnershipCasOutcome, TryWriterLease};
-    let runtime = HistoryRuntime::new(history_root, codex_home, false).unwrap();
-    let lease = match runtime.ownership().try_acquire_writer_lease().unwrap() {
-        TryWriterLease::Acquired(lease) => lease,
-        TryWriterLease::Busy(_) => panic!("fixture writer lease is busy"),
-    };
-    let v1 = match runtime.ownership().initialize_v1_active(&lease).unwrap() {
-        InitializeV1Outcome::Initialized(manifest) | InitializeV1Outcome::Existing(manifest) => {
-            manifest
-        }
-    };
-    let OwnershipCasOutcome::Applied(migrating) =
-        runtime.ownership().begin_migration(&lease, &v1).unwrap()
-    else {
-        panic!("fixture migration conflicted");
-    };
-    let OwnershipCasOutcome::Applied(active) = runtime
-        .ownership()
-        .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
-        .unwrap()
-    else {
-        panic!("fixture activation conflicted");
-    };
-    assert!(!active.is_sqlite_backend());
-    let authority = runtime
-        .ownership()
-        .authorize_v2_write(&lease, &active)
-        .unwrap();
-    runtime
-        .source_history()
-        .writer(&authority)
-        .unwrap()
-        .record_local_observation(
-            runtime.source_identity(),
-            "local",
-            runtime.redaction_profile(),
-            observation,
-            LocalObservationMode::Incremental,
-        )
-        .unwrap();
-    drop(lease);
-    runtime
-}
-
-#[test]
 fn recent_legacy_recorder_defers_tui_v2_cutover() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
@@ -11696,27 +11473,17 @@ fn recent_legacy_recorder_defers_tui_v2_cutover() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
-    let mut status = RecorderStatusFile::started_with_interval(
-        now,
-        runtime.legacy_history().namespace().to_string(),
-        60,
-    );
+    let mut status =
+        RecorderStatusFile::started_with_interval(now, runtime.namespace().to_string(), 60);
     status.record_success(now);
-    crate::service::write_recorder_status(
-        &default_status_file(runtime.legacy_history().history_root().unwrap()),
-        &status,
-    )
-    .unwrap();
+    crate::service::write_recorder_status(&default_status_file(runtime.history_root()), &status)
+        .unwrap();
 
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, now) {
-        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("legacy status should retain the fenced V1 runtime: {warnings:?}")
-        }
-    };
+    let TuiHistoryRuntimePreparation::Ready(warnings) =
+        prepare_tui_history_runtime(&mut runtime, &profile_lease, now);
     assert!(warnings.iter().any(|warning| {
-        warning.contains("source-aware history cutover deferred while legacy recorder")
+        warning.contains("SQLite history initialization deferred while legacy recorder")
     }));
     let manifest = match runtime.ownership().load_manifest().unwrap() {
         OwnershipManifestStatus::Initialized(manifest) => manifest,
@@ -11726,7 +11493,7 @@ fn recent_legacy_recorder_defers_tui_v2_cutover() {
 }
 
 #[test]
-fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
+fn busy_recorder_keeps_tui_bound_to_sqlite_without_reading_old_history() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
     std::fs::create_dir(&codex_home).unwrap();
@@ -11743,24 +11510,25 @@ fn busy_cooperating_recorder_lock_keeps_tui_on_legacy_without_migrating() {
     let mut store = TuiHistoryStore::deferred_runtime(runtime, profile_lease);
     assert_eq!(
         store.prepare_deferred_runtime(&codex_home, false, Utc::now()),
-        DeferredTuiHistoryPreparation::LegacyFallback
+        DeferredTuiHistoryPreparation::Ready
     );
+    assert!(store.setup_warnings.iter().any(|warning| {
+        warning.contains("initialization is deferred while the recorder is active")
+    }));
+    assert!(matches!(store.backend, TuiHistoryBackend::Runtime(_)));
     assert!(
         store
-            .setup_warnings
-            .iter()
-            .any(|warning| { warning.contains("cutover deferred while the recorder is active") })
+            .source_history_store()
+            .unwrap()
+            .sqlite_database()
+            .is_some()
     );
-    assert!(matches!(
-        store.backend,
-        TuiHistoryBackend::LegacyFallback(_)
-    ));
-    assert!(store.profile_lease.is_none());
+    assert!(store.profile_lease.is_some());
     assert!(!store.write_permitted());
     assert_eq!(
         ownership.load_manifest().unwrap(),
         OwnershipManifestStatus::Uninitialized,
-        "a busy current recorder must prevent even the start of migration"
+        "a busy recorder must prevent SQLite initialization"
     );
 }
 
@@ -11772,12 +11540,8 @@ fn same_profile_recorder_on_v2_allows_tui_persistence() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
-        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("an active V2 manifest must remain queryable: {warnings:?}")
-        }
-    };
+    let TuiHistoryRuntimePreparation::Ready(warnings) =
+        prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now());
     assert!(warnings.is_empty());
     let _recorder_profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     let _recorder_guard =
@@ -11806,12 +11570,8 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
     let history_root = directory.path().join("state/history-v1");
     let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
-    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
-        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("unexpected legacy fallback: {warnings:?}")
-        }
-    };
+    let TuiHistoryRuntimePreparation::Ready(warnings) =
+        prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now());
     let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 11, 0, 0).unwrap();
     let observed_at = starts_at + ChronoDuration::minutes(20);
@@ -11819,7 +11579,7 @@ fn same_profile_recorder_does_not_block_tui_reconcile_or_backfill_marker() {
 
     let _recorder_profile_lease = acquire_runtime_profile_lease(match &store.backend {
         TuiHistoryBackend::Runtime(runtime) => runtime,
-        TuiHistoryBackend::LegacyFallback(_) => unreachable!(),
+        TuiHistoryBackend::MemoryFallback(_) => unreachable!(),
     })
     .unwrap();
     let _recorder_guard =
@@ -11850,9 +11610,6 @@ fn tui_revalidates_profile_lease_before_each_runtime_write() {
     let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
     match prepare_tui_history_runtime(&mut runtime, &profile_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("unexpected legacy fallback: {warnings:?}")
-        }
     }
     let marker = profile_lease
         .lock_path()
@@ -11889,9 +11646,6 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
     match prepare_tui_history_runtime(&mut preview_runtime, &preview_lease, Utc::now()) {
         TuiHistoryRuntimePreparation::Ready(_) => {}
-        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-            panic!("unexpected legacy fallback: {warnings:?}")
-        }
     }
     preview_runtime
         .record_local_observation(
@@ -11934,15 +11688,15 @@ fn opposite_profile_keeps_tui_runtime_read_only_without_losing_v2_history() {
 }
 
 #[test]
-fn legacy_tui_fallback_keeps_live_history_when_persistence_is_unavailable() {
+fn memory_tui_fallback_keeps_live_history_without_persisting() {
     let directory = tempfile::tempdir().unwrap();
     let codex_home = directory.path().join("codex-home");
     std::fs::create_dir(&codex_home).unwrap();
     let history_root = directory.path().join("not-a-directory");
     std::fs::write(&history_root, b"occupied").unwrap();
-    let legacy = HistoryStore::new(history_root, &codex_home);
+    let memory = HistoryStore::memory_only(&codex_home, false);
     let mut store =
-        TuiHistoryStore::legacy_fallback(legacy, vec!["source-aware test fallback".to_string()]);
+        TuiHistoryStore::memory_fallback(memory, vec!["source-aware test fallback".to_string()]);
     let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
 
     let mut observation = tui_runtime_test_observation(starts_at, 42);
@@ -11973,12 +11727,8 @@ fn legacy_tui_fallback_keeps_live_history_when_persistence_is_unavailable() {
             .iter()
             .any(|warning| warning.contains("source-aware test fallback"))
     );
-    assert!(
-        history
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("history persistence failed"))
-    );
+    assert!(history.read_only);
+    assert!(store.flush_staged().unwrap().is_none());
 
     let source_id: NodeId = "node-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap();
     let exact = store.load_since_with_staged_selected(
@@ -11992,7 +11742,7 @@ fn legacy_tui_fallback_keeps_live_history_when_persistence_is_unavailable() {
     assert!(matches!(
         exact.status,
         Some(HistorySourceSelectionStatus::Unavailable(
-            HistorySourceUnavailableReason::UnsupportedByLegacy
+            HistorySourceUnavailableReason::UnavailableInMemoryView
         ))
     ));
     assert!(

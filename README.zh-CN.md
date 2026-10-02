@@ -10,7 +10,7 @@
 
 `codex-usage-monit` 用于监控 Codex 额度窗口、重置时间、重置机会、任务、turn、模型、本地可观察 token 用量、模型调用的 API 等价费用和历史走势。它既可以作为交互式 TUI 使用，也可以通过非交互式 CLI 输出纯文本或 JSON，供脚本、cron 和 CI 调用。
 
-它以本地数据和终端为核心：不需要桌面程序、浏览器、数据库或监听端口。TUI 可以独立运行；也可以选择注册用户级后台记录服务，在 TUI 关闭后继续保存额度走势。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
+它以本地数据和终端为核心：不需要桌面程序、浏览器、外部数据库服务或监听端口。TUI 可以独立运行；也可以选择注册用户级后台记录服务，在 TUI 关闭后继续保存额度走势。预编译程序支持 Windows、macOS 和 Linux，也能通过 SSH 直接运行在没有桌面环境的开发服务器上。
 
 ## TUI 预览
 
@@ -249,6 +249,8 @@ codex-usage-monit --redact-content record
 
 如果 recorder 使用非默认历史目录，所有会读写远程状态的命令都要指定同一个 source-aware 目录，例如 `codex-usage-monit --redact-content remote --history-dir /srv/codex-state/history-v1 sync buildbox`。这样配对、解绑/移除、保留来源管理与手工同步会进入 recorder 的同一个持久化域，不会静默落到平台默认目录。TUI 和服务命令应按指南配置相同的 state-root 环境变量。
 
+历史生产后端统一为 SQLite；`history-v1` 是沿用的路径绑定名称，数据保存在同一 state-root 的 `history-v2/{profile}/history.sqlite3`。初始化只保留旧配额采样，以及来源策略、本地编号高水位和未完成的来源删除意图等控制状态；即使来源 metadata 已删除，中断的不可逆删除仍阻止重新配对；身份和配置原文件保持不动，其余旧派生历史由既有采集、Summary 有界回填与 SSH bootstrap 按需重建，不在启动时主动解析全部历史。已激活的数据库缺失、损坏或 receipt 不支持时明确报错，不自动丢库重建，也不退回旧文件历史；当前 schema 为 version 2；旧 schema 1 开发预览库及 full-migration receipt 不兼容，不自动删库；正常旧文件版本的配额采样保留不受影响。完整去重与远端协议继续保留，范围和当前验证状态见[存储执行方案](docs/storage-rewrite-execution-plan-2026-10-02.zh-CN.md#73-sqlite-唯一后端与按需重建)。
+
 **Settings** 中也提供相同的逐主机控制和显式项目映射。Git 证据仍只是需要接受的建议；未映射 instance 会单独列出，可多选后明确执行手工 Merge，Split 则撤销 logical membership。同步完成后，Overview 使用两层本地数据：source-aware 统一历史独立于 Summary/Trends 的来源选择器，负责提供经过 replica 去重的 task/turn 行以及 5 小时/周窗口用量；有边界的 live 快照只负责近期状态和元数据。live 层包含活动/不确定任务以及最近 24 小时的终态记录，语义 revision 握手只在内容变化时发送完整快照，硬上限为 128 个 task、512 个 turn 和 64 KiB；没有变化时只发送 revision，本地 baseline 丢失时则强制补发完整 replacement。远端行只读，连续 15 分钟没有成功刷新后会变为 `STALE`。live 中的 task/turn 累计计数绝不会在历史缺失时冒充 5 小时或周窗口数据；历史覆盖不完整时会继续明确显示为下界。
 
 滚动带宽预算按每个已配置 source 独立计算：自动 bulk 在 rolling 24 小时达到 150 MiB 时暂停，普通自动传输在 250 MiB 时暂停。调度器只有一个 worker，同一时刻最多连接一台主机；但如果显式启用多台主机，总预算仍会线性叠加，因此只应启用确实需要轮询的主机。Exclude 只会让保留 source 不再参与 **All** 和 replica authority 计算，不会删除数据；在 Summary 或 Trends 精确选中该 source 时仍可查看 inspect-only 数据，并明确标为 `EXCLUDED`。
@@ -274,7 +276,7 @@ codex-usage-monit service uninstall
 
 Windows 任务通过内嵌、与业务版本绑定的 GUI host 无窗口启动 recorder，并管理其进程树。`service start` 会启用自动启动并立即开始记录；`service stop` 会禁用自动启动并停止记录。`service restart` 要求注册项处于启用状态；`service repair` 保留原启用/停用状态，沿现有更新流程向前恢复。`service status --format json` 区分 manager 状态、心跳健康和 `waiting_for_logon`。默认 Windows 任务要求同一用户保持交互登录，仅有 SSH 会话不够；服务器模式和恢复步骤见 [Windows 安装指南](docs/windows-installation.md)。
 
-应用升级使用 `update`，它会自动协调已有服务；只把已经准备好的程序应用到 recorder 时可以使用 `service upgrade`。需要明确修改 `--codex-home`、Codex 可执行文件位置或采集选项时，再运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 v1→v2 history cutover 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次迁移和迁移恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
+应用升级使用 `update`，它会自动协调已有服务；只把已经准备好的程序应用到 recorder 时可以使用 `service upgrade`。需要明确修改 `--codex-home`、Codex 可执行文件位置或采集选项时，再运行 `service install`。由于每个平台对同一用户只有一个 recorder 注册项，即使使用不同的自定义 history 目录，服务变更与待执行的 SQLite history 初始化 也会共用一把当前用户全局 gate。安装器在触碰系统服务前先写入不会自动过期的 cutover blocker、移除旧 trust marker，再停用并停止原来的受管 recorder，同时验证没有独立前台 recorder 占用目标历史目录。每个新 definition 都带有 source-aware 协议，以及由可执行文件、完整 recorder 参数和安装时环境确定性生成的 identity；安装器把磁盘上的精确定义与 manager 已加载的 identity 绑定，并在清除 blocker 前立即再次复验，之后才允许 recorder 启动。Linux unit 和 Windows 任务在校验期间保持 inactive；launchd 必须先加载 job 才能暴露已加载参数，因此安装器会一直持有目标 history 的 recorder 单例锁，任何提前启动的尝试都会在写历史前失败。即使同一路径后来被换成旧 binary，旧程序也会拒绝新服务参数，而不会重新成为 legacy writer。替换失败时不会恢复可能在未来登录时再次启动的旧版注册；注册、trust 或 blocker 清理失败都会进入可验证的清理流程，无法确认清理成功时 blocker 会无期限保留。休眠的旧注册、被修改的注册或缺少匹配 trust record 的注册同样会阻止首次初始化和初始化恢复；已经处于 V2Active 的 history 则不会在每次启动时重复查询服务管理器。v0.4 以前的安装器或管理员与本次 cutover 并发修改 manager 不属于受支持场景；清除 blocker 前的最终复验会把这个无法跨旧版本完全消除的窗口压到最小，并在观察到变化时 fail closed。如果已没有受管注册，但仍存在近期前台 recorder 状态，安装和卸载同样会 fail closed，直到该进程停止。LaunchAgent 属于已登录的 macOS GUI 用户；systemd 用户服务通常只随用户登录会话运行，除非系统启用了 lingering；Windows 任务使用交互式用户令牌，因此只在该用户保持登录时运行。如果无界面主机不会保留用户会话，请启用对应平台支持的用户服务常驻方式，或使用已有 supervisor。
 
 没有受支持服务管理器的环境，可以在 tmux、Zellij 或其他 supervisor 中运行：
 
@@ -425,7 +427,7 @@ Task 状态证据和置信度是两个独立的 JSON 字段。Task 的 `statusPr
 | `15m Local Tokens` | 按调用完成观察时间放入 UTC 对齐 15 分钟桶的本地 token 增量。 |
 | `15m ~EST Usage` | 把同一周低置信度分配拆到这些 15 分钟 credit 费率权重桶。 |
 
-历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 8；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。已发布的 revision 3 基础历史会保留，但重建前无法提供可选倍率；短暂开发版本产生的 revision 4 单权重历史会被丢弃，因为无法安全拆分基础值和附加值。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
+历史使用 UTC 保存、按本地时间显示。周累计样本使用原始调用时间，因此可以精确切在服务端给出的任意重置分钟。Summary 的项目拆分从新版本开始向前记录，`1h` 到 `1d` 图表桶均由同一份持久化 15 分钟观察聚合而来；切换粒度不会重新扫描 rollout，也不需要另一种 recorder 模式。首次在 TUI 选择历史不完整的近 30 天范围，或运行 `summary --range 30d` 时，共享覆盖策略会执行一次仅扫描本地数据的 31 天回填，并临时扩大文件上限；TUI 在后台执行，一次性命令则在输出前完成。日常 recorder 仍保持已配置的轻量 lookback。按 history namespace 保存的标记会避免部分回填在每次启动或调用时重复运行；覆盖仍不完整时，七天后可再次自动尝试。无法重建的桶继续显示为 `PARTIAL`，总量会明确标为已知下限，未知时间桶留空而不会当成零。EST 聚合会携带估算器 revision，避免静默混用不同权重定义。内置双权重映射对应 estimator revision 8；外部目录使用它自己声明的更高 revision。每次新的本地观察都会同时保存基础 Codex credit 代理值与可选 API 长上下文附加值。Longx 关闭时，无法核实请求边界的大聚合不会影响完整性；开启时仍保留基础费率，并标记 `long_context_usage_unknown`，不会猜测。SQLite 初始化保留配额采样，不导入旧派生用量；需要的用量从现存 Codex 日志按当前估算器重建，不静默复用不兼容的权重定义。混合 estimator revision 仍不会合并。由于计算采用最新周 gauge 和完整周期分母，新增本地调用、服务端样本、切换估算口径或升级估算器后，之前绘制的 `~EST` 柱可能被修订。跨越周重置边界的 `15m ~EST` 桶会被排除并标记为 partial，而不会混入相邻周期。
 
 Trends 的 Inspect 直接显示所选观测点原始保存的准确时间戳和值，而不是从图表坐标反推。对于 Trends 中的 15 分钟柱，读数会以本地时间显示其准确的 UTC 对齐桶区间。Summary 的 Inspect 则显示当前 `1h` 到 `1d` 粒度下所选派生本地聚合桶的起点、区间和值；它不是原始事件时间戳。
 

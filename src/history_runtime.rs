@@ -1,11 +1,10 @@
-//! Explicit ownership-aware bridge between legacy local history and the v2
-//! source-aware history layout.
+//! Ownership-aware publication of staged local history into SQLite.
 //!
 //! Construction resolves and validates one stable filesystem namespace, but
-//! deliberately does not initialize ownership or migrate data. Callers choose
+//! deliberately does not initialize ownership or retain old quota. Callers choose
 //! the cutover point by invoking [`HistoryRuntime::ensure_v2_active`].
 //! The ownership lease fences upgraded, cooperating writers only. Before that
-//! explicit call, orchestration must stop any legacy binary that does not know
+//! explicit call, orchestration must stop any old binary that does not know
 //! about the ownership manifest; this module cannot prove such a process is
 //! absent.
 
@@ -20,17 +19,13 @@ use chrono::{DateTime, Utc};
 use crate::domain::TaskRecord;
 use crate::git_repository::GitProjectEvidenceResolver;
 use crate::history::{
-    HistoryObservation, HistoryStore, HistoryWriteReport, SummaryBackfillAttempt,
-    default_history_root,
+    HistoryObservation, HistoryStore, SummaryBackfillAttempt, default_history_root,
 };
 use crate::history_ownership::{
     HistoryOwnershipManifest, HistoryOwnershipState, HistoryOwnershipStore, InitializeV1Outcome,
-    OwnershipCasOutcome, OwnershipManifestStatus,
+    OwnershipManifestStatus,
 };
-use crate::history_query::{HistorySourceSelection, UnifiedHistoryBackend, UnifiedHistorySnapshot};
-use crate::local_history_migration::{
-    LocalV1MigrationOptions, activate_local_v2_history, migrate_local_v1_history,
-};
+use crate::history_query::{HistorySourceSelection, UnifiedHistorySnapshot};
 use crate::project_mapping::{
     PROJECT_MAPPING_REGISTRATION_FAILED_WARNING, ProjectMappingStore, ProjectObservation,
 };
@@ -98,7 +93,6 @@ fn local_observation_write_trace_fields(report: &LocalObservationWriteReport) ->
 /// Backend-specific persistence details from one runtime-managed flush.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryRuntimeWriteReport {
-    V1(HistoryWriteReport),
     V2(LocalObservationWriteReport),
 }
 
@@ -109,16 +103,6 @@ struct StagedLocalSessionDigests {
     digests: Vec<SourceSessionDigest>,
 }
 
-/// Stable lower bound for every local-v1 migration.
-///
-/// A recovery must present exactly the same window as the durable migration
-/// marker. Using wall-clock-relative retention here would make a crash
-/// unrecoverable on the next run. The legacy store applies its own retention
-/// bounds, so an epoch lower bound does not make the import unbounded.
-fn migration_window_starts_at() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is representable")
-}
-
 /// One fully bound local-history runtime.
 ///
 /// All stores use the same canonical state-root spelling. In particular this
@@ -126,7 +110,7 @@ fn migration_window_starts_at() -> DateTime<Utc> {
 /// from creating separate ownership and data domains.
 pub struct HistoryRuntime {
     state_root: PathBuf,
-    legacy: HistoryStore,
+    staging: HistoryStore,
     source_identity: SourceIdentity,
     source_history: SourceHistoryStore,
     ownership: HistoryOwnershipStore,
@@ -151,7 +135,7 @@ pub struct HistoryRuntime {
 }
 
 impl HistoryRuntime {
-    /// Resolves the process-default legacy history root.
+    /// Resolves the process-default staging history root.
     ///
     /// This may create the stable source identity when it is genuinely absent,
     /// but it never creates an ownership manifest or migrates history.
@@ -165,10 +149,10 @@ impl HistoryRuntime {
         Self::new(history_root, codex_home, redact_content)
     }
 
-    /// Binds a runtime to an explicit legacy history root.
+    /// Binds a runtime to an explicit staging history root.
     ///
     /// The only accepted custom layout is `<state-root>/history-v1`, matching
-    /// the migration format and the source-history sibling layout exactly.
+    /// the established profile identity and source-history sibling layout exactly.
     pub fn new(history_root: PathBuf, codex_home: &Path, redact_content: bool) -> io::Result<Self> {
         #[cfg(test)]
         let project_mapping_store = ProjectMappingStore::new(
@@ -196,7 +180,7 @@ impl HistoryRuntime {
         redact_content: bool,
         project_mapping_store: ProjectMappingStore,
     ) -> io::Result<Self> {
-        let requested_history_root = strict_absolute_path(&history_root, "legacy history root")?;
+        let requested_history_root = strict_absolute_path(&history_root, "staging history root")?;
         if requested_history_root
             .file_name()
             .and_then(|name| name.to_str())
@@ -204,7 +188,7 @@ impl HistoryRuntime {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "legacy history root must end in history-v1",
+                "staging history root must end in history-v1",
             ));
         }
         let requested_state_root = requested_history_root
@@ -212,12 +196,12 @@ impl HistoryRuntime {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "legacy history root has no state-root parent",
+                    "staging history root has no state-root parent",
                 )
             })?
             .to_path_buf();
         validate_directory_leaf_if_present(&requested_state_root, "history state root")?;
-        validate_directory_leaf_if_present(&requested_history_root, "legacy history root")?;
+        validate_directory_leaf_if_present(&requested_history_root, "staging history root")?;
 
         let codex_home = canonical_existing_directory(codex_home, "Codex home")?;
 
@@ -236,7 +220,7 @@ impl HistoryRuntime {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "legacy history root does not resolve to the canonical state-root sibling",
+                "staging history root does not resolve to the canonical state-root sibling",
             ));
         }
 
@@ -252,15 +236,15 @@ impl HistoryRuntime {
             ));
         }
 
-        let legacy = HistoryStore::new_with_redaction(
+        let staging = HistoryStore::new_with_redaction(
             canonical_history_root.clone(),
             &codex_home,
             redact_content,
         );
-        if legacy.history_root() != Some(canonical_history_root.as_path()) {
+        if staging.history_root() != Some(canonical_history_root.as_path()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "legacy history store did not preserve its canonical root binding",
+                "staging history store did not preserve its canonical root binding",
             ));
         }
 
@@ -269,45 +253,40 @@ impl HistoryRuntime {
         } else {
             RedactionProfile::PreviewEnabled
         };
-        let profile_text =
-            match redaction_profile {
-                RedactionProfile::PreviewEnabled => legacy.namespace(),
-                RedactionProfile::Redacted => legacy
-                    .namespace()
-                    .strip_suffix("-redacted")
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "redacted legacy namespace is missing its redaction suffix",
-                        )
-                    })?,
-            };
+        let profile_text = match redaction_profile {
+            RedactionProfile::PreviewEnabled => staging.namespace(),
+            RedactionProfile::Redacted => staging
+                .namespace()
+                .strip_suffix("-redacted")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "redacted staging namespace is missing its redaction suffix",
+                    )
+                })?,
+        };
         let profile_id = profile_text.parse::<HistoryProfileId>().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("legacy history namespace is not a valid v2 profile ID: {error}"),
+                format!("staging history namespace is not a valid v2 profile ID: {error}"),
             )
         })?;
         let expected_namespace = match redaction_profile {
             RedactionProfile::PreviewEnabled => profile_id.as_str().to_owned(),
             RedactionProfile::Redacted => format!("{}-redacted", profile_id.as_str()),
         };
-        if legacy.namespace() != expected_namespace {
+        if staging.namespace() != expected_namespace {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "legacy history namespace does not match the runtime redaction binding",
+                "staging history namespace does not match the runtime redaction binding",
             ));
         }
 
-        let mut source_history = SourceHistoryStore::new(state_root.clone(), profile_id.clone());
+        let source_history = SourceHistoryStore::new_sqlite(state_root.clone(), profile_id.clone());
         let ownership =
             HistoryOwnershipStore::new(state_root.clone(), profile_id.clone(), redaction_profile);
-        if let OwnershipManifestStatus::Initialized(manifest) = ownership.load_manifest()?
-            && manifest.is_sqlite_backend()
-            && manifest.state() == HistoryOwnershipState::V2Active
-        {
-            source_history = SourceHistoryStore::new_sqlite(state_root.clone(), profile_id.clone());
-        }
+        let manifest_status = ownership.load_manifest()?;
+        validate_missing_ownership_database(&source_history, &manifest_status)?;
         if source_history.state_root() != state_root
             || source_history.profile_id() != &profile_id
             || ownership.state_root() != state_root
@@ -330,7 +309,7 @@ impl HistoryRuntime {
             #[cfg(test)]
             service_definition_observation_override: Some(ServiceDefinitionObservation::Absent),
             state_root,
-            legacy,
+            staging,
             source_identity: canonical_identity,
             source_history,
             ownership,
@@ -358,8 +337,18 @@ impl HistoryRuntime {
         self.redaction_profile
     }
 
-    pub fn legacy_history(&self) -> &HistoryStore {
-        &self.legacy
+    pub fn staging_history(&self) -> &HistoryStore {
+        &self.staging
+    }
+
+    pub fn history_root(&self) -> &Path {
+        self.staging
+            .history_root()
+            .expect("runtime binds a coordination root")
+    }
+
+    pub fn namespace(&self) -> &str {
+        self.staging.namespace()
     }
 
     pub fn source_identity(&self) -> &SourceIdentity {
@@ -484,10 +473,10 @@ impl HistoryRuntime {
 
     /// Publishes the initial v1 ownership manifest without starting cutover.
     ///
-    /// This is the safe startup path while a legacy recorder may still be
+    /// This is the safe startup path while a staging recorder may still be
     /// running: uninitialized ownership becomes `V1Active`, while every
     /// already-initialized phase is returned byte-for-byte unchanged. Only an
-    /// explicit [`Self::ensure_v2_active`] call may begin migration.
+    /// explicit [`Self::ensure_v2_active`] call may initialize SQLite.
     pub fn ensure_ownership_initialized(&self) -> io::Result<HistoryOwnershipManifest> {
         let lease = self.ownership.acquire_writer_lease()?;
         let manifest = match self.ownership.load_manifest()? {
@@ -512,10 +501,10 @@ impl HistoryRuntime {
     }
 
     /// Loads one ownership-consistent history projection without exposing the
-    /// mutable legacy store required by its internal read cache.
+    /// mutable staging store required by its internal read cache.
     ///
-    /// Ownership must already be initialized. `V1Active` and `Migrating`
-    /// select legacy history; `V2Active` selects the source-aware aggregate.
+    /// SQLite must be active. Earlier ownership phases yield a retryable
+    /// error; durable projections never read old JSON or overlay pending data.
     pub fn load_unified_history_since(
         &mut self,
         since: DateTime<Utc>,
@@ -536,7 +525,7 @@ impl HistoryRuntime {
         )
     }
 
-    /// Query only: callers establish ownership and perform any migration or
+    /// Query only: callers establish ownership and perform SQLite initialization or
     /// observation commits before opening this request-scoped context.
     pub(crate) fn query_history_selected(
         &mut self,
@@ -546,7 +535,6 @@ impl HistoryRuntime {
         self.refresh_active_sqlite_backend()?;
         let mut snapshot = crate::history_query::load_unified_history_with_context(
             &self.ownership,
-            &mut self.legacy,
             &self.source_history,
             &self.project_mapping_store,
             &self.source_identity,
@@ -560,7 +548,7 @@ impl HistoryRuntime {
 
     /// Another cooperating process can finish the cutover after this runtime
     /// was constructed. Refresh a reader without waiting for its writer lease
-    /// or running a migration from inside a query.
+    /// or initializing storage from inside a query.
     pub(crate) fn refresh_active_sqlite_backend(&mut self) -> io::Result<()> {
         if let OwnershipManifestStatus::Initialized(manifest) = self.ownership.load_manifest()?
             && manifest.is_sqlite_backend()
@@ -569,7 +557,7 @@ impl HistoryRuntime {
             self.validate_manifest_binding(&manifest)?;
             let store =
                 SourceHistoryStore::new_sqlite(self.state_root.clone(), self.profile_id.clone());
-            crate::sqlite_history_migration::validate_receipt(
+            crate::sqlite_history_initialization::validate_receipt(
                 &store
                     .sqlite_database()
                     .expect("SQLite store has a database"),
@@ -593,7 +581,7 @@ impl HistoryRuntime {
 
     /// Adds one live observation to the in-memory batching buffer.
     pub fn stage(&mut self, observation: &HistoryObservation) {
-        self.legacy.stage(observation);
+        self.staging.stage(observation);
         self.staged_pending = true;
         // A plain observation has no source-local digest sidecar. Never attach
         // evidence left by an earlier collection to a different observation.
@@ -605,7 +593,7 @@ impl HistoryRuntime {
     /// V2 callers must later use [`Self::flush_staged_reconcile`] so missing
     /// facts inside the declared window can be tombstoned deliberately.
     pub fn stage_full_observation(&mut self, observation: &HistoryObservation) {
-        self.legacy.stage_full_observation(observation);
+        self.staging.stage_full_observation(observation);
         self.staged_pending = true;
         self.staged_reconcile_required = true;
         self.staged_local_session_digests = None;
@@ -621,7 +609,7 @@ impl HistoryRuntime {
     ) -> io::Result<()> {
         let normalized = self.prepare_local_collection_observation(observation, tasks);
         let digests = finalize_local_session_digests(&self.source_identity, evidence, &normalized)?;
-        self.legacy.stage(&normalized);
+        self.staging.stage(&normalized);
         self.staged_pending = true;
         self.staged_local_session_digests = Some(StagedLocalSessionDigests {
             observed_at: evidence.observed_at(),
@@ -642,7 +630,7 @@ impl HistoryRuntime {
     ) -> io::Result<()> {
         let normalized = self.prepare_local_collection_observation(observation, tasks);
         let digests = finalize_local_session_digests(&self.source_identity, evidence, &normalized)?;
-        self.legacy.stage_full_observation(&normalized);
+        self.staging.stage_full_observation(&normalized);
         self.staged_pending = true;
         self.staged_reconcile_required = true;
         self.staged_local_session_digests = Some(StagedLocalSessionDigests {
@@ -653,7 +641,7 @@ impl HistoryRuntime {
         Ok(())
     }
 
-    /// Loads durable history and overlays the current in-memory observation.
+    /// Loads durable history while local observations may still be pending.
     pub fn load_unified_history_since_with_staged(
         &mut self,
         since: DateTime<Utc>,
@@ -664,8 +652,8 @@ impl HistoryRuntime {
         )
     }
 
-    /// Loads a selected durable projection and overlays staged local v1 data
-    /// only when the request is all-source or the runtime's exact local ID.
+    /// Loads a selected durable projection. Pending local data becomes visible
+    /// after its atomic commit, preserving cross-source aggregation.
     pub fn load_unified_history_since_with_staged_selected(
         &mut self,
         selection: &HistorySourceSelection,
@@ -676,32 +664,14 @@ impl HistoryRuntime {
             &mut crate::history_query::HistoryQueryContext::new(since),
         )
     }
-
     pub(crate) fn query_history_with_staged_selected(
         &mut self,
         selection: &HistorySourceSelection,
         context: &mut crate::history_query::HistoryQueryContext,
     ) -> io::Result<UnifiedHistorySnapshot> {
-        let since = context.since();
-        let mut snapshot = self.query_history_selected(selection, context)?;
-        // A v2 snapshot is already an additive local+remote aggregate. The
-        // legacy overlay helper performs key replacement, so applying it here
-        // could replace the whole aggregate bucket with only the staged local
-        // slice. Until query owns a source-slice overlay, expose durable v2
-        // rather than losing or double-counting remote usage.
-        let permits_v1_local_overlay = match selection {
-            HistorySourceSelection::AllIncluded => true,
-            HistorySourceSelection::Local(source_id) => source_id == self.source_identity.node_id(),
-            HistorySourceSelection::Remote(_) => false,
-        };
-        if snapshot.backend == UnifiedHistoryBackend::V1
-            && snapshot.source_selection_status.is_applied()
-            && permits_v1_local_overlay
-        {
-            self.legacy
-                .overlay_staged_since(&mut snapshot.history, since);
-        }
-        Ok(snapshot)
+        // SQL projections already combine source slices; overlaying a local
+        // memory buffer here would replace or double count remote usage.
+        self.query_history_selected(selection, context)
     }
 
     /// Flushes staged live data immediately through the active backend.
@@ -719,8 +689,8 @@ impl HistoryRuntime {
 
     /// Flushes a staged complete lookback using explicit reconciliation.
     ///
-    /// V1 preserves its established full-merge behavior. V2 emits tombstones
-    /// for previously persisted local facts missing from `[from, to)`.
+    /// SQLite emits tombstones for previously persisted local facts missing
+    /// from `[from, to)`.
     pub fn flush_staged_reconcile(
         &mut self,
         from: DateTime<Utc>,
@@ -735,8 +705,7 @@ impl HistoryRuntime {
         self.flush_staged_internal(None, Some((from, to)))
     }
 
-    /// Persists the Summary backfill marker through whichever backend owns
-    /// runtime writes. A pending staged observation always downgrades a
+    /// Persists the SQLite Summary backfill marker. A pending observation downgrades a
     /// requested complete marker to partial.
     pub fn mark_summary_backfill_attempt(
         &mut self,
@@ -746,24 +715,15 @@ impl HistoryRuntime {
         let lease = self.ownership.acquire_writer_lease()?;
         let manifest = self.load_runtime_write_manifest()?;
         let complete = complete && !self.staged_pending;
-        let marker = match manifest.state() {
-            HistoryOwnershipState::V1Active => {
-                let authority = self.ownership.authorize_v1_write(&lease, &manifest)?;
-                self.legacy
-                    .writer(&authority)?
-                    .mark_summary_backfill_attempt(completed_at, complete)?
+        let marker = {
+            let authority = self.ownership.authorize_v2_write(&lease, &manifest)?;
+            let writer = self.source_history.writer(&authority)?;
+            let marker = writer.mark_v2_summary_backfill_attempt(completed_at, complete)?;
+            writer.validate()?;
+            SummaryBackfillAttempt {
+                completed_at: marker.completed_at,
+                complete: marker.complete,
             }
-            HistoryOwnershipState::V2Active => {
-                let authority = self.ownership.authorize_v2_write(&lease, &manifest)?;
-                let writer = self.source_history.writer(&authority)?;
-                let marker = writer.mark_v2_summary_backfill_attempt(completed_at, complete)?;
-                writer.validate()?;
-                SummaryBackfillAttempt {
-                    completed_at: marker.completed_at,
-                    complete: marker.complete,
-                }
-            }
-            HistoryOwnershipState::Migrating => unreachable!("write manifest rejects migration"),
         };
         self.validate_exact_write_manifest(&manifest)?;
         Ok(marker)
@@ -777,140 +737,88 @@ impl HistoryRuntime {
         let lease = self.ownership.acquire_writer_lease()?;
         let manifest = self.load_runtime_write_manifest()?;
 
-        match manifest.state() {
-            HistoryOwnershipState::V1Active => {
-                if reconcile.is_some() {
-                    let Some(flush) = self.legacy.prepare_staged_flush() else {
-                        self.staged_pending = false;
-                        self.staged_reconcile_required = false;
-                        self.staged_local_session_digests = None;
-                        self.validate_exact_write_manifest(&manifest)?;
-                        return Ok(None);
-                    };
-                    if !self.staged_reconcile_required {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "staged reconciliation requires a full observation",
-                        ));
-                    }
-                    debug_assert!(flush.force_full_merge());
-                }
-
-                let authority = self.ownership.authorize_v1_write(&lease, &manifest)?;
-                let mut writer = self.legacy.writer(&authority)?;
-                let result = match (due_interval, reconcile) {
-                    (Some(interval), None) => writer.flush_staged_if_due(interval)?,
-                    (None, _) => writer.flush_staged()?,
-                    (Some(_), Some(_)) => unreachable!("reconciliation is never interval-gated"),
-                };
-                writer.validate()?;
-                self.validate_exact_write_manifest(&manifest)?;
-                match result {
-                    Some(report) => {
-                        if v1_write_succeeded(&report) {
-                            self.staged_pending = false;
-                            self.staged_reconcile_required = false;
-                            self.staged_local_session_digests = None;
-                        }
-                        Ok(Some(HistoryRuntimeWriteReport::V1(report)))
-                    }
-                    None => {
-                        if due_interval.is_none() {
-                            self.staged_pending = false;
-                            self.staged_reconcile_required = false;
-                            self.staged_local_session_digests = None;
-                        }
-                        Ok(None)
-                    }
-                }
+        let flush = match due_interval {
+            Some(interval) => self.staging.prepare_staged_flush_if_due(interval),
+            None => self.staging.prepare_staged_flush(),
+        };
+        let Some(flush) = flush else {
+            self.validate_exact_write_manifest(&manifest)?;
+            if due_interval.is_none() {
+                self.staged_pending = false;
+                self.staged_reconcile_required = false;
+                self.staged_local_session_digests = None;
             }
-            HistoryOwnershipState::V2Active => {
-                let flush = match due_interval {
-                    Some(interval) => self.legacy.prepare_staged_flush_if_due(interval),
-                    None => self.legacy.prepare_staged_flush(),
-                };
-                let Some(flush) = flush else {
-                    self.validate_exact_write_manifest(&manifest)?;
-                    if due_interval.is_none() {
-                        self.staged_pending = false;
-                        self.staged_reconcile_required = false;
-                        self.staged_local_session_digests = None;
-                    }
-                    return Ok(None);
-                };
-                let mode = match reconcile {
-                    Some((from, to)) => {
-                        if !self.staged_reconcile_required {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "staged reconciliation requires a full observation",
-                            ));
-                        }
-                        debug_assert!(flush.force_full_merge());
-                        LocalObservationMode::Reconcile { from, to }
-                    }
-                    None => {
-                        if self.staged_reconcile_required {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "a staged full observation requires explicit reconciliation",
-                            ));
-                        }
-                        LocalObservationMode::Incremental
-                    }
-                };
-
-                let authority = self.ownership.authorize_v2_write(&lease, &manifest)?;
-                let writer = self.source_history.writer(&authority)?;
-                let staged_digests = self.staged_local_session_digests.as_ref();
-                if staged_digests
-                    .is_some_and(|evidence| evidence.observed_at != flush.observation().observed_at)
-                {
+            return Ok(None);
+        };
+        let mode = match reconcile {
+            Some((from, to)) => {
+                if !self.staged_reconcile_required {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "staged local session digests do not match the flushed observation",
+                        io::ErrorKind::InvalidInput,
+                        "staged reconciliation requires a full observation",
                     ));
                 }
-                let mut report = match staged_digests {
-                    Some(evidence) => writer.record_local_observation_with_session_digests(
-                        &self.source_identity,
-                        LOCAL_SOURCE_LABEL,
-                        self.redaction_profile,
-                        flush.observation(),
-                        mode,
-                        &evidence.digests,
-                        evidence.scan_complete,
-                    )?,
-                    None => writer.record_local_observation(
-                        &self.source_identity,
-                        LOCAL_SOURCE_LABEL,
-                        self.redaction_profile,
-                        flush.observation(),
-                        mode,
-                    )?,
-                };
-                self.maybe_garbage_collect_after_local_write(
-                    &writer,
-                    flush.observation().observed_at,
-                    &mut report,
-                );
-                writer.validate()?;
-                self.validate_exact_write_manifest(&manifest)?;
-                let cleared = self.legacy.complete_staged_flush(&flush);
-                self.staged_pending = !cleared;
-                if cleared {
-                    self.staged_reconcile_required = false;
-                    self.staged_local_session_digests = None;
-                }
-                Ok(Some(HistoryRuntimeWriteReport::V2(report)))
+                LocalObservationMode::Reconcile { from, to }
             }
-            HistoryOwnershipState::Migrating => unreachable!("write manifest rejects migration"),
+            None => {
+                if self.staged_reconcile_required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a staged full observation requires explicit reconciliation",
+                    ));
+                }
+                LocalObservationMode::Incremental
+            }
+        };
+
+        let authority = self.ownership.authorize_v2_write(&lease, &manifest)?;
+        let writer = self.source_history.writer(&authority)?;
+        let staged_digests = self.staged_local_session_digests.as_ref();
+        if staged_digests
+            .is_some_and(|evidence| evidence.observed_at != flush.observation().observed_at)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged local session digests do not match the flushed observation",
+            ));
         }
+        let mut report = match staged_digests {
+            Some(evidence) => writer.record_local_observation_with_session_digests(
+                &self.source_identity,
+                LOCAL_SOURCE_LABEL,
+                self.redaction_profile,
+                flush.observation(),
+                mode,
+                &evidence.digests,
+                evidence.scan_complete,
+            )?,
+            None => writer.record_local_observation(
+                &self.source_identity,
+                LOCAL_SOURCE_LABEL,
+                self.redaction_profile,
+                flush.observation(),
+                mode,
+            )?,
+        };
+        self.maybe_garbage_collect_after_local_write(
+            &writer,
+            flush.observation().observed_at,
+            &mut report,
+        );
+        writer.validate()?;
+        self.validate_exact_write_manifest(&manifest)?;
+        let cleared = self.staging.complete_staged_flush(&flush);
+        self.staged_pending = !cleared;
+        if cleared {
+            self.staged_reconcile_required = false;
+            self.staged_local_session_digests = None;
+        }
+        Ok(Some(HistoryRuntimeWriteReport::V2(report)))
     }
 
     /// Persists one local observation in the source-aware namespace.
     ///
-    /// Runtime writes never initialize ownership or trigger migration. The
+    /// Runtime writes never initialize ownership or SQLite. The
     /// caller must perform the explicit cutover first. A fresh, short-lived
     /// writer lease and an authority for the exact durable v2 epoch fence each
     /// call independently.
@@ -938,7 +846,7 @@ impl HistoryRuntime {
 
     /// Production collection write which normalizes project identity before
     /// entering the durable v2 writer. The lower-level method remains useful
-    /// for migration and storage tests which already carry canonical IDs.
+    /// for storage tests which already carry canonical IDs.
     pub fn record_local_collection_observation(
         &self,
         observation: &HistoryObservation,
@@ -1098,36 +1006,20 @@ impl HistoryRuntime {
         Ok(marker)
     }
 
-    /// Explicitly migrates this namespace to v2, or returns the already-active
-    /// v2 manifest without changing it.
-    ///
-    /// Initialization, import, crash recovery, verification, and activation
-    /// all occur while one ownership writer lease is held. The caller must
-    /// first quiesce legacy binaries that do not participate in that lease.
+    /// Initializes SQLite, retaining only quota samples, policies and revision floors.
+    /// Ownership and service coordination fence old writers throughout
+    /// initialization and crash recovery; derived usage is rebuilt on demand.
     pub fn ensure_v2_active(&mut self) -> io::Result<HistoryOwnershipManifest> {
-        self.ensure_v2_active_at(Utc::now())
-    }
-
-    fn ensure_v2_active_at(
-        &mut self,
-        completed_at: DateTime<Utc>,
-    ) -> io::Result<HistoryOwnershipManifest> {
-        let window_starts_at = migration_window_starts_at();
-        let completed_at = completed_at.max(window_starts_at);
         let lease = self.ownership.acquire_writer_lease()?;
         let manifest_status = self.ownership.load_manifest()?;
-        if let OwnershipManifestStatus::Initialized(manifest) = &manifest_status {
+        validate_missing_ownership_database(&self.source_history, &manifest_status)?;
+        if let OwnershipManifestStatus::Initialized(manifest) = &manifest_status
+            && manifest.is_sqlite_backend()
+            && manifest.state() == HistoryOwnershipState::V2Active
+        {
             self.validate_manifest_binding(manifest)?;
-            if manifest.is_sqlite_backend() && manifest.state() == HistoryOwnershipState::V2Active {
-                let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
-                    &self.ownership,
-                    &lease,
-                    manifest,
-                    &self.source_history,
-                )?;
-                self.source_history = store;
-                return Ok(active);
-            }
+            self.validate_sqlite_write_backend(manifest)?;
+            return Ok(manifest.clone());
         }
         let coordination_root = self.service_coordination_root_for_cutover()?;
         let _service_gate = match try_acquire_service_cutover_shared_at(&coordination_root)? {
@@ -1164,93 +1056,14 @@ impl HistoryRuntime {
             OwnershipManifestStatus::Initialized(manifest) => manifest,
         };
         self.validate_manifest_binding(&manifest)?;
-
-        if manifest.uses_source_history() {
-            let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
-                &self.ownership,
-                &lease,
-                &manifest,
-                &self.source_history,
-            )?;
-            self.source_history = store;
-            return Ok(active);
-        }
-
-        let migrating = match manifest.state() {
-            HistoryOwnershipState::V2Active => {
-                let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
-                    &self.ownership,
-                    &lease,
-                    &manifest,
-                    &self.source_history,
-                )?;
-                self.source_history = store;
-                return Ok(active);
-            }
-            HistoryOwnershipState::Migrating => manifest,
-            HistoryOwnershipState::V1Active => {
-                match self.ownership.begin_migration(&lease, &manifest)? {
-                    OwnershipCasOutcome::Applied(manifest) => manifest,
-                    OwnershipCasOutcome::Conflict(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "history ownership changed while the writer lease was held",
-                        ));
-                    }
-                }
-            }
-        };
-        self.validate_manifest_binding(&migrating)?;
-        if migrating.state() != HistoryOwnershipState::Migrating {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history cutover did not enter the migrating state",
-            ));
-        }
-
-        let options = LocalV1MigrationOptions {
-            source_identity: &self.source_identity,
-            redaction_profile: self.redaction_profile,
-            source_label: LOCAL_SOURCE_LABEL,
-            expected_ownership_epoch: migrating.epoch(),
-            window_starts_at,
-            completed_at,
-        };
-        migrate_local_v1_history(
-            &mut self.legacy,
-            &self.source_history,
+        let (active, store) = crate::sqlite_history_initialization::activate_sqlite_history(
             &self.ownership,
             &lease,
-            &migrating,
-            &options,
-        )?;
-        let activation = activate_local_v2_history(
-            &mut self.legacy,
-            &self.source_history,
-            &self.ownership,
-            &lease,
-            &migrating,
-            &options,
-        )?;
-        let active = activation.ownership().clone();
-        self.validate_manifest_binding(&active)?;
-        if active.state() != HistoryOwnershipState::V2Active
-            || self.ownership.load_manifest()?
-                != OwnershipManifestStatus::Initialized(active.clone())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "v2 activation was not durably published in this runtime namespace",
-            ));
-        }
-        self.ownership.validate_writer_lease(&lease)?;
-        let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
-            &self.ownership,
-            &lease,
-            &active,
+            &manifest,
             &self.source_history,
         )?;
         self.source_history = store;
+        self.validate_manifest_binding(&active)?;
         Ok(active)
     }
 
@@ -1310,15 +1123,13 @@ impl HistoryRuntime {
             OwnershipManifestStatus::Initialized(manifest) => manifest,
         };
         self.validate_manifest_binding(&manifest)?;
-        if manifest.state() == HistoryOwnershipState::Migrating {
+        if manifest.state() != HistoryOwnershipState::V2Active {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "history cutover is in progress; staged data remains pending",
             ));
         }
-        if manifest.state() == HistoryOwnershipState::V2Active {
-            self.validate_sqlite_write_backend(&manifest)?;
-        }
+        self.validate_sqlite_write_backend(&manifest)?;
         Ok(manifest)
     }
 
@@ -1334,7 +1145,7 @@ impl HistoryRuntime {
         if !manifest.is_sqlite_backend() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "file-based v2 history is read-only; complete the SQLite cutover before writing",
+                "history writes require initialized SQLite ownership",
             ));
         }
         let database = self.source_history.sqlite_database().ok_or_else(|| {
@@ -1343,7 +1154,7 @@ impl HistoryRuntime {
                 "history backend changed; refresh the runtime before writing",
             )
         })?;
-        crate::sqlite_history_migration::validate_receipt(&database, manifest)
+        crate::sqlite_history_initialization::validate_receipt(&database, manifest)
     }
 
     fn validate_exact_write_manifest(&self, expected: &HistoryOwnershipManifest) -> io::Result<()> {
@@ -1400,10 +1211,6 @@ impl HistoryRuntime {
     }
 }
 
-fn v1_write_succeeded(report: &HistoryWriteReport) -> bool {
-    !report.read_only && report.warnings.is_empty()
-}
-
 fn saturating_duration_us(duration: StdDuration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1442,6 +1249,24 @@ fn strict_absolute_path(path: &Path, subject: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(path.to_path_buf())
+}
+
+fn validate_missing_ownership_database(
+    store: &SourceHistoryStore,
+    status: &OwnershipManifestStatus,
+) -> io::Result<()> {
+    if matches!(status, OwnershipManifestStatus::Uninitialized)
+        && store
+            .sqlite_database()
+            .expect("runtime uses SQLite")
+            .exists()?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history ownership manifest is missing for an existing SQLite database",
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_existing_directory(path: &Path, subject: &str) -> io::Result<PathBuf> {
@@ -1509,10 +1334,8 @@ mod tests {
         HISTORY_ESTIMATOR_REVISION, HISTORY_PROJECT_BREAKDOWN_REVISION, HistoryObservation,
         LocalHalfHourBucket, LocalProjectUsageGroup, QuotaPoint,
     };
-    use crate::history_query::HistorySourceSelectionStatus;
-    use crate::local_history_migration::{
-        LocalV1MigrationOptions, load_migrated_local_history_since, migrate_local_v1_history,
-    };
+    use crate::history_ownership::OwnershipCasOutcome;
+    use crate::history_query::UnifiedHistoryBackend;
     use crate::remote_protocol::{ProtocolRevisions, SourceGeneration};
     use crate::source_export::materialize_local_session_digest_evidence;
     use crate::source_history::{
@@ -1542,6 +1365,32 @@ mod tests {
             ProjectMappingStore::new(directory.join("config/project-mappings.json")),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn lost_active_ownership_cannot_be_reinitialized_by_an_existing_runtime() {
+        let directory = tempdir().unwrap();
+        let mut runtime = runtime(directory.path(), false);
+        runtime.ensure_v2_active().unwrap();
+        let observation = HistoryObservation {
+            observed_at: at(2, 10, 15),
+            half_hour_buckets: vec![sample_bucket(at(2, 10, 0), 42)],
+            ..HistoryObservation::default()
+        };
+        runtime.stage(&observation);
+        let manifest = runtime.ownership().manifest_path();
+        fs::remove_file(&manifest).unwrap();
+
+        let error = runtime.ensure_v2_active().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ownership manifest is missing"));
+        assert!(!manifest.exists());
+        assert!(runtime.flush_staged().is_err());
+        let pending = runtime.staging.prepare_staged_flush().unwrap();
+        assert_eq!(
+            pending.observation().half_hour_buckets,
+            observation.half_hour_buckets
+        );
     }
 
     fn sample_bucket(starts_at: DateTime<Utc>, tokens: u64) -> LocalHalfHourBucket {
@@ -1697,6 +1546,153 @@ mod tests {
     }
 
     #[test]
+    fn local_runtime_writes_refuse_uninitialized_v1_and_migrating_phases() {
+        let directory = tempdir().unwrap();
+        let runtime = runtime(directory.path(), false);
+        let observation = sample_observation(at(30, 9, 0), 101);
+
+        let error = runtime
+            .record_local_observation(&observation, LocalObservationMode::Incremental)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            runtime.ownership.load_manifest().unwrap(),
+            OwnershipManifestStatus::Uninitialized
+        );
+
+        let v1 = {
+            let lease = runtime.ownership.acquire_writer_lease().unwrap();
+            match runtime.ownership.initialize_v1_active(&lease).unwrap() {
+                InitializeV1Outcome::Initialized(manifest)
+                | InitializeV1Outcome::Existing(manifest) => manifest,
+            }
+        };
+        let error = runtime
+            .record_local_observation(&observation, LocalObservationMode::Incremental)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        {
+            let lease = runtime.ownership.acquire_writer_lease().unwrap();
+            let outcome = runtime
+                .ownership
+                .begin_sqlite_initialization(&lease, &v1)
+                .unwrap();
+            assert!(matches!(outcome, OwnershipCasOutcome::Applied(_)));
+        }
+        let error = runtime
+            .record_local_observation(&observation, LocalObservationMode::Incremental)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let error = runtime.load_v2_summary_backfill_attempt().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn inactive_sqlite_queries_and_failed_publication_preserve_staged_observations() {
+        let directory = tempdir().unwrap();
+        let mut runtime = runtime(directory.path(), false);
+        runtime.ensure_ownership_initialized().unwrap();
+        runtime.stage(&sample_observation(at(30, 9, 0), 333));
+        assert_eq!(
+            runtime.flush_staged().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            runtime
+                .load_unified_history_since_with_staged(at(30, 8, 0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(runtime.staging.prepare_staged_flush().is_some());
+        runtime.ensure_v2_active().unwrap();
+        let correct = runtime.source_history.clone();
+        runtime.source_history = SourceHistoryStore::new_sqlite(
+            directory.path().join("wrong-state-root"),
+            runtime.profile_id.clone(),
+        );
+        assert_eq!(
+            runtime.flush_staged().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(runtime.staging.prepare_staged_flush().is_some());
+        runtime.source_history = correct;
+        let pending = runtime
+            .load_unified_history_since_with_staged(at(30, 8, 0))
+            .unwrap();
+        assert!(pending.history.half_hour_buckets.is_empty());
+        assert!(matches!(
+            runtime.flush_staged().unwrap(),
+            Some(HistoryRuntimeWriteReport::V2(_))
+        ));
+        assert_eq!(
+            runtime
+                .load_unified_history_since(at(30, 8, 0))
+                .unwrap()
+                .history
+                .half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            333
+        );
+    }
+
+    #[test]
+    fn redacted_runtime_derives_the_unredacted_profile_id() {
+        let directory = tempdir().unwrap();
+        let runtime = runtime(directory.path(), true);
+        assert_eq!(runtime.redaction_profile(), RedactionProfile::Redacted);
+        assert_eq!(
+            runtime.staging.namespace(),
+            format!("{}-redacted", runtime.profile_id())
+        );
+    }
+
+    #[test]
+    fn custom_layout_and_relative_roots_fail_before_ownership_initialization() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        fs::create_dir(&codex_home).unwrap();
+
+        let wrong_leaf = directory.path().join("state/custom-history");
+        let error = HistoryRuntime::new(wrong_leaf, &codex_home, false)
+            .err()
+            .expect("custom leaf should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!directory.path().join("state").exists());
+
+        let error = HistoryRuntime::new(PathBuf::from("history-v1"), &codex_home, false)
+            .err()
+            .expect("relative root should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_legacy_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let state_root = directory.path().join("state");
+        let actual = directory.path().join("actual-history");
+        fs::create_dir(&codex_home).unwrap();
+        fs::create_dir(&state_root).unwrap();
+        fs::create_dir(&actual).unwrap();
+        symlink(&actual, state_root.join(LEGACY_HISTORY_DIRECTORY)).unwrap();
+
+        let error = HistoryRuntime::new(
+            state_root.join(LEGACY_HISTORY_DIRECTORY),
+            &codex_home,
+            false,
+        )
+        .err()
+        .expect("symlinked history root should fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn local_registration_deduplicates_same_path_and_logical_projection_survives_restart() {
         let directory = tempdir().unwrap();
         let mapping_store =
@@ -1797,7 +1793,7 @@ mod tests {
         assert!(cached_mapping.contains("git-sha256-v1-"));
         assert!(cached_mapping.contains("\"repositoryRelativeWorkspaceRoot\":\".\""));
 
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         runtime
             .record_local_collection_observation(
                 &observation,
@@ -1860,7 +1856,7 @@ mod tests {
             bad_mapping,
         )
         .unwrap();
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         let project = directory.path().join("project");
         fs::create_dir(&project).unwrap();
         let observation = sample_observation(at(30, 9, 0), 10);
@@ -1893,6 +1889,70 @@ mod tests {
     }
 
     #[test]
+    fn staged_late_usage_correction_commits_old_bucket_and_digest_together() {
+        let directory = tempdir().unwrap();
+        let mut runtime = runtime(directory.path(), false);
+        runtime.ensure_v2_active().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let task = project_task(project);
+        let mut calls = Vec::new();
+        for iteration in 1..=2 {
+            calls.push(UsageCall {
+                timestamp: at(30, 8, iteration * 5),
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                usage_event_id: Some(format!("late-event-{iteration}")),
+                usage_event_identity_exact: true,
+                model: Some("gpt-5.6-luna".to_owned()),
+                service_tier: Some("standard".to_owned()),
+                tokens: TokenUsage {
+                    input_tokens: 100,
+                    total_tokens: 100,
+                    ..Default::default()
+                },
+                request_usage_exact: true,
+            });
+            let mut observation = sample_observation(at(30, 8, 0), 100 * u64::from(iteration));
+            observation.observed_at = at(30, 10, iteration);
+            let bucket = &mut observation.half_hour_buckets[0];
+            bucket.call_count = u64::from(iteration);
+            bucket.project_groups[0].call_count = u64::from(iteration);
+            let evidence = materialize_local_session_digest_evidence(
+                &calls,
+                &observation.half_hour_buckets,
+                observation.observed_at,
+                false,
+            )
+            .unwrap();
+            runtime
+                .stage_local_collection(&observation, std::slice::from_ref(&task), &evidence)
+                .unwrap();
+            runtime.flush_staged().unwrap();
+        }
+        let source = runtime.source_identity.node_id();
+        let durable = runtime
+            .source_history
+            .load_source_since(source, runtime.redaction_profile, at(30, 7, 0))
+            .unwrap();
+        assert_eq!(durable.buckets[0].token_usage.total_tokens, 200);
+        assert_eq!(durable.buckets[0].call_count, 2);
+        let digests = runtime
+            .source_history
+            .load_source_session_digest_records_since(
+                source,
+                runtime.redaction_profile,
+                at(30, 7, 0),
+            )
+            .unwrap();
+        let SourceSessionDigestChange::Upsert(digest) = digests.records[0].change() else {
+            panic!("expected active digest");
+        };
+        assert_eq!(digest.metrics().token_usage.total_tokens, 200);
+        assert_eq!(digest.metrics().call_count, 2);
+    }
+
+    #[test]
     fn local_collection_session_digest_survives_runtime_restart_without_content() {
         let directory = tempdir().unwrap();
         let (history_root, codex_home) = runtime_paths(directory.path());
@@ -1904,7 +1964,7 @@ mod tests {
             ProjectMappingStore::new(mapping_path.clone()),
         )
         .unwrap();
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         let project = directory.path().join("private-project-name");
         fs::create_dir(&project).unwrap();
         let task = project_task(project.clone());
@@ -1982,7 +2042,11 @@ mod tests {
 
         let migrating = {
             let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            match runtime.ownership.begin_migration(&lease, &v1).unwrap() {
+            match runtime
+                .ownership
+                .begin_sqlite_initialization(&lease, &v1)
+                .unwrap()
+            {
                 OwnershipCasOutcome::Applied(manifest) => manifest,
                 OwnershipCasOutcome::Conflict(status) => {
                     panic!("unexpected migration conflict: {status:?}")
@@ -1992,56 +2056,16 @@ mod tests {
         assert_eq!(migrating.state(), HistoryOwnershipState::Migrating);
         assert_eq!(runtime.ensure_ownership_initialized().unwrap(), migrating);
 
-        let active = runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        let active = runtime.ensure_v2_active().unwrap();
         assert_eq!(active.state(), HistoryOwnershipState::V2Active);
         assert_eq!(runtime.ensure_ownership_initialized().unwrap(), active);
-    }
-
-    #[test]
-    fn local_runtime_writes_refuse_uninitialized_v1_and_migrating_phases() {
-        let directory = tempdir().unwrap();
-        let runtime = runtime(directory.path(), false);
-        let observation = sample_observation(at(30, 9, 0), 101);
-
-        let error = runtime
-            .record_local_observation(&observation, LocalObservationMode::Incremental)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            runtime.ownership.load_manifest().unwrap(),
-            OwnershipManifestStatus::Uninitialized
-        );
-
-        let v1 = {
-            let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            match runtime.ownership.initialize_v1_active(&lease).unwrap() {
-                InitializeV1Outcome::Initialized(manifest)
-                | InitializeV1Outcome::Existing(manifest) => manifest,
-            }
-        };
-        let error = runtime
-            .record_local_observation(&observation, LocalObservationMode::Incremental)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-
-        {
-            let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            let outcome = runtime.ownership.begin_migration(&lease, &v1).unwrap();
-            assert!(matches!(outcome, OwnershipCasOutcome::Applied(_)));
-        }
-        let error = runtime
-            .record_local_observation(&observation, LocalObservationMode::Incremental)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        let error = runtime.load_v2_summary_backfill_attempt().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
     fn v2_local_runtime_writes_reserve_revisions_and_persist_marker() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
 
         assert_eq!(runtime.load_v2_summary_backfill_attempt().unwrap(), None);
         let first = runtime
@@ -2056,8 +2080,8 @@ mod tests {
                 LocalObservationMode::Incremental,
             )
             .unwrap();
-        assert_eq!(first.revision, 2);
-        assert_eq!(second.revision, 3);
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 2);
 
         let source = runtime
             .source_history
@@ -2105,7 +2129,7 @@ mod tests {
     fn v2_gc_failure_is_reported_without_rolling_back_a_staged_observation() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         let first = runtime
             .record_local_observation(
                 &sample_observation(at(30, 9, 0), 111),
@@ -2138,7 +2162,7 @@ mod tests {
             .unwrap();
 
         let history_root = runtime
-            .legacy_history()
+            .staging_history()
             .history_root()
             .unwrap()
             .to_path_buf();
@@ -2147,10 +2171,8 @@ mod tests {
         let mut restarted = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
         restarted.stage(&sample_observation(at(30, 15, 0), 222));
         let report = restarted.flush_staged().unwrap().unwrap();
-        let HistoryRuntimeWriteReport::V2(report) = report else {
-            panic!("expected a v2 write report");
-        };
-        assert_eq!(report.revision, 3);
+        let HistoryRuntimeWriteReport::V2(report) = report;
+        assert_eq!(report.revision, 2);
         assert!(report.garbage_collection.attempted);
         let warning = report
             .garbage_collection
@@ -2181,7 +2203,7 @@ mod tests {
     fn v2_local_runtime_write_rejects_a_mismatched_source_store() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         runtime.source_history = SourceHistoryStore::new(
             directory.path().join("different-state-root"),
             runtime.profile_id.clone(),
@@ -2200,7 +2222,7 @@ mod tests {
     fn redacted_runtime_direct_write_never_persists_plaintext_content() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), true);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         let mut observation = sample_observation(at(30, 9, 0), 111);
         let group = &mut observation.half_hour_buckets[0].project_groups[0];
         group.title = Some("private incident title".to_owned());
@@ -2222,170 +2244,10 @@ mod tests {
     }
 
     #[test]
-    fn unified_query_requires_initialization_and_switches_backend_at_activation() {
-        let directory = tempdir().unwrap();
-        let mut runtime = runtime(directory.path(), false);
-        let starts_at = at(29, 9, 0);
-        runtime
-            .legacy
-            .record(&sample_observation(starts_at, 123))
-            .unwrap();
-
-        let error = runtime
-            .load_unified_history_since(at(29, 8, 0))
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(
-            runtime.ownership.load_manifest().unwrap(),
-            OwnershipManifestStatus::Uninitialized,
-            "a read must not initialize ownership implicitly"
-        );
-
-        let v1 = runtime.ensure_ownership_initialized().unwrap();
-        let legacy = runtime.load_unified_history_since(at(29, 8, 0)).unwrap();
-        assert_eq!(
-            legacy.backend,
-            crate::history_query::UnifiedHistoryBackend::V1
-        );
-        assert_eq!(legacy.ownership_epoch, v1.epoch());
-        assert_eq!(legacy.history.half_hour_buckets.len(), 1);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
-        let source_aware = runtime.load_unified_history_since(at(29, 8, 0)).unwrap();
-        assert_eq!(
-            source_aware.backend,
-            crate::history_query::UnifiedHistoryBackend::V2
-        );
-        assert_eq!(source_aware.history.half_hour_buckets.len(), 1);
-        assert_eq!(
-            source_aware.history.half_hour_buckets[0]
-                .token_usage
-                .total_tokens,
-            123
-        );
-    }
-
-    #[test]
-    fn staged_overlay_and_flush_route_through_v1_and_v2() {
-        let first_directory = tempdir().unwrap();
-        let mut v1_runtime = runtime(first_directory.path(), false);
-        v1_runtime.ensure_ownership_initialized().unwrap();
-        v1_runtime.stage(&sample_observation(at(30, 9, 0), 111));
-
-        let durable = v1_runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert!(durable.history.half_hour_buckets.is_empty());
-        let live = v1_runtime
-            .load_unified_history_since_with_staged(at(30, 8, 0))
-            .unwrap();
-        assert_eq!(live.history.half_hour_buckets.len(), 1);
-        assert!(matches!(
-            v1_runtime.flush_staged_if_due(StdDuration::ZERO).unwrap(),
-            Some(HistoryRuntimeWriteReport::V1(_))
-        ));
-        let durable = v1_runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert_eq!(durable.history.half_hour_buckets.len(), 1);
-
-        let second_directory = tempdir().unwrap();
-        let mut v2_runtime = runtime(second_directory.path(), false);
-        v2_runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
-        v2_runtime.stage(&sample_observation(at(30, 9, 0), 222));
-        let durable = v2_runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert!(durable.history.half_hour_buckets.is_empty());
-        let live = v2_runtime
-            .load_unified_history_since_with_staged(at(30, 8, 0))
-            .unwrap();
-        assert!(
-            live.history.half_hour_buckets.is_empty(),
-            "v2 must not apply a local replacement overlay to an additive aggregate"
-        );
-        let report = v2_runtime.flush_staged().unwrap();
-        assert!(matches!(
-            report,
-            Some(HistoryRuntimeWriteReport::V2(LocalObservationWriteReport {
-                revision: 2,
-                ..
-            }))
-        ));
-        let durable = v2_runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert_eq!(durable.history.half_hour_buckets.len(), 1);
-        assert_eq!(
-            durable.history.half_hour_buckets[0]
-                .token_usage
-                .total_tokens,
-            222
-        );
-    }
-
-    #[test]
-    fn selected_v1_staged_overlay_is_limited_to_all_and_exact_local() {
-        let directory = tempdir().unwrap();
-        let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_ownership_initialized().unwrap();
-        runtime.stage(&sample_observation(at(30, 9, 0), 111));
-        let local_id = runtime.source_identity.node_id().clone();
-        let remote_id: NodeId = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
-
-        let all = runtime
-            .load_unified_history_since_with_staged_selected(
-                &HistorySourceSelection::AllIncluded,
-                at(30, 8, 0),
-            )
-            .unwrap();
-        assert_eq!(
-            all.source_selection_status,
-            HistorySourceSelectionStatus::Applied
-        );
-        assert_eq!(all.history.half_hour_buckets.len(), 1);
-
-        let local = runtime
-            .load_unified_history_since_with_staged_selected(
-                &HistorySourceSelection::Local(local_id.clone()),
-                at(30, 8, 0),
-            )
-            .unwrap();
-        assert_eq!(
-            local.source_selection_status,
-            HistorySourceSelectionStatus::Applied
-        );
-        assert_eq!(local.history.half_hour_buckets.len(), 1);
-        assert_eq!(
-            local.history.half_hour_buckets[0].token_usage.total_tokens,
-            111
-        );
-
-        let remote = runtime
-            .load_unified_history_since_with_staged_selected(
-                &HistorySourceSelection::Remote(remote_id.clone()),
-                at(30, 8, 0),
-            )
-            .unwrap();
-        assert_eq!(
-            remote.source_selection_status,
-            HistorySourceSelectionStatus::Unavailable(
-                crate::history_query::HistorySourceUnavailableReason::UnsupportedByLegacy
-            )
-        );
-        assert!(remote.history.half_hour_buckets.is_empty());
-
-        let stale_local = runtime
-            .load_unified_history_since_with_staged_selected(
-                &HistorySourceSelection::Local(remote_id),
-                at(30, 8, 0),
-            )
-            .unwrap();
-        assert_eq!(
-            stale_local.source_selection_status,
-            HistorySourceSelectionStatus::Unavailable(
-                crate::history_query::HistorySourceUnavailableReason::LocalIdentityMismatch
-            )
-        );
-        assert!(stale_local.history.half_hour_buckets.is_empty());
-    }
-
-    #[test]
     fn v2_staged_read_never_replaces_a_same_bucket_local_remote_aggregate() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         let starts_at = at(30, 9, 0);
         runtime
             .record_local_observation(
@@ -2508,61 +2370,18 @@ mod tests {
     }
 
     #[test]
-    fn migrating_and_failed_v2_flushes_preserve_staged_data() {
-        let directory = tempdir().unwrap();
-        let mut runtime = runtime(directory.path(), false);
-        let v1 = runtime.ensure_ownership_initialized().unwrap();
-        runtime.stage(&sample_observation(at(30, 9, 0), 333));
-        {
-            let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            assert!(matches!(
-                runtime.ownership.begin_migration(&lease, &v1).unwrap(),
-                OwnershipCasOutcome::Applied(_)
-            ));
-        }
-
-        let error = runtime.flush_staged().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        let during = runtime
-            .load_unified_history_since_with_staged(at(30, 8, 0))
-            .unwrap();
-        assert_eq!(during.history.half_hour_buckets.len(), 1);
-
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
-        let correct_store = runtime.source_history.clone();
-        runtime.source_history = SourceHistoryStore::new(
-            directory.path().join("wrong-state-root"),
-            runtime.profile_id.clone(),
-        );
-        let error = runtime.flush_staged().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        runtime.source_history = correct_store;
-
-        let retained = runtime
-            .load_unified_history_since_with_staged(at(30, 8, 0))
-            .unwrap();
-        assert!(retained.history.half_hour_buckets.is_empty());
-        assert!(matches!(
-            runtime.flush_staged().unwrap(),
-            Some(HistoryRuntimeWriteReport::V2(_))
-        ));
-        let durable = runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert_eq!(durable.history.half_hour_buckets.len(), 1);
-    }
-
-    #[test]
     fn an_old_successful_snapshot_cannot_clear_newer_staged_data() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
-        runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        runtime.ensure_v2_active().unwrap();
         runtime.stage(&sample_observation(at(30, 9, 0), 444));
-        let old = runtime.legacy.prepare_staged_flush().unwrap();
+        let old = runtime.staging.prepare_staged_flush().unwrap();
 
         runtime
             .record_local_observation(old.observation(), LocalObservationMode::Incremental)
             .unwrap();
         runtime.stage(&sample_observation(at(30, 9, 15), 555));
-        assert!(!runtime.legacy.complete_staged_flush(&old));
+        assert!(!runtime.staging.complete_staged_flush(&old));
 
         let durable_before_retry = runtime
             .load_unified_history_since_with_staged(at(30, 8, 0))
@@ -2588,7 +2407,7 @@ mod tests {
     fn full_staging_requires_explicit_v2_reconciliation() {
         let directory = tempdir().unwrap();
         let mut v2_runtime = runtime(directory.path(), false);
-        v2_runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        v2_runtime.ensure_v2_active().unwrap();
         let first = HistoryObservation {
             observed_at: at(30, 9, 40),
             half_hour_buckets: vec![
@@ -2623,38 +2442,13 @@ mod tests {
                 .total_tokens,
             150
         );
-
-        let v1_directory = tempdir().unwrap();
-        let mut v1_runtime = runtime(v1_directory.path(), false);
-        v1_runtime.ensure_ownership_initialized().unwrap();
-        v1_runtime.stage_full_observation(&replacement);
-        assert!(matches!(
-            v1_runtime
-                .flush_staged_reconcile(at(30, 9, 0), at(30, 9, 30))
-                .unwrap(),
-            Some(HistoryRuntimeWriteReport::V1(_))
-        ));
     }
 
     #[test]
     fn summary_marker_uses_active_backend_and_pending_state() {
-        let directory = tempdir().unwrap();
-        let mut v1_runtime = runtime(directory.path(), false);
-        v1_runtime.ensure_ownership_initialized().unwrap();
-        v1_runtime.stage(&sample_observation(at(30, 9, 0), 1));
-        let partial = v1_runtime
-            .mark_summary_backfill_attempt(at(30, 10, 0), true)
-            .unwrap();
-        assert!(!partial.complete);
-        v1_runtime.flush_staged().unwrap();
-        let complete = v1_runtime
-            .mark_summary_backfill_attempt(at(30, 10, 1), true)
-            .unwrap();
-        assert!(complete.complete);
-
         let v2_directory = tempdir().unwrap();
         let mut v2_runtime = runtime(v2_directory.path(), false);
-        v2_runtime.ensure_v2_active_at(at(30, 8, 0)).unwrap();
+        v2_runtime.ensure_v2_active().unwrap();
         v2_runtime.stage(&sample_observation(at(30, 9, 0), 2));
         let partial = v2_runtime
             .mark_summary_backfill_attempt(at(30, 10, 0), true)
@@ -2675,137 +2469,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_v1_migrates_and_v2_activation_is_idempotent() {
-        let directory = tempdir().unwrap();
-        let mut runtime = runtime(directory.path(), false);
-
-        let first = runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap();
-        assert_eq!(first.state(), HistoryOwnershipState::V2Active);
-        assert_eq!(first.epoch(), 3);
-        // Exact V2Active is already beyond the irreversible cutover. It must
-        // not query the global service manager or coordination directory on
-        // every normal startup/read.
-        runtime
-            .set_service_coordination_root_for_test(directory.path().join("missing-parent/root"));
-        runtime.service_definition_observation_override =
-            Some(ServiceDefinitionObservation::Unverifiable(
-                "this observation must not be consulted for V2Active".to_string(),
-            ));
-        let second = runtime.ensure_v2_active_at(at(30, 13, 0)).unwrap();
-        assert_eq!(second, first);
-        assert_eq!(initialized_manifest(&runtime), first);
-
-        let migrated = load_migrated_local_history_since(
-            &runtime.source_history,
-            &runtime.ownership,
-            &first,
-            &runtime.source_identity,
-            runtime.redaction_profile,
-            migration_window_starts_at(),
-        )
-        .unwrap();
-        assert!(migrated.account.quota_points.is_empty());
-        assert!(migrated.source.buckets.is_empty());
-    }
-
-    #[test]
-    fn existing_v1_data_is_imported_once() {
-        let directory = tempdir().unwrap();
-        let mut runtime = runtime(directory.path(), false);
-        let starts_at = at(20, 9, 0);
-        runtime
-            .legacy
-            .record(&sample_observation(starts_at, 321))
-            .unwrap();
-
-        let active = runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap();
-        let migrated = load_migrated_local_history_since(
-            &runtime.source_history,
-            &runtime.ownership,
-            &active,
-            &runtime.source_identity,
-            runtime.redaction_profile,
-            migration_window_starts_at(),
-        )
-        .unwrap();
-        assert_eq!(migrated.account.quota_points.len(), 1);
-        assert_eq!(migrated.source.buckets.len(), 1);
-        assert_eq!(migrated.source.buckets[0].token_usage.total_tokens, 321);
-
-        assert_eq!(runtime.ensure_v2_active_at(at(30, 13, 0)).unwrap(), active);
-        let reloaded = runtime
-            .source_history
-            .load_source_since(
-                runtime.source_identity.node_id(),
-                runtime.redaction_profile,
-                migration_window_starts_at(),
-            )
-            .unwrap();
-        assert_eq!(reloaded.buckets.len(), 1);
-    }
-
-    #[test]
-    fn complete_migrating_state_recovers_after_crash_before_activation() {
-        let directory = tempdir().unwrap();
-        let (history_root, codex_home) = runtime_paths(directory.path());
-        let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-        runtime
-            .legacy
-            .record(&sample_observation(at(21, 10, 0), 444))
-            .unwrap();
-
-        {
-            let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            let v1 = match runtime.ownership.initialize_v1_active(&lease).unwrap() {
-                InitializeV1Outcome::Initialized(manifest)
-                | InitializeV1Outcome::Existing(manifest) => manifest,
-            };
-            let migrating = match runtime.ownership.begin_migration(&lease, &v1).unwrap() {
-                OwnershipCasOutcome::Applied(manifest) => manifest,
-                OwnershipCasOutcome::Conflict(status) => {
-                    panic!("unexpected migration conflict: {status:?}")
-                }
-            };
-            let options = LocalV1MigrationOptions {
-                source_identity: &runtime.source_identity,
-                redaction_profile: runtime.redaction_profile,
-                source_label: LOCAL_SOURCE_LABEL,
-                expected_ownership_epoch: migrating.epoch(),
-                window_starts_at: migration_window_starts_at(),
-                completed_at: at(30, 12, 0),
-            };
-            migrate_local_v1_history(
-                &mut runtime.legacy,
-                &runtime.source_history,
-                &runtime.ownership,
-                &lease,
-                &migrating,
-                &options,
-            )
-            .unwrap();
-            assert_eq!(
-                initialized_manifest(&runtime).state(),
-                HistoryOwnershipState::Migrating
-            );
-        }
-        drop(runtime);
-
-        let mut recovered = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-        let active = recovered.ensure_v2_active_at(at(30, 12, 5)).unwrap();
-        assert_eq!(active.state(), HistoryOwnershipState::V2Active);
-        let migrated = load_migrated_local_history_since(
-            &recovered.source_history,
-            &recovered.ownership,
-            &active,
-            &recovered.source_identity,
-            recovered.redaction_profile,
-            migration_window_starts_at(),
-        )
-        .unwrap();
-        assert_eq!(migrated.source.buckets.len(), 1);
-    }
-
-    #[test]
     fn durable_service_blocker_prevents_the_central_cutover_state_machine() {
         let directory = tempdir().unwrap();
         let mut runtime = runtime(directory.path(), false);
@@ -2819,7 +2482,7 @@ mod tests {
         let blocker = coordination_root.join("recorder-cutover-blocked.json");
         fs::write(&blocker, b"durable service replacement fence\n").unwrap();
 
-        let error = runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap_err();
+        let error = runtime.ensure_v2_active().unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
@@ -2828,7 +2491,7 @@ mod tests {
         );
         fs::remove_file(blocker).unwrap();
         assert_eq!(
-            runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap().state(),
+            runtime.ensure_v2_active().unwrap().state(),
             HistoryOwnershipState::V2Active
         );
     }
@@ -2843,7 +2506,7 @@ mod tests {
         let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
         runtime.pause_cutover_after_blocker_check_for_test(entered.clone(), resume.clone());
 
-        let cutover = std::thread::spawn(move || runtime.ensure_v2_active_at(at(30, 12, 0)));
+        let cutover = std::thread::spawn(move || runtime.ensure_v2_active());
         entered.wait();
         assert!(matches!(
             try_acquire_service_cutover_exclusive_at(&coordination_root).unwrap(),
@@ -2886,17 +2549,11 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            old_runtime
-                .ensure_v2_active_at(at(30, 12, 0))
-                .unwrap_err()
-                .kind(),
+            old_runtime.ensure_v2_active().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
-            new_runtime
-                .ensure_v2_active_at(at(30, 12, 0))
-                .unwrap_err()
-                .kind(),
+            new_runtime.ensure_v2_active().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
@@ -2919,7 +2576,7 @@ mod tests {
             ServiceDefinitionObservation::Fingerprint("legacy-v0.3-definition".to_string()),
         );
 
-        let error = runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap_err();
+        let error = runtime.ensure_v2_active().unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(
@@ -2934,50 +2591,6 @@ mod tests {
     }
 
     #[test]
-    fn migrating_state_without_a_marker_restarts_the_import() {
-        let directory = tempdir().unwrap();
-        let (history_root, codex_home) = runtime_paths(directory.path());
-        let mut runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
-        runtime
-            .legacy
-            .record(&sample_observation(at(22, 10, 0), 555))
-            .unwrap();
-
-        {
-            let lease = runtime.ownership.acquire_writer_lease().unwrap();
-            let v1 = match runtime.ownership.initialize_v1_active(&lease).unwrap() {
-                InitializeV1Outcome::Initialized(manifest)
-                | InitializeV1Outcome::Existing(manifest) => manifest,
-            };
-            let migrating = match runtime.ownership.begin_migration(&lease, &v1).unwrap() {
-                OwnershipCasOutcome::Applied(manifest) => manifest,
-                OwnershipCasOutcome::Conflict(status) => {
-                    panic!("unexpected migration conflict: {status:?}")
-                }
-            };
-            assert_eq!(migrating.state(), HistoryOwnershipState::Migrating);
-            // Simulate a crash after the ownership CAS but before the first
-            // durable migration marker is written.
-        }
-        drop(runtime);
-
-        let mut recovered = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
-        let active = recovered.ensure_v2_active_at(at(30, 12, 5)).unwrap();
-        assert_eq!(active.state(), HistoryOwnershipState::V2Active);
-        let migrated = load_migrated_local_history_since(
-            &recovered.source_history,
-            &recovered.ownership,
-            &active,
-            &recovered.source_identity,
-            recovered.redaction_profile,
-            migration_window_starts_at(),
-        )
-        .unwrap();
-        assert_eq!(migrated.source.buckets.len(), 1);
-        assert_eq!(migrated.source.buckets[0].token_usage.total_tokens, 555);
-    }
-
-    #[test]
     fn migrating_recovery_still_honors_the_global_service_blocker() {
         let directory = tempdir().unwrap();
         let (history_root, codex_home) = runtime_paths(directory.path());
@@ -2989,7 +2602,10 @@ mod tests {
                 | InitializeV1Outcome::Existing(manifest) => manifest,
             };
             assert!(matches!(
-                runtime.ownership.begin_migration(&lease, &v1).unwrap(),
+                runtime
+                    .ownership
+                    .begin_sqlite_initialization(&lease, &v1)
+                    .unwrap(),
                 OwnershipCasOutcome::Applied(_)
             ));
         }
@@ -3007,10 +2623,7 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            runtime
-                .ensure_v2_active_at(at(30, 12, 5))
-                .unwrap_err()
-                .kind(),
+            runtime.ensure_v2_active().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
         assert!(matches!(
@@ -3031,7 +2644,7 @@ mod tests {
         let run = |mut runtime: HistoryRuntime, barrier: Arc<Barrier>| {
             thread::spawn(move || {
                 barrier.wait();
-                runtime.ensure_v2_active_at(at(30, 12, 0))
+                runtime.ensure_v2_active()
             })
         };
         let first_handle = run(first, Arc::clone(&barrier));
@@ -3040,97 +2653,6 @@ mod tests {
         let second = second_handle.join().unwrap().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.state(), HistoryOwnershipState::V2Active);
-        assert_eq!(first.epoch(), 3);
-    }
-
-    #[test]
-    fn redacted_runtime_derives_the_unredacted_profile_id() {
-        let directory = tempdir().unwrap();
-        let runtime = runtime(directory.path(), true);
-        assert_eq!(runtime.redaction_profile(), RedactionProfile::Redacted);
-        assert_eq!(
-            runtime.legacy.namespace(),
-            format!("{}-redacted", runtime.profile_id())
-        );
-    }
-
-    #[test]
-    fn custom_layout_and_relative_roots_fail_before_ownership_initialization() {
-        let directory = tempdir().unwrap();
-        let codex_home = directory.path().join("codex-home");
-        fs::create_dir(&codex_home).unwrap();
-
-        let wrong_leaf = directory.path().join("state/custom-history");
-        let error = HistoryRuntime::new(wrong_leaf, &codex_home, false)
-            .err()
-            .expect("custom leaf should fail");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(!directory.path().join("state").exists());
-
-        let error = HistoryRuntime::new(PathBuf::from("history-v1"), &codex_home, false)
-            .err()
-            .expect("relative root should fail");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_legacy_root_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempdir().unwrap();
-        let codex_home = directory.path().join("codex-home");
-        let state_root = directory.path().join("state");
-        let actual = directory.path().join("actual-history");
-        fs::create_dir(&codex_home).unwrap();
-        fs::create_dir(&state_root).unwrap();
-        fs::create_dir(&actual).unwrap();
-        symlink(&actual, state_root.join(LEGACY_HISTORY_DIRECTORY)).unwrap();
-
-        let error = HistoryRuntime::new(
-            state_root.join(LEGACY_HISTORY_DIRECTORY),
-            &codex_home,
-            false,
-        )
-        .err()
-        .expect("symlinked history root should fail");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_codex_home_preserves_the_legacy_namespace_identity() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempdir().unwrap();
-        let actual_codex_home = directory.path().join("actual-codex-home");
-        let codex_home_alias = directory.path().join("codex-home-alias");
-        let history_root = directory.path().join("state/history-v1");
-        fs::create_dir(&actual_codex_home).unwrap();
-        symlink(&actual_codex_home, &codex_home_alias).unwrap();
-
-        // v0.3 HistoryStore normalizes an existing Codex home through
-        // canonicalize before hashing it. HistoryRuntime's stricter directory
-        // validation must retain that exact namespace rather than creating an
-        // empty sibling profile for the symlink spelling.
-        let mut legacy =
-            HistoryStore::new_with_redaction(history_root.clone(), &codex_home_alias, false);
-        legacy
-            .record(&sample_observation(at(30, 9, 0), 4321))
-            .unwrap();
-        let mut runtime = HistoryRuntime::new(history_root, &codex_home_alias, false).unwrap();
-        assert_eq!(runtime.legacy.namespace(), legacy.namespace());
-        assert_eq!(
-            fs::canonicalize(runtime.legacy.namespace_dir().unwrap()).unwrap(),
-            fs::canonicalize(legacy.namespace_dir().unwrap()).unwrap(),
-            "the migration reader must target the existing v0.3 namespace directory"
-        );
-        runtime.ensure_ownership_initialized().unwrap();
-        let loaded = runtime.load_unified_history_since(at(30, 8, 0)).unwrap();
-        assert_eq!(loaded.history.half_hour_buckets.len(), 1);
-        assert_eq!(
-            loaded.history.half_hour_buckets[0].token_usage.total_tokens,
-            4321
-        );
+        assert_eq!(first.epoch(), 2);
     }
 }

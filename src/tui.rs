@@ -208,19 +208,17 @@ const REMOTE_CONFIG_BUSY_RETRY: Duration = Duration::from_millis(250);
 
 enum TuiHistoryBackend {
     Runtime(Box<HistoryRuntime>),
-    LegacyFallback(Box<HistoryStore>),
+    MemoryFallback(Box<HistoryStore>),
 }
 
 enum TuiHistoryRuntimePreparation {
     Ready(Vec<String>),
-    LegacyFallback(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferredTuiHistoryPreparation {
     AlreadyPrepared,
     Ready,
-    LegacyFallback,
 }
 
 #[derive(Debug, Default)]
@@ -242,11 +240,8 @@ struct TuiHistoryProjectionCache {
 
 /// History state used by the interactive UI.
 ///
-/// The canonical user-level store is ownership-aware and source-aware. The
-/// legacy variant exists only so a corrupt or non-canonical state directory
-/// or a concurrently starting recorder cannot prevent the TUI from rendering
-/// durable V1 plus the current live observation. Fallback persistence is
-/// deliberately disabled because its owner may activate V2 at any moment.
+/// The canonical store always uses SQLite. If binding fails, a read-only
+/// memory view retains this process's current observation so the UI can render.
 struct TuiHistoryStore {
     backend: TuiHistoryBackend,
     profile_lease: Option<HistoryProfileLeaseGuard>,
@@ -314,9 +309,9 @@ impl TuiHistoryStore {
         store
     }
 
-    fn legacy_fallback(store: HistoryStore, setup_warnings: Vec<String>) -> Self {
+    fn memory_fallback(store: HistoryStore, setup_warnings: Vec<String>) -> Self {
         Self {
-            backend: TuiHistoryBackend::LegacyFallback(Box::new(store)),
+            backend: TuiHistoryBackend::MemoryFallback(Box::new(store)),
             profile_lease: None,
             runtime_preparation_pending: false,
             setup_warnings,
@@ -333,8 +328,8 @@ impl TuiHistoryStore {
 
     fn prepare_deferred_runtime(
         &mut self,
-        codex_home: &Path,
-        redact_content: bool,
+        _codex_home: &Path,
+        _redact_content: bool,
         now: DateTime<Utc>,
     ) -> DeferredTuiHistoryPreparation {
         if !self.runtime_preparation_pending {
@@ -346,13 +341,6 @@ impl TuiHistoryStore {
             hook();
         }
 
-        let fallback_root = match &self.backend {
-            TuiHistoryBackend::Runtime(runtime) => runtime
-                .legacy_history()
-                .history_root()
-                .map(Path::to_path_buf),
-            TuiHistoryBackend::LegacyFallback(_) => None,
-        };
         let preparation = match (&mut self.backend, self.profile_lease.as_ref()) {
             (TuiHistoryBackend::Runtime(runtime), Some(profile_lease)) => {
                 prepare_tui_history_runtime(runtime, profile_lease, now)
@@ -368,19 +356,6 @@ impl TuiHistoryStore {
                 self.setup_warnings.extend(warnings);
                 DeferredTuiHistoryPreparation::Ready
             }
-            TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
-                let legacy = fallback_root.map_or_else(
-                    || HistoryStore::discover_with_redaction(codex_home, redact_content),
-                    |history_root| {
-                        HistoryStore::new_with_redaction(history_root, codex_home, redact_content)
-                    },
-                );
-                self.backend = TuiHistoryBackend::LegacyFallback(Box::new(legacy));
-                self.profile_lease = None;
-                self.setup_warnings.extend(warnings);
-                self.invalidate_projection_cache();
-                DeferredTuiHistoryPreparation::LegacyFallback
-            }
         }
     }
 
@@ -389,10 +364,17 @@ impl TuiHistoryStore {
         self.deferred_runtime_preparation_hook = Some(Box::new(hook));
     }
 
-    fn legacy_history(&self) -> &HistoryStore {
+    fn history_root(&self) -> Option<&Path> {
         match &self.backend {
-            TuiHistoryBackend::Runtime(runtime) => runtime.legacy_history(),
-            TuiHistoryBackend::LegacyFallback(store) => store,
+            TuiHistoryBackend::Runtime(runtime) => Some(runtime.history_root()),
+            TuiHistoryBackend::MemoryFallback(_) => None,
+        }
+    }
+
+    fn namespace(&self) -> &str {
+        match &self.backend {
+            TuiHistoryBackend::Runtime(runtime) => runtime.namespace(),
+            TuiHistoryBackend::MemoryFallback(store) => store.namespace(),
         }
     }
 
@@ -401,14 +383,14 @@ impl TuiHistoryStore {
             TuiHistoryBackend::Runtime(runtime) => {
                 Some(runtime.source_identity().node_id().clone())
             }
-            TuiHistoryBackend::LegacyFallback(_) => None,
+            TuiHistoryBackend::MemoryFallback(_) => None,
         }
     }
 
     fn source_history_store(&self) -> Option<SourceHistoryStore> {
         match &self.backend {
             TuiHistoryBackend::Runtime(runtime) => Some(runtime.source_history().clone()),
-            TuiHistoryBackend::LegacyFallback(_) => None,
+            TuiHistoryBackend::MemoryFallback(_) => None,
         }
     }
 
@@ -418,7 +400,7 @@ impl TuiHistoryStore {
                 .source_history()
                 .load_included_remote_live_states()
                 .map_err(|error| format!("remote live state is unavailable: {error}")),
-            TuiHistoryBackend::LegacyFallback(_) => Ok(Vec::new()),
+            TuiHistoryBackend::MemoryFallback(_) => Ok(Vec::new()),
         }
     }
 
@@ -550,7 +532,7 @@ impl TuiHistoryStore {
             return Ok(false);
         }
         if !matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
-            return Ok(true);
+            return Ok(false);
         }
         let Some(profile_lease) = self.profile_lease.as_ref() else {
             return Ok(false);
@@ -586,7 +568,7 @@ impl TuiHistoryStore {
     fn stage(&mut self, observation: &HistoryObservation) {
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => runtime.stage(observation),
-            TuiHistoryBackend::LegacyFallback(store) => store.stage(observation),
+            TuiHistoryBackend::MemoryFallback(store) => store.stage(observation),
         }
     }
 
@@ -604,7 +586,7 @@ impl TuiHistoryStore {
                     self.setup_warnings.push(warning);
                 }
             }
-            TuiHistoryBackend::LegacyFallback(store) => store.stage(observation),
+            TuiHistoryBackend::MemoryFallback(store) => store.stage(observation),
         }
     }
 
@@ -612,7 +594,7 @@ impl TuiHistoryStore {
     fn stage_full_observation(&mut self, observation: &HistoryObservation) {
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => runtime.stage_full_observation(observation),
-            TuiHistoryBackend::LegacyFallback(store) => {
+            TuiHistoryBackend::MemoryFallback(store) => {
                 store.stage_full_observation(observation);
             }
         }
@@ -632,7 +614,7 @@ impl TuiHistoryStore {
                     self.setup_warnings.push(warning);
                 }
             }
-            TuiHistoryBackend::LegacyFallback(store) => {
+            TuiHistoryBackend::MemoryFallback(store) => {
                 store.stage_full_observation(observation);
             }
         }
@@ -644,7 +626,7 @@ impl TuiHistoryStore {
         }
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged(),
-            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+            TuiHistoryBackend::MemoryFallback(_) => Err(memory_fallback_write_error()),
         }
     }
 
@@ -657,11 +639,8 @@ impl TuiHistoryStore {
         }
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged_if_due(interval),
-            // A fallback may have been selected while a recorder held the
-            // cutover lock. It must never write V1 after that recorder
-            // activates V2. Keep staged data visible, but leave persistence
-            // disabled until the TUI is restarted into a verified runtime.
-            TuiHistoryBackend::LegacyFallback(_) => Ok(None),
+            // The fallback retains staged observations only in memory.
+            TuiHistoryBackend::MemoryFallback(_) => Ok(None),
         }
     }
 
@@ -675,7 +654,7 @@ impl TuiHistoryStore {
         }
         match &mut self.backend {
             TuiHistoryBackend::Runtime(runtime) => runtime.flush_staged_reconcile(from, to),
-            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+            TuiHistoryBackend::MemoryFallback(_) => Err(memory_fallback_write_error()),
         }
     }
 
@@ -691,7 +670,7 @@ impl TuiHistoryStore {
     ) -> io::Result<Option<HistoryProjectionRevision>> {
         match &self.backend {
             TuiHistoryBackend::Runtime(runtime) => history_projection_revision(runtime, selection),
-            TuiHistoryBackend::LegacyFallback(_) => Ok(None),
+            TuiHistoryBackend::MemoryFallback(_) => Ok(None),
         }
     }
 
@@ -816,12 +795,12 @@ impl TuiHistoryStore {
                     }
                     Err(error) => {
                         let mut history = HistoryData::default();
-                        // Only an all-source failure may expose the legacy
+                        // Only an all-source failure may expose the in-memory
                         // staged local slice. Exact source failures remain
                         // empty rather than silently falling back to All.
                         if matches!(selection, HistorySourceSelection::AllIncluded) {
                             runtime
-                                .legacy_history()
+                                .staging_history()
                                 .overlay_staged_since(&mut history, since);
                         }
                         history
@@ -831,7 +810,7 @@ impl TuiHistoryStore {
                     }
                 }
             }
-            TuiHistoryBackend::LegacyFallback(store) => match selection {
+            TuiHistoryBackend::MemoryFallback(store) => match selection {
                 HistorySourceSelection::AllIncluded => (
                     store.load_since_with_staged(since),
                     Some(HistorySourceSelectionStatus::Applied),
@@ -839,7 +818,7 @@ impl TuiHistoryStore {
                     false,
                 ),
                 HistorySourceSelection::Local(_) | HistorySourceSelection::Remote(_) => {
-                    // Quota is account-global, so preserve it (plus legacy
+                    // Quota is account-global, so preserve it (plus memory
                     // diagnostics/read-only state) while failing closed for
                     // source-scoped local usage.
                     let mut history = store.load_since_with_staged(since);
@@ -848,12 +827,13 @@ impl TuiHistoryStore {
                     history.summary_backfill_attempted_at = None;
                     history.summary_backfill_attempt_complete = None;
                     history.warnings.push(
-                        "source selection is unavailable while using legacy history".to_owned(),
+                        "source selection is unavailable while using a read-only memory view"
+                            .to_owned(),
                     );
                     (
                         history,
                         Some(HistorySourceSelectionStatus::Unavailable(
-                            HistorySourceUnavailableReason::UnsupportedByLegacy,
+                            HistorySourceUnavailableReason::UnavailableInMemoryView,
                         )),
                         None,
                         false,
@@ -897,9 +877,8 @@ impl TuiHistoryStore {
     ) -> Option<TuiHistoryProjection> {
         if matches!(&self.backend, TuiHistoryBackend::Runtime(_)) {
             // Source-aware history can change when another process completes
-            // a remote sync, so it cannot use the legacy store's local-only
-            // shard stamp as its staleness oracle. Mirror the legacy 30-second
-            // read cache instead of rescanning all source shards on every
+            // a remote sync. Revalidate cached database input revisions rather
+            // than reloading all source records on every
             // two-second local rollout poll.
             if self.projection_cache_valid(selection, since, false) {
                 return None;
@@ -910,7 +889,7 @@ impl TuiHistoryStore {
         if !matches!(selection, HistorySourceSelection::AllIncluded) {
             return Some(self.load_since_with_staged_selected(selection, since));
         }
-        let TuiHistoryBackend::LegacyFallback(store) = &mut self.backend else {
+        let TuiHistoryBackend::MemoryFallback(store) = &mut self.backend else {
             unreachable!("the runtime backend returned above")
         };
         let mut history = store.reload_since_if_stale_with_staged(since)?;
@@ -939,7 +918,7 @@ impl TuiHistoryStore {
             TuiHistoryBackend::Runtime(runtime) => {
                 runtime.mark_summary_backfill_attempt(completed_at, complete)
             }
-            TuiHistoryBackend::LegacyFallback(_) => Err(legacy_fallback_write_error()),
+            TuiHistoryBackend::MemoryFallback(_) => Err(memory_fallback_write_error()),
         };
         if result.is_ok() {
             self.invalidate_projection_cache();
@@ -948,7 +927,7 @@ impl TuiHistoryStore {
     }
 }
 
-fn legacy_fallback_write_error() -> io::Error {
+fn memory_fallback_write_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         "history persistence is disabled while the source-aware runtime is unavailable",
@@ -9099,7 +9078,7 @@ fn tui_history_store_from_binding(
                 )],
             ),
         },
-        Err(error) => TuiHistoryStore::legacy_fallback(
+        Err(error) => TuiHistoryStore::memory_fallback(
             HistoryStore::memory_only(&config.codex_home, config.redact_content),
             vec![format!(
                 "source-aware history runtime unavailable; showing only this process's collected history in a read-only memory view; no history will be persisted until the source-aware state is repaired: {error}"
@@ -9151,10 +9130,7 @@ fn prepare_tui_history_runtime(
         }
     }
 
-    let history_root = runtime
-        .legacy_history()
-        .history_root()
-        .expect("a bound runtime always has a legacy root");
+    let history_root = runtime.history_root();
     // The recorder singleton is only a cutover fence. The process-lifetime
     // profile lease remains held after this short guard is dropped, while
     // ordinary V2 writes use their own short writer lease.
@@ -9173,20 +9149,15 @@ fn prepare_tui_history_runtime(
                 }
                 return TuiHistoryRuntimePreparation::Ready(warnings);
             }
-            if matches!(runtime.ownership().load_manifest(), Ok(OwnershipManifestStatus::Initialized(manifest)) if manifest.uses_source_history())
-            {
-                warnings.push("history storage upgrade is deferred while the recorder is active; existing source-aware history is read-only until the upgrade completes".to_owned());
-                return TuiHistoryRuntimePreparation::Ready(warnings);
-            }
             warnings.push(
-                "source-aware history cutover deferred while the recorder is active; using read-only legacy history until the TUI restarts"
-                    .to_string(),
+                "SQLite history initialization is deferred while the recorder is active; only current in-memory observations are available until initialization completes"
+                    .to_owned(),
             );
-            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+            return TuiHistoryRuntimePreparation::Ready(warnings);
         }
         Err(error) => {
             warnings.push(format!(
-                "source-aware history cutover lock could not be verified; history persistence is read-only: {error}"
+                "SQLite history initialization lock could not be verified; history persistence is read-only: {error}"
             ));
             return TuiHistoryRuntimePreparation::Ready(warnings);
         }
@@ -9195,26 +9166,20 @@ fn prepare_tui_history_runtime(
     // The lifetime lock proves that a cooperating recorder cannot start or
     // continue during this check. Re-read legacy status only after acquiring
     // it because pre-v0.4 recorders do not participate in the lock protocol.
-    let status_path = default_status_file(
-        runtime
-            .legacy_history()
-            .history_root()
-            .expect("a bound runtime always has a legacy root"),
-    );
-    match incompatible_recorder_for_cutover(&status_path, runtime.legacy_history().namespace(), now)
-    {
+    let status_path = default_status_file(runtime.history_root());
+    match incompatible_recorder_for_cutover(&status_path, runtime.namespace(), now) {
         Ok(Some(status)) => {
             if let Err(error) = runtime.ensure_ownership_initialized() {
                 warnings.push(format!("history ownership initialization failed: {error}"));
             }
             warnings.push(format!(
-                "source-aware history cutover deferred while legacy recorder pid {} may still be active",
+                "SQLite history initialization deferred while legacy recorder pid {} may still be active",
                 status.pid
             ));
         }
         Ok(None) => {
             if let Err(error) = runtime.ensure_v2_active() {
-                warnings.push(format!("source-aware history cutover failed: {error}"));
+                warnings.push(format!("SQLite history initialization failed: {error}"));
             }
         }
         Err(error) => {
@@ -9224,7 +9189,7 @@ fn prepare_tui_history_runtime(
                 ));
             }
             warnings.push(format!(
-                "source-aware history cutover deferred because recorder status could not be verified at {}: {error}",
+                "SQLite history initialization deferred because recorder status could not be verified at {}: {error}",
                 status_path.display()
             ));
         }
@@ -9323,7 +9288,7 @@ fn tui_history_cache_effect(
 ) -> TuiHistoryCacheEffect {
     match write_result {
         Ok(None) => TuiHistoryCacheEffect::Preserve,
-        Ok(Some(HistoryRuntimeWriteReport::V1(_))) | Err(_) => TuiHistoryCacheEffect::Invalidate,
+        Err(_) => TuiHistoryCacheEffect::Invalidate,
         Ok(Some(HistoryRuntimeWriteReport::V2(report))) => {
             let shards_written = report
                 .account
@@ -9332,10 +9297,7 @@ fn tui_history_cache_effect(
                 .saturating_add(report.weekly.shards_written)
                 .saturating_add(report.session_digests.shards_written)
                 .saturating_add(report.garbage_collection.shards_pruned);
-            if shards_written == 0
-                && !report.recovered_pending
-                && report.garbage_collection.warning.is_none()
-            {
+            if shards_written == 0 && report.garbage_collection.warning.is_none() {
                 TuiHistoryCacheEffect::RebaseRevision
             } else {
                 TuiHistoryCacheEffect::Invalidate
@@ -9349,11 +9311,6 @@ fn append_tui_history_write_trace_fields(
     write_result: &io::Result<Option<HistoryRuntimeWriteReport>>,
 ) -> TraceFields {
     match write_result {
-        Ok(Some(HistoryRuntimeWriteReport::V1(report))) => fields
-            .label("writeBackend", "v1")
-            .usize("writeShardsWritten", report.shards_written)
-            .usize("writeShardsSkipped", report.shards_skipped)
-            .usize("writeShardsPruned", report.shards_pruned),
         Ok(Some(HistoryRuntimeWriteReport::V2(report))) => fields
             .label("writeBackend", "v2")
             .usize("accountShardsWritten", report.account.shards_written)
@@ -9612,7 +9569,6 @@ fn flush_staged_history_on_exit(
 }
 
 fn load_recorder_health(store: &TuiHistoryStore) -> RecorderHealth {
-    let store = store.legacy_history();
     let Some(history_root) = store.history_root() else {
         return RecorderHealth {
             status: None,
@@ -10157,7 +10113,6 @@ fn collect_initial_refresh_completion(
     activation_span.finish(match history_preparation {
         DeferredTuiHistoryPreparation::AlreadyPrepared => "status=already_prepared",
         DeferredTuiHistoryPreparation::Ready => "status=ready",
-        DeferredTuiHistoryPreparation::LegacyFallback => "status=legacy_fallback",
     });
     // Initial data-ready is deliberately local-only. A cold or temporarily
     // unavailable network account RPC must not hold the first useful TUI

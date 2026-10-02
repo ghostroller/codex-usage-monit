@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     HistoryProfileId, RedactionProfile, SourceHistoryStore, SourceHistoryWriter, SourceKind,
-    SourceMetadata, encode_pretty_bounded, invalid_data, lock_exclusive, open_lock_file,
-    read_optional_json_file, write_private_atomically,
+    SourceMetadata, encode_pretty_bounded, invalid_data,
 };
 use crate::remote_protocol::{
     ProtocolRevisions, RemoteLiveSnapshot, RemoteLiveState, RemoteProjectDescriptor,
@@ -19,7 +18,6 @@ use crate::source_identity::NodeId;
 const REMOTE_LIVE_FORMAT_VERSION: u32 = 2;
 const REMOTE_LIVE_FILE: &str = "remote-live.json";
 const REMOTE_LIVE_MAX_BYTES: u64 = 8 * 1024 * 1024;
-const SOURCE_LOCK_FILE: &str = "source.lock";
 const MAX_QUALITY_REASONS: usize = 128;
 const MAX_QUALITY_REASON_BYTES: usize = 128;
 
@@ -52,8 +50,8 @@ struct StoredRemoteLiveSnapshot {
     source_generation: SourceGeneration,
     revisions: ProtocolRevisions,
     redaction_profile: RedactionProfile,
-    /// Absent in caches written before journal-scoped live revisions. Such
-    /// caches remain readable but cannot advertise a known live baseline.
+    /// Binding of the cached live revision to the export journal.
+    /// Current SQL publications always require this binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_generation: Option<NonZeroU64>,
     live_revision: NonZeroU64,
@@ -73,10 +71,8 @@ impl StoredRemoteLiveSnapshot {
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
     ) -> io::Result<()> {
-        let legacy = self.format_version == 1 && self.journal_generation.is_none();
-        let current =
-            self.format_version == REMOTE_LIVE_FORMAT_VERSION && self.journal_generation.is_some();
-        if !(legacy || current)
+        if self.format_version != REMOTE_LIVE_FORMAT_VERSION
+            || self.journal_generation.is_none()
             || &self.profile_id != profile_id
             || &self.source_generation.node_id != source_id
             || self.redaction_profile != redaction_profile
@@ -144,7 +140,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         warning_codes: &[String],
     ) -> io::Result<()> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.record_remote_live_state_unfenced(
                 source_generation,
                 revisions,
@@ -164,36 +160,6 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
-    pub(super) fn import_legacy_remote_live_sqlite(
-        &self,
-        legacy: &SourceHistoryStore,
-        source_id: &NodeId,
-        redaction: RedactionProfile,
-    ) -> io::Result<()> {
-        let path = legacy.remote_live_path(source_id, redaction);
-        if !legacy
-            .private_directory_exists(path.parent().expect("remote live file has a parent"))?
-        {
-            return Ok(());
-        }
-        let Some(stored) =
-            read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?
-        else {
-            return Ok(());
-        };
-        stored.validate(legacy.profile_id(), source_id, redaction)?;
-        let database = self
-            .sqlite_database()
-            .expect("SQL import requires a database");
-        database.write(|connection| {
-            super::database::set_state(
-                connection,
-                &database.namespace(&self.remote_live_path(source_id, redaction))?,
-                &stored,
-            )
-        })
-    }
-
     pub fn remote_live_revision_for_binding(
         &self,
         source_generation: &SourceGeneration,
@@ -223,13 +189,10 @@ impl SourceHistoryStore {
             }
             let profile = metadata.aggregate_redaction_profile();
             let path = self.remote_live_path(source_id, profile);
-            let stored = if let Some(database) = self.sqlite_database() {
-                database.read(|connection| {
-                    super::database::state(connection, &database.namespace(&path)?)
-                })?
-            } else {
-                read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?
-            };
+            let database = self.sqlite_database().expect("SQLite history backend");
+            let stored = database.read(|connection| {
+                super::database::state(connection, &database.namespace(&path)?)
+            })?;
             let Some(stored): Option<StoredRemoteLiveSnapshot> = stored else {
                 return Ok(None);
             };
@@ -373,47 +336,33 @@ impl SourceHistoryStore {
                 Ok(stored)
             };
         let path = self.remote_live_path(source_id, redaction_profile);
-        if let Some(database) = self.sqlite_database() {
-            return database.write(|connection| {
-                let metadata = self.load_source_metadata(source_id)?;
-                if metadata.kind() != SourceKind::Ssh
-                    || metadata.aggregate_redaction_profile() != redaction_profile
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "remote live publication raced a source profile change",
-                    ));
-                }
-                let key = database.namespace(&path)?;
-                let stored = merge(super::database::state(connection, &key)?)?;
-                encode_pretty_bounded(&stored, REMOTE_LIVE_MAX_BYTES)?;
-                super::database::set_state(connection, &key, &stored)
-            });
-        }
-        let directory = self.source_directory(source_id);
-        self.validate_private_path(&directory)?;
-        let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
-        let _lock = lock_exclusive(lock, &directory, SOURCE_LOCK_FILE)?;
-        let metadata = super::read_source_metadata_file(
-            &directory.join(super::SOURCE_METADATA_FILE),
-            &self.profile_id,
-            source_id,
-        )?;
-        if metadata.kind() != SourceKind::Ssh
-            || metadata.aggregate_redaction_profile() != redaction_profile
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote live publication raced a source profile change",
-            ));
-        }
-        let path = self.remote_live_path(source_id, redaction_profile);
-        let existing =
-            read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?;
-        let stored = merge(existing)?;
-        self.prepare_private_directory(path.parent().expect("remote live file has a parent"))?;
-        let contents = encode_pretty_bounded(&stored, REMOTE_LIVE_MAX_BYTES)?;
-        write_private_atomically(&path, &contents)
+        let database = self.sqlite_database().expect("SQLite history backend");
+
+        database.write(|connection| {
+            let metadata = self.load_source_metadata(source_id)?;
+            if metadata.kind() != SourceKind::Ssh
+                || metadata.aggregate_redaction_profile() != redaction_profile
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote live publication raced a source profile change",
+                ));
+            }
+            let key = database.namespace(&path)?;
+            let existing: Option<StoredRemoteLiveSnapshot> =
+                super::database::state(connection, &key)?;
+            let stored = merge(existing.clone())?;
+            encode_pretty_bounded(&stored, REMOTE_LIVE_MAX_BYTES)?;
+            if existing.as_ref() != Some(&stored) {
+                super::database::set_state(connection, &key, &stored)?;
+                self.advance_remote_history_projection_revision(
+                    connection,
+                    source_id,
+                    redaction_profile,
+                )?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -577,70 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_upgrade_live_cache_is_readable_but_requires_a_fresh_full_baseline() {
-        let (_directory, store, source) = fixture();
-        let revisions = crate::remote_agent::current_revisions();
-        store
-            .record_remote_live_state_unfenced(
-                &source,
-                &revisions,
-                RedactionProfile::Redacted,
-                NonZeroU64::new(10).unwrap(),
-                true,
-                &full_live(2, at(12, 0)),
-                &[],
-                at(12, 0),
-                at(12, 1),
-                true,
-                &[],
-                &[],
-            )
-            .unwrap();
-        let path = store.remote_live_path(&source.node_id, RedactionProfile::Redacted);
-        let mut old: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        old.as_object_mut().unwrap().remove("journalGeneration");
-        old["formatVersion"] = serde_json::json!(1);
-        std::fs::write(path, serde_json::to_vec(&old).unwrap()).unwrap();
-        assert_eq!(
-            store
-                .load_remote_live_state(&source.node_id)
-                .unwrap()
-                .unwrap()
-                .live_revision
-                .get(),
-            2
-        );
-        assert_eq!(
-            store
-                .remote_live_revision_for_binding(
-                    &source,
-                    &revisions,
-                    RedactionProfile::Redacted,
-                    NonZeroU64::new(11)
-                )
-                .unwrap(),
-            None
-        );
-        store
-            .record_remote_live_state_unfenced(
-                &source,
-                &revisions,
-                RedactionProfile::Redacted,
-                NonZeroU64::new(11).unwrap(),
-                true,
-                &full_live(1, at(12, 2)),
-                &[],
-                at(12, 2),
-                at(12, 3),
-                true,
-                &[],
-                &[],
-            )
-            .unwrap();
-    }
-
-    #[test]
     fn full_live_state_is_durable_and_revision_only_requires_the_exact_local_baseline() {
         let (_directory, store, source) = fixture();
         let revisions = crate::remote_agent::current_revisions();
@@ -712,7 +597,14 @@ mod tests {
             "revision-only pages preserve the exact cached replacement"
         );
 
-        std::fs::remove_file(store.remote_live_path(&source.node_id, RedactionProfile::Redacted))
+        let database = store.sqlite_database().unwrap();
+        database
+            .write(|connection| {
+                let key = database.namespace(
+                    &store.remote_live_path(&source.node_id, RedactionProfile::Redacted),
+                )?;
+                super::super::database::delete_state(connection, &key)
+            })
             .unwrap();
         assert_eq!(
             store

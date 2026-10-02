@@ -1,6 +1,6 @@
 //! Typed session evidence and immutable fact publication in SQLite.
 //!
-//! Replica namespaces remain physical (source + thread). A staged generation
+//! Replica namespaces remain source- and thread-specific SQL keys. A staged generation
 //! is invisible until the active manifest, digest proof and cursor are published
 //! together by a short compare-and-swap transaction.
 use super::*;
@@ -120,9 +120,8 @@ fn ensure_sql_fact_cap(
                 .join(redaction.directory_name())
         )?
     );
-    // The old entry cap counted files/directories, not individual events.
-    // Count SQL generation namespaces and state descriptors equivalently;
-    // per-generation record limits are enforced separately.
+    // Bound generation namespaces and state descriptors as well as bytes;
+    // per-generation event limits are enforced separately.
     let (record_bytes, generation_count): (i64, i64) = connection.query_row(
         "SELECT COALESCE(sum(length(payload)),0),count(DISTINCT namespace) FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,length(?1)+1,6)='facts/'", [&root], |row| Ok((row.get(0)?, row.get(1)?)),
     ).map_err(database::sql_error)?;
@@ -401,7 +400,13 @@ impl SourceHistoryStore {
                 current
                     .as_ref()
                     .map(|manifest| {
-                        self.read_fact_generation_unlocked(source_id, redaction, manifest)
+                        let mut budget = SourceHistoryReadBudget::for_query();
+                        self.sqlite_read_fact_generation(
+                            source_id,
+                            redaction,
+                            manifest,
+                            &mut budget,
+                        )
                     })
                     .transpose()?
                     .unwrap_or_default()
@@ -937,7 +942,7 @@ pub(super) fn garbage_collect_session_evidence(
     redaction: RedactionProfile,
     cutoff_day: NaiveDate,
     trusted_at: DateTime<Utc>,
-) -> io::Result<usize> {
+) -> io::Result<(usize, bool)> {
     let database = store.sqlite_database().expect("SQLite backend");
     database.write(|connection| {
         let cutoff = cutoff_day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
@@ -945,6 +950,7 @@ pub(super) fn garbage_collect_session_evidence(
         let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND substr(namespace,-8)='/digests'").map_err(database::sql_error)?;
         let namespaces = statement.query_map([&prefix], |row| row.get::<_, String>(0)).map_err(database::sql_error)?.collect::<Result<Vec<_>, _>>().map_err(database::sql_error)?;
         let mut pruned = 0;
+        let mut query_visible_deleted = false;
         for namespace in namespaces {
             let mut budget = SourceHistoryReadBudget::for_query();
             let records = database::records::<SourceSessionDigestRecord>(connection, &namespace, i64::MIN, &mut budget)?;
@@ -954,6 +960,7 @@ pub(super) fn garbage_collect_session_evidence(
             for record in records {
                 if record.range_start().date_naive() < cutoff_day && record.retention_through() < cutoff {
                     database::delete_record(connection, &namespace, &sqlite_record_key(&(record.thread_id(), record.range_start()))?)?;
+                    query_visible_deleted = true;
                     old_days.insert(record.range_start().date_naive());
                 } else { retained_days.insert(record.range_start().date_naive()); }
             }
@@ -975,11 +982,12 @@ pub(super) fn garbage_collect_session_evidence(
             let replacement_manifest = ActiveFactManifest { active_generation: replacement, retained_since: Some(retained_since), shard_days: record_days(&retained), record_count: retained.len(), ..manifest.clone() };
             database::set_state(connection, &key, &replacement_manifest)?;
             database::delete_namespace(connection, &generation_namespace(store, &database, source_id, redaction, &manifest.thread_shard_key, &manifest.active_generation)?)?;
+            query_visible_deleted = true;
             pruned += manifest.shard_days.iter().filter(|day| **day < cutoff_day).count();
         }
         garbage_collect_artifacts(store, &database, connection, source_id, redaction, trusted_at)?;
         ensure_sql_fact_cap(store, &database, connection, source_id, redaction)?;
-        Ok(pruned)
+        Ok((pruned, query_visible_deleted))
     })
 }
 
@@ -1068,127 +1076,4 @@ fn garbage_collect_artifacts(
         }
     }
     Ok(())
-}
-
-fn import_generation(
-    connection: &rusqlite::Connection,
-    namespace: &str,
-    records: &[UsageEventFactRecord],
-) -> io::Result<()> {
-    let mut budget = SourceHistoryReadBudget::for_query();
-    let mut existing =
-        database::records::<UsageEventFactRecord>(connection, namespace, i64::MIN, &mut budget)?;
-    if !existing.is_empty() {
-        sort_fact_records(&mut existing);
-        if existing != records {
-            return Err(invalid_data(
-                "legacy fact generation conflicts with existing SQLite records",
-            ));
-        }
-        return Ok(());
-    }
-    for record in records {
-        database::put_record(
-            connection,
-            namespace,
-            record.event_id().as_str(),
-            record.occurred_at().timestamp_millis(),
-            record,
-        )?;
-    }
-    Ok(())
-}
-
-pub(super) fn import_legacy_evidence(
-    target: &SourceHistoryStore,
-    legacy: &SourceHistoryStore,
-    sources: &[SourceMetadata],
-) -> io::Result<()> {
-    let database = target.sqlite_database().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "evidence import target must use SQLite",
-        )
-    })?;
-    database.write(|connection| {
-        let prior_migration = !database::state_keys(connection, "database/migration/")?.is_empty();
-        let cutoff = if prior_migration { target.sqlite_retention_cutoff(connection)? } else { None };
-        for source in sources {
-            // Re-pairing a previously purged node must not restore facts or
-            // digests from its immutable legacy backup after the first import.
-            if prior_migration && source.kind() == SourceKind::Ssh {
-                continue;
-            }
-            for redaction in [RedactionProfile::PreviewEnabled, RedactionProfile::Redacted] {
-                let directory = legacy.source_digests_directory(source.source_id(), redaction);
-                let mut budget = SourceHistoryReadBudget::for_query();
-                let mut digests = legacy.load_source_session_digest_records_from_directory_with_budget(source.source_id(), redaction, DateTime::<Utc>::MIN_UTC, &directory, &mut budget)?;
-                digests.retain(|record| cutoff.is_none_or(|cutoff| record.retention_through() >= cutoff));
-                target.sqlite_record_digest_changes(source.source_id(), redaction, &target.source_digests_directory(source.source_id(), redaction), &digests)?;
-                let manifests = legacy.source_fact_manifests_directory(source.source_id(), redaction);
-                if legacy.private_directory_exists(&manifests)? {
-                    for (shard_key, path) in fact_manifest_entries(legacy, &manifests)? {
-                        let manifest: ActiveFactManifest = read_json_file(&path, MAX_FACT_MANIFEST_BYTES)?;
-                        validate_active_manifest(&manifest, &legacy.profile_id, source.source_id(), redaction, &manifest.replica, &shard_key)?;
-                        validate_fact_remote_binding(source.kind(), source.source_id(), manifest.remote_binding.as_ref())?;
-                        let records = legacy.read_fact_generation_unlocked(source.source_id(), redaction, &manifest)?;
-                        validate_proof(&manifest.replica, &records, &manifest.validated_digests, manifest.retained_since)?;
-                        // A later redaction migration must never replace an
-                        // already committed SQL cursor/proof with its old backup.
-                        if let Some(existing) = target.sqlite_read_fact_manifest(source.source_id(), redaction, &manifest.replica, &shard_key, None)? {
-                            let mut budget = SourceHistoryReadBudget::for_query();
-                            let existing_records = target.sqlite_read_fact_generation(source.source_id(), redaction, &existing, &mut budget)?;
-                            validate_proof(&existing.replica, &existing_records, &existing.validated_digests, existing.retained_since)?;
-                            continue;
-                        }
-                        let namespace = generation_namespace(target, &database, source.source_id(), redaction, &shard_key, &manifest.active_generation)?;
-                        import_generation(connection, &namespace, &records)?;
-                        database::set_state(connection, &manifest_key(target, &database, source.source_id(), redaction, &shard_key)?, &manifest)?;
-                    }
-                }
-                let staging_root = legacy.source_fact_staging_directory(source.source_id(), redaction);
-                if legacy.private_directory_exists(&staging_root)? {
-                    for entry in fs::read_dir(&staging_root)? {
-                        let entry = entry?;
-                        if entry.file_name() == OsStr::new(FACT_STAGING_LOCK_FILE) { continue; }
-                        if is_atomic_fact_manifest_temporary_file(&entry.file_name()) { continue; }
-                        let name = entry.file_name();
-                        let batch_id = name.to_str().ok_or_else(|| invalid_data("fact staging name is not UTF-8"))?.parse::<FactBatchId>().map_err(|error| invalid_data(error.to_string()))?;
-                        let staging = entry.path();
-                        legacy.validate_private_path(&staging)?;
-                        let descriptor = match read_staged_batch(&staging.join(STAGED_BATCH_FILE), &legacy.profile_id, source.source_id(), redaction, &batch_id) {
-                            Ok(descriptor) => descriptor,
-                            // A interrupted creation without a descriptor never
-                            // became a complete durable batch.
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                            Err(error) => return Err(error),
-                        };
-                        validate_fact_remote_binding(source.kind(), source.source_id(), descriptor.remote_binding.as_ref())?;
-                        let staged_generation = staging.join(STAGED_GENERATION_DIRECTORY);
-                        let generation = if legacy.private_directory_exists(&staged_generation)? { staged_generation } else { legacy.source_facts_directory(source.source_id(), redaction).join(descriptor.thread_shard_key.as_str()).join(batch_id.as_str()) };
-                        let records = read_fact_generation(legacy, &generation, &legacy.profile_id, source.source_id(), redaction, &descriptor.replica, &descriptor.thread_shard_key, &batch_id, &descriptor.shard_days)?;
-                        if records.len() != descriptor.record_count { return Err(invalid_data("legacy staged fact record count does not match descriptor")); }
-                        validate_proof(&descriptor.replica, &records, &descriptor.validated_digests, descriptor.retained_since)?;
-                        let descriptor_key = staged_key(target, &database, source.source_id(), redaction, &batch_id, STAGED_BATCH_FILE)?;
-                        if let Some(existing) = sqlite_state_bounded::<StagedFactBatch>(connection, &descriptor_key, MAX_FACT_MANIFEST_BYTES, None)? {
-                            if existing != descriptor { return Err(invalid_data("legacy staging conflicts with an existing SQLite fact descriptor")); }
-                            continue;
-                        }
-                        let namespace = generation_namespace(target, &database, source.source_id(), redaction, &descriptor.thread_shard_key, &batch_id)?;
-                        import_generation(connection, &namespace, &records)?;
-                        database::set_state(connection, &descriptor_key, &descriptor)?;
-                        let staged_at = DateTime::<Utc>::from(fs::symlink_metadata(&staging)?.modified()?);
-                        database::set_state(connection, &staged_key(target, &database, source.source_id(), redaction, &batch_id, "staged-at.json")?, &staged_at)?;
-                        if let Some(candidate) = read_optional_json_file::<ActiveFactManifest>(&staging.join(STAGED_PUBLICATION_FILE), MAX_FACT_MANIFEST_BYTES)? {
-                            validate_active_manifest(&candidate, &legacy.profile_id, source.source_id(), redaction, &descriptor.replica, &descriptor.thread_shard_key)?;
-                            if candidate.active_generation != batch_id || candidate.cursor != descriptor.activate_cursor || candidate.validated_digests != descriptor.validated_digests || candidate.remote_binding != descriptor.remote_binding || candidate.retained_since != descriptor.retained_since || candidate.record_count != descriptor.record_count || candidate.shard_days != descriptor.shard_days { return Err(invalid_data("legacy candidate fact publication differs from its descriptor")); }
-                            database::set_state(connection, &staged_key(target, &database, source.source_id(), redaction, &batch_id, STAGED_PUBLICATION_FILE)?, &candidate)?;
-                        }
-                    }
-                }
-                ensure_sql_fact_cap(target, &database, connection, source.source_id(), redaction)?;
-            }
-        }
-        Ok(())
-    })
 }

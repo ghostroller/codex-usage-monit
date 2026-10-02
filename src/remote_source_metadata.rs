@@ -146,7 +146,7 @@ pub fn purge_detached_remote_source(
             Ok(RemoteSourcePurgeOutcome {
                 ingest_namespaces_removed: ingest.namespaces_removed,
                 project_instances_removed,
-                resumed_history_purge: history.resumed_from_trash(),
+                resumed_history_purge: history.resumed_claim(),
             })
         })
     })
@@ -346,10 +346,8 @@ pub fn prepare_remote_source_metadata(
                     metadata.set_display_label(selected.host().id())
                 })?;
                 if target_profile == RedactionProfile::Redacted {
-                    // A prior successful publication may have crashed or hit
-                    // Windows sharing semantics during physical preview
-                    // retirement. Make one bounded pass before networking;
-                    // this never changes aggregate visibility.
+                    // Finish any previously queued SQL preview retirement
+                    // before networking without changing aggregate visibility.
                     let _ = writer.retry_remote_source_redaction_retirement(&source.node_id)?;
                     let _ = retry_remote_preview_ingest_retirement(
                         runtime.source_history(),
@@ -476,7 +474,8 @@ fn with_v2_writer<T>(
     };
     let manifest = match runtime.ownership().load_manifest()? {
         OwnershipManifestStatus::Initialized(manifest)
-            if manifest.state() == HistoryOwnershipState::V2Active =>
+            if manifest.is_sqlite_backend()
+                && manifest.state() == HistoryOwnershipState::V2Active =>
         {
             manifest
         }
@@ -794,12 +793,14 @@ mod tests {
             &fixture.remote_source.node_id,
         )
         .unwrap();
-        assert!(
-            !fixture
+        assert_eq!(
+            fixture
                 .runtime
                 .source_history()
-                .source_directory(&fixture.remote_source.node_id)
-                .exists()
+                .load_source_metadata(&fixture.remote_source.node_id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
         );
 
         let restarted = HistoryRuntime::new(
