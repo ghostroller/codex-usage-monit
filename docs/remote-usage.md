@@ -221,9 +221,22 @@ compilation or git pull is started implicitly.
    response saves the working executable path for subsequent syncs. Explicit
    custom paths are used exactly as entered. Discovery does not explicitly load
    shell startup files.
-   This is an executable token, not a shell command: spaces, quoting and extra
-   arguments are rejected. Windows can use a path such as
+   This is one executable path or a shell-safe PATH name, rather than a shell
+   command with additional arguments. Explicit native paths support spaces,
+   apostrophes and non-ASCII names. Windows can use a path such as
    `C:\Tools\codex-usage-monit.exe`; `~` expansion is Unix-shell-specific.
+   Windows native invocation uses a visible PowerShell command. Its path and
+   arguments cannot contain `$`, a backtick, `%`, `!`, `"`, `^`, smart quotes
+   (U+2018–U+201F), or control
+   characters, because an outer CMD or PowerShell login shell could expand
+   them before the native invocation. Explicit Windows `.cmd`/`.bat` paths are
+   rejected because batch files add another command parser. For those paths,
+   configure a private launcher using a shell-safe PATH name and fixed native
+   paths; do not put a command fragment in `Agent exe`. Launcher authors remain
+   responsible for safely forwarding parameters through any batch parser.
+   Windows PowerShell reports a sole native invocation as success (`0`) or
+   failure (`1`), so it may normalize a native `2` to `1`. Structured component
+   results remain authoritative for partial operations.
 4. The remote login must be able to read its Codex home and write the monitor's
    own state. A custom Codex home or environment can be supplied by a small
    remote launcher script with a safe executable path. Keep launcher output off

@@ -270,7 +270,7 @@ impl<'a> AgentConnection<'a> {
         }
         let mut command = Command::new(self.environment.resolve_program()?);
         command.args(SSH_OPTIONS).arg("--").arg(self.host).arg(
-            crate::remote_transport::remote_executable_command(installed, &args),
+            crate::remote_transport::remote_executable_command(installed, &args)?,
         );
         let output = self.output(&mut command, Duration::from_secs(240), MAX_INFO)?;
         // Partial results are structured so the caller can preserve a completed
@@ -280,12 +280,23 @@ impl<'a> AgentConnection<'a> {
         }
         let report: crate::update::UpdateReport = serde_json::from_slice(&output.stdout)
             .context("agent_node_update_invalid: invalid update result")?;
+        // A visible PowerShell sole invocation normalizes native partial exit 2
+        // to SSH exit 1. Interpret that only for this explicit Windows wrapper
+        // and a parsed partial report; retain the actual process status above.
+        let validation_exit_code = if crate::remote_transport::is_windows_executable_path(installed)
+            && output.status.code() == Some(1)
+            && report.outcome == "partial"
+        {
+            Some(2)
+        } else {
+            output.status.code()
+        };
         crate::update::validate_apply_report(
             &report,
             &AgentInfo::local(),
             Path::new(installed),
             scope,
-            output.status.code(),
+            validation_exit_code,
         )?;
         Ok(report)
     }
@@ -298,7 +309,7 @@ impl<'a> AgentConnection<'a> {
         }
         let output = self.ssh(&crate::remote_transport::remote_executable_command(
             executable, &args,
-        ))?;
+        )?)?;
         if !output.status.success() {
             let diagnostic = safe_diagnostic(&output.stderr);
             if output.status.code() != Some(255)
@@ -486,7 +497,7 @@ impl<'a> AgentConnection<'a> {
         let output = self.ssh(&crate::remote_transport::remote_executable_command(
             candidate,
             &["remote-agent", "install", "--sha256", digest],
-        ))?;
+        )?)?;
         successful(&output, "agent_install_failed")?;
         let installed = String::from_utf8(output.stdout)
             .context("agent_install_invalid: installation path is not UTF-8")?
@@ -1227,6 +1238,66 @@ mod tests {
             assert_eq!(actual.outcome, outcome);
             assert_ne!(actual.outcome, "complete");
             assert!(actual.diagnostic.is_some());
+        }
+    }
+
+    #[test]
+    fn windows_node_update_normalizes_only_a_valid_partial_failure_report() {
+        let environment = SshCommandEnvironment::default();
+        let windows_path = r"C:\Users\O'Brien 用户\App Data\agent.exe";
+        for (case, installed, outcome, code, expected) in [
+            ("windows partial", windows_path, "partial", 1, true),
+            ("windows complete", windows_path, "complete", 0, true),
+            ("windows failed", windows_path, "failed", 1, true),
+            ("partial success", windows_path, "partial", 0, false),
+            ("false complete", windows_path, "complete", 1, false),
+            ("failed status mismatch", windows_path, "failed", 2, false),
+            ("wrong partial identity", windows_path, "partial", 1, false),
+            ("wrong partial cli", windows_path, "partial", 1, false),
+            (
+                "missing partial heartbeat",
+                windows_path,
+                "partial",
+                1,
+                false,
+            ),
+            ("posix failure", "/home/user/agent", "partial", 1, false),
+            (
+                "bare launcher failure",
+                "private-agent-launcher",
+                "partial",
+                1,
+                false,
+            ),
+        ] {
+            let mut report = update_report(crate::update::UpdateScope::Node, installed);
+            report.outcome = outcome.into();
+            if outcome == "partial" {
+                report.cli.outcome = "failed".into();
+            }
+            if case == "wrong partial identity" {
+                report.build_id = "0".repeat(64);
+            } else if case == "wrong partial cli" {
+                report.cli.outcome = "pending".into();
+            } else if case == "missing partial heartbeat" {
+                report.recorder.last_history_heartbeat = None;
+            }
+            let runner = |command: &Command| {
+                let invocation = command.get_args().last().unwrap().to_str().unwrap();
+                if installed == windows_path {
+                    assert!(invocation.contains("-Command \"& "));
+                    assert!(!invocation.contains("EncodedCommand"));
+                }
+                Ok(output(code, &serde_json::to_vec(&report).unwrap(), b""))
+            };
+            let mut connection = AgentConnection::new("node-test", &environment).unwrap();
+            connection.runner = Some(&runner);
+            let actual =
+                connection.update_node(installed, crate::update::UpdateScope::Node, false, false);
+            assert_eq!(actual.is_ok(), expected, "{case}");
+            if expected {
+                assert_eq!(actual.unwrap().outcome, outcome, "{case}");
+            }
         }
     }
 

@@ -1274,6 +1274,16 @@ pub(crate) fn validate_agent_executable(agent_executable: &str) -> Result<(), St
             "Agent executable must contain 1-{MAX_AGENT_EXECUTABLE_BYTES} bytes"
         ));
     }
+    if crate::remote_transport::is_windows_executable_path(agent_executable) {
+        crate::remote_transport::validate_windows_shell_literal(agent_executable)?;
+        if agent_executable.to_ascii_lowercase().ends_with(".cmd")
+            || agent_executable.to_ascii_lowercase().ends_with(".bat")
+        {
+            return Err(
+                "Explicit Windows agent paths cannot invoke batch files; use a private launcher with a shell-safe PATH name".to_owned(),
+            );
+        }
+    }
     // Managed installations use native absolute paths (including macOS's
     // Application Support and non-ASCII account names). They are always quoted
     // by the transport, never interpreted as shell command fragments.

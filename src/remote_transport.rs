@@ -1199,7 +1199,7 @@ where
     let deadline = started
         .checked_add(timeout)
         .ok_or(RemoteTransportError::InvalidTimeout)?;
-    let mut command = build_ssh_command(&ssh_program, ssh_host, agent_executable);
+    let mut command = build_ssh_command(&ssh_program, ssh_host, agent_executable)?;
     environment.apply(&mut command);
     configure_process_tree(&mut command, environment.owns_process_tree());
     let mut child = command
@@ -1611,7 +1611,11 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn build_ssh_command(program: &Path, ssh_host: &str, agent_executable: &str) -> Command {
+fn build_ssh_command(
+    program: &Path,
+    ssh_host: &str,
+    agent_executable: &str,
+) -> Result<Command, RemoteTransportError> {
     let mut command = Command::new(program);
     command.args(SSH_OPTIONS);
     command.arg("--");
@@ -1620,12 +1624,12 @@ fn build_ssh_command(program: &Path, ssh_host: &str, agent_executable: &str) -> 
         command.arg(remote_executable_command(
             agent_executable,
             &SSH_REMOTE_AGENT_ARGUMENTS,
-        ));
+        )?);
     } else {
         command.arg(agent_executable);
         command.args(SSH_REMOTE_AGENT_ARGUMENTS);
     }
-    command
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -1644,7 +1648,7 @@ mod executable_path_tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = executable.to_str().unwrap();
         crate::remotes_config::validate_agent_executable(path).unwrap();
-        let command = remote_executable_command(path, &["remote-agent", "export"]);
+        let command = remote_executable_command(path, &["remote-agent", "export"]).unwrap();
         let result = Command::new("/bin/sh")
             .args(["-c", &command])
             .current_dir(root.path())
@@ -1660,30 +1664,47 @@ mod executable_path_tests {
     }
 
     #[test]
-    fn windows_native_path_uses_encoded_literal_invocation() {
-        use base64::Engine;
+    fn windows_native_path_uses_visible_literal_invocation() {
         let command = remote_executable_command(
             r"C:\Users\O'Brien 用户\App Data\codex-usage-monit.exe",
             &["remote-agent", "export"],
-        );
-        let encoded = command.split_whitespace().last().unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap();
-        let script = String::from_utf16(
-            &bytes
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<_>>(),
         )
         .unwrap();
-        assert!(script.contains(
-            "& 'C:\\Users\\O''Brien 用户\\App Data\\codex-usage-monit.exe' 'remote-agent' 'export'"
-        ));
-        assert!(script.ends_with("exit $LASTEXITCODE"));
+        assert_eq!(
+            command,
+            "powershell.exe -NoProfile -NonInteractive -Command \"& 'C:\\Users\\O''Brien 用户\\App Data\\codex-usage-monit.exe' 'remote-agent' 'export'\""
+        );
         assert!(
             remote_executable_command("C:/App Data/MONIT.EXE", &["-V"])
+                .unwrap()
                 .starts_with("powershell.exe -NoProfile")
+        );
+        assert!(!command.contains("EncodedCommand"));
+        assert!(!command.contains("$LASTEXITCODE"));
+        println!("Reviewed Windows remote command: {command}");
+    }
+
+    #[test]
+    fn windows_remote_literals_reject_outer_shell_expansion_before_spawning() {
+        for character in [
+            '$', '`', '%', '!', '"', '^', '\n', '\r', '\0', '\u{2018}', '\u{2019}', '\u{201a}',
+            '\u{201b}', '\u{201c}', '\u{201d}', '\u{201e}', '\u{201f}',
+        ] {
+            let path = format!(r"C:\private\{character}agent.exe");
+            assert!(crate::remotes_config::validate_agent_executable(&path).is_err());
+            assert!(remote_executable_command(&path, &["remote-agent", "export"]).is_err());
+            let argument = format!("literal{character}value");
+            assert!(remote_executable_command(r"C:\private\agent.exe", &[&argument]).is_err());
+        }
+        for path in [r"C:\private\agent.cmd", r".\agent.BAT"] {
+            assert!(crate::remotes_config::validate_agent_executable(path).is_err());
+            assert!(remote_executable_command(path, &["remote-agent", "export"]).is_err());
+        }
+        assert!(remote_executable_command(r"C:\private\agent.exe", &[""]).is_err());
+        assert_eq!(
+            remote_executable_command("private-agent-launcher", &["remote-agent", "export"])
+                .unwrap(),
+            "private-agent-launcher remote-agent export"
         );
     }
 
@@ -1693,6 +1714,7 @@ mod executable_path_tests {
             crate::remotes_config::validate_agent_executable(path).unwrap();
             assert!(
                 remote_executable_command(path, &["remote-agent", "info"])
+                    .unwrap()
                     .starts_with("powershell.exe -NoProfile"),
                 "{path} must not receive POSIX quoting"
             );
@@ -1706,9 +1728,11 @@ mod executable_path_tests {
     #[cfg(windows)]
     #[test]
     fn windows_remote_invocation_runs_under_cmd_and_both_powershells() {
-        let root = tempfile::tempdir().unwrap();
-        let tools = root.path().join("tools");
-        let child = root.path().join("child");
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("O'Brien 中文 App Data");
+        fs::create_dir(&root).unwrap();
+        let tools = root.join("tools");
+        let child = root.join("child");
         fs::create_dir(&tools).unwrap();
         fs::create_dir(&child).unwrap();
         let executable = tools.join("agent.exe");
@@ -1719,17 +1743,24 @@ mod executable_path_tests {
         .unwrap();
         let absolute = executable.to_string_lossy().into_owned();
         for (directory, path) in [
-            (root.path(), r"tools\agent.exe"),
-            (root.path(), r".\tools\agent.exe"),
+            (root.as_path(), r"tools\agent.exe"),
+            (root.as_path(), r".\tools\agent.exe"),
             (child.as_path(), r"..\tools\agent.exe"),
-            (root.path(), absolute.as_str()),
+            (root.as_path(), absolute.as_str()),
         ] {
-            let invocation = remote_executable_command(path, &["/d", "/c", "echo literal-ready"]);
+            let invocation =
+                remote_executable_command(path, &["/d", "/c", "echo literal-ready"]).unwrap();
+            assert!(!invocation.contains("EncodedCommand"));
             for shell in ["cmd.exe", "powershell.exe", "pwsh.exe"] {
+                // Keep the exact readable command in --nocapture evidence before
+                // starting the process; never hide a rejected invocation.
+                println!("Windows remote invocation: {shell}: {invocation}");
                 let mut command = Command::new(shell);
                 command.current_dir(directory);
                 if shell == "cmd.exe" {
-                    command.args(["/d", "/c", &invocation]);
+                    // cmd /c does not use C-runtime argv escaping. The already
+                    // validated shell command must reach its parser unchanged.
+                    command.args(["/d", "/c"]).raw_arg(&invocation);
                 } else {
                     command.args(["-NoProfile", "-NonInteractive", "-Command", &invocation]);
                 }
@@ -1738,7 +1769,7 @@ mod executable_path_tests {
                     Duration::from_secs(30),
                     64 * 1024,
                 )
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{shell}: {path}: {error}"));
                 assert_eq!(
                     result.status.code(),
                     Some(0),
@@ -1751,10 +1782,26 @@ mod executable_path_tests {
                 );
             }
         }
+        for shell in ["cmd.exe", "powershell.exe", "pwsh.exe"] {
+            let invocation = remote_executable_command(&absolute, &["/d", "/c", "exit 2"]).unwrap();
+            println!("Windows nonzero invocation: {shell}: {invocation}");
+            let mut command = Command::new(shell);
+            if shell == "cmd.exe" {
+                command.args(["/d", "/c"]).raw_arg(&invocation);
+            } else {
+                command.args(["-NoProfile", "-NonInteractive", "-Command", &invocation]);
+            }
+            let result =
+                crate::bounded_process::output(&mut command, Duration::from_secs(30), 64 * 1024)
+                    .unwrap_or_else(|error| panic!("{shell}: native exit 2: {error}"));
+            // -Command's sole native invocation reports failure as 1. Component
+            // JSON, rather than a preserved native 2, identifies partial work.
+            assert_eq!(result.status.code(), Some(1), "{shell}");
+        }
     }
 }
 
-fn is_windows_executable_path(path: &str) -> bool {
+pub(crate) fn is_windows_executable_path(path: &str) -> bool {
     path.starts_with(".\\")
         || path.starts_with("\\\\")
         || (path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
@@ -1780,52 +1827,84 @@ fn executable_needs_quoting(path: &str) -> bool {
     })
 }
 
-/// Build one remote shell command. Callers validate the executable first;
-/// arguments are data and are quoted independently. Encoded PowerShell works
-/// under both supported Windows OpenSSH login shells. The inner script returns
-/// the native exit code; an outer PowerShell login shell can normalize nonzero
-/// codes, so structured component outcomes remain authoritative.
-pub(crate) fn remote_executable_command(executable: &str, args: &[&str]) -> String {
-    let windows = is_windows_executable_path(executable);
-    if windows {
-        use base64::Engine;
-        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-        let script = format!(
-            "$ErrorActionPreference='Stop'; & {} {}; exit $LASTEXITCODE",
-            quote(executable),
-            args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
-        );
-        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        return format!(
-            "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
+/// Values in the Windows command pass through both the OpenSSH login shell and
+/// an inner PowerShell. Single quotes protect the inner literal, but these
+/// characters can expand or change quoting in the outer cmd/PowerShell shell.
+/// PowerShell also recognizes smart quotes U+2018..=U+201E; reject U+201F
+/// conservatively together with that punctuation family.
+/// A private launcher with a shell-safe PATH name can handle such native paths.
+pub(crate) fn validate_windows_shell_literal(value: &str) -> Result<(), String> {
+    if value.chars().any(|ch| {
+        ch.is_control()
+            || matches!(
+                ch,
+                '$' | '`' | '%' | '!' | '"' | '^' | '\u{2018}'..='\u{201f}'
+            )
+    }) {
+        return Err(
+            "Windows agent paths and arguments cannot contain shell expansion characters ($, `, %, !, double quote, ^), smart quotes or controls; use a private launcher with a shell-safe PATH name"
+                .to_owned(),
         );
     }
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
-    let executable = if executable_needs_quoting(executable) {
-        if let Some(relative) = executable.strip_prefix("~/") {
-            format!("\"$HOME\"/{}", quote(relative))
-        } else {
-            quote(executable)
-        }
-    } else {
-        executable.to_owned()
-    };
-    let arguments = args
-        .iter()
-        .map(|s| {
-            if !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
-            {
-                (*s).to_owned()
-            } else {
-                quote(s)
+    Ok(())
+}
+
+/// Build one remote shell command with independently quoted literal arguments.
+/// Windows uses a visible sole native invocation under both supported OpenSSH
+/// login shells. PowerShell can normalize a native nonzero exit to 1, so the
+/// structured component outcome remains authoritative for partial operations.
+pub(crate) fn remote_executable_command(
+    executable: &str,
+    args: &[&str],
+) -> Result<String, RemoteTransportError> {
+    validate_agent_executable(executable).map_err(RemoteTransportError::InvalidAgentExecutable)?;
+    let windows = is_windows_executable_path(executable);
+    if windows {
+        validate_windows_shell_literal(executable)
+            .map_err(RemoteTransportError::InvalidAgentExecutable)?;
+        for argument in args {
+            if argument.is_empty() {
+                return Err(RemoteTransportError::InvalidAgentExecutable(
+                    "Windows agent arguments must be nonempty".to_owned(),
+                ));
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{executable} {arguments}")
+            validate_windows_shell_literal(argument)
+                .map_err(RemoteTransportError::InvalidAgentExecutable)?;
+        }
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        Ok(format!(
+            "powershell.exe -NoProfile -NonInteractive -Command \"& {} {}\"",
+            quote(executable),
+            args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
+        ))
+    } else {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+        let executable = if executable_needs_quoting(executable) {
+            if let Some(relative) = executable.strip_prefix("~/") {
+                format!("\"$HOME\"/{}", quote(relative))
+            } else {
+                quote(executable)
+            }
+        } else {
+            executable.to_owned()
+        };
+        let arguments = args
+            .iter()
+            .map(|s| {
+                if !s.is_empty()
+                    && s.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/')
+                    })
+                {
+                    (*s).to_owned()
+                } else {
+                    quote(s)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!("{executable} {arguments}"))
+    }
 }
 
 fn validate_ssh_host(ssh_host: &str) -> Result<(), RemoteTransportError> {
@@ -2688,7 +2767,8 @@ mod tests {
             Path::new("ssh-test"),
             "dev-server",
             DEFAULT_REMOTE_AGENT_EXECUTABLE,
-        );
+        )
+        .unwrap();
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let mut expected = SSH_OPTIONS.iter().map(OsString::from).collect::<Vec<_>>();
         expected.extend(
@@ -2711,7 +2791,8 @@ mod tests {
             Path::new("ssh-test"),
             "dev-server",
             "~/.local/bin/codex-usage-monit",
-        );
+        )
+        .unwrap();
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let mut expected = SSH_OPTIONS.iter().map(OsString::from).collect::<Vec<_>>();
         expected.extend(
@@ -2729,19 +2810,23 @@ mod tests {
     }
 
     #[test]
-    fn custom_windows_agent_executable_uses_one_encoded_shell_command() {
+    fn custom_windows_agent_executable_uses_one_visible_shell_command() {
         let command = build_ssh_command(
             Path::new("ssh-test"),
             "windows-server",
             "C:/Users/codex/bin/codex-usage-monit.exe",
-        );
+        )
+        .unwrap();
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let mut expected = SSH_OPTIONS.iter().map(OsString::from).collect::<Vec<_>>();
         expected.extend([OsString::from("--"), OsString::from("windows-server")]);
-        expected.push(OsString::from(remote_executable_command(
-            "C:/Users/codex/bin/codex-usage-monit.exe",
-            &["remote-agent", "export"],
-        )));
+        expected.push(OsString::from(
+            remote_executable_command(
+                "C:/Users/codex/bin/codex-usage-monit.exe",
+                &["remote-agent", "export"],
+            )
+            .unwrap(),
+        ));
         assert_eq!(args, expected);
     }
 
@@ -2792,7 +2877,8 @@ mod tests {
         )
         .unwrap();
         let mut command =
-            build_ssh_command(&selected_ssh, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE);
+            build_ssh_command(&selected_ssh, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE)
+                .unwrap();
         environment.apply(&mut command);
 
         assert_eq!(selected_ssh, std::fs::canonicalize(ssh).unwrap());
@@ -2812,7 +2898,7 @@ mod tests {
         let environment = SshCommandEnvironment::default();
         let program = environment.resolve_program().unwrap();
         let mut command =
-            build_ssh_command(&program, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE);
+            build_ssh_command(&program, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE).unwrap();
         environment.apply(&mut command);
 
         assert_eq!(program, default_ssh_program());
@@ -2862,7 +2948,8 @@ mod tests {
         let environment = SshCommandEnvironment::new(Some(saved_path));
         let selected_ssh = environment.resolve_program().unwrap();
         let mut ssh_command =
-            build_ssh_command(&selected_ssh, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE);
+            build_ssh_command(&selected_ssh, "dev-server", DEFAULT_REMOTE_AGENT_EXECUTABLE)
+                .unwrap();
         environment.apply(&mut ssh_command);
         let child_path = ssh_command
             .get_envs()

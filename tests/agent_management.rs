@@ -97,7 +97,6 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
     assert_eq!(info["executableSha256"], digest);
     #[cfg(windows)]
     {
-        use base64::Engine;
         use std::os::windows::process::CommandExt;
 
         assert!(
@@ -110,22 +109,31 @@ fn self_install_checks_bytes_and_can_execute_its_immutable_copy() {
             "Windows PowerShell 5.1 requires a short fixture path; use a short private TEMP outside the checkout: {installed}"
         );
 
-        // Match the production SSH command: cmd cannot directly execute a
-        // canonical \\?\ path, so invoke it through encoded PowerShell. Pass
+        // Match the visible production SSH command: cmd cannot directly execute
+        // a canonical \\?\ path, so invoke it through PowerShell. Pass
         // cmd's command text literally rather than applying CRT argv quoting.
+        assert!(
+            !installed.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '$' | '`' | '%' | '!' | '"' | '^' | '\u{2018}'..='\u{201f}'
+                    )
+            }),
+            "the native Windows fixture requires a shell-safe private TEMP"
+        );
         let script = format!(
-            "$ErrorActionPreference='Stop'; & '{}' remote-agent info; exit $LASTEXITCODE",
+            "& '{}' 'remote-agent' 'info'",
             installed.replace('\'', "''")
         );
-        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let invocation = format!("powershell.exe -NoProfile -NonInteractive -Command \"{script}\"");
+        assert!(!invocation.contains("EncodedCommand"));
+        println!("Immutable Windows remote command: {invocation}");
         let from_shell: Value = serde_json::from_slice(&success(
-            "cmd shell via encoded PowerShell",
+            "cmd shell via visible PowerShell",
             isolated_command(root.path(), "cmd.exe")
                 .args(["/d", "/s", "/c"])
-                .raw_arg(format!(
-                    "powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
-                )),
+                .raw_arg(&invocation),
         ))
         .unwrap();
         assert_eq!(from_shell["buildId"], info["buildId"]);
