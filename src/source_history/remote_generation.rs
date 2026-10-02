@@ -427,6 +427,24 @@ struct RemoteActiveManifest {
     activated_at: DateTime<Utc>,
 }
 
+/// SQL generations retain the protocol/CAS identity while incremental pages
+/// update one stable stream inside a transaction. No shard baseline is copied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SqliteRemoteGeneration {
+    metadata: RemoteGenerationMetadata,
+    data_generation: SourceHistoryRemoteGenerationId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SqliteRemoteImportMarker {
+    format_version: u32,
+    profile_id: HistoryProfileId,
+    source_id: NodeId,
+    redaction_profile: RedactionProfile,
+}
+
 impl RemoteActiveManifest {
     fn validate(
         &self,
@@ -450,6 +468,688 @@ impl RemoteActiveManifest {
 }
 
 impl SourceHistoryStore {
+    /// Imports complete visible and staging streams plus their exact logical
+    /// generation identities. Incomplete legacy COW clones remain invisible;
+    /// their durable ingest page is replayed from the imported active stream.
+    pub(crate) fn import_legacy_remote_sqlite_state(
+        &self,
+        legacy: &SourceHistoryStore,
+    ) -> io::Result<()> {
+        let database = self
+            .sqlite_database()
+            .ok_or_else(|| invalid_data("remote import requires SQL history"))?;
+        if self.profile_id() != legacy.profile_id() {
+            return Err(invalid_data("remote SQL import profile mismatch"));
+        }
+        database.write(|connection| {
+            for source in legacy.list_source_metadata()? {
+                if source.kind() != SourceKind::Ssh {
+                    continue;
+                }
+                let source_id = source.source_id();
+                for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+                    // The retained files are a backup after the first import.
+                    // Re-entering migration for another privacy mode must not
+                    // overwrite a stream that SQL has already advanced/purged.
+                    let import_key = format!(
+                        "remote-history-import/{}/{}/{}",
+                        self.profile_id.as_str(),
+                        redaction.directory_name(),
+                        source_id.as_str()
+                    );
+                    if let Some(marker) =
+                        database::state::<SqliteRemoteImportMarker>(connection, &import_key)?
+                    {
+                        if marker.format_version != 1
+                            || marker.profile_id != self.profile_id
+                            || marker.source_id != *source_id
+                            || marker.redaction_profile != redaction
+                        {
+                            return Err(invalid_data("remote SQL import marker mismatch"));
+                        }
+                        continue;
+                    }
+                    let history_prefix = format!(
+                        "{}/",
+                        database.namespace(&self.source_remote_history_directory(source_id, redaction))?
+                    );
+                    let live_key = database.namespace(&self.remote_live_path(source_id, redaction))?;
+                    let existing: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM history_state WHERE state_key=?1 OR substr(state_key,1,length(?2))=?2 UNION ALL SELECT 1 FROM history_records WHERE substr(namespace,1,length(?2))=?2)",
+                        rusqlite::params![live_key, history_prefix],
+                        |row| row.get(0),
+                    ).map_err(database::sql_error)?;
+                    if existing {
+                        return Err(invalid_data("remote SQL namespace exists without an import marker"));
+                    }
+                    self.import_legacy_remote_live_sqlite(legacy, source_id, redaction)?;
+                    let root = legacy.source_remote_history_directory(source_id, redaction);
+                    if !legacy.private_directory_exists(&root)? {
+                        database::set_state(connection, &import_key, &SqliteRemoteImportMarker {
+                            format_version: 1,
+                            profile_id: self.profile_id.clone(),
+                            source_id: source_id.clone(),
+                            redaction_profile: redaction,
+                        })?;
+                        continue;
+                    }
+                    let lock = open_lock_file(&root, REMOTE_HISTORY_LOCK_FILE)?;
+                    let _lock = lock_shared(lock, &root, REMOTE_HISTORY_LOCK_FILE)?;
+                    let catalog = load_remote_history_generation_catalog_locked(
+                        legacy, source_id, redaction, &root, true,
+                    )?;
+                    for (generation, directory) in catalog.generations {
+                        let metadata = legacy.read_remote_generation_metadata_locked(
+                            source_id,
+                            redaction,
+                            &generation,
+                        )?;
+                        metadata.validate(
+                            legacy.profile_id(),
+                            source_id,
+                            redaction,
+                            &generation,
+                        )?;
+                        if !metadata.clone_complete {
+                            continue;
+                        }
+                        let target_directory = self.source_remote_history_generation_directory(
+                            source_id,
+                            redaction,
+                            &generation,
+                        );
+                        let mut budget = SourceHistoryReadBudget::with_limits(
+                            MAX_REMOTE_CLONE_TOTAL_BYTES,
+                            usize::MAX,
+                            usize::MAX,
+                        );
+                        let buckets = legacy
+                            .load_source_bucket_records_from_directory_with_budget(
+                                source_id,
+                                redaction,
+                                DateTime::<Utc>::MIN_UTC,
+                                &directory.join(BUCKETS_DIRECTORY),
+                                &mut budget,
+                            )?;
+                        let digests = legacy
+                            .load_source_session_digest_records_from_directory_with_budget(
+                                source_id,
+                                redaction,
+                                DateTime::<Utc>::MIN_UTC,
+                                &directory.join(DIGESTS_DIRECTORY),
+                                &mut budget,
+                            )?;
+                        self.record_source_bucket_changes_in_directory_unfenced(
+                            source_id,
+                            redaction,
+                            &target_directory.join(BUCKETS_DIRECTORY),
+                            &buckets,
+                        )?;
+                        self.record_source_session_digest_changes_in_directory_unfenced(
+                            source_id,
+                            redaction,
+                            &target_directory.join(DIGESTS_DIRECTORY),
+                            &digests,
+                        )?;
+                        self.import_legacy_remote_quota_sqlite(
+                            legacy,
+                            source_id,
+                            redaction,
+                            &directory,
+                            &target_directory,
+                        )?;
+                        let value = SqliteRemoteGeneration {
+                            metadata,
+                            data_generation: generation.clone(),
+                        };
+                        database::set_state(
+                            connection,
+                            &self.sqlite_remote_generation_key(
+                                &database,
+                                source_id,
+                                redaction,
+                                &generation,
+                            )?,
+                            &value,
+                        )?;
+                    }
+                    if let Some(active) =
+                        legacy.read_remote_active_manifest_locked(source_id, redaction, &root)?
+                    {
+                        legacy.validate_remote_generation_binding_locked(
+                            source_id,
+                            redaction,
+                            &active.active_generation,
+                            &active.binding,
+                        )?;
+                        database::set_state(
+                            connection,
+                            &database.namespace(
+                                &self
+                                    .source_remote_history_directory(source_id, redaction)
+                                    .join(REMOTE_ACTIVE_MANIFEST_FILE),
+                            )?,
+                            &active,
+                        )?;
+                        self.sqlite_remote_active(connection, &database, source_id, redaction)?;
+                    }
+                    database::set_state(connection, &import_key, &SqliteRemoteImportMarker {
+                        format_version: 1,
+                        profile_id: self.profile_id.clone(),
+                        source_id: source_id.clone(),
+                        redaction_profile: redaction,
+                    })?;
+                }
+            }
+            crate::remote_ingest_state::import_legacy_remote_ingest_sqlite_state(self, legacy)
+        })
+    }
+
+    fn sqlite_remote_generation_key(
+        &self,
+        database: &database::HistoryDatabase,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        generation: &SourceHistoryRemoteGenerationId,
+    ) -> io::Result<String> {
+        database.namespace(
+            &self
+                .source_remote_history_generation_directory(source, redaction, generation)
+                .join(REMOTE_GENERATION_METADATA_FILE),
+        )
+    }
+
+    fn sqlite_remote_active(
+        &self,
+        connection: &rusqlite::Connection,
+        database: &database::HistoryDatabase,
+        source: &NodeId,
+        redaction: RedactionProfile,
+    ) -> io::Result<Option<RemoteActiveManifest>> {
+        let key = database.namespace(
+            &self
+                .source_remote_history_directory(source, redaction)
+                .join(REMOTE_ACTIVE_MANIFEST_FILE),
+        )?;
+        let active: Option<RemoteActiveManifest> = database::state(connection, &key)?;
+        if let Some(active) = &active {
+            active.validate(&self.profile_id, source, redaction)?;
+            let generation = self.sqlite_remote_generation(
+                connection,
+                database,
+                source,
+                redaction,
+                &active.active_generation,
+            )?;
+            if generation.metadata.binding != active.binding {
+                return Err(invalid_data(
+                    "remote SQL active generation binding mismatch",
+                ));
+            }
+        }
+        Ok(active)
+    }
+
+    fn sqlite_remote_generation(
+        &self,
+        connection: &rusqlite::Connection,
+        database: &database::HistoryDatabase,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        generation: &SourceHistoryRemoteGenerationId,
+    ) -> io::Result<SqliteRemoteGeneration> {
+        let key = self.sqlite_remote_generation_key(database, source, redaction, generation)?;
+        let value: SqliteRemoteGeneration =
+            database::state(connection, &key)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "remote SQL generation is missing")
+            })?;
+        value
+            .metadata
+            .validate_ready(&self.profile_id, source, redaction, generation)?;
+        value.data_generation.validate()?;
+        Ok(value)
+    }
+
+    fn sqlite_remote_catalog(
+        &self,
+        connection: &rusqlite::Connection,
+        database: &database::HistoryDatabase,
+        source: &NodeId,
+        redaction: RedactionProfile,
+    ) -> io::Result<Vec<(String, SqliteRemoteGeneration)>> {
+        let prefix = format!(
+            "{}/",
+            database.namespace(
+                &self
+                    .source_remote_history_directory(source, redaction)
+                    .join(REMOTE_GENERATIONS_DIRECTORY)
+            )?
+        );
+        // Quota headers share the stable generation stream namespace. Only
+        // generation descriptors identify logical aliases; do not decode or
+        // count the other family's state as a generation.
+        let mut values = Vec::new();
+        let mut budget = SourceHistoryReadBudget::for_query();
+        let suffix = format!("/{REMOTE_GENERATION_METADATA_FILE}");
+        for key in database::state_keys(connection, &prefix)? {
+            if !key.ends_with(&suffix) {
+                continue;
+            }
+            if values.len() >= MAX_REMOTE_HISTORY_GENERATIONS {
+                return Err(invalid_data(
+                    "remote SQL generation count exceeds its bound",
+                ));
+            }
+            budget.charge_records(1)?;
+            let value: SqliteRemoteGeneration = sqlite_state_bounded(
+                connection,
+                &key,
+                MAX_REMOTE_GENERATION_FILE_BYTES + 1024,
+                Some(&mut budget),
+            )?
+            .ok_or_else(|| invalid_data("remote SQL generation descriptor disappeared"))?;
+            values.push((key, value));
+        }
+        for (key, value) in &values {
+            value.metadata.validate_ready(
+                &self.profile_id,
+                source,
+                redaction,
+                &value.metadata.generation,
+            )?;
+            value.data_generation.validate()?;
+            if *key
+                != self.sqlite_remote_generation_key(
+                    database,
+                    source,
+                    redaction,
+                    &value.metadata.generation,
+                )?
+            {
+                return Err(invalid_data("remote SQL generation key mismatch"));
+            }
+        }
+        Ok(values)
+    }
+
+    fn sqlite_remote_capacity(
+        &self,
+        connection: &rusqlite::Connection,
+        database: &database::HistoryDatabase,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        candidate: &SourceHistoryRemoteGenerationId,
+    ) -> io::Result<()> {
+        let catalog = self.sqlite_remote_catalog(connection, database, source, redaction)?;
+        if catalog.len() >= MAX_REMOTE_HISTORY_GENERATIONS
+            && !catalog
+                .iter()
+                .any(|(_, value)| &value.metadata.generation == candidate)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote SQL generation capacity is exhausted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sqlite_remote_data_directory(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        value: &SqliteRemoteGeneration,
+    ) -> PathBuf {
+        self.source_remote_history_generation_directory(source, redaction, &value.data_generation)
+    }
+
+    fn sqlite_ensure_remote_generation(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        generation: &SourceHistoryRemoteGenerationId,
+        binding: &SourceHistoryRemoteBinding,
+    ) -> io::Result<()> {
+        let database = self
+            .sqlite_database()
+            .expect("SQL dispatch requires a database");
+        database.write(|connection| {
+            require_ssh_source(&self.load_source_metadata(source)?)?;
+            self.sqlite_remote_capacity(connection, &database, source, redaction, generation)?;
+            let key =
+                self.sqlite_remote_generation_key(&database, source, redaction, generation)?;
+            if let Some(existing) = database::state::<SqliteRemoteGeneration>(connection, &key)? {
+                existing.metadata.validate_ready(
+                    &self.profile_id,
+                    source,
+                    redaction,
+                    generation,
+                )?;
+                if existing.metadata.origin != RemoteGenerationOrigin::Bootstrap
+                    || &existing.metadata.binding != binding
+                {
+                    return Err(invalid_data(
+                        "remote SQL generation is bound to another bootstrap",
+                    ));
+                }
+                existing.data_generation.validate()?;
+                return Ok(());
+            }
+            let value = SqliteRemoteGeneration {
+                metadata: RemoteGenerationMetadata::bootstrap(
+                    self.profile_id.clone(),
+                    source.clone(),
+                    redaction,
+                    generation.clone(),
+                    binding.clone(),
+                ),
+                data_generation: generation.clone(),
+            };
+            database::set_state(connection, &key, &value)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sqlite_apply_remote_generation_page(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        generation: &SourceHistoryRemoteGenerationId,
+        binding: &SourceHistoryRemoteBinding,
+        require_active: bool,
+        buckets: &[SourceBucketRecord],
+        digests: &[SourceSessionDigestRecord],
+        quotas: &[RemoteQuotaChange],
+    ) -> io::Result<RemoteHistoryPageWriteReport> {
+        let database = self
+            .sqlite_database()
+            .expect("SQL dispatch requires a database");
+        database.write(|connection| {
+            require_ssh_source(&self.load_source_metadata(source)?)?;
+            let active = self.sqlite_remote_active(connection, &database, source, redaction)?;
+            if require_active
+                || active
+                    .as_ref()
+                    .is_some_and(|active| &active.active_generation == generation)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote active pages require the CAS apply path",
+                ));
+            }
+            let value = self
+                .sqlite_remote_generation(connection, &database, source, redaction, generation)?;
+            if &value.metadata.binding != binding {
+                return Err(invalid_data("remote SQL page generation binding mismatch"));
+            }
+            let directory = self.sqlite_remote_data_directory(source, redaction, &value);
+            let bucket_history = self.record_source_bucket_changes_in_directory_unfenced(
+                source,
+                redaction,
+                &directory.join(BUCKETS_DIRECTORY),
+                buckets,
+            )?;
+            let session_digests = self.record_source_session_digest_changes_in_directory_unfenced(
+                source,
+                redaction,
+                &directory.join(DIGESTS_DIRECTORY),
+                digests,
+            )?;
+            apply_remote_quota(self, source, redaction, &directory, quotas)?;
+            Ok(RemoteHistoryPageWriteReport {
+                bucket_history,
+                session_digests,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sqlite_apply_remote_active_page(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        expected: &SourceHistoryRemoteActiveRef,
+        replacement: &SourceHistoryRemoteGenerationId,
+        binding: &SourceHistoryRemoteBinding,
+        buckets: &[SourceBucketRecord],
+        digests: &[SourceSessionDigestRecord],
+        activated_at: DateTime<Utc>,
+        quotas: &[RemoteQuotaChange],
+    ) -> io::Result<RemoteHistoryPageWriteReport> {
+        let database = self
+            .sqlite_database()
+            .expect("SQL dispatch requires a database");
+        let origin = RemoteGenerationOrigin::ActiveReplacement {
+            expected_active_generation: expected.generation().clone(),
+            page_fingerprint: remote_page_fingerprint(buckets, digests, quotas)?,
+        };
+        database.write(|connection| {
+            require_ssh_source(&self.load_source_metadata(source)?)?;
+            let active = self
+                .sqlite_remote_active(connection, &database, source, redaction)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "remote SQL active generation is missing",
+                    )
+                })?;
+            let actual =
+                SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)?;
+            if actual.generation() == replacement && actual.binding() == binding {
+                let value = self.sqlite_remote_generation(
+                    connection,
+                    &database,
+                    source,
+                    redaction,
+                    replacement,
+                )?;
+                if value.metadata.origin != origin {
+                    return Err(invalid_data(
+                        "remote SQL replacement ID was reused for a different page",
+                    ));
+                }
+                return Ok(RemoteHistoryPageWriteReport::default());
+            }
+            if &actual != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote SQL active generation changed before apply",
+                ));
+            }
+            self.sqlite_remote_capacity(connection, &database, source, redaction, replacement)?;
+            let previous = self.sqlite_remote_generation(
+                connection,
+                &database,
+                source,
+                redaction,
+                expected.generation(),
+            )?;
+            let key =
+                self.sqlite_remote_generation_key(&database, source, redaction, replacement)?;
+            if let Some(existing) = database::state::<SqliteRemoteGeneration>(connection, &key)? {
+                existing.metadata.validate_ready(
+                    &self.profile_id,
+                    source,
+                    redaction,
+                    replacement,
+                )?;
+                if existing.metadata.origin != origin || &existing.metadata.binding != binding {
+                    return Err(invalid_data(
+                        "remote SQL replacement is bound to another page",
+                    ));
+                }
+            }
+            let directory = self.sqlite_remote_data_directory(source, redaction, &previous);
+            let bucket_history = self.record_source_bucket_changes_in_directory_unfenced(
+                source,
+                redaction,
+                &directory.join(BUCKETS_DIRECTORY),
+                buckets,
+            )?;
+            let session_digests = self.record_source_session_digest_changes_in_directory_unfenced(
+                source,
+                redaction,
+                &directory.join(DIGESTS_DIRECTORY),
+                digests,
+            )?;
+            apply_remote_quota(self, source, redaction, &directory, quotas)?;
+            let value = SqliteRemoteGeneration {
+                metadata: RemoteGenerationMetadata {
+                    format_version: REMOTE_GENERATION_FORMAT_VERSION,
+                    profile_id: self.profile_id.clone(),
+                    source_id: source.clone(),
+                    redaction_profile: redaction,
+                    generation: replacement.clone(),
+                    binding: binding.clone(),
+                    origin,
+                    clone_complete: true,
+                },
+                data_generation: previous.data_generation,
+            };
+            database::set_state(connection, &key, &value)?;
+            let manifest = RemoteActiveManifest {
+                format_version: REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION,
+                profile_id: self.profile_id.clone(),
+                source_id: source.clone(),
+                redaction_profile: redaction,
+                active_generation: replacement.clone(),
+                binding: binding.clone(),
+                activated_at,
+            };
+            database::set_state(
+                connection,
+                &database.namespace(
+                    &self
+                        .source_remote_history_directory(source, redaction)
+                        .join(REMOTE_ACTIVE_MANIFEST_FILE),
+                )?,
+                &manifest,
+            )?;
+            Ok(RemoteHistoryPageWriteReport {
+                bucket_history,
+                session_digests,
+            })
+        })
+    }
+
+    fn sqlite_activate_remote_generation(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        expected: Option<&SourceHistoryRemoteActiveRef>,
+        candidate: &SourceHistoryRemoteGenerationId,
+        binding: &SourceHistoryRemoteBinding,
+        activated_at: DateTime<Utc>,
+    ) -> io::Result<()> {
+        let database = self
+            .sqlite_database()
+            .expect("SQL dispatch requires a database");
+        database.write(|connection| {
+            require_ssh_source(&self.load_source_metadata(source)?)?;
+            let value =
+                self.sqlite_remote_generation(connection, &database, source, redaction, candidate)?;
+            if &value.metadata.binding != binding
+                || value.metadata.origin != RemoteGenerationOrigin::Bootstrap
+            {
+                return Err(invalid_data(
+                    "remote SQL bootstrap generation binding mismatch",
+                ));
+            }
+            let actual = self
+                .sqlite_remote_active(connection, &database, source, redaction)?
+                .map(|active| {
+                    SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)
+                })
+                .transpose()?;
+            let wanted = SourceHistoryRemoteActiveRef::new(candidate.clone(), binding.clone())?;
+            if actual.as_ref() == Some(&wanted) {
+                return Ok(());
+            }
+            if actual.as_ref() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote SQL active generation changed before bootstrap",
+                ));
+            }
+            if let Some(actual) = &actual {
+                validate_binding_does_not_roll_back(actual.binding(), binding)?;
+            }
+            let manifest = RemoteActiveManifest {
+                format_version: REMOTE_ACTIVE_MANIFEST_FORMAT_VERSION,
+                profile_id: self.profile_id.clone(),
+                source_id: source.clone(),
+                redaction_profile: redaction,
+                active_generation: candidate.clone(),
+                binding: binding.clone(),
+                activated_at,
+            };
+            database::set_state(
+                connection,
+                &database.namespace(
+                    &self
+                        .source_remote_history_directory(source, redaction)
+                        .join(REMOTE_ACTIVE_MANIFEST_FILE),
+                )?,
+                &manifest,
+            )
+        })
+    }
+
+    fn sqlite_gc_remote_generation(
+        &self,
+        source: &NodeId,
+        redaction: RedactionProfile,
+        candidate: &SourceHistoryRemoteGenerationId,
+        protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
+    ) -> io::Result<RemoteHistoryGenerationGcOutcome> {
+        let database = self
+            .sqlite_database()
+            .expect("SQL dispatch requires a database");
+        database.write(|connection| {
+            require_ssh_source(&self.load_source_metadata(source)?)?;
+            if self
+                .sqlite_remote_active(connection, &database, source, redaction)?
+                .is_some_and(|active| &active.active_generation == candidate)
+            {
+                return Ok(RemoteHistoryGenerationGcOutcome::SkippedActive);
+            }
+            if protected.contains(candidate) {
+                return Ok(RemoteHistoryGenerationGcOutcome::SkippedProtected);
+            }
+            let key = self.sqlite_remote_generation_key(&database, source, redaction, candidate)?;
+            let Some(value) = database::state::<SqliteRemoteGeneration>(connection, &key)? else {
+                return Ok(RemoteHistoryGenerationGcOutcome::NotFound);
+            };
+            value
+                .metadata
+                .validate_ready(&self.profile_id, source, redaction, candidate)?;
+            value.data_generation.validate()?;
+            database::delete_state(connection, &key)?;
+            let still_referenced = self
+                .sqlite_remote_catalog(connection, &database, source, redaction)?
+                .iter()
+                .any(|(_, retained)| retained.data_generation == value.data_generation);
+            if !still_referenced {
+                let directory = self.sqlite_remote_data_directory(source, redaction, &value);
+                for family in [BUCKETS_DIRECTORY, DIGESTS_DIRECTORY] {
+                    database::delete_namespace(
+                        connection,
+                        &database.namespace(&directory.join(family))?,
+                    )?;
+                }
+                database::delete_state(
+                    connection,
+                    &database.namespace(&directory.join(REMOTE_QUOTA_FILE))?,
+                )?;
+                database::delete_namespace(
+                    connection,
+                    &database.namespace(&directory.join(REMOTE_QUOTA_FILE))?,
+                )?;
+            }
+            Ok(RemoteHistoryGenerationGcOutcome::Deleted)
+        })
+    }
+
     pub fn source_remote_history_directory(
         &self,
         source_id: &NodeId,
@@ -489,6 +1189,16 @@ impl SourceHistoryStore {
         source_id: &NodeId,
         redaction_profile: RedactionProfile,
     ) -> io::Result<Option<SourceHistoryRemoteActiveRef>> {
+        if let Some(database) = self.sqlite_database() {
+            return database.read(|connection| {
+                require_ssh_source(&self.load_source_metadata(source_id)?)?;
+                self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?
+                    .map(|active| {
+                        SourceHistoryRemoteActiveRef::new(active.active_generation, active.binding)
+                    })
+                    .transpose()
+            });
+        }
         let source = self.load_source_metadata(source_id)?;
         require_ssh_source(&source)?;
         let root = self.source_remote_history_directory(source_id, redaction_profile);
@@ -578,6 +1288,46 @@ impl SourceHistoryStore {
         between_families: impl FnOnce(),
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceHistoryRemoteSnapshot> {
+        if let Some(database) = self.sqlite_database() {
+            return database.read(|_| {
+                self.with_source_metadata_shared(source_id, |source| {
+                    require_ssh_source(source)?;
+                    self.with_active_remote_history_generation(
+                        source_id,
+                        redaction_profile,
+                        |directory| {
+                            let Some(directory) = directory else {
+                                return Ok(SourceHistoryRemoteSnapshot::default());
+                            };
+                            let active_ref =
+                                self.active_remote_history_ref(source_id, redaction_profile)?;
+                            let bucket_records = self
+                                .load_source_bucket_records_from_directory_with_budget(
+                                    source_id,
+                                    redaction_profile,
+                                    since,
+                                    &directory.join(BUCKETS_DIRECTORY),
+                                    budget,
+                                )?;
+                            between_families();
+                            let session_digest_records = self
+                                .load_source_session_digest_records_from_directory_with_budget(
+                                    source_id,
+                                    redaction_profile,
+                                    since,
+                                    &directory.join(DIGESTS_DIRECTORY),
+                                    budget,
+                                )?;
+                            Ok(SourceHistoryRemoteSnapshot {
+                                active_ref,
+                                bucket_records,
+                                session_digest_records,
+                            })
+                        },
+                    )
+                })
+            });
+        }
         self.with_source_metadata_shared(source_id, |source| {
             require_ssh_source(source)?;
             let root = self.source_remote_history_directory(source_id, redaction_profile);
@@ -631,6 +1381,30 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         operation: impl FnOnce(Option<&Path>) -> io::Result<T>,
     ) -> io::Result<T> {
+        if let Some(database) = self.sqlite_database() {
+            return database.read(|connection| {
+                let directory = self
+                    .sqlite_remote_active(connection, &database, source_id, redaction_profile)?
+                    .map(|active| {
+                        self.sqlite_remote_generation(
+                            connection,
+                            &database,
+                            source_id,
+                            redaction_profile,
+                            &active.active_generation,
+                        )
+                        .map(|generation| {
+                            self.sqlite_remote_data_directory(
+                                source_id,
+                                redaction_profile,
+                                &generation,
+                            )
+                        })
+                    })
+                    .transpose()?;
+                operation(directory.as_deref())
+            });
+        }
         let root = self.source_remote_history_directory(source_id, redaction_profile);
         if !self.private_directory_exists(&root)? {
             return operation(None);
@@ -660,6 +1434,16 @@ impl SourceHistoryStore {
         generation: &SourceHistoryRemoteGenerationId,
         binding: &SourceHistoryRemoteBinding,
     ) -> io::Result<()> {
+        if self.sqlite_database().is_some() {
+            generation.validate()?;
+            binding.validate_namespace(source_id)?;
+            return self.sqlite_ensure_remote_generation(
+                source_id,
+                redaction_profile,
+                generation,
+                binding,
+            );
+        }
         generation.validate()?;
         binding.validate_namespace(source_id)?;
         let source = self.load_source_metadata(source_id)?;
@@ -736,6 +1520,20 @@ impl SourceHistoryStore {
         digest_records: &[SourceSessionDigestRecord],
         quota_records: &[RemoteQuotaChange],
     ) -> io::Result<RemoteHistoryPageWriteReport> {
+        if self.sqlite_database().is_some() {
+            generation.validate()?;
+            binding.validate_namespace(source_id)?;
+            return self.sqlite_apply_remote_generation_page(
+                source_id,
+                redaction_profile,
+                generation,
+                binding,
+                require_active,
+                bucket_records,
+                digest_records,
+                quota_records,
+            );
+        }
         generation.validate()?;
         binding.validate_namespace(source_id)?;
         let source = self.load_source_metadata(source_id)?;
@@ -833,6 +1631,19 @@ impl SourceHistoryStore {
                 io::ErrorKind::InvalidInput,
                 "remote active replacement must use a distinct generation",
             ));
+        }
+        if self.sqlite_database().is_some() {
+            return self.sqlite_apply_remote_active_page(
+                source_id,
+                redaction_profile,
+                expected_active,
+                replacement_generation,
+                candidate_binding,
+                bucket_records,
+                digest_records,
+                activated_at,
+                quota_records,
+            );
         }
         let page_fingerprint =
             remote_page_fingerprint(bucket_records, digest_records, quota_records)?;
@@ -961,6 +1772,21 @@ impl SourceHistoryStore {
         activated_at: DateTime<Utc>,
         #[cfg(test)] before_manifest: Option<&dyn Fn()>,
     ) -> io::Result<()> {
+        if self.sqlite_database().is_some() {
+            candidate_generation.validate()?;
+            candidate_binding.validate_namespace(source_id)?;
+            if let Some(expected) = expected_active {
+                expected.validate_namespace(source_id)?;
+            }
+            return self.sqlite_activate_remote_generation(
+                source_id,
+                redaction_profile,
+                expected_active,
+                candidate_generation,
+                candidate_binding,
+                activated_at,
+            );
+        }
         if let Some(expected_active) = expected_active {
             expected_active.validate_namespace(source_id)?;
         }
@@ -1118,6 +1944,18 @@ impl SourceHistoryStore {
         candidate: &SourceHistoryRemoteGenerationId,
         protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
     ) -> io::Result<RemoteHistoryGenerationGcOutcome> {
+        if self.sqlite_database().is_some() {
+            candidate.validate()?;
+            for generation in protected {
+                generation.validate()?;
+            }
+            return self.sqlite_gc_remote_generation(
+                source_id,
+                redaction_profile,
+                candidate,
+                protected,
+            );
+        }
         candidate.validate()?;
         for generation in protected {
             generation.validate()?;
@@ -1229,6 +2067,43 @@ impl SourceHistoryStore {
         protected: &BTreeSet<SourceHistoryRemoteGenerationId>,
         max_work: usize,
     ) -> io::Result<RemoteHistoryGenerationSweepReport> {
+        if let Some(database) = self.sqlite_database() {
+            for generation in protected {
+                generation.validate()?;
+            }
+            return database.write(|connection| {
+                let catalog = self.sqlite_remote_catalog(
+                    connection,
+                    &database,
+                    source_id,
+                    redaction_profile,
+                )?;
+                let active =
+                    self.sqlite_remote_active(connection, &database, source_id, redaction_profile)?;
+                let mut report = RemoteHistoryGenerationSweepReport::default();
+                for (_, generation) in catalog {
+                    let candidate = &generation.metadata.generation;
+                    if protected.contains(candidate)
+                        || active
+                            .as_ref()
+                            .is_some_and(|active| &active.active_generation == candidate)
+                    {
+                        report.skipped += 1;
+                    } else if report.deleted >= max_work {
+                        report.remaining += 1;
+                    } else if self.sqlite_gc_remote_generation(
+                        source_id,
+                        redaction_profile,
+                        candidate,
+                        protected,
+                    )? == RemoteHistoryGenerationGcOutcome::Deleted
+                    {
+                        report.deleted += 1;
+                    }
+                }
+                Ok(report)
+            });
+        }
         for generation in protected {
             generation.validate()?;
         }

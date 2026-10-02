@@ -13,7 +13,11 @@ use crate::history::{
 };
 use crate::source_identity::SourceIdentity;
 
+#[path = "sqlite_local.rs"]
+mod sqlite_local;
+
 const STATE_FILE: &str = "local-observation-state.json";
+const COMMITTED_STATE_FILE: &str = "local-observation-committed.json";
 const STATE_LOCK: &str = "local-observation.lock";
 const JOURNAL_FILE: &str = "local-observation-pending.json";
 const MAX_JOURNAL_BYTES: u64 = MAX_SHARD_FILE_BYTES;
@@ -117,13 +121,10 @@ impl LocalObservationWriteReport {
 }
 
 /// One revision-consistent read of every local observation family used by a
-/// history query. The local writer publishes buckets, weekly points, and
-/// session digests under one stable source-level state lock; readers must hold
-/// the shared side of that same lock so they cannot splice two observation
-/// revisions together, including while the first profile namespace is being
-/// created. After an interrupted write, combined reads remain unavailable
-/// until an authorized writer replays the durable batch. Individual account
-/// samples and raw family inspection APIs have independent read contracts.
+/// history query. SQLite readers use one transaction and may observe the
+/// previous complete batch while a new batch is being prepared. The legacy
+/// migration/fixture backend holds the shared source state lock instead and
+/// refuses combined reads until its durable redo batch has been replayed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalObservationSnapshot {
     pub source: SourceMetadata,
@@ -251,6 +252,21 @@ impl SourceHistoryWriter<'_, '_, '_> {
         let observation = redacted.as_ref().unwrap_or(observation);
         let identity = identity.clone();
         let display_label = display_label.to_owned();
+        if self.store.sqlite_database().is_some() {
+            return self.fenced(|store| {
+                sqlite_local::record_observation(
+                    self,
+                    store,
+                    &identity,
+                    &display_label,
+                    redaction_profile,
+                    observation,
+                    mode,
+                    session_digests,
+                    session_digest_scan_complete,
+                )
+            });
+        }
         self.fenced(|store| {
             // The lock lives in the stable source directory, which is
             // created before source metadata is published. Taking it first
@@ -348,6 +364,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
                     observation,
                     mode,
                     revision,
+                    true,
                 )?;
             let (session_digest_records, session_digest_tombstones) = build_session_digest_records(
                 store,
@@ -358,6 +375,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 revision,
                 session_digests,
                 session_digest_scan_complete,
+                true,
             )?;
             let account_records = observation.quota_points.len();
             let bucket_record_count = bucket_records.len();
@@ -471,6 +489,15 @@ impl SourceHistoryWriter<'_, '_, '_> {
         }
         let identity = identity.clone();
         self.fenced(|store| {
+            if store.sqlite_database().is_some() {
+                return sqlite_local::raise_revision_floor(
+                    self,
+                    store,
+                    &identity,
+                    redaction_profile,
+                    floor,
+                );
+            }
             let state_directory =
                 local_state_directory(store, identity.node_id(), redaction_profile);
             let lock_directory = store.source_directory(identity.node_id());
@@ -489,6 +516,9 @@ impl SourceHistoryWriter<'_, '_, '_> {
         complete: bool,
     ) -> io::Result<V2SummaryBackfillAttempt> {
         self.fenced(|store| {
+            if store.sqlite_database().is_some() {
+                return sqlite_local::mark_backfill(self, store, completed_at, complete);
+            }
             let directory = store
                 .profile_directory()
                 .join(self.redaction_profile().directory_name());
@@ -541,15 +571,26 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
-    /// Loads the monotonic local-observation revision under the same shared
-    /// source lock used by combined history reads. TUI projection caches use
-    /// this cheap stamp to notice recorder writes without reopening every
-    /// historical shard.
+    /// Migration-only replay of durable local state. Ordinary observation
+    /// writes reserve their revision in a separate committed transaction.
+    pub(crate) fn import_legacy_local_sqlite_state(
+        &self,
+        legacy: &SourceHistoryStore,
+        epochs: &[(RedactionProfile, u64, u64)],
+    ) -> io::Result<()> {
+        sqlite_local::import_legacy_state(self, legacy, epochs)
+    }
+
+    /// Loads the reserved revision high-water. Failed publication may leave
+    /// a harmless gap; SQLite query caches use the committed stamp below.
     pub fn load_local_observation_revision(
         &self,
         identity: &SourceIdentity,
         redaction_profile: RedactionProfile,
     ) -> io::Result<u64> {
+        if self.sqlite_database().is_some() {
+            return sqlite_local::load_revision(self, identity, redaction_profile);
+        }
         let lock_directory = self.source_directory(identity.node_id());
         if !self.private_directory_exists(&lock_directory)? {
             return Ok(0);
@@ -563,8 +604,27 @@ impl SourceHistoryStore {
         revision
     }
 
-    /// Loads all local source families under the shared local-observation
-    /// state lock. `include_session_digests=false` avoids opening digest
+    /// Loads a stamp committed atomically with the visible observation.
+    /// SQLite reads share the caller's snapshot without waiting for a source
+    /// writer, so a reserved but unpublished revision cannot mask new data.
+    pub(crate) fn load_local_observation_projection_revision(
+        &self,
+        identity: &SourceIdentity,
+        redaction_profile: RedactionProfile,
+    ) -> io::Result<u64> {
+        if self.sqlite_database().is_some() {
+            return sqlite_local::load_projection_revision(self, identity, redaction_profile);
+        }
+        self.load_local_observation_revision(identity, redaction_profile)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inspect_next_local_observation_reservation(inspector: impl FnOnce() + 'static) {
+        sqlite_local::inspect_next_reservation(inspector);
+    }
+
+    /// Loads all local source families in one SQLite snapshot (or the legacy
+    /// shared state lock). `include_session_digests=false` avoids reading digest
     /// shards when replica detection is disabled while preserving the same
     /// bucket/weekly consistency boundary.
     pub fn load_local_observation_snapshot_since(
@@ -592,6 +652,16 @@ impl SourceHistoryStore {
         include_session_digests: bool,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<LocalObservationSnapshot> {
+        if self.sqlite_database().is_some() {
+            return sqlite_local::load_snapshot(
+                self,
+                source_id,
+                redaction_profile,
+                since,
+                include_session_digests,
+                budget,
+            );
+        }
         budget.charge_source()?;
         let lock_directory = self.source_directory(source_id);
         self.validate_private_path(&lock_directory)?;
@@ -612,7 +682,26 @@ impl SourceHistoryStore {
             }
         }
 
-        let snapshot = self.with_source_metadata_shared(source_id, |source| {
+        let snapshot = self.load_local_observation_snapshot_unlocked(
+            source_id,
+            redaction_profile,
+            since,
+            include_session_digests,
+            budget,
+        );
+        drop(state_lock);
+        snapshot
+    }
+
+    fn load_local_observation_snapshot_unlocked(
+        &self,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        since: DateTime<Utc>,
+        include_session_digests: bool,
+        budget: &mut SourceHistoryReadBudget,
+    ) -> io::Result<LocalObservationSnapshot> {
+        self.with_source_metadata_shared(source_id, |source| {
             if source.kind() != SourceKind::Local {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -669,9 +758,7 @@ impl SourceHistoryStore {
                 weekly_local_points,
                 session_digest_records,
             })
-        });
-        drop(state_lock);
-        snapshot
+        })
     }
 
     /// Loads the v2 Summary backfill marker without acquiring write
@@ -687,6 +774,9 @@ impl SourceHistoryStore {
             return Err(invalid_data(
                 "v2 summary backfill marker requires a cutover ownership epoch",
             ));
+        }
+        if self.sqlite_database().is_some() {
+            return sqlite_local::load_backfill(self, redaction_profile, ownership_epoch);
         }
         let directory = self
             .profile_directory()
@@ -807,6 +897,14 @@ fn validate_pending_observation(
     if metadata.kind() != SourceKind::Local || metadata.display_label() != pending.display_label {
         return Err(invalid_data("local observation journal metadata mismatch"));
     }
+    validate_pending_records(identity.node_id(), pending)
+}
+
+fn validate_pending_records(
+    source_id: &NodeId,
+    pending: &PendingLocalObservation,
+) -> io::Result<()> {
+    let revision = pending.binding.last_reserved_revision;
     for point in &pending.account_points {
         validate_account_quota_point(point)?;
     }
@@ -841,7 +939,7 @@ fn validate_pending_observation(
             ));
         }
         if let SourceSessionDigestChange::Upsert(digest) = record.change()
-            && digest.replica().source_id() != identity.node_id()
+            && digest.replica().source_id() != source_id
         {
             return Err(invalid_data(
                 "local observation journal digest source mismatch",
@@ -944,6 +1042,7 @@ fn build_records(
     observation: &HistoryObservation,
     mode: LocalObservationMode,
     revision: u64,
+    source_exists: bool,
 ) -> io::Result<(
     Vec<SourceBucketRecord>,
     Vec<SourceWeeklyRecord>,
@@ -977,7 +1076,7 @@ fn build_records(
             LocalObservationMode::Incremental => None,
         })
         .min();
-    let existing = match load_since {
+    let existing = match load_since.filter(|_| source_exists) {
         Some(since) => {
             Some(store.load_source_records_since(identity.node_id(), redaction_profile, since)?)
         }
@@ -1157,6 +1256,7 @@ fn build_session_digest_records(
     revision: u64,
     incoming: &[SourceSessionDigest],
     scan_complete: bool,
+    source_exists: bool,
 ) -> io::Result<(Vec<SourceSessionDigestRecord>, usize)> {
     let reconcile = match mode {
         LocalObservationMode::Reconcile { from, to } if scan_complete => Some((from, to)),
@@ -1167,7 +1267,7 @@ fn build_session_digest_records(
         .map(SourceSessionDigest::range_start)
         .chain(reconcile.map(|(from, _)| from))
         .min();
-    let existing = match load_since {
+    let existing = match load_since.filter(|_| source_exists) {
         Some(since) => {
             store
                 .load_source_session_digest_records_since(
@@ -1426,10 +1526,21 @@ mod tests {
     fn with_writer(
         test: impl FnOnce(&SourceIdentity, &SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>),
     ) {
+        with_backend_writer(false, test);
+    }
+
+    fn with_backend_writer(
+        sqlite: bool,
+        test: impl FnOnce(&SourceIdentity, &SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>),
+    ) {
         let directory = tempdir().unwrap();
         let root = directory.path().join("state");
         let profile: HistoryProfileId = PROFILE.parse().unwrap();
-        let history = SourceHistoryStore::new(root.clone(), profile.clone());
+        let history = if sqlite {
+            SourceHistoryStore::new_sqlite(root.clone(), profile.clone())
+        } else {
+            SourceHistoryStore::new(root.clone(), profile.clone())
+        };
         let ownership = HistoryOwnershipStore::new(root, profile, RedactionProfile::Redacted);
         let lease = ownership.acquire_writer_lease().unwrap();
         let v1 = match ownership.initialize_v1_active(&lease).unwrap() {
@@ -1445,6 +1556,26 @@ mod tests {
         {
             OwnershipCasOutcome::Applied(value) => value,
             OwnershipCasOutcome::Conflict(_) => panic!("unexpected conflict"),
+        };
+        let active = if sqlite {
+            let migrating = match ownership.begin_sqlite_migration(&lease, &active).unwrap() {
+                OwnershipCasOutcome::Applied(value) => value,
+                OwnershipCasOutcome::Conflict(_) => panic!("unexpected conflict"),
+            };
+            history
+                .sqlite_database()
+                .unwrap()
+                .write(|_| Ok(()))
+                .unwrap();
+            match ownership
+                .complete_sqlite_migration(&lease, &migrating)
+                .unwrap()
+            {
+                OwnershipCasOutcome::Applied(value) => value,
+                OwnershipCasOutcome::Conflict(_) => panic!("unexpected conflict"),
+            }
+        } else {
+            active
         };
         let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
         let writer = history.writer(&authority).unwrap();
@@ -2485,203 +2616,209 @@ mod tests {
 
     #[test]
     fn durable_revision_floor_is_monotonic_and_next_write_is_strictly_newer() {
-        with_writer(|identity, _history, writer| {
-            assert_eq!(
-                writer
-                    .ensure_local_observation_revision_floor(
+        for sqlite in [false, true] {
+            with_backend_writer(sqlite, |identity, _history, writer| {
+                assert_eq!(
+                    writer
+                        .ensure_local_observation_revision_floor(
+                            identity,
+                            RedactionProfile::Redacted,
+                            5,
+                        )
+                        .unwrap(),
+                    5
+                );
+                assert_eq!(
+                    writer
+                        .ensure_local_observation_revision_floor(
+                            identity,
+                            RedactionProfile::Redacted,
+                            3,
+                        )
+                        .unwrap(),
+                    5
+                );
+                let report = writer
+                    .record_local_observation(
                         identity,
+                        "local",
                         RedactionProfile::Redacted,
-                        5,
+                        &HistoryObservation {
+                            observed_at: at(30, 12, 15),
+                            half_hour_buckets: vec![bucket(at(30, 12, 0), 10)],
+                            ..HistoryObservation::default()
+                        },
+                        LocalObservationMode::Incremental,
                     )
-                    .unwrap(),
-                5
-            );
-            assert_eq!(
-                writer
-                    .ensure_local_observation_revision_floor(
-                        identity,
-                        RedactionProfile::Redacted,
-                        3,
-                    )
-                    .unwrap(),
-                5
-            );
-            let report = writer
-                .record_local_observation(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &HistoryObservation {
-                        observed_at: at(30, 12, 15),
-                        half_hour_buckets: vec![bucket(at(30, 12, 0), 10)],
-                        ..HistoryObservation::default()
-                    },
-                    LocalObservationMode::Incremental,
-                )
-                .unwrap();
-            assert_eq!(report.revision, 6);
-        });
+                    .unwrap();
+                assert_eq!(report.revision, 6);
+            });
+        }
     }
 
     #[test]
     fn partial_digest_writes_never_lower_or_delete_and_complete_reconcile_tombstones() {
-        with_writer(|identity, history, writer| {
-            let range_start = at(29, 0, 0);
-            let observed_at = at(30, 12, 0);
-            let observation = HistoryObservation {
-                observed_at,
-                ..HistoryObservation::default()
-            };
-            let strong = session_digest(identity, "thread-a", range_start, 'a', 100);
-            let stale = session_digest(identity, "thread-b", range_start, 'b', 200);
-            let first = writer
-                .record_local_observation_with_session_digests(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Incremental,
-                    &[strong.clone(), stale],
-                    true,
-                )
-                .unwrap();
-            assert_eq!(first.revision, 1);
-            assert_eq!(first.session_digest_tombstones, 0);
+        for sqlite in [false, true] {
+            with_backend_writer(sqlite, |identity, history, writer| {
+                let range_start = at(29, 0, 0);
+                let observed_at = at(30, 12, 0);
+                let observation = HistoryObservation {
+                    observed_at,
+                    ..HistoryObservation::default()
+                };
+                let strong = session_digest(identity, "thread-a", range_start, 'a', 100);
+                let stale = session_digest(identity, "thread-b", range_start, 'b', 200);
+                let first = writer
+                    .record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                        &[strong.clone(), stale],
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(first.revision, 1);
+                assert_eq!(first.session_digest_tombstones, 0);
 
-            let weaker = session_digest(identity, "thread-a", range_start, 'c', 50);
-            writer
-                .record_local_observation_with_session_digests(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Incremental,
-                    &[weaker],
-                    false,
-                )
-                .unwrap();
-            let after_weaker = history
-                .load_source_session_digest_records_since(
-                    identity.node_id(),
-                    RedactionProfile::Redacted,
-                    range_start,
-                )
-                .unwrap();
-            let retained = after_weaker
-                .records
-                .iter()
-                .find(|record| record.thread_id().as_str() == "thread-a")
-                .unwrap();
-            assert_eq!(retained.revision(), 1);
-            let SourceSessionDigestChange::Upsert(retained) = retained.change() else {
-                panic!("the stronger digest must remain active")
-            };
-            assert_eq!(retained.metrics().token_usage.total_tokens, 100);
-
-            let incomplete = writer
-                .record_local_observation_with_session_digests(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Reconcile {
-                        from: range_start,
-                        to: observed_at,
-                    },
-                    std::slice::from_ref(&strong),
-                    false,
-                )
-                .unwrap();
-            assert_eq!(incomplete.session_digest_tombstones, 0);
-            assert!(
-                history
+                let weaker = session_digest(identity, "thread-a", range_start, 'c', 50);
+                writer
+                    .record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                        &[weaker],
+                        false,
+                    )
+                    .unwrap();
+                let after_weaker = history
                     .load_source_session_digest_records_since(
                         identity.node_id(),
                         RedactionProfile::Redacted,
                         range_start,
                     )
-                    .unwrap()
+                    .unwrap();
+                let retained = after_weaker
                     .records
                     .iter()
-                    .any(|record| {
-                        record.thread_id().as_str() == "thread-b"
-                            && matches!(record.change(), SourceSessionDigestChange::Upsert(_))
-                    })
-            );
+                    .find(|record| record.thread_id().as_str() == "thread-a")
+                    .unwrap();
+                assert_eq!(retained.revision(), 1);
+                let SourceSessionDigestChange::Upsert(retained) = retained.change() else {
+                    panic!("the stronger digest must remain active")
+                };
+                assert_eq!(retained.metrics().token_usage.total_tokens, 100);
 
-            let complete = writer
-                .record_local_observation_with_session_digests(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Reconcile {
-                        from: range_start,
-                        to: observed_at,
-                    },
-                    &[strong],
-                    true,
-                )
-                .unwrap();
-            assert_eq!(complete.session_digest_tombstones, 1);
-            assert!(
-                history
-                    .load_source_session_digest_records_since(
-                        identity.node_id(),
+                let incomplete = writer
+                    .record_local_observation_with_session_digests(
+                        identity,
+                        "local",
                         RedactionProfile::Redacted,
-                        range_start,
+                        &observation,
+                        LocalObservationMode::Reconcile {
+                            from: range_start,
+                            to: observed_at,
+                        },
+                        std::slice::from_ref(&strong),
+                        false,
                     )
-                    .unwrap()
-                    .records
-                    .iter()
-                    .any(|record| {
-                        record.thread_id().as_str() == "thread-b"
-                            && matches!(record.change(), SourceSessionDigestChange::Tombstone)
-                    })
-            );
-        });
+                    .unwrap();
+                assert_eq!(incomplete.session_digest_tombstones, 0);
+                assert!(
+                    history
+                        .load_source_session_digest_records_since(
+                            identity.node_id(),
+                            RedactionProfile::Redacted,
+                            range_start,
+                        )
+                        .unwrap()
+                        .records
+                        .iter()
+                        .any(|record| {
+                            record.thread_id().as_str() == "thread-b"
+                                && matches!(record.change(), SourceSessionDigestChange::Upsert(_))
+                        })
+                );
+
+                let complete = writer
+                    .record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Reconcile {
+                            from: range_start,
+                            to: observed_at,
+                        },
+                        &[strong],
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(complete.session_digest_tombstones, 1);
+                assert!(
+                    history
+                        .load_source_session_digest_records_since(
+                            identity.node_id(),
+                            RedactionProfile::Redacted,
+                            range_start,
+                        )
+                        .unwrap()
+                        .records
+                        .iter()
+                        .any(|record| {
+                            record.thread_id().as_str() == "thread-b"
+                                && matches!(record.change(), SourceSessionDigestChange::Tombstone)
+                        })
+                );
+            });
+        }
     }
 
     #[test]
     fn metadata_registration_is_idempotent_and_conflicts_fail_closed() {
-        with_writer(|identity, history, writer| {
-            let observation = HistoryObservation::default();
-            writer
-                .record_local_observation(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Incremental,
-                )
-                .unwrap();
-            writer
-                .record_local_observation(
-                    identity,
-                    "local",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Incremental,
-                )
-                .unwrap();
-            assert_eq!(
-                history
-                    .load_source_metadata(identity.node_id())
-                    .unwrap()
-                    .kind(),
-                SourceKind::Local
-            );
-            let error = writer
-                .record_local_observation(
-                    identity,
-                    "different",
-                    RedactionProfile::Redacted,
-                    &observation,
-                    LocalObservationMode::Incremental,
-                )
-                .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        });
+        for sqlite in [false, true] {
+            with_backend_writer(sqlite, |identity, history, writer| {
+                let observation = HistoryObservation::default();
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                    )
+                    .unwrap();
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    history
+                        .load_source_metadata(identity.node_id())
+                        .unwrap()
+                        .kind(),
+                    SourceKind::Local
+                );
+                let error = writer
+                    .record_local_observation(
+                        identity,
+                        "different",
+                        RedactionProfile::Redacted,
+                        &observation,
+                        LocalObservationMode::Incremental,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            });
+        }
     }
 
     #[test]
@@ -3103,41 +3240,1018 @@ mod tests {
 
     #[test]
     fn summary_backfill_marker_is_monotonic_and_complete_is_terminal() {
-        with_writer(|_identity, history, writer| {
-            assert_eq!(writer.load_v2_summary_backfill_attempt().unwrap(), None);
-            let first = writer
-                .mark_v2_summary_backfill_attempt(at(30, 12, 0), false)
-                .unwrap();
-            assert!(!first.complete);
-            let complete = writer
-                .mark_v2_summary_backfill_attempt(at(30, 12, 0), true)
-                .unwrap();
-            assert!(complete.complete);
-            assert_eq!(
-                writer.load_v2_summary_backfill_attempt().unwrap(),
-                Some(complete)
-            );
+        for sqlite in [false, true] {
+            with_backend_writer(sqlite, |_identity, history, writer| {
+                assert_eq!(writer.load_v2_summary_backfill_attempt().unwrap(), None);
+                let first = writer
+                    .mark_v2_summary_backfill_attempt(at(30, 12, 0), false)
+                    .unwrap();
+                assert!(!first.complete);
+                let complete = writer
+                    .mark_v2_summary_backfill_attempt(at(30, 12, 0), true)
+                    .unwrap();
+                assert!(complete.complete);
+                assert_eq!(
+                    writer.load_v2_summary_backfill_attempt().unwrap(),
+                    Some(complete)
+                );
+                assert_eq!(
+                    history
+                        .load_v2_summary_backfill_attempt(
+                            RedactionProfile::Redacted,
+                            writer.authority.expected_manifest().epoch(),
+                        )
+                        .unwrap(),
+                    Some(complete)
+                );
+                assert!(
+                    history
+                        .load_v2_summary_backfill_attempt(
+                            RedactionProfile::Redacted,
+                            writer.authority.expected_manifest().epoch() + 1,
+                        )
+                        .is_err()
+                );
+                let later_partial = writer
+                    .mark_v2_summary_backfill_attempt(at(30, 13, 0), false)
+                    .unwrap();
+                assert_eq!(later_partial, complete);
+            });
+        }
+    }
+
+    #[test]
+    fn sqlite_interruption_rolls_back_all_families_but_preserves_reserved_revision() {
+        for stage in [
+            "revision",
+            "account",
+            "buckets",
+            "weekly",
+            "session_digests",
+            "metadata",
+        ] {
+            with_backend_writer(true, |identity, history, writer| {
+                let starts_at = at(30, 12, 0);
+                let write = |total| {
+                    writer.record_local_observation_with_session_digests(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &HistoryObservation {
+                            observed_at: starts_at + Duration::minutes(15),
+                            quota_points: vec![QuotaPoint {
+                                observed_at: starts_at,
+                                limit_id: "codex".to_string(),
+                                duration_mins: 10_080,
+                                resets_at: starts_at + Duration::days(7),
+                                used_percent: total as f64,
+                                remaining_percent: 100.0 - total as f64,
+                                provenance: crate::domain::Provenance::ServerSnapshot,
+                            }],
+                            half_hour_buckets: vec![bucket(starts_at, total)],
+                            weekly_local_points: vec![weekly(starts_at, total)],
+                        },
+                        LocalObservationMode::Incremental,
+                        &[session_digest(
+                            identity,
+                            "thread-one",
+                            starts_at,
+                            'a',
+                            total,
+                        )],
+                        true,
+                    )
+                };
+                assert_eq!(write(10).unwrap().revision, 1);
+                // A failed switch must roll back metadata as well as records.
+                writer
+                    .update_source_metadata(identity.node_id(), |metadata| {
+                        metadata.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+                        Ok(())
+                    })
+                    .unwrap();
+                inject_local_observation_failure_after(stage);
+                assert_eq!(
+                    write(20).unwrap_err().to_string(),
+                    format!("injected failure after {stage}")
+                );
+
+                let reopened = SourceHistoryStore::new_sqlite(
+                    history.state_root().to_owned(),
+                    history.profile_id().clone(),
+                );
+                assert_eq!(
+                    reopened
+                        .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                        .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    reopened
+                        .load_local_observation_projection_revision(
+                            identity,
+                            RedactionProfile::Redacted
+                        )
+                        .unwrap(),
+                    1,
+                    "a reserved revision must not publish a failed batch"
+                );
+                assert_eq!(
+                    reopened
+                        .load_source_metadata(identity.node_id())
+                        .unwrap()
+                        .aggregate_redaction_profile(),
+                    RedactionProfile::PreviewEnabled
+                );
+                let snapshot = reopened
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(snapshot.buckets[0].token_usage.total_tokens, 10);
+                assert_eq!(snapshot.weekly_local_points[0].token_usage.total_tokens, 10);
+                assert_eq!(snapshot.session_digest_records[0].revision(), 1);
+                assert_eq!(
+                    reopened.load_account_since(starts_at).unwrap().quota_points[0].used_percent,
+                    10.0
+                );
+                let revision_directory =
+                    local_state_directory(history, identity.node_id(), RedactionProfile::Redacted);
+                assert!(!revision_directory.join(JOURNAL_FILE).exists());
+                assert!(!revision_directory.join(STATE_FILE).exists());
+
+                let retry = write(20).unwrap();
+                assert_eq!(retry.revision, 3);
+                assert_eq!(
+                    reopened
+                        .load_local_observation_projection_revision(
+                            identity,
+                            RedactionProfile::Redacted
+                        )
+                        .unwrap(),
+                    3
+                );
+                assert!(!retry.recovered_pending);
+                let snapshot = reopened
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(snapshot.buckets[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.weekly_local_points[0].token_usage.total_tokens, 20);
+                assert_eq!(snapshot.session_digest_records[0].revision(), 3);
+                assert_eq!(
+                    reopened.load_account_since(starts_at).unwrap().quota_points[0].used_percent,
+                    20.0
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn sqlite_failed_first_batch_does_not_register_source_and_unsigned_revision_is_exact() {
+        with_backend_writer(true, |identity, history, writer| {
             assert_eq!(
                 history
-                    .load_v2_summary_backfill_attempt(
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                0
+            );
+            let floor = i64::MAX as u64 + 7;
+            assert_eq!(
+                writer
+                    .ensure_local_observation_revision_floor(
+                        identity,
                         RedactionProfile::Redacted,
-                        writer.authority.expected_manifest().epoch(),
+                        floor
                     )
                     .unwrap(),
-                Some(complete)
+                floor
             );
-            assert!(
+            assert_eq!(
                 history
-                    .load_v2_summary_backfill_attempt(
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                0
+            );
+            inject_local_observation_failure_after("metadata");
+            assert!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
                         RedactionProfile::Redacted,
-                        writer.authority.expected_manifest().epoch() + 1,
+                        &HistoryObservation::default(),
+                        LocalObservationMode::Incremental
                     )
                     .is_err()
             );
-            let later_partial = writer
-                .mark_v2_summary_backfill_attempt(at(30, 13, 0), false)
+            assert_eq!(
+                history
+                    .load_source_metadata(identity.node_id())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
+            let reopened = SourceHistoryStore::new_sqlite(
+                history.state_root().to_owned(),
+                history.profile_id().clone(),
+            );
+            assert_eq!(
+                reopened
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                floor + 1
+            );
+            assert_eq!(
+                reopened
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &HistoryObservation::default(),
+                        LocalObservationMode::Incremental
+                    )
+                    .unwrap()
+                    .revision,
+                floor + 2
+            );
+            writer
+                .ensure_local_observation_revision_floor(
+                    identity,
+                    RedactionProfile::Redacted,
+                    u64::MAX,
+                )
                 .unwrap();
-            assert_eq!(later_partial, complete);
+            assert_eq!(
+                reopened
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                floor + 2
+            );
+            assert_eq!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &HistoryObservation::default(),
+                        LocalObservationMode::Incremental
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "local observation revision exhausted"
+            );
+            assert_eq!(
+                reopened
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                u64::MAX
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_migration_replays_committed_local_pending_and_rebinds_backfill_epoch() {
+        with_writer(|identity, legacy, writer| {
+            let starts_at = at(30, 12, 0);
+            let marker = writer
+                .mark_v2_summary_backfill_attempt(at(30, 12, 15), true)
+                .unwrap();
+            let old_epoch = writer.authority.expected_manifest().epoch();
+            inject_local_observation_failure_after("account");
+            writer
+                .record_local_observation_with_session_digests(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: starts_at + Duration::minutes(15),
+                        half_hour_buckets: vec![bucket(starts_at, 20)],
+                        weekly_local_points: vec![weekly(starts_at, 20)],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                    &[session_digest(identity, "thread-one", starts_at, 'a', 20)],
+                    true,
+                )
+                .unwrap_err();
+            let pending_path =
+                local_state_directory(legacy, identity.node_id(), RedactionProfile::Redacted)
+                    .join(JOURNAL_FILE);
+            let pending_bytes = fs::read(&pending_path).unwrap();
+            let target = SourceHistoryStore::new_sqlite(
+                legacy.state_root().to_owned(),
+                legacy.profile_id().clone(),
+            );
+            target
+                .save_source_metadata(&legacy.load_source_metadata(identity.node_id()).unwrap())
+                .unwrap();
+            let epochs = [(RedactionProfile::Redacted, old_epoch, old_epoch + 1)];
+            target
+                .import_legacy_local_sqlite_state(legacy, &epochs)
+                .unwrap();
+            // Replaying the same immutable migration input remains idempotent.
+            target
+                .import_legacy_local_sqlite_state(legacy, &epochs)
+                .unwrap();
+            let snapshot = target
+                .load_local_observation_snapshot_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(snapshot.buckets.len(), 1);
+            assert_eq!(snapshot.buckets[0].token_usage.total_tokens, 20);
+            assert_eq!(snapshot.weekly_local_points.len(), 1);
+            assert_eq!(snapshot.weekly_local_points[0].token_usage.total_tokens, 20);
+            assert_eq!(snapshot.session_digest_records.len(), 1);
+            assert_eq!(snapshot.session_digest_records[0].revision(), 1);
+            assert_eq!(
+                target
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                target
+                    .load_v2_summary_backfill_attempt(RedactionProfile::Redacted, old_epoch + 1)
+                    .unwrap(),
+                Some(marker)
+            );
+            assert!(
+                target
+                    .load_v2_summary_backfill_attempt(RedactionProfile::Redacted, old_epoch)
+                    .is_err()
+            );
+            // A later namespace cutover re-reading this backup must preserve
+            // the database's newer data, high-water, policy and terminal mark.
+            target
+                .update_source_metadata(identity.node_id(), |metadata| {
+                    metadata.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+                    Ok(())
+                })
+                .unwrap();
+            target
+                .record_source_bucket_changes_unfenced(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    &[SourceBucketRecord::upsert(5, bucket(starts_at, 50)).unwrap()],
+                )
+                .unwrap();
+            let database = target.sqlite_database().unwrap();
+            let state_key = database
+                .namespace(
+                    &local_state_directory(&target, identity.node_id(), RedactionProfile::Redacted)
+                        .join(STATE_FILE),
+                )
+                .unwrap();
+            let published_key = database
+                .namespace(
+                    &local_state_directory(&target, identity.node_id(), RedactionProfile::Redacted)
+                        .join(COMMITTED_STATE_FILE),
+                )
+                .unwrap();
+            let marker_key = database
+                .namespace(
+                    &target
+                        .profile_directory()
+                        .join(RedactionProfile::Redacted.directory_name())
+                        .join(MARKER_FILE),
+                )
+                .unwrap();
+            database
+                .write(|connection| {
+                    let next_state = LocalRevisionState {
+                        format_version: STATE_VERSION,
+                        profile_id: target.profile_id().clone(),
+                        source_id: identity.node_id().clone(),
+                        source_generation: identity.generation(),
+                        redaction_profile: RedactionProfile::Redacted,
+                        last_reserved_revision: 5,
+                    };
+                    database::set_state(connection, &state_key, &next_state)?;
+                    database::set_state(connection, &published_key, &next_state)?;
+                    database::set_state(
+                        connection,
+                        &marker_key,
+                        &BackfillMarker {
+                            format_version: STATE_VERSION,
+                            profile_id: target.profile_id().clone(),
+                            redaction_profile: RedactionProfile::Redacted,
+                            ownership_epoch: old_epoch + 1,
+                            completed_at: at(30, 13, 0),
+                            complete: true,
+                        },
+                    )
+                })
+                .unwrap();
+            target
+                .import_legacy_local_sqlite_state(legacy, &epochs)
+                .unwrap();
+            assert_eq!(
+                target
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                target
+                    .load_source_metadata(identity.node_id())
+                    .unwrap()
+                    .aggregate_redaction_profile(),
+                RedactionProfile::PreviewEnabled
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        true
+                    )
+                    .unwrap()
+                    .buckets[0]
+                    .token_usage
+                    .total_tokens,
+                50
+            );
+            assert_eq!(
+                target
+                    .load_v2_summary_backfill_attempt(RedactionProfile::Redacted, old_epoch + 1)
+                    .unwrap()
+                    .unwrap()
+                    .completed_at,
+                at(30, 13, 0)
+            );
+            assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+
+            // A later privacy namespace can carry current file metadata with
+            // the old label while SQL has a valid user rename. Its first
+            // policy publication preserves that rename and existing data.
+            target
+                .update_source_metadata(identity.node_id(), |metadata| {
+                    metadata.set_display_label("renamed local")?;
+                    metadata.set_aggregate_redaction_profile(RedactionProfile::Redacted);
+                    Ok(())
+                })
+                .unwrap();
+            legacy
+                .update_source_metadata(identity.node_id(), |metadata| {
+                    metadata.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+                    Ok(())
+                })
+                .unwrap();
+            legacy
+                .record_source_bucket_changes_unfenced(
+                    identity.node_id(),
+                    RedactionProfile::PreviewEnabled,
+                    &[SourceBucketRecord::upsert(6, bucket(starts_at, 60)).unwrap()],
+                )
+                .unwrap();
+            let preview_directory =
+                local_state_directory(legacy, identity.node_id(), RedactionProfile::PreviewEnabled);
+            legacy
+                .prepare_private_directory(&preview_directory)
+                .unwrap();
+            write_private_atomically(
+                &preview_directory.join(STATE_FILE),
+                &encode_pretty_bounded(
+                    &LocalRevisionState {
+                        format_version: STATE_VERSION,
+                        profile_id: legacy.profile_id().clone(),
+                        source_id: identity.node_id().clone(),
+                        source_generation: identity.generation(),
+                        redaction_profile: RedactionProfile::PreviewEnabled,
+                        last_reserved_revision: 6,
+                    },
+                    MAX_STATE_BYTES,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let both_epochs = [
+                (RedactionProfile::Redacted, old_epoch, old_epoch + 1),
+                (RedactionProfile::PreviewEnabled, old_epoch, old_epoch + 1),
+            ];
+            database
+                .write(|connection| {
+                    // This hook only inspects receipt presence; the root
+                    // migration driver separately validates its DTO/binding.
+                    database::set_state(connection, "database/migration/redacted", &true)?;
+                    target.import_sqlite_history_core_and_facts(legacy)?;
+                    target.import_legacy_local_sqlite_state(legacy, &both_epochs)
+                })
+                .unwrap();
+            let metadata = target.load_source_metadata(identity.node_id()).unwrap();
+            assert_eq!(metadata.display_label(), "renamed local");
+            assert_eq!(
+                metadata.aggregate_redaction_profile(),
+                RedactionProfile::PreviewEnabled
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::PreviewEnabled
+                    )
+                    .unwrap(),
+                6
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                target
+                    .load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::PreviewEnabled,
+                        starts_at,
+                        false
+                    )
+                    .unwrap()
+                    .buckets[0]
+                    .token_usage
+                    .total_tokens,
+                60
+            );
+            target
+                .update_source_metadata(identity.node_id(), |metadata| {
+                    metadata.set_aggregate_redaction_profile(RedactionProfile::Redacted);
+                    Ok(())
+                })
+                .unwrap();
+            database
+                .write(|_| {
+                    target.import_sqlite_history_core_and_facts(legacy)?;
+                    target.import_legacy_local_sqlite_state(legacy, &both_epochs)
+                })
+                .unwrap();
+            let metadata = target.load_source_metadata(identity.node_id()).unwrap();
+            assert_eq!(metadata.display_label(), "renamed local");
+            assert_eq!(
+                metadata.aggregate_redaction_profile(),
+                RedactionProfile::Redacted
+            );
+            assert_eq!(fs::read(pending_path).unwrap(), pending_bytes);
+        });
+    }
+
+    #[test]
+    fn sqlite_observation_rejects_nested_transaction_before_reserving_revision() {
+        with_backend_writer(true, |identity, history, writer| {
+            let database = history.sqlite_database().unwrap();
+            database
+                .write(|_| {
+                    assert_eq!(
+                        writer
+                            .record_local_observation(
+                                identity,
+                                "local",
+                                RedactionProfile::Redacted,
+                                &HistoryObservation::default(),
+                                LocalObservationMode::Incremental
+                            )
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::InvalidInput
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                history
+                    .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                history
+                    .load_source_metadata(identity.node_id())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_combined_snapshot_sees_previous_batch_while_next_batch_is_uncommitted() {
+        with_backend_writer(true, |identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            writer
+                .record_local_observation_with_session_digests(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &HistoryObservation {
+                        observed_at: starts_at + Duration::minutes(15),
+                        half_hour_buckets: vec![bucket(starts_at, 10)],
+                        weekly_local_points: vec![weekly(starts_at, 10)],
+                        ..HistoryObservation::default()
+                    },
+                    LocalObservationMode::Incremental,
+                    &[session_digest(identity, "thread-one", starts_at, 'a', 10)],
+                    true,
+                )
+                .unwrap();
+            let next_digest = SourceSessionDigestRecord::upsert(
+                2,
+                session_digest(identity, "thread-one", starts_at, 'b', 20),
+            )
+            .unwrap();
+            let writing_store = history.clone();
+            let source = identity.node_id().clone();
+            let (prepared_tx, prepared_rx) = mpsc::channel();
+            let (commit_tx, commit_rx) = mpsc::channel();
+            let next_batch = thread::spawn(move || {
+                writing_store
+                    .sqlite_database()
+                    .unwrap()
+                    .write(|_| {
+                        writing_store.record_source_bucket_changes_unfenced(
+                            &source,
+                            RedactionProfile::Redacted,
+                            &[SourceBucketRecord::upsert(2, bucket(starts_at, 20)).unwrap()],
+                        )?;
+                        writing_store.record_source_weekly_changes_unfenced(
+                            &source,
+                            RedactionProfile::Redacted,
+                            &[SourceWeeklyRecord::upsert(2, weekly(starts_at, 20)).unwrap()],
+                        )?;
+                        writing_store.record_source_session_digest_changes_unfenced(
+                            &source,
+                            RedactionProfile::Redacted,
+                            &[next_digest],
+                        )?;
+                        prepared_tx.send(()).unwrap();
+                        commit_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            prepared_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+            let previous = history
+                .load_local_observation_snapshot_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(previous.buckets[0].token_usage.total_tokens, 10);
+            assert_eq!(previous.weekly_local_points[0].token_usage.total_tokens, 10);
+            assert_eq!(previous.session_digest_records[0].revision(), 1);
+            commit_tx.send(()).unwrap();
+            next_batch.join().unwrap();
+            let current = history
+                .load_local_observation_snapshot_since(
+                    identity.node_id(),
+                    RedactionProfile::Redacted,
+                    starts_at,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(current.buckets[0].token_usage.total_tokens, 20);
+            assert_eq!(current.weekly_local_points[0].token_usage.total_tokens, 20);
+            assert_eq!(current.session_digest_records[0].revision(), 2);
+        });
+    }
+
+    #[test]
+    fn sqlite_committed_stamp_and_data_remain_consistent_in_a_reserved_revision_snapshot() {
+        with_backend_writer(true, |identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            let observation = |total| HistoryObservation {
+                observed_at: starts_at + Duration::minutes(15),
+                quota_points: vec![QuotaPoint {
+                    observed_at: starts_at,
+                    limit_id: "codex".to_owned(),
+                    duration_mins: 10_080,
+                    resets_at: starts_at + Duration::days(7),
+                    used_percent: total as f64,
+                    remaining_percent: 100.0 - total as f64,
+                    provenance: crate::domain::Provenance::ServerSnapshot,
+                }],
+                half_hour_buckets: vec![bucket(starts_at, total)],
+                ..HistoryObservation::default()
+            };
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation(10),
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            let reader_store = history.clone();
+            let reader_identity = identity.clone();
+            let (reader_tx, reader_rx) = mpsc::channel();
+            SourceHistoryStore::inspect_next_local_observation_reservation(move || {
+                let (snapshot_tx, snapshot_rx) = mpsc::channel();
+                let (committed_tx, committed_rx) = mpsc::channel();
+                let reader = thread::spawn(move || {
+                    reader_store
+                        .sqlite_database()
+                        .unwrap()
+                        .read(|_| {
+                            // Establish the SQLite snapshot after r2 was reserved,
+                            // before its data publication. Keep it open through
+                            // the writer's commit, as a history query can do.
+                            reader_store.load_source_metadata(reader_identity.node_id())?;
+                            snapshot_tx.send(()).unwrap();
+                            committed_rx
+                                .recv_timeout(StdDuration::from_secs(5))
+                                .unwrap();
+                            let stamp = reader_store.load_local_observation_projection_revision(
+                                &reader_identity,
+                                RedactionProfile::Redacted,
+                            )?;
+                            let data = reader_store.load_local_observation_snapshot_since(
+                                reader_identity.node_id(),
+                                RedactionProfile::Redacted,
+                                starts_at,
+                                false,
+                            )?;
+                            let quota = reader_store.load_account_since(starts_at)?;
+                            Ok((
+                                stamp,
+                                data.buckets[0].token_usage.total_tokens,
+                                quota.quota_points[0].used_percent,
+                            ))
+                        })
+                        .unwrap()
+                });
+                snapshot_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+                reader_tx.send((reader, committed_tx)).unwrap();
+            });
+            assert_eq!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation(20),
+                        LocalObservationMode::Incremental,
+                    )
+                    .unwrap()
+                    .revision,
+                2
+            );
+            let (reader, committed_tx) = reader_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+            committed_tx.send(()).unwrap();
+            assert_eq!(reader.join().unwrap(), (1, 10, 10.0));
+            let current = history
+                .sqlite_database()
+                .unwrap()
+                .read(|_| {
+                    let stamp = history.load_local_observation_projection_revision(
+                        identity,
+                        RedactionProfile::Redacted,
+                    )?;
+                    let data = history.load_local_observation_snapshot_since(
+                        identity.node_id(),
+                        RedactionProfile::Redacted,
+                        starts_at,
+                        false,
+                    )?;
+                    let quota = history.load_account_since(starts_at)?;
+                    Ok((
+                        stamp,
+                        data.buckets[0].token_usage.total_tokens,
+                        quota.quota_points[0].used_percent,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(current, (2, 20, 20.0));
+        });
+    }
+
+    #[test]
+    fn sqlite_invalid_committed_stamp_rejects_queries_and_reservation_without_advancing_floor() {
+        with_backend_writer(true, |identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            let observation = HistoryObservation {
+                observed_at: starts_at + Duration::minutes(15),
+                half_hour_buckets: vec![bucket(starts_at, 10)],
+                ..HistoryObservation::default()
+            };
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation,
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            let database = history.sqlite_database().unwrap();
+            let key = database
+                .namespace(
+                    &local_state_directory(history, identity.node_id(), RedactionProfile::Redacted)
+                        .join(COMMITTED_STATE_FILE),
+                )
+                .unwrap();
+            for (generation, revision) in
+                [(identity.generation(), 2), (identity.generation() + 1, 1)]
+            {
+                database
+                    .write(|connection| {
+                        database::set_state(
+                            connection,
+                            &key,
+                            &LocalRevisionState {
+                                format_version: STATE_VERSION,
+                                profile_id: history.profile_id().clone(),
+                                source_id: identity.node_id().clone(),
+                                source_generation: generation,
+                                redaction_profile: RedactionProfile::Redacted,
+                                last_reserved_revision: revision,
+                            },
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    history
+                        .load_local_observation_projection_revision(
+                            identity,
+                            RedactionProfile::Redacted
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    writer
+                        .record_local_observation(
+                            identity,
+                            "local",
+                            RedactionProfile::Redacted,
+                            &observation,
+                            LocalObservationMode::Incremental
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    history
+                        .load_local_observation_revision(identity, RedactionProfile::Redacted)
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    history
+                        .load_local_observation_snapshot_since(
+                            identity.node_id(),
+                            RedactionProfile::Redacted,
+                            starts_at,
+                            false
+                        )
+                        .unwrap()
+                        .buckets[0]
+                        .token_usage
+                        .total_tokens,
+                    10
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn sqlite_revision_high_water_waits_for_the_reserved_batch_to_finish() {
+        with_backend_writer(true, |identity, history, writer| {
+            let starts_at = at(30, 12, 0);
+            let observation = |total| HistoryObservation {
+                observed_at: starts_at + Duration::minutes(15),
+                half_hour_buckets: vec![bucket(starts_at, total)],
+                ..HistoryObservation::default()
+            };
+            writer
+                .record_local_observation(
+                    identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &observation(10),
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap();
+            let reader_store = history.clone();
+            let reader_identity = identity.clone();
+            let (reader_tx, reader_rx) = mpsc::channel();
+            sqlite_local::inspect_next_reservation(move || {
+                // The writer is paused after r2 is durable while its data
+                // still has r1. A combined SQL snapshot may read that batch.
+                assert_eq!(
+                    reader_store
+                        .load_local_observation_snapshot_since(
+                            reader_identity.node_id(),
+                            RedactionProfile::Redacted,
+                            starts_at,
+                            false
+                        )
+                        .unwrap()
+                        .buckets[0]
+                        .token_usage
+                        .total_tokens,
+                    10
+                );
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (stamp_tx, stamp_rx) = mpsc::channel();
+                let reader = thread::spawn(move || {
+                    sqlite_local::observe_next_revision_read(ready_tx);
+                    let stamp = reader_store
+                        .load_local_observation_revision(
+                            &reader_identity,
+                            RedactionProfile::Redacted,
+                        )
+                        .unwrap();
+                    stamp_tx.send(stamp).unwrap();
+                    let snapshot = reader_store
+                        .load_local_observation_snapshot_since(
+                            reader_identity.node_id(),
+                            RedactionProfile::Redacted,
+                            starts_at,
+                            false,
+                        )
+                        .unwrap();
+                    (stamp, snapshot.buckets[0].token_usage.total_tokens)
+                });
+                ready_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+                assert!(
+                    matches!(
+                        stamp_rx.recv_timeout(StdDuration::from_millis(250)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "the reserved high-water reader remains coordinated with its writer"
+                );
+                // Keep the receiver alive until the writer has committed.
+                reader_tx.send((reader, stamp_rx)).unwrap();
+            });
+            assert_eq!(
+                writer
+                    .record_local_observation(
+                        identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation(20),
+                        LocalObservationMode::Incremental
+                    )
+                    .unwrap()
+                    .revision,
+                2
+            );
+            let (reader, stamp_rx) = reader_rx.recv_timeout(StdDuration::from_secs(5)).unwrap();
+            assert_eq!(stamp_rx.recv_timeout(StdDuration::from_secs(5)).unwrap(), 2);
+            assert_eq!(reader.join().unwrap(), (2, 20));
         });
     }
 }

@@ -164,6 +164,36 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
+    pub(super) fn import_legacy_remote_live_sqlite(
+        &self,
+        legacy: &SourceHistoryStore,
+        source_id: &NodeId,
+        redaction: RedactionProfile,
+    ) -> io::Result<()> {
+        let path = legacy.remote_live_path(source_id, redaction);
+        if !legacy
+            .private_directory_exists(path.parent().expect("remote live file has a parent"))?
+        {
+            return Ok(());
+        }
+        let Some(stored) =
+            read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?
+        else {
+            return Ok(());
+        };
+        stored.validate(legacy.profile_id(), source_id, redaction)?;
+        let database = self
+            .sqlite_database()
+            .expect("SQL import requires a database");
+        database.write(|connection| {
+            super::database::set_state(
+                connection,
+                &database.namespace(&self.remote_live_path(source_id, redaction))?,
+                &stored,
+            )
+        })
+    }
+
     pub fn remote_live_revision_for_binding(
         &self,
         source_generation: &SourceGeneration,
@@ -193,9 +223,14 @@ impl SourceHistoryStore {
             }
             let profile = metadata.aggregate_redaction_profile();
             let path = self.remote_live_path(source_id, profile);
-            let Some(stored) =
+            let stored = if let Some(database) = self.sqlite_database() {
+                database.read(|connection| {
+                    super::database::state(connection, &database.namespace(&path)?)
+                })?
+            } else {
                 read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?
-            else {
+            };
+            let Some(stored): Option<StoredRemoteLiveSnapshot> = stored else {
                 return Ok(None);
             };
             stored.validate(&self.profile_id, source_id, profile)?;
@@ -224,7 +259,7 @@ impl SourceHistoryStore {
         Ok(states)
     }
 
-    fn remote_live_path(
+    pub(super) fn remote_live_path(
         &self,
         source_id: &NodeId,
         profile: RedactionProfile,
@@ -251,6 +286,110 @@ impl SourceHistoryStore {
         warning_codes: &[String],
     ) -> io::Result<()> {
         let source_id = &source_generation.node_id;
+        let merge =
+            |existing: Option<StoredRemoteLiveSnapshot>| -> io::Result<StoredRemoteLiveSnapshot> {
+                if let Some(existing) = existing.as_ref() {
+                    existing.validate(&self.profile_id, source_id, redaction_profile)?;
+                    if existing.journal_generation.is_some()
+                        && existing.journal_generation != Some(journal_generation)
+                        && !allow_journal_replacement
+                    {
+                        return Err(invalid_data(
+                            "remote live journal changed outside a cursorless bootstrap",
+                        ));
+                    }
+                    if (existing.source_generation != *source_generation
+                        || existing.revisions != *revisions
+                        || existing.journal_generation != Some(journal_generation))
+                        && live.snapshot.is_none()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "revision-only remote live publication has no matching binding",
+                        ));
+                    }
+                }
+
+                let existing = existing.as_ref().filter(|existing| {
+                    existing.source_generation == *source_generation
+                        && existing.revisions == *revisions
+                        && existing.journal_generation == Some(journal_generation)
+                });
+                let (snapshot, descriptors) = match (&live.snapshot, existing) {
+                    (Some(snapshot), Some(existing))
+                        if live.live_revision == existing.live_revision =>
+                    {
+                        if snapshot != &existing.snapshot
+                            || project_descriptors != existing.project_descriptors.as_slice()
+                        {
+                            return Err(invalid_data(
+                                "remote live revision was reused with different content",
+                            ));
+                        }
+                        (snapshot.clone(), project_descriptors.to_vec())
+                    }
+                    (Some(snapshot), existing) => {
+                        if existing
+                            .is_some_and(|existing| live.live_revision < existing.live_revision)
+                        {
+                            return Err(invalid_data("remote live revision regressed"));
+                        }
+                        (snapshot.clone(), project_descriptors.to_vec())
+                    }
+                    (None, Some(existing)) if live.live_revision == existing.live_revision => {
+                        if !project_descriptors.is_empty() {
+                            return Err(invalid_data(
+                                "revision-only remote live page contains descriptors",
+                            ));
+                        }
+                        (
+                            existing.snapshot.clone(),
+                            existing.project_descriptors.clone(),
+                        )
+                    }
+                    (None, _) => {
+                        return Err(invalid_data(
+                            "revision-only remote live page has no exact cached baseline",
+                        ));
+                    }
+                };
+                let stored = StoredRemoteLiveSnapshot {
+                    format_version: REMOTE_LIVE_FORMAT_VERSION,
+                    profile_id: self.profile_id.clone(),
+                    source_generation: source_generation.clone(),
+                    revisions: revisions.clone(),
+                    redaction_profile,
+                    journal_generation: Some(journal_generation),
+                    live_revision: live.live_revision,
+                    snapshot,
+                    project_descriptors: descriptors,
+                    remote_observed_at,
+                    received_at,
+                    range_complete,
+                    partial_reasons: partial_reasons.to_vec(),
+                    warning_codes: warning_codes.to_vec(),
+                };
+                stored.validate(&self.profile_id, source_id, redaction_profile)?;
+                Ok(stored)
+            };
+        let path = self.remote_live_path(source_id, redaction_profile);
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|connection| {
+                let metadata = self.load_source_metadata(source_id)?;
+                if metadata.kind() != SourceKind::Ssh
+                    || metadata.aggregate_redaction_profile() != redaction_profile
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "remote live publication raced a source profile change",
+                    ));
+                }
+                let key = database.namespace(&path)?;
+                let stored = merge(super::database::state(connection, &key)?)?;
+                encode_pretty_bounded(&stored, REMOTE_LIVE_MAX_BYTES)?;
+                super::database::set_state(connection, &key, &stored)
+            });
+        }
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
@@ -271,84 +410,7 @@ impl SourceHistoryStore {
         let path = self.remote_live_path(source_id, redaction_profile);
         let existing =
             read_optional_json_file::<StoredRemoteLiveSnapshot>(&path, REMOTE_LIVE_MAX_BYTES)?;
-        if let Some(existing) = existing.as_ref() {
-            existing.validate(&self.profile_id, source_id, redaction_profile)?;
-            if existing.journal_generation.is_some()
-                && existing.journal_generation != Some(journal_generation)
-                && !allow_journal_replacement
-            {
-                return Err(invalid_data(
-                    "remote live journal changed outside a cursorless bootstrap",
-                ));
-            }
-            if (existing.source_generation != *source_generation
-                || existing.revisions != *revisions
-                || existing.journal_generation != Some(journal_generation))
-                && live.snapshot.is_none()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "revision-only remote live publication has no matching binding",
-                ));
-            }
-        }
-
-        let existing = existing.as_ref().filter(|existing| {
-            existing.source_generation == *source_generation
-                && existing.revisions == *revisions
-                && existing.journal_generation == Some(journal_generation)
-        });
-        let (snapshot, descriptors) = match (&live.snapshot, existing) {
-            (Some(snapshot), Some(existing)) if live.live_revision == existing.live_revision => {
-                if snapshot != &existing.snapshot
-                    || project_descriptors != existing.project_descriptors.as_slice()
-                {
-                    return Err(invalid_data(
-                        "remote live revision was reused with different content",
-                    ));
-                }
-                (snapshot.clone(), project_descriptors.to_vec())
-            }
-            (Some(snapshot), existing) => {
-                if existing.is_some_and(|existing| live.live_revision < existing.live_revision) {
-                    return Err(invalid_data("remote live revision regressed"));
-                }
-                (snapshot.clone(), project_descriptors.to_vec())
-            }
-            (None, Some(existing)) if live.live_revision == existing.live_revision => {
-                if !project_descriptors.is_empty() {
-                    return Err(invalid_data(
-                        "revision-only remote live page contains descriptors",
-                    ));
-                }
-                (
-                    existing.snapshot.clone(),
-                    existing.project_descriptors.clone(),
-                )
-            }
-            (None, _) => {
-                return Err(invalid_data(
-                    "revision-only remote live page has no exact cached baseline",
-                ));
-            }
-        };
-        let stored = StoredRemoteLiveSnapshot {
-            format_version: REMOTE_LIVE_FORMAT_VERSION,
-            profile_id: self.profile_id.clone(),
-            source_generation: source_generation.clone(),
-            revisions: revisions.clone(),
-            redaction_profile,
-            journal_generation: Some(journal_generation),
-            live_revision: live.live_revision,
-            snapshot,
-            project_descriptors: descriptors,
-            remote_observed_at,
-            received_at,
-            range_complete,
-            partial_reasons: partial_reasons.to_vec(),
-            warning_codes: warning_codes.to_vec(),
-        };
-        stored.validate(&self.profile_id, source_id, redaction_profile)?;
+        let stored = merge(existing)?;
         self.prepare_private_directory(path.parent().expect("remote live file has a parent"))?;
         let contents = encode_pretty_bounded(&stored, REMOTE_LIVE_MAX_BYTES)?;
         write_private_atomically(&path, &contents)

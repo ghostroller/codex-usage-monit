@@ -370,7 +370,7 @@ struct QueryInputs {
     ownership: HistoryOwnershipManifest,
     mapping: LoadedProjectMappingProjection,
     metadata: Vec<SourceMetadata>,
-    local_revision: Option<u64>,
+    local_revision: Option<(u64, u64)>,
     remote_revisions: Vec<Option<SourceHistoryRemoteActiveRef>>,
     revision_probes_valid: bool,
 }
@@ -415,18 +415,62 @@ fn query_inputs(
     local_identity: Option<&SourceIdentity>,
 ) -> io::Result<QueryInputs> {
     let manifest = initialized_manifest(ownership)?;
-    let mut metadata = if manifest.state() == HistoryOwnershipState::V2Active {
+    if manifest.state() == HistoryOwnershipState::V2Active
+        && manifest.is_sqlite_backend() != source_history.sqlite_database().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "history backend changed; rebuild the runtime before querying",
+        ));
+    }
+    if manifest.is_sqlite_backend()
+        && manifest.state() == HistoryOwnershipState::V2Active
+        && source_history
+            .sqlite_database()
+            .is_some_and(|database| !database.is_transaction_active())
+    {
+        let database = source_history
+            .sqlite_database()
+            .expect("SQLite backend checked above");
+        if !database.exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "active SQLite history database is missing",
+            ));
+        }
+    }
+    let mut metadata = if manifest.uses_source_history() {
         source_history.list_source_metadata()?
     } else {
         Vec::new()
     };
     metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     let mut revision_probes_valid = true;
-    let local_revision = if manifest.state() == HistoryOwnershipState::V2Active {
+    let local_revision = if manifest.uses_source_history() {
         local_identity
             .map(|identity| {
-                source_history
-                    .load_local_observation_revision(identity, ownership.redaction_profile())
+                if source_history.sqlite_database().is_some() {
+                    // Account quota is profile-wide, and source metadata may
+                    // select the other privacy namespace for local usage.
+                    // Both committed stamps belong to this SQL read snapshot.
+                    Ok((
+                        source_history.load_local_observation_projection_revision(
+                            identity,
+                            RedactionProfile::Redacted,
+                        )?,
+                        source_history.load_local_observation_projection_revision(
+                            identity,
+                            RedactionProfile::PreviewEnabled,
+                        )?,
+                    ))
+                } else {
+                    source_history
+                        .load_local_observation_projection_revision(
+                            identity,
+                            ownership.redaction_profile(),
+                        )
+                        .map(|revision| (revision, 0))
+                }
             })
             .transpose()
             .unwrap_or_else(|_| {
@@ -481,129 +525,187 @@ fn query_with_context(
     context: &mut HistoryQueryContext,
 ) -> io::Result<HistoryQueryResult> {
     validate_store_bindings(ownership, legacy, source_history)?;
-    let since = context.since;
     for _ in 0..MAX_STABLE_QUERY_ATTEMPTS {
-        let before = query_inputs(ownership, source_history, mapping(), local_identity)?;
-        let local_identity_mismatch = matches!(selection, HistorySourceSelection::Local(source_id) if bound_local_source_id != Some(source_id));
-        if before.ownership.state() != HistoryOwnershipState::V2Active {
-            // An ownership switch invalidates account data even if this request
-            // later returns to V2 with a different epoch.
-            context.quota = None;
-            let legacy_history = legacy.load_since(since);
-            let account_quota = Ok(AccountHistoryData {
-                quota_points: legacy_history.quota_points.clone(),
-            });
-            let status = if local_identity_mismatch {
-                HistorySourceSelectionStatus::Unavailable(
-                    HistorySourceUnavailableReason::LocalIdentityMismatch,
-                )
-            } else if matches!(selection, HistorySourceSelection::Remote(_)) {
-                HistorySourceSelectionStatus::Unavailable(
-                    HistorySourceUnavailableReason::UnsupportedByLegacy,
-                )
-            } else {
-                HistorySourceSelectionStatus::Applied
-            };
-            let history = match status {
-                HistorySourceSelectionStatus::Unavailable(reason) => {
-                    unavailable_v1_history(legacy_history, selection, reason)
-                }
-                _ => legacy_history,
-            };
-            if before == query_inputs(ownership, source_history, mapping(), local_identity)? {
-                return Ok(HistoryQueryResult {
-                    account_quota,
-                    usage: Ok(UnifiedHistorySnapshot {
-                        history,
-                        backend: UnifiedHistoryBackend::V1,
-                        ownership_epoch: before.ownership.epoch(),
-                        source_selection: selection.clone(),
-                        source_selection_status: status,
-                        included_sources: Vec::new(),
-                        redaction_skipped_sources: Vec::new(),
-                    }),
-                });
-            }
-            continue;
-        }
-        if !before.revision_probes_valid
-            || context
-                .quota
-                .as_ref()
-                .is_none_or(|quota| quota.inputs != before)
+        // All source inputs, quota and replica reconciliation use one SQL read
+        // snapshot. An external ownership/mapping change starts a fresh snapshot
+        // on retry, while the request's budget remains shared across attempts.
+        let result = if let Some(database) = source_history.sqlite_database()
+            && database.exists()?
         {
-            #[cfg(test)]
-            {
-                context.quota_loads += 1;
-            }
-            let evidence_since = since
-                .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
-                .unwrap_or(DateTime::<Utc>::MIN_UTC);
-            let account = load_account_quota(
-                source_history,
-                &before.metadata,
-                ownership.redaction_profile(),
-                evidence_since,
-                &mut context.budget,
-            );
-            context.quota = Some(PreparedQuota {
-                inputs: before.clone(),
-                account,
-            });
-        }
-        let account = &context
-            .quota
-            .as_ref()
-            .expect("quota initialized for this attempt")
-            .account;
-        let usage = match account {
-            Ok(account) => load_v2_history_since(
-                &V2HistoryQuery {
-                    query_redaction: ownership.redaction_profile(),
-                    ownership_epoch: before.ownership.epoch(),
-                    store: source_history,
-                    project_mapping: &before.mapping,
+            database.read(|_| {
+                query_with_context_attempt(
+                    ownership,
+                    legacy,
+                    source_history,
+                    &mapping,
+                    local_identity,
                     bound_local_source_id,
                     selection,
-                    since,
-                    metadata: &before.metadata,
-                    account,
-                },
-                &mut context.budget,
-            ),
-            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+                    context,
+                )
+            })?
+        } else {
+            query_with_context_attempt(
+                ownership,
+                legacy,
+                source_history,
+                &mapping,
+                local_identity,
+                bound_local_source_id,
+                selection,
+                context,
+            )?
         };
-        let after = query_inputs(ownership, source_history, mapping(), local_identity)?;
-        if before != after || matches!(&usage, Ok(None)) {
-            context.quota = None;
-            continue;
+        if let Some(result) = result {
+            return Ok(result);
         }
-        let account_quota = match account {
-            Ok(account) => Ok(account.clone()),
-            // Keep the original error (including OS code and typed cause) for
-            // the compatibility adapter. Failed quota is never cached.
-            Err(_) => context.quota.take().expect("failed quota exists").account,
-        };
-        return Ok(HistoryQueryResult {
-            account_quota,
-            usage: usage.map(|read| {
-                let read = read.expect("unstable query retried above");
-                UnifiedHistorySnapshot {
-                    history: read.history,
-                    backend: UnifiedHistoryBackend::V2,
-                    ownership_epoch: before.ownership.epoch(),
-                    source_selection: selection.clone(),
-                    source_selection_status: read.source_selection_status,
-                    included_sources: read.included_sources,
-                    redaction_skipped_sources: read.redaction_skipped_sources,
-                }
-            }),
-        });
     }
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
         "history ownership or source policy changed repeatedly during the query",
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_with_context_attempt(
+    ownership: &HistoryOwnershipStore,
+    legacy: &mut HistoryStore,
+    source_history: &SourceHistoryStore,
+    mapping: &impl Fn() -> LoadedProjectMappingProjection,
+    local_identity: Option<&SourceIdentity>,
+    bound_local_source_id: Option<&NodeId>,
+    selection: &HistorySourceSelection,
+    context: &mut HistoryQueryContext,
+) -> io::Result<Option<HistoryQueryResult>> {
+    let since = context.since;
+    let before = query_inputs(ownership, source_history, mapping(), local_identity)?;
+    let local_identity_mismatch = matches!(selection, HistorySourceSelection::Local(source_id) if bound_local_source_id != Some(source_id));
+    if !before.ownership.uses_source_history() {
+        // An ownership switch invalidates account data even if this request
+        // later returns to V2 with a different epoch.
+        context.quota = None;
+        let legacy_history = legacy.load_since(since);
+        let account_quota = Ok(AccountHistoryData {
+            quota_points: legacy_history.quota_points.clone(),
+        });
+        let status = if local_identity_mismatch {
+            HistorySourceSelectionStatus::Unavailable(
+                HistorySourceUnavailableReason::LocalIdentityMismatch,
+            )
+        } else if matches!(selection, HistorySourceSelection::Remote(_)) {
+            HistorySourceSelectionStatus::Unavailable(
+                HistorySourceUnavailableReason::UnsupportedByLegacy,
+            )
+        } else {
+            HistorySourceSelectionStatus::Applied
+        };
+        let history = match status {
+            HistorySourceSelectionStatus::Unavailable(reason) => {
+                unavailable_v1_history(legacy_history, selection, reason)
+            }
+            _ => legacy_history,
+        };
+        if before == query_inputs(ownership, source_history, mapping(), local_identity)? {
+            return Ok(Some(HistoryQueryResult {
+                account_quota,
+                usage: Ok(UnifiedHistorySnapshot {
+                    history,
+                    backend: UnifiedHistoryBackend::V1,
+                    ownership_epoch: before.ownership.epoch(),
+                    source_selection: selection.clone(),
+                    source_selection_status: status,
+                    included_sources: Vec::new(),
+                    redaction_skipped_sources: Vec::new(),
+                }),
+            }));
+        }
+        return Ok(None);
+    }
+    if !before.revision_probes_valid
+        || context
+            .quota
+            .as_ref()
+            .is_none_or(|quota| quota.inputs != before)
+    {
+        #[cfg(test)]
+        {
+            context.quota_loads += 1;
+        }
+        let evidence_since = since
+            .checked_sub_signed(Duration::days(QUERY_EVIDENCE_LOOKBACK_DAYS))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let account = load_account_quota(
+            source_history,
+            &before.metadata,
+            ownership.redaction_profile(),
+            evidence_since,
+            &mut context.budget,
+        );
+        context.quota = Some(PreparedQuota {
+            inputs: before.clone(),
+            account,
+        });
+    }
+    let account = &context
+        .quota
+        .as_ref()
+        .expect("quota initialized for this attempt")
+        .account;
+    let usage = match account {
+        Ok(account) => load_v2_history_since(
+            &V2HistoryQuery {
+                query_redaction: ownership.redaction_profile(),
+                backfill_epoch: if before.ownership.is_sqlite_backend()
+                    && before.ownership.state() == HistoryOwnershipState::Migrating
+                    && source_history.sqlite_database().is_none()
+                {
+                    before.ownership.epoch().checked_sub(1).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pending SQLite migration has no previous file ownership epoch",
+                        )
+                    })?
+                } else {
+                    before.ownership.epoch()
+                },
+                store: source_history,
+                project_mapping: &before.mapping,
+                bound_local_source_id,
+                selection,
+                since,
+                metadata: &before.metadata,
+                account,
+            },
+            &mut context.budget,
+        ),
+        Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+    };
+    let after = query_inputs(ownership, source_history, mapping(), local_identity)?;
+    if before != after || matches!(&usage, Ok(None)) {
+        context.quota = None;
+        return Ok(None);
+    }
+    let account_quota = match account {
+        Ok(account) => Ok(account.clone()),
+        // Keep the original error (including OS code and typed cause) for
+        // the compatibility adapter. Failed quota is never cached.
+        Err(_) => context.quota.take().expect("failed quota exists").account,
+    };
+    Ok(Some(HistoryQueryResult {
+        account_quota,
+        usage: usage.map(|read| {
+            let read = read.expect("unstable query retried above");
+            UnifiedHistorySnapshot {
+                history: read.history,
+                backend: UnifiedHistoryBackend::V2,
+                ownership_epoch: before.ownership.epoch(),
+                source_selection: selection.clone(),
+                source_selection_status: read.source_selection_status,
+                included_sources: read.included_sources,
+                redaction_skipped_sources: read.redaction_skipped_sources,
+            }
+        }),
+    }))
 }
 
 pub(crate) fn load_unified_history_with_context(
@@ -899,7 +1001,7 @@ fn load_account_quota(
 #[derive(Clone, Copy)]
 struct V2HistoryQuery<'a> {
     query_redaction: RedactionProfile,
-    ownership_epoch: u64,
+    backfill_epoch: u64,
     store: &'a SourceHistoryStore,
     project_mapping: &'a LoadedProjectMappingProjection,
     bound_local_source_id: Option<&'a NodeId>,
@@ -949,7 +1051,7 @@ fn load_v2_history_since_inner(
 ) -> io::Result<Option<V2HistoryRead>> {
     let V2HistoryQuery {
         query_redaction,
-        ownership_epoch,
+        backfill_epoch,
         store,
         project_mapping,
         bound_local_source_id,
@@ -1238,7 +1340,7 @@ fn load_v2_history_since_inner(
             selection,
             HistorySourceSelection::AllIncluded | HistorySourceSelection::Local(_)
         ) {
-        store.load_v2_summary_backfill_attempt(query_redaction, ownership_epoch)?
+        store.load_v2_summary_backfill_attempt(query_redaction, backfill_epoch)?
     } else {
         None
     };
@@ -1436,6 +1538,312 @@ mod tests {
             changed.source_selection_status,
             HistorySourceSelectionStatus::AppliedExcludedFromAggregates
         );
+    }
+
+    #[test]
+    fn sqlite_request_context_uses_committed_local_revision_across_selectors() {
+        use std::sync::mpsc;
+        use std::time::Duration as StdDuration;
+
+        use crate::source_history::LocalObservationMode;
+        use crate::source_identity::SourceIdentityStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores_for_backend(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+            true,
+        );
+        let identity =
+            SourceIdentityStore::at_path(directory.path().join("identity").join("source.json"))
+                .load_or_create()
+                .unwrap();
+        store.sqlite_database().unwrap().write(|_| Ok(())).unwrap();
+        activate_for_backend(&ownership, true);
+        let starts_at = at(2, 10, 0);
+        let first_quota = quota(at(2, 9, 0), at(8, 0, 0));
+        let mut next_quota = first_quota.clone();
+        next_quota.observed_at += Duration::minutes(1);
+        next_quota.used_percent = 60.0;
+        next_quota.remaining_percent = 40.0;
+        let observation = |point, total| HistoryObservation {
+            observed_at: starts_at + Duration::minutes(15),
+            quota_points: vec![point],
+            half_hour_buckets: vec![bucket(starts_at, total, "local")],
+            ..HistoryObservation::default()
+        };
+        {
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let active = initialized_manifest(&ownership).unwrap();
+            let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+            assert_eq!(
+                store
+                    .writer(&authority)
+                    .unwrap()
+                    .record_local_observation(
+                        &identity,
+                        "local",
+                        RedactionProfile::Redacted,
+                        &observation(first_quota.clone(), 10),
+                        LocalObservationMode::Incremental,
+                    )
+                    .unwrap()
+                    .revision,
+                1
+            );
+        }
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let writer_store = store.clone();
+        let writer_ownership = ownership.clone();
+        let writer_identity = identity.clone();
+        let next_observation = observation(next_quota.clone(), 20);
+        let writer = std::thread::spawn(move || {
+            let lease = writer_ownership.acquire_writer_lease().unwrap();
+            let active = initialized_manifest(&writer_ownership).unwrap();
+            let authority = writer_ownership
+                .authorize_v2_write(&lease, &active)
+                .unwrap();
+            SourceHistoryStore::inspect_next_local_observation_reservation(move || {
+                reserved_tx.send(()).unwrap();
+                publish_rx.recv_timeout(StdDuration::from_secs(10)).unwrap();
+            });
+            writer_store
+                .writer(&authority)
+                .unwrap()
+                .record_local_observation(
+                    &writer_identity,
+                    "local",
+                    RedactionProfile::Redacted,
+                    &next_observation,
+                    LocalObservationMode::Incremental,
+                )
+                .unwrap()
+                .revision
+        });
+        reserved_rx
+            .recv_timeout(StdDuration::from_secs(10))
+            .unwrap();
+        let mut context = HistoryQueryContext::new(at(2, 0, 0));
+        store
+            .sqlite_database()
+            .unwrap()
+            .read(|_| {
+                // Pin a snapshot after reservation 2 but before its data commit.
+                // The writer then commits successfully while this snapshot retains
+                // quota/data 1 and the independent high-water mark 2.
+                assert_eq!(store.list_source_metadata()?.len(), 1);
+                publish_tx.send(()).unwrap();
+                assert_eq!(writer.join().unwrap(), 2);
+                assert_eq!(
+                    store.load_local_observation_revision(&identity, RedactionProfile::Redacted)?,
+                    2
+                );
+                let previous = query_with_context(
+                    &ownership,
+                    &mut legacy,
+                    &store,
+                    LoadedProjectMappingProjection::default,
+                    Some(&identity),
+                    Some(identity.node_id()),
+                    &HistorySourceSelection::AllIncluded,
+                    &mut context,
+                )?
+                .into_snapshot()?;
+                assert_eq!(previous.history.quota_points, vec![first_quota]);
+                assert_eq!(
+                    previous.history.half_hour_buckets[0]
+                        .token_usage
+                        .total_tokens,
+                    10
+                );
+                assert_eq!(context.quota_loads, 1);
+                Ok(())
+            })
+            .unwrap();
+        let current = query_with_context(
+            &ownership,
+            &mut legacy,
+            &store,
+            LoadedProjectMappingProjection::default,
+            Some(&identity),
+            Some(identity.node_id()),
+            &HistorySourceSelection::Local(identity.node_id().clone()),
+            &mut context,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert_eq!(current.history.quota_points, vec![next_quota]);
+        assert_eq!(
+            current.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert_eq!(
+            context.quota_loads, 2,
+            "the committed data change invalidates quota reuse"
+        );
+    }
+
+    #[test]
+    fn sqlite_first_redacted_migration_updates_local_query_policy_without_new_observation() {
+        use crate::history_runtime::{HistoryRuntime, HistoryRuntimeWriteReport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let history_root = directory.path().join("state/history-v1");
+        let codex_home = directory.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let starts_at = Utc::now() - Duration::minutes(30);
+        let starts_at = starts_at
+            .with_minute(starts_at.minute() / 15 * 15)
+            .unwrap()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
+        let initial_quota = quota(starts_at, starts_at + Duration::days(7));
+        let observation = |total, label| HistoryObservation {
+            observed_at: starts_at + Duration::minutes(15),
+            quota_points: vec![initial_quota.clone()],
+            half_hour_buckets: vec![bucket(starts_at, total, label)],
+            ..HistoryObservation::default()
+        };
+        let mut preview = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+        preview.ensure_ownership_initialized().unwrap();
+        preview.stage(&observation(10, "preview-only"));
+        assert!(matches!(
+            preview.flush_staged().unwrap(),
+            Some(HistoryRuntimeWriteReport::V1(_))
+        ));
+        assert!(preview.ensure_v2_active().unwrap().is_sqlite_backend());
+        let local_id = preview.source_identity().node_id().clone();
+        let profile = preview.profile_id().clone();
+        assert_eq!(
+            preview
+                .load_unified_history_since(starts_at)
+                .unwrap()
+                .history
+                .half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+
+        // Only the preview V2 namespace existed at the first profile import.
+        // This cooperating redacted V1 writer therefore still has its own
+        // history to upgrade through File V2 into the shared profile database.
+        let mut redacted = HistoryRuntime::new(history_root.clone(), &codex_home, true).unwrap();
+        assert_eq!(redacted.profile_id(), &profile);
+        assert_eq!(redacted.source_identity().node_id(), &local_id);
+        let initial = redacted.ensure_ownership_initialized().unwrap();
+        assert_eq!(initial.state(), HistoryOwnershipState::V1Active);
+        assert!(!initial.is_sqlite_backend());
+        redacted.stage(&observation(20, "redacted-history"));
+        assert!(matches!(
+            redacted.flush_staged().unwrap(),
+            Some(HistoryRuntimeWriteReport::V1(_))
+        ));
+        let active = redacted.ensure_v2_active().unwrap();
+        assert!(active.is_sqlite_backend());
+        assert_eq!(active.state(), HistoryOwnershipState::V2Active);
+        assert_eq!(
+            redacted
+                .source_history()
+                .load_source_metadata(&local_id)
+                .unwrap()
+                .aggregate_redaction_profile(),
+            RedactionProfile::Redacted
+        );
+        // No live observation is written after migration to repair visibility.
+        // Both the exact local selector and the default aggregate must expose
+        // the newly imported redacted history immediately and after reopening.
+        for reopen in [false, true] {
+            if reopen {
+                redacted = HistoryRuntime::new(history_root.clone(), &codex_home, true).unwrap();
+                assert_eq!(redacted.ensure_v2_active().unwrap(), active);
+            }
+            for selection in [
+                HistorySourceSelection::Local(local_id.clone()),
+                HistorySourceSelection::AllIncluded,
+            ] {
+                let result = redacted
+                    .load_unified_history_since_selected(&selection, starts_at)
+                    .unwrap();
+                assert_eq!(
+                    result.source_selection_status,
+                    HistorySourceSelectionStatus::Applied
+                );
+                assert_eq!(result.included_sources, vec![local_id.clone()]);
+                assert!(result.redaction_skipped_sources.is_empty());
+                assert_eq!(result.history.half_hour_buckets.len(), 1);
+                assert_eq!(
+                    result.history.half_hour_buckets[0].token_usage.total_tokens,
+                    20
+                );
+            }
+        }
+
+        let selection = HistorySourceSelection::Local(local_id.clone());
+        let projection_before =
+            crate::history_application::history_projection_revision(&preview, &selection)
+                .unwrap()
+                .unwrap();
+        let mut context = HistoryQueryContext::new(starts_at);
+        let previous = preview
+            .query_history_selected(&HistorySourceSelection::AllIncluded, &mut context)
+            .unwrap();
+        assert_eq!(previous.history.quota_points, vec![initial_quota.clone()]);
+        assert_eq!(
+            previous.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            20
+        );
+        assert_eq!(context.quota_loads, 1);
+
+        // Metadata already selects Redacted. A later write changes only that
+        // namespace and the profile-wide quota, while Preview's stamp stays
+        // fixed. Both the request context and outer TUI cache must invalidate.
+        let mut next_quota = initial_quota.clone();
+        next_quota.observed_at += Duration::minutes(1);
+        next_quota.used_percent = 60.0;
+        next_quota.remaining_percent = 40.0;
+        let mut next = observation(30, "redacted-history");
+        next.observed_at += Duration::minutes(1);
+        next.quota_points = vec![next_quota.clone()];
+        redacted.stage(&next);
+        assert!(matches!(
+            redacted.flush_staged().unwrap(),
+            Some(HistoryRuntimeWriteReport::V2(_))
+        ));
+        let projection_after =
+            crate::history_application::history_projection_revision(&preview, &selection)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            projection_before.local_observation_revision,
+            projection_after.local_observation_revision
+        );
+        assert_ne!(
+            projection_before.other_local_observation_revision,
+            projection_after.other_local_observation_revision
+        );
+        assert_eq!(projection_before.sources, projection_after.sources);
+        assert!(!projection_before.same_query_inputs_except_local_revision(&projection_after));
+        let current = preview
+            .query_history_selected(&selection, &mut context)
+            .unwrap();
+        assert_eq!(current.history.quota_points, vec![next_quota]);
+        assert_eq!(
+            current.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            30
+        );
+        assert_eq!(context.quota_loads, 2);
     }
 
     #[test]
@@ -2015,6 +2423,41 @@ mod tests {
         (legacy, ownership, source_history)
     }
 
+    fn stores_for_backend(
+        root: &Path,
+        codex_home: &Path,
+        redaction: RedactionProfile,
+        sqlite: bool,
+    ) -> (HistoryStore, HistoryOwnershipStore, SourceHistoryStore) {
+        let (legacy, ownership, store) = stores(root, codex_home, redaction);
+        let store = if sqlite {
+            SourceHistoryStore::new_sqlite(
+                store.state_root().to_path_buf(),
+                store.profile_id().clone(),
+            )
+        } else {
+            store
+        };
+        (legacy, ownership, store)
+    }
+
+    fn activate_for_backend(ownership: &HistoryOwnershipStore, sqlite: bool) {
+        let active = activate_v2(ownership);
+        if sqlite {
+            let lease = ownership.acquire_writer_lease().unwrap();
+            let pending = match ownership.begin_sqlite_migration(&lease, &active).unwrap() {
+                OwnershipCasOutcome::Applied(manifest) => manifest,
+                OwnershipCasOutcome::Conflict(_) => panic!("unexpected SQLite migration conflict"),
+            };
+            assert!(matches!(
+                ownership
+                    .complete_sqlite_migration(&lease, &pending)
+                    .unwrap(),
+                OwnershipCasOutcome::Applied(_)
+            ));
+        }
+    }
+
     fn initialize_v1(ownership: &HistoryOwnershipStore) -> HistoryOwnershipManifest {
         let lease = ownership.acquire_writer_lease().unwrap();
         match ownership.initialize_v1_active(&lease).unwrap() {
@@ -2417,10 +2860,22 @@ mod tests {
 
     #[test]
     fn identical_exact_replica_is_counted_once_and_source_only_stays_physical() {
+        identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(false);
+    }
+
+    #[test]
+    fn sqlite_identical_exact_replica_is_counted_once_and_source_only_stays_physical() {
+        identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(true);
+    }
+
+    fn identical_exact_replica_is_counted_once_and_source_only_stays_physical_backend(
+        sqlite: bool,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (mut legacy, ownership, store) =
+            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -2451,7 +2906,7 @@ mod tests {
             session_digest(source_b.source_id(), range_start, 'a', 10, 1, project_b),
             Vec::new(),
         );
-        activate_v2(&ownership);
+        activate_for_backend(&ownership, sqlite);
 
         let all = load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
         assert_eq!(
@@ -2475,7 +2930,7 @@ mod tests {
                 .contains(&DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string())
         );
         let (mut restarted_legacy, restarted_ownership, restarted_store) =
-            stores(&root, &codex_home, RedactionProfile::Redacted);
+            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
         let after_restart = load_unified_history_since(
             &restarted_ownership,
             &mut restarted_legacy,
@@ -3027,10 +3482,20 @@ mod tests {
 
     #[test]
     fn divergent_exact_facts_form_one_event_union_and_preserve_sources() {
+        divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(false);
+    }
+
+    #[test]
+    fn sqlite_divergent_exact_facts_form_one_event_union_and_preserve_sources() {
+        divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(true);
+    }
+
+    fn divergent_exact_facts_form_one_event_union_and_preserve_sources_backend(sqlite: bool) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (mut legacy, ownership, store) =
+            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3096,7 +3561,7 @@ mod tests {
                 ),
             ],
         );
-        activate_v2(&ownership);
+        activate_for_backend(&ownership, sqlite);
 
         let result =
             load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
@@ -3624,10 +4089,20 @@ mod tests {
 
     #[test]
     fn conflicting_event_id_uses_deterministic_authority_and_warns() {
+        conflicting_event_id_uses_deterministic_authority_and_warns_backend(false);
+    }
+
+    #[test]
+    fn sqlite_conflicting_event_id_uses_deterministic_authority_and_warns() {
+        conflicting_event_id_uses_deterministic_authority_and_warns_backend(true);
+    }
+
+    fn conflicting_event_id_uses_deterministic_authority_and_warns_backend(sqlite: bool) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let codex_home = directory.path().join("codex-home");
-        let (mut legacy, ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let (mut legacy, ownership, store) =
+            stores_for_backend(&root, &codex_home, RedactionProfile::Redacted, sqlite);
         let source_a = source(
             SOURCE_A,
             "alpha",
@@ -3684,7 +4159,7 @@ mod tests {
                 project_b,
             )],
         );
-        activate_v2(&ownership);
+        activate_for_backend(&ownership, sqlite);
 
         let result =
             load_unified_history_since(&ownership, &mut legacy, &store, range_start).unwrap();
@@ -5080,5 +5555,104 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn sqlite_pending_migration_reads_file_v2_history_with_previous_backfill_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+        );
+        let local = source(
+            SOURCE_A,
+            "local",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        store.save_source_metadata(&local).unwrap();
+        store
+            .record_source_bucket_changes(
+                local.source_id(),
+                RedactionProfile::Redacted,
+                &[SourceBucketRecord::upsert(1, bucket(at(2, 10, 0), 10, "local")).unwrap()],
+            )
+            .unwrap();
+        let active = activate_v2(&ownership);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        store
+            .writer(&authority)
+            .unwrap()
+            .mark_v2_summary_backfill_attempt(at(2, 9, 30), true)
+            .unwrap();
+        let pending = match ownership.begin_sqlite_migration(&lease, &active).unwrap() {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected SQLite migration conflict"),
+        };
+        for selection in [
+            HistorySourceSelection::AllIncluded,
+            HistorySourceSelection::Local(local.source_id().clone()),
+        ] {
+            let history = load_unified_history_since_selected(
+                &ownership,
+                &mut legacy,
+                &store,
+                local.source_id(),
+                &selection,
+                at(2, 0, 0),
+            )
+            .unwrap();
+            assert_eq!(history.backend, UnifiedHistoryBackend::V2);
+            assert_eq!(history.ownership_epoch, pending.epoch());
+            assert_eq!(
+                history.history.half_hour_buckets[0]
+                    .token_usage
+                    .total_tokens,
+                10
+            );
+            assert_eq!(
+                history.history.summary_backfill_attempted_at,
+                Some(at(2, 9, 30))
+            );
+            assert_eq!(
+                history.history.summary_backfill_attempt_complete,
+                Some(true)
+            );
+        }
+        assert_eq!(
+            store
+                .load_v2_summary_backfill_attempt(RedactionProfile::Redacted, pending.epoch())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sqlite_active_query_fails_closed_when_database_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut legacy, ownership, store) = stores_for_backend(
+            &directory.path().join("state"),
+            &directory.path().join("codex"),
+            RedactionProfile::Redacted,
+            true,
+        );
+        legacy
+            .record(&HistoryObservation {
+                observed_at: at(2, 10, 15),
+                half_hour_buckets: vec![bucket(at(2, 10, 0), 123, "legacy")],
+                ..HistoryObservation::default()
+            })
+            .unwrap();
+        activate_for_backend(&ownership, true);
+        assert_eq!(
+            load_unified_history_since(&ownership, &mut legacy, &store, at(2, 0, 0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!store.sqlite_database().unwrap().exists().unwrap());
     }
 }

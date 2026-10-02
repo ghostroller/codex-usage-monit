@@ -66,6 +66,7 @@ pub mod source_export;
 pub mod source_history;
 pub mod source_identity;
 pub mod source_model;
+mod sqlite_history_migration;
 pub mod startup;
 mod startup_progress;
 pub mod summary;

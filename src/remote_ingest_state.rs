@@ -43,6 +43,7 @@ use crate::remote_protocol::{
     RemoteExportResponseBody, RemotePagePayload, RemoteProjectDescriptor, RemoteSessionDigest,
     RemoteSessionDigestMutation, RemoteUsageBucket, RemoteUsageBucketMutation, SourceGeneration,
 };
+use crate::source_history::database;
 use crate::source_history::{
     HistoryProfileId, RedactionProfile, RemoteHistoryGenerationGcOutcome,
     RemoteHistoryGenerationSweepReport, SessionDigestFingerprint, SourceBucketRecord,
@@ -558,6 +559,37 @@ pub(crate) fn queue_remote_preview_ingest_retirement(
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestProfileRetirementStatus> {
+    if let Some(db) = history_store.sqlite_database() {
+        validate_ingest_retirement_writer(history_store, writer)?;
+        return db.write_nowait(|connection| {
+            let prefix = sqlite_ingest_source_prefix(
+                history_store.profile_id(),
+                RedactionProfile::PreviewEnabled,
+                source_id,
+            );
+            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+            let existing: Option<StoredRemoteIngestProfileRetirement> =
+                database::state(connection, &key)?;
+            if let Some(existing) = &existing {
+                existing.validate(history_store.profile_id(), source_id)?;
+            }
+            if existing.is_none()
+                && database::states::<StoredRemoteDeltaIngestState>(connection, &prefix)?.is_empty()
+            {
+                return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
+            }
+            database::set_state(
+                connection,
+                &key,
+                &StoredRemoteIngestProfileRetirement::preview_to_redacted(
+                    history_store.profile_id().clone(),
+                    source_id.clone(),
+                ),
+            )?;
+            writer.validate()?;
+            Ok(RemoteIngestProfileRetirementStatus::Pending)
+        });
+    }
     validate_ingest_retirement_writer(history_store, writer)?;
     let paths = RemoteIngestRetirementPaths::new(history_store, source_id);
     let source_exists = private_directory_exists(history_store, &paths.preview_source)?;
@@ -594,6 +626,45 @@ pub(crate) fn retry_remote_preview_ingest_retirement(
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestProfileRetirementStatus> {
+    if let Some(db) = history_store.sqlite_database() {
+        validate_ingest_retirement_writer(history_store, writer)?;
+        return db.write_nowait(|connection| {
+            let metadata = history_store.load_source_metadata(source_id)?;
+            if metadata.kind() != crate::source_history::SourceKind::Ssh {
+                return Err(invalid_data(
+                    "remote SQL ingest retirement requires an SSH source",
+                ));
+            }
+            if metadata.aggregate_redaction_profile() != RedactionProfile::Redacted {
+                return Ok(RemoteIngestProfileRetirementStatus::Pending);
+            }
+            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+            let marker: Option<StoredRemoteIngestProfileRetirement> =
+                database::state(connection, &key)?;
+            if let Some(marker) = &marker {
+                marker.validate(history_store.profile_id(), source_id)?;
+            }
+            let removed = sqlite_remove_ingest_namespace(
+                connection,
+                history_store.profile_id(),
+                source_id,
+                RedactionProfile::PreviewEnabled,
+            )?;
+            if marker.is_none() && !removed {
+                return Ok(RemoteIngestProfileRetirementStatus::NotRequired);
+            }
+            database::set_state(
+                connection,
+                &key,
+                &StoredRemoteIngestProfileRetirement::preview_to_redacted(
+                    history_store.profile_id().clone(),
+                    source_id.clone(),
+                ),
+            )?;
+            writer.validate()?;
+            Ok(RemoteIngestProfileRetirementStatus::Complete)
+        });
+    }
     validate_ingest_retirement_writer(history_store, writer)?;
     let metadata = history_store.load_source_metadata(source_id)?;
     if metadata.kind() != crate::source_history::SourceKind::Ssh {
@@ -651,6 +722,32 @@ pub(crate) fn purge_remote_ingest_state_for_source(
     source_id: &NodeId,
     writer: &SourceHistoryWriter<'_, '_, '_>,
 ) -> io::Result<RemoteIngestSourcePurgeReport> {
+    if let Some(db) = history_store.sqlite_database() {
+        writer.validate_store_binding(history_store)?;
+        return db.write_nowait(|connection| {
+            let mut report = RemoteIngestSourcePurgeReport::default();
+            for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+                if sqlite_remove_ingest_namespace(
+                    connection,
+                    history_store.profile_id(),
+                    source_id,
+                    redaction,
+                )? {
+                    report.namespaces_removed += 1;
+                }
+            }
+            let key = sqlite_ingest_retirement_key(history_store.profile_id(), source_id);
+            if let Some(marker) =
+                database::state::<StoredRemoteIngestProfileRetirement>(connection, &key)?
+            {
+                marker.validate(history_store.profile_id(), source_id)?;
+                database::delete_state(connection, &key)?;
+                report.namespaces_removed += 1;
+            }
+            writer.validate()?;
+            Ok(report)
+        });
+    }
     writer.validate_store_binding(history_store)?;
     let profile_root = history_store
         .state_root()
@@ -1083,15 +1180,43 @@ impl RemoteDeltaIngestStateStore {
         let lock_path = self.lock_path();
         let lock = open_private_lock(&lock_path)?;
         let lock = try_lock_private_lock(&lock_path, lock)?;
-        self.prepare_binding_namespace_locked()?;
+        if self.history_store.sqlite_database().is_none() {
+            self.prepare_binding_namespace_locked()?;
+            cleanup_remote_ingest_temporary_files(&self.namespace_directory())?;
+        }
         self.validate_namespace()?;
-        cleanup_remote_ingest_temporary_files(&self.namespace_directory())?;
         let state = self.load_or_create_state()?;
         Ok(RemoteDeltaIngestSession {
             store: self,
             lock,
             state,
         })
+    }
+
+    fn sqlite_state_key(&self) -> String {
+        format!(
+            "{}{}/state",
+            self.sqlite_source_prefix(),
+            self.binding_namespace
+        )
+    }
+
+    fn sqlite_anchor_key(&self) -> String {
+        format!(
+            "remote-ingest-anchor/{}/{}/{}/{}",
+            self.binding.profile_id.as_str(),
+            self.binding.redaction_profile.directory_name(),
+            self.binding.source.node_id.as_str(),
+            self.binding_namespace
+        )
+    }
+
+    fn sqlite_source_prefix(&self) -> String {
+        sqlite_ingest_source_prefix(
+            &self.binding.profile_id,
+            self.binding.redaction_profile,
+            &self.binding.source.node_id,
+        )
     }
 
     fn state_path(&self) -> PathBuf {
@@ -1160,11 +1285,86 @@ impl RemoteDeltaIngestStateStore {
     }
 
     fn validate_namespace(&self) -> io::Result<()> {
+        if self.history_store.sqlite_database().is_some() {
+            self.binding.validate()?;
+            return self
+                .history_store
+                .validate_private_path(&self.source_namespace_directory());
+        }
         self.history_store
             .validate_private_path(&self.namespace_directory())
     }
 
     fn load_or_create_state(&self) -> io::Result<StoredRemoteDeltaIngestState> {
+        if let Some(db) = self.history_store.sqlite_database() {
+            if db.exists()? {
+                let ready = db.read(|connection| {
+                    let state: Option<StoredRemoteDeltaIngestState> =
+                        database::state(connection, &self.sqlite_state_key())?;
+                    let anchor: Option<StoredRemoteDeltaIngestAnchor> =
+                        database::state(connection, &self.sqlite_anchor_key())?;
+                    if let Some(anchor) = &anchor {
+                        anchor.validate(&self.binding)?;
+                    }
+                    match (state, anchor) {
+                        (Some(state), Some(_)) => {
+                            state.validate(&self.binding)?;
+                            Ok(Some(state))
+                        }
+                        (None, Some(_)) => Err(invalid_data(
+                            "remote SQL ingest state is missing from an initialized namespace",
+                        )),
+                        _ => Ok(None),
+                    }
+                })?;
+                if let Some(state) = ready {
+                    return Ok(state);
+                }
+            }
+            return db.write(|connection| {
+                let key = self.sqlite_state_key();
+                let existing: Option<StoredRemoteDeltaIngestState> =
+                    database::state(connection, &key)?;
+                let anchor: Option<StoredRemoteDeltaIngestAnchor> =
+                    database::state(connection, &self.sqlite_anchor_key())?;
+                if let Some(anchor) = &anchor {
+                    anchor.validate(&self.binding)?;
+                }
+                if existing.is_none() && anchor.is_some() {
+                    return Err(invalid_data(
+                        "remote SQL ingest state is missing from an initialized namespace",
+                    ));
+                }
+                let existing_count = database::states::<StoredRemoteDeltaIngestState>(
+                    connection,
+                    &self.sqlite_source_prefix(),
+                )?
+                .len();
+                if existing.is_none() && existing_count >= MAX_BINDING_NAMESPACES_PER_SOURCE {
+                    return Err(invalid_data(
+                        "remote SQL ingest binding namespace count exceeds its bound",
+                    ));
+                }
+                let initialize = existing.is_none();
+                let state = existing
+                    .unwrap_or_else(|| StoredRemoteDeltaIngestState::new(self.binding.clone()));
+                state.validate(&self.binding)?;
+                if initialize {
+                    database::set_state(connection, &key, &state)?;
+                }
+                if anchor.is_none() {
+                    database::set_state(
+                        connection,
+                        &self.sqlite_anchor_key(),
+                        &StoredRemoteDeltaIngestAnchor {
+                            format_version: INGEST_ANCHOR_FORMAT_VERSION,
+                            binding: self.binding.clone(),
+                        },
+                    )?;
+                }
+                Ok(state)
+            });
+        }
         match self.read_state() {
             Ok(state) => {
                 self.ensure_anchor()?;
@@ -1190,6 +1390,19 @@ impl RemoteDeltaIngestStateStore {
     }
 
     fn read_state(&self) -> io::Result<StoredRemoteDeltaIngestState> {
+        if let Some(db) = self.history_store.sqlite_database() {
+            return db.read(|connection| {
+                let state: StoredRemoteDeltaIngestState =
+                    database::state(connection, &self.sqlite_state_key())?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "remote SQL ingest state is missing",
+                        )
+                    })?;
+                state.validate(&self.binding)?;
+                Ok(state)
+            });
+        }
         let state: StoredRemoteDeltaIngestState = read_private_json(
             &self.state_path(),
             MAX_INGEST_STATE_BYTES,
@@ -1200,6 +1413,20 @@ impl RemoteDeltaIngestStateStore {
     }
 
     fn write_state(&self, state: &StoredRemoteDeltaIngestState) -> io::Result<()> {
+        if let Some(db) = self.history_store.sqlite_database() {
+            self.validate_namespace()?;
+            state.validate(&self.binding)?;
+            let encoded =
+                serde_json::to_vec(state).map_err(|error| invalid_data(error.to_string()))?;
+            if encoded.len() as u64 > MAX_INGEST_STATE_BYTES {
+                return Err(invalid_data(
+                    "remote SQL ingest state exceeds its size bound",
+                ));
+            }
+            return db.write(|connection| {
+                database::set_state(connection, &self.sqlite_state_key(), state)
+            });
+        }
         self.validate_namespace()?;
         state.validate(&self.binding)?;
         write_private_json_atomically(
@@ -1211,6 +1438,19 @@ impl RemoteDeltaIngestStateStore {
     }
 
     fn read_anchor(&self) -> io::Result<StoredRemoteDeltaIngestAnchor> {
+        if let Some(db) = self.history_store.sqlite_database() {
+            return db.read(|connection| {
+                let anchor: StoredRemoteDeltaIngestAnchor =
+                    database::state(connection, &self.sqlite_anchor_key())?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "remote SQL ingest anchor is missing",
+                        )
+                    })?;
+                anchor.validate(&self.binding)?;
+                Ok(anchor)
+            });
+        }
         let anchor: StoredRemoteDeltaIngestAnchor = read_private_json(
             &self.anchor_path(),
             MAX_INGEST_ANCHOR_BYTES,
@@ -1221,6 +1461,24 @@ impl RemoteDeltaIngestStateStore {
     }
 
     fn ensure_anchor(&self) -> io::Result<()> {
+        if let Some(db) = self.history_store.sqlite_database() {
+            return db.write(|connection| {
+                if let Some(anchor) = database::state::<StoredRemoteDeltaIngestAnchor>(
+                    connection,
+                    &self.sqlite_anchor_key(),
+                )? {
+                    return anchor.validate(&self.binding);
+                }
+                database::set_state(
+                    connection,
+                    &self.sqlite_anchor_key(),
+                    &StoredRemoteDeltaIngestAnchor {
+                        format_version: INGEST_ANCHOR_FORMAT_VERSION,
+                        binding: self.binding.clone(),
+                    },
+                )
+            });
+        }
         let expected = StoredRemoteDeltaIngestAnchor {
             format_version: INGEST_ANCHOR_FORMAT_VERSION,
             binding: self.binding.clone(),
@@ -1744,6 +2002,39 @@ impl RemoteDeltaIngestSession<'_> {
     fn protected_history_generations(
         &self,
     ) -> io::Result<BTreeSet<SourceHistoryRemoteGenerationId>> {
+        if let Some(db) = self.store.history_store.sqlite_database() {
+            return db.read(|connection| {
+                let states = database::states::<StoredRemoteDeltaIngestState>(
+                    connection,
+                    &self.store.sqlite_source_prefix(),
+                )?;
+                if states.len() > MAX_BINDING_NAMESPACES_PER_SOURCE {
+                    return Err(invalid_data(
+                        "remote SQL ingest binding namespace count exceeds its bound",
+                    ));
+                }
+                let mut protected = BTreeSet::new();
+                for (key, state) in states {
+                    state.validate(&state.binding)?;
+                    let expected_key = format!(
+                        "{}{}/state",
+                        sqlite_ingest_source_prefix(
+                            &state.binding.profile_id,
+                            state.binding.redaction_profile,
+                            &state.binding.source.node_id
+                        ),
+                        binding_namespace_component(&state.binding)?
+                    );
+                    if key != expected_key {
+                        return Err(invalid_data(
+                            "remote SQL ingest state key does not match its binding",
+                        ));
+                    }
+                    collect_state_history_generations(&state, &mut protected)?;
+                }
+                Ok(protected)
+            });
+        }
         self.validate_fence()?;
         let source_directory = self.store.source_namespace_directory();
         self.store
@@ -2012,6 +2303,25 @@ pub fn apply_and_commit_remote_delta_page(
     page: &PreparedRemoteDeltaPage,
     activated_at: chrono::DateTime<chrono::Utc>,
 ) -> io::Result<RemoteDeltaCommitReport> {
+    if let Some(db) = session.store.history_store.sqlite_database() {
+        let previous = session.state.clone();
+        let result = db.write_nowait(|_| {
+            apply_and_commit_remote_delta_page_inner(session, writer, page, activated_at)
+        });
+        if result.is_err() {
+            session.state = previous;
+        }
+        return result;
+    }
+    apply_and_commit_remote_delta_page_inner(session, writer, page, activated_at)
+}
+
+fn apply_and_commit_remote_delta_page_inner(
+    session: &mut RemoteDeltaIngestSession<'_>,
+    writer: &SourceHistoryWriter<'_, '_, '_>,
+    page: &PreparedRemoteDeltaPage,
+    activated_at: chrono::DateTime<chrono::Utc>,
+) -> io::Result<RemoteDeltaCommitReport> {
     let retired_generation = match &page.target {
         RemoteDeltaApplyTarget::ActiveCow {
             expected_generation,
@@ -2038,6 +2348,23 @@ pub fn apply_and_commit_remote_delta_page(
 /// same ready bootstrap, repeats the already-completed manifest switch, and
 /// then commits the cursor.
 pub fn activate_remote_delta_bootstrap(
+    session: &mut RemoteDeltaIngestSession<'_>,
+    writer: &SourceHistoryWriter<'_, '_, '_>,
+    activated_at: chrono::DateTime<chrono::Utc>,
+) -> io::Result<Option<RemoteBootstrapActivationReport>> {
+    if let Some(db) = session.store.history_store.sqlite_database() {
+        let previous = session.state.clone();
+        let result = db
+            .write_nowait(|_| activate_remote_delta_bootstrap_inner(session, writer, activated_at));
+        if result.is_err() {
+            session.state = previous;
+        }
+        return result;
+    }
+    activate_remote_delta_bootstrap_inner(session, writer, activated_at)
+}
+
+fn activate_remote_delta_bootstrap_inner(
     session: &mut RemoteDeltaIngestSession<'_>,
     writer: &SourceHistoryWriter<'_, '_, '_>,
     activated_at: chrono::DateTime<chrono::Utc>,
@@ -2632,6 +2959,278 @@ fn queue_retired_generation(
     {
         state.retired_generations.push(generation.clone());
     }
+}
+
+fn sqlite_ingest_retirement_key(profile: &HistoryProfileId, source: &NodeId) -> String {
+    format!(
+        "remote-ingest-retirement/{}/{}",
+        profile.as_str(),
+        source.as_str()
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRemoteIngestImportMarker {
+    format_version: u32,
+    profile_id: HistoryProfileId,
+    source_id: NodeId,
+    redaction_profile: RedactionProfile,
+}
+
+fn sqlite_remove_ingest_namespace(
+    connection: &rusqlite::Connection,
+    profile: &HistoryProfileId,
+    source: &NodeId,
+    redaction: RedactionProfile,
+) -> io::Result<bool> {
+    let prefix = sqlite_ingest_source_prefix(profile, redaction, source);
+    let states = database::states::<StoredRemoteDeltaIngestState>(connection, &prefix)?;
+    if states.len() > MAX_BINDING_NAMESPACES_PER_SOURCE {
+        return Err(invalid_data(
+            "remote SQL ingest namespace count exceeds its bound",
+        ));
+    }
+    let anchor_prefix = format!(
+        "remote-ingest-anchor/{}/{}/{}/",
+        profile.as_str(),
+        redaction.directory_name(),
+        source.as_str()
+    );
+    let anchors = database::states::<StoredRemoteDeltaIngestAnchor>(connection, &anchor_prefix)?;
+    if anchors.len() > MAX_BINDING_NAMESPACES_PER_SOURCE {
+        return Err(invalid_data(
+            "remote SQL ingest anchor count exceeds its bound",
+        ));
+    }
+    let removed = !states.is_empty() || !anchors.is_empty();
+    for (key, state) in states {
+        state.validate(&state.binding)?;
+        let expected = format!(
+            "{}{}/state",
+            sqlite_ingest_source_prefix(
+                &state.binding.profile_id,
+                state.binding.redaction_profile,
+                &state.binding.source.node_id
+            ),
+            binding_namespace_component(&state.binding)?
+        );
+        if key != expected {
+            return Err(invalid_data("remote SQL ingest state namespace mismatch"));
+        }
+        database::delete_state(connection, &key)?;
+    }
+    for (key, anchor) in anchors {
+        anchor.validate(&anchor.binding)?;
+        let expected = format!(
+            "remote-ingest-anchor/{}/{}/{}/{}",
+            anchor.binding.profile_id.as_str(),
+            anchor.binding.redaction_profile.directory_name(),
+            anchor.binding.source.node_id.as_str(),
+            binding_namespace_component(&anchor.binding)?
+        );
+        if key != expected {
+            return Err(invalid_data("remote SQL ingest anchor namespace mismatch"));
+        }
+        database::delete_state(connection, &key)?;
+    }
+    Ok(removed)
+}
+
+/// Imports every validated binding, including invisible bootstrap and pending
+/// pages. The caller holds the ownership lease and the encompassing SQL import
+/// transaction; old files remain available for recovery.
+pub(crate) fn import_legacy_remote_ingest_sqlite_state(
+    target: &SourceHistoryStore,
+    legacy: &SourceHistoryStore,
+) -> io::Result<()> {
+    let db = target
+        .sqlite_database()
+        .ok_or_else(|| invalid_data("remote ingest import requires SQL history"))?;
+    if target.profile_id() != legacy.profile_id() {
+        return Err(invalid_data("remote ingest import profile mismatch"));
+    }
+    db.write(|connection| {
+        let profile = legacy
+            .state_root()
+            .join(INGEST_LAYOUT_DIRECTORY)
+            .join(legacy.profile_id().as_str());
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            let directory = profile.join(redaction.directory_name());
+            let mut source_names = legacy.list_source_metadata()?.into_iter()
+                .filter(|metadata| metadata.kind() == crate::source_history::SourceKind::Ssh)
+                .map(|metadata| metadata.source_id().as_str().to_owned())
+                .collect::<BTreeSet<_>>();
+            if private_directory_exists(legacy, &directory)? {
+                for entry in fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    source_names.insert(entry.file_name().to_str()
+                        .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest source"))?.to_owned());
+                }
+            }
+            for source_name in source_names {
+                let source: NodeId = source_name.parse()
+                    .map_err(|_| invalid_data("invalid legacy ingest source namespace"))?;
+                let source_path = directory.join(source.as_str());
+                let import_key = format!(
+                    "remote-ingest-import/{}/{}/{}",
+                    target.profile_id().as_str(),
+                    redaction.directory_name(),
+                    source.as_str()
+                );
+                if let Some(marker) = database::state::<StoredRemoteIngestImportMarker>(connection, &import_key)? {
+                    if marker.format_version != 1
+                        || marker.profile_id != *target.profile_id()
+                        || marker.source_id != source
+                        || marker.redaction_profile != redaction
+                    {
+                        return Err(invalid_data("remote SQL ingest import marker mismatch"));
+                    }
+                    continue;
+                }
+                let state_prefix = sqlite_ingest_source_prefix(target.profile_id(), redaction, &source);
+                let anchor_prefix = format!(
+                    "remote-ingest-anchor/{}/{}/{}/",
+                    target.profile_id().as_str(), redaction.directory_name(), source.as_str()
+                );
+                let existing: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM history_state WHERE substr(state_key,1,length(?1))=?1 OR substr(state_key,1,length(?2))=?2)",
+                    rusqlite::params![state_prefix, anchor_prefix],
+                    |row| row.get(0),
+                ).map_err(database::sql_error)?;
+                if existing {
+                    return Err(invalid_data("remote SQL ingest namespace exists without an import marker"));
+                }
+                if private_directory_exists(legacy, &source_path)? {
+                let lock_path = source_path.join(INGEST_LOCK_FILE);
+                let lock = open_private_lock(&lock_path)?;
+                let _lock = try_lock_private_lock(&lock_path, lock)?;
+                let mut count = 0;
+                for entry in fs::read_dir(&source_path)? {
+                    let entry = entry?;
+                    if entry.file_name() == OsStr::new(INGEST_LOCK_FILE) {
+                        continue;
+                    }
+                    let name = entry
+                        .file_name()
+                        .to_str()
+                        .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest binding"))?
+                        .to_owned();
+                    validate_prefixed_hex(
+                        &name,
+                        BINDING_NAMESPACE_PREFIX,
+                        SHA256_HEX_LEN,
+                        "legacy ingest binding",
+                    )?;
+                    count += 1;
+                    if count > MAX_BINDING_NAMESPACES_PER_SOURCE {
+                        return Err(invalid_data(
+                            "legacy ingest namespace count exceeds its bound",
+                        ));
+                    }
+                    legacy.validate_private_path(&entry.path())?;
+                    validate_ingest_binding_namespace_entries(&entry.path())?;
+                    let anchor: Option<StoredRemoteDeltaIngestAnchor> = match read_private_json(
+                        &entry.path().join(INGEST_ANCHOR_FILE),
+                        MAX_INGEST_ANCHOR_BYTES,
+                        "legacy remote ingest anchor",
+                    ) {
+                        Ok(anchor) => Some(anchor),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error),
+                    };
+                    let state: StoredRemoteDeltaIngestState = match read_private_json(
+                        &entry.path().join(INGEST_STATE_FILE),
+                        MAX_INGEST_STATE_BYTES,
+                        "legacy remote ingest state",
+                    ) {
+                        Ok(state) => state,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::NotFound && anchor.is_none() =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let anchor = anchor.unwrap_or_else(|| StoredRemoteDeltaIngestAnchor {
+                        format_version: INGEST_ANCHOR_FORMAT_VERSION,
+                        binding: state.binding.clone(),
+                    });
+                    anchor.validate(&anchor.binding)?;
+                    state.validate(&anchor.binding)?;
+                    if anchor.binding.profile_id != *legacy.profile_id()
+                        || anchor.binding.source.node_id != source
+                        || anchor.binding.redaction_profile != redaction
+                        || binding_namespace_component(&anchor.binding)? != name
+                    {
+                        return Err(invalid_data(
+                            "legacy ingest binding does not match its namespace",
+                        ));
+                    }
+                    let store =
+                        RemoteDeltaIngestStateStore::new(target.clone(), anchor.binding.clone())?;
+                    database::set_state(connection, &store.sqlite_state_key(), &state)?;
+                    database::set_state(connection, &store.sqlite_anchor_key(), &anchor)?;
+                }
+                }
+                database::set_state(connection, &import_key, &StoredRemoteIngestImportMarker {
+                    format_version: 1,
+                    profile_id: target.profile_id().clone(),
+                    source_id: source,
+                    redaction_profile: redaction,
+                })?;
+            }
+        }
+        let retirements = profile.join(INGEST_RETIREMENTS_DIRECTORY);
+        if private_directory_exists(legacy, &retirements)? {
+            for entry in fs::read_dir(&retirements)? {
+                let entry = entry?;
+                let source: NodeId = entry
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| invalid_data("non-UTF-8 legacy ingest retirement"))?
+                    .parse()
+                    .map_err(|_| invalid_data("invalid legacy ingest retirement namespace"))?;
+                legacy.validate_private_path(&entry.path())?;
+                let marker: StoredRemoteIngestProfileRetirement = read_private_json(
+                    &entry.path().join(INGEST_RETIREMENT_MARKER_FILE),
+                    MAX_INGEST_ANCHOR_BYTES,
+                    "legacy remote ingest retirement",
+                )?;
+                marker.validate(legacy.profile_id(), &source)?;
+                let import_key = format!("remote-ingest-retirement-import/{}/{}", target.profile_id().as_str(), source.as_str());
+                if let Some(imported) = database::state::<StoredRemoteIngestProfileRetirement>(connection, &import_key)? {
+                    imported.validate(target.profile_id(), &source)?;
+                    continue;
+                }
+                let key = sqlite_ingest_retirement_key(legacy.profile_id(), &source);
+                if let Some(existing) = database::state::<StoredRemoteIngestProfileRetirement>(connection, &key)? {
+                    existing.validate(target.profile_id(), &source)?;
+                    return Err(invalid_data("remote SQL ingest retirement exists without an import marker"));
+                }
+                database::set_state(
+                    connection,
+                    &key,
+                    &marker,
+                )?;
+                database::set_state(connection, &import_key, &marker)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn sqlite_ingest_source_prefix(
+    profile: &HistoryProfileId,
+    redaction: RedactionProfile,
+    source: &NodeId,
+) -> String {
+    format!(
+        "remote-ingest/{}/{}/{}/",
+        profile.as_str(),
+        redaction.directory_name(),
+        source.as_str()
+    )
 }
 
 fn binding_namespace_component(binding: &RemoteDeltaIngestBinding) -> io::Result<String> {
@@ -3499,7 +4098,7 @@ mod tests {
 
     use super::*;
     use crate::history_ownership::{
-        HistoryOwnershipStore, InitializeV1Outcome, OwnershipCasOutcome,
+        HistoryOwnershipState, HistoryOwnershipStore, InitializeV1Outcome, OwnershipCasOutcome,
     };
     use crate::remote_protocol::{
         AcceptedRevisionRange, AcceptedRevisions, BinaryVersion, MAX_REMOTE_FRAME_ENCODED_BYTES,
@@ -3769,15 +4368,34 @@ mod tests {
         redaction_profile: RedactionProfile,
         action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
     ) -> T {
+        with_history_writer_backend(root, profile, redaction_profile, false, action)
+    }
+
+    fn with_sqlite_history_writer<T>(
+        root: &Path,
+        redaction_profile: RedactionProfile,
+        action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
+    ) -> T {
+        with_history_writer_backend(root, PROFILE, redaction_profile, true, action)
+    }
+
+    fn with_history_writer_backend<T>(
+        root: &Path,
+        profile: &str,
+        redaction_profile: RedactionProfile,
+        sqlite: bool,
+        action: impl FnOnce(&SourceHistoryStore, &SourceHistoryWriter<'_, '_, '_>) -> T,
+    ) -> T {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let history = SourceHistoryStore::new(
-            root.to_path_buf(),
-            profile.parse::<HistoryProfileId>().unwrap(),
-        );
+        let history = if sqlite {
+            SourceHistoryStore::new_sqlite(root.to_path_buf(), profile.parse().unwrap())
+        } else {
+            SourceHistoryStore::new(root.to_path_buf(), profile.parse().unwrap())
+        };
         let ownership = HistoryOwnershipStore::new(
             root.to_path_buf(),
             profile.parse().unwrap(),
@@ -3788,11 +4406,46 @@ mod tests {
             InitializeV1Outcome::Initialized(manifest)
             | InitializeV1Outcome::Existing(manifest) => manifest,
         };
-        let migrating = match ownership.begin_migration(&lease, &v1).unwrap() {
-            OwnershipCasOutcome::Applied(manifest) => manifest,
-            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+        let mut manifest = if v1.state() == HistoryOwnershipState::V1Active {
+            match ownership.begin_migration(&lease, &v1).unwrap() {
+                OwnershipCasOutcome::Applied(manifest) => manifest,
+                OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+            }
+        } else {
+            v1
         };
-        let authority = ownership.authorize_v2_write(&lease, &migrating).unwrap();
+        if sqlite {
+            if !manifest.is_sqlite_backend() {
+                if manifest.state() == HistoryOwnershipState::Migrating {
+                    manifest = match ownership
+                        .compare_and_transition(&lease, &manifest, HistoryOwnershipState::V2Active)
+                        .unwrap()
+                    {
+                        OwnershipCasOutcome::Applied(manifest) => manifest,
+                        OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+                    };
+                }
+                manifest = match ownership.begin_sqlite_migration(&lease, &manifest).unwrap() {
+                    OwnershipCasOutcome::Applied(manifest) => manifest,
+                    OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+                };
+            }
+            if manifest.state() == HistoryOwnershipState::Migrating {
+                history
+                    .sqlite_database()
+                    .unwrap()
+                    .write(|_| Ok(()))
+                    .unwrap();
+                manifest = match ownership
+                    .complete_sqlite_migration(&lease, &manifest)
+                    .unwrap()
+                {
+                    OwnershipCasOutcome::Applied(manifest) => manifest,
+                    OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+                };
+            }
+        }
+        let authority = ownership.authorize_v2_write(&lease, &manifest).unwrap();
         let writer = history.writer(&authority).unwrap();
         action(&history, &writer)
     }
@@ -3828,6 +4481,409 @@ mod tests {
             binding,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sqlite_remote_page_rolls_back_history_live_and_cursor_then_replays_high_u64() {
+        let root = tempdir().unwrap();
+        let binding = live_binding_with(u64::MAX, 1);
+        with_sqlite_history_writer(root.path(), binding.redaction_profile, |history, writer| {
+            writer
+                .save_source_metadata(
+                    &SourceMetadata::new(binding.source.node_id.clone(), SourceKind::Ssh, "remote")
+                        .unwrap(),
+                )
+                .unwrap();
+            let ingest =
+                RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
+            let mut session = ingest.try_begin().unwrap();
+            session.start_bootstrap(writer).unwrap();
+            let range = export_range(at(30, 3, 0), 60);
+            let req = request(&binding, None, range.clone());
+            let mut payload = payload_for(
+                range.clone(),
+                vec![bucket_change(&binding, 1, at(30, 3, 0), u64::MAX)],
+                Vec::new(),
+            );
+            payload.live = Some(RemoteLiveState {
+                live_revision: nonzero64(u64::MAX),
+                snapshot: Some(RemoteLiveSnapshot {
+                    captured_at: at(30, 3, 59),
+                    tasks: Vec::new(),
+                    turns: Vec::new(),
+                }),
+            });
+            let response = response(
+                &binding,
+                range,
+                one_change_page(u64::MAX, 1, false),
+                payload,
+            );
+            let page = session
+                .prepare_page(&req, &response, response.observed_at)
+                .unwrap();
+            let previous = session.state.clone();
+            let database = history.sqlite_database().unwrap();
+            database.write(|connection| {
+                connection.execute_batch("CREATE TRIGGER fail_sqlite_live_publication BEFORE INSERT ON history_state WHEN NEW.state_key LIKE '%/remote-live.json' BEGIN SELECT RAISE(ABORT, 'injected live publication failure'); END;").map_err(io::Error::other)?;
+            let error = apply_and_commit_remote_delta_page(&mut session, writer, &page, at(30, 4, 1)).unwrap_err();
+            assert!(error.to_string().contains("injected live publication failure"));
+            assert_eq!(session.state, previous);
+            assert_eq!(session.pending_page().unwrap(), Some(page.clone()));
+            assert!(session.bootstrap_activation_required().unwrap().is_none());
+            assert!(
+                history
+                    .load_remote_live_state(&binding.source.node_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                database
+                    .read(|connection| connection
+                        .query_row("SELECT count(*) FROM history_records", [], |row| row
+                            .get::<_, i64>(0))
+                        .map_err(io::Error::other))
+                    .unwrap(),
+                0
+            );
+                connection.execute_batch("DROP TRIGGER fail_sqlite_live_publication").map_err(io::Error::other)?;
+                Ok(())
+            }).unwrap();
+            apply_and_commit_remote_delta_page(&mut session, writer, &page, at(30, 4, 1)).unwrap();
+            activate_remote_delta_bootstrap(&mut session, writer, at(30, 4, 1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded_bucket_totals(history, &binding), vec![u64::MAX]);
+            assert_eq!(
+                session
+                    .next_request_position()
+                    .unwrap()
+                    .delta_cursor
+                    .unwrap()
+                    .generation
+                    .get(),
+                u64::MAX
+            );
+            assert_eq!(
+                history
+                    .load_remote_live_state(&binding.source.node_id)
+                    .unwrap()
+                    .unwrap()
+                    .live_revision
+                    .get(),
+                u64::MAX
+            );
+            assert!(!ingest.namespace_directory().exists());
+            assert!(
+                !history
+                    .source_remote_history_directory(
+                        &binding.source.node_id,
+                        binding.redaction_profile
+                    )
+                    .exists()
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_incremental_generations_reuse_the_same_record_stream() {
+        let root = tempdir().unwrap();
+        let binding = binding_with(1, 1, 60);
+        with_sqlite_history_writer(root.path(), binding.redaction_profile, |history, writer| {
+            writer
+                .save_source_metadata(
+                    &SourceMetadata::new(binding.source.node_id.clone(), SourceKind::Ssh, "remote")
+                        .unwrap(),
+                )
+                .unwrap();
+            let ingest =
+                RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
+            let mut session = ingest.try_begin().unwrap();
+            session.start_bootstrap(writer).unwrap();
+            let range = export_range(at(30, 3, 0), 60);
+            let initial = response(
+                &binding,
+                range.clone(),
+                one_change_page(9, 1, false),
+                payload_for(
+                    range.clone(),
+                    vec![bucket_change(&binding, 1, at(30, 3, 0), 31)],
+                    Vec::new(),
+                ),
+            );
+            let page = session
+                .prepare_page(
+                    &request(&binding, None, range.clone()),
+                    &initial,
+                    initial.observed_at,
+                )
+                .unwrap();
+            apply_and_commit_remote_delta_page(&mut session, writer, &page, at(30, 4, 1)).unwrap();
+            activate_remote_delta_bootstrap(&mut session, writer, at(30, 4, 1)).unwrap();
+            let before = history
+                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
+                .unwrap()
+                .unwrap();
+            let database = history.sqlite_database().unwrap();
+            let stream = database
+                .read(|connection| {
+                    connection
+                        .query_row("SELECT namespace FROM history_records LIMIT 1", [], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(io::Error::other)
+                })
+                .unwrap();
+            for sequence in 2..=4 {
+                let cursor = session.next_request_position().unwrap().delta_cursor;
+                let response = response(
+                    &binding,
+                    range.clone(),
+                    one_change_page(9, sequence, false),
+                    payload_for(
+                        range.clone(),
+                        vec![bucket_change(
+                            &binding,
+                            sequence,
+                            at(30, 3, 0),
+                            sequence * 31,
+                        )],
+                        Vec::new(),
+                    ),
+                );
+                let page = session
+                    .prepare_page(
+                        &request(&binding, cursor, range.clone()),
+                        &response,
+                        response.observed_at,
+                    )
+                    .unwrap();
+                apply_and_commit_remote_delta_page(
+                    &mut session,
+                    writer,
+                    &page,
+                    at(30, 4, sequence as u32),
+                )
+                .unwrap();
+                assert_eq!(loaded_bucket_totals(history, &binding), vec![sequence * 31]);
+                assert_eq!(
+                    database
+                        .read(|connection| connection
+                            .query_row("SELECT namespace FROM history_records LIMIT 1", [], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .map_err(io::Error::other))
+                        .unwrap(),
+                    stream
+                );
+                assert_eq!(
+                    database
+                        .read(|connection| connection
+                            .query_row("SELECT count(*) FROM history_records", [], |row| row
+                                .get::<_, i64>(0))
+                            .map_err(io::Error::other))
+                        .unwrap(),
+                    1
+                );
+            }
+            let after = history
+                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
+                .unwrap()
+                .unwrap();
+            assert_ne!(before.generation(), after.generation());
+            assert_eq!(before.binding(), after.binding());
+        });
+    }
+
+    #[test]
+    fn sqlite_remote_import_preserves_staging_rows_and_exact_pending_page() {
+        let root = tempdir().unwrap();
+        let binding = binding_with(u64::MAX, 1, 60);
+        let legacy = SourceHistoryStore::new(root.path().to_path_buf(), PROFILE.parse().unwrap());
+        let ingest = RemoteDeltaIngestStateStore::new(legacy.clone(), binding.clone()).unwrap();
+        let range = export_range(at(30, 3, 0), 60);
+        let pending = with_history_writer(
+            root.path(),
+            PROFILE,
+            binding.redaction_profile,
+            |_history, writer| {
+                writer
+                    .save_source_metadata(
+                        &SourceMetadata::new(
+                            binding.source.node_id.clone(),
+                            SourceKind::Ssh,
+                            "remote",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let mut session = ingest.try_begin().unwrap();
+                session.start_bootstrap(writer).unwrap();
+                let first = response(
+                    &binding,
+                    range.clone(),
+                    one_change_page(u64::MAX, 1, true),
+                    payload_for(
+                        range.clone(),
+                        vec![bucket_change(&binding, 1, at(30, 3, 0), 31)],
+                        Vec::new(),
+                    ),
+                );
+                let first_page = session
+                    .prepare_page(
+                        &request(&binding, None, range.clone()),
+                        &first,
+                        first.observed_at,
+                    )
+                    .unwrap();
+                apply_and_commit_remote_delta_page(&mut session, writer, &first_page, at(30, 4, 1))
+                    .unwrap();
+                let cursor = session.next_request_position().unwrap().delta_cursor;
+                let second = response(
+                    &binding,
+                    range.clone(),
+                    one_change_page(u64::MAX, 2, false),
+                    payload_for(
+                        range.clone(),
+                        vec![bucket_change(&binding, 2, at(30, 3, 15), 47)],
+                        Vec::new(),
+                    ),
+                );
+                session
+                    .prepare_page(
+                        &request(&binding, cursor, range.clone()),
+                        &second,
+                        second.observed_at,
+                    )
+                    .unwrap()
+            },
+        );
+        with_sqlite_history_writer(root.path(), binding.redaction_profile, |history, writer| {
+            writer
+                .save_source_metadata(
+                    &legacy
+                        .load_source_metadata(&binding.source.node_id)
+                        .unwrap(),
+                )
+                .unwrap();
+            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
+            let sql_ingest =
+                RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
+            let mut recovered = sql_ingest.try_begin().unwrap();
+            assert_eq!(recovered.pending_page().unwrap(), Some(pending.clone()));
+            assert!(loaded_bucket_totals(history, &binding).is_empty());
+            apply_and_commit_remote_delta_page(&mut recovered, writer, &pending, at(30, 4, 2))
+                .unwrap();
+            activate_remote_delta_bootstrap(&mut recovered, writer, at(30, 4, 2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded_bucket_totals(history, &binding), vec![31, 47]);
+            assert_eq!(
+                recovered.next_request_position().unwrap().delta_cursor,
+                Some(pending.next_cursor)
+            );
+            let committed_state = recovered.state.clone();
+            let active = history
+                .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
+                .unwrap();
+            drop(recovered);
+            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
+            let recovered_again = sql_ingest.try_begin().unwrap();
+            assert_eq!(recovered_again.state, committed_state);
+            assert_eq!(
+                history
+                    .active_remote_history_ref(&binding.source.node_id, binding.redaction_profile)
+                    .unwrap(),
+                active
+            );
+            assert_eq!(loaded_bucket_totals(history, &binding), vec![31, 47]);
+            drop(recovered_again);
+            purge_remote_ingest_state_for_source(history, &binding.source.node_id, writer).unwrap();
+            history.import_legacy_remote_sqlite_state(&legacy).unwrap();
+            history
+                .sqlite_database()
+                .unwrap()
+                .read(|connection| {
+                    assert!(
+                        database::state::<StoredRemoteDeltaIngestState>(
+                            connection,
+                            &sql_ingest.sqlite_state_key()
+                        )?
+                        .is_none()
+                    );
+                    assert!(
+                        database::state::<StoredRemoteDeltaIngestAnchor>(
+                            connection,
+                            &sql_ingest.sqlite_anchor_key()
+                        )?
+                        .is_none()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let unchanged_legacy = ingest.try_begin().unwrap();
+            assert_eq!(unchanged_legacy.pending_page().unwrap(), Some(pending));
+        });
+    }
+
+    #[test]
+    fn sqlite_remote_import_refuses_existing_unmarked_history_or_ingest() {
+        for history_conflict in [false, true] {
+            let root = tempdir().unwrap();
+            let binding = binding_with(1, 1, 60);
+            let legacy =
+                SourceHistoryStore::new(root.path().to_path_buf(), PROFILE.parse().unwrap());
+            with_history_writer(
+                root.path(),
+                PROFILE,
+                binding.redaction_profile,
+                |_history, writer| {
+                    writer
+                        .save_source_metadata(
+                            &SourceMetadata::new(
+                                binding.source.node_id.clone(),
+                                SourceKind::Ssh,
+                                "remote",
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                },
+            );
+            with_sqlite_history_writer(
+                root.path(),
+                binding.redaction_profile,
+                |history, writer| {
+                    writer
+                        .save_source_metadata(
+                            &legacy
+                                .load_source_metadata(&binding.source.node_id)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    let ingest =
+                        RemoteDeltaIngestStateStore::new(history.clone(), binding.clone()).unwrap();
+                    let mut session = ingest.try_begin().unwrap();
+                    if history_conflict {
+                        session.start_bootstrap(writer).unwrap();
+                    }
+                    drop(session);
+                    let db = history.sqlite_database().unwrap();
+                    let before: Vec<(String, serde_json::Value)> = db
+                        .read(|connection| database::states(connection, ""))
+                        .unwrap();
+                    let error = history
+                        .import_legacy_remote_sqlite_state(&legacy)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert!(error.to_string().contains("without an import marker"));
+                    let after: Vec<(String, serde_json::Value)> = db
+                        .read(|connection| database::states(connection, ""))
+                        .unwrap();
+                    assert_eq!(after, before);
+                },
+            );
+        }
     }
 
     #[test]
@@ -5872,12 +6928,26 @@ mod tests {
     }
     #[test]
     fn quota_sync_bootstrap_cow_replay_and_tombstones_keep_local_account_separate() {
+        quota_sync_bootstrap_replay_and_tombstones(false);
+    }
+
+    #[test]
+    fn sqlite_quota_pages_incremental_replay_and_generation_gc_keep_active_stream() {
+        quota_sync_bootstrap_replay_and_tombstones(true);
+    }
+
+    fn quota_sync_bootstrap_replay_and_tombstones(sqlite: bool) {
         use crate::domain::Provenance;
         use crate::history::QuotaPoint;
         use crate::remote_quota::{RemoteQuotaChange, RemoteQuotaDay, RemoteQuotaPoint};
         let root = tempdir().unwrap();
         let binding = binding_with(1, 1, 60);
-        let ingest = store(root.path(), binding.clone());
+        let history = if sqlite {
+            SourceHistoryStore::new_sqlite(root.path().to_owned(), PROFILE.parse().unwrap())
+        } else {
+            SourceHistoryStore::new(root.path().to_owned(), PROFILE.parse().unwrap())
+        };
+        let ingest = RemoteDeltaIngestStateStore::new(history, binding.clone()).unwrap();
         let range = export_range(at(30, 3, 0), 60);
         let make_change = |sequence, observed_at: DateTime<Utc>, remaining| RemoteQuotaChange {
             sequence: nonzero64(sequence),
@@ -5906,10 +6976,11 @@ mod tests {
             payload.stats.quota_changes_emitted = 1;
             response(&binding, range.clone(), page, payload)
         };
-        with_history_writer(
+        with_history_writer_backend(
             root.path(),
             PROFILE,
             binding.redaction_profile,
+            sqlite,
             |history, writer| {
                 writer
                     .save_source_metadata(
@@ -5982,8 +7053,21 @@ mod tests {
                 assert_eq!(read()[1].remaining_percent, 94.8);
                 let mut recovered = ingest.try_begin().unwrap();
                 let replay = recovered.pending_page().unwrap().unwrap();
-                apply_and_commit_remote_delta_page(&mut recovered, writer, &replay, at(30, 4, 4))
-                    .unwrap();
+                let replay_commit = apply_and_commit_remote_delta_page(
+                    &mut recovered,
+                    writer,
+                    &replay,
+                    at(30, 4, 4),
+                )
+                .unwrap();
+                if sqlite {
+                    assert_eq!(
+                        replay_commit.cleanup,
+                        RemoteGenerationCleanup::Completed(
+                            RemoteHistoryGenerationGcOutcome::Deleted
+                        )
+                    );
+                }
                 assert_eq!(read().len(), 2);
                 let deletion = RemoteQuotaChange {
                     sequence: nonzero64(4),
@@ -6012,6 +7096,74 @@ mod tests {
                     .unwrap();
                 assert_eq!(read().len(), 1);
                 assert!(loaded_bucket_totals(history, &binding).is_empty());
+                if sqlite {
+                    let orphan: SourceHistoryRemoteGenerationId =
+                        "ingest-gen-ffffffffffffffffffffffffffffffff"
+                            .parse()
+                            .unwrap();
+                    let history_binding = source_history_binding(&binding).unwrap();
+                    writer
+                        .ensure_remote_history_generation(
+                            &binding.source.node_id,
+                            binding.redaction_profile,
+                            &orphan,
+                            &history_binding,
+                        )
+                        .unwrap();
+                    writer
+                        .apply_remote_history_generation_page(
+                            &binding.source.node_id,
+                            binding.redaction_profile,
+                            &orphan,
+                            &history_binding,
+                            &[],
+                            &[],
+                            &[make_change(1, at(30, 3, 50), 80.0)],
+                        )
+                        .unwrap();
+                    let db = history.sqlite_database().unwrap();
+                    let quota_namespace = db
+                        .namespace(
+                            &history
+                                .source_remote_history_generation_directory(
+                                    &binding.source.node_id,
+                                    binding.redaction_profile,
+                                    &orphan,
+                                )
+                                .join("quota.json"),
+                        )
+                        .unwrap();
+                    assert!(
+                        db.read(|connection| database::state::<serde_json::Value>(
+                            connection,
+                            &quota_namespace
+                        ))
+                        .unwrap()
+                        .is_some()
+                    );
+                    let swept =
+                        sweep_unreferenced_remote_history_generations(&recovered, writer).unwrap();
+                    assert_eq!(swept.deleted, 1);
+                    assert!(swept.skipped >= 1);
+                    db.read(|connection| {
+                        assert!(
+                            database::state::<serde_json::Value>(connection, &quota_namespace)?
+                                .is_none()
+                        );
+                        assert!(
+                            database::records::<serde_json::Value>(
+                                connection,
+                                &quota_namespace,
+                                i64::MIN,
+                                &mut crate::source_history::SourceHistoryReadBudget::for_query()
+                            )?
+                            .is_empty()
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(read().len(), 1);
+                }
             },
         );
     }

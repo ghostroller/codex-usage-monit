@@ -1,5 +1,7 @@
 # 项目瘦身与外部库复用提案：审核意见
 
+> 2026-10-02 决策更新：用户决定不采用 A 方案，保留全部去重功能，授权优先实施生产历史存储重写。后续工作以[新的存储重写执行方案](storage-rewrite-execution-plan-2026-10-02.zh-CN.md)为准；本文件保留此前审核及其证据边界。
+
 日期：2026-09-26  
 仓库：`ghostroller/codex-usage-monit`  
 审核对象：[`refactoring-proposal-2026-09-26.zh-CN.md`](refactoring-proposal-2026-09-26.zh-CN.md)  

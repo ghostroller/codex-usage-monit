@@ -1,6 +1,8 @@
 //! Crash-safe retirement of no-longer-visible SSH preview history.
 //!
-//! The privacy transition is deliberately ordered as:
+//! SQLite publishes the metadata change and deletes the preview subtree in
+//! one transaction. Migration retains a queued marker while preview is still
+//! visible. The legacy migration/fixture transition is deliberately ordered as:
 //!
 //! 1. persist a source-scoped retirement marker;
 //! 2. atomically publish `redacted` in `source.json`;
@@ -88,6 +90,18 @@ impl SourceHistoryWriter<'_, '_, '_> {
                 "v2 history writer authority does not match the published remote redaction profile",
             ));
         }
+        if let Some(database) = self.store.sqlite_database() {
+            return self.fenced(|store| {
+                database.write(|_| {
+                    let result = store.publish_remote_source_redaction_profile_unfenced(
+                        source_id,
+                        target_profile,
+                    )?;
+                    self.validate()?;
+                    Ok(result)
+                })
+            });
+        }
         self.fenced(|store| {
             store.publish_remote_source_redaction_profile_unfenced(source_id, target_profile)
         })
@@ -99,6 +113,18 @@ impl SourceHistoryWriter<'_, '_, '_> {
         &self,
         source_id: &NodeId,
     ) -> io::Result<SourceRedactionRetirementStatus> {
+        if let Some(database) = self.store.sqlite_database() {
+            return self.fenced(|store| {
+                database.write(|_| {
+                    let status = store.retry_remote_source_redaction_retirement_unfenced(
+                        source_id,
+                        self.redaction_profile(),
+                    )?;
+                    self.validate()?;
+                    Ok(status)
+                })
+            });
+        }
         self.fenced(|store| {
             store.retry_remote_source_redaction_retirement_unfenced(
                 source_id,
@@ -109,11 +135,119 @@ impl SourceHistoryWriter<'_, '_, '_> {
 }
 
 impl SourceHistoryStore {
+    /// Carries pending privacy transitions into the same import transaction
+    /// as their data. Already-hidden SQL preview rows can be retired there;
+    /// the original filesystem namespace remains an explicit backup.
+    pub(crate) fn import_legacy_redaction_retirement_sqlite_state(
+        &self,
+        legacy: &SourceHistoryStore,
+    ) -> io::Result<()> {
+        if legacy.sqlite_database().is_some() || legacy.profile_id() != self.profile_id() {
+            return Err(invalid_data(
+                "redaction retirement import backend/profile mismatch",
+            ));
+        }
+        let database = self
+            .sqlite_database()
+            .ok_or_else(|| invalid_data("redaction retirement import requires SQLite"))?;
+        database.write(|connection| {
+            let already_imported =
+                !database::state_keys(connection, "database/migration/")?.is_empty();
+            for source in legacy.list_source_metadata()? {
+                if source.kind() != SourceKind::Ssh {
+                    continue;
+                }
+                let directory = legacy.source_directory(source.source_id());
+                let marker = read_optional_json_file::<SourceRedactionRetirementMarker>(
+                    &retirement_marker_path(&directory),
+                    MAX_METADATA_FILE_BYTES,
+                )?;
+                if let Some(marker) = &marker {
+                    marker.validate(legacy.profile_id(), source.source_id())?;
+                }
+                if already_imported {
+                    continue;
+                }
+                if marker.is_none()
+                    && (source.aggregate_redaction_profile() != RedactionProfile::Redacted
+                        || !retirement_artifacts_exist(legacy, source.source_id())?)
+                {
+                    continue;
+                }
+                let marker = marker.unwrap_or_else(|| {
+                    SourceRedactionRetirementMarker::preview_to_redacted(
+                        self.profile_id.clone(),
+                        source.source_id().clone(),
+                    )
+                });
+                let key = database.namespace(&retirement_marker_path(
+                    &self.source_directory(source.source_id()),
+                ))?;
+                if let Some(existing) =
+                    sqlite_retirement_marker(self, connection, source.source_id(), &key)?
+                    && existing != marker
+                {
+                    return Err(invalid_data("redaction retirement import marker conflict"));
+                }
+                database::set_state(connection, &key, &marker)?;
+                if source.aggregate_redaction_profile() == RedactionProfile::Redacted {
+                    self.retry_remote_source_redaction_retirement_unfenced(
+                        source.source_id(),
+                        RedactionProfile::Redacted,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn publish_remote_source_redaction_profile_unfenced(
         &self,
         source_id: &NodeId,
         target_profile: RedactionProfile,
     ) -> io::Result<(SourceMetadata, SourceRedactionRetirementStatus)> {
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|connection| {
+                let mut metadata = self.load_source_metadata(source_id)?;
+                require_remote_source(&metadata)?;
+                let marker_key = database
+                    .namespace(&retirement_marker_path(&self.source_directory(source_id)))?;
+                let marker = sqlite_retirement_marker(self, connection, source_id, &marker_key)?;
+                let retiring = target_profile == RedactionProfile::Redacted
+                    && (metadata.aggregate_redaction_profile() == RedactionProfile::PreviewEnabled
+                        || marker.is_some()
+                        || sqlite_preview_exists(self, &database, connection, source_id)?);
+                if retiring && marker.is_none() {
+                    database::set_state(
+                        connection,
+                        &marker_key,
+                        &SourceRedactionRetirementMarker::preview_to_redacted(
+                            self.profile_id.clone(),
+                            source_id.clone(),
+                        ),
+                    )?;
+                }
+                if metadata.aggregate_redaction_profile() != target_profile {
+                    metadata = self.update_source_metadata_unfenced(source_id, |metadata| {
+                        metadata.set_aggregate_redaction_profile(target_profile);
+                        Ok(())
+                    })?;
+                }
+                let status = if retiring {
+                    let namespace = database.namespace(
+                        &self
+                            .source_directory(source_id)
+                            .join(RedactionProfile::PreviewEnabled.directory_name()),
+                    )?;
+                    source_purge::delete_sqlite_namespace_tree(connection, &namespace)?;
+                    database::delete_state(connection, &marker_key)?;
+                    SourceRedactionRetirementStatus::Complete
+                } else {
+                    SourceRedactionRetirementStatus::NotRequired
+                };
+                Ok((metadata, status))
+            });
+        }
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
@@ -154,6 +288,31 @@ impl SourceHistoryStore {
         if writer_profile != RedactionProfile::Redacted {
             return Ok(SourceRedactionRetirementStatus::NotRequired);
         }
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|connection| {
+                let metadata = self.load_source_metadata(source_id)?;
+                require_remote_source(&metadata)?;
+                let marker_key = database
+                    .namespace(&retirement_marker_path(&self.source_directory(source_id)))?;
+                let marker = sqlite_retirement_marker(self, connection, source_id, &marker_key)?;
+                if metadata.aggregate_redaction_profile() != RedactionProfile::Redacted {
+                    return Ok(SourceRedactionRetirementStatus::Pending);
+                }
+                if marker.is_none()
+                    && !sqlite_preview_exists(self, &database, connection, source_id)?
+                {
+                    return Ok(SourceRedactionRetirementStatus::NotRequired);
+                }
+                let namespace = database.namespace(
+                    &self
+                        .source_directory(source_id)
+                        .join(RedactionProfile::PreviewEnabled.directory_name()),
+                )?;
+                source_purge::delete_sqlite_namespace_tree(connection, &namespace)?;
+                database::delete_state(connection, &marker_key)?;
+                Ok(SourceRedactionRetirementStatus::Complete)
+            });
+        }
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
@@ -179,12 +338,62 @@ impl SourceHistoryStore {
 
     #[cfg(test)]
     pub(crate) fn queue_preview_retirement_for_test(&self, source_id: &NodeId) -> io::Result<()> {
+        if let Some(database) = self.sqlite_database() {
+            let key =
+                database.namespace(&retirement_marker_path(&self.source_directory(source_id)))?;
+            return database.write(|connection| {
+                if sqlite_retirement_marker(self, connection, source_id, &key)?.is_none() {
+                    database::set_state(
+                        connection,
+                        &key,
+                        &SourceRedactionRetirementMarker::preview_to_redacted(
+                            self.profile_id.clone(),
+                            source_id.clone(),
+                        ),
+                    )?;
+                }
+                Ok(())
+            });
+        }
         let source_directory = self.source_directory(source_id);
         self.validate_private_path(&source_directory)?;
         let lock = open_lock_file(&source_directory, SOURCE_LOCK_FILE)?;
         let _lock = lock_exclusive(lock, &source_directory, SOURCE_LOCK_FILE)?;
         ensure_retirement_marker_locked(self, source_id, &source_directory)
     }
+}
+
+fn sqlite_retirement_marker(
+    store: &SourceHistoryStore,
+    connection: &rusqlite::Connection,
+    source_id: &NodeId,
+    key: &str,
+) -> io::Result<Option<SourceRedactionRetirementMarker>> {
+    let marker = sqlite_state_bounded::<SourceRedactionRetirementMarker>(
+        connection,
+        key,
+        MAX_METADATA_FILE_BYTES,
+        None,
+    )?;
+    if let Some(marker) = &marker {
+        marker.validate(store.profile_id(), source_id)?;
+    }
+    Ok(marker)
+}
+
+fn sqlite_preview_exists(
+    store: &SourceHistoryStore,
+    database: &database::HistoryDatabase,
+    connection: &rusqlite::Connection,
+    source_id: &NodeId,
+) -> io::Result<bool> {
+    let namespace = database.namespace(
+        &store
+            .source_directory(source_id)
+            .join(RedactionProfile::PreviewEnabled.directory_name()),
+    )?;
+    let prefix = format!("{namespace}/");
+    connection.query_row("SELECT EXISTS(SELECT 1 FROM history_records WHERE namespace=?1 OR substr(namespace,1,length(?2))=?2) OR EXISTS(SELECT 1 FROM history_state WHERE state_key=?1 OR substr(state_key,1,length(?2))=?2)", rusqlite::params![namespace, prefix], |row| row.get(0)).map_err(database::sql_error)
 }
 
 fn require_remote_source(metadata: &SourceMetadata) -> io::Result<()> {
@@ -497,6 +706,10 @@ mod tests {
     }
 
     fn store() -> (tempfile::TempDir, SourceHistoryStore, NodeId) {
+        store_backend(false)
+    }
+
+    fn store_backend(sqlite: bool) -> (tempfile::TempDir, SourceHistoryStore, NodeId) {
         let directory = tempdir().unwrap();
         let root = directory.path().join("state");
         fs::create_dir(&root).unwrap();
@@ -506,7 +719,11 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let profile = "profile".parse().unwrap();
-        let store = SourceHistoryStore::new(root, profile);
+        let store = if sqlite {
+            SourceHistoryStore::new_sqlite(root, profile)
+        } else {
+            SourceHistoryStore::new(root, profile)
+        };
         let source: NodeId = SOURCE.parse().unwrap();
         store
             .save_source_metadata(
@@ -709,5 +926,209 @@ mod tests {
             "visibility changes before best-effort physical retirement"
         );
         assert!(retirement_marker_path(&store.source_directory(&source)).exists());
+    }
+
+    #[test]
+    fn sqlite_retirement_preserves_visible_preview_until_metadata_and_data_commit_together() {
+        let (_directory, store, source) = store_backend(true);
+        install_preview_generation(&store, &source);
+        store
+            .update_source_metadata(&source, |metadata| {
+                metadata.set_detached(true);
+                metadata.set_include_in_aggregates(false);
+                Ok(())
+            })
+            .unwrap();
+        let database = store.sqlite_database().unwrap();
+        let preview = database
+            .namespace(
+                &store
+                    .source_directory(&source)
+                    .join("preview-enabled/facts/active"),
+            )
+            .unwrap();
+        let redacted = database
+            .namespace(
+                &store
+                    .source_directory(&source)
+                    .join("redacted/facts/active"),
+            )
+            .unwrap();
+        let other = database
+            .namespace(
+                &store
+                    .sources_directory()
+                    .join("node-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/preview-enabled/facts/active"),
+            )
+            .unwrap();
+        database
+            .write(|connection| {
+                database::put_record(connection, &preview, "event", 1, &1u64)?;
+                database::put_record(connection, &redacted, "event", 1, &2u64)?;
+                database::put_record(connection, &other, "event", 1, &3u64)
+            })
+            .unwrap();
+        store.queue_preview_retirement_for_test(&source).unwrap();
+        assert_eq!(
+            store
+                .retry_remote_source_redaction_retirement_unfenced(
+                    &source,
+                    RedactionProfile::Redacted
+                )
+                .unwrap(),
+            SourceRedactionRetirementStatus::Pending
+        );
+        assert!(
+            store
+                .active_remote_history_generation(&source, RedactionProfile::PreviewEnabled)
+                .unwrap()
+                .is_some()
+        );
+        database
+            .write(|_| {
+                store.publish_remote_source_redaction_profile_unfenced(
+                    &source,
+                    RedactionProfile::Redacted,
+                )?;
+                Err::<(), _>(io::Error::other("interrupt before privacy commit"))
+            })
+            .unwrap_err();
+        assert_eq!(
+            store
+                .load_source_metadata(&source)
+                .unwrap()
+                .aggregate_redaction_profile(),
+            RedactionProfile::PreviewEnabled
+        );
+        assert!(
+            store
+                .active_remote_history_generation(&source, RedactionProfile::PreviewEnabled)
+                .unwrap()
+                .is_some()
+        );
+        let (metadata, status) = store
+            .publish_remote_source_redaction_profile_unfenced(&source, RedactionProfile::Redacted)
+            .unwrap();
+        assert_eq!(status, SourceRedactionRetirementStatus::Complete);
+        assert!(metadata.detached());
+        assert!(!metadata.include_in_aggregates());
+        assert!(
+            store
+                .active_remote_history_generation(&source, RedactionProfile::PreviewEnabled)
+                .unwrap()
+                .is_none()
+        );
+        database
+            .read(|connection| {
+                let load = |namespace: &str| {
+                    database::records::<u64>(
+                        connection,
+                        namespace,
+                        0,
+                        &mut SourceHistoryReadBudget::for_query(),
+                    )
+                };
+                assert!(load(&preview)?.is_empty());
+                assert_eq!(load(&redacted)?, vec![2]);
+                assert_eq!(load(&other)?, vec![3]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .retry_remote_source_redaction_retirement_unfenced(
+                    &source,
+                    RedactionProfile::Redacted
+                )
+                .unwrap(),
+            SourceRedactionRetirementStatus::NotRequired
+        );
+    }
+
+    #[test]
+    fn sqlite_migration_carries_retirement_intent_without_deleting_still_visible_preview() {
+        for profile in [RedactionProfile::PreviewEnabled, RedactionProfile::Redacted] {
+            let (_directory, legacy, source) = store();
+            legacy.queue_preview_retirement_for_test(&source).unwrap();
+            legacy
+                .update_source_metadata(&source, |metadata| {
+                    metadata.set_aggregate_redaction_profile(profile);
+                    Ok(())
+                })
+                .unwrap();
+            let marker_path = retirement_marker_path(&legacy.source_directory(&source));
+            let marker_bytes = fs::read(&marker_path).unwrap();
+            let target = SourceHistoryStore::new_sqlite(
+                legacy.state_root().to_owned(),
+                legacy.profile_id().clone(),
+            );
+            target
+                .save_source_metadata(&legacy.load_source_metadata(&source).unwrap())
+                .unwrap();
+            install_preview_generation(&target, &source);
+            target
+                .import_legacy_redaction_retirement_sqlite_state(&legacy)
+                .unwrap();
+            assert_eq!(
+                target
+                    .load_source_metadata(&source)
+                    .unwrap()
+                    .aggregate_redaction_profile(),
+                profile
+            );
+            assert_eq!(
+                target
+                    .active_remote_history_generation(&source, RedactionProfile::PreviewEnabled)
+                    .unwrap()
+                    .is_some(),
+                profile == RedactionProfile::PreviewEnabled
+            );
+            assert_eq!(
+                target
+                    .retry_remote_source_redaction_retirement_unfenced(
+                        &source,
+                        RedactionProfile::Redacted
+                    )
+                    .unwrap(),
+                if profile == RedactionProfile::PreviewEnabled {
+                    SourceRedactionRetirementStatus::Pending
+                } else {
+                    SourceRedactionRetirementStatus::NotRequired
+                }
+            );
+            if profile == RedactionProfile::Redacted {
+                target
+                    .sqlite_database()
+                    .unwrap()
+                    .write(|connection| {
+                        database::set_state(connection, "database/migration/test-receipt", &true)
+                    })
+                    .unwrap();
+                target
+                    .update_source_metadata(&source, |metadata| {
+                        metadata.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+                        Ok(())
+                    })
+                    .unwrap();
+                install_preview_generation(&target, &source);
+                target
+                    .import_legacy_redaction_retirement_sqlite_state(&legacy)
+                    .unwrap();
+                assert_eq!(
+                    target
+                        .load_source_metadata(&source)
+                        .unwrap()
+                        .aggregate_redaction_profile(),
+                    RedactionProfile::PreviewEnabled
+                );
+                assert!(
+                    target
+                        .active_remote_history_generation(&source, RedactionProfile::PreviewEnabled)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert_eq!(fs::read(marker_path).unwrap(), marker_bytes);
+        }
     }
 }

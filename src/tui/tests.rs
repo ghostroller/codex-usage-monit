@@ -11006,8 +11006,23 @@ fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cach
     let metadata_path = source_store
         .source_directory(&sources[0].0)
         .join("source.json");
-    let metadata_bytes = std::fs::read(&metadata_path).unwrap();
-    std::fs::write(&metadata_path, b"invalid metadata").unwrap();
+    let database = source_store.sqlite_database().unwrap();
+    let metadata_key = database.namespace(&metadata_path).unwrap();
+    let metadata = database
+        .read(|connection| {
+            crate::source_history::database::state::<serde_json::Value>(connection, &metadata_key)
+        })
+        .unwrap()
+        .unwrap();
+    database
+        .write(|connection| {
+            crate::source_history::database::set_state(
+                connection,
+                &metadata_key,
+                &"invalid metadata",
+            )
+        })
+        .unwrap();
     for supplied in [Some(&seed), None] {
         let error = store
             .load_remote_overview_history(supplied, now)
@@ -11017,13 +11032,21 @@ fn remote_overview_seed_with_remote_sources_preserves_projection_errors_and_cach
             "{error}"
         );
     }
-    std::fs::write(&metadata_path, metadata_bytes).unwrap();
+    database
+        .write(|connection| {
+            crate::source_history::database::set_state(connection, &metadata_key, &metadata)
+        })
+        .unwrap();
     let remote_root = source_store
         .source_remote_history_directory(&sources[1].0, RedactionProfile::PreviewEnabled);
-    source_store
-        .prepare_private_directory(&remote_root)
+    let active_key = database
+        .namespace(&remote_root.join("active.json"))
         .unwrap();
-    std::fs::write(remote_root.join("active.json"), b"invalid manifest").unwrap();
+    database
+        .write(|connection| {
+            crate::source_history::database::set_state(connection, &active_key, &"invalid manifest")
+        })
+        .unwrap();
     for supplied in [Some(&seed), None] {
         let error = store
             .load_remote_overview_history(supplied, now)
@@ -11330,7 +11353,7 @@ fn v2_projection_cache_rebases_only_a_proven_noop_local_revision() {
 }
 
 #[test]
-fn v2_projection_cache_reloads_after_metadata_only_journal_recovery() {
+fn v2_projection_cache_reloads_after_sqlite_batch_rollback_and_retry() {
     for exact_local in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let codex_home = directory.path().join("codex-home");
@@ -11353,20 +11376,31 @@ fn v2_projection_cache_reloads_after_metadata_only_journal_recovery() {
         } else {
             HistorySourceSelection::AllIncluded
         };
+        let mut initial = tui_runtime_test_observation(starts_at, 10);
+        initial.half_hour_buckets[0].project_groups.clear();
+        runtime
+            .record_local_observation(&initial, LocalObservationMode::Incremental)
+            .unwrap();
         let mut observation = tui_runtime_test_observation(starts_at, 20);
         observation.half_hour_buckets[0].project_groups.clear();
-        // Every family is durable, but the journal still fences the combined
-        // read. Recovery will change visibility without rewriting any shard.
+        // A failure after metadata rolls back the whole SQL batch. Readers
+        // retain the previous complete observation until a later commit.
         crate::source_history::inject_local_observation_failure_after("metadata");
         runtime
             .record_local_observation(&observation, LocalObservationMode::Incremental)
             .unwrap_err();
         let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), Vec::new());
         let since = history_view_since(now);
-        let pending = store.load_since_with_staged_selected(&selection, since);
-        assert!(pending.history.half_hour_buckets.is_empty());
-        assert!(pending.history.warnings.iter().any(|warning| {
-            warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
+        let previous = store.load_since_with_staged_selected(&selection, since);
+        assert_eq!(previous.history.half_hour_buckets.len(), 1);
+        assert_eq!(
+            previous.history.half_hour_buckets[0]
+                .token_usage
+                .total_tokens,
+            10
+        );
+        assert!(previous.history.warnings.iter().all(|warning| {
+            !warning.starts_with(crate::source_history::LOCAL_OBSERVATION_RECOVERY_PENDING_WARNING)
         }));
         assert!(store.projection_cache_valid(&selection, since, false));
 
@@ -11393,9 +11427,265 @@ fn v2_projection_cache_reloads_after_metadata_only_journal_recovery() {
         }));
         assert_eq!(
             store.projection_cache_delivery_clones, 0,
-            "recovery must reload immediately without serving the cached pending projection"
+            "retry must reload immediately without serving the cached previous observation"
         );
     }
+}
+
+#[test]
+fn tui_history_with_damaged_or_missing_ownership_excludes_persisted_v1_backup() {
+    for missing in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let history_root = directory.path().join("state/history-v1");
+        let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+        let mut legacy = HistoryStore::new(history_root.clone(), &codex_home);
+        legacy
+            .record(&tui_runtime_test_observation(starts_at, 999))
+            .unwrap();
+        let shard = legacy.namespace_dir().unwrap().join("2026-08-30.json");
+        let before = std::fs::read(&shard).unwrap();
+        let runtime = HistoryRuntime::new(history_root.clone(), &codex_home, false).unwrap();
+        runtime.ensure_ownership_initialized().unwrap();
+        let manifest = runtime.ownership().manifest_path();
+        drop(runtime);
+        if missing {
+            std::fs::remove_file(manifest).unwrap();
+        } else {
+            std::fs::write(manifest, b"invalid ownership").unwrap();
+        }
+        let config = CollectConfig {
+            codex_home: codex_home.clone(),
+            ..CollectConfig::default()
+        };
+        let binding = HistoryRuntime::new(history_root, &codex_home, false);
+        assert!(binding.is_err());
+        let mut store = tui_history_store_from_binding(&config, binding);
+        store.stage(&tui_runtime_test_observation(
+            starts_at + ChronoDuration::minutes(30),
+            42,
+        ));
+        let history = store.load_since_with_staged(starts_at - ChronoDuration::hours(1));
+        assert!(history.read_only);
+        assert_eq!(history.half_hour_buckets.len(), 1);
+        assert_eq!(history.half_hour_buckets[0].token_usage.total_tokens, 42);
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("read-only memory view"))
+        );
+        assert!(store.flush_staged_if_due(Duration::ZERO).unwrap().is_none());
+        assert_eq!(std::fs::read(&shard).unwrap(), before);
+    }
+}
+
+#[test]
+fn file_v2_tui_defers_writes_while_busy_then_upgrades_preserving_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let now = starts_at + ChronoDuration::minutes(20);
+    let mut runtime = tui_file_v2_runtime(
+        history_root.clone(),
+        &codex_home,
+        &tui_runtime_test_observation(starts_at, 10),
+    );
+    let profile_lease = acquire_runtime_profile_lease(&runtime).unwrap();
+    let local_id = runtime.source_identity().node_id().clone();
+    let legacy_source_directory = runtime.source_history().source_directory(&local_id);
+    let legacy_bytes = || {
+        walkdir::WalkDir::new(&legacy_source_directory)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .map(|entry| {
+                (
+                    entry.path().to_path_buf(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = legacy_bytes();
+    assert!(!before.is_empty());
+    let recorder = match crate::service::try_acquire_recorder_instance_lock(&history_root).unwrap()
+    {
+        TryRecorderInstanceLock::Acquired(guard) => guard,
+        TryRecorderInstanceLock::Busy => panic!("fixture recorder lock is busy"),
+    };
+    let warnings = match prepare_tui_history_runtime(&mut runtime, &profile_lease, now) {
+        TuiHistoryRuntimePreparation::Ready(warnings) => warnings,
+        TuiHistoryRuntimePreparation::LegacyFallback(warnings) => {
+            panic!("file v2 must retain its source-aware snapshot: {warnings:?}")
+        }
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("upgrade is deferred"))
+    );
+    let selection = HistorySourceSelection::Local(local_id);
+    let since = starts_at - ChronoDuration::hours(1);
+    let mut store = TuiHistoryStore::runtime(runtime, Some(profile_lease), warnings);
+    let existing = store.load_since_with_staged_selected(&selection, since);
+    assert!(existing.query_error.is_none(), "{:?}", existing.query_error);
+    assert!(existing.history.read_only);
+    assert_eq!(
+        existing.history.half_hour_buckets[0]
+            .token_usage
+            .total_tokens,
+        10
+    );
+    store.stage(&tui_runtime_test_observation(starts_at, 20));
+    assert!(store.flush_staged().unwrap().is_none());
+    assert_eq!(legacy_bytes(), before);
+    drop(recorder);
+
+    let (TuiHistoryBackend::Runtime(runtime), Some(profile_lease)) =
+        (&mut store.backend, &store.profile_lease)
+    else {
+        panic!("deferred file v2 must retain its runtime and lease");
+    };
+    assert!(matches!(
+        prepare_tui_history_runtime(runtime, profile_lease, now),
+        TuiHistoryRuntimePreparation::Ready(_)
+    ));
+    assert!(runtime.source_history().sqlite_database().is_some());
+    assert!(store.write_permitted());
+    assert!(matches!(
+        store.flush_staged().unwrap(),
+        Some(HistoryRuntimeWriteReport::V2(_))
+    ));
+    let upgraded = store.load_since_with_staged_selected(&selection, since);
+    assert!(upgraded.query_error.is_none(), "{:?}", upgraded.query_error);
+    assert!(!upgraded.history.read_only);
+    assert_eq!(
+        upgraded.history.half_hour_buckets[0]
+            .token_usage
+            .total_tokens,
+        20
+    );
+    assert_eq!(
+        legacy_bytes(),
+        before,
+        "SQL commits must preserve the file backup"
+    );
+}
+
+#[test]
+fn file_v2_projection_cache_refreshes_after_another_runtime_activates_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&codex_home).unwrap();
+    let history_root = directory.path().join("state/history-v1");
+    let starts_at = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+    let runtime = tui_file_v2_runtime(
+        history_root.clone(),
+        &codex_home,
+        &tui_runtime_test_observation(starts_at, 10),
+    );
+    let lease = acquire_runtime_profile_lease(&runtime).unwrap();
+    let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
+    let since = starts_at - ChronoDuration::hours(1);
+    let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
+    let existing = store.load_since_with_staged_selected(&selection, since);
+    assert!(existing.query_error.is_none(), "{:?}", existing.query_error);
+    assert_eq!(
+        existing.history.half_hour_buckets[0]
+            .token_usage
+            .total_tokens,
+        10
+    );
+    assert!(store.projection_cache_valid(&selection, since, false));
+
+    let mut writer_runtime = HistoryRuntime::new(history_root, &codex_home, false).unwrap();
+    let _writer_profile_lease = acquire_runtime_profile_lease(&writer_runtime).unwrap();
+    writer_runtime.ensure_v2_active().unwrap();
+    writer_runtime
+        .record_local_observation(
+            &tui_runtime_test_observation(starts_at, 20),
+            LocalObservationMode::Incremental,
+        )
+        .unwrap();
+    assert!(store.cached_projection(&selection, since, false).is_none());
+    let refreshed = store.load_since_with_staged_selected(&selection, since);
+    assert!(
+        refreshed.query_error.is_none(),
+        "{:?}",
+        refreshed.query_error
+    );
+    assert_eq!(
+        refreshed.history.half_hour_buckets[0]
+            .token_usage
+            .total_tokens,
+        20
+    );
+    assert!(!refreshed.history.read_only);
+    assert!(
+        store
+            .source_history_store()
+            .unwrap()
+            .sqlite_database()
+            .is_some()
+    );
+}
+
+fn tui_file_v2_runtime(
+    history_root: PathBuf,
+    codex_home: &Path,
+    observation: &HistoryObservation,
+) -> HistoryRuntime {
+    use crate::history_ownership::{InitializeV1Outcome, OwnershipCasOutcome, TryWriterLease};
+    let runtime = HistoryRuntime::new(history_root, codex_home, false).unwrap();
+    let lease = match runtime.ownership().try_acquire_writer_lease().unwrap() {
+        TryWriterLease::Acquired(lease) => lease,
+        TryWriterLease::Busy(_) => panic!("fixture writer lease is busy"),
+    };
+    let v1 = match runtime.ownership().initialize_v1_active(&lease).unwrap() {
+        InitializeV1Outcome::Initialized(manifest) | InitializeV1Outcome::Existing(manifest) => {
+            manifest
+        }
+    };
+    let OwnershipCasOutcome::Applied(migrating) =
+        runtime.ownership().begin_migration(&lease, &v1).unwrap()
+    else {
+        panic!("fixture migration conflicted");
+    };
+    let OwnershipCasOutcome::Applied(active) = runtime
+        .ownership()
+        .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+        .unwrap()
+    else {
+        panic!("fixture activation conflicted");
+    };
+    assert!(!active.is_sqlite_backend());
+    let authority = runtime
+        .ownership()
+        .authorize_v2_write(&lease, &active)
+        .unwrap();
+    runtime
+        .source_history()
+        .writer(&authority)
+        .unwrap()
+        .record_local_observation(
+            runtime.source_identity(),
+            "local",
+            runtime.redaction_profile(),
+            observation,
+            LocalObservationMode::Incremental,
+        )
+        .unwrap();
+    drop(lease);
+    runtime
 }
 
 #[test]

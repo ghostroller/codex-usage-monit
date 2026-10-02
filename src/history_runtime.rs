@@ -299,9 +299,15 @@ impl HistoryRuntime {
             ));
         }
 
-        let source_history = SourceHistoryStore::new(state_root.clone(), profile_id.clone());
+        let mut source_history = SourceHistoryStore::new(state_root.clone(), profile_id.clone());
         let ownership =
             HistoryOwnershipStore::new(state_root.clone(), profile_id.clone(), redaction_profile);
+        if let OwnershipManifestStatus::Initialized(manifest) = ownership.load_manifest()?
+            && manifest.is_sqlite_backend()
+            && manifest.state() == HistoryOwnershipState::V2Active
+        {
+            source_history = SourceHistoryStore::new_sqlite(state_root.clone(), profile_id.clone());
+        }
         if source_history.state_root() != state_root
             || source_history.profile_id() != &profile_id
             || ownership.state_root() != state_root
@@ -537,6 +543,7 @@ impl HistoryRuntime {
         selection: &HistorySourceSelection,
         context: &mut crate::history_query::HistoryQueryContext,
     ) -> io::Result<UnifiedHistorySnapshot> {
+        self.refresh_active_sqlite_backend()?;
         let mut snapshot = crate::history_query::load_unified_history_with_context(
             &self.ownership,
             &mut self.legacy,
@@ -549,6 +556,28 @@ impl HistoryRuntime {
         .into_snapshot()?;
         self.append_pending_runtime_warning(&mut snapshot);
         Ok(snapshot)
+    }
+
+    /// Another cooperating process can finish the cutover after this runtime
+    /// was constructed. Refresh a reader without waiting for its writer lease
+    /// or running a migration from inside a query.
+    pub(crate) fn refresh_active_sqlite_backend(&mut self) -> io::Result<()> {
+        if let OwnershipManifestStatus::Initialized(manifest) = self.ownership.load_manifest()?
+            && manifest.is_sqlite_backend()
+            && manifest.state() == HistoryOwnershipState::V2Active
+        {
+            self.validate_manifest_binding(&manifest)?;
+            let store =
+                SourceHistoryStore::new_sqlite(self.state_root.clone(), self.profile_id.clone());
+            crate::sqlite_history_migration::validate_receipt(
+                &store
+                    .sqlite_database()
+                    .expect("SQLite store has a database"),
+                &manifest,
+            )?;
+            self.source_history = store;
+        }
+        Ok(())
     }
 
     fn append_pending_runtime_warning(&self, snapshot: &mut UnifiedHistorySnapshot) {
@@ -1089,8 +1118,15 @@ impl HistoryRuntime {
         let manifest_status = self.ownership.load_manifest()?;
         if let OwnershipManifestStatus::Initialized(manifest) = &manifest_status {
             self.validate_manifest_binding(manifest)?;
-            if manifest.state() == HistoryOwnershipState::V2Active {
-                return Ok(manifest.clone());
+            if manifest.is_sqlite_backend() && manifest.state() == HistoryOwnershipState::V2Active {
+                let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
+                    &self.ownership,
+                    &lease,
+                    manifest,
+                    &self.source_history,
+                )?;
+                self.source_history = store;
+                return Ok(active);
             }
         }
         let coordination_root = self.service_coordination_root_for_cutover()?;
@@ -1129,8 +1165,28 @@ impl HistoryRuntime {
         };
         self.validate_manifest_binding(&manifest)?;
 
+        if manifest.uses_source_history() {
+            let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
+                &self.ownership,
+                &lease,
+                &manifest,
+                &self.source_history,
+            )?;
+            self.source_history = store;
+            return Ok(active);
+        }
+
         let migrating = match manifest.state() {
-            HistoryOwnershipState::V2Active => return Ok(manifest),
+            HistoryOwnershipState::V2Active => {
+                let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
+                    &self.ownership,
+                    &lease,
+                    &manifest,
+                    &self.source_history,
+                )?;
+                self.source_history = store;
+                return Ok(active);
+            }
             HistoryOwnershipState::Migrating => manifest,
             HistoryOwnershipState::V1Active => {
                 match self.ownership.begin_migration(&lease, &manifest)? {
@@ -1188,6 +1244,13 @@ impl HistoryRuntime {
             ));
         }
         self.ownership.validate_writer_lease(&lease)?;
+        let (active, store) = crate::sqlite_history_migration::activate_sqlite_history(
+            &self.ownership,
+            &lease,
+            &active,
+            &self.source_history,
+        )?;
+        self.source_history = store;
         Ok(active)
     }
 
@@ -1253,7 +1316,34 @@ impl HistoryRuntime {
                 "history cutover is in progress; staged data remains pending",
             ));
         }
+        if manifest.state() == HistoryOwnershipState::V2Active {
+            self.validate_sqlite_write_backend(&manifest)?;
+        }
         Ok(manifest)
+    }
+
+    fn validate_sqlite_write_backend(&self, manifest: &HistoryOwnershipManifest) -> io::Result<()> {
+        if self.source_history.state_root() != self.state_root()
+            || self.source_history.profile_id() != self.profile_id()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime source history store has a different root or profile",
+            ));
+        }
+        if !manifest.is_sqlite_backend() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file-based v2 history is read-only; complete the SQLite cutover before writing",
+            ));
+        }
+        let database = self.source_history.sqlite_database().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "history backend changed; refresh the runtime before writing",
+            )
+        })?;
+        crate::sqlite_history_migration::validate_receipt(&database, manifest)
     }
 
     fn validate_exact_write_manifest(&self, expected: &HistoryOwnershipManifest) -> io::Result<()> {
@@ -1281,12 +1371,13 @@ impl HistoryRuntime {
             OwnershipManifestStatus::Initialized(manifest) => manifest,
         };
         self.validate_manifest_binding(&manifest)?;
-        if manifest.state() != HistoryOwnershipState::V2Active {
+        if manifest.state() != HistoryOwnershipState::V2Active || !manifest.is_sqlite_backend() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "v2 runtime history writes require a durable v2-active ownership state",
             ));
         }
+        self.validate_sqlite_write_backend(&manifest)?;
         Ok(manifest)
     }
 
@@ -1296,6 +1387,7 @@ impl HistoryRuntime {
     ) -> io::Result<()> {
         self.validate_manifest_binding(expected)?;
         if expected.state() != HistoryOwnershipState::V2Active
+            || !expected.is_sqlite_backend()
             || self.ownership.load_manifest()?
                 != OwnershipManifestStatus::Initialized(expected.clone())
         {
@@ -2023,7 +2115,7 @@ mod tests {
         assert!(first.garbage_collection.attempted);
         assert!(first.garbage_collection.warning.is_none());
 
-        // Corrupt an expired shard after the successful initial GC. The next
+        // Corrupt an expired record after the successful initial GC. The next
         // due pass must fail, but the observation preceding that best-effort
         // pass is already authoritative and must still clear the staged batch.
         let old = at(30, 9, 0) - Duration::days(40);
@@ -2031,8 +2123,19 @@ mod tests {
             runtime.source_identity.node_id(),
             RedactionProfile::PreviewEnabled,
         );
-        let invalid_shard = bucket_directory.join(format!("{}.json", old.format("%Y-%m-%d")));
-        fs::write(&invalid_shard, b"not json\n").unwrap();
+        let database = runtime.source_history.sqlite_database().unwrap();
+        let namespace = database.namespace(&bucket_directory).unwrap();
+        database
+            .write(|connection| {
+                crate::source_history::database::put_record(
+                    connection,
+                    &namespace,
+                    "invalid-expired-fixture",
+                    old.timestamp_millis(),
+                    &"not a bucket",
+                )
+            })
+            .unwrap();
 
         let history_root = runtime
             .legacy_history()
@@ -2578,7 +2681,7 @@ mod tests {
 
         let first = runtime.ensure_v2_active_at(at(30, 12, 0)).unwrap();
         assert_eq!(first.state(), HistoryOwnershipState::V2Active);
-        assert_eq!(first.epoch(), 2);
+        assert_eq!(first.epoch(), 3);
         // Exact V2Active is already beyond the irreversible cutover. It must
         // not query the global service manager or coordination directory on
         // every normal startup/read.
@@ -2937,7 +3040,7 @@ mod tests {
         let second = second_handle.join().unwrap().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.state(), HistoryOwnershipState::V2Active);
-        assert_eq!(first.epoch(), 2);
+        assert_eq!(first.epoch(), 3);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::source_identity::{validate_windows_private_directory, validate_window
 
 mod session_evidence;
 pub use session_evidence::*;
+pub(crate) mod database;
 mod remote_generation;
 pub use remote_generation::*;
 mod remote_live;
@@ -663,6 +664,7 @@ pub struct SourceHistoryWriteReport {
 pub struct SourceHistoryStore {
     state_root: PathBuf,
     profile_id: HistoryProfileId,
+    sqlite: bool,
 }
 
 /// The only production write surface for source-aware v2 history.
@@ -680,7 +682,10 @@ impl SourceHistoryWriter<'_, '_, '_> {
         self.validate()?;
         let writer_root = fs::canonicalize(self.store.state_root())?;
         let expected_root = fs::canonicalize(expected.state_root())?;
-        if writer_root != expected_root || self.store.profile_id() != expected.profile_id() {
+        if writer_root != expected_root
+            || self.store.profile_id() != expected.profile_id()
+            || self.store.sqlite != expected.sqlite
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "v2 history writer does not match the expected state root and profile",
@@ -694,6 +699,14 @@ impl SourceHistoryWriter<'_, '_, '_> {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.store.sqlite_database().is_some()
+            != self.authority.expected_manifest().is_sqlite_backend()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "history writer backend does not match its ownership authority",
+            ));
+        }
         self.authority.validate_v2_namespace(
             self.store.state_root(),
             self.store.profile_id(),
@@ -724,8 +737,47 @@ impl SourceHistoryWriter<'_, '_, '_> {
         }
     }
 
+    /// Revalidate ownership before committing ordinary SQL family updates.
+    /// Local observations deliberately use their own transaction so revision
+    /// reservation can remain a separately committed, nonreusable allocation.
+    fn transaction_fenced<T>(
+        &self,
+        operation: impl FnOnce(&SourceHistoryStore) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let Some(database) = self.store.sqlite_database() else {
+            return self.fenced(operation);
+        };
+        self.validate()?;
+        database.write(|_| {
+            let result = operation(self.store);
+            let fence = self.validate();
+            match (result, fence) {
+                (_, Err(error)) => Err(error),
+                (result, Ok(())) => result,
+            }
+        })
+    }
+
+    fn transaction_fenced_nowait<T>(
+        &self,
+        operation: impl FnOnce(&SourceHistoryStore) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let Some(database) = self.store.sqlite_database() else {
+            return self.fenced(operation);
+        };
+        self.validate()?;
+        database.write_nowait(|_| {
+            let result = operation(self.store);
+            let fence = self.validate();
+            match (result, fence) {
+                (_, Err(error)) => Err(error),
+                (result, Ok(())) => result,
+            }
+        })
+    }
+
     pub fn save_source_metadata(&self, metadata: &SourceMetadata) -> io::Result<()> {
-        self.fenced(|store| store.save_source_metadata_unfenced(metadata))
+        self.transaction_fenced(|store| store.save_source_metadata_unfenced(metadata))
     }
 
     pub fn update_source_metadata<F>(
@@ -736,12 +788,12 @@ impl SourceHistoryWriter<'_, '_, '_> {
     where
         F: FnOnce(&mut SourceMetadata) -> io::Result<()>,
     {
-        self.fenced(|store| store.update_source_metadata_unfenced(source_id, update))
+        self.transaction_fenced(|store| store.update_source_metadata_unfenced(source_id, update))
     }
 
     pub fn garbage_collect(&self, observed_at: DateTime<Utc>) -> io::Result<SourceHistoryGcReport> {
         let redaction_profile = self.redaction_profile();
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.garbage_collect_unfenced(observed_at, std::slice::from_ref(&redaction_profile))
         })
     }
@@ -761,6 +813,28 @@ impl SourceHistoryWriter<'_, '_, '_> {
         minimum_interval: StdDuration,
     ) -> io::Result<Option<SourceHistoryGcReport>> {
         let redaction_profile = self.redaction_profile();
+        if let Some(database) = self.store.sqlite_database() {
+            let minimum_interval = gc_minimum_interval_duration(minimum_interval)?;
+            let due = self.transaction_fenced(|store| {
+                store.sqlite_schedule_gc_if_due(
+                    &database,
+                    observed_at,
+                    minimum_interval,
+                    redaction_profile,
+                )
+            })?;
+            return if due {
+                self.transaction_fenced(|store| {
+                    store.garbage_collect_unfenced(
+                        observed_at,
+                        std::slice::from_ref(&redaction_profile),
+                    )
+                })
+                .map(Some)
+            } else {
+                Ok(None)
+            };
+        }
         self.fenced(|store| {
             store.garbage_collect_if_due_unfenced(observed_at, minimum_interval, redaction_profile)
         })
@@ -770,7 +844,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         &self,
         points: &[QuotaPoint],
     ) -> io::Result<SourceHistoryWriteReport> {
-        self.fenced(|store| store.record_account_points_unfenced(points))
+        self.transaction_fenced(|store| store.record_account_points_unfenced(points))
     }
 
     pub fn record_source_bucket_changes(
@@ -780,7 +854,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         records: &[SourceBucketRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.record_source_bucket_changes_unfenced(source_id, redaction_profile, records)
         })
     }
@@ -792,7 +866,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         records: &[SourceWeeklyRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.record_source_weekly_changes_unfenced(source_id, redaction_profile, records)
         })
     }
@@ -804,7 +878,7 @@ impl SourceHistoryWriter<'_, '_, '_> {
         records: &[SourceSessionDigestRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
         self.validate_redaction(redaction_profile)?;
-        self.fenced(|store| {
+        self.transaction_fenced(|store| {
             store.record_source_session_digest_changes_unfenced(
                 source_id,
                 redaction_profile,
@@ -844,6 +918,13 @@ impl SourceHistoryWriter<'_, '_, '_> {
         batch_id: &FactBatchId,
     ) -> io::Result<FactActivationReport> {
         self.validate_redaction(redaction_profile)?;
+        if self.store.sqlite_database().is_some() {
+            let publication =
+                self.prevalidate_staged_fact_batch(source_id, redaction_profile, batch_id)?;
+            let mut report = self.publish_prevalidated_fact_batch(&publication)?;
+            report.cleanup_pending = self.cleanup_prevalidated_fact_publication(&publication);
+            return Ok(report);
+        }
         self.fenced(|store| {
             store.activate_staged_fact_batch_unfenced(source_id, redaction_profile, batch_id)
         })
@@ -857,7 +938,9 @@ impl SourceHistoryWriter<'_, '_, '_> {
         publication: &PrevalidatedFactPublication,
     ) -> io::Result<FactActivationReport> {
         self.validate_redaction(publication.redaction_profile())?;
-        self.fenced(|store| store.publish_prevalidated_fact_batch_unfenced(publication))
+        self.transaction_fenced_nowait(|store| {
+            store.publish_prevalidated_fact_batch_unfenced(publication)
+        })
     }
 
     pub(crate) fn cleanup_prevalidated_fact_publication(
@@ -870,8 +953,10 @@ impl SourceHistoryWriter<'_, '_, '_> {
         {
             return true;
         }
-        self.fenced(|store| Ok(store.cleanup_prevalidated_fact_publication_unfenced(publication)))
-            .unwrap_or(true)
+        self.transaction_fenced(|store| {
+            Ok(store.cleanup_prevalidated_fact_publication_unfenced(publication))
+        })
+        .unwrap_or(true)
     }
 
     /// Stages one complete, invisible fact candidate and atomically publishes
@@ -888,6 +973,10 @@ impl SourceHistoryWriter<'_, '_, '_> {
         batch: &CompleteFactBatch,
     ) -> io::Result<FactActivationReport> {
         self.validate_redaction(redaction_profile)?;
+        if self.store.sqlite_database().is_some() {
+            self.stage_complete_fact_batch(source_id, redaction_profile, batch)?;
+            return self.activate_staged_fact_batch(source_id, redaction_profile, &batch.batch_id);
+        }
         self.fenced(|store| {
             store.stage_complete_fact_batch_unfenced(source_id, redaction_profile, batch)?;
             store.activate_staged_fact_batch_unfenced(source_id, redaction_profile, &batch.batch_id)
@@ -900,7 +989,22 @@ impl SourceHistoryStore {
         Self {
             state_root,
             profile_id,
+            sqlite: false,
         }
+    }
+
+    /// Binds the production SQLite backend without creating or migrating it.
+    pub fn new_sqlite(state_root: PathBuf, profile_id: HistoryProfileId) -> Self {
+        Self {
+            state_root,
+            profile_id,
+            sqlite: true,
+        }
+    }
+
+    pub(crate) fn sqlite_database(&self) -> Option<database::HistoryDatabase> {
+        self.sqlite
+            .then(|| database::HistoryDatabase::new(&self.state_root, &self.profile_id))
     }
 
     pub fn state_root(&self) -> &Path {
@@ -1053,6 +1157,42 @@ impl SourceHistoryStore {
     /// Use the fenced writer's update API for later changes.
     fn save_source_metadata_unfenced(&self, metadata: &SourceMetadata) -> io::Result<()> {
         metadata.validate()?;
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|connection| {
+                let directory = self.source_directory(metadata.source_id());
+                source_purge::reject_source_metadata_update_during_purge(
+                    self,
+                    &directory,
+                    metadata.source_id(),
+                )?;
+                let key = database.namespace(&directory.join(SOURCE_METADATA_FILE))?;
+                if let Some(envelope) = sqlite_state_bounded::<SourceMetadataEnvelope>(
+                    connection,
+                    &key,
+                    MAX_METADATA_FILE_BYTES,
+                    None,
+                )? {
+                    let existing =
+                        self.validate_sqlite_source_metadata(envelope, metadata.source_id())?;
+                    if existing.kind != metadata.kind {
+                        return Err(invalid_data(
+                            "source kind cannot change for an existing source identity",
+                        ));
+                    }
+                    if existing == *metadata {
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "source metadata already exists; use update_source_metadata",
+                    ));
+                }
+                let envelope =
+                    SourceMetadataEnvelope::new(self.profile_id.clone(), metadata.clone());
+                encode_pretty_bounded(&envelope, MAX_METADATA_FILE_BYTES)?;
+                database::set_state(connection, &key, &envelope)
+            });
+        }
         let directory = self.source_directory(metadata.source_id());
         self.prepare_private_directory(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
@@ -1092,6 +1232,40 @@ impl SourceHistoryStore {
     where
         F: FnOnce(&mut SourceMetadata) -> io::Result<()>,
     {
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|connection| {
+                let directory = self.source_directory(source_id);
+                source_purge::reject_source_metadata_update_during_purge(
+                    self, &directory, source_id,
+                )?;
+                let key = database.namespace(&directory.join(SOURCE_METADATA_FILE))?;
+                let envelope = sqlite_state_bounded::<SourceMetadataEnvelope>(
+                    connection,
+                    &key,
+                    MAX_METADATA_FILE_BYTES,
+                    None,
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "source metadata is missing")
+                })?;
+                let mut metadata = self.validate_sqlite_source_metadata(envelope, source_id)?;
+                let previous = metadata.clone();
+                update(&mut metadata)?;
+                metadata.validate()?;
+                if metadata.source_id != previous.source_id || metadata.kind != previous.kind {
+                    return Err(invalid_data(
+                        "source identity and kind are immutable metadata fields",
+                    ));
+                }
+                if metadata != previous {
+                    let envelope =
+                        SourceMetadataEnvelope::new(self.profile_id.clone(), metadata.clone());
+                    encode_pretty_bounded(&envelope, MAX_METADATA_FILE_BYTES)?;
+                    database::set_state(connection, &key, &envelope)?;
+                }
+                Ok(metadata)
+            });
+        }
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
@@ -1124,6 +1298,22 @@ impl SourceHistoryStore {
         source_id: &NodeId,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<SourceMetadata> {
+        if let Some(database) = self.sqlite_database() {
+            return database.read(|connection| {
+                let key = database
+                    .namespace(&self.source_directory(source_id).join(SOURCE_METADATA_FILE))?;
+                let envelope = sqlite_state_bounded::<SourceMetadataEnvelope>(
+                    connection,
+                    &key,
+                    MAX_METADATA_FILE_BYTES,
+                    Some(budget),
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "source metadata is missing")
+                })?;
+                self.validate_sqlite_source_metadata(envelope, source_id)
+            });
+        }
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
@@ -1148,6 +1338,23 @@ impl SourceHistoryStore {
         source_id: &NodeId,
         operation: impl FnOnce(&SourceMetadata) -> io::Result<T>,
     ) -> io::Result<T> {
+        if let Some(database) = self.sqlite_database() {
+            return database.read(|connection| {
+                let key = database
+                    .namespace(&self.source_directory(source_id).join(SOURCE_METADATA_FILE))?;
+                let envelope = sqlite_state_bounded::<SourceMetadataEnvelope>(
+                    connection,
+                    &key,
+                    MAX_METADATA_FILE_BYTES,
+                    None,
+                )?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "source metadata is missing")
+                })?;
+                let metadata = self.validate_sqlite_source_metadata(envelope, source_id)?;
+                operation(&metadata)
+            });
+        }
         let directory = self.source_directory(source_id);
         self.validate_private_path(&directory)?;
         let lock = open_lock_file(&directory, SOURCE_LOCK_FILE)?;
@@ -1164,6 +1371,43 @@ impl SourceHistoryStore {
     /// A malformed `node-*` entry or a valid node ID with the wrong file type
     /// fails closed; unrelated files/directories are ignored.
     pub fn list_source_metadata(&self) -> io::Result<Vec<SourceMetadata>> {
+        if let Some(database) = self.sqlite_database() {
+            if !database.exists()? {
+                return Ok(Vec::new());
+            }
+            return database.read(|connection| {
+                let prefix = format!("{}/", database.namespace(&self.sources_directory())?);
+                let mut sources = Vec::new();
+                let mut statement = connection.prepare("SELECT state_key,payload FROM history_state WHERE substr(state_key,1,length(?1))=?1 AND substr(state_key,-12)='/source.json' ORDER BY state_key").map_err(database::sql_error)?;
+                let mut rows = statement.query([&prefix]).map_err(database::sql_error)?;
+                while let Some(row) = rows.next().map_err(database::sql_error)? {
+                    let key = row.get_ref(0).map_err(database::sql_error)?.as_str().map_err(|error| invalid_data(error.to_string()))?;
+                    let Some(relative) = key
+                        .strip_prefix(&prefix)
+                        .and_then(|value| value.strip_suffix("/source.json"))
+                    else {
+                        continue;
+                    };
+                    if relative.contains('/') {
+                        continue;
+                    }
+                    let source_id = relative
+                        .parse::<NodeId>()
+                        .map_err(|error| invalid_data(error.to_string()))?;
+                    if sources.len() >= MAX_HISTORY_QUERY_SOURCES {
+                        return Err(history_query_budget_exceeded("sources"));
+                    }
+                    let bytes = row.get_ref(1).map_err(database::sql_error)?.as_blob().map_err(|error| invalid_data(error.to_string()))?;
+                    if bytes.len() as u64 > MAX_METADATA_FILE_BYTES { return Err(invalid_data("source metadata exceeds its size budget")); }
+                    let envelope: SourceMetadataEnvelope = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
+                    sources.push(self.validate_sqlite_source_metadata(envelope, &source_id)?);
+                }
+                sources.sort_by(|left, right| {
+                    left.source_id().as_str().cmp(right.source_id().as_str())
+                });
+                Ok(sources)
+            });
+        }
         let directory = self.sources_directory();
         if !self.private_directory_exists(&directory)? {
             return Ok(Vec::new());
@@ -1251,18 +1495,21 @@ impl SourceHistoryStore {
         minimum_interval: StdDuration,
         redaction_profile: RedactionProfile,
     ) -> io::Result<Option<SourceHistoryGcReport>> {
-        if minimum_interval.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source history garbage-collection interval must be nonzero",
-            ));
+        let minimum_interval = gc_minimum_interval_duration(minimum_interval)?;
+        if let Some(database) = self.sqlite_database() {
+            let due = self.sqlite_schedule_gc_if_due(
+                &database,
+                observed_at,
+                minimum_interval,
+                redaction_profile,
+            )?;
+            return if due {
+                self.garbage_collect_unfenced(observed_at, std::slice::from_ref(&redaction_profile))
+                    .map(Some)
+            } else {
+                Ok(None)
+            };
         }
-        let minimum_interval = Duration::from_std(minimum_interval).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source history garbage-collection interval is too large",
-            )
-        })?;
         let schedule_directory = self
             .profile_directory()
             .join(redaction_profile.directory_name());
@@ -1308,6 +1555,9 @@ impl SourceHistoryStore {
         observed_at: DateTime<Utc>,
         redaction_profiles: &[RedactionProfile],
     ) -> io::Result<SourceHistoryGcReport> {
+        if let Some(database) = self.sqlite_database() {
+            return self.sqlite_garbage_collect(&database, observed_at, redaction_profiles);
+        }
         let profile_directory = self.profile_directory();
         self.prepare_private_directory(&profile_directory)?;
         let retention_lock = open_lock_file(&profile_directory, RETENTION_LOCK_FILE)?;
@@ -1408,6 +1658,9 @@ impl SourceHistoryStore {
         &self,
         points: &[QuotaPoint],
     ) -> io::Result<SourceHistoryWriteReport> {
+        if let Some(database) = self.sqlite_database() {
+            return self.sqlite_record_account_points(&database, points);
+        }
         // Validate the complete batch before creating a directory, lock, or
         // shard. A single malformed server sample must not leave a partial
         // account write behind.
@@ -1456,7 +1709,18 @@ impl SourceHistoryStore {
         records: &[SourceBucketRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
         // An explicit source descriptor is the durable authority for source
-        // policy. Refuse to create orphan usage shards.
+        // policy. Refuse to create orphan usage records.
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|_| {
+                self.load_source_metadata(source_id)?;
+                self.record_source_bucket_changes_in_directory_unfenced(
+                    source_id,
+                    redaction_profile,
+                    &self.source_buckets_directory(source_id, redaction_profile),
+                    records,
+                )
+            });
+        }
         let _ = self.load_source_metadata(source_id)?;
         self.record_source_bucket_changes_in_directory_unfenced(
             source_id,
@@ -1473,6 +1737,14 @@ impl SourceHistoryStore {
         directory: &Path,
         records: &[SourceBucketRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
+        if let Some(database) = self.sqlite_database() {
+            return self.sqlite_record_bucket_changes(
+                &database,
+                redaction_profile,
+                directory,
+                records,
+            );
+        }
         let additions = group_source_records_by_day(records, redaction_profile)?;
         if additions.is_empty() {
             return Ok(SourceHistoryWriteReport::default());
@@ -1523,6 +1795,14 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         records: &[SourceWeeklyRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
+        if let Some(database) = self.sqlite_database() {
+            return self.sqlite_record_weekly_changes(
+                &database,
+                source_id,
+                redaction_profile,
+                records,
+            );
+        }
         let additions = group_source_weekly_records_by_day(records)?;
         if additions.is_empty() {
             return Ok(SourceHistoryWriteReport::default());
@@ -1578,6 +1858,37 @@ impl SourceHistoryStore {
         since: DateTime<Utc>,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<AccountHistoryData> {
+        if let Some(database) = self.sqlite_database() {
+            if !database.exists()? {
+                return Ok(AccountHistoryData::default());
+            }
+            return database.read(|connection| {
+                let namespace = database.namespace(&self.account_directory())?;
+                let values = database::records::<QuotaPoint>(
+                    connection,
+                    &namespace,
+                    since.timestamp_millis(),
+                    budget,
+                )?;
+                let mut points = Vec::new();
+                let mut index = HashMap::new();
+                for point in values {
+                    validate_account_quota_point(&point)?;
+                    if point.observed_at >= since {
+                        apply_account_quota_point(&mut points, &mut index, point)?;
+                    }
+                }
+                points.sort_by(|left, right| {
+                    left.observed_at
+                        .cmp(&right.observed_at)
+                        .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+                        .then_with(|| left.resets_at.cmp(&right.resets_at))
+                });
+                Ok(AccountHistoryData {
+                    quota_points: points,
+                })
+            });
+        }
         let directory = self.account_directory();
         if !self.private_directory_exists(&directory)? {
             return Ok(AccountHistoryData::default());
@@ -1712,6 +2023,36 @@ impl SourceHistoryStore {
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceBucketRecord>> {
+        if let Some(database) = self.sqlite_database() {
+            if !database.exists()? {
+                return Ok(Vec::new());
+            }
+            return database.read(|connection| {
+                let namespace = database.namespace(directory)?;
+                let floor = since
+                    .checked_sub_signed(Duration::seconds(SOURCE_BUCKET_SECONDS))
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                let values = database::records::<SourceBucketRecord>(
+                    connection,
+                    &namespace,
+                    floor.timestamp_millis(),
+                    budget,
+                )?;
+                let mut records = Vec::new();
+                let mut index = HashMap::new();
+                for record in values {
+                    record.validate()?;
+                    if source_record_intersects_since(&record, since) {
+                        apply_source_bucket_record(&mut records, &mut index, record)?;
+                    }
+                }
+                if redaction_profile == RedactionProfile::Redacted {
+                    redact_source_records(&mut records);
+                }
+                records.sort_by_key(|record| record.starts_at);
+                Ok(records)
+            });
+        }
         if !self.private_directory_exists(directory)? {
             return Ok(Vec::new());
         }
@@ -1748,6 +2089,31 @@ impl SourceHistoryStore {
         since: DateTime<Utc>,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceWeeklyRecord>> {
+        if let Some(database) = self.sqlite_database() {
+            if !database.exists()? {
+                return Ok(Vec::new());
+            }
+            return database.read(|connection| {
+                let namespace = database
+                    .namespace(&self.source_weekly_directory(source_id, redaction_profile))?;
+                let values = database::records::<SourceWeeklyRecord>(
+                    connection,
+                    &namespace,
+                    since.timestamp_millis(),
+                    budget,
+                )?;
+                let mut records = Vec::new();
+                let mut index = HashMap::new();
+                for record in values {
+                    record.validate()?;
+                    if record.observed_at >= since {
+                        apply_source_weekly_record(&mut records, &mut index, record)?;
+                    }
+                }
+                records.sort_by_key(|record| (record.observed_at, record.resets_at));
+                Ok(records)
+            });
+        }
         let directory = self.source_weekly_directory(source_id, redaction_profile);
         if !self.private_directory_exists(&directory)? {
             return Ok(Vec::new());
@@ -1828,6 +2194,663 @@ impl SourceHistoryStore {
             redaction_profile: records.redaction_profile,
             buckets,
             weekly_local_points,
+        })
+    }
+}
+
+impl SourceHistoryStore {
+    fn sqlite_schedule_gc_if_due(
+        &self,
+        database: &database::HistoryDatabase,
+        observed_at: DateTime<Utc>,
+        minimum_interval: Duration,
+        redaction_profile: RedactionProfile,
+    ) -> io::Result<bool> {
+        database.write(|connection| {
+            let key = database.namespace(
+                &self
+                    .profile_directory()
+                    .join(redaction_profile.directory_name())
+                    .join(GARBAGE_COLLECTION_SCHEDULE_FILE),
+            )?;
+            if let Some(schedule) = sqlite_state_bounded::<GarbageCollectionSchedule>(
+                connection,
+                &key,
+                MAX_METADATA_FILE_BYTES,
+                None,
+            )? {
+                schedule.validate(&self.profile_id, redaction_profile)?;
+                let elapsed = observed_at.signed_duration_since(schedule.last_attempted_at);
+                if elapsed >= Duration::zero() && elapsed < minimum_interval {
+                    return Ok(false);
+                }
+            }
+            let schedule = GarbageCollectionSchedule::new(
+                self.profile_id.clone(),
+                redaction_profile,
+                observed_at,
+            );
+            database::set_state(connection, &key, &schedule)?;
+            Ok(true)
+        })
+    }
+
+    fn sqlite_garbage_collect(
+        &self,
+        database: &database::HistoryDatabase,
+        observed_at: DateTime<Utc>,
+        redactions: &[RedactionProfile],
+    ) -> io::Result<SourceHistoryGcReport> {
+        database.write(|connection| {
+            let sources = self.list_source_metadata()?;
+            let key = database.namespace(&self.profile_directory().join(RETENTION_CLOCK_FILE))?;
+            let envelope = sqlite_state_bounded::<RetentionClockEnvelope>(connection, &key, MAX_METADATA_FILE_BYTES, None)?;
+            let current = envelope.map(|envelope| {
+                if envelope.format_version != RETENTION_CLOCK_FORMAT_VERSION || envelope.profile_id != self.profile_id { return Err(invalid_data("retention clock database envelope is invalid")); }
+                envelope.clock.validate()?;
+                Ok(envelope.clock)
+            }).transpose()?;
+            let namespaces = self.sqlite_retained_core_namespaces(database, connection, &sources, redactions)?;
+            let initial_anchor = if current.is_none() {
+                let mut earliest = None;
+                for namespace in &namespaces {
+                    let timestamp: Option<i64> = connection.query_row("SELECT min(sort_time) FROM history_records WHERE namespace=?1", [namespace], |row| row.get(0)).map_err(database::sql_error)?;
+                    if let Some(timestamp) = timestamp {
+                        let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp).ok_or_else(|| invalid_data("invalid persisted history timestamp"))?.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+                        earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)));
+                    }
+                }
+                if let Some(timestamp) = session_evidence::earliest_session_evidence_time(self, &sources, redactions)? { earliest = Some(earliest.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp))); }
+                earliest.map(|timestamp| timestamp.min(observed_at))
+            } else { None };
+            let (clock, pruning_deferred) = next_retention_clock(current, initial_anchor, observed_at);
+            database::set_state(connection, &key, &RetentionClockEnvelope { format_version: RETENTION_CLOCK_FORMAT_VERSION, profile_id: self.profile_id.clone(), clock })?;
+            let cutoff = clock.trusted_at.checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS)).unwrap_or(DateTime::<Utc>::MIN_UTC).date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+            let account = database.namespace(&self.account_directory())?;
+            let mut pruned = 0;
+            for namespace in namespaces {
+                let mut statement = connection.prepare("SELECT record_key,sort_time,payload FROM history_records WHERE namespace=?1 AND sort_time<?2 ORDER BY sort_time,record_key").map_err(database::sql_error)?;
+                let mut rows = statement.query(rusqlite::params![&namespace, cutoff.timestamp_millis()]).map_err(database::sql_error)?;
+                let mut keys = Vec::new();
+                let mut days = std::collections::BTreeSet::new();
+                let mut budget = SourceHistoryReadBudget::for_query();
+                while let Some(row) = rows.next().map_err(database::sql_error)? {
+                    let bytes = row.get_ref(2).map_err(database::sql_error)?.as_blob().map_err(|error| invalid_data(error.to_string()))?;
+                    budget.charge_decoded_bytes(bytes.len() as u64)?;
+                    budget.charge_records(1)?;
+                    let actual = if namespace == account {
+                        let record: QuotaPoint = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
+                        validate_account_quota_point(&record)?;
+                        record.observed_at
+                    } else if namespace.ends_with("/buckets") {
+                        let record: SourceBucketRecord = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
+                        record.validate()?;
+                        record.starts_at
+                    } else {
+                        let record: SourceWeeklyRecord = serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?;
+                        record.validate()?;
+                        record.observed_at
+                    };
+                    if actual.timestamp_millis() != row.get::<_, i64>(1).map_err(database::sql_error)? { return Err(invalid_data("history database ordering timestamp does not match its record")); }
+                    keys.push(row.get::<_, String>(0).map_err(database::sql_error)?);
+                    days.insert(actual.date_naive());
+                }
+                drop(rows);
+                drop(statement);
+                for key in keys { database::delete_record(connection, &namespace, &key)?; }
+                pruned += days.len();
+            }
+            for source in &sources {
+                for &redaction in redactions {
+                    pruned += session_evidence::garbage_collect_session_evidence_for_source(self, source.source_id(), redaction, cutoff.date_naive(), clock.trusted_at)?;
+                }
+            }
+            Ok(SourceHistoryGcReport { shards_pruned: pruned, pruning_deferred, trusted_at: Some(clock.trusted_at) })
+        })
+    }
+
+    fn sqlite_retained_core_namespaces(
+        &self,
+        database: &database::HistoryDatabase,
+        connection: &rusqlite::Connection,
+        sources: &[SourceMetadata],
+        redactions: &[RedactionProfile],
+    ) -> io::Result<Vec<String>> {
+        let account = database.namespace(&self.account_directory())?;
+        let mut namespaces = vec![account];
+        for source in sources {
+            for &redaction in redactions {
+                let prefix = format!(
+                    "{}/",
+                    database.namespace(
+                        &self
+                            .source_directory(source.source_id())
+                            .join(redaction.directory_name())
+                    )?
+                );
+                let mut statement = connection.prepare("SELECT DISTINCT namespace FROM history_records WHERE substr(namespace,1,length(?1))=?1 AND (substr(namespace,-8)='/buckets' OR substr(namespace,-7)='/weekly') ORDER BY namespace").map_err(database::sql_error)?;
+                let values = statement
+                    .query_map([prefix], |row| row.get::<_, String>(0))
+                    .map_err(database::sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(database::sql_error)?;
+                namespaces.extend(values);
+            }
+        }
+        Ok(namespaces)
+    }
+
+    pub(crate) fn sqlite_retention_cutoff(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> io::Result<Option<DateTime<Utc>>> {
+        let database = self
+            .sqlite_database()
+            .ok_or_else(|| invalid_data("SQLite retention cutoff requires SQLite backend"))?;
+        let key = database.namespace(&self.profile_directory().join(RETENTION_CLOCK_FILE))?;
+        let Some(envelope) = sqlite_state_bounded::<RetentionClockEnvelope>(
+            connection,
+            &key,
+            MAX_METADATA_FILE_BYTES,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        if envelope.format_version != RETENTION_CLOCK_FORMAT_VERSION
+            || envelope.profile_id != self.profile_id
+        {
+            return Err(invalid_data("retention clock database envelope is invalid"));
+        }
+        envelope.clock.validate()?;
+        let cutoff = envelope
+            .clock
+            .trusted_at
+            .checked_sub_signed(Duration::days(SOURCE_HISTORY_RETENTION_DAYS))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
+        Ok(Some(cutoff))
+    }
+
+    /// Imports all legacy typed history, including excluded sources, future
+    /// observations, retained tombstones and complete staged fact publications.
+    /// Once a profile migration receipt exists, only local history can advance
+    /// from the legacy backend; SSH backups can no longer repopulate SQL state.
+    /// The caller keeps the ownership fence and one outer SQL transaction;
+    /// this method never publishes the backend ownership marker itself.
+    pub(crate) fn import_sqlite_history_core_and_facts(
+        &self,
+        legacy: &SourceHistoryStore,
+    ) -> io::Result<()> {
+        let database = self.sqlite_database().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history import target must use SQLite",
+            )
+        })?;
+        if legacy.sqlite_database().is_some()
+            || legacy.profile_id != self.profile_id
+            || legacy.state_root != self.state_root
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history import needs the matching legacy profile",
+            ));
+        }
+        database.write(|connection| {
+            let legacy_sources = legacy.list_source_metadata()?;
+            let prior_migration =
+                !database::state_keys(connection, "database/migration/")?.is_empty();
+            let mut sources = Vec::new();
+            for source in legacy_sources {
+                match self.load_source_metadata(source.source_id()) {
+                    Ok(existing) if existing.kind() == source.kind() => {}
+                    Ok(_) => {
+                        return Err(invalid_data(
+                            "legacy source identity conflicts with existing SQLite source kind",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound && prior_migration => {
+                        if source.kind() == SourceKind::Ssh {
+                            // The first profile import included every source.
+                            // Its absence now is a completed SQL purge; the
+                            // immutable backup cannot register it again.
+                            continue;
+                        }
+                        return Err(invalid_data(
+                            "previously imported local source is missing from SQLite",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.save_source_metadata_unfenced(&source)?
+                    }
+                    Err(error) => return Err(error),
+                }
+                if prior_migration && source.kind() == SourceKind::Ssh {
+                    // Every legacy SSH source was imported before the first
+                    // receipt and its old writers are fenced. Even if pairing
+                    // recreates the same node after purge, the immutable backup
+                    // must not repopulate its new SQL history namespace.
+                    continue;
+                }
+                sources.push(source);
+            }
+            let cutoff = if prior_migration {
+                self.sqlite_retention_cutoff(connection)?
+            } else {
+                None
+            };
+            let mut budget = SourceHistoryReadBudget::for_query();
+            let mut account =
+                legacy.load_account_since_with_budget(DateTime::<Utc>::MIN_UTC, &mut budget)?;
+            account
+                .quota_points
+                .retain(|point| cutoff.is_none_or(|cutoff| point.observed_at >= cutoff));
+            self.record_account_points_unfenced(&account.quota_points)?;
+            for source in &sources {
+                for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+                    let mut budget = SourceHistoryReadBudget::for_query();
+                    let mut records = legacy
+                        .load_source_bucket_records_from_directory_with_budget(
+                            source.source_id(),
+                            redaction,
+                            DateTime::<Utc>::MIN_UTC,
+                            &legacy.source_buckets_directory(source.source_id(), redaction),
+                            &mut budget,
+                        )?;
+                    records
+                        .retain(|record| cutoff.is_none_or(|cutoff| record.starts_at() >= cutoff));
+                    self.record_source_bucket_changes_in_directory_unfenced(
+                        source.source_id(),
+                        redaction,
+                        &self.source_buckets_directory(source.source_id(), redaction),
+                        &records,
+                    )?;
+                    let mut budget = SourceHistoryReadBudget::for_query();
+                    let mut records = legacy.load_source_weekly_records_since_with_budget(
+                        source.source_id(),
+                        redaction,
+                        DateTime::<Utc>::MIN_UTC,
+                        &mut budget,
+                    )?;
+                    records.retain(|record| {
+                        cutoff.is_none_or(|cutoff| record.observed_at() >= cutoff)
+                    });
+                    self.record_source_weekly_changes_unfenced(
+                        source.source_id(),
+                        redaction,
+                        &records,
+                    )?;
+                    let path = legacy
+                        .profile_directory()
+                        .join(redaction.directory_name())
+                        .join(GARBAGE_COLLECTION_SCHEDULE_FILE);
+                    if let Some(schedule) = read_optional_json_file::<GarbageCollectionSchedule>(
+                        &path,
+                        MAX_METADATA_FILE_BYTES,
+                    )? {
+                        schedule.validate(&self.profile_id, redaction)?;
+                        let key = database.namespace(&path)?;
+                        if let Some(existing) = sqlite_state_bounded::<GarbageCollectionSchedule>(
+                            connection,
+                            &key,
+                            MAX_METADATA_FILE_BYTES,
+                            None,
+                        )? {
+                            existing.validate(&self.profile_id, redaction)?;
+                        } else {
+                            database::set_state(connection, &key, &schedule)?;
+                        }
+                    }
+                }
+            }
+            if let Some(clock) =
+                read_retention_clock(&legacy.profile_directory(), &self.profile_id)?
+            {
+                let envelope = RetentionClockEnvelope {
+                    format_version: RETENTION_CLOCK_FORMAT_VERSION,
+                    profile_id: self.profile_id.clone(),
+                    clock,
+                };
+                let key =
+                    database.namespace(&legacy.profile_directory().join(RETENTION_CLOCK_FILE))?;
+                if let Some(existing) = sqlite_state_bounded::<RetentionClockEnvelope>(
+                    connection,
+                    &key,
+                    MAX_METADATA_FILE_BYTES,
+                    None,
+                )? {
+                    if existing.format_version != RETENTION_CLOCK_FORMAT_VERSION
+                        || existing.profile_id != self.profile_id
+                    {
+                        return Err(invalid_data("retention clock database envelope is invalid"));
+                    }
+                    existing.clock.validate()?;
+                } else {
+                    database::set_state(connection, &key, &envelope)?;
+                }
+            }
+            session_evidence::import_sqlite_session_evidence(self, legacy, &sources)
+        })
+    }
+}
+
+fn gc_minimum_interval_duration(minimum_interval: StdDuration) -> io::Result<Duration> {
+    if minimum_interval.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source history garbage-collection interval must be nonzero",
+        ));
+    }
+    Duration::from_std(minimum_interval).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source history garbage-collection interval is too large",
+        )
+    })
+}
+
+// SQL helpers decode one business record at a time. A row is bounded before
+// serde allocation, preserving the filesystem backend's query budget contract.
+fn sqlite_state_bounded<T: serde::de::DeserializeOwned>(
+    connection: &rusqlite::Connection,
+    key: &str,
+    maximum_bytes: u64,
+    budget: Option<&mut SourceHistoryReadBudget>,
+) -> io::Result<Option<T>> {
+    let mut statement = connection
+        .prepare("SELECT payload FROM history_state WHERE state_key=?1")
+        .map_err(database::sql_error)?;
+    let mut rows = statement.query([key]).map_err(database::sql_error)?;
+    let Some(row) = rows.next().map_err(database::sql_error)? else {
+        return Ok(None);
+    };
+    let bytes = row
+        .get_ref(0)
+        .map_err(database::sql_error)?
+        .as_blob()
+        .map_err(|error| invalid_data(error.to_string()))?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(invalid_data(
+            "history database state exceeds its size budget",
+        ));
+    }
+    if let Some(budget) = budget {
+        budget.charge_decoded_bytes(bytes.len() as u64)?;
+    }
+    serde_json::from_slice(bytes)
+        .map(Some)
+        .map_err(|error| invalid_data(error.to_string()))
+}
+
+fn sqlite_record<T: serde::de::DeserializeOwned>(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    key: &str,
+) -> io::Result<Option<T>> {
+    let mut statement = connection
+        .prepare("SELECT payload FROM history_records WHERE namespace=?1 AND record_key=?2")
+        .map_err(database::sql_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![namespace, key])
+        .map_err(database::sql_error)?;
+    let Some(row) = rows.next().map_err(database::sql_error)? else {
+        return Ok(None);
+    };
+    let bytes = row
+        .get_ref(0)
+        .map_err(database::sql_error)?
+        .as_blob()
+        .map_err(|error| invalid_data(error.to_string()))?;
+    if bytes.len() as u64 > MAX_SHARD_FILE_BYTES {
+        return Err(invalid_data(
+            "history database record exceeds its size budget",
+        ));
+    }
+    serde_json::from_slice(bytes)
+        .map(Some)
+        .map_err(|error| invalid_data(error.to_string()))
+}
+
+fn sqlite_records_between<T: serde::de::DeserializeOwned>(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    start: i64,
+    end: i64,
+    budget: &mut SourceHistoryReadBudget,
+) -> io::Result<Vec<T>> {
+    let mut statement = connection.prepare("SELECT payload FROM history_records WHERE namespace=?1 AND sort_time>=?2 AND sort_time<?3 ORDER BY sort_time,record_key").map_err(database::sql_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![namespace, start, end])
+        .map_err(database::sql_error)?;
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().map_err(database::sql_error)? {
+        let bytes = row
+            .get_ref(0)
+            .map_err(database::sql_error)?
+            .as_blob()
+            .map_err(|error| invalid_data(error.to_string()))?;
+        budget.charge_decoded_bytes(bytes.len() as u64)?;
+        budget.charge_records(1)?;
+        values
+            .push(serde_json::from_slice(bytes).map_err(|error| invalid_data(error.to_string()))?);
+    }
+    Ok(values)
+}
+
+fn sqlite_record_key<T: Serialize>(value: &T) -> io::Result<String> {
+    serde_json::to_string(value).map_err(|error| invalid_data(error.to_string()))
+}
+
+fn sqlite_quota_key(point: &QuotaPoint) -> io::Result<String> {
+    sqlite_record_key(&(
+        point.observed_at,
+        point.duration_mins,
+        point.resets_at,
+        point.limit_id.to_ascii_lowercase(),
+    ))
+}
+
+impl SourceHistoryStore {
+    fn validate_sqlite_source_metadata(
+        &self,
+        envelope: SourceMetadataEnvelope,
+        source_id: &NodeId,
+    ) -> io::Result<SourceMetadata> {
+        if envelope.format_version != SOURCE_METADATA_ENVELOPE_FORMAT_VERSION
+            || envelope.profile_id != self.profile_id
+            || envelope.source.source_id() != source_id
+        {
+            return Err(invalid_data("source metadata database envelope is invalid"));
+        }
+        envelope.source.validate()?;
+        Ok(envelope.source)
+    }
+
+    fn sqlite_record_account_points(
+        &self,
+        database: &database::HistoryDatabase,
+        points: &[QuotaPoint],
+    ) -> io::Result<SourceHistoryWriteReport> {
+        for point in points {
+            validate_account_quota_point(point)?;
+        }
+        if points.is_empty() {
+            return Ok(SourceHistoryWriteReport::default());
+        }
+        database.write(|connection| {
+            let namespace = database.namespace(&self.account_directory())?;
+            let mut days = BTreeMap::<NaiveDate, bool>::new();
+            for point in points {
+                let slot = point
+                    .observed_at
+                    .timestamp()
+                    .div_euclid(ACCOUNT_QUOTA_SAMPLE_SECONDS)
+                    * ACCOUNT_QUOTA_SAMPLE_SECONDS;
+                let mut budget = SourceHistoryReadBudget::for_query();
+                let mut existing = sqlite_records_between::<QuotaPoint>(
+                    connection,
+                    &namespace,
+                    slot.saturating_mul(1000),
+                    (slot + ACCOUNT_QUOTA_SAMPLE_SECONDS).saturating_mul(1000),
+                    &mut budget,
+                )?;
+                for value in &existing {
+                    validate_account_quota_point(value)?;
+                }
+                existing.sort_by(|left, right| {
+                    left.observed_at
+                        .cmp(&right.observed_at)
+                        .then_with(|| left.duration_mins.cmp(&right.duration_mins))
+                        .then_with(|| left.resets_at.cmp(&right.resets_at))
+                });
+                let previous = existing.clone();
+                let mut index = account_quota_point_index(&existing)?;
+                let changed = apply_account_quota_point(&mut existing, &mut index, point.clone())?;
+                *days.entry(point.observed_at.date_naive()).or_default() |= changed;
+                if changed {
+                    for old in &previous {
+                        if !existing
+                            .iter()
+                            .any(|value| sqlite_quota_key(value).ok() == sqlite_quota_key(old).ok())
+                        {
+                            database::delete_record(
+                                connection,
+                                &namespace,
+                                &sqlite_quota_key(old)?,
+                            )?;
+                        }
+                    }
+                    for value in existing {
+                        if !previous.iter().any(|old| old == &value) {
+                            database::put_record(
+                                connection,
+                                &namespace,
+                                &sqlite_quota_key(&value)?,
+                                value.observed_at.timestamp_millis(),
+                                &value,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Ok(SourceHistoryWriteReport {
+                shards_written: days.values().filter(|changed| **changed).count(),
+                shards_skipped: days.values().filter(|changed| !**changed).count(),
+            })
+        })
+    }
+
+    fn sqlite_record_bucket_changes(
+        &self,
+        database: &database::HistoryDatabase,
+        redaction_profile: RedactionProfile,
+        directory: &Path,
+        records: &[SourceBucketRecord],
+    ) -> io::Result<SourceHistoryWriteReport> {
+        let additions = group_source_records_by_day(records, redaction_profile)?;
+        if additions.is_empty() {
+            return Ok(SourceHistoryWriteReport::default());
+        }
+        database.write(|connection| {
+            let namespace = database.namespace(directory)?;
+            let mut report = SourceHistoryWriteReport::default();
+            for (_, additions) in additions {
+                let mut changed = false;
+                for incoming in additions {
+                    let key = sqlite_record_key(&incoming.starts_at)?;
+                    let mut existing =
+                        sqlite_record::<SourceBucketRecord>(connection, &namespace, &key)?
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                    for record in &existing {
+                        record.validate()?;
+                        if record.starts_at != incoming.starts_at {
+                            return Err(invalid_data(
+                                "source bucket database key does not match its record",
+                            ));
+                        }
+                    }
+                    let mut index = source_bucket_record_index(&existing)?;
+                    if apply_source_bucket_record(&mut existing, &mut index, incoming)? {
+                        let value = &existing[0];
+                        database::put_record(
+                            connection,
+                            &namespace,
+                            &key,
+                            value.starts_at.timestamp_millis(),
+                            value,
+                        )?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    report.shards_written += 1;
+                } else {
+                    report.shards_skipped += 1;
+                }
+            }
+            Ok(report)
+        })
+    }
+
+    fn sqlite_record_weekly_changes(
+        &self,
+        database: &database::HistoryDatabase,
+        source_id: &NodeId,
+        redaction_profile: RedactionProfile,
+        records: &[SourceWeeklyRecord],
+    ) -> io::Result<SourceHistoryWriteReport> {
+        let additions = group_source_weekly_records_by_day(records)?;
+        if additions.is_empty() {
+            return Ok(SourceHistoryWriteReport::default());
+        }
+        database.write(|connection| {
+            self.load_source_metadata(source_id)?;
+            let namespace =
+                database.namespace(&self.source_weekly_directory(source_id, redaction_profile))?;
+            let mut report = SourceHistoryWriteReport::default();
+            for (_, additions) in additions {
+                let mut changed = false;
+                for incoming in additions {
+                    let key = sqlite_record_key(&(incoming.observed_at, incoming.resets_at))?;
+                    let mut existing =
+                        sqlite_record::<SourceWeeklyRecord>(connection, &namespace, &key)?
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                    for record in &existing {
+                        record.validate()?;
+                        if (record.observed_at, record.resets_at)
+                            != (incoming.observed_at, incoming.resets_at)
+                        {
+                            return Err(invalid_data(
+                                "source weekly database key does not match its record",
+                            ));
+                        }
+                    }
+                    let mut index = source_weekly_record_index(&existing)?;
+                    if apply_source_weekly_record(&mut existing, &mut index, incoming)? {
+                        let value = &existing[0];
+                        database::put_record(
+                            connection,
+                            &namespace,
+                            &key,
+                            value.observed_at.timestamp_millis(),
+                            value,
+                        )?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    report.shards_written += 1;
+                } else {
+                    report.shards_skipped += 1;
+                }
+            }
+            Ok(report)
         })
     }
 }
@@ -6438,5 +7461,770 @@ mod tests {
             .prepare_private_directory(&store.account_directory())
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    fn sqlite_store(root: &Path) -> SourceHistoryStore {
+        let legacy = store(root);
+        SourceHistoryStore::new_sqlite(
+            legacy.state_root().to_path_buf(),
+            legacy.profile_id().clone(),
+        )
+    }
+
+    #[test]
+    fn sqlite_bucket_batch_conflict_rolls_back_all_rows_and_preserves_u64_revisions() {
+        let root = tempdir().unwrap();
+        let store = sqlite_store(root.path());
+        let source = metadata(SOURCE_A, "sql");
+        store.save_source_metadata(&source).unwrap();
+        let start = at(30, 9, 0);
+        let initial = upsert_record(u64::MAX, bucket(start, 10));
+        store
+            .record_source_bucket_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                std::slice::from_ref(&initial),
+            )
+            .unwrap();
+        let conflict = upsert_record(u64::MAX, bucket(start, 20));
+        let new = upsert_record(1, bucket(start + Duration::minutes(15), 30));
+        assert_eq!(
+            store
+                .record_source_bucket_changes(
+                    source.source_id(),
+                    RedactionProfile::Redacted,
+                    &[new, conflict]
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let loaded = store
+            .load_source_records_since(source.source_id(), RedactionProfile::Redacted, start)
+            .unwrap();
+        assert_eq!(loaded.records, vec![initial]);
+        assert!(!store.source_directory(source.source_id()).exists());
+    }
+
+    #[test]
+    fn sqlite_account_reset_drift_merge_matches_legacy_order_and_amounts() {
+        let root = tempdir().unwrap();
+        let legacy_root = root.path().join("legacy");
+        let sql_root = root.path().join("sql");
+        let legacy = store(&legacy_root);
+        let sql = sqlite_store(&sql_root);
+        let observed = at(30, 9, 0);
+        let resets = at(31, 9, 0);
+        let samples = vec![
+            quota_point_with_identity(observed, "Codex", resets, 10.0),
+            quota_point_with_identity(
+                observed + Duration::minutes(1),
+                "codex",
+                resets + Duration::seconds(90),
+                20.0,
+            ),
+            quota_point_with_identity(
+                observed + Duration::minutes(2),
+                "CODEX",
+                resets + Duration::seconds(400),
+                30.0,
+            ),
+            quota_point_with_identity(
+                observed + Duration::minutes(3),
+                "codex",
+                resets + Duration::seconds(150),
+                25.0,
+            ),
+        ];
+        for sample in &samples {
+            legacy
+                .record_account_points(std::slice::from_ref(sample))
+                .unwrap();
+            sql.record_account_points(std::slice::from_ref(sample))
+                .unwrap();
+        }
+        assert_eq!(
+            sql.load_account_since(observed).unwrap(),
+            legacy.load_account_since(observed).unwrap()
+        );
+        assert!(!sql.account_directory().exists());
+    }
+
+    #[test]
+    fn sqlite_read_snapshot_keeps_source_policy_and_usage_together_across_writer_commit() {
+        use std::sync::mpsc;
+        let root = tempdir().unwrap();
+        let store = sqlite_store(root.path());
+        let source = metadata(SOURCE_A, "before");
+        store.save_source_metadata(&source).unwrap();
+        let start = at(30, 9, 0);
+        store
+            .record_source_bucket_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                &[upsert_record(1, bucket(start, 10))],
+            )
+            .unwrap();
+        let database = store.sqlite_database().unwrap();
+        database
+            .read(|_| {
+                assert_eq!(
+                    store
+                        .load_source_metadata(source.source_id())?
+                        .display_label(),
+                    "before"
+                );
+                let (done_tx, done_rx) = mpsc::channel();
+                let writer = store.clone();
+                let source_id = source.source_id().clone();
+                let worker = std::thread::spawn(move || {
+                    let result = writer.sqlite_database().unwrap().write(|_| {
+                        writer.update_source_metadata_unfenced(&source_id, |source| {
+                            source.set_display_label("after")
+                        })?;
+                        writer.record_source_bucket_changes_unfenced(
+                            &source_id,
+                            RedactionProfile::Redacted,
+                            &[upsert_record(2, bucket(start, 20))],
+                        )?;
+                        Ok(())
+                    });
+                    done_tx.send(result).unwrap();
+                });
+                done_rx.recv_timeout(StdDuration::from_secs(10)).unwrap()?;
+                worker.join().unwrap();
+                let snapshot = store.load_source_records_since(
+                    source.source_id(),
+                    RedactionProfile::Redacted,
+                    start,
+                )?;
+                assert_eq!(snapshot.source.display_label(), "before");
+                assert_eq!(snapshot.records[0].revision(), 1);
+                Ok(())
+            })
+            .unwrap();
+        let after = store
+            .load_source_records_since(source.source_id(), RedactionProfile::Redacted, start)
+            .unwrap();
+        assert_eq!(after.source.display_label(), "after");
+        assert_eq!(after.records[0].revision(), 2);
+    }
+
+    #[test]
+    fn sqlite_core_import_retains_excluded_future_and_tombstone_history() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let mut source = metadata(SOURCE_A, "excluded");
+        source.set_include_in_aggregates(false);
+        source.set_detached(true);
+        legacy.save_source_metadata(&source).unwrap();
+        let old = at(1, 9, 0);
+        let future = at(31, 9, 0) + Duration::days(90);
+        let records = vec![
+            SourceBucketRecord::tombstone(old, u64::MAX).unwrap(),
+            upsert_record(3, bucket(future, 10)),
+        ];
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            legacy
+                .record_source_bucket_changes(source.source_id(), redaction, &records)
+                .unwrap();
+            legacy
+                .record_source_weekly_changes(
+                    source.source_id(),
+                    redaction,
+                    &[SourceWeeklyRecord::upsert(4, weekly_point(future, 20)).unwrap()],
+                )
+                .unwrap();
+        }
+        legacy
+            .record_account_points(&[quota_point(future)])
+            .unwrap();
+        let sql = sqlite_store(root.path());
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(
+            sql.load_source_metadata(source.source_id()).unwrap(),
+            source
+        );
+        assert_eq!(
+            sql.load_account_since(DateTime::<Utc>::MIN_UTC).unwrap(),
+            legacy.load_account_since(DateTime::<Utc>::MIN_UTC).unwrap()
+        );
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            assert_eq!(
+                sql.load_source_records_since(
+                    source.source_id(),
+                    redaction,
+                    DateTime::<Utc>::MIN_UTC
+                )
+                .unwrap(),
+                legacy
+                    .load_source_records_since(
+                        source.source_id(),
+                        redaction,
+                        DateTime::<Utc>::MIN_UTC
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_repeat_core_import_does_not_resurrect_a_purged_ssh_source() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let source_id: NodeId = SOURCE_B.parse().unwrap();
+        let mut source =
+            SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "retired").unwrap();
+        source.set_detached(true);
+        legacy.save_source_metadata(&source).unwrap();
+        legacy
+            .record_source_weekly_changes(
+                &source_id,
+                RedactionProfile::Redacted,
+                &[SourceWeeklyRecord::upsert(1, weekly_point(at(30, 9, 0), 20)).unwrap()],
+            )
+            .unwrap();
+        let ownership = HistoryOwnershipStore::new(
+            root.path().to_path_buf(),
+            PROFILE.parse().unwrap(),
+            RedactionProfile::Redacted,
+        );
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let initial = match ownership.initialize_v1_active(&lease).unwrap() {
+            InitializeV1Outcome::Initialized(manifest)
+            | InitializeV1Outcome::Existing(manifest) => manifest,
+        };
+        let migrating = match ownership.begin_migration(&lease, &initial).unwrap() {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected migration conflict"),
+        };
+        let active = match ownership
+            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+            .unwrap()
+        {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected activation conflict"),
+        };
+        let (active, sql) = crate::sqlite_history_migration::activate_sqlite_history(
+            &ownership, &lease, &active, &legacy,
+        )
+        .unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let writer = sql.writer(&authority).unwrap();
+        writer
+            .prepare_detached_ssh_source_for_purge(&source_id)
+            .unwrap();
+        writer.purge_detached_ssh_source(&source_id).unwrap();
+        assert_eq!(
+            sql.load_source_metadata(&source_id).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(
+            sql.load_source_metadata(&source_id).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(legacy.load_source_metadata(&source_id).unwrap(), source);
+        let database = sql.sqlite_database().unwrap();
+        database.read(|connection| {
+            let prefix = format!("{}/", database.namespace(&sql.source_directory(&source_id))?);
+            assert!(database::state_keys(connection, &prefix)?.is_empty());
+            let count: i64 = connection.query_row("SELECT count(*) FROM history_records WHERE substr(namespace,1,length(?1))=?1", [prefix], |row| row.get(0)).map_err(database::sql_error)?;
+            assert_eq!(count, 0);
+            Ok(())
+        }).unwrap();
+    }
+    fn activate_sqlite_test_store(
+        legacy: &SourceHistoryStore,
+    ) -> (
+        HistoryOwnershipStore,
+        crate::history_ownership::HistoryWriterLease,
+        crate::history_ownership::HistoryOwnershipManifest,
+        SourceHistoryStore,
+    ) {
+        let ownership = HistoryOwnershipStore::new(
+            legacy.state_root().to_path_buf(),
+            legacy.profile_id().clone(),
+            RedactionProfile::Redacted,
+        );
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let initial = match ownership.initialize_v1_active(&lease).unwrap() {
+            InitializeV1Outcome::Initialized(manifest)
+            | InitializeV1Outcome::Existing(manifest) => manifest,
+        };
+        let migrating = match ownership.begin_migration(&lease, &initial).unwrap() {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected migration conflict"),
+        };
+        let active = match ownership
+            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+            .unwrap()
+        {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected activation conflict"),
+        };
+        let (active, sql) = crate::sqlite_history_migration::activate_sqlite_history(
+            &ownership, &lease, &active, legacy,
+        )
+        .unwrap();
+        (ownership, lease, active, sql)
+    }
+
+    #[test]
+    fn sqlite_repeat_core_import_does_not_restore_history_after_ssh_repair() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let source_id: NodeId = SOURCE_B.parse().unwrap();
+        let mut source =
+            SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "old ssh").unwrap();
+        source.set_detached(true);
+        source.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+        legacy.save_source_metadata(&source).unwrap();
+        let start = at(30, 9, 0);
+        let replica = crate::source_model::SessionReplicaKey::new(
+            source_id.clone(),
+            "thread-purged".parse().unwrap(),
+        );
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            legacy
+                .record_source_bucket_changes(
+                    &source_id,
+                    redaction,
+                    &[upsert_record(1, bucket(start, 10))],
+                )
+                .unwrap();
+            legacy
+                .record_source_weekly_changes(
+                    &source_id,
+                    redaction,
+                    &[SourceWeeklyRecord::upsert(1, weekly_point(start, 20)).unwrap()],
+                )
+                .unwrap();
+            legacy
+                .record_source_session_digest_changes(
+                    &source_id,
+                    redaction,
+                    &[SourceSessionDigestRecord::tombstone(
+                        replica.thread_id().clone(),
+                        start,
+                        start + Duration::hours(1),
+                        start + Duration::hours(1),
+                        1,
+                    )
+                    .unwrap()],
+                )
+                .unwrap();
+            let first = CompleteFactBatch {
+                batch_id: FactBatchId::generate().unwrap(),
+                kind: FactBatchKind::Snapshot,
+                replica: replica.clone(),
+                expected_active_version: None,
+                remote_binding: Some(
+                    SourceHistoryRemoteBinding::new(
+                        crate::remote_protocol::SourceGeneration {
+                            node_id: source_id.clone(),
+                            generation: std::num::NonZeroU64::new(1).unwrap(),
+                        },
+                        crate::remote_agent::current_revisions(),
+                    )
+                    .unwrap(),
+                ),
+                validated_digests: Vec::new(),
+                activate_cursor: FactCursor::new(1, 1).unwrap(),
+                completed_at: start,
+                changes: vec![
+                    UsageEventFactRecord::tombstone("event-purged".parse().unwrap(), start, 1)
+                        .unwrap(),
+                ],
+            };
+            legacy
+                .stage_complete_fact_batch(&source_id, redaction, &first)
+                .unwrap();
+            legacy
+                .activate_staged_fact_batch(&source_id, redaction, &first.batch_id)
+                .unwrap();
+            let previous = legacy
+                .load_active_fact_set(&source_id, redaction, replica.thread_id())
+                .unwrap()
+                .unwrap();
+            let staged = CompleteFactBatch {
+                batch_id: FactBatchId::generate().unwrap(),
+                kind: FactBatchKind::Delta,
+                expected_active_version: Some(previous.version),
+                activate_cursor: FactCursor::new(1, 2).unwrap(),
+                changes: vec![
+                    UsageEventFactRecord::tombstone("event-purged".parse().unwrap(), start, 2)
+                        .unwrap(),
+                ],
+                ..first
+            };
+            legacy
+                .stage_complete_fact_batch(&source_id, redaction, &staged)
+                .unwrap();
+            legacy
+                .prevalidate_staged_fact_batch_unfenced(&source_id, redaction, &staged.batch_id)
+                .unwrap();
+        }
+        let (ownership, lease, active, sql) = activate_sqlite_test_store(&legacy);
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            assert!(
+                sql.load_active_fact_set(&source_id, redaction, replica.thread_id())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let writer = sql.writer(&authority).unwrap();
+        writer
+            .prepare_detached_ssh_source_for_purge(&source_id)
+            .unwrap();
+        writer.purge_detached_ssh_source(&source_id).unwrap();
+        let repaired = SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "new ssh").unwrap();
+        writer.save_source_metadata(&repaired).unwrap();
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(sql.load_source_metadata(&source_id).unwrap(), repaired);
+        for redaction in [RedactionProfile::Redacted, RedactionProfile::PreviewEnabled] {
+            assert!(
+                sql.load_active_fact_set(&source_id, redaction, replica.thread_id())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                legacy
+                    .load_active_fact_set(&source_id, redaction, replica.thread_id())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let database = sql.sqlite_database().unwrap();
+        database
+            .read(|connection| {
+                let prefix = format!(
+                    "{}/",
+                    database.namespace(&sql.source_directory(&source_id))?
+                );
+                assert_eq!(
+                    database::state_keys(connection, &prefix)?,
+                    vec![
+                        database.namespace(
+                            &sql.source_directory(&source_id).join(SOURCE_METADATA_FILE)
+                        )?
+                    ],
+                );
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM history_records
+                         WHERE substr(namespace,1,length(?1))=?1",
+                        [prefix],
+                        |row| row.get(0),
+                    )
+                    .map_err(database::sql_error)?;
+                assert_eq!(count, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_repeat_core_import_preserves_gc_cutoff_and_accepts_new_local_data() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let source = metadata(SOURCE_A, "local");
+        legacy.save_source_metadata(&source).unwrap();
+        let old = at(1, 9, 0);
+        let future = old + Duration::days(90);
+        legacy
+            .record_account_points(&[quota_point(old), quota_point(future)])
+            .unwrap();
+        legacy
+            .record_source_bucket_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                &[
+                    upsert_record(1, bucket(old, 10)),
+                    upsert_record(1, bucket(future, 20)),
+                ],
+            )
+            .unwrap();
+        legacy
+            .record_source_weekly_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                &[
+                    SourceWeeklyRecord::upsert(1, weekly_point(old, 10)).unwrap(),
+                    SourceWeeklyRecord::upsert(1, weekly_point(future, 20)).unwrap(),
+                ],
+            )
+            .unwrap();
+        let digests = [old, future]
+            .into_iter()
+            .map(|start| {
+                SourceSessionDigestRecord::tombstone(
+                    "thread-gc".parse().unwrap(),
+                    start,
+                    start + Duration::hours(1),
+                    start + Duration::hours(1),
+                    1,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        legacy
+            .record_source_session_digest_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                &digests,
+            )
+            .unwrap();
+        let (ownership, lease, active, sql) = activate_sqlite_test_store(&legacy);
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let writer = sql.writer(&authority).unwrap();
+        for observed in [
+            old,
+            old + Duration::days(40),
+            old + Duration::days(41),
+            old + Duration::days(42),
+        ] {
+            writer.garbage_collect(observed).unwrap();
+        }
+        let local_new = upsert_record(2, bucket(old + Duration::days(8), 30));
+        legacy
+            .record_source_bucket_changes(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                std::slice::from_ref(&local_new),
+            )
+            .unwrap();
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        let records = sql
+            .load_source_records_since(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                DateTime::<Utc>::MIN_UTC,
+            )
+            .unwrap();
+        assert_eq!(records.records.len(), 2);
+        assert!(records.records.contains(&local_new));
+        assert!(
+            !records
+                .records
+                .iter()
+                .any(|record| record.starts_at() == old)
+        );
+        assert_eq!(records.weekly_records.len(), 1);
+        assert_eq!(
+            sql.load_account_since(DateTime::<Utc>::MIN_UTC)
+                .unwrap()
+                .quota_points
+                .len(),
+            1
+        );
+        let digests = sql
+            .load_source_session_digest_records_since(
+                source.source_id(),
+                RedactionProfile::Redacted,
+                DateTime::<Utc>::MIN_UTC,
+            )
+            .unwrap();
+        assert_eq!(digests.records.len(), 1);
+        assert_eq!(digests.records[0].range_start(), future);
+    }
+
+    #[test]
+    fn sqlite_repeat_core_import_does_not_restore_retired_ssh_preview_facts() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let source_id: NodeId = SOURCE_B.parse().unwrap();
+        let mut source = SourceMetadata::new(source_id.clone(), SourceKind::Ssh, "ssh").unwrap();
+        source.set_aggregate_redaction_profile(RedactionProfile::PreviewEnabled);
+        legacy.save_source_metadata(&source).unwrap();
+        let start = at(30, 9, 0);
+        legacy
+            .record_source_bucket_changes(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                &[upsert_record(
+                    1,
+                    bucket_with_content(start, "private title", "private preview"),
+                )],
+            )
+            .unwrap();
+        legacy
+            .record_source_weekly_changes(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                &[SourceWeeklyRecord::upsert(1, weekly_point(start, 20)).unwrap()],
+            )
+            .unwrap();
+        let replica = crate::source_model::SessionReplicaKey::new(
+            source_id.clone(),
+            "thread-retired".parse().unwrap(),
+        );
+        let first = CompleteFactBatch {
+            batch_id: FactBatchId::generate().unwrap(),
+            kind: FactBatchKind::Snapshot,
+            replica: replica.clone(),
+            expected_active_version: None,
+            remote_binding: Some(
+                SourceHistoryRemoteBinding::new(
+                    crate::remote_protocol::SourceGeneration {
+                        node_id: source_id.clone(),
+                        generation: std::num::NonZeroU64::new(1).unwrap(),
+                    },
+                    crate::remote_agent::current_revisions(),
+                )
+                .unwrap(),
+            ),
+            validated_digests: Vec::new(),
+            activate_cursor: FactCursor::new(1, 1).unwrap(),
+            completed_at: start,
+            changes: vec![
+                UsageEventFactRecord::tombstone("event-retired".parse().unwrap(), start, 1)
+                    .unwrap(),
+            ],
+        };
+        legacy
+            .stage_complete_fact_batch(&source_id, RedactionProfile::PreviewEnabled, &first)
+            .unwrap();
+        legacy
+            .activate_staged_fact_batch(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                &first.batch_id,
+            )
+            .unwrap();
+        let previous = legacy
+            .load_active_fact_set(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                replica.thread_id(),
+            )
+            .unwrap()
+            .unwrap();
+        let staged = CompleteFactBatch {
+            batch_id: FactBatchId::generate().unwrap(),
+            kind: FactBatchKind::Delta,
+            expected_active_version: Some(previous.version),
+            activate_cursor: FactCursor::new(1, 2).unwrap(),
+            changes: vec![
+                UsageEventFactRecord::tombstone("event-retired".parse().unwrap(), start, 2)
+                    .unwrap(),
+            ],
+            ..first
+        };
+        legacy
+            .stage_complete_fact_batch(&source_id, RedactionProfile::PreviewEnabled, &staged)
+            .unwrap();
+        legacy
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                &staged.batch_id,
+            )
+            .unwrap();
+        let (ownership, lease, active, sql) = activate_sqlite_test_store(&legacy);
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        sql.writer(&authority)
+            .unwrap()
+            .publish_remote_source_redaction_profile(&source_id, RedactionProfile::Redacted)
+            .unwrap();
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(
+            sql.load_source_metadata(&source_id)
+                .unwrap()
+                .aggregate_redaction_profile(),
+            RedactionProfile::Redacted
+        );
+        assert!(
+            sql.load_active_fact_set(
+                &source_id,
+                RedactionProfile::PreviewEnabled,
+                replica.thread_id()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let database = sql.sqlite_database().unwrap();
+        database.read(|connection| {
+            let namespace = database.namespace(&sql.source_directory(&source_id).join(RedactionProfile::PreviewEnabled.directory_name()))?;
+            assert!(database::state_keys(connection, &format!("{namespace}/"))?.is_empty());
+            let count: i64 = connection.query_row("SELECT count(*) FROM history_records WHERE substr(namespace,1,length(?1))=?1", [format!("{namespace}/")], |row| row.get(0)).map_err(database::sql_error)?;
+            assert_eq!(count, 0);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn sqlite_metadata_authority_failure_rolls_back_before_commit() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let source = metadata(SOURCE_A, "before");
+        legacy.save_source_metadata(&source).unwrap();
+        let (ownership, lease, active, sql) = activate_sqlite_test_store(&legacy);
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let result =
+            sql.writer(&authority)
+                .unwrap()
+                .update_source_metadata(source.source_id(), |source| {
+                    source.set_display_label("after")?;
+                    fs::remove_file(ownership.manifest_path())?;
+                    Ok(())
+                });
+        assert!(result.is_err());
+        assert_eq!(
+            sql.load_source_metadata(source.source_id())
+                .unwrap()
+                .display_label(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn sqlite_failed_gc_scan_keeps_committed_attempt_throttle() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let (ownership, lease, active, sql) = activate_sqlite_test_store(&legacy);
+        let observed = at(30, 9, 0);
+        let old = observed - Duration::days(70);
+        let database = sql.sqlite_database().unwrap();
+        database
+            .write(|connection| {
+                let key =
+                    database.namespace(&sql.profile_directory().join(RETENTION_CLOCK_FILE))?;
+                database::set_state(
+                    connection,
+                    &key,
+                    &RetentionClockEnvelope {
+                        format_version: RETENTION_CLOCK_FORMAT_VERSION,
+                        profile_id: sql.profile_id().clone(),
+                        clock: RetentionClock::current(observed),
+                    },
+                )?;
+                database::put_record(
+                    connection,
+                    &database.namespace(&sql.account_directory())?,
+                    "invalid-old-point",
+                    old.timestamp_millis(),
+                    &serde_json::json!({"invalid":"quota"}),
+                )
+            })
+            .unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &active).unwrap();
+        let writer = sql.writer(&authority).unwrap();
+        assert_eq!(
+            writer
+                .garbage_collect_if_due(observed, StdDuration::from_secs(3600))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            writer
+                .garbage_collect_if_due(
+                    observed + Duration::minutes(1),
+                    StdDuration::from_secs(3600)
+                )
+                .unwrap(),
+            None
+        );
     }
 }

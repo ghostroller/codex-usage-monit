@@ -1014,6 +1014,12 @@ impl HistoryStore {
         Self::from_optional_root(Some(history_root), codex_home, redact_content)
     }
 
+    /// Safe fallback when ownership cannot establish a persistent backend.
+    /// Only observations staged by this process can be shown or updated.
+    pub(crate) fn memory_only(codex_home: &Path, redact_content: bool) -> Self {
+        Self::from_optional_root(None, codex_home, redact_content)
+    }
+
     fn from_optional_root(
         history_root: Option<PathBuf>,
         codex_home: &Path,

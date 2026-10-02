@@ -763,13 +763,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(
-            fixture
-                .runtime
-                .source_history()
-                .source_directory(&fixture.remote_source.node_id)
-                .is_dir()
-        );
+        let metadata = fixture
+            .runtime
+            .source_history()
+            .load_source_metadata(&fixture.remote_source.node_id)
+            .unwrap();
+        assert_eq!(metadata.kind(), SourceKind::Ssh);
+        assert!(!metadata.detached());
+        assert!(metadata.include_in_aggregates());
     }
 
     #[test]
@@ -850,12 +851,31 @@ mod tests {
         fixture.create_matching_active_generation(RedactionProfile::PreviewEnabled);
         finalize_remote_source_metadata(&fixture.store, &preview_selected, &fixture.runtime)
             .unwrap();
-        let preview_directory = fixture
-            .runtime
-            .source_history()
-            .source_directory(&fixture.remote_source.node_id)
-            .join(RedactionProfile::PreviewEnabled.directory_name());
-        assert!(preview_directory.is_dir());
+        let history = fixture.runtime.source_history();
+        let database = history.sqlite_database().unwrap();
+        let preview_prefix = format!(
+            "{}/",
+            database
+                .namespace(
+                    &history
+                        .source_directory(&fixture.remote_source.node_id)
+                        .join(RedactionProfile::PreviewEnabled.directory_name())
+                )
+                .unwrap()
+        );
+        let preview_keys = database
+            .read(|connection| {
+                crate::source_history::database::state_keys(connection, &preview_prefix)
+            })
+            .unwrap();
+        assert!(!preview_keys.is_empty());
+        let preview_active = history
+            .active_remote_history_ref(
+                &fixture.remote_source.node_id,
+                RedactionProfile::PreviewEnabled,
+            )
+            .unwrap();
+        assert!(preview_active.is_some());
 
         fixture.config = fixture
             .store
@@ -885,7 +905,26 @@ mod tests {
         // publication and retirement below.
         prepare_remote_source_metadata(&fixture.store, &redacted_selected, &fixture.runtime)
             .unwrap();
-        assert!(preview_directory.is_dir());
+        assert_eq!(
+            fixture
+                .runtime
+                .source_history()
+                .active_remote_history_ref(
+                    &fixture.remote_source.node_id,
+                    RedactionProfile::PreviewEnabled
+                )
+                .unwrap(),
+            preview_active
+        );
+        assert_eq!(
+            database
+                .read(|connection| crate::source_history::database::state_keys(
+                    connection,
+                    &preview_prefix
+                ))
+                .unwrap(),
+            preview_keys
+        );
         fixture.create_matching_active_generation(RedactionProfile::Redacted);
 
         let outcome =
@@ -898,7 +937,37 @@ mod tests {
             metadata.aggregate_redaction_profile(),
             RedactionProfile::Redacted
         );
-        assert!(!preview_directory.exists());
+        assert!(
+            fixture
+                .runtime
+                .source_history()
+                .active_remote_history_ref(
+                    &fixture.remote_source.node_id,
+                    RedactionProfile::PreviewEnabled
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            database
+                .read(|connection| crate::source_history::database::state_keys(
+                    connection,
+                    &preview_prefix
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .runtime
+                .source_history()
+                .active_remote_history_ref(
+                    &fixture.remote_source.node_id,
+                    RedactionProfile::Redacted
+                )
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -937,11 +1006,16 @@ mod tests {
         let fixture = Fixture::new();
         let selected = fixture.selected();
         prepare_remote_source_metadata(&fixture.store, &selected, &fixture.runtime).unwrap();
-        let source_directory = fixture
+        fixture.create_matching_active_generation(RedactionProfile::PreviewEnabled);
+        let active = fixture
             .runtime
             .source_history()
-            .source_directory(&fixture.remote_source.node_id);
-        assert!(source_directory.is_dir());
+            .active_remote_history_ref(
+                &fixture.remote_source.node_id,
+                RedactionProfile::PreviewEnabled,
+            )
+            .unwrap();
+        assert!(active.is_some());
 
         let removed = remove_remote_host_with_source_policy(
             &fixture.store,
@@ -959,9 +1033,17 @@ mod tests {
         };
         assert!(metadata.detached());
         assert!(!metadata.include_in_aggregates());
-        assert!(
-            source_directory.is_dir(),
-            "source history must not be deleted"
+        assert_eq!(
+            fixture
+                .runtime
+                .source_history()
+                .active_remote_history_ref(
+                    &fixture.remote_source.node_id,
+                    RedactionProfile::PreviewEnabled
+                )
+                .unwrap(),
+            active,
+            "source history must survive connection removal"
         );
 
         drop(fixture.runtime);
@@ -977,11 +1059,16 @@ mod tests {
             .unwrap();
         assert!(metadata.detached());
         assert!(!metadata.include_in_aggregates());
-        assert!(
+        assert_eq!(
             restarted
                 .source_history()
-                .source_directory(&fixture.remote_source.node_id)
-                .is_dir()
+                .active_remote_history_ref(
+                    &fixture.remote_source.node_id,
+                    RedactionProfile::PreviewEnabled
+                )
+                .unwrap(),
+            active,
+            "retained SQL generation must survive restart"
         );
     }
 

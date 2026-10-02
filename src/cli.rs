@@ -35,7 +35,8 @@ use crate::history_application::{
 #[cfg(test)]
 use crate::history_application::{legacy_history_for_source_selector, report_history_observation};
 #[cfg(test)]
-use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
+use crate::history_ownership::HistoryOwnershipState;
+use crate::history_ownership::OwnershipManifestStatus;
 use crate::history_profile_lease::HistoryProfileLeaseGuard;
 use crate::history_query::HistorySourceSelector;
 use crate::history_runtime::HistoryRuntime;
@@ -2459,6 +2460,9 @@ fn ensure_remote_sync_runtime_v2(host_id: &str, runtime: &mut HistoryRuntime) ->
             "remote sync for {host_id:?} could not inspect local history ownership: {error}; no SSH connection was opened"
         )
     })? {
+        runtime.refresh_active_sqlite_backend().map_err(|error| {
+            anyhow::anyhow!("remote sync for {host_id:?} could not verify active history storage: {error}; no SSH connection was opened")
+        })?;
         return Ok(());
     }
 
@@ -2889,7 +2893,7 @@ fn remote_source_lifecycle_runtime(
     history_dir: Option<&Path>,
     operation: &str,
 ) -> Result<(HistoryRuntime, HistoryProfileLeaseGuard)> {
-    let runtime = HistoryRuntime::new(
+    let mut runtime = HistoryRuntime::new(
         remote_history_root(history_dir)?,
         &collect_config.codex_home,
         collect_config.redact_content,
@@ -2904,6 +2908,13 @@ fn remote_source_lifecycle_runtime(
             "remote {operation} could not select the active local history profile: {error}; no source lifecycle change was published"
         )
     })?;
+    if matches!(runtime.ownership().load_manifest()?, OwnershipManifestStatus::Initialized(manifest) if manifest.uses_source_history())
+    {
+        ensure_remote_sync_runtime_v2(operation, &mut runtime).map_err(|error| {
+            anyhow::anyhow!("remote {operation} could not prepare active history storage: {error}; no source lifecycle change was published")
+        })?;
+    }
+    profile_lease.validate()?;
     Ok((runtime, profile_lease))
 }
 
@@ -9733,14 +9744,27 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+        let database = runtime.source_history().sqlite_database().unwrap();
+        let revision_key = database
+            .namespace(
+                &runtime
+                    .source_history()
+                    .source_directory(runtime.source_identity().node_id())
+                    .join(runtime.redaction_profile().directory_name())
+                    .join("local-observation-committed.json"),
+            )
+            .unwrap();
         let selector = HistorySourceSelector::Remote(remote);
         let expected = request.query(&config, &selector);
-        let revision_file = walkdir::WalkDir::new(temp.path())
-            .into_iter()
-            .map(|entry| entry.unwrap())
-            .find(|entry| entry.file_name() == "local-observation-state.json")
-            .expect("a submitted observation has a revision file");
-        fs::write(revision_file.path(), b"invalid revision").unwrap();
+        database
+            .write(|connection| {
+                crate::source_history::database::set_state(
+                    connection,
+                    &revision_key,
+                    &"invalid revision",
+                )
+            })
+            .unwrap();
         let actual = request.query(&config, &selector);
         assert_eq!(
             actual, expected,
@@ -9973,13 +9997,14 @@ mod tests {
     }
 
     #[test]
-    fn report_history_keeps_live_observation_when_future_format_is_read_only() {
+    fn report_history_keeps_live_observation_when_unbound_root_contains_future_history() {
         let temp = tempfile::tempdir().unwrap();
         let history_root = temp.path().join("history");
         let config = CollectConfig {
             codex_home: temp.path().join("codex"),
             ..CollectConfig::default()
         };
+        fs::create_dir_all(&config.codex_home).unwrap();
         let result = report_history_collection_result(Provenance::ServerSnapshot);
         let probe = HistoryStore::new(history_root.clone(), &config.codex_home);
         let namespace_dir = probe.namespace_dir().unwrap().to_path_buf();
@@ -9992,14 +10017,23 @@ mod tests {
         .unwrap();
         std::fs::write(&shard_path, &future).unwrap();
 
-        let (_, history) = collect_and_load_report_history(&config, &result, Some(history_root));
+        let (store, history) =
+            collect_and_load_report_history(&config, &result, Some(history_root));
 
+        assert!(matches!(
+            store,
+            ReportHistoryStore::LegacyFallback {
+                writable: false,
+                ..
+            }
+        ));
         assert!(history.read_only);
         assert!(
             history
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("future history format version"))
+                .any(|warning| warning.contains("read-only memory view")
+                    && warning.contains("legacy history root must end in history-v1"))
         );
         assert_eq!(
             history.quota_points,
@@ -10014,6 +10048,66 @@ mod tests {
             result.history_observation.weekly_local_points
         );
         assert_eq!(std::fs::read(shard_path).unwrap(), future);
+    }
+
+    #[test]
+    fn report_history_with_damaged_or_missing_ownership_excludes_persisted_v1_backup() {
+        for missing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let history_root = temp.path().join("state/history-v1");
+            let config = CollectConfig {
+                codex_home: temp.path().join("codex"),
+                ..CollectConfig::default()
+            };
+            fs::create_dir_all(&config.codex_home).unwrap();
+            let result = report_history_collection_result(Provenance::ServerSnapshot);
+            let mut previous = result.history_observation.clone();
+            let bucket = &mut previous.half_hour_buckets[0];
+            bucket.starts_at -= chrono::Duration::hours(1);
+            bucket.ends_at -= chrono::Duration::hours(1);
+            bucket.sampled_at -= chrono::Duration::hours(1);
+            bucket.token_usage.total_tokens = 999;
+            previous.quota_points.clear();
+            previous.weekly_local_points.clear();
+            let mut legacy = HistoryStore::new(history_root.clone(), &config.codex_home);
+            legacy.record(&previous).unwrap();
+            let shard = legacy.namespace_dir().unwrap().join(format!(
+                "{}.json",
+                previous.half_hour_buckets[0].starts_at.date_naive()
+            ));
+            let before = fs::read(&shard).unwrap();
+            let runtime =
+                HistoryRuntime::new(history_root.clone(), &config.codex_home, false).unwrap();
+            runtime.ensure_ownership_initialized().unwrap();
+            let manifest = runtime.ownership().manifest_path();
+            drop(runtime);
+            if missing {
+                fs::remove_file(manifest).unwrap();
+            } else {
+                fs::write(manifest, b"invalid ownership").unwrap();
+            }
+            let (store, history) =
+                collect_and_load_report_history(&config, &result, Some(history_root));
+            assert!(matches!(
+                store,
+                ReportHistoryStore::LegacyFallback {
+                    writable: false,
+                    ..
+                }
+            ));
+            assert!(history.read_only);
+            assert_eq!(
+                history.half_hour_buckets,
+                result.history_observation.half_hour_buckets
+            );
+            assert!(
+                history
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("read-only memory view"))
+            );
+            assert_eq!(fs::read(&shard).unwrap(), before);
+        }
     }
 
     #[test]
@@ -10056,7 +10150,7 @@ mod tests {
         assert!(!hidden_v1_shard.exists());
         assert_eq!(history.half_hour_buckets.len(), 1);
         assert!(history.warnings.iter().any(|warning| {
-            warning.contains("read-only legacy view")
+            warning.contains("read-only memory view")
                 && warning.contains("no history will be persisted")
         }));
     }
@@ -10090,7 +10184,7 @@ mod tests {
             history
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("using a read-only legacy view"))
+                .any(|warning| warning.contains("read-only memory view"))
         );
         assert_eq!(
             history.quota_points,

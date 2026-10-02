@@ -96,7 +96,8 @@ use crate::history_application::{
     HistoryProjectionRevision, SummaryBackfillObservation, acquire_runtime_profile_lease,
     apply_runtime_write_metrics, apply_summary_backfill_marker, history_projection_revision,
     merge_runtime_history_write_result, normalize_history_warnings, query_runtime_history,
-    report_history_observation, stage_runtime_collection, summary_backfill_attempt,
+    report_history_observation, runtime_history_write_permitted, stage_runtime_collection,
+    summary_backfill_attempt,
 };
 use crate::history_ownership::{HistoryOwnershipState, OwnershipManifestStatus};
 use crate::history_profile_lease::HistoryProfileLeaseGuard;
@@ -429,6 +430,9 @@ impl TuiHistoryStore {
         let TuiHistoryBackend::Runtime(runtime) = &mut self.backend else {
             return Ok(RemoteOverviewHistory::default());
         };
+        runtime
+            .refresh_active_sqlite_backend()
+            .map_err(|error| format!("remote Overview history storage is unavailable: {error}"))?;
         let store = runtime.source_history().clone();
         let mut metadata = store
             .list_source_metadata()
@@ -530,8 +534,12 @@ impl TuiHistoryStore {
 
     fn write_permitted(&self) -> bool {
         !self.runtime_preparation_pending
-            && matches!(&self.backend, TuiHistoryBackend::Runtime(_))
-            && self.profile_lease.is_some()
+            && matches!((&self.backend, self.profile_lease.as_ref()), (TuiHistoryBackend::Runtime(runtime), Some(lease))
+                if lease.state_root() == runtime.state_root()
+                    && lease.profile_id() == runtime.profile_id()
+                    && lease.redaction_profile() == runtime.redaction_profile()
+                    && lease.validate().is_ok()
+                    && runtime_history_write_permitted(runtime).unwrap_or(false))
     }
 
     /// Revalidates the process-lifetime profile selection immediately before
@@ -547,12 +555,29 @@ impl TuiHistoryStore {
         let Some(profile_lease) = self.profile_lease.as_ref() else {
             return Ok(false);
         };
-        if let Err(error) = profile_lease.validate() {
+        let validation = match &self.backend {
+            TuiHistoryBackend::Runtime(runtime)
+                if profile_lease.state_root() != runtime.state_root()
+                    || profile_lease.profile_id() != runtime.profile_id()
+                    || profile_lease.redaction_profile() != runtime.redaction_profile() =>
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "history profile lease does not match the TUI runtime",
+                ))
+            }
+            _ => profile_lease.validate(),
+        };
+        if let Err(error) = validation {
             self.profile_lease = None;
             self.setup_warnings.push(format!(
                 "history persistence became read-only because its profile lease could not be revalidated: {error}"
             ));
             return Err(error);
+        }
+        if let TuiHistoryBackend::Runtime(runtime) = &mut self.backend {
+            runtime.refresh_active_sqlite_backend()?;
+            return runtime_history_write_permitted(runtime);
         }
         Ok(true)
     }
@@ -9053,7 +9078,17 @@ fn prepare_deferred_initial_tui(
 }
 
 fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
-    match HistoryRuntime::discover(&config.codex_home, config.redact_content) {
+    tui_history_store_from_binding(
+        config,
+        HistoryRuntime::discover(&config.codex_home, config.redact_content),
+    )
+}
+
+fn tui_history_store_from_binding(
+    config: &CollectConfig,
+    runtime: io::Result<HistoryRuntime>,
+) -> TuiHistoryStore {
+    match runtime {
         Ok(runtime) => match acquire_runtime_profile_lease(&runtime) {
             Ok(profile_lease) => TuiHistoryStore::deferred_runtime(runtime, profile_lease),
             Err(error) => TuiHistoryStore::runtime(
@@ -9065,9 +9100,9 @@ fn prepare_tui_history_store(config: &CollectConfig) -> TuiHistoryStore {
             ),
         },
         Err(error) => TuiHistoryStore::legacy_fallback(
-            HistoryStore::discover_with_redaction(&config.codex_home, config.redact_content),
+            HistoryStore::memory_only(&config.codex_home, config.redact_content),
             vec![format!(
-                "source-aware history runtime unavailable; using legacy history only: {error}"
+                "source-aware history runtime unavailable; showing only this process's collected history in a read-only memory view; no history will be persisted until the source-aware state is repaired: {error}"
             )],
         ),
     }
@@ -9084,29 +9119,35 @@ fn prepare_tui_history_runtime(
         || profile_lease.redaction_profile() != runtime.redaction_profile()
     {
         warnings.push(
-            "source-aware history profile lease does not match the TUI runtime; using legacy history only"
+            "source-aware history profile lease does not match the TUI runtime; history persistence is read-only"
                 .to_owned(),
         );
-        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        return TuiHistoryRuntimePreparation::Ready(warnings);
     }
     if let Err(error) = profile_lease.validate() {
         warnings.push(format!(
-            "source-aware history profile lease could not be verified; using legacy history only: {error}"
+            "source-aware history profile lease could not be verified; history persistence is read-only: {error}"
         ));
-        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        return TuiHistoryRuntimePreparation::Ready(warnings);
     }
     match runtime.ownership().load_manifest() {
         Ok(OwnershipManifestStatus::Initialized(manifest))
-            if manifest.state() == HistoryOwnershipState::V2Active =>
+            if manifest.state() == HistoryOwnershipState::V2Active
+                && manifest.is_sqlite_backend() =>
         {
+            if let Err(error) = runtime.refresh_active_sqlite_backend() {
+                warnings.push(format!(
+                    "active history storage could not be verified: {error}"
+                ));
+            }
             return TuiHistoryRuntimePreparation::Ready(warnings);
         }
         Ok(_) => {}
         Err(error) => {
             warnings.push(format!(
-                "source-aware history ownership could not be verified; using legacy history only: {error}"
+                "source-aware history ownership could not be verified; history persistence is read-only: {error}"
             ));
-            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+            return TuiHistoryRuntimePreparation::Ready(warnings);
         }
     }
 
@@ -9123,8 +9164,18 @@ fn prepare_tui_history_runtime(
             if matches!(
                 runtime.ownership().load_manifest(),
                 Ok(OwnershipManifestStatus::Initialized(manifest))
-                    if manifest.state() == HistoryOwnershipState::V2Active
+                    if manifest.state() == HistoryOwnershipState::V2Active && manifest.is_sqlite_backend()
             ) {
+                if let Err(error) = runtime.refresh_active_sqlite_backend() {
+                    warnings.push(format!(
+                        "active history storage could not be verified: {error}"
+                    ));
+                }
+                return TuiHistoryRuntimePreparation::Ready(warnings);
+            }
+            if matches!(runtime.ownership().load_manifest(), Ok(OwnershipManifestStatus::Initialized(manifest)) if manifest.uses_source_history())
+            {
+                warnings.push("history storage upgrade is deferred while the recorder is active; existing source-aware history is read-only until the upgrade completes".to_owned());
                 return TuiHistoryRuntimePreparation::Ready(warnings);
             }
             warnings.push(
@@ -9135,9 +9186,9 @@ fn prepare_tui_history_runtime(
         }
         Err(error) => {
             warnings.push(format!(
-                "source-aware history cutover lock could not be verified; using legacy history only: {error}"
+                "source-aware history cutover lock could not be verified; history persistence is read-only: {error}"
             ));
-            return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+            return TuiHistoryRuntimePreparation::Ready(warnings);
         }
     };
 
@@ -9182,7 +9233,7 @@ fn prepare_tui_history_runtime(
         warnings.push(format!(
             "source-aware history profile lease changed during cutover: {error}"
         ));
-        return TuiHistoryRuntimePreparation::LegacyFallback(warnings);
+        return TuiHistoryRuntimePreparation::Ready(warnings);
     }
     TuiHistoryRuntimePreparation::Ready(warnings)
 }

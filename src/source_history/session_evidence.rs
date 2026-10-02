@@ -12,6 +12,9 @@ use flate2::write::GzEncoder;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::*;
+
+#[path = "sqlite_evidence.rs"]
+mod sqlite_evidence;
 use crate::domain::{ApiCostAmount, TokenUsage};
 use crate::source_model::{ObservedProjectKey, SessionReplicaKey, ThreadId, ThreadShardKey};
 
@@ -1350,6 +1353,17 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         records: &[SourceSessionDigestRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
+        if let Some(database) = self.sqlite_database() {
+            return database.write(|_| {
+                self.load_source_metadata(source_id)?;
+                self.record_source_session_digest_changes_in_directory_unfenced(
+                    source_id,
+                    redaction_profile,
+                    &self.source_digests_directory(source_id, redaction_profile),
+                    records,
+                )
+            });
+        }
         let _ = self.load_source_metadata(source_id)?;
         self.record_source_session_digest_changes_in_directory_unfenced(
             source_id,
@@ -1366,6 +1380,14 @@ impl SourceHistoryStore {
         directory: &Path,
         records: &[SourceSessionDigestRecord],
     ) -> io::Result<SourceHistoryWriteReport> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_record_digest_changes(
+                source_id,
+                redaction_profile,
+                directory,
+                records,
+            );
+        }
         let additions = group_digest_records_by_day(source_id, records)?;
         if additions.is_empty() {
             return Ok(SourceHistoryWriteReport::default());
@@ -1474,6 +1496,9 @@ impl SourceHistoryStore {
         directory: &Path,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<SourceSessionDigestRecord>> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_load_digest_records(source_id, since, directory, budget);
+        }
         if !self.private_directory_exists(directory)? {
             return Ok(Vec::new());
         }
@@ -1509,6 +1534,9 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         batch: &CompleteFactBatch,
     ) -> io::Result<()> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_stage_fact_batch(source_id, redaction_profile, batch);
+        }
         batch.validate()?;
         if batch.replica.source_id() != source_id {
             return Err(invalid_data(
@@ -1655,6 +1683,9 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         batch_id: &FactBatchId,
     ) -> io::Result<PrevalidatedFactPublication> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_prevalidate_fact_batch(source_id, redaction_profile, batch_id);
+        }
         let source = self.load_source_metadata(source_id)?;
         let staging_root = self.source_fact_staging_directory(source_id, redaction_profile);
         self.validate_private_path(&staging_root)?;
@@ -1810,6 +1841,9 @@ impl SourceHistoryStore {
         &self,
         publication: &PrevalidatedFactPublication,
     ) -> io::Result<FactActivationReport> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_publish_fact_batch(publication);
+        }
         let descriptor = &publication.descriptor;
         let source_id = &descriptor.source_id;
         let redaction_profile = descriptor.redaction_profile;
@@ -1951,6 +1985,9 @@ impl SourceHistoryStore {
         &self,
         publication: &PrevalidatedFactPublication,
     ) -> bool {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_cleanup_fact_publication(publication).is_err();
+        }
         (|| -> io::Result<()> {
             let descriptor = &publication.descriptor;
             let source_id = &descriptor.source_id;
@@ -2015,6 +2052,14 @@ impl SourceHistoryStore {
         thread_id: &ThreadId,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Option<ActiveFactSet>> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_load_active_fact_set(
+                source_id,
+                redaction_profile,
+                thread_id,
+                budget,
+            );
+        }
         let source = self.load_source_metadata_with_budget(source_id, budget)?;
         let replica = SessionReplicaKey::new(source_id.clone(), thread_id.clone());
         let shard_key = ThreadShardKey::from_replica(&replica);
@@ -2094,6 +2139,15 @@ impl SourceHistoryStore {
         shard_key: &ThreadShardKey,
         mut budget: Option<&mut SourceHistoryReadBudget>,
     ) -> io::Result<Option<ActiveFactManifest>> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_read_fact_manifest(
+                source_id,
+                redaction_profile,
+                replica,
+                shard_key,
+                budget,
+            );
+        }
         let directory = self.source_fact_manifests_directory(source_id, redaction_profile);
         self.validate_private_path(&directory)?;
         let path = fact_manifest_path(&directory, shard_key);
@@ -2124,6 +2178,15 @@ impl SourceHistoryStore {
         redaction_profile: RedactionProfile,
         manifest: &ActiveFactManifest,
     ) -> io::Result<Vec<UsageEventFactRecord>> {
+        if self.sqlite_database().is_some() {
+            let mut budget = SourceHistoryReadBudget::for_query();
+            return self.sqlite_read_fact_generation(
+                source_id,
+                redaction_profile,
+                manifest,
+                &mut budget,
+            );
+        }
         let directory = self
             .source_facts_directory(source_id, redaction_profile)
             .join(manifest.thread_shard_key.as_str())
@@ -2162,6 +2225,14 @@ impl SourceHistoryStore {
         manifest: &ActiveFactManifest,
         budget: &mut SourceHistoryReadBudget,
     ) -> io::Result<Vec<UsageEventFactRecord>> {
+        if self.sqlite_database().is_some() {
+            return self.sqlite_read_fact_generation(
+                source_id,
+                redaction_profile,
+                manifest,
+                budget,
+            );
+        }
         let directory = self
             .source_facts_directory(source_id, redaction_profile)
             .join(manifest.thread_shard_key.as_str())
@@ -2818,6 +2889,24 @@ fn read_staged_batch(
     batch_id: &FactBatchId,
 ) -> io::Result<StagedFactBatch> {
     let descriptor: StagedFactBatch = read_json_file(path, MAX_FACT_MANIFEST_BYTES)?;
+    validate_staged_batch(
+        descriptor,
+        path,
+        profile_id,
+        source_id,
+        redaction_profile,
+        batch_id,
+    )
+}
+
+fn validate_staged_batch(
+    descriptor: StagedFactBatch,
+    path: &Path,
+    profile_id: &HistoryProfileId,
+    source_id: &NodeId,
+    redaction_profile: RedactionProfile,
+    batch_id: &FactBatchId,
+) -> io::Result<StagedFactBatch> {
     if descriptor.format_version != FACT_BATCH_FORMAT_VERSION
         || &descriptor.profile_id != profile_id
         || &descriptor.source_id != source_id
@@ -3392,11 +3481,22 @@ fn private_tree_usage_bounded(
     Ok(usage)
 }
 
+pub(super) fn import_sqlite_session_evidence(
+    target: &SourceHistoryStore,
+    legacy: &SourceHistoryStore,
+    sources: &[SourceMetadata],
+) -> io::Result<()> {
+    sqlite_evidence::import_legacy_evidence(target, legacy, sources)
+}
+
 pub(super) fn earliest_session_evidence_time(
     store: &SourceHistoryStore,
     sources: &[SourceMetadata],
     redaction_profiles: &[RedactionProfile],
 ) -> io::Result<Option<DateTime<Utc>>> {
+    if store.sqlite_database().is_some() {
+        return sqlite_evidence::earliest_session_evidence_time(store, sources, redaction_profiles);
+    }
     let mut earliest = None;
     for source in sources {
         for &redaction_profile in redaction_profiles {
@@ -3455,6 +3555,15 @@ pub(super) fn garbage_collect_session_evidence_for_source(
     cutoff_day: NaiveDate,
     trusted_at: DateTime<Utc>,
 ) -> io::Result<usize> {
+    if store.sqlite_database().is_some() {
+        return sqlite_evidence::garbage_collect_session_evidence(
+            store,
+            source_id,
+            redaction_profile,
+            cutoff_day,
+            trusted_at,
+        );
+    }
     let mut pruned = prune_digest_evidence(store, source_id, redaction_profile, cutoff_day)?;
     pruned += prune_active_fact_evidence(store, source_id, redaction_profile, cutoff_day)?;
     garbage_collect_fact_artifacts(store, source_id, redaction_profile, trusted_at)?;
@@ -5841,5 +5950,424 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert!(!outside.join(DIGESTS_DIRECTORY).exists());
+    }
+    fn sqlite_store(root: &Path) -> SourceHistoryStore {
+        let store =
+            SourceHistoryStore::new_sqlite(root.join("state-root"), PROFILE.parse().unwrap());
+        store
+            .save_source_metadata(
+                &SourceMetadata::new(source_id(), SourceKind::Local, "sql").unwrap(),
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn sqlite_fact_compare_and_swap_keeps_complete_cursor_and_proof_atomic() {
+        let root = tempdir().unwrap();
+        let store = sqlite_store(root.path());
+        let occurred = at(8, 28, 1);
+        let first = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Snapshot,
+            "thread-a",
+            None,
+            FactCursor::new(u64::MAX, 1).unwrap(),
+            occurred,
+            vec![
+                UsageEventFactRecord::upsert(u64::MAX, fact("thread-a", "event-1", occurred, 10))
+                    .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &first)
+            .unwrap();
+        assert!(
+            store
+                .load_active_fact_set(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    &thread("thread-a")
+                )
+                .unwrap()
+                .is_none()
+        );
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &first.batch_id)
+            .unwrap();
+        let initial = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        let delta = |event: &str| {
+            batch(
+                FactBatchId::generate().unwrap(),
+                FactBatchKind::Delta,
+                "thread-a",
+                Some(initial.version.clone()),
+                FactCursor::new(u64::MAX, 2).unwrap(),
+                occurred + Duration::minutes(1),
+                vec![
+                    UsageEventFactRecord::upsert(
+                        1,
+                        fact("thread-a", event, occurred + Duration::minutes(1), 20),
+                    )
+                    .unwrap(),
+                ],
+            )
+        };
+        let left = delta("event-left");
+        let right = delta("event-right");
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &left)
+            .unwrap();
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &right)
+            .unwrap();
+        let left = store
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &left.batch_id,
+            )
+            .unwrap();
+        let right = store
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &right.batch_id,
+            )
+            .unwrap();
+        assert!(
+            store
+                .publish_prevalidated_fact_batch_unfenced(&left)
+                .unwrap()
+                .activated
+        );
+        assert_eq!(
+            store
+                .publish_prevalidated_fact_batch_unfenced(&right)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let active = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.cursor, FactCursor::new(u64::MAX, 2).unwrap());
+        assert_eq!(active.records.len(), 2);
+        assert!(
+            active
+                .records
+                .iter()
+                .any(|record| record.event_id().as_str() == "event-left")
+        );
+        assert!(
+            !active
+                .records
+                .iter()
+                .any(|record| record.event_id().as_str() == "event-right")
+        );
+        assert!(
+            !store
+                .source_facts_directory(&source_id(), RedactionProfile::Redacted)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn sqlite_digest_revision_preserves_suppression_horizon_and_rejects_equal_conflict() {
+        let root = tempdir().unwrap();
+        let store = sqlite_store(root.path());
+        let start = at(8, 28, 1);
+        let long = SourceSessionDigestRecord::upsert(
+            1,
+            digest("thread-a", start, start + Duration::hours(2), 10),
+        )
+        .unwrap();
+        store
+            .record_source_session_digest_changes(&source_id(), RedactionProfile::Redacted, &[long])
+            .unwrap();
+        let short = SourceSessionDigestRecord::upsert(
+            2,
+            digest("thread-a", start, start + Duration::hours(1), 10),
+        )
+        .unwrap();
+        store
+            .record_source_session_digest_changes(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &[short],
+            )
+            .unwrap();
+        let loaded = store
+            .load_source_session_digest_records_since(
+                &source_id(),
+                RedactionProfile::Redacted,
+                start + Duration::minutes(90),
+            )
+            .unwrap();
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(
+            loaded.records[0].retention_through(),
+            start + Duration::hours(2)
+        );
+        let conflict = SourceSessionDigestRecord::upsert(
+            2,
+            digest("thread-a", start, start + Duration::hours(1), 20),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .record_source_session_digest_changes(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    &[conflict]
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sqlite_fact_import_keeps_active_and_prevalidated_staged_generations() {
+        let root = tempdir().unwrap();
+        let legacy = store(root.path());
+        let occurred = at(8, 28, 1);
+        let first = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Snapshot,
+            "thread-a",
+            None,
+            FactCursor::new(1, 1).unwrap(),
+            occurred,
+            vec![
+                UsageEventFactRecord::upsert(1, fact("thread-a", "event-1", occurred, 10)).unwrap(),
+            ],
+        );
+        legacy
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &first)
+            .unwrap();
+        legacy
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &first.batch_id)
+            .unwrap();
+        let active = legacy
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        let next = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Delta,
+            "thread-a",
+            Some(active.version.clone()),
+            FactCursor::new(1, 2).unwrap(),
+            occurred + Duration::minutes(1),
+            vec![
+                UsageEventFactRecord::upsert(2, fact("thread-a", "event-1", occurred, 20)).unwrap(),
+            ],
+        );
+        legacy
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &next)
+            .unwrap();
+        legacy
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &next.batch_id,
+            )
+            .unwrap();
+        let sql = SourceHistoryStore::new_sqlite(
+            legacy.state_root().to_path_buf(),
+            legacy.profile_id().clone(),
+        );
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(
+            sql.load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a")
+            )
+            .unwrap()
+            .unwrap(),
+            active
+        );
+        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &next.batch_id)
+            .unwrap();
+        let activated = sql
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(activated.cursor, FactCursor::new(1, 2).unwrap());
+        assert_eq!(activated.records[0].revision(), 2);
+        sql.update_source_metadata(&source_id(), |source| {
+            source.set_display_label("sql-updated")?;
+            source.set_include_in_aggregates(false);
+            Ok(())
+        })
+        .unwrap();
+        let latest = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Delta,
+            "thread-a",
+            Some(activated.version),
+            FactCursor::new(1, 3).unwrap(),
+            occurred + Duration::minutes(2),
+            vec![
+                UsageEventFactRecord::upsert(3, fact("thread-a", "event-1", occurred, 30)).unwrap(),
+            ],
+        );
+        sql.stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &latest)
+            .unwrap();
+        sql.activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &latest.batch_id)
+            .unwrap();
+        let before_reimport = sql
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        sql.import_sqlite_history_core_and_facts(&legacy).unwrap();
+        assert_eq!(
+            sql.load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a")
+            )
+            .unwrap()
+            .unwrap(),
+            before_reimport
+        );
+        let metadata = sql.load_source_metadata(&source_id()).unwrap();
+        assert_eq!(metadata.display_label(), "sql-updated");
+        assert!(!metadata.include_in_aggregates());
+    }
+
+    #[test]
+    fn sqlite_fact_gc_fences_stale_staging_and_preserves_tombstone_retention_floor() {
+        let root = tempdir().unwrap();
+        let store = sqlite_store(root.path());
+        let occurred = at(8, 1, 1);
+        let first = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Snapshot,
+            "thread-a",
+            None,
+            FactCursor::new(1, 1).unwrap(),
+            occurred,
+            vec![
+                UsageEventFactRecord::tombstone("event-old".parse().unwrap(), occurred, 5).unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &first)
+            .unwrap();
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &first.batch_id)
+            .unwrap();
+        let initial = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        let stale = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Delta,
+            "thread-a",
+            Some(initial.version),
+            FactCursor::new(1, 2).unwrap(),
+            occurred,
+            vec![
+                UsageEventFactRecord::upsert(6, fact("thread-a", "event-old", occurred, 10))
+                    .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &stale)
+            .unwrap();
+        let stale = store
+            .prevalidate_staged_fact_batch_unfenced(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &stale.batch_id,
+            )
+            .unwrap();
+        garbage_collect_session_evidence_for_source(
+            &store,
+            &source_id(),
+            RedactionProfile::Redacted,
+            at(8, 2, 0).date_naive(),
+            at(8, 2, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .publish_prevalidated_fact_batch_unfenced(&stale)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let active = store
+            .load_active_fact_set(
+                &source_id(),
+                RedactionProfile::Redacted,
+                &thread("thread-a"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(active.records.is_empty());
+        assert_eq!(active.version.retained_since(), Some(at(8, 2, 0)));
+        let next = batch(
+            FactBatchId::generate().unwrap(),
+            FactBatchKind::Delta,
+            "thread-a",
+            Some(active.version),
+            FactCursor::new(1, 2).unwrap(),
+            occurred,
+            vec![
+                UsageEventFactRecord::upsert(6, fact("thread-a", "event-old", occurred, 10))
+                    .unwrap(),
+            ],
+        );
+        store
+            .stage_complete_fact_batch(&source_id(), RedactionProfile::Redacted, &next)
+            .unwrap();
+        store
+            .activate_staged_fact_batch(&source_id(), RedactionProfile::Redacted, &next.batch_id)
+            .unwrap();
+        assert!(
+            store
+                .load_active_fact_set(
+                    &source_id(),
+                    RedactionProfile::Redacted,
+                    &thread("thread-a")
+                )
+                .unwrap()
+                .unwrap()
+                .records
+                .is_empty()
+        );
     }
 }

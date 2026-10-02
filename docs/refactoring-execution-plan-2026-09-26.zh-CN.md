@@ -1,5 +1,7 @@
 # 项目瘦身与重构：修改方案及本地 Agent 执行说明
 
+> 2026-10-02 决策更新：用户决定不采用 A 方案，保留全部去重功能，授权优先实施生产历史存储重写。后续工作以[新的存储重写执行方案](storage-rewrite-execution-plan-2026-10-02.zh-CN.md)为准；下文的默认范围和原型决策门保留为此前执行记录，不限制本次已授权的生产接入与迁移。
+
 日期：2026-09-26  
 仓库：`ghostroller/codex-usage-monit`  
 依据：[`refactoring-review-2026-09-26.zh-CN.md`](refactoring-review-2026-09-26.zh-CN.md)  

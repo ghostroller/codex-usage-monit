@@ -58,9 +58,12 @@ impl ReportHistoryStore {
     pub(crate) fn validated_write_permitted(&self) -> io::Result<bool> {
         match self {
             Self::Runtime {
+                runtime,
                 profile_lease: Some(profile_lease),
-                ..
-            } => profile_lease.validate().map(|_| true),
+            } => {
+                profile_lease.validate()?;
+                runtime_history_write_permitted(runtime)
+            }
             Self::Runtime {
                 profile_lease: None,
                 ..
@@ -101,8 +104,31 @@ pub(crate) fn runtime_requires_v2_cutover(runtime: &HistoryRuntime) -> io::Resul
     Ok(match runtime.ownership().load_manifest()? {
         OwnershipManifestStatus::Uninitialized => true,
         OwnershipManifestStatus::Initialized(manifest) => {
-            manifest.state() != HistoryOwnershipState::V2Active
+            manifest.state() != HistoryOwnershipState::V2Active || !manifest.is_sqlite_backend()
         }
+    })
+}
+
+/// File-based v2 is retained as upgrade input and a read-only snapshot.
+/// V1 may still be owned by the original recorder while cutover is deferred.
+pub(crate) fn runtime_history_write_permitted(runtime: &HistoryRuntime) -> io::Result<bool> {
+    Ok(match runtime.ownership().load_manifest()? {
+        OwnershipManifestStatus::Initialized(manifest) => {
+            if manifest.state() == HistoryOwnershipState::V1Active {
+                true
+            } else if manifest.state() == HistoryOwnershipState::V2Active
+                && manifest.is_sqlite_backend()
+            {
+                let Some(database) = runtime.source_history().sqlite_database() else {
+                    return Ok(false);
+                };
+                crate::sqlite_history_migration::validate_receipt(&database, &manifest)?;
+                true
+            } else {
+                false
+            }
+        }
+        OwnershipManifestStatus::Uninitialized => false,
     })
 }
 
@@ -125,7 +151,7 @@ pub(crate) fn prepare_report_history(
     let write_permitted = match store.validated_write_permitted() {
         Ok(permitted) => permitted,
         Err(error) => {
-            warnings.push(format!("history persistence is read-only because its profile lease could not be revalidated: {error}"));
+            warnings.push(format!("history persistence is read-only because its profile lease or active storage could not be revalidated: {error}"));
             false
         }
     };
@@ -153,7 +179,7 @@ pub(crate) fn prepare_report_history(
         && match store.validated_write_permitted() {
             Ok(permitted) => permitted,
             Err(error) => {
-                warnings.push(format!("history persistence is read-only because its profile lease could not be revalidated: {error}"));
+                warnings.push(format!("history persistence is read-only because its profile lease or active storage could not be revalidated: {error}"));
                 false
             }
         };
@@ -373,23 +399,14 @@ fn report_history_store(
             )
         }
         Err(error) => {
-            let store = explicit_root.map_or_else(
-                || HistoryStore::discover_with_redaction(&config.codex_home, config.redact_content),
-                |history_root| {
-                    HistoryStore::new_with_redaction(
-                        history_root,
-                        &config.codex_home,
-                        config.redact_content,
-                    )
-                },
-            );
+            let store = HistoryStore::memory_only(&config.codex_home, config.redact_content);
             (
                 ReportHistoryStore::LegacyFallback {
                     store: Box::new(store),
                     writable: false,
                 },
                 vec![format!(
-                    "source-aware history runtime unavailable; using a read-only legacy view; no history will be persisted until the source-aware state is repaired: {error}"
+                    "source-aware history runtime unavailable; showing only this process's collected history in a read-only memory view; no history will be persisted until the source-aware state is repaired: {error}"
                 )],
             )
         }
@@ -399,7 +416,14 @@ fn report_history_store(
 fn prepare_report_history_runtime(runtime: &mut HistoryRuntime) -> Vec<String> {
     let mut warnings = Vec::new();
     match runtime_requires_v2_cutover(runtime) {
-        Ok(false) => return warnings,
+        Ok(false) => {
+            if let Err(error) = runtime.refresh_active_sqlite_backend() {
+                warnings.push(format!(
+                    "active history storage could not be verified: {error}"
+                ));
+            }
+            return warnings;
+        }
         Err(error) => {
             warnings.push(format!(
                 "source-aware history ownership could not be inspected: {error}"
@@ -777,6 +801,7 @@ pub(crate) struct HistoryProjectionRevision {
     pub ownership: OwnershipManifestStatus,
     pub project_mapping_revision: u64,
     pub local_observation_revision: u64,
+    pub other_local_observation_revision: u64,
     pub sources: Vec<(SourceMetadata, Option<SourceHistoryRemoteActiveRef>)>,
 }
 
@@ -784,6 +809,7 @@ impl HistoryProjectionRevision {
     pub fn same_query_inputs_except_local_revision(&self, other: &Self) -> bool {
         self.ownership == other.ownership
             && self.project_mapping_revision == other.project_mapping_revision
+            && self.other_local_observation_revision == other.other_local_observation_revision
             && self.sources == other.sources
     }
 }
@@ -813,6 +839,20 @@ fn history_projection_revision_once(
     ) {
         return Ok(None);
     }
+    if let OwnershipManifestStatus::Initialized(manifest) = &ownership {
+        if manifest.is_sqlite_backend() != runtime.source_history().sqlite_database().is_some() {
+            // A different process activated SQLite after this runtime was
+            // constructed. Force a query, which refreshes the facade, instead
+            // of stamping a cached file projection with the new ownership.
+            return Ok(None);
+        }
+        if manifest.is_sqlite_backend() {
+            crate::sqlite_history_migration::validate_receipt(
+                &runtime.source_history().sqlite_database().unwrap(),
+                manifest,
+            )?;
+        }
+    }
     let project_mapping_revision = match runtime.project_mapping_store().load() {
         Ok(mappings) => mappings.revision(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -820,7 +860,24 @@ fn history_projection_revision_once(
     };
     let local_observation_revision = runtime
         .source_history()
-        .load_local_observation_revision(runtime.source_identity(), runtime.redaction_profile())?;
+        .load_local_observation_projection_revision(
+            runtime.source_identity(),
+            runtime.redaction_profile(),
+        )?;
+    // Account quota is shared by the profile. The other privacy writer may
+    // update it without changing this runtime's own observation namespace or
+    // source metadata, so it must also invalidate a cached projection.
+    let other_local_observation_revision = if runtime.source_history().sqlite_database().is_some() {
+        let redaction = match runtime.redaction_profile() {
+            RedactionProfile::Redacted => RedactionProfile::PreviewEnabled,
+            RedactionProfile::PreviewEnabled => RedactionProfile::Redacted,
+        };
+        runtime
+            .source_history()
+            .load_local_observation_projection_revision(runtime.source_identity(), redaction)?
+    } else {
+        0
+    };
     let mut metadata = runtime.source_history().list_source_metadata()?;
     metadata.sort_by(|left, right| left.source_id().as_str().cmp(right.source_id().as_str()));
     let selected = metadata.into_iter().filter(|source| {
@@ -855,6 +912,7 @@ fn history_projection_revision_once(
         ownership,
         project_mapping_revision,
         local_observation_revision,
+        other_local_observation_revision,
         sources,
     }))
 }

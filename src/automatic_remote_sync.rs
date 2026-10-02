@@ -109,7 +109,7 @@ impl AutomaticRemoteProbeTransport for SshRemoteDeltaTransport {
     }
 }
 
-/// Whether this adapter may perform the one-time local v1-to-v2 cutover.
+/// Whether this adapter may perform the one-time history backend cutover.
 ///
 /// `RequireV2Active` is the safe default for a background worker. The second
 /// variant is an explicit assertion made by startup orchestration after it has
@@ -406,7 +406,15 @@ where
             .map_err(RemoteSyncError::Local)?
         {
             OwnershipManifestStatus::Initialized(manifest)
-                if manifest.state() == HistoryOwnershipState::V2Active => {}
+                if manifest.state() == HistoryOwnershipState::V2Active
+                    && manifest.is_sqlite_backend() =>
+            {
+                // A cooperating process may have activated SQL after runtime
+                // construction. Bind its reader without taking a writer lease.
+                runtime
+                    .refresh_active_sqlite_backend()
+                    .map_err(RemoteSyncError::Local)?;
+            }
             OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized
                 if self.cutover_policy
                     == AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated =>
@@ -416,7 +424,7 @@ where
             OwnershipManifestStatus::Initialized(_) | OwnershipManifestStatus::Uninitialized => {
                 return Err(RemoteSyncError::Local(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "automatic remote sync requires v2-active history; startup must first quiesce legacy writers and perform the explicit cutover",
+                    "automatic remote sync requires SQLite v2-active history; startup must first quiesce legacy writers and perform the explicit cutover",
                 )));
             }
         }
@@ -1814,6 +1822,93 @@ mod tests {
                 if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(executor.transport.calls, 0);
+    }
+
+    #[test]
+    fn production_executor_requires_sqlite_cutover_for_active_legacy_v2() {
+        use crate::history_ownership::{InitializeV1Outcome, OwnershipCasOutcome};
+
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let runtime =
+            HistoryRuntime::new(state_root.join("history-v1"), &codex_home, false).unwrap();
+        let lease = runtime.ownership().acquire_writer_lease().unwrap();
+        let v1 = match runtime.ownership().initialize_v1_active(&lease).unwrap() {
+            InitializeV1Outcome::Initialized(manifest)
+            | InitializeV1Outcome::Existing(manifest) => manifest,
+        };
+        let migrating = match runtime.ownership().begin_migration(&lease, &v1).unwrap() {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+        };
+        let active = match runtime
+            .ownership()
+            .compare_and_transition(&lease, &migrating, HistoryOwnershipState::V2Active)
+            .unwrap()
+        {
+            OwnershipCasOutcome::Applied(manifest) => manifest,
+            OwnershipCasOutcome::Conflict(_) => panic!("unexpected ownership conflict"),
+        };
+        assert!(!active.is_sqlite_backend());
+        drop(lease);
+        let remote_node = if runtime.source_identity().node_id().as_str() == NODE_A {
+            NODE_B
+        } else {
+            NODE_A
+        };
+        let (store, config) = configured_store(
+            directory.path().join("config/remotes.json"),
+            source(remote_node),
+        );
+        let selected =
+            RemoteSyncHostSnapshot::capture_for_automatic(&config, config.host("dev").unwrap())
+                .unwrap();
+        let mut executor = FilesystemAutomaticRemoteSyncExecutor::with_transport(
+            state_root,
+            codex_home,
+            store,
+            false,
+            AutomaticRemoteCutoverPolicy::RequireV2Active,
+            RejectingTransport::default(),
+        );
+        let error = executor
+            .sync_host(&selected, RemoteSyncLimits::default())
+            .unwrap_err();
+        assert!(
+            matches!(error, RemoteSyncError::Local(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(executor.transport.calls, 0);
+        assert_eq!(
+            runtime.ownership().load_manifest().unwrap(),
+            OwnershipManifestStatus::Initialized(active)
+        );
+        executor.cutover_policy =
+            AutomaticRemoteCutoverPolicy::LegacyWritersQuiescedAndPrevalidated;
+        let error = executor
+            .sync_host(&selected, RemoteSyncLimits::default())
+            .unwrap_err();
+        assert!(matches!(error, RemoteSyncError::Transport(_)), "{error:?}");
+        assert_eq!(executor.transport.calls, 1);
+        let OwnershipManifestStatus::Initialized(sqlite_active) =
+            runtime.ownership().load_manifest().unwrap()
+        else {
+            panic!("ownership missing after SQLite cutover")
+        };
+        assert_eq!(sqlite_active.state(), HistoryOwnershipState::V2Active);
+        assert!(sqlite_active.is_sqlite_backend());
+        let sql = crate::source_history::SourceHistoryStore::new_sqlite(
+            runtime.state_root().to_path_buf(),
+            runtime.profile_id().clone(),
+        );
+        assert!(sql.sqlite_database().unwrap().exists().unwrap());
+        assert_eq!(
+            sql.load_source_metadata(&source(remote_node).node_id)
+                .unwrap()
+                .kind(),
+            crate::source_history::SourceKind::Ssh
+        );
     }
 
     #[test]

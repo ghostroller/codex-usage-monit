@@ -1005,6 +1005,20 @@ pub fn load_migrated_local_history_since(
     redaction_profile: RedactionProfile,
     since: DateTime<Utc>,
 ) -> io::Result<MigratedLocalHistory> {
+    if let Some(database) = target.sqlite_database()
+        && !database.is_transaction_active()
+    {
+        return database.read(|_| {
+            load_migrated_local_history_since(
+                target,
+                ownership,
+                expected_ownership,
+                identity,
+                redaction_profile,
+                since,
+            )
+        });
+    }
     validate_current_query_ownership(ownership, expected_ownership, target, redaction_profile)?;
     let imports_directory = imports_directory(target);
     target.validate_private_path(&imports_directory)?;
@@ -1015,7 +1029,14 @@ pub fn load_migrated_local_history_since(
         target,
         identity,
         redaction_profile,
-        expected_ownership.epoch(),
+        if expected_ownership.is_sqlite_backend() {
+            expected_ownership
+                .epoch()
+                .checked_sub(1)
+                .ok_or_else(|| invalid_data("SQLite migration epoch is invalid"))?
+        } else {
+            expected_ownership.epoch()
+        },
     )?;
     if state.status != MigrationStatus::Complete {
         return Err(io::Error::new(

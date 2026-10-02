@@ -29,6 +29,8 @@ use crate::source_history::{HistoryProfileId, RedactionProfile};
 use crate::source_identity::{validate_windows_private_directory, validate_windows_private_file};
 
 pub const HISTORY_OWNERSHIP_MANIFEST_VERSION: u32 = 1;
+/// Older binaries reject this version before obtaining write authority.
+pub const SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION: u32 = 2;
 pub const WRITER_LEASE_DIAGNOSTIC_VERSION: u32 = 1;
 
 const OWNERSHIP_DIRECTORY: &str = "history-ownership";
@@ -93,6 +95,17 @@ impl HistoryOwnershipManifest {
         self.state
     }
 
+    pub fn is_sqlite_backend(&self) -> bool {
+        self.version == SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION
+    }
+
+    /// A SQLite cutover starts from a complete file-based v2 store. Readers
+    /// keep using that source-aware snapshot while the new import is fenced.
+    pub fn uses_source_history(&self) -> bool {
+        self.state == HistoryOwnershipState::V2Active
+            || (self.is_sqlite_backend() && self.state == HistoryOwnershipState::Migrating)
+    }
+
     fn initial(profile_id: HistoryProfileId, redaction_profile: RedactionProfile) -> Self {
         Self {
             version: HISTORY_OWNERSHIP_MANIFEST_VERSION,
@@ -104,16 +117,24 @@ impl HistoryOwnershipManifest {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.version != HISTORY_OWNERSHIP_MANIFEST_VERSION {
-            let relation = if self.version > HISTORY_OWNERSHIP_MANIFEST_VERSION {
+        if !matches!(
+            self.version,
+            HISTORY_OWNERSHIP_MANIFEST_VERSION | SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION
+        ) {
+            let relation = if self.version > SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION {
                 "future"
             } else {
                 "unsupported"
             };
             return Err(invalid_data(format!(
                 "{relation} history ownership manifest version {}; expected {}",
-                self.version, HISTORY_OWNERSHIP_MANIFEST_VERSION
+                self.version, SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION
             )));
+        }
+        if self.is_sqlite_backend() && self.state == HistoryOwnershipState::V1Active {
+            return Err(invalid_data(
+                "SQLite ownership cannot select legacy v1 history",
+            ));
         }
         if self.epoch == 0 {
             return Err(invalid_data(
@@ -894,6 +915,72 @@ impl HistoryOwnershipStore {
         if published != next {
             return Err(invalid_data(
                 "history ownership manifest changed during transition",
+            ));
+        }
+        drop(transition);
+        self.validate_writer_lease(lease)?;
+        Ok(OwnershipCasOutcome::Applied(published))
+    }
+
+    /// Fence old file writers before importing the source-aware namespace.
+    /// The exclusive writer lease must span import and final activation.
+    pub(crate) fn begin_sqlite_migration(
+        &self,
+        lease: &HistoryWriterLease,
+        expected: &HistoryOwnershipManifest,
+    ) -> io::Result<OwnershipCasOutcome> {
+        if expected.is_sqlite_backend() || expected.state() != HistoryOwnershipState::V2Active {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQLite cutover requires active file-based v2 history",
+            ));
+        }
+        let mut next = expected.clone();
+        next.version = SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION;
+        next.state = HistoryOwnershipState::Migrating;
+        next.epoch = next
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("SQLite cutover ownership epoch overflowed"))?;
+        self.publish_sqlite_transition(lease, expected, next)
+    }
+
+    pub(crate) fn complete_sqlite_migration(
+        &self,
+        lease: &HistoryWriterLease,
+        expected: &HistoryOwnershipManifest,
+    ) -> io::Result<OwnershipCasOutcome> {
+        if !expected.is_sqlite_backend() || expected.state() != HistoryOwnershipState::Migrating {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQLite activation requires its pending cutover",
+            ));
+        }
+        let mut next = expected.clone();
+        next.state = HistoryOwnershipState::V2Active;
+        self.publish_sqlite_transition(lease, expected, next)
+    }
+
+    fn publish_sqlite_transition(
+        &self,
+        lease: &HistoryWriterLease,
+        expected: &HistoryOwnershipManifest,
+        next: HistoryOwnershipManifest,
+    ) -> io::Result<OwnershipCasOutcome> {
+        expected.validate_binding(self)?;
+        next.validate_binding(self)?;
+        self.validate_writer_lease(lease)?;
+        let transition = self.lock_transition()?;
+        let current = self.load_manifest()?;
+        if current != OwnershipManifestStatus::Initialized(expected.clone()) {
+            return Ok(OwnershipCasOutcome::Conflict(current));
+        }
+        self.validate_writer_lease(lease)?;
+        write_manifest_atomically(&self.manifest_path(), &next)?;
+        let published = read_manifest(&self.manifest_path(), self)?;
+        if published != next {
+            return Err(invalid_data(
+                "SQLite ownership changed while activation was fenced",
             ));
         }
         drop(transition);
@@ -2083,7 +2170,7 @@ mod tests {
             &path,
             format!(
                 "{{\"version\":{},\"profileId\":\"{}\",\"redactionProfile\":\"preview-enabled\",\"epoch\":1,\"state\":\"v1_active\"}}",
-                HISTORY_OWNERSHIP_MANIFEST_VERSION + 1,
+                SQLITE_HISTORY_OWNERSHIP_MANIFEST_VERSION + 1,
                 PROFILE
             )
             .as_bytes(),
