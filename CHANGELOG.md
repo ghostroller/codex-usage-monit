@@ -4,15 +4,41 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-04
+
+### Added
+
+- Recognize GPT-6.1 Sol with an independent exact-ID profile for Codex credit weights and API Standard/Fast short/long-context prices, checked against the official sources on October 1, 2026. Preserve exact fractional rates, legacy model mappings, and explicit partial/unpriced results for unsupported models or tiers.
+- Add an opt-in synthetic TUI measurement workflow with frozen comparison binaries, fixed sample batches, and retained failure evidence.
+
 ### Changed
 
+- Replace the active file-based history backend with bundled transactional SQLite for local observations, account quota samples, synchronized history, session digests and exact facts. Commit each received page with its cursor and activate completed candidates transactionally; distinguish reserved local revisions from successfully committed observations.
+- Retain old quota samples, source policies, the current local source's revision high-water mark, and unfinished source-purge intent during initialization. Rebuild other usage history on demand through normal collection, bounded Summary backfill and remote bootstrap; do not import old buckets, digests, facts, cursors or pending publications, and do not scan all historical logs at startup.
+- Share CLI and TUI history preparation, report queries and manual synchronization orchestration. Preserve source selection, replica reconciliation, precision/partial semantics and report output; reuse account quota within a validated query request and invalidate projections when contributing quota sources change.
+- Reduce repeated SQLite opens and filesystem validation during TUI startup with a shared history authority, batched state reads and transaction-scoped validated database access. Reuse supplied All-source Overview projections without preparing an optional cache entry, retaining source errors and consistency checks for subsequent queries.
 - Validate complete semantic versions during updates, rejecting leading-zero numeric versions and malformed build metadata. Build metadata still does not determine upgrade precedence; source-build conflicts and downgrade protection retain their existing rules.
 - Use standard-library file locks in production, retaining explicit unlock guards and compatibility tests with older `fs2` processes.
-- Separate history preparation from shared CLI/TUI queries, preserving source selection, replica reconciliation and report output. Reuse account quota within a validated query request and invalidate projections when contributing quota sources change.
 - Parse launchd plist fields structurally with bounded XML input while preserving generated service definitions and fingerprints. Share the durable private-file replacement sequence where publication contracts match.
 - Validate the native Windows test account and inherited temporary-directory permissions before running tests, with an explicit private temporary-directory override and restored caller environment. Make Git evidence and manifest-lock regressions independent of scheduler timing.
-- Add an opt-in synthetic TUI measurement workflow with frozen comparison binaries, fixed sample batches, and retained failure evidence.
-- Reuse supplied All-source Overview projections without preparing an optional cache entry, retaining source errors and consistency checks for subsequent queries.
+
+### Fixed
+
+- Fence SQLite initialization and publication against ownership changes, database loss/replacement, unsafe side files and incompatible receipts. Preserve interrupted source-deletion claims even after metadata is removed, and bind evidence/garbage collection to the correct privacy namespace and committed generation.
+- Publish the complete bounded local observation batch so late changes to older buckets and session digests are committed together, and invalidate cached projections after query-visible garbage collection.
+- Keep Windows TUI initial data loading within the existing ConPTY regression deadline by removing repeated validation work while preserving permission, object-identity and ownership checks.
+- Bound Windows portable-launcher probe cleanup retries and require terminal child-process cleanup before accepting its real proxy contract.
+- Invoke Windows SSH agents with visible literal commands. Save bootstrap bytes to a private script file and use a separate PowerShell `-File` invocation instead of encoded or dynamically evaluated scripts, preserving path quoting and process/exit-code handling.
+- Verify configuration-lock protection directly in concurrency tests and replace short durable-write timing assertions with bounded worker completion checks, retaining revision, persisted configuration and stale-publication assertions.
+- Replace avoidable unsafe operations and zeroize temporary password buffers used for Windows machine-service installation.
+
+### Compatibility
+
+- History now requires SQLite schema 2 with matching ownership manifests and initialization receipts. Old schema 1 development databases and receipts from the abandoned full-history migration are rejected explicitly. Missing, empty, damaged or incompatible active databases are not silently recreated or replaced with the old file backend.
+- Old file-version quota samples remain eligible for retention. Source identity, configuration, ownership coordination and installation/service metadata keep their existing file responsibilities; old derived-history files are left on disk but are no longer the active backend. Usage cannot be reconstructed from deleted/truncated logs or beyond scan budgets, so coverage may remain partial. See the [storage scope and rebuild policy](docs/storage-rewrite-execution-plan-2026-10-02.zh-CN.md#73-sqlite-唯一后端与按需重建).
+- Remote protocol remains v5 and replica/fork deduplication and exact-fact handling remain supported. Upgrade the center and synchronized nodes to the same source build and model-catalog fingerprint; version strings alone do not establish compatibility. Restart already-running TUIs after updating, and follow [forward recovery](docs/remote-updates.md#recovery-and-component-results) rather than starting an old writer against initialized SQLite history.
+- Bundled estimator revision is now 8 and API pricing catalog revision is 5, with rates checked on October 1, 2026. External catalogs must use higher revisions; the complete example uses 9/6. Longx remains an optional estimate and API-equivalent values remain separate from Codex subscription charges.
+- The SQLite rewrite does not remove the existing deduplication feature set or claim a fixed performance improvement. Platform and real SSH validation results, including their remaining coverage limits, are recorded in the [storage execution plan](docs/storage-rewrite-execution-plan-2026-10-02.zh-CN.md) and [real-machine sync report](docs/sqlite-real-machine-sync-validation-2026-10-03.zh-CN.md).
 
 ## [0.5.2] - 2026-09-26
 
@@ -325,7 +351,11 @@ All notable changes to this project are documented in this file.
 
 - JSON schema remains version 1. Existing confidence and preferred five-hour fields keep their prior meaning; reset-credit fields are additive and backward compatible.
 
-[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ghostroller/codex-usage-monit/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ghostroller/codex-usage-monit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ghostroller/codex-usage-monit/compare/v0.2.9...v0.3.0
