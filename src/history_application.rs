@@ -741,13 +741,43 @@ pub(crate) fn history_projection_revision(
     runtime: &HistoryRuntime,
     selection: &HistorySourceSelection,
 ) -> io::Result<Option<HistoryProjectionRevision>> {
-    let Some(before) = history_projection_revision_once(runtime, selection)? else {
+    // An uninitialized namespace may legitimately have no database yet. Keep
+    // that gate outside the read snapshot so a cache probe never creates it.
+    if !matches!(
+        runtime.ownership().load_manifest()?,
+        OwnershipManifestStatus::Initialized(manifest)
+            if manifest.state() == HistoryOwnershipState::V2Active
+    ) {
         return Ok(None);
-    };
-    let Some(after) = history_projection_revision_once(runtime, selection)? else {
-        return Ok(None);
-    };
-    Ok((before == after).then_some(after))
+    }
+    let database = runtime.source_history().sqlite_database().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history runtime is not bound to SQLite",
+        )
+    })?;
+    // All SQL stamps and source policy belong to one short read snapshot.
+    // Facade reads retain their path/permission checks but share this open
+    // connection instead of opening a database for every individual stamp.
+    // Ownership and project mappings live outside SQL, so still read both
+    // complete probes and reject changes to those inputs. Nothing writes or
+    // collects while this snapshot is held, and it ends before the caller's
+    // usage query, cache delivery or next observation commit.
+    database.read(|_| {
+        let Some(before) = history_projection_revision_once(runtime, selection)? else {
+            return Ok(None);
+        };
+        let Some(after) = history_projection_revision_once(runtime, selection)? else {
+            return Ok(None);
+        };
+        Ok((before == after).then_some(after))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_REVISION_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn history_projection_revision_once(
@@ -782,6 +812,12 @@ fn history_projection_revision_once(
             runtime.source_identity(),
             runtime.redaction_profile(),
         )?;
+    #[cfg(test)]
+    PROJECTION_REVISION_READ_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     // Account quota is shared by the profile. The other privacy writer may
     // update it without changing this runtime's own observation namespace or
     // source metadata, so it must also invalidate a cached projection.
@@ -850,6 +886,200 @@ mod tests {
     use super::*;
     use crate::domain::{AccountSnapshot, CollectionStats, Snapshot, TokenUsage, UsageCall};
     use crate::summary_report::summary_history_backfill_needed;
+
+    fn projection_runtime() -> (tempfile::TempDir, HistoryRuntime) {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let runtime = HistoryRuntime::new_with_project_mapping_store(
+            directory.path().join("state/history-v1"),
+            &codex_home,
+            false,
+            crate::project_mapping::ProjectMappingStore::new(
+                directory.path().join("config/project-mappings.json"),
+            ),
+        )
+        .unwrap();
+        (directory, runtime)
+    }
+
+    fn record_projection_observation(runtime: &HistoryRuntime, observed_at: DateTime<Utc>) {
+        let OwnershipManifestStatus::Initialized(active) =
+            runtime.ownership().load_manifest().unwrap()
+        else {
+            panic!("fixture ownership is not initialized");
+        };
+        let lease = runtime.ownership().acquire_writer_lease().unwrap();
+        let authority = runtime
+            .ownership()
+            .authorize_v2_write(&lease, &active)
+            .unwrap();
+        runtime
+            .source_history()
+            .writer(&authority)
+            .unwrap()
+            .record_local_observation(
+                runtime.source_identity(),
+                "local",
+                runtime.redaction_profile(),
+                &HistoryObservation {
+                    observed_at,
+                    ..HistoryObservation::default()
+                },
+                crate::source_history::LocalObservationMode::Incremental,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn projection_revision_keeps_sql_stamps_and_policy_in_one_snapshot() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_directory, mut runtime) = projection_runtime();
+        let active = runtime.ensure_v2_active().unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record_projection_observation(&runtime, observed_at);
+        let selection = HistorySourceSelection::Local(runtime.source_identity().node_id().clone());
+        let before = history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .unwrap();
+        assert!(before.sources[0].0.include_in_aggregates());
+
+        let ownership = runtime.ownership().clone();
+        let store = runtime.source_history().clone();
+        let identity = runtime.source_identity().clone();
+        let redaction = runtime.redaction_profile();
+        PROJECTION_REVISION_READ_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Commit from another connection after the probe has already
+                // read its local stamp. A deterministic handshake replaces
+                // timing sleeps; WAL readers do not stop this writer.
+                let (done_tx, done_rx) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let result = (|| -> io::Result<()> {
+                        let lease = ownership.acquire_writer_lease()?;
+                        let authority = ownership.authorize_v2_write(&lease, &active)?;
+                        let writer = store.writer(&authority)?;
+                        writer.record_local_observation(
+                            &identity,
+                            "local",
+                            redaction,
+                            &HistoryObservation {
+                                observed_at: observed_at + chrono::Duration::minutes(1),
+                                ..HistoryObservation::default()
+                            },
+                            crate::source_history::LocalObservationMode::Incremental,
+                        )?;
+                        writer.update_source_metadata(identity.node_id(), |source| {
+                            source.set_include_in_aggregates(false);
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })();
+                    done_tx.send(result).unwrap();
+                });
+                done_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+                worker.join().unwrap();
+            }));
+        });
+        let during = history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .expect("a concurrent SQL commit must not split the revision snapshot");
+        assert_eq!(during, before);
+
+        let after = history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .unwrap();
+        assert!(after.local_observation_revision > before.local_observation_revision);
+        assert!(!after.sources[0].0.include_in_aggregates());
+        assert!(
+            !runtime
+                .source_history()
+                .sqlite_database()
+                .unwrap()
+                .is_transaction_active(),
+            "the cache probe must release its read snapshot"
+        );
+        let selected = runtime
+            .query_history_selected(&selection, &mut HistoryQueryContext::new(observed_at))
+            .unwrap();
+        assert_eq!(
+            selected.source_selection_status,
+            crate::history_query::HistorySourceSelectionStatus::AppliedExcludedFromAggregates
+        );
+        record_projection_observation(&runtime, observed_at + chrono::Duration::minutes(2));
+        let latest = history_projection_revision(&runtime, &selection)
+            .unwrap()
+            .unwrap();
+        assert!(latest.local_observation_revision > after.local_observation_revision);
+        assert!(!latest.sources[0].0.include_in_aggregates());
+    }
+
+    #[test]
+    fn projection_revision_still_rejects_external_mapping_change_between_probes() {
+        let (directory, mut runtime) = projection_runtime();
+        runtime.ensure_v2_active().unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record_projection_observation(&runtime, observed_at);
+        let mappings = runtime.project_mapping_store().clone();
+        let initial = mappings.load_or_create().unwrap();
+        let expected_revision = initial.revision();
+        let key = crate::source_model::ObservedProjectKey::from_canonical_path(
+            runtime.source_identity(),
+            &directory.path().canonicalize().unwrap(),
+        )
+        .unwrap();
+        let observation = crate::project_mapping::ProjectObservation::new(
+            crate::project_mapping::SourceObservedProject::new(
+                runtime.source_identity().node_id().clone(),
+                key,
+            ),
+        );
+        PROJECTION_REVISION_READ_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                mappings
+                    .resolve_or_create(expected_revision, observation)
+                    .unwrap();
+            }));
+        });
+        assert!(
+            history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+                .unwrap()
+                .is_none()
+        );
+        let current = history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+            .unwrap()
+            .unwrap();
+        assert!(current.project_mapping_revision > expected_revision);
+    }
+
+    #[test]
+    fn projection_revision_does_not_initialize_or_recreate_a_database() {
+        let (_directory, mut runtime) = projection_runtime();
+        let database = runtime.source_history().sqlite_database().unwrap();
+        assert!(!database.path().exists());
+        assert!(
+            history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!database.path().exists());
+
+        runtime.ensure_v2_active().unwrap();
+        std::fs::remove_file(database.path()).unwrap();
+        let error = history_projection_revision(&runtime, &HistorySourceSelection::AllIncluded)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!database.path().exists());
+    }
 
     #[test]
     fn summary_backfill_scan_keeps_usage_and_tasks_without_importing_account_history() {

@@ -526,6 +526,7 @@ impl OpenedDatabase {
             .ok_or_else(|| invalid_data("missing database directory"))?;
         super::validate_private_directory_beneath(&self.state_root, parent)?;
         let metadata = fs::symlink_metadata(&self.path)?;
+        #[cfg(not(windows))]
         validate_file(&self.path, &metadata)?;
         #[cfg(unix)]
         {
@@ -550,23 +551,24 @@ impl OpenedDatabase {
         }
         #[cfg(windows)]
         {
-            let opened_metadata = self.identity_guard.metadata()?;
-            validate_file(&self.path, &opened_metadata)?;
-            super::ensure_opened_file_matches_path(
-                &self.path,
-                &self.identity_guard,
-                &metadata,
-                &opened_metadata,
-                "history database",
-            )?;
+            validate_windows_bound_file(&self.path, &self.identity_guard, &metadata)?;
             validate_windows_sqlite_handle(&self.connection, &self.identity_guard)?;
         }
+        #[cfg(not(windows))]
         validate_side_files(&self.path)?;
         #[cfg(unix)]
         validate_unix_sqlite_side_handles(&self.connection, &self.path)?;
         #[cfg(windows)]
         {
             validate_windows_side_guards(&self.path, &self.side_file_guards)?;
+            // WAL/SHM are validated through their pinned objects above. The
+            // rollback journal is transient and has no such guard.
+            let journal = side_file_path(&self.path, "-journal");
+            match fs::symlink_metadata(&journal) {
+                Ok(metadata) => validate_file(&journal, &metadata)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             if let Some(journal) = sqlite_journal_file(&self.connection)? {
                 let guards = self.side_file_guards.borrow();
                 let wal = side_file_path(&self.path, "-wal");
@@ -773,6 +775,39 @@ fn pin_windows_side_files(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
 }
 
 #[cfg(windows)]
+fn validate_windows_bound_file(
+    path: &Path,
+    guard: &File,
+    current: &fs::Metadata,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    super::validate_data_file_metadata(path, current)?;
+    let opened = guard.metadata()?;
+    super::validate_data_file_metadata(path, &opened)?;
+    // This checks both live handles' ACLs, walks every ancestor before and
+    // after each check, and reopens the current path to compare file IDs.
+    // Do not replace it with a comparison of the supplied metadata alone.
+    super::ensure_opened_file_matches_path(path, guard, current, &opened, "history database file")?;
+    // The path and guard now refer to the same object. Check its link count
+    // through the guard rather than opening and validating that path again.
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: guard owns this live handle and the output is writable.
+    if unsafe { GetFileInformationByHandle(guard.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.nNumberOfLinks != 1 {
+        return Err(invalid_data(
+            "history database files must have exactly one hard link",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn validate_windows_side_guards(
     path: &Path,
     guards: &RefCell<Vec<(PathBuf, File)>>,
@@ -792,7 +827,6 @@ fn validate_windows_side_guards(
             }
             Err(error) => return Err(error),
         };
-        validate_file(&side, &current)?;
         if !guards.iter().any(|(path, _)| path == &side) {
             let mut options = OpenOptions::new();
             options
@@ -806,15 +840,7 @@ fn validate_windows_side_guards(
             .find(|(path, _)| path == &side)
             .expect("guard inserted")
             .1;
-        let opened = guard.metadata()?;
-        validate_file(&side, &opened)?;
-        super::ensure_opened_file_matches_path(
-            &side,
-            guard,
-            &current,
-            &opened,
-            "history side file",
-        )?;
+        validate_windows_bound_file(&side, guard, &current)?;
     }
     Ok(())
 }
@@ -1173,6 +1199,10 @@ pub(crate) fn delete_namespace(connection: &Connection, namespace: &str) -> io::
     Ok(())
 }
 
+#[cfg(all(test, windows))]
+#[path = "database/windows_security_tests.rs"]
+mod windows_security_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,6 +1541,59 @@ mod tests {
         for suffix in ["-wal", "-shm"] {
             assert!(!side_file_path(database.path(), suffix).exists());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bound_files_reject_hardlinks_and_roll_back_the_uncommitted_batch() {
+        for suffix in ["", "-wal", "-shm"] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = database(directory.path());
+            database
+                .write(|connection| set_state(connection, "committed", &true))
+                .unwrap();
+            let alias = database.profile_root.join("untrusted-alias");
+            let result = database.write(|connection| {
+                set_state(connection, "uncommitted", &true)?;
+                let path = side_file_path(database.path(), suffix);
+                fs::hard_link(path, &alias)?;
+                database.read::<()>(|_| panic!("an aliased database object must not be used"))
+            });
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("exactly one hard link"));
+            fs::remove_file(alias).unwrap();
+            database
+                .read(|connection| {
+                    assert_eq!(state::<bool>(connection, "committed")?, Some(true));
+                    assert_eq!(state::<bool>(connection, "uncommitted")?, None);
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bound_file_reopens_the_path_instead_of_trusting_supplied_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database(directory.path());
+        database.write(|_| Ok(())).unwrap();
+        let other = database.profile_root.join("other.sqlite3");
+        create_closed_database_file(&other).unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        super::super::add_nofollow_flags(&mut options);
+        let guard = options.open(database.path()).unwrap();
+        // Even metadata from the guard must not bless a different current path.
+        let error =
+            validate_windows_bound_file(&other, &guard, &guard.metadata().unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was being opened")
+        );
     }
 
     #[cfg(unix)]
