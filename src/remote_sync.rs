@@ -1406,6 +1406,9 @@ mod tests {
     const PROFILE: &str = "0123456789abcdef";
     const SOURCE: &str = "node-0123456789abcdef0123456789abcdef";
     const OTHER_SOURCE: &str = "node-fedcba9876543210fedcba9876543210";
+    // Bound worker hangs without making scheduling, ACL checks, or durable
+    // file publication part of the lock-order contract.
+    const TEST_THREAD_WATCHDOG: StdDuration = StdDuration::from_secs(30);
 
     fn at(day: u32, hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
@@ -2324,13 +2327,17 @@ mod tests {
             sync_result_tx.send(result).unwrap();
         });
         preparing_rx
-            .recv_timeout(StdDuration::from_secs(1))
-            .unwrap();
-        thread::sleep(StdDuration::from_millis(50));
+            .recv_timeout(TEST_THREAD_WATCHDOG)
+            .expect("sync worker must start preparing the page");
         assert!(matches!(
             sync_result_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        let config_lock = store
+            .try_lock_exclusive_for_test()
+            .unwrap()
+            .expect("mapping preparation must leave the remotes config lock available");
+        drop(config_lock);
 
         let (mutation_tx, mutation_rx) = mpsc::channel();
         let mutation_store = store.clone();
@@ -2342,7 +2349,7 @@ mod tests {
                 .unwrap();
         });
         let changed = mutation_rx
-            .recv_timeout(StdDuration::from_secs(1))
+            .recv_timeout(TEST_THREAD_WATCHDOG)
             .expect("disable/remove must not wait for project mapping preparation")
             .unwrap();
         mutation_thread.join().unwrap();
@@ -2351,7 +2358,7 @@ mod tests {
         std::fs::File::unlock(&mapping_lock).unwrap();
         drop(mapping_lock);
         let commit = sync_result_rx
-            .recv_timeout(StdDuration::from_secs(2))
+            .recv_timeout(TEST_THREAD_WATCHDOG)
             .expect("staged sync must terminate after the mapping lock is released");
         assert!(matches!(
             commit,
@@ -2438,30 +2445,26 @@ mod tests {
             purge_result_tx.send(result).unwrap();
         });
         purge_entered_rx
-            .recv_timeout(StdDuration::from_secs(1))
+            .recv_timeout(TEST_THREAD_WATCHDOG)
             .expect("purge must acquire the remotes fence");
 
         // The purge holds remotes exclusive and will later acquire mapping.
         // The staged sync must not wait for remotes while retaining mapping:
         // its exact-host fence is a try-lock and immediately abandons the
         // candidate instead.
-        let started = std::time::Instant::now();
         let fence = store
             .try_with_current_host(paired.config_revision(), &host, || {
                 staged.publish()?.finish()
             })
             .unwrap();
-        let elapsed = started.elapsed();
+        // The purge cannot release its fence until we send allow_purge, so
+        // returning Busy establishes nonblocking behavior without a timer.
         assert!(matches!(fence, TryCurrentHost::Busy));
-        assert!(
-            elapsed < StdDuration::from_millis(250),
-            "staged sync waited on a purge fence for {elapsed:?}"
-        );
 
         allow_purge_tx.send(()).unwrap();
         assert_eq!(
             purge_result_rx
-                .recv_timeout(StdDuration::from_secs(2))
+                .recv_timeout(TEST_THREAD_WATCHDOG)
                 .expect("purge must finish after staged sync abandons its candidate")
                 .unwrap(),
             1
@@ -2588,55 +2591,49 @@ mod tests {
     fn current_host_guard_linearizes_local_phase_against_config_updates() {
         let temp = TempDir::new().unwrap();
         let (store, _, host, selected) = paired_config(&temp);
-        let guarded_store = store.clone();
-        let guarded_host = host.clone();
         let revision = selected.config_revision();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let guarded = thread::spawn(move || {
-            guarded_store.with_current_host(revision, &guarded_host, || {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(())
-            })
-        });
-        entered_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
-
-        let updating_store = store.clone();
         let (attempting_tx, attempting_rx) = mpsc::channel();
         let (updated_tx, updated_rx) = mpsc::channel();
-        let updater = thread::spawn(move || {
-            attempting_tx.send(()).unwrap();
-            let result = updating_store.update(
-                revision,
-                RemotesConfigMutation::edit_host(
-                    "dev",
-                    RemoteHostEdit {
-                        ssh_host: Some("changed-alias".to_owned()),
-                        agent_executable: None,
-                        redact_content: None,
-                    },
-                ),
-            );
-            updated_tx.send(result).unwrap();
-        });
-        attempting_rx
-            .recv_timeout(StdDuration::from_secs(1))
+        let (exclusive_blocked, attempting, updater) = store
+            .with_current_host(revision, &host, || {
+                // Probe before starting the updater: only this callback can
+                // own the lock, so WouldBlock proves its shared fence is live.
+                let exclusive_blocked = store.try_lock_exclusive_for_test()?.is_none();
+                let updating_store = store.clone();
+                let updater = thread::spawn(move || {
+                    let _ = attempting_tx.send(());
+                    let result = updating_store.update(
+                        revision,
+                        RemotesConfigMutation::edit_host(
+                            "dev",
+                            RemoteHostEdit {
+                                ssh_host: Some("changed-alias".to_owned()),
+                                agent_executable: None,
+                                redact_content: None,
+                            },
+                        ),
+                    );
+                    let _ = updated_tx.send(result);
+                });
+                let attempting = attempting_rx.recv_timeout(TEST_THREAD_WATCHDOG);
+                Ok((exclusive_blocked, attempting, updater))
+            })
             .unwrap();
-        assert!(
-            updated_rx
-                .recv_timeout(StdDuration::from_millis(100))
-                .is_err(),
-            "config update completed while the guarded local phase was active"
-        );
-
-        release_tx.send(()).unwrap();
-        guarded.join().unwrap().unwrap();
-        updated_rx
-            .recv_timeout(StdDuration::from_secs(1))
-            .unwrap()
+        // Returning from the callback releases the fence even if a later
+        // assertion fails; no worker waits for a test-owned release message.
+        let changed = updated_rx
+            .recv_timeout(TEST_THREAD_WATCHDOG)
+            .expect("config update must finish after the guarded phase releases its fence")
             .unwrap();
         updater.join().unwrap();
+        assert!(
+            exclusive_blocked,
+            "guarded local phase must hold its shared config fence"
+        );
+        attempting.expect("config updater must start during the guarded phase");
+        assert_eq!(changed.config_revision(), revision + 1);
+        assert_eq!(changed.host("dev").unwrap().ssh_host(), "changed-alias");
+        assert_eq!(store.load().unwrap(), changed);
     }
 
     #[test]
