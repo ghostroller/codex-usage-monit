@@ -577,3 +577,82 @@ Mac本地可审阅产物：
 预定目的地为 Windows `D:/Workspace/codex-usage-monit/target/sqlite-review-fixes-2026-10-03/real-ssh/controlled-macos-logs.tar.gz`。截至此记录尚不存在，统一 `revalidation-comparison.json` 和本轮 `fixes-evidence.zip` 尚未生成，不把准备好的比较/打包脚本算作实测通过。中心facts只读audit、Mac反向64/64 audit和本地平台结果分别已有；Mac `logs/reverse.validation.json` SHA256 `d8e12075b8629764b029ceda09976a41150be71549d2cb31a3f7b6fd4ed45fc5`。
 
 原首轮与补测ZIP仍保留各自第9/10.5节SHA256，本轮未覆盖它们。`target`中的新证据不随Git同步；无新CI、push、tag或正式部署。用户批准具体传输后再补最后的文件对照及独立包哈希，不能在批准前声称已有Windows副本或统一包。
+
+## 13. Windows 安装 bootstrap 改用私有脚本文件（2026-10-03）
+
+### 13.1 修改与源码绑定
+
+用户要求使用更安全的调用方式后，完成实现提交 **`b67a6a7dbfe789835ebb1b3663fb7d691c7ef120`**。普通 agent 同步的明文调用仍沿用第12节实现；本节补齐此前主动跳过的安装 bootstrap 启动层，而不是重新宣称整条 SQLite 实机验收已覆盖新快照。
+
+Windows 官方远端准备改为两次独立 SSH：固定明文 receiver 只接收 stdin 数据，创建当前 SID 专属、受保护 ACL 的随机目录，拒绝既存目录和 reparse point；最多读取65,537bytes并拒绝超过64KiB，核对脚本原始字节 SHA256，再以 CreateNew 写入带 UTF-8 BOM 的 `bootstrap.ps1`。随后运行 `powershell.exe -NoProfile -NonInteractive -File .\.codex-usage-monit-bootstrap-<nonce>\bootstrap.ps1`。接收器不执行输入，没有 EncodedCommand、ScriptBlock::Create 或 Invoke-Expression。Expected JSON 的 Base64 仍只是元数据，不是可执行命令编码。
+
+本机 Windows update 直接运行私有绝对路径的 `-File`；平台探测和固定文件清理也改为明文。准备仍保留五分钟下载预算、输出限制与取消语义。清理仅删除已知文件及空目录，拒绝 reparse point，不删除 receiver 拒绝的预存目录；Release 准备失败时由其原有 finally 清理自己的目录。未成功准备的目录不会被外层盲目删除。新增 receiver 纳入 `build.rs` 源码身份输入。
+
+版本、build ID、协议、平台、大小和 SHA256 校验、候选 info/install 后校验、安装和服务 gate 保持原有要求。官方模式仍只经 SSH 在远端取得固定 HTTPS Release，没有 SCP 可执行文件兜底。没有修改执行策略、杀毒软件、正式安装、auth、sshd、默认 shell 或服务；文件入口更便于检查，不保证下载和安装行为不会被安全软件告警。
+
+测试基线 HEAD 为 `85c855afeceb3b978e3c2382e71ee6ef8a19168c`，dirty 为 `build.rs`、manager Rust、receiver、两份说明文档。最终 v3 归档：
+
+- Windows `D:/Workspace/codex-usage-monit/target/sqlite-bootstrap-safe-2026-10-03/source-v3.tar.gz`；SHA256 **`56b252ccc10c05b052b29ff91fd80405abe511006d5115be27534a4892a054c8`**。
+- Mac 私有工作根 `/Users/user/sqlite-bootstrap-safe-2026-10-03`。隔离 checkout 用可用的 c420 对象作 Git 记账基线，实际代码是上述85c dirty归档；CRLF归一化、Git executable mode恢复、实际归档和源码稳定性分别记录，不能把c420当实际测试源码。
+- 127个归一化构建输入的 build ID **`1bc17f0a7efd0298f73451c4eed111bb2aad5a904a659fd16ff482f0f72ede71`**。提交后逐文件核对 Git blob、测试快照与当前内容一致，工作树 clean；`validation-summary.json` 保存绑定和真实失败结果。
+
+### 13.2 平台、二进制及本地结果
+
+三端 Rust1.97.0，info均exit0、version0.5.2/schema1/protocol5、build ID同上。匹配源码的开发二进制未进入正式安装：
+
+| 平台 | 实际二进制绝对路径 | SHA256 |
+| --- | --- | --- |
+| Windows11 AMD64 / x86_64-pc-windows-msvc | `D:/Workspace/codex-usage-monit/target/debug/codex-usage-monit.exe` | 最终双shell smoke后 `252c86e0e3ccae7c25f0ccb63c129bc2dc84c38fb93cc8737c57f6dc56ea6f94` |
+| macOS15.7.2 arm64 / aarch64-apple-darwin | `/Users/user/sqlite-review-fixes-2026-10-03/cargo-target/debug/codex-usage-monit` | `539ba8521743f4e0c8c3cf166fc527cac2d631da0058a1332bbf32bfb5cd4b09` |
+| Docker Linux aarch64 / aarch64-unknown-linux-gnu | `/Volumes/File/codex-usage-monit-docker-build/target-linux-arm64/debug/codex-usage-monit` | `78af7a53a9a6e6bd0e4f85790e6c2a20175cd3ff57755b929bb62c0ac54f3791` |
+
+Windows各编译阶段的artifact独立记录：完整Rust批次时 `eb9100c0727ae9bbb5ffc4835ca0b9d178a4d951523a5807001dd69186d73c95`，定向ConPTY诊断时 `9207b195d9e5d2bc81e2c4275421a40d2cf8b56b1f57dd697cd879d122f70a7c`，最终smoke为上表252c。均为同源码build ID；不把不同编译产物混为同一个SHA。info前固定空的私有CODEX_HOME/state/config/cache，未读取正式历史或创建正式身份。最终Windowsinfo在 `windows.final-agent-info.json`，初次info在 `windows.checkpoint-agent-info.json`；Mac/Linuxinfo在 `platform-ssh-results/logs-v3`。
+
+证据根为 `D:/Workspace/codex-usage-monit/target/sqlite-bootstrap-safe-2026-10-03`，下表日志相对此根；Python verifier在相邻 `D:/Workspace/codex-usage-monit/target/safer-bootstrap-2026-10-03`。Windows TEMP为Ghost-only `C:/Users/Ghost/AppData/Local/Temp/sr-20261003-5257353c`，Cargo target/build实际均为仓库 `target`。
+
+| 检查与预期 | 实际、退出码与时间（UTC） | 结果与日志 |
+| --- | --- | --- |
+| manager校验、部署gates；3外层cmd/PS5.1/PS7 × 2内层PS5.1/7 × 6启动场景 | v2定向18pass/0fail/exit0；最终v3完整lib同18项通过。36组合覆盖正常、语法错、明确exit1、篡改、超限、既存sentinel，以及Unicode/空格/单引号路径。Release准备另有2shell×成功/坏校验和4子场景，下载夹具不可执行 | **通过**；`manager-focused-5.log`、`windows-checkpoint-v3.log`。不把v2当最终build证据，v3由完整lib绑定 |
+| shared Release verifier | 原样13方法通过，PS5.1.26100.9444/7.4.1各12子场景，共24，exit0；09:57:10–09:57:32；三个未修改verifier输入SHA前后稳定 | **通过**；`python-full-verifier.result.json` SHA `37ce788f9e59f84ebd319842b002f11e0b083b7e14e5628079692a97ef3ada94` |
+| Windows格式、Clippy、全部Rust目标 | 格式/Clippy0；完整runner在ConPTY处exit1，Cargo101。已执行1858pass/1fail/3ignore；随后补update_cli4pass/1ignore及usage_evidence9pass/exit0。唯一目标汇总 **1871pass/1fail/4ignore**，无编码bootstrap过滤 | **完整批次失败**；`windows-checkpoint-v3.log`、`windows-remaining-targets.log`。完整日志创建10:09:42，失败和诊断不隐藏 |
+| Windows5.1/7实际文件入口离线CLI smoke | 两shell分别 `verify.ps1 -SkipFormat -SkipClippy -SkipTests`，脚本exit0；offline snapshot预期partial/CLI2由原有JSON断言接受 | **通过**；`windows-smoke-51.log`、`windows-smoke-7.log`。未运行无关的Bypass installer fixtures，不能称完整脚本合同全部通过 |
+| macOS受影响本地回归 | `sh scripts/verify-unix.sh --filter remote_agent_manager` 17pass/0；随后 `cargo test --locked --offline --test agent_management -- --nocapture --test-threads=1` 2pass/0；10:10:26–10:11:17 | **定向通过**；`platform-ssh-results/logs-v3/native.result.json` SHA `db56520dd5fb5118d46676f56109fc678d4beccfb36578cf531dfdf148721f12` |
+| Docker Linux受影响回归 | `sh scripts/test-linux-docker.sh --filter remote_agent_manager` 17pass/exit0；10:10:29–10:11:17；snapshot SHA `b5c5940dd5f5ea7a6c00131944cb8cd9098d0374549a663a7af9b8eafd411c78` | **定向通过**；`platform-ssh-results/logs-v3/linux-run/result.json` SHA `0129ab164054512ac7d1c75de357ed5a70d0ac28c69dbc14ea9d03062e3b3e46`；非新全Linux/macOS套件 |
+
+实际Windows完整入口为 PowerShell7.4.1：
+
+```powershell
+& scripts/windows/verify.ps1 -RepositoryPath D:/Workspace/codex-usage-monit -CargoTargetDir D:/Workspace/codex-usage-monit/target -CargoBuildDir D:/Workspace/codex-usage-monit/target -TestTempDir C:/Users/Ghost/AppData/Local/Temp/sr-20261003-5257353c -SkipSmoke
+cargo test --locked --test tui_pty -- --nocapture --test-threads=1
+cargo test --locked --test update_cli --test usage_evidence -- --test-threads=1
+# 两shell均使用普通 -File，无Bypass；完整参数也保存于validation-summary.json：
+powershell.exe -NoProfile -NonInteractive -File scripts/windows/verify.ps1 -RepositoryPath D:/Workspace/codex-usage-monit -CargoTargetDir D:/Workspace/codex-usage-monit/target -CargoBuildDir D:/Workspace/codex-usage-monit/target -TestTempDir C:/Users/Ghost/AppData/Local/Temp/sr-20261003-5257353c -SkipFormat -SkipClippy -SkipTests
+pwsh.exe -NoProfile -NonInteractive -File scripts/windows/verify.ps1 -RepositoryPath D:/Workspace/codex-usage-monit -CargoTargetDir D:/Workspace/codex-usage-monit/target -CargoBuildDir D:/Workspace/codex-usage-monit/target -TestTempDir C:/Users/Ghost/AppData/Local/Temp/sr-20261003-5257353c -SkipFormat -SkipClippy -SkipTests
+```
+
+首次编译因先前短TEMP已清理而LNK1104，重建当前SID私有TEMP后解决；新测试编译借用、mock误认receiver内部cleanup及PowerShell自身启动cwd的非法`[]` pattern问题在夹具修正后通过，保留 `manager-focused-{1,3,4}.log`。v2完整检查曾在新测试的 unnecessary_unwrap Clippy处失败，改成if let并重新绑定v3后通过lint。没有删除失败记录、放宽安全检查、修改执行策略或用旧绿灯替代新结果。
+
+### 13.3 真实反向SSH启动链
+
+Mac通过现有私有 `/Users/user/sqlite-review-fixes-2026-10-03/real-ssh/reverse-client/ssh_config` 的 `acceptance-win-lan`，真实连接Ghost@192.168.100.20:22。每条保持严格host-key检查，核对ED25519 `SHA256:3UqgD5DbXKUfY1uaR2yYcBhskq/KeeTMRbgfi47e3xE`。默认Windows SSH cwd为 `C:/Users/Ghost`，只创建随机独立SID私有bootstrap目录，不写正式state。内容完全为合成脚本，没有Release下载或候选安装。
+
+| 场景 | 预期 | 实际 | 判定 |
+| --- | --- | --- | --- |
+| 接收并执行正常脚本 | receiver0/空stdout；-File0/唯一JSON | 符合，原始UTF8+BOM文件、SHA与ACL交叉核对 | **通过** |
+| 不完整语法 | 保存成功；文件解析失败而非stdin EOF假成功 | receiver0，-File1/ParserError/空stdout | **通过** |
+| 输入篡改 | SHA不符拒绝，候选不执行 | receiver1，自己的暂存目录已清理 | **通过** |
+| 预存私有目录 | 拒绝覆盖、sentinel原样 | receiver1，sentinel SHA不变；只在测试核对完成后清理自己创建的fixture | **通过** |
+
+UTC10:13:47–10:14:06，4/4场景、19条实际SSH、**56/56检查**。owner为当前Ghost SID1001、DACL受保护且仅该SID、目录非reparse；所有本轮自己创建的stage最终均不存在。完整可审阅命令、合成stdin、退出码、stderr/stdout、SSH Sending command/TCP/key、ACL及哈希位于 `platform-ssh-results/logs-v3/synthetic-reverse-ssh`；`result.json` SHA256 **`32d11e4e5ab5d442c0321729d0733d76e1bfc404deca31ae702311fbbefbb18e`**。receiver归一化SHA `024a13d3713f51c9be4d5013537b4ae32a5c17edec27a4c4a7a1fbea7d595785` 与已提交源码一致。
+
+### 13.4 ConPTY失败与覆盖边界
+
+全量中 `real_tui_pty_handles_keyboard_mouse_search_resize_and_exit` 在原有8秒门限等待初始fixture会话失败；原样单线程focused再次同样失败（Cargo101，另一ConPTY测试通过）。未强称偶发。原样测试源码、TUI、rollout、startup和SQLite stage/load与85c逐路径一致，新bootstrap调用不进入这项离线、无remotes配置的初始加载路径。
+
+进一步用独立rustc test harness绑定旧 `aa131b9a…`/04e6 CLI作同条件对照，同样exit101；当前 `9207b195…` 冻结CLI的诊断副本只增加日志/保留私有目录，保持原8秒谓词，也exit101。两个harness编译0，CLI/原始测试SHA稳定，不替换当前Cargo二进制。当前首帧约235ms，rollout scan约3.381ms、materialize180µs已完成；`history.stage_load` span开始后到门限结束仍未finish，故Finalizing文案不能定位为rollout卡住。已有history stage/load在当前环境可重复超时，内部阶段和原因 **仍未定位**；不据此扩大本次调用层修复、盲加timeout或宣称完整Windows全绿。
+
+证据在 `tui-diagnostic`，`baseline-trace.result.json` SHA `7a7d1b90bcae6684fcc9cb53d7f13f833192c462370f6ea1141bb429930a8032`，operation日志SHA `0be27fb018b9b7142fec20ec58d0763d65bb497815f1a3bdc96eb03c9511c4a5`；仅复制content-free日志，保留的可丢弃fixture在短TEMP `.tmpO4geIs`，受控PID30312已kill/wait。没有读取正式DB、停止正式recorder或修改原TUI测试。
+
+本节证明了新Windows bootstrap的原生shell合同、下载校验控制流和真实SSH“接收文件→执行→错误状态→清理”链。**正式Release可用性、成功官方安装/服务升级仍未覆盖**，当前未发布分支不能退回旧Release。没有为新build重新运行非空SQLite双向用量、quota、facts/proof、多页恢复或TUI同步刷新；第12节真实SQL证据仍绑定其原04e6 build，不因本节source变化自动升级。第12.8待授权的旧用量归档仍未传输；这里只回传本轮源码/编译和合成启动日志。无新CI、push、tag或正式部署。
+
+此前 `transport-v4-probe/frozen-v4-libtest.exe` 保留的是旧编码调用，只作为原始失败证据；不要拿它复跑本轮安全调用。新合同由当前Cargo测试二进制及已核对build ID的开发CLI执行。
