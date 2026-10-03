@@ -348,7 +348,7 @@ impl<'a> AgentConnection<'a> {
             "agent_platform_failed: {}",
             safe_diagnostic(&output.stderr)
         );
-        // EncodedCommand is accepted by both cmd.exe and PowerShell SSH shells.
+        // Fixed dollar-free code passes unchanged through cmd and PowerShell.
         let output = self.ssh(&powershell("[Console]::Write([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())"))?;
         ensure!(
             output.status.success(),
@@ -375,27 +375,30 @@ impl<'a> AgentConnection<'a> {
         } else {
             format!("./{stage}/agent")
         };
+        let mut prepared = false;
         let result = (|| {
             let local = LocalStaging::new()?;
             let input_path = local.0.join("bootstrap");
-            LAYOUT.write_atomically(&input_path, release_script(&required, &stage)?.as_bytes())?;
-            let mut command = Command::new(self.environment.resolve_program()?);
-            command
-                .args(SSH_OPTIONS)
-                .arg("--")
-                .arg(self.host)
-                .arg(if windows {
-                    powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))")
-                } else {
-                    "python3 -".into()
-                });
-            let output = self.output_with_stdin(
-                &mut command,
-                TIMEOUT,
-                MAX_INFO,
-                Stdio::from(fs::File::open(input_path)?),
-            )?;
+            let script = release_script(&required, &stage)?;
+            LAYOUT.write_atomically(&input_path, script.as_bytes())?;
+            let output = if windows {
+                self.prepare_windows_release(&script, &input_path)?
+            } else {
+                let mut command = Command::new(self.environment.resolve_program()?);
+                command
+                    .args(SSH_OPTIONS)
+                    .arg("--")
+                    .arg(self.host)
+                    .arg("python3 -");
+                self.output_with_stdin(
+                    &mut command,
+                    TIMEOUT,
+                    MAX_INFO,
+                    Stdio::from(fs::File::open(input_path)?),
+                )?
+            };
             successful(&output, "agent_release_prepare_failed")?;
+            prepared = true;
             let manifest: AgentManifest = serde_json::from_slice(&output.stdout)
                 .context("agent_release_invalid: remote bootstrap returned invalid metadata")?;
             validate_manifest(&manifest, &required.target)?;
@@ -405,21 +408,62 @@ impl<'a> AgentConnection<'a> {
             self.install_candidate(&candidate, &required, &manifest.sha256)
         })();
         let cleanup = if windows {
-            powershell(&format!(
-                "$ErrorActionPreference='Stop'; if (Test-Path -LiteralPath './{stage}') {{ foreach ($n in @('agent.exe','manifest.json')) {{ $p=Join-Path './{stage}' $n; if (Test-Path -LiteralPath $p) {{ Remove-Item -LiteralPath $p -Force }} }}; [IO.Directory]::Delete((Join-Path (Get-Location).Path '{stage}'),$false) }}"
-            ))
+            windows_stage_cleanup(&stage, &["agent.exe", "manifest.json"])
         } else {
             format!(
                 "if [ -d ./{stage} ]; then rm -f ./{stage}/agent ./{stage}/manifest.json && rmdir ./{stage}; fi"
             )
         };
-        if self
-            .ssh(&cleanup)
-            .and_then(|output| successful(&output, "agent_release_cleanup_failed"))
-            .is_err()
+        if prepared
+            && self
+                .ssh(&cleanup)
+                .and_then(|output| successful(&output, "agent_release_cleanup_failed"))
+                .is_err()
         {
             eprintln!(
                 "warning: agent_release_cleanup_failed: staging directory {stage} may remain on the remote host"
+            );
+        }
+        result
+    }
+
+    fn prepare_windows_release(&self, script: &str, input: &Path) -> Result<Output> {
+        let stage = format!(".codex-usage-monit-bootstrap-{}", nonce()?);
+        let mut receive = Command::new(self.environment.resolve_program()?);
+        receive
+            .args(SSH_OPTIONS)
+            .arg("--")
+            .arg(self.host)
+            .arg(windows_bootstrap_receiver(&stage, script)?);
+        let received = self.output_with_stdin(
+            &mut receive,
+            Duration::from_secs(30),
+            MAX_INFO,
+            Stdio::from(fs::File::open(input)?),
+        )?;
+        // A failed receiver owns its own cleanup. Do not delete a preexisting
+        // stage when it refused to create one.
+        successful(&received, "agent_bootstrap_receive_failed")?;
+        let result = (|| {
+            ensure!(
+                received.stdout.is_empty(),
+                "agent_bootstrap_receive_invalid: unexpected stdout (check shell startup output)"
+            );
+            let mut execute = Command::new(self.environment.resolve_program()?);
+            execute
+                .args(SSH_OPTIONS)
+                .arg("--")
+                .arg(self.host)
+                .arg(windows_bootstrap_file(&stage));
+            self.output(&mut execute, TIMEOUT, MAX_INFO)
+        })();
+        if self
+            .ssh(&windows_stage_cleanup(&stage, &["bootstrap.ps1"]))
+            .and_then(|output| successful(&output, "agent_bootstrap_cleanup_failed"))
+            .is_err()
+        {
+            eprintln!(
+                "warning: agent_bootstrap_cleanup_failed: private staging directory {stage} may remain on the remote host"
             );
         }
         result
@@ -471,7 +515,7 @@ impl<'a> AgentConnection<'a> {
         // cleanup must not hide the primary error; no recursive deletion.
         let cleanup = if target.contains("windows") {
             powershell(&format!(
-                "$ErrorActionPreference='Stop'; if (Test-Path -LiteralPath './{upload}') {{ Remove-Item -LiteralPath './{upload}' -Force }}"
+                "Set-Variable -Name ErrorActionPreference -Value Stop; [IO.File]::Delete('./{upload}')"
             ))
         } else {
             format!("rm -f ./{upload}")
@@ -615,19 +659,23 @@ pub(crate) fn update_local(
         );
         let name = format!(".codex-usage-monit-release-{}", nonce()?);
         let required = serde_json::json!({"target": target, "version": version});
-        let input = stage.0.join("bootstrap");
-        LAYOUT.write_atomically(
-            &input,
-            preparation_script(&required, &name, windows)?.as_bytes(),
-        )?;
+        let input = stage.0.join(if windows {
+            "bootstrap.ps1"
+        } else {
+            "bootstrap"
+        });
+        let script = preparation_script(&required, &name, windows)?;
+        let bytes = if windows {
+            windows_script_bytes(&script)
+        } else {
+            script.into_bytes()
+        };
+        LAYOUT.write_atomically(&input, &bytes)?;
         let mut command = if windows {
             let mut command = Command::new("powershell.exe");
-            command.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "& ([scriptblock]::Create([Console]::In.ReadToEnd()))",
-            ]);
+            command
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(&input);
             command
         } else {
             let mut command = Command::new("python3");
@@ -639,7 +687,11 @@ pub(crate) fn update_local(
             &mut command,
             TIMEOUT,
             MAX_INFO,
-            Stdio::from(fs::File::open(input)?),
+            if windows {
+                Stdio::null()
+            } else {
+                Stdio::from(fs::File::open(input)?)
+            },
             || false,
         )
         .context("release_prepare_failed: local download bootstrap unavailable")?;
@@ -745,12 +797,52 @@ fn successful(output: &Output, stage: &str) -> Result<()> {
     Ok(())
 }
 fn powershell(script: &str) -> String {
-    use base64::Engine;
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    format!(
-        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    )
+    // Only fixed templates and generated ASCII nonce paths reach this helper.
+    // Dollar/backtick expansion by an outer PowerShell shell would change code.
+    assert!(!script.contains(['$', '`', '"', '\r', '\n']));
+    format!("powershell.exe -NoProfile -NonInteractive -Command \"{script}\"")
+}
+fn windows_bootstrap_receiver(stage: &str, script: &str) -> Result<String> {
+    const MAX_SCRIPT: usize = 64 * 1024;
+    ensure!(
+        script.len() <= MAX_SCRIPT,
+        "agent_bootstrap_input_too_large"
+    );
+    ensure!(
+        stage
+            .strip_prefix(".codex-usage-monit-bootstrap-")
+            .is_some_and(
+                |suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            ),
+        "agent_bootstrap_stage_invalid"
+    );
+    let receiver = include_str!("remote_agent_manager/bootstrap_receiver.ps1")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("__STAGE__", stage)
+        .replace("__LIMIT__", &(MAX_SCRIPT + 1).to_string())
+        .replace("__SHA256__", &checksum(script.as_bytes()));
+    Ok(powershell(&receiver))
+}
+fn windows_bootstrap_file(stage: &str) -> String {
+    format!("powershell.exe -NoProfile -NonInteractive -File .\\{stage}\\bootstrap.ps1")
+}
+fn windows_stage_cleanup(stage: &str, files: &[&str]) -> String {
+    let deletes = files
+        .iter()
+        .map(|file| format!("[IO.File]::Delete('./{stage}/{file}'); "))
+        .collect::<String>();
+    powershell(&format!(
+        "Set-Variable -Name ErrorActionPreference -Value Stop; if ([IO.Directory]::Exists('./{stage}')) {{ if (([IO.File]::GetAttributes('./{stage}') -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ throw 'agent_stage_cleanup_reparse_point' }}; {deletes}[IO.Directory]::Delete([IO.Path]::GetFullPath('./{stage}'),[bool]0) }}"
+    ))
+}
+fn windows_script_bytes(script: &str) -> Vec<u8> {
+    // PowerShell 5.1 requires a BOM to recognize non-ASCII UTF-8 source.
+    let mut bytes = vec![0xef, 0xbb, 0xbf];
+    bytes.extend_from_slice(script.as_bytes());
+    bytes
 }
 fn target_from_uname(text: &str) -> Result<String> {
     match text.split_whitespace().collect::<Vec<_>>().as_slice() {
@@ -873,29 +965,15 @@ mod tests {
     }
 
     fn fixture_remote_command(command: &Command) -> String {
-        use base64::Engine;
         let remote = command
             .get_args()
             .last()
             .expect("SSH fixture must have a remote command")
             .to_str()
             .unwrap();
-        let Some(encoded) =
-            remote.strip_prefix("powershell.exe -NoProfile -NonInteractive -EncodedCommand ")
-        else {
-            return remote.into();
-        };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .expect("remote PowerShell command must be Base64");
-        assert!(bytes.len().is_multiple_of(2));
-        String::from_utf16(
-            &bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .expect("remote PowerShell command must be UTF-16")
+        assert!(!remote.contains("-EncodedCommand"));
+        assert!(!remote.to_ascii_lowercase().contains("scriptblock"));
+        remote.into()
     }
 
     fn fixture_calls_agent(remote: &str, arguments: &[&str]) -> bool {
@@ -1523,7 +1601,7 @@ mod tests {
                 assert!(
                     remote.starts_with("chmod 700 ")
                         || remote.contains("rm -f ")
-                        || remote.contains("Remove-Item -LiteralPath"),
+                        || remote.contains("[IO.File]::Delete("),
                     "unexpected deployment fixture command: {remote}"
                 );
                 Ok(output(0, b"", b""))
@@ -1553,7 +1631,7 @@ mod tests {
                 );
             }
             assert!(
-                calls.last().unwrap().contains("Remove-Item -LiteralPath")
+                calls.last().unwrap().contains("[IO.File]::Delete(")
                     || calls.last().unwrap().contains("rm -f")
             );
         }
@@ -1562,16 +1640,20 @@ mod tests {
     #[test]
     fn official_release_deployment_uses_ssh_only_and_never_falls_back_to_upload() {
         for target in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
-            for failure in ["none", "missing", "download", "mismatch", "verification"] {
+            for failure in [
+                "none",
+                "receive",
+                "banner",
+                "missing",
+                "download",
+                "mismatch",
+                "verification",
+                "cleanup",
+            ] {
                 let mut data = manifest(b"official binary");
                 data.agent.target = target.into();
                 data.file = artifact_name(target);
                 let calls = RefCell::new(Vec::new());
-                let bootstrap = if target.contains("windows") {
-                    powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))")
-                } else {
-                    "python3 -".into()
-                };
                 let runner = |command: &Command| {
                     assert!(!command.get_program().to_string_lossy().contains("scp"));
                     assert!(!command.get_program().to_string_lossy().contains("curl"));
@@ -1586,7 +1668,20 @@ mod tests {
                     if args.ends_with("old-agent remote-agent info") {
                         return Ok(output(0, &serde_json::to_vec(&data.agent).unwrap(), b""));
                     }
-                    if args.ends_with(&bootstrap) {
+                    if remote.contains("agent_bootstrap_stage_exists") {
+                        return Ok(output(
+                            if failure == "receive" { 1 } else { 0 },
+                            if failure == "banner" {
+                                b"shell banner"
+                            } else {
+                                b""
+                            },
+                            b"receive fixture",
+                        ));
+                    }
+                    if remote == "python3 -"
+                        || remote.contains("-File .\\.codex-usage-monit-bootstrap-")
+                    {
                         if matches!(failure, "missing" | "download") {
                             return Ok(output(
                                 1,
@@ -1622,10 +1717,14 @@ mod tests {
                         return Ok(output(0, &serde_json::to_vec(&info).unwrap(), b""));
                     }
                     assert!(
-                        remote.contains("rm -f ") || remote.contains("Remove-Item -LiteralPath"),
+                        remote.contains("rm -f ") || remote.contains("[IO.File]::Delete("),
                         "unexpected release fixture command: {remote}"
                     );
-                    Ok(output(0, b"", b""))
+                    Ok(output(
+                        if failure == "cleanup" { 1 } else { 0 },
+                        b"",
+                        b"cleanup fixture",
+                    ))
                 };
                 let environment = SshCommandEnvironment::default();
                 let mut connection = AgentConnection::new("test-host", &environment).unwrap();
@@ -1633,19 +1732,31 @@ mod tests {
                 let result = connection.deploy("old-agent");
                 assert_eq!(
                     result.is_ok(),
-                    failure == "none",
+                    matches!(failure, "none" | "cleanup")
+                        || (!target.contains("windows") && matches!(failure, "receive" | "banner")),
                     "{target}: {failure}: {result:?}"
                 );
                 let installed = calls
                     .borrow()
                     .iter()
                     .any(|call| fixture_calls_agent(call, &["remote-agent", "install"]));
-                assert_eq!(installed, matches!(failure, "none" | "verification"));
-                if failure == "none" {
-                    assert_eq!(
-                        result.unwrap(),
-                        managed_executable(&data.agent, &data.sha256)
+                assert_eq!(
+                    installed,
+                    matches!(failure, "none" | "verification" | "cleanup")
+                        || (!target.contains("windows") && matches!(failure, "receive" | "banner"))
+                );
+                if target.contains("windows") && failure == "receive" {
+                    assert!(
+                        !calls
+                            .borrow()
+                            .iter()
+                            .any(|call| call.contains("bootstrap.ps1")
+                                && call.contains("[IO.File]::Delete(")
+                                && !call.contains("agent_bootstrap_stage_exists"))
                     );
+                }
+                if let Ok(installed) = result {
+                    assert_eq!(installed, managed_executable(&data.agent, &data.sha256));
                 }
             }
         }
@@ -1711,9 +1822,158 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn official_bootstrap_runs_over_stdin_in_both_windows_shells() {
-        // Exercise the actual encoded-command trampoline and embedded entrypoint,
-        // not just a dot-sourced function. The fixture is deliberately not executable.
+    fn windows_bootstrap_receiver_and_file_entry_are_literal_and_fail_closed() {
+        use std::os::windows::process::CommandExt;
+        fn run(outer: &str, remote: &str, cwd: &Path, input: Option<&Path>) -> Output {
+            assert!(!remote.contains("-EncodedCommand"));
+            assert!(!remote.to_ascii_lowercase().contains("scriptblock"));
+            let mut command = Command::new(outer);
+            if outer == "cmd.exe" {
+                command.args(["/d", "/c"]).raw_arg(remote);
+            } else {
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(remote);
+            }
+            command.current_dir(cwd);
+            crate::bounded_process::output_cancellable_with_stdin(
+                &mut command,
+                Duration::from_secs(30),
+                MAX_INFO,
+                input.map_or_else(Stdio::null, |path| {
+                    Stdio::from(fs::File::open(path).unwrap())
+                }),
+                || false,
+            )
+            .unwrap()
+        }
+        for outer in ["cmd.exe", "powershell.exe", "pwsh.exe"] {
+            for inner in ["powershell.exe", "pwsh.exe"] {
+                for case in [
+                    "ready", "syntax", "exit", "tampered", "existing", "oversize",
+                ] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let cwd = directory.path().join("private 空格'&");
+                    fs::create_dir(&cwd).unwrap();
+                    let stage = format!(".codex-usage-monit-bootstrap-{}", "3".repeat(32));
+                    let script = match case {
+                        "syntax" => "function Broken(\n",
+                        "exit" => "[Console]::Error.Write('controlled failure'); exit 1\n",
+                        _ => {
+                            "[IO.File]::WriteAllText('unicode.txt','中文',[Text.UTF8Encoding]::new()); [Console]::Write('file-ready'); exit 0\n"
+                        }
+                    };
+                    let input = cwd.join("input");
+                    fs::write(
+                        &input,
+                        match case {
+                            "tampered" => b"throw 'must not execute'".to_vec(),
+                            "oversize" => vec![b' '; 64 * 1024 + 1],
+                            _ => script.as_bytes().to_vec(),
+                        },
+                    )
+                    .unwrap();
+                    if case == "existing" {
+                        fs::create_dir(cwd.join(&stage)).unwrap();
+                        fs::write(cwd.join(&stage).join("bootstrap.ps1"), b"sentinel").unwrap();
+                    }
+                    let remote = windows_bootstrap_receiver(&stage, script)
+                        .unwrap()
+                        .replacen("powershell.exe", inner, 1);
+                    let received = run(outer, &remote, &cwd, Some(&input));
+                    assert!(
+                        received.stdout.is_empty(),
+                        "{outer}/{inner}/{case}: unexpected receiver stdout"
+                    );
+                    let expected_receive = matches!(case, "ready" | "syntax" | "exit");
+                    assert_eq!(
+                        received.status.success(),
+                        expected_receive,
+                        "{outer}/{inner}/{case}: {}",
+                        safe_diagnostic(&received.stderr)
+                    );
+                    if !expected_receive {
+                        if case == "existing" {
+                            assert!(
+                                safe_diagnostic(&received.stderr)
+                                    .contains("agent_bootstrap_stage_exists")
+                            );
+                            assert_eq!(
+                                fs::read(cwd.join(&stage).join("bootstrap.ps1")).unwrap(),
+                                b"sentinel"
+                            );
+                        } else {
+                            assert!(
+                                !cwd.join(&stage).exists(),
+                                "failed receiver left its own stage"
+                            );
+                            assert!(safe_diagnostic(&received.stderr).contains(
+                                if case == "oversize" {
+                                    "agent_bootstrap_input_too_large"
+                                } else {
+                                    "agent_bootstrap_checksum_mismatch"
+                                }
+                            ));
+                        }
+                        continue;
+                    }
+                    assert_eq!(
+                        fs::read(cwd.join(&stage).join("bootstrap.ps1")).unwrap(),
+                        windows_script_bytes(script)
+                    );
+                    let remote =
+                        windows_bootstrap_file(&stage).replacen("powershell.exe", inner, 1);
+                    let executed = run(outer, &remote, &cwd, None);
+                    assert_eq!(
+                        executed.status.success(),
+                        case == "ready",
+                        "{outer}/{inner}/{case}: {}",
+                        safe_diagnostic(&executed.stderr)
+                    );
+                    if case == "ready" {
+                        assert_eq!(executed.stdout, b"file-ready");
+                        assert_eq!(
+                            fs::read(cwd.join("unicode.txt")).unwrap(),
+                            "中文".as_bytes()
+                        );
+                    } else {
+                        assert!(executed.stdout.is_empty());
+                        assert!(!executed.stderr.is_empty());
+                    }
+                    let cleanup = run(
+                        outer,
+                        &windows_stage_cleanup(&stage, &["bootstrap.ps1"]).replacen(
+                            "powershell.exe",
+                            inner,
+                            1,
+                        ),
+                        &cwd,
+                        None,
+                    );
+                    assert!(
+                        cleanup.status.success(),
+                        "{}",
+                        safe_diagnostic(&cleanup.stderr)
+                    );
+                    assert!(!cwd.join(&stage).exists());
+                }
+            }
+        }
+        assert!(windows_bootstrap_receiver("../escape", "exit 0").is_err());
+        assert!(
+            windows_bootstrap_receiver(
+                &format!(".codex-usage-monit-bootstrap-{}", "f".repeat(32)),
+                &"x".repeat(64 * 1024 + 1)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn official_bootstrap_runs_from_private_file_in_both_windows_shells() {
+        // Exercise the receiver and actual file entrypoint. The downloaded
+        // fixture is deliberately not executable.
         for shell in ["powershell.exe", "pwsh.exe"] {
             for corrupt in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
@@ -1738,13 +1998,22 @@ mod tests {
                     "\nfunction Receive-ReleaseAsset { param($Url,$Destination,$Maximum); $fixture=if ($Url.EndsWith('.json')) {'fixture.json'} else {'fixture.bin'}; [IO.File]::Copy((Join-Path (Get-Location).Path $fixture),$Destination) }\ntry { $e=",
                 );
                 let input = directory.path().join("input");
-                fs::write(&input, script).unwrap();
-                let trampoline = powershell("& ([scriptblock]::Create([Console]::In.ReadToEnd()))");
+                fs::write(&input, &script).unwrap();
+                let bootstrap_stage = format!(".codex-usage-monit-bootstrap-{}", "2".repeat(32));
+                let receiver = windows_bootstrap_receiver(&bootstrap_stage, &script).unwrap();
                 let mut command = Command::new(shell);
                 command
-                    .args(trampoline.split_whitespace().skip(1))
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(
+                        receiver
+                            .split_once("-Command \"")
+                            .unwrap()
+                            .1
+                            .strip_suffix('"')
+                            .unwrap(),
+                    )
                     .current_dir(directory.path());
-                let output = crate::bounded_process::output_cancellable_with_stdin(
+                let received = crate::bounded_process::output_cancellable_with_stdin(
                     &mut command,
                     Duration::from_secs(30),
                     MAX_INFO,
@@ -1752,6 +2021,35 @@ mod tests {
                     || false,
                 )
                 .unwrap();
+                assert!(
+                    received.status.success(),
+                    "{shell}: {}",
+                    safe_diagnostic(&received.stderr)
+                );
+                assert!(received.stdout.is_empty());
+                assert_eq!(
+                    fs::read(
+                        directory
+                            .path()
+                            .join(&bootstrap_stage)
+                            .join("bootstrap.ps1")
+                    )
+                    .unwrap(),
+                    windows_script_bytes(&script)
+                );
+                let mut command = Command::new(shell);
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-File"])
+                    .arg(
+                        directory
+                            .path()
+                            .join(&bootstrap_stage)
+                            .join("bootstrap.ps1"),
+                    )
+                    .current_dir(directory.path());
+                let output =
+                    crate::bounded_process::output(&mut command, Duration::from_secs(30), MAX_INFO)
+                        .unwrap();
                 assert_eq!(
                     output.status.success(),
                     !corrupt,

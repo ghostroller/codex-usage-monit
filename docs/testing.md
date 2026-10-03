@@ -71,8 +71,13 @@ For agent deployment changes, run `python -B -m unittest discover -s tests -p
 test_remote_release_bootstrap.py -v` locally. On Windows this exercises both
 PowerShell 5.1 and 7 as well as the platform-independent Python preparation
 contracts; both shells must be installed. Rust `remote_agent_manager` tests cover
-the actual Windows stdin bootstrap invocation, SSH-only Release selection, the
-explicit development upload, and install verification. Fixture success proves
+the Windows receiver that saves stdin bytes in a SID-private `bootstrap.ps1`,
+the separate `-File` preparation invocation, SSH-only Release selection, the
+explicit development upload, and install verification. The receiver does not
+execute stdin; local Windows update preparation also uses `-File`. Unix
+preparation continues to use Python's stdin. Windows coverage must exercise both
+5.1 and 7 without `-EncodedCommand`, `ScriptBlock.Create`, execution-policy
+changes or antivirus exceptions. Fixture success proves
 the control flow, not availability of a published Release. Record an authorized
 live SSH attempt separately, including missing-release diagnostics and whether
 the prior configuration was preserved. Do not create a tag or publish assets just

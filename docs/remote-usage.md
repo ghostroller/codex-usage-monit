@@ -64,7 +64,16 @@ pairing and enabling automatic sync remain explicit operations.
 
 **The normal deployment path downloads the official Release on the remote host.**
 The center probes the OS/architecture and sends a small embedded bootstrap script
-over SSH. That script fetches the manifest and binary from the fixed repository
+over SSH. On Windows, a visible, fixed PowerShell receiver writes the stdin bytes
+to `bootstrap.ps1` in a fresh directory accessible only to the remote user's SID.
+The receiver does not execute stdin. A separate `powershell.exe -NoProfile
+-NonInteractive -File ...` invocation runs the saved script; local Windows
+updates also run their private script with `-File`. These paths use neither
+`-EncodedCommand` nor `ScriptBlock.Create`, and do not change execution policy or
+antivirus settings. The file makes the invocation easier to inspect; security
+software may still flag a script that downloads and installs an executable.
+Unix preparation continues to run the embedded script through Python's stdin.
+That script fetches the manifest and binary from the fixed repository
 `https://github.com/ghostroller/codex-usage-monit/releases/download/v<VERSION>/`.
 It checks the manifest's exact source build, version, protocol, platform, bounded
 size and SHA-256 before executing the candidate installer. Downloads and redirects
