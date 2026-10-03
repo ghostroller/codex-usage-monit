@@ -656,3 +656,21 @@ UTC10:13:47–10:14:06，4/4场景、19条实际SSH、**56/56检查**。owner为
 本节证明了新Windows bootstrap的原生shell合同、下载校验控制流和真实SSH“接收文件→执行→错误状态→清理”链。**正式Release可用性、成功官方安装/服务升级仍未覆盖**，当前未发布分支不能退回旧Release。没有为新build重新运行非空SQLite双向用量、quota、facts/proof、多页恢复或TUI同步刷新；第12节真实SQL证据仍绑定其原04e6 build，不因本节source变化自动升级。第12.8待授权的旧用量归档仍未传输；这里只回传本轮源码/编译和合成启动日志。无新CI、push、tag或正式部署。
 
 此前 `transport-v4-probe/frozen-v4-libtest.exe` 保留的是旧编码调用，只作为原始失败证据；不要拿它复跑本轮安全调用。新合同由当前Cargo测试二进制及已核对build ID的开发CLI执行。
+
+用户随后要求分析 ConPTY 超时；进一步的独立观察已确认当前二进制最终在16.086秒出现fixture数据，原8秒失败仍保留。阶段计时、原因分析和源码/命令绑定见 [Windows ConPTY 初始数据超时诊断](conpty-startup-timeout-analysis-2026-10-03.zh-CN.md)，不追溯修改本节当时的验收结果。
+
+## 14. ConPTY启动超时修复与本地检查补充
+
+用户要求修复后，本地实现提交 **`2ac404617a60bbcd25e4908dba69f81113d139f9`** 将revision所需SQL读取合并到短read snapshot，并移除Windows同一已绑定数据库对象的重复完整验证。ownership/project mapping双读、receipt、live ACL、全部祖先reparse校验、文件身份、硬链接、SQLite真实HANDLE和WAL/SHM guards均保留；没有改原8秒门限、fixture、TUI交互代码或同步协议。
+
+| 场景 | 预期 | 实际 | 判定 |
+| --- | --- | --- | --- |
+| 原ConPTY初始fixture数据 | 原8秒内可见并完成交互 | 原两项ConPTY均通过；独立非仪器CLI观察6.411187s ready、q退出0，修复前16.085970s | **通过**，仅本次受控fixture回归，非正式历史性能基准 |
+| revision并发与初始化边界 | 一致SQL stamps/policy、保留外部文件变动检测；不创建/重建缺失库 | 三项新回归通过；仅恢复旧revision函数的exact回归test101，命中并发快照断言 | **通过**，确定性红灯/绿灯证据 |
+| Windows文件安全与rollback | DB/WAL/SHM权限扩大、硬链接或当前路径身份不符时拒绝nested use，保留旧提交 | 实际Win32 DACL扩大和hardlink测试均拒绝/回滚，ACL恢复，旧提交保留、新写未入库 | **通过**，11项数据库focused回归 |
+| 稳定源码完整本地检查 | 对本轮实现完成平台对应的全套检查 | Windows1878、Mac1923、Linux ARM64 1920项Rust通过，各0失败；完整entry均exit0 | **通过**；ignored为4/3/3，非零退出的离线partial smoke按既有合同检查 |
+| 本轮build的非空双向SSH、quota、facts/proof、多页恢复 | 重新绑定实际同步证据 | 本轮未重跑这些场景 | **未覆盖**；第12节证据仍绑定原04e6build |
+
+测试时源码是deec0256+三份声明的dirty文件，现已保存为上述实现提交；sourceHash `6a1f4dd99d51957039daaf353c2a3af2a4314fd50c51aecdd21c888595731e72`，三平台build ID均 **`f9bf593a9e8b33eece0dc099fc9cb5f8b2dd80db1ebe7b09f04198ac606f9451`**。原失败证据保留，第13节结果不追溯改写。完整命令、平台、UTC、各开发binary路径/SHA256/info、dirty snapshot及限制作进一步说明，见 [诊断与修复第7节](conpty-startup-timeout-analysis-2026-10-03.zh-CN.md#7-修复与原门限回归)。
+
+日志根为 `D:/Workspace/codex-usage-monit/target/conpty-startup-fix-2026-10-03`（focused、red-revision、observer、Windows完整 `validation-summary.json`），跨平台合成日志和source summary位于 `D:/Workspace/codex-usage-monit/target/fix/platforms`。Mac端仅通过真实local-mac SSH传输源码和本轮合成日志，未传输待授权的旧用量归档。未更新正式安装/recorder/sshd或防护策略，未跑新CI、push、tag或正式部署。
