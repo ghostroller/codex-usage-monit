@@ -24,6 +24,197 @@ fn popup_text(app: &App) -> String {
         .join("\n")
 }
 
+fn assert_comparison_row(content: &str, label: &str, values: &[&str]) {
+    let row = content
+        .lines()
+        .find(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("missing comparison row {label:?}: {content}"));
+    let mut remainder = row;
+    for value in values {
+        let position = remainder
+            .find(value)
+            .unwrap_or_else(|| panic!("missing ordered value {value:?} in {row:?}"));
+        remainder = &remainder[position + value.len()..];
+    }
+}
+
+fn cycle_usage_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = detail_harness(width, height, theme);
+    set_task_parent(&mut harness.app, 1, 0);
+    set_task_parent(&mut harness.app, 2, 1);
+    for (task, total) in harness
+        .app
+        .snapshot
+        .tasks
+        .iter_mut()
+        .zip([11_130, 22_290, 33_370])
+    {
+        task.token_usage = TokenUsage {
+            input_tokens: total,
+            total_tokens: total,
+            ..TokenUsage::default()
+        };
+    }
+    add_window_analysis(&mut harness.app, WindowScope::FiveHours, 1_113, 1.0);
+    let threads = harness
+        .app
+        .snapshot
+        .tasks
+        .iter()
+        .zip([1_113, 2_229, 3_337])
+        .enumerate()
+        .map(|(index, (task, total))| ThreadWindowUsage {
+            thread_id: task.thread_id.clone(),
+            usage: WindowUsage {
+                token_usage: TokenUsage {
+                    input_tokens: total,
+                    total_tokens: total,
+                    ..TokenUsage::default()
+                },
+                local_token_share_percent: index as f64 + 1.0,
+                estimated_quota_percent: index as f64 + 0.5,
+                quota_confidence: Confidence::Low,
+                api_equivalent_cost: exact_api_cost((index as u128 + 1) * 1_000_000_000_000),
+            },
+        })
+        .collect();
+    harness.app.snapshot.window_analyses[0].threads = threads;
+    // All values come from the injected snapshot, with no asynchronous reader.
+    harness.app.local_snapshot.tasks.clear();
+    harness.app.task_list_mode = TaskListMode::Tree;
+    harness.app.selected_task = 0;
+    harness.render();
+    harness
+}
+
+fn screenshot_usage_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = detail_harness(width, height, theme);
+    set_task_parent(&mut harness.app, 1, 0);
+    set_task_parent(&mut harness.app, 2, 1);
+    let captured = DateTime::parse_from_rfc3339("2026-10-04T21:13:36Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    harness.app.snapshot.as_of = captured;
+    // Preserve every known token component and Own pricing field from the
+    // screenshot. The two descendant splits and delegated quota/cost are
+    // synthetic fixture values, not recovered account billing data.
+    let usages = [
+        TokenUsage {
+            input_tokens: 63_660_760,
+            cached_input_tokens: 61_897_856,
+            output_tokens: 289_930,
+            reasoning_output_tokens: 126_242,
+            total_tokens: 63_950_690,
+            ..TokenUsage::default()
+        },
+        TokenUsage {
+            input_tokens: 29_800_000,
+            cached_input_tokens: 28_800_000,
+            output_tokens: 200_000,
+            reasoning_output_tokens: 80_000,
+            total_tokens: 30_000_000,
+            ..TokenUsage::default()
+        },
+        TokenUsage {
+            input_tokens: 37_841_776,
+            cached_input_tokens: 36_354_688,
+            output_tokens: 166_457,
+            reasoning_output_tokens: 63_255,
+            total_tokens: 38_008_233,
+            ..TokenUsage::default()
+        },
+    ];
+    for (task, usage) in harness.app.snapshot.tasks.iter_mut().zip(usages) {
+        task.token_usage = usage;
+        task.created_at = Some(captured - ChronoDuration::hours(50));
+        task.updated_at = Some(captured);
+    }
+    harness.app.snapshot.tasks[0].title = "Session usage comparison".into();
+    add_window_analysis(&mut harness.app, WindowScope::Week, 63_950_690, 13.5638);
+    let threads = harness
+        .app
+        .snapshot
+        .tasks
+        .iter()
+        .zip(usages)
+        .zip([8.1, 3.8, 4.9])
+        .enumerate()
+        .map(
+            |(index, ((task, token_usage), estimated_quota_percent))| ThreadWindowUsage {
+                thread_id: task.thread_id.clone(),
+                usage: WindowUsage {
+                    token_usage,
+                    local_token_share_percent: token_usage.total_tokens as f64 / 63_950_690.0
+                        * 13.5638,
+                    estimated_quota_percent,
+                    quota_confidence: Confidence::Low,
+                    api_equivalent_cost: if index == 0 {
+                        ApiCostAmount {
+                            minimum_pico_usd: PicoUsd::new(24_642_300_000_000),
+                            maximum_pico_usd: PicoUsd::new(24_642_300_000_000),
+                            observed_samples: 517,
+                            priced_samples: 501,
+                            observed_tokens: 63_950_690,
+                            priced_tokens: 62_890_536,
+                        }
+                    } else {
+                        ApiCostAmount {
+                            minimum_pico_usd: PicoUsd::new(
+                                (index as u128 + 1) * 12_500_000_000_000,
+                            ),
+                            maximum_pico_usd: PicoUsd::new(
+                                (index as u128 + 1) * 12_500_000_000_000,
+                            ),
+                            observed_samples: 100 * (index as u64 + 1),
+                            priced_samples: 100 * (index as u64 + 1),
+                            observed_tokens: token_usage.total_tokens,
+                            priced_tokens: token_usage.total_tokens,
+                        }
+                    },
+                },
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut total = TokenUsage::default();
+    for usage in usages {
+        total.add_assign(usage);
+    }
+    let analysis = &mut harness.app.snapshot.window_analyses[0];
+    analysis.threads = threads;
+    analysis.attribution.local_token_usage = total;
+    analysis.attribution.proxy_projected_percent = 44.0;
+    analysis.attribution.unattributed_percent = 44.0;
+    let window = analysis.attribution.window.as_mut().unwrap();
+    window.used_percent = 44.0;
+    window.starts_at = DateTime::parse_from_rfc3339("2026-10-02T21:13:36Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    window.ends_at = window.starts_at + ChronoDuration::weeks(1);
+    harness.app.window_scope = WindowScope::Week;
+    harness.app.local_snapshot.tasks.clear();
+    harness.app.task_list_mode = TaskListMode::Tree;
+    harness.app.selected_task = 0;
+    harness.render();
+    harness
+}
+
+fn align_usage_at_top(harness: &mut TuiHarness) {
+    harness.key(KeyCode::Home);
+    let limit = harness.app.entity_detail.as_ref().unwrap().line_count;
+    for _ in 0..=limit {
+        let content = harness.app.entity_detail_hitbox.unwrap().content;
+        if rendered_row(harness, content, content.y).trim() == "Usage" {
+            return;
+        }
+        let before = harness.app.entity_detail.as_ref().unwrap().offset;
+        harness.key(KeyCode::Down);
+        if harness.app.entity_detail.as_ref().unwrap().offset == before {
+            break;
+        }
+    }
+    panic!("the Usage heading must be reachable at the viewport top");
+}
+
 fn entry(harness: &TuiHarness, focus: Focus) -> Rect {
     match focus {
         Focus::Tasks => harness.app.task_controls_hitbox.unwrap().details,
@@ -1446,6 +1637,7 @@ fn entity_detail_sections_default_to_closed_while_overview_and_usage_remain_visi
             let popup = harness.app.entity_detail.as_ref().unwrap();
             let foldable = section_ids(&popup.document, true);
             assert!(has_usage_node(&popup.document));
+            assert!(foldable.iter().any(|id| id == "usage.calculation"));
             assert!(foldable.iter().any(|id| id == "snapshot.Related"));
             assert!(foldable.iter().any(|id| id == "snapshot.Data notes"));
             for id in &foldable {
@@ -1472,7 +1664,8 @@ fn entity_detail_sections_default_to_closed_while_overview_and_usage_remain_visi
             }
             let content = popup_text(&harness.app);
             assert!(content.contains("Thread ID:"));
-            assert!(content.contains("Own cumulative tokens"));
+            assert!(content.contains("Cumulative usage (selected cycle unavailable)"));
+            assert!(content.contains("Total tokens"));
             assert!(!content.contains("Approval policy: on-request"));
             assert!(!content.contains("user | commentary"));
             assert!(!content.contains("TOOL-ARGUMENTS-MARKER"));
@@ -1511,6 +1704,301 @@ fn entity_detail_sections_default_to_closed_while_overview_and_usage_remain_visi
                 );
             }
             assert!(!expanded.contains("MESSAGE-BODY-STAYS-HIDDEN"));
+        }
+    }
+}
+
+#[test]
+fn entity_detail_cycle_comparison_keeps_lifetime_and_calculation_details_separate() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut harness = cycle_usage_harness(160, 45, theme);
+        open(&mut harness);
+        let content = popup_text(&harness.app);
+        assert!(content.contains("Current cycle"));
+        assert!(content.contains("Own: this session"));
+        assert!(content.contains("Delegated: all linked descendants"));
+        assert_comparison_row(&content, "Total tokens", &["1,113", "5,566", "6,679"]);
+        assert_comparison_row(&content, "TOKEN%", &["1.0000%", "5.0000%", "6.0000%"]);
+        assert_comparison_row(
+            &content,
+            "API equivalent",
+            &["$1.0000", "$5.0000", "$6.0000"],
+        );
+        for cumulative in ["11,130", "55,660", "66,790"] {
+            assert!(
+                !content.contains(cumulative),
+                "lifetime is closed: {content}"
+            );
+        }
+        assert!(!content.contains("current_codex_gauge_credit_rate_weighted_proxy"));
+        let order = harness
+            .app
+            .entity_detail
+            .as_ref()
+            .unwrap()
+            .headers
+            .iter()
+            .map(|header| header.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &order[..3],
+            ["usage.lifetime", "usage.calculation", "snapshot.Related"]
+        );
+        assert!(!section_expanded(&harness, "usage.lifetime"));
+        assert!(!section_expanded(&harness, "usage.calculation"));
+
+        harness.key(KeyCode::Tab);
+        assert_eq!(
+            harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .selected_section
+                .as_deref(),
+            Some("usage.lifetime")
+        );
+        harness.key(KeyCode::Enter);
+        let expanded = popup_text(&harness.app);
+        let lifetime = expanded
+            .split_once("All observed cumulative tokens")
+            .expect("lifetime explanation is revealed")
+            .1;
+        assert_comparison_row(lifetime, "Total tokens", &["11,130", "55,660", "66,790"]);
+        assert!(
+            expanded.contains("6,679"),
+            "current-cycle data remains visible"
+        );
+        assert!(!section_expanded(&harness, "usage.calculation"));
+
+        harness.key(KeyCode::Tab);
+        assert_eq!(
+            harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .selected_section
+                .as_deref(),
+            Some("usage.calculation")
+        );
+        harness.key(KeyCode::Enter);
+        let expanded = popup_text(&harness.app);
+        for explanation in [
+            "Attribution method: current_codex_gauge_credit_rate_weighted_proxy",
+            "External activity possible: true",
+            "it does not report detected activity",
+            "EST Longx: disabled",
+            "same total-token denominator",
+        ] {
+            assert!(
+                expanded.contains(explanation),
+                "missing {explanation}: {expanded}"
+            );
+        }
+
+        harness.key(KeyCode::Esc);
+        expand_task_tree(&mut harness.app);
+        harness.app.task_source_filter = TaskSourceFilter::Desktop;
+        harness.render();
+        open(&mut harness);
+        assert_eq!(
+            popup_text(&harness.app),
+            content,
+            "tree expansion and hidden descendant rows do not change the comparison"
+        );
+    }
+}
+
+#[test]
+fn entity_detail_usage_comparison_gallery_preserves_large_cache_and_small_output() {
+    for (theme, theme_name) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+        for (width, height) in [(160, 45), (60, 24)] {
+            let mut harness = screenshot_usage_harness(width, height, theme);
+            open(&mut harness);
+            let content = popup_text(&harness.app);
+            for label in [
+                "Token counts",
+                "Own",
+                "Delegated",
+                "Total",
+                "Quota estimate",
+                "API-equivalent cost",
+                "Lifetime usage (same as current cycle)",
+                "Usage calculation details",
+            ] {
+                assert!(content.contains(label), "missing {label}: {content}");
+            }
+            assert!(!section_expanded(&harness, "usage.lifetime"));
+            assert!(!section_expanded(&harness, "usage.calculation"));
+            if width >= 120 {
+                assert_comparison_row(
+                    &content,
+                    "Total tokens",
+                    &["63,950,690", "68,008,233", "131,958,923"],
+                );
+                assert_comparison_row(
+                    &content,
+                    "Uncached input",
+                    &["1,762,904", "2,487,088", "4,249,992"],
+                );
+                assert_comparison_row(
+                    &content,
+                    "Cache read",
+                    &["61,897,856", "65,154,688", "127,052,544"],
+                );
+                assert_comparison_row(
+                    &content,
+                    "Non-reasoning output",
+                    &["163,688", "223,202", "386,890"],
+                );
+                assert_comparison_row(
+                    &content,
+                    "Reasoning output",
+                    &["126,242", "143,255", "269,497"],
+                );
+                assert!(content.contains("96.28%"), "cache dominates the true total");
+                assert!(
+                    content.contains("0.29%"),
+                    "small output remains precisely represented"
+                );
+                assert!(
+                    content.contains("0.20%"),
+                    "reasoning uses the same total denominator"
+                );
+                assert_comparison_row(&content, "Estimated quota", &["~8.1%", "~8.7%", "~16.8%"]);
+                assert_comparison_row(
+                    &content,
+                    "API equivalent",
+                    &["$24.6423+", "$62.5000", "$87.1423+"],
+                );
+                assert!(
+                    content.contains("62,890,536"),
+                    "known priced token count is retained"
+                );
+                assert!(
+                    content.contains("501"),
+                    "known priced sample count is retained"
+                );
+                assert!(
+                    content.contains("517"),
+                    "known observed sample count is retained"
+                );
+            } else {
+                for value in [
+                    "63,950,690",
+                    "68,008,233",
+                    "131,958,923",
+                    "127,052,544",
+                    "386,890",
+                    "269,497",
+                ] {
+                    assert!(
+                        content.contains(value),
+                        "narrow layout preserves exact value {value}"
+                    );
+                }
+            }
+            align_usage_at_top(&mut harness);
+            if width >= 120 {
+                let viewport = harness.app.entity_detail_hitbox.unwrap().content;
+                let visible = rendered_region(&harness, viewport);
+                assert!(
+                    visible.contains("API-equivalent cost"),
+                    "fee fits the wide Usage view"
+                );
+                assert!(
+                    visible.contains("Lifetime usage"),
+                    "folded lifetime fits the wide Usage view"
+                );
+            }
+            save_gallery(
+                &harness,
+                &format!("entity-usage-comparison-{theme_name}-{width}x{height}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn entity_detail_usage_supplements_use_enter_tab_and_whole_labels_in_compact_themes() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = cycle_usage_harness(width, height, theme);
+            open(&mut harness);
+            for id in ["usage.lifetime", "usage.calculation"] {
+                assert!(!section_expanded(&harness, id));
+                let header = focus_section(&mut harness, id);
+                assert_section_binding(&harness, header, true);
+                let before = harness.state();
+                harness.key(KeyCode::Enter);
+                assert!(section_expanded(&harness, id));
+                harness.key(KeyCode::Enter);
+                assert!(!section_expanded(&harness, id));
+                assert_eq!(harness.state(), before);
+                let header = focus_section(&mut harness, id);
+                for row in header.y..header.bottom() {
+                    for column in header.x..header.right() {
+                        let current = focus_section(&mut harness, id);
+                        assert_eq!(current, header, "folded header geometry stays stable");
+                        assert!(mouse_at(
+                            &mut harness,
+                            MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row
+                        ));
+                        assert!(
+                            section_expanded(&harness, id),
+                            "click {column},{row} activates {id}"
+                        );
+                        harness.key(KeyCode::Enter);
+                        assert!(!section_expanded(&harness, id));
+                    }
+                }
+                let smaller = if width > 32 { (32, 14) } else { (120, 40) };
+                harness.resize(smaller.0, smaller.1);
+                assert_eq!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .selected_section
+                        .as_deref(),
+                    Some(id)
+                );
+                let resized = focus_section(&mut harness, id);
+                assert_section_binding(&harness, resized, true);
+                harness.key(KeyCode::Enter);
+                assert!(section_expanded(&harness, id));
+                harness.key(KeyCode::Enter);
+                harness.resize(width, height);
+                let restored = focus_section(&mut harness, id);
+                assert_section_binding(&harness, restored, true);
+            }
+            focus_section(&mut harness, "usage.calculation");
+            harness.key(KeyCode::BackTab);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some("usage.lifetime")
+            );
+            harness.key(KeyCode::Tab);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some("usage.calculation")
+            );
         }
     }
 }
@@ -2156,8 +2644,10 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
             "model-0",
             "high",
             "fast",
-            "Cache write input",
-            "Cached input",
+            "Uncached input",
+            "Cache write",
+            "Cache read",
+            "Non-reasoning output",
             "Reasoning output",
             "135",
             "234",
@@ -2165,15 +2655,41 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
             "API equivalent",
             "Priced token coverage",
             "50.00%",
-            "Usage samples",
-            "18.96%",
-            "10.94%",
-            "28.47%",
-            "Input 1,234 (72.59% total)",
-            "Output 432 (25.41% total)",
+            "Priced / observed samples",
+            "50.88%",
+            "13.76%",
+            "7.94%",
+            "18.18%",
+            "7.24%",
+            "2.00%",
+            "865",
+            "309",
         ] {
             assert!(content.contains(text), "missing {text:?}: {content}");
         }
+        let headers = content
+            .lines()
+            .filter(|line| line.contains("Metric"))
+            .collect::<Vec<_>>();
+        assert!(
+            !headers.is_empty(),
+            "the turn comparison has a rendered column header"
+        );
+        for header in headers {
+            assert!(
+                !header.contains("Delegated"),
+                "a turn has only its Own column"
+            );
+        }
+        assert!(
+            content
+                .contains("Delegated turn usage: unavailable (no exact turn linkage in snapshot)")
+        );
+        assert!(content.contains("% of Own"));
+        assert!(!content.contains("% of Total"));
+        assert!(content.contains("Lifetime usage (same as current cycle)"));
+        assert!(!section_expanded(&harness, "usage.lifetime"));
+        assert!(!section_expanded(&harness, "usage.calculation"));
         let directory = gallery_directory();
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -2267,19 +2783,20 @@ fn entity_detail_derived_turn_statistics_keep_duration_and_count_meanings_distin
     open_expanded(&mut harness);
     let content = popup_text(&harness.app);
     assert!(content.contains("Elapsed at capture: 3210 ms"));
-    assert!(content.contains("All ratios: unavailable (zero denominator)"));
+    assert!(content.contains("unavailable"));
+    assert!(
+        content.contains("zero"),
+        "zero totals have no composition percentages"
+    );
     for component in [
-        "Input 0",
-        "Output 0",
-        "Unclassified 0",
-        "Cached input 0",
-        "Cache write input 0",
-        "Reasoning output 0",
+        "Total tokens",
+        "Uncached input",
+        "Cache read",
+        "Cache write",
+        "Non-reasoning output",
+        "Reasoning output",
     ] {
-        assert!(
-            content.contains(component),
-            "missing {component}: {content}"
-        );
+        assert_comparison_row(&content, component, &["0"]);
     }
 }
 
@@ -2297,18 +2814,18 @@ fn entity_detail_longx_changes_quota_projection_without_changing_api_cost() {
     harness.render();
     open(&mut harness);
     let without_longx = popup_text(&harness.app);
-    assert!(without_longx.contains("Own API equivalent: $1.0000"));
+    assert_comparison_row(&without_longx, "API equivalent", &["$1.0000"]);
     harness.key(KeyCode::Esc);
     harness.app.api_long_context_multiplier = true;
     harness.render();
     open(&mut harness);
     let with_longx = popup_text(&harness.app);
-    assert!(with_longx.contains("Own API equivalent: $1.0000"));
-    assert!(!with_longx.contains("Own API equivalent: $9.0000"));
+    assert_comparison_row(&with_longx, "API equivalent", &["$1.0000"]);
+    assert!(!with_longx.contains("$9.0000"));
     let quota = |content: &str| {
         content
             .lines()
-            .find(|line| line.contains("Estimated quota:"))
+            .find(|line| line.contains("Estimated quota"))
             .expect("the selected scope retains its estimate")
             .to_string()
     };
@@ -2350,19 +2867,15 @@ fn entity_detail_session_aggregation_is_stable_when_subagent_tree_expands() {
     harness.render();
     open(&mut harness);
     let collapsed = popup_text(&harness.app);
-    for label in [
-        "Own cumulative tokens",
-        "Delegated cumulative tokens",
-        "Total cumulative tokens",
-    ] {
-        assert!(collapsed.contains(label));
-    }
-    for total in ["113", "566", "679"] {
-        assert!(
-            collapsed.contains(total),
-            "missing aggregation {total}: {collapsed}"
-        );
-    }
+    assert!(collapsed.contains("Cumulative usage (selected cycle unavailable)"));
+    assert_comparison_row(&collapsed, "Total tokens", &["113", "566", "679"]);
+    assert!(
+        !section_ids(&harness.app.entity_detail.as_ref().unwrap().document, true)
+            .iter()
+            .any(|id| id == "usage.lifetime")
+    );
+    assert!(!collapsed.contains("Quota estimate"));
+    assert!(!collapsed.contains("API-equivalent cost"));
     harness.key(KeyCode::Esc);
     expand_task_tree(&mut harness.app);
     harness.render();

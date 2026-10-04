@@ -276,7 +276,24 @@ fn project_detail_nodes(
                     line
                 }));
             }
-            DetailNode::Usage(block) => lines.extend(block.render(width, theme)),
+            DetailNode::Usage(block) => {
+                let indent_columns = depth
+                    .saturating_mul(2)
+                    .min(usize::from(width.saturating_sub(1)));
+                let indent = " ".repeat(indent_columns);
+                let content_width = width.saturating_sub(indent_columns as u16);
+                lines.extend(
+                    block
+                        .render(content_width, theme)
+                        .into_iter()
+                        .map(|mut line| {
+                            if !indent.is_empty() && !line.spans.is_empty() {
+                                line.spans.insert(0, Span::raw(indent.clone()));
+                            }
+                            line
+                        }),
+                );
+            }
             DetailNode::Section {
                 id,
                 title,
@@ -864,19 +881,6 @@ fn api_amount(
     });
 }
 
-fn scope_usage(
-    lines: &mut DetailLines,
-    label: &str,
-    usage: WindowUsage,
-    state: ApiCostWindowState,
-) {
-    lines.usage(UsageBlock::Scope {
-        label: label.to_owned(),
-        usage,
-        state,
-    });
-}
-
 fn workspace_label(source: Option<&str>) -> &'static str {
     if source.is_some_and(|source| source.starts_with("remote:")) {
         "Project/workspace label"
@@ -911,7 +915,81 @@ fn detail_turn_window_usage(app: &App, turn: &TurnRecord) -> WindowUsage {
     usage
 }
 
-fn window_description(lines: &mut DetailLines, app: &App) -> bool {
+fn entity_usage(
+    lines: &mut DetailLines,
+    app: &App,
+    cumulative: Vec<(String, TokenUsage)>,
+    scoped: Vec<(String, WindowUsage)>,
+) {
+    lines.section("Usage");
+    let attribution = attribution_for_scope_with_api_long_context(
+        &app.snapshot,
+        app.window_scope,
+        app.api_long_context_multiplier,
+    );
+    if let Some(window) = attribution.and_then(|value| value.window.as_ref()) {
+        lines.field("Current cycle", app.window_scope.label());
+        lines.field(
+            "Cycle",
+            format!(
+                "{} → {}",
+                timestamp(Some(window.starts_at)),
+                timestamp(Some(window.ends_at))
+            ),
+        );
+        if scoped.len() > 1 {
+            lines.note("Own: this session · Delegated: all linked descendants · Total: combined");
+        }
+        lines.usage(UsageBlock::TokenComparison {
+            columns: scoped
+                .iter()
+                .map(|(label, usage)| (label.clone(), usage.token_usage))
+                .collect(),
+            show_composition: true,
+        });
+        lines.usage(UsageBlock::QuotaComparison {
+            columns: scoped.clone(),
+            account_used_percent: window.used_percent,
+            long_context: app.api_long_context_multiplier,
+        });
+        lines.usage(UsageBlock::CostComparison {
+            columns: scoped
+                .iter()
+                .map(|(label, usage)| (label.clone(), usage.api_equivalent_cost))
+                .collect(),
+            state: api_cost_window_state(window_analysis(&app.snapshot, app.window_scope)),
+        });
+        let matches_cycle = cumulative.len() == scoped.len()
+            && cumulative.iter().zip(&scoped).all(
+                |((label, usage), (scope_label, scope_usage))| {
+                    label == scope_label && *usage == scope_usage.token_usage
+                },
+            );
+        lines.subsection(
+            "usage.lifetime".into(),
+            if matches_cycle {
+                "Lifetime usage (same as current cycle)".into()
+            } else {
+                "Lifetime usage".into()
+            },
+        );
+        lines.note("All observed cumulative tokens for this entity, across cycles.");
+        lines.usage(UsageBlock::TokenComparison {
+            columns: cumulative,
+            show_composition: false,
+        });
+        lines.end_subsection();
+    } else {
+        lines.note("Cumulative usage (selected cycle unavailable)");
+        lines.usage(UsageBlock::TokenComparison {
+            columns: cumulative,
+            show_composition: true,
+        });
+    }
+    lines.subsection(
+        "usage.calculation".into(),
+        "Usage calculation details".into(),
+    );
     lines.field("Selected scope", app.window_scope.label());
     lines.field(
         "EST Longx",
@@ -921,25 +999,17 @@ fn window_description(lines: &mut DetailLines, app: &App) -> bool {
             "disabled"
         },
     );
-    if let Some(attribution) = attribution_for_scope_with_api_long_context(
-        &app.snapshot,
-        app.window_scope,
-        app.api_long_context_multiplier,
-    ) && let Some(window) = attribution.window.as_ref()
-    {
-        lines.field("Cycle start", timestamp(Some(window.starts_at)));
-        lines.field("Cycle end", timestamp(Some(window.ends_at)));
-        lines.field("Account gauge", format!("{:.2}%", window.used_percent));
+    if let Some(attribution) = attribution {
         lines.field("Attribution method", &attribution.method);
         lines.field(
             "External activity possible",
             attribution.external_activity_possible,
         );
-        true
-    } else {
-        lines.field("Selected window", "unavailable");
-        false
+        lines.note("External activity possible expresses uncertainty; it does not report detected activity.");
     }
+    lines.note("Cached input is split from input; reasoning is split from output. Each composition percentage uses the same total-token denominator.");
+    lines.note("Usage samples are token-delta records and may contain several model requests.");
+    lines.end_subsection();
 }
 
 fn add_usage(left: &mut WindowUsage, right: WindowUsage) {
@@ -1033,23 +1103,27 @@ fn task_detail(app: &App, task: &TaskRecord) -> EntityDetailPopup {
     }
     let mut total = task.token_usage;
     total.add_assign(delegated);
-    lines.section("Usage");
-    tokens(&mut lines, "Own cumulative tokens", task.token_usage);
-    tokens(&mut lines, "Delegated cumulative tokens", delegated);
-    tokens(&mut lines, "Total cumulative tokens", total);
-    if window_description(&mut lines, app) {
-        let own = detail_task_window_usage(app, task);
-        let mut delegated = WindowUsage::default();
-        for child in &children {
-            add_usage(&mut delegated, detail_task_window_usage(app, child));
-        }
-        let mut total = own;
-        add_usage(&mut total, delegated);
-        let state = api_cost_window_state(window_analysis(&app.snapshot, app.window_scope));
-        scope_usage(&mut lines, "Own", own, state);
-        scope_usage(&mut lines, "Delegated", delegated, state);
-        scope_usage(&mut lines, "Total", total, state);
+    let own_window = detail_task_window_usage(app, task);
+    let mut delegated_window = WindowUsage::default();
+    for child in &children {
+        add_usage(&mut delegated_window, detail_task_window_usage(app, child));
     }
+    let mut total_window = own_window;
+    add_usage(&mut total_window, delegated_window);
+    entity_usage(
+        &mut lines,
+        app,
+        vec![
+            ("Own".into(), task.token_usage),
+            ("Delegated".into(), delegated),
+            ("Total".into(), total),
+        ],
+        vec![
+            ("Own".into(), own_window),
+            ("Delegated".into(), delegated_window),
+            ("Total".into(), total_window),
+        ],
+    );
     lines.section("Related");
     lines.field(
         "Parent thread",
@@ -1270,16 +1344,12 @@ fn turn_detail(app: &App, turn: &TurnRecord) -> EntityDetailPopup {
             duration(elapsed(turn.started_at, app.snapshot.as_of)),
         );
     }
-    lines.section("Usage");
-    tokens(&mut lines, "Own cumulative tokens", turn.token_usage);
-    if window_description(&mut lines, app) {
-        scope_usage(
-            &mut lines,
-            "Own",
-            detail_turn_window_usage(app, turn),
-            api_cost_window_state(window_analysis(&app.snapshot, app.window_scope)),
-        );
-    }
+    entity_usage(
+        &mut lines,
+        app,
+        vec![("Own".into(), turn.token_usage)],
+        vec![("Own".into(), detail_turn_window_usage(app, turn))],
+    );
     lines.field(
         "Delegated turn usage",
         "unavailable (no exact turn linkage in snapshot)",
@@ -1337,7 +1407,7 @@ fn overview_notes(lines: &mut DetailLines, app: &App) {
         lines.field("API price source", &analysis.api_pricing.source_url);
     }
     lines.note("Cached/cache-write input are input subsets; reasoning output is an output subset. Do not add them again to total tokens.");
-    lines.note("TOKEN% is the observed local token share. Estimated quota is a low-confidence account-gauge projection, not official per-session billing.");
+    lines.note("TOKEN% is the share of observed tokens in the selected cycle and configured sources. Estimated quota is a low-confidence account-gauge projection, not official per-session billing.");
     lines.note("API equivalent covers priced model tokens only, not the Codex subscription bill or tool charges. Unpriced usage is excluded; incomplete totals are lower bounds.");
     lines.note("Usage samples are token-delta records; a cumulative record may contain several model requests.");
     lines.note("Running status is inferred from rollout activity. Waiting for approval or user input cannot be recovered reliably.");
