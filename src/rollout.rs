@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -28,6 +29,8 @@ use crate::trace::{TraceFields, TraceOutcome};
 
 mod request_evidence;
 use request_evidence::{deduplicate_native_calls, request_covered_counters};
+mod parsed_events;
+use parsed_events::ParsedEvents;
 
 const TURN_MESSAGE_PREVIEW_CHARS: usize = 72;
 const ROLLOUT_CACHE_FORMAT_VERSION: u32 = 3;
@@ -264,13 +267,7 @@ struct SelectedFile {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum ParsedEvent {
-    RequestUsage {
-        timestamp: DateTime<Utc>,
-        turn_id: String,
-        response_id: String,
-        usage: TokenUsage,
-        turn_usage: Option<TokenUsage>,
-    },
+    RequestUsage(Box<RequestUsageEvent>),
     SessionMeta {
         timestamp: DateTime<Utc>,
         payload: Map<String, Value>,
@@ -332,14 +329,29 @@ enum ParsedEvent {
         duration_ms: Option<u64>,
         failed: bool,
     },
-    TokenCount {
-        timestamp: DateTime<Utc>,
-        line_number: usize,
-        total_usage: Option<TokenUsage>,
-        #[serde(default)]
-        last_usage: Option<TokenUsage>,
-        rate_limits: Option<CachedRateLimits>,
-    },
+    TokenCount(Box<TokenCountEvent>),
+}
+
+// These two payloads would otherwise set the inline size of every Activity
+// event. Box keeps their existing externally tagged serialized object shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RequestUsageEvent {
+    timestamp: DateTime<Utc>,
+    turn_id: String,
+    response_id: String,
+    usage: TokenUsage,
+    turn_usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct TokenCountEvent {
+    timestamp: DateTime<Utc>,
+    line_number: usize,
+    total_usage: Option<TokenUsage>,
+    #[serde(default)]
+    last_usage: Option<TokenUsage>,
+    // An absent quota should not reserve both limit windows in every counter.
+    rate_limits: Option<Box<CachedRateLimits>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -371,7 +383,7 @@ struct TailGuard {
 struct ParsedFile {
     owner_thread_id: Option<String>,
     activity_updated_at: Option<DateTime<Utc>>,
-    events: Vec<ParsedEvent>,
+    events: ParsedEvents,
     parsed_lines: usize,
     skipped_lines: usize,
     unreadable_files: usize,
@@ -410,7 +422,27 @@ struct ParsedFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedFile {
     fingerprint: FileFingerprint,
-    parsed: ParsedFile,
+    #[serde(with = "shared_parsed_file")]
+    parsed: Arc<ParsedFile>,
+}
+
+// Arc is an in-process ownership detail. Keep the persisted ParsedFile object
+// identical without enabling serde's global rc feature.
+mod shared_parsed_file {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        parsed: &Arc<ParsedFile>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        parsed.as_ref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Arc<ParsedFile>, D::Error> {
+        ParsedFile::deserialize(deserializer).map(Arc::new)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -954,6 +986,17 @@ pub fn scan_rollouts(config: &CollectConfig, now: DateTime<Utc>) -> Result<Rollo
 impl RolloutCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shares immutable parsed inputs with a one-shot history scan. Selection,
+    /// discovery, reduction, as-of boundaries, coverage and writer scheduling
+    /// belong to the new scan; changing its lookback cannot widen the live UI.
+    pub(crate) fn fork_for_history_scan(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            files: self.files.clone(),
+            ..Self::default()
+        }
     }
 
     pub fn last_refresh(&self) -> RolloutCacheRefresh {
@@ -4043,7 +4086,7 @@ fn refresh_stable_rollout_file(
                 return StableParse {
                     cached: CachedFile {
                         fingerprint: candidate.fingerprint,
-                        parsed,
+                        parsed: Arc::new(parsed),
                     },
                     stability_retries: attempt,
                     tail_parsed: false,
@@ -4075,7 +4118,7 @@ fn refresh_stable_rollout_file(
                 return StableParse {
                     cached: CachedFile {
                         fingerprint: after.fingerprint,
-                        parsed,
+                        parsed: Arc::new(parsed),
                     },
                     stability_retries: attempt,
                     tail_parsed,
@@ -4109,7 +4152,7 @@ fn refresh_stable_rollout_file(
         return StableParse {
             cached: CachedFile {
                 fingerprint: after.fingerprint,
-                parsed,
+                parsed: Arc::new(parsed),
             },
             stability_retries: attempt,
             tail_parsed: false,
@@ -4164,7 +4207,7 @@ fn can_tail_parse(previous: &CachedFile, file: &RolloutFile) -> bool {
 fn parse_rollout_tail(
     file: &RolloutFile,
     config: &CollectConfig,
-    mut previous: CachedFile,
+    previous: CachedFile,
 ) -> (Option<ParsedFile>, u64) {
     let mut guard_bytes = 0_u64;
     let mut handle = match open_rollout_source_for_validation(&file.path) {
@@ -4185,12 +4228,16 @@ fn parse_rollout_tail(
     {
         return (None, guard_bytes);
     }
-    previous.parsed.complete = false;
+    // Failed validation discards the shared prefix without copying it. After
+    // validation a shared ParsedFile only copies its metadata/chunk handles;
+    // parsing appends through a bounded final-chunk COW, never a whole Vec COW.
+    let mut parsed = Arc::unwrap_or_clone(previous.parsed);
+    parsed.complete = false;
     (
         Some(parse_rollout_reader(
             file,
             config,
-            previous.parsed,
+            parsed,
             BufReader::new(handle),
         )),
         guard_bytes,
@@ -4538,9 +4585,8 @@ fn parse_rollout_reader_with_limit<R: BufRead>(
                         return None;
                     }
                     let usage = parse_token_usage(payload.get("usage")?)?;
-                    usage
-                        .has_valid_breakdown()
-                        .then(|| ParsedEvent::RequestUsage {
+                    usage.has_valid_breakdown().then(|| {
+                        ParsedEvent::RequestUsage(Box::new(RequestUsageEvent {
                             timestamp,
                             turn_id: turn_id.to_owned(),
                             response_id: response_id.to_owned(),
@@ -4549,7 +4595,8 @@ fn parse_rollout_reader_with_limit<R: BufRead>(
                                 .get("turn_token_usage")
                                 .and_then(parse_token_usage)
                                 .filter(|usage| usage.has_valid_breakdown()),
-                        })
+                        }))
+                    })
                 })();
                 if let Some(request) = request {
                     parsed.events.push(request);
@@ -4678,24 +4725,35 @@ fn push_parsed_warning(parsed: &mut ParsedFile, warning: String) {
 }
 
 fn retain_latest_foreign_baseline(
-    events: &mut Vec<ParsedEvent>,
+    events: &mut ParsedEvents,
     timestamp: DateTime<Utc>,
     total_usage: TokenUsage,
 ) -> bool {
-    for event in events.iter_mut().rev() {
+    // Locate without mutable iteration: inspecting an immutable shared prefix
+    // must not copy all chunks traversed before the baseline is found.
+    let mut baseline_index = None;
+    for (index, event) in events.iter().enumerate().rev() {
         match event {
-            ParsedEvent::ForeignCounterBaseline {
-                timestamp: previous_timestamp,
-                total_usage: previous,
-            } => {
-                *previous_timestamp = timestamp;
-                *previous = total_usage;
-                return false;
+            ParsedEvent::ForeignCounterBaseline { .. } => {
+                baseline_index = Some(index);
+                break;
             }
             ParsedEvent::ForeignThreadSettingsBaseline { .. } | ParsedEvent::SessionMeta { .. } => {
             }
             _ => break,
         }
+    }
+    if let Some(index) = baseline_index {
+        let ParsedEvent::ForeignCounterBaseline {
+            timestamp: previous_timestamp,
+            total_usage: previous,
+        } = events.get_mut(index).expect("the located baseline exists")
+        else {
+            unreachable!("the located event is a foreign baseline")
+        };
+        *previous_timestamp = timestamp;
+        *previous = total_usage;
+        return false;
     }
     events.push(ParsedEvent::ForeignCounterBaseline {
         timestamp,
@@ -4705,7 +4763,7 @@ fn retain_latest_foreign_baseline(
 }
 
 fn retain_latest_foreign_thread_settings(
-    events: &mut Vec<ParsedEvent>,
+    events: &mut ParsedEvents,
     timestamp: DateTime<Utc>,
     model: Option<String>,
     service_tier: Option<String>,
@@ -4718,7 +4776,7 @@ fn retain_latest_foreign_thread_settings(
 }
 
 fn cache_event_message(
-    events: &mut Vec<ParsedEvent>,
+    events: &mut ParsedEvents,
     payload: &Map<String, Value>,
     timestamp: DateTime<Utc>,
     line_number: usize,
@@ -4775,15 +4833,16 @@ fn cache_event_message(
                 .get("rate_limits")
                 .or_else(|| payload.get("rateLimits"))
                 .and_then(Value::as_object)
-                .and_then(parse_cached_rate_limits);
+                .and_then(parse_cached_rate_limits)
+                .map(Box::new);
             if total_usage.is_some() || last_usage.is_some() || rate_limits.is_some() {
-                events.push(ParsedEvent::TokenCount {
+                events.push(ParsedEvent::TokenCount(Box::new(TokenCountEvent {
                     timestamp,
                     line_number,
                     total_usage,
                     last_usage,
                     rate_limits,
-                });
+                })));
             }
         }
         _ => {}
@@ -5097,13 +5156,7 @@ fn replay_rollout_file(
     for (event_index, event) in parsed.events.iter().enumerate() {
         if !event_is_visible(event) {
             if matches!(event, ParsedEvent::ForeignCounterBaseline { .. })
-                || matches!(
-                    event,
-                    ParsedEvent::TokenCount {
-                        total_usage: Some(_),
-                        ..
-                    }
-                )
+                || matches!(event, ParsedEvent::TokenCount(counter) if counter.total_usage.is_some())
             {
                 // A later wall-clock timestamp can appear earlier in append
                 // order when the system clock is corrected. Do not use that
@@ -5120,13 +5173,14 @@ fn replay_rollout_file(
             set_max_timestamp(&mut thread.updated_at, activity_at);
         }
         match event {
-            ParsedEvent::RequestUsage {
-                timestamp,
-                turn_id,
-                response_id,
-                usage,
-                ..
-            } => {
+            ParsedEvent::RequestUsage(request) => {
+                let RequestUsageEvent {
+                    timestamp,
+                    turn_id,
+                    response_id,
+                    usage,
+                    ..
+                } = request.as_ref();
                 let turn = ensure_turn(thread, turn_id);
                 let model = turn.model.clone();
                 let service_tier = turn.service_tier.clone();
@@ -5238,13 +5292,14 @@ fn replay_rollout_file(
                     TurnStatus::Interrupted
                 },
             ),
-            ParsedEvent::TokenCount {
-                timestamp,
-                line_number,
-                total_usage,
-                last_usage,
-                rate_limits,
-            } => {
+            ParsedEvent::TokenCount(counter) => {
+                let TokenCountEvent {
+                    timestamp,
+                    line_number,
+                    total_usage,
+                    last_usage,
+                    rate_limits,
+                } = counter.as_ref();
                 let covered = covered_counters.contains(&event_index);
                 apply_token_count(
                     thread,
@@ -5252,7 +5307,7 @@ fn replay_rollout_file(
                         total: if covered { None } else { *total_usage },
                         last: *last_usage,
                     },
-                    rate_limits.as_ref(),
+                    rate_limits.as_deref(),
                     *timestamp,
                     path,
                     *line_number,
@@ -5275,14 +5330,14 @@ fn replay_rollout_file(
 fn parsed_event_available_at(event: &ParsedEvent) -> Option<DateTime<Utc>> {
     match event {
         ParsedEvent::SessionMeta { timestamp, .. }
-        | ParsedEvent::RequestUsage { timestamp, .. }
         | ParsedEvent::ForeignCounterBaseline { timestamp, .. }
         | ParsedEvent::ForeignThreadSettingsBaseline { timestamp, .. }
         | ParsedEvent::UserMessage { timestamp, .. }
         | ParsedEvent::ThreadSettingsApplied { timestamp, .. }
         | ParsedEvent::Activity { timestamp }
-        | ParsedEvent::TurnContext { timestamp, .. }
-        | ParsedEvent::TokenCount { timestamp, .. } => Some(*timestamp),
+        | ParsedEvent::TurnContext { timestamp, .. } => Some(*timestamp),
+        ParsedEvent::RequestUsage(request) => Some(request.timestamp),
+        ParsedEvent::TokenCount(counter) => Some(counter.timestamp),
         ParsedEvent::AgentCall { requested_at, .. } => *requested_at,
         ParsedEvent::AgentActivity {
             recorded_at,
@@ -6516,4 +6571,8 @@ fn set_max_timestamp(slot: &mut Option<DateTime<Utc>>, value: DateTime<Utc>) {
 }
 
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;

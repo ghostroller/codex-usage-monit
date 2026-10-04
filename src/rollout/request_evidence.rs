@@ -10,7 +10,7 @@ struct TurnRequests<'a> {
 }
 
 pub(super) fn request_covered_counters(
-    events: &[ParsedEvent],
+    events: &ParsedEvents,
     as_of: Option<DateTime<Utc>>,
 ) -> HashSet<usize> {
     let mut turns = HashMap::<&str, TurnRequests<'_>>::new();
@@ -36,13 +36,14 @@ pub(super) fn request_covered_counters(
                     current_turn = Some(turn);
                 }
             }
-            ParsedEvent::RequestUsage {
-                turn_id,
-                response_id,
-                usage,
-                turn_usage,
-                ..
-            } => {
+            ParsedEvent::RequestUsage(request) => {
+                let RequestUsageEvent {
+                    turn_id,
+                    response_id,
+                    usage,
+                    turn_usage,
+                    ..
+                } = request.as_ref();
                 let state = turns.entry(turn_id).or_default();
                 match state.requests.insert(response_id, *usage) {
                     Some(previous) if previous != *usage => state.inconsistent = true,
@@ -60,11 +61,12 @@ pub(super) fn request_covered_counters(
                 }
                 pending_request = Some((turn_id.as_str(), *usage));
             }
-            ParsedEvent::TokenCount {
-                total_usage,
-                last_usage,
-                ..
-            } => {
+            ParsedEvent::TokenCount(counter) => {
+                let TokenCountEvent {
+                    total_usage,
+                    last_usage,
+                    ..
+                } = counter.as_ref();
                 if let Some(turn) = current_turn {
                     counters.push((index, turn));
                     // Consume only one following mirror, retaining its counter

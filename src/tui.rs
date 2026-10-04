@@ -10494,6 +10494,21 @@ impl RefreshCollectionInputs {
     }
 }
 
+fn with_summary_backfill_cache<T>(
+    rollout_cache: &Arc<Mutex<RolloutCache>>,
+    collect: impl FnOnce(&mut RolloutCache) -> T,
+) -> T {
+    let mut cache = {
+        let cache = rollout_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.fork_for_history_scan()
+    };
+    // Scanning and reducing the wider range must not hold the live-cache lock.
+    // Release its shared parsed events before staging the resulting history.
+    collect(&mut cache)
+}
+
 fn start_refresh_if_due(
     app: &mut App,
     config: &CollectConfig,
@@ -10603,6 +10618,7 @@ fn start_refresh_if_due(
     if summary_backfill_due {
         let worker_config = summary_backfill_config(config);
         let worker_sender = context.refresh_sender.clone();
+        let worker_cache = Arc::clone(rollout_cache);
         let worker_history = Arc::clone(history_store);
         let history_source_generation = app.history_source_generation;
         let history_source_selection = app.history_source_selection.clone();
@@ -10613,8 +10629,9 @@ fn start_refresh_if_due(
             send_refresh_completion_catching_panics(
                 &worker_sender,
                 || {
-                    let mut cache = RolloutCache::new();
-                    let result = collect_snapshot_cached(&worker_config, None, false, &mut cache);
+                    let result = with_summary_backfill_cache(&worker_cache, |cache| {
+                        collect_snapshot_cached(&worker_config, None, false, cache)
+                    });
                     let SummaryBackfillObservation {
                         scan_complete,
                         observed_at,
@@ -10622,7 +10639,6 @@ fn start_refresh_if_due(
                         local_session_digests,
                         observation,
                     } = SummaryBackfillObservation::from_collection(result);
-                    drop(cache);
                     let (mut projection, recorder_health) = {
                         let mut history_store = worker_history
                             .lock()

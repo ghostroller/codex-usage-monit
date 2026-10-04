@@ -792,7 +792,8 @@ fn oversized_entry_is_suppressed_after_the_first_serialization() {
             parsed: ParsedFile {
                 complete: true,
                 ..ParsedFile::default()
-            },
+            }
+            .into(),
         },
     );
     cache.dirty_files.insert(source.clone());
@@ -817,7 +818,8 @@ fn oversized_entry_is_suppressed_after_the_first_serialization() {
             parsed: ParsedFile {
                 complete: true,
                 ..ParsedFile::default()
-            },
+            }
+            .into(),
         },
     );
     cache.dirty_files.insert(source);
@@ -841,7 +843,8 @@ fn persistent_hit_is_rejected_if_source_changed_after_discovery() {
         parsed: ParsedFile {
             complete: true,
             ..ParsedFile::default()
-        },
+        }
+        .into(),
     };
     let cache_root = temp.path().join("cache");
     assert!(
@@ -891,7 +894,8 @@ fn persistent_exact_hit_uses_the_metadata_only_fast_path() {
         parsed: ParsedFile {
             complete: true,
             ..ParsedFile::default()
-        },
+        }
+        .into(),
     };
     let cache_root = temp.path().join("cache");
     persist_file_entry(
@@ -1063,7 +1067,8 @@ fn persistent_entry_above_the_full_hash_limit_uses_bounded_guards() {
         parsed: ParsedFile {
             complete: true,
             ..ParsedFile::default()
-        },
+        }
+        .into(),
     };
     let key = CacheKey {
         codex_home: temp.path().join("home"),
@@ -1174,7 +1179,7 @@ fn incomplete_in_memory_entry_is_reparsed_instead_of_hydrated_from_disk() {
         source.clone(),
         CachedFile {
             fingerprint: discovered.fingerprint.clone(),
-            parsed: ParsedFile::default(),
+            parsed: ParsedFile::default().into(),
         },
     );
     cache.selected = vec![SelectedFile {
@@ -1218,7 +1223,8 @@ fn file_reordering_marks_only_threads_whose_internal_replay_order_changed() {
                     owner_thread_id: Some(owner_thread_id.to_string()),
                     complete: true,
                     ..ParsedFile::default()
-                },
+                }
+                .into(),
             },
         );
     }
