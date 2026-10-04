@@ -1532,8 +1532,24 @@ fn summary_controls_clip_only_whole_buttons_in_tiny_terminals() {
 
 #[test]
 fn summary_controls_keep_collapse_all_visible_at_standard_and_full_label_widths() {
-    for (width, expected_width) in [(80, 3), (100, 3), (109, 3), (118, 11)] {
+    for (width, expected_width, inspect_width) in [
+        (50, 3, 3),
+        (59, 3, 3),
+        (60, 3, 10),
+        (80, 3, 10),
+        (100, 3, 10),
+        (109, 3, 10),
+        (118, 3, 10),
+        (129, 3, 10),
+        (130, 11, 10),
+    ] {
         let harness = summary_harness(width, 24, Theme::Dark);
+        let details = harness.app.summary_controls_hitbox.unwrap().details;
+        assert_eq!(details.width, if expected_width == 11 { 11 } else { 4 });
+        assert!(
+            details.right() <= width,
+            "details overflow at width {width}"
+        );
         for control in [
             ControlId::SummaryRangeCycle,
             ControlId::SummaryRangeSevenDays,
@@ -1556,6 +1572,11 @@ fn summary_controls_keep_collapse_all_visible_at_standard_and_full_label_widths(
         assert_eq!(
             harness.control_rect(ControlId::SummaryCollapseAll).width,
             expected_width
+        );
+        assert_eq!(
+            harness.control_rect(ControlId::SummaryInspect).width,
+            inspect_width,
+            "inspection label at width {width}"
         );
     }
 }

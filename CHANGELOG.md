@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Open scrollable session and turn details with `F2` in Overview and Summary, including derived usage/duration metrics and bounded background reads of local message, tool, file-change, configuration, Git and model/hourly evidence. Preserve exact entity attribution, content redaction, capture/range boundaries and explicit missing/partial results.
 - View the running application's version, source build ID, target, and bundled current-version release notes in the TUI with `?` or Settings **[?]Version info**. Scroll with keyboard, mouse wheel, or the draggable scrollbar and return with **[←]Back**.
 
 ### Changed

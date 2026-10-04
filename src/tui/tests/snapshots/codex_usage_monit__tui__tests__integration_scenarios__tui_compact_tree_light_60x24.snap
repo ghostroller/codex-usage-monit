@@ -11,11 +11,11 @@ rows:
 04|│███38%/62% | 07-12 06:30    ││███42%/58% | 07-16 04:30    │
 05|│███████████                 ││! 2026-07-14 04:30:00 +00:00│
 06|└────────────────────────────┘└────────────────────────────┘
-07|┌ 5h tasks ↵[O][R][E][A][D][S][C] Filter: ─────────────────┐
+07|┌5h tasks ↵[F2][O][R][E][A][D][S][C] Filter: ──────────────┐
 08|│ TOKENS     EST.Q5H  API EQ. TASK                         │
 09|│▌D 15.0K    ~37.5%   $0.0000 [+] codex-usage-monit | deskt│
 10|└  R RUN   W WAIT   D DONE   X STOP   F FAIL   ? STALE  ───┘
-11|┌Turns · 5h cycle   Filter: ───────────────────────────────┐
+11|┌Turns · 5h cycle    [F2]Details Filter: ──────────────────┐
 12|│ EFFORT/MODEL      MESSAGE       TOKENS    EST.Q   API EQ.│
 13|│▏high/gpt-5.3-code Add determini D 0       -       $0.0000│
 14|│ medium/gpt-… FAST Inspect the e D 0       -       $0.0000│
@@ -82,30 +82,32 @@ styles:
 05:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 06:000+060 fg=#7d8998 bg=#f7f9fc mods=none text="└────────────────────────────┘└────────────────────────────┘"
 07:000+001 fg=#006c75 bg=#f7f9fc mods=none text="┌"
-07:001+009 fg=#17202a bg=#f7f9fc mods=bold text=" 5h tasks"
-07:011+001 fg=#006c75 bg=#e6eaf0 mods=bold text="↵"
-07:012+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
-07:013+001 fg=#006c75 bg=#f7f9fc mods=bold text="O"
-07:014+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
-07:015+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
-07:016+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="R"
-07:017+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
-07:018+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
-07:019+001 fg=#006c75 bg=#f7f9fc mods=bold text="E"
-07:020+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
-07:021+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
-07:022+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="A"
-07:023+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
-07:024+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
-07:025+001 fg=#006c75 bg=#f7f9fc mods=bold text="D"
-07:026+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
-07:028+001 fg=#006c75 bg=#f7f9fc mods=bold text="S"
+07:001+008 fg=#17202a bg=#f7f9fc mods=bold text="5h tasks"
+07:010+001 fg=#006c75 bg=#e6eaf0 mods=bold text="↵"
+07:011+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
+07:012+002 fg=#006c75 bg=#f7f9fc mods=bold text="F2"
+07:014+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
+07:016+001 fg=#006c75 bg=#f7f9fc mods=bold text="O"
+07:017+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
+07:018+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
+07:019+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="R"
+07:020+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
+07:021+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
+07:022+001 fg=#006c75 bg=#f7f9fc mods=bold text="E"
+07:023+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
+07:024+001 fg=#f7f9fc bg=#006c75 mods=bold text="["
+07:025+001 fg=#f7f9fc bg=#006c75 mods=bold+underline text="A"
+07:026+001 fg=#f7f9fc bg=#006c75 mods=bold text="]"
+07:027+001 fg=#5f6b7a bg=#f7f9fc mods=none text="["
+07:028+001 fg=#006c75 bg=#f7f9fc mods=bold text="D"
 07:029+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
-07:031+001 fg=#006c75 bg=#f7f9fc mods=bold text="C"
-07:032+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
-07:034+001 fg=#006c75 bg=#f7f9fc mods=bold text="F"
-07:035+006 fg=#5f6b7a bg=#f7f9fc mods=none text="ilter:"
-07:041+019 fg=#006c75 bg=#f7f9fc mods=none text=" ─────────────────┐"
+07:031+001 fg=#006c75 bg=#f7f9fc mods=bold text="S"
+07:032+002 fg=#5f6b7a bg=#f7f9fc mods=none text="]["
+07:034+001 fg=#006c75 bg=#f7f9fc mods=bold text="C"
+07:035+001 fg=#5f6b7a bg=#f7f9fc mods=none text="]"
+07:037+001 fg=#006c75 bg=#f7f9fc mods=bold text="F"
+07:038+006 fg=#5f6b7a bg=#f7f9fc mods=none text="ilter:"
+07:044+016 fg=#006c75 bg=#f7f9fc mods=none text=" ──────────────┐"
 08:000+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
 08:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" TOKENS     EST.Q5H  API EQ. TASK                         "
 08:059+001 fg=#006c75 bg=#f7f9fc mods=none text="│"
@@ -124,8 +126,9 @@ styles:
 10:055+005 fg=#006c75 bg=#f7f9fc mods=none text=" ───┘"
 11:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="┌"
 11:001+016 fg=#17202a bg=#f7f9fc mods=bold text="Turns · 5h cycle"
-11:020+007 fg=#5f6b7a bg=#f7f9fc mods=none text="Filter:"
-11:027+033 fg=#7d8998 bg=#f7f9fc mods=none text=" ───────────────────────────────┐"
+11:021+011 fg=#5f6b7a bg=#f7f9fc mods=none text="[F2]Details"
+11:033+007 fg=#5f6b7a bg=#f7f9fc mods=none text="Filter:"
+11:040+020 fg=#7d8998 bg=#f7f9fc mods=none text=" ──────────────────┐"
 12:000+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
 12:001+058 fg=#006c75 bg=#f7f9fc mods=bold text=" EFFORT/MODEL      MESSAGE       TOKENS    EST.Q   API EQ."
 12:059+001 fg=#7d8998 bg=#f7f9fc mods=none text="│"
@@ -172,14 +175,14 @@ ToggleTurns binding=V rect=0,1,8,1
 ToggleModels binding=M rect=9,1,9,1
 ScopeFiveHours binding=5 rect=19,1,4,1
 ScopeWeek binding=W rect=24,1,6,1
-SourceAll binding=A rect=21,7,3,1
-SourceDesktop binding=D rect=24,7,3,1
-SourceSubagent binding=S rect=27,7,3,1
-SourceCli binding=C rect=30,7,3,1
-TaskSearch binding=F rect=34,7,25,1
-EnterTurns binding=↵ rect=11,7,1,1
-OpenTerminal binding=O rect=12,7,3,1
-ToggleTree binding=R rect=15,7,3,1
-CollapseAll binding=E rect=18,7,3,1
+SourceAll binding=A rect=24,7,3,1
+SourceDesktop binding=D rect=27,7,3,1
+SourceSubagent binding=S rect=30,7,3,1
+SourceCli binding=C rect=33,7,3,1
+TaskSearch binding=F rect=37,7,22,1
+EnterTurns binding=↵ rect=10,7,1,1
+OpenTerminal binding=O rect=15,7,3,1
+ToggleTree binding=R rect=18,7,3,1
+CollapseAll binding=E rect=21,7,3,1
 BackTasks binding=← rect=18,11,1,1
-TurnSearch binding=F rect=20,11,39,1
+TurnSearch binding=F rect=33,11,26,1

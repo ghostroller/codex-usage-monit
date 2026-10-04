@@ -10,7 +10,7 @@ rows:
 03|│█████████38% used | 62% left | reset 07-12 06:30          ││█████████42% used | 58% left | reset 07-16 04:30          │
 04|│██████████████████████                                    ││████! RESET CREDIT EXPIRES 2026-07-14 04:30:00 +00:00     │
 05|└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
-06|┌ 5h tasks ↵[O][R][E][A][D][S][C] Filter: ───────────────────┐┌Turns · 5h cycle   Filter: ─────────────────────────────┐
+06|┌5h tasks ↵[F2][O][R][E][A][D][S][C] Filter: ────────────────┐┌Turns · 5h cycle [F2] Filter: ──────────────────────────┐
 07|│ TOKENS     EST.Q5H  API EQ. TASK                           ││ EFFORT/MODEL      MESSAGE     TOKENS    EST.Q   API EQ.│
 08|│▌D 10.0K    ~25.0%   $0.0000 codex-usage-monit | desktop | 2││▏high/gpt-5.3-code Add determi D 0       -       $0.0000│
 09|│ W 5.0K     ~12.5%   $0.0000 codex-usage-monit | subagent | ││ medium/gpt-… FAST Inspect the D 0       -       $0.0000│
@@ -99,30 +99,33 @@ styles:
 04:119+001 fg=#4b525c bg=#121417 mods=none text="│"
 05:000+120 fg=#4b525c bg=#121417 mods=none text="└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘"
 06:000+001 fg=#3fb9c0 bg=#121417 mods=none text="┌"
-06:001+009 fg=#f4f6f8 bg=#121417 mods=bold text=" 5h tasks"
-06:011+001 fg=#3fb9c0 bg=#20242a mods=bold text="↵"
-06:012+001 fg=#7e8691 bg=#121417 mods=none text="["
-06:013+001 fg=#3fb9c0 bg=#121417 mods=bold text="O"
+06:001+008 fg=#f4f6f8 bg=#121417 mods=bold text="5h tasks"
+06:010+001 fg=#3fb9c0 bg=#20242a mods=bold text="↵"
+06:011+001 fg=#7e8691 bg=#121417 mods=none text="["
+06:012+002 fg=#3fb9c0 bg=#121417 mods=bold text="F2"
 06:014+002 fg=#7e8691 bg=#121417 mods=none text="]["
-06:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="R"
-06:017+004 fg=#7e8691 bg=#121417 mods=none text="][E]"
-06:021+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-06:022+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="A"
-06:023+001 fg=#121417 bg=#3fb9c0 mods=bold text="]"
-06:024+001 fg=#7e8691 bg=#121417 mods=none text="["
-06:025+001 fg=#3fb9c0 bg=#121417 mods=bold text="D"
-06:026+002 fg=#7e8691 bg=#121417 mods=none text="]["
-06:028+001 fg=#3fb9c0 bg=#121417 mods=bold text="S"
+06:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="O"
+06:017+002 fg=#7e8691 bg=#121417 mods=none text="]["
+06:019+001 fg=#3fb9c0 bg=#121417 mods=bold text="R"
+06:020+004 fg=#7e8691 bg=#121417 mods=none text="][E]"
+06:024+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+06:025+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="A"
+06:026+001 fg=#121417 bg=#3fb9c0 mods=bold text="]"
+06:027+001 fg=#7e8691 bg=#121417 mods=none text="["
+06:028+001 fg=#3fb9c0 bg=#121417 mods=bold text="D"
 06:029+002 fg=#7e8691 bg=#121417 mods=none text="]["
-06:031+001 fg=#3fb9c0 bg=#121417 mods=bold text="C"
-06:032+001 fg=#7e8691 bg=#121417 mods=none text="]"
-06:034+001 fg=#3fb9c0 bg=#121417 mods=bold text="F"
-06:035+006 fg=#7e8691 bg=#121417 mods=none text="ilter:"
-06:041+021 fg=#3fb9c0 bg=#121417 mods=none text=" ───────────────────┐"
+06:031+001 fg=#3fb9c0 bg=#121417 mods=bold text="S"
+06:032+002 fg=#7e8691 bg=#121417 mods=none text="]["
+06:034+001 fg=#3fb9c0 bg=#121417 mods=bold text="C"
+06:035+001 fg=#7e8691 bg=#121417 mods=none text="]"
+06:037+001 fg=#3fb9c0 bg=#121417 mods=bold text="F"
+06:038+006 fg=#7e8691 bg=#121417 mods=none text="ilter:"
+06:044+018 fg=#3fb9c0 bg=#121417 mods=none text=" ────────────────┐"
 06:062+001 fg=#4b525c bg=#121417 mods=none text="┌"
 06:063+016 fg=#f4f6f8 bg=#121417 mods=bold text="Turns · 5h cycle"
-06:082+007 fg=#7e8691 bg=#121417 mods=none text="Filter:"
-06:089+031 fg=#4b525c bg=#121417 mods=none text=" ─────────────────────────────┐"
+06:079+005 fg=#7e8691 bg=#121417 mods=none text=" [F2]"
+06:085+007 fg=#7e8691 bg=#121417 mods=none text="Filter:"
+06:092+028 fg=#4b525c bg=#121417 mods=none text=" ──────────────────────────┐"
 07:000+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
 07:001+060 fg=#3fb9c0 bg=#121417 mods=bold text=" TOKENS     EST.Q5H  API EQ. TASK                           "
 07:061+001 fg=#3fb9c0 bg=#121417 mods=none text="│"
@@ -275,14 +278,14 @@ ToggleTurns binding=V rect=69,0,8,1
 ToggleModels binding=M rect=78,0,9,1
 ScopeFiveHours binding=5 rect=88,0,4,1
 ScopeWeek binding=W rect=93,0,6,1
-SourceAll binding=A rect=21,6,3,1
-SourceDesktop binding=D rect=24,6,3,1
-SourceSubagent binding=S rect=27,6,3,1
-SourceCli binding=C rect=30,6,3,1
-TaskSearch binding=F rect=34,6,27,1
-EnterTurns binding=↵ rect=11,6,1,1
-OpenTerminal binding=O rect=12,6,3,1
-ToggleTree binding=R rect=15,6,3,1
-CollapseAll binding=E rect=18,6,3,1
-BackTasks binding=← rect=80,6,1,1
-TurnSearch binding=F rect=82,6,37,1
+SourceAll binding=A rect=24,6,3,1
+SourceDesktop binding=D rect=27,6,3,1
+SourceSubagent binding=S rect=30,6,3,1
+SourceCli binding=C rect=33,6,3,1
+TaskSearch binding=F rect=37,6,24,1
+EnterTurns binding=↵ rect=10,6,1,1
+OpenTerminal binding=O rect=15,6,3,1
+ToggleTree binding=R rect=18,6,3,1
+CollapseAll binding=E rect=21,6,3,1
+BackTasks binding=← rect=79,6,1,1
+TurnSearch binding=F rect=85,6,34,1

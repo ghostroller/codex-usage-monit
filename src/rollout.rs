@@ -983,6 +983,128 @@ pub fn scan_rollouts(config: &CollectConfig, now: DateTime<Utc>) -> Result<Rollo
     RolloutCache::default().scan(config, now)
 }
 
+/// Reuse the collector's counter, fork, request and replay rules for an
+/// on-demand detail projection. This never writes the rollout/history cache.
+pub(crate) fn load_detail_usage(
+    paths: &[PathBuf],
+    codex_home: &Path,
+    thread_id: &str,
+    as_of: DateTime<Utc>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> RolloutDataset {
+    use std::sync::atomic::Ordering;
+
+    struct CancellableRead<'a, R> {
+        reader: R,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl<R: Read> Read for CancellableRead<'_, R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("detail loading cancelled"));
+            }
+            self.reader.read(buffer)
+        }
+    }
+
+    let config = CollectConfig {
+        codex_home: codex_home.to_owned(),
+        redact_content: true,
+        offline: true,
+        ..CollectConfig::default()
+    };
+    let mut discovery = RolloutDataset::default();
+    let mut files = Vec::new();
+    let mut cache = HashMap::new();
+    let mut budget = 32 * 1024 * 1024u64;
+    let mut seen = HashSet::new();
+    for path in paths.iter().take(8) {
+        if cancel.load(Ordering::Relaxed) || budget == 0 {
+            break;
+        }
+        if !seen.insert(path) {
+            continue;
+        }
+        let opened = (|| -> std::io::Result<_> {
+            let handle = open_rollout_source_for_validation(path)?;
+            let metadata = handle.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::other("rollout is not a regular file"));
+            }
+            let fingerprint = FileFingerprint::from_path_and_metadata(path, &metadata)?;
+            Ok((
+                handle,
+                RolloutFile {
+                    path: path.clone(),
+                    modified_at: DateTime::<Utc>::from(metadata.modified()?),
+                    fingerprint,
+                },
+            ))
+        })();
+        let (handle, file) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                discovery.stats.unreadable_files += 1;
+                discovery.warnings.push(format!(
+                    "detail usage could not open {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let limit = file.fingerprint.len.min(8 * 1024 * 1024).min(budget);
+        budget -= limit;
+        let reader = CancellableRead {
+            reader: handle.take(limit),
+            cancel,
+        };
+        let mut parsed = parse_rollout_reader_with_limit(
+            &file,
+            &config,
+            ParsedFile {
+                replay_timestamps_complete: true,
+                ..ParsedFile::default()
+            },
+            BufReader::new(reader),
+            2 * 1024 * 1024,
+        );
+        if file.fingerprint.len > limit {
+            parsed.complete = false;
+            discovery.stats.truncated_files += 1;
+            discovery.warnings.push(
+                "Detail usage reached its read limit; model/hourly totals are partial.".to_owned(),
+            );
+        }
+        if parsed.owner_thread_id.as_deref() != Some(thread_id) {
+            continue;
+        }
+        cache.insert(
+            path.clone(),
+            CachedFile {
+                fingerprint: file.fingerprint.clone(),
+                parsed: Arc::new(parsed),
+            },
+        );
+        files.push(file);
+    }
+    if paths.len() > 8 || budget == 0 {
+        discovery
+            .warnings
+            .push("Detail usage reached its file/byte budget; totals may omit records.".to_owned());
+    }
+    sort_rollout_files_for_replay_as_of(&mut files, &cache, Some(as_of));
+    let plan = build_replay_plan(
+        &files,
+        &cache,
+        None,
+        &mut HashMap::new(),
+        &config,
+        Some(as_of),
+    );
+    let reduced = reduce_cached_files_as_of(&files, &cache, &config, &plan, as_of);
+    materialize_dataset(&reduced, discovery, 0, &config, as_of, &HashMap::new())
+}
+
 impl RolloutCache {
     pub fn new() -> Self {
         Self::default()
@@ -2698,7 +2820,7 @@ fn sha256_file_prefix(
     Ok(hasher.finalize().into())
 }
 
-fn open_rollout_source_for_validation(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_rollout_source_for_validation(path: &Path) -> std::io::Result<File> {
     let path_metadata = fs::symlink_metadata(path)?;
     if path_metadata.file_type().is_symlink() || !path_metadata.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -5758,7 +5880,7 @@ fn last_token_usage(payload: &Map<String, Value>) -> Option<TokenUsage> {
         .and_then(parse_token_usage)
 }
 
-fn starts_owning_segment(
+pub(crate) fn starts_owning_segment(
     record_type: Option<&str>,
     payload: Option<&Map<String, Value>>,
     owning_thread_id: &str,

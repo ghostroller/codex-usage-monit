@@ -66,10 +66,12 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod entity_detail;
 mod geometry;
 mod stacked_area;
 mod text;
 
+use entity_detail::{EntityDetailHitbox, EntityDetailPopup, render_entity_detail};
 use geometry::{reveal_offset, scale_rounded, scroll_offset, scrollbar_geometry};
 use stacked_area::{StackedArea, StackedAreaSeries, StackedAreaState, date_index_at_column};
 use text::{
@@ -2335,6 +2337,7 @@ struct TaskControlsHitbox {
     clear_search: Rect,
     enter_turns: Rect,
     open_terminal: Rect,
+    details: Rect,
     toggle_tree: Rect,
     collapse_all: Rect,
 }
@@ -2393,6 +2396,7 @@ impl SummaryDailyHitbox {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TurnControlsHitbox {
     back_tasks: Rect,
+    details: Rect,
     search: Rect,
     clear_search: Rect,
 }
@@ -2405,6 +2409,7 @@ struct ViewTabsHitbox {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SummaryControlsHitbox {
+    details: Rect,
     ranges: [Rect; 3],
     metrics: [Rect; 3],
     bucket_grain: Rect,
@@ -3203,6 +3208,7 @@ enum ScrollTarget {
     ProjectMappings,
     Diagnostics,
     VersionInfo,
+    EntityDetail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3393,6 +3399,8 @@ struct App {
     zellij_environment: bool,
     resume_confirmation: Option<ResumeConfirmation>,
     resume_confirmation_hitbox: Option<ResumeConfirmationHitbox>,
+    entity_detail: Option<EntityDetailPopup>,
+    entity_detail_hitbox: Option<EntityDetailHitbox>,
     pending_clipboard: Option<ClipboardRequest>,
     pending_resume: Option<ResumeLaunchRequest>,
     launching_threads: HashSet<String>,
@@ -3553,6 +3561,8 @@ impl App {
             zellij_environment: std::env::var_os("ZELLIJ").is_some(),
             resume_confirmation: None,
             resume_confirmation_hitbox: None,
+            entity_detail: None,
+            entity_detail_hitbox: None,
             pending_clipboard: None,
             pending_resume: None,
             launching_threads: HashSet::new(),
@@ -4419,6 +4429,7 @@ impl App {
 
     fn shortcuts_active(&self) -> bool {
         !self.focus.is_search()
+            && self.entity_detail.is_none()
             && !self.version_info_visible
             && !self.quit_confirmation_visible
             && self.resume_confirmation.is_none()
@@ -6803,6 +6814,11 @@ impl App {
         let Some(hitbox) = self.task_controls_hitbox else {
             return false;
         };
+        if rect_contains(hitbox.details, column, row) {
+            self.accept_active_search();
+            self.focus = Focus::Tasks;
+            return self.open_entity_detail();
+        }
         if rect_contains(hitbox.enter_turns, column, row)
             && self.focus == Focus::Tasks
             && self.selected_task_raw_turn_count() > 0
@@ -6850,6 +6866,11 @@ impl App {
         let Some(hitbox) = self.turn_controls_hitbox else {
             return false;
         };
+        if rect_contains(hitbox.details, column, row) {
+            self.accept_active_search();
+            self.focus = Focus::Turns;
+            return self.open_entity_detail();
+        }
         if rect_contains(hitbox.back_tasks, column, row) && self.focus == Focus::Turns {
             self.focus_tasks();
             return true;
@@ -7259,6 +7280,9 @@ impl App {
         let Some(hitbox) = self.summary_controls_hitbox else {
             return false;
         };
+        if rect_contains(hitbox.details, column, row) {
+            return self.open_entity_detail();
+        }
         if let Some(range) = SummaryRange::ALL
             .into_iter()
             .find(|range| rect_contains(hitbox.ranges[range.index()], column, row))
@@ -7758,6 +7782,9 @@ impl App {
             ScrollTarget::VersionInfo => {
                 self.version_info_hitbox.and_then(|hitbox| hitbox.scrollbar)
             }
+            ScrollTarget::EntityDetail => self
+                .entity_detail_hitbox
+                .and_then(|hitbox| hitbox.scrollbar),
             ScrollTarget::ProjectMappings => self
                 .settings_controls_hitbox
                 .as_ref()
@@ -7767,6 +7794,7 @@ impl App {
 
     fn begin_scrollbar_drag_at(&mut self, column: u16, row: u16) -> bool {
         let Some((target, hitbox)) = [
+            ScrollTarget::EntityDetail,
             ScrollTarget::VersionInfo,
             ScrollTarget::Diagnostics,
             ScrollTarget::ProjectMappings,
@@ -7789,7 +7817,8 @@ impl App {
             ScrollTarget::Summary
             | ScrollTarget::ProjectMappings
             | ScrollTarget::Diagnostics
-            | ScrollTarget::VersionInfo => {}
+            | ScrollTarget::VersionInfo
+            | ScrollTarget::EntityDetail => {}
         }
         let on_thumb = rect_contains(hitbox.thumb, column, row);
         self.scroll_drag = Some(ScrollDrag {
@@ -7840,6 +7869,11 @@ impl App {
             ScrollTarget::Summary => self.summary_offset = offset,
             ScrollTarget::Diagnostics => self.diagnostics_offset = offset,
             ScrollTarget::VersionInfo => self.version_info_offset = offset,
+            ScrollTarget::EntityDetail => {
+                if let Some(popup) = self.entity_detail.as_mut() {
+                    popup.offset = offset;
+                }
+            }
             ScrollTarget::ProjectMappings => {
                 self.project_mapping_reveal_pending = false;
                 self.project_mapping_offset = offset;
@@ -7969,6 +8003,48 @@ fn collect_task_descendants(index: usize, children: &[Vec<usize>], descendants: 
 }
 
 fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
+    if app.entity_detail.is_some() {
+        if let Some(hitbox) = app.entity_detail_hitbox {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.scroll_drag = None;
+                    if rect_contains(hitbox.back, event.column, event.row) {
+                        app.close_entity_detail();
+                    } else if rect_contains(hitbox.up, event.column, event.row) {
+                        app.scroll_entity_detail(false, 1);
+                    } else if rect_contains(hitbox.down, event.column, event.row) {
+                        app.scroll_entity_detail(true, 1);
+                    } else if hitbox
+                        .scrollbar
+                        .is_some_and(|bar| rect_contains(bar.track, event.column, event.row))
+                    {
+                        app.begin_scrollbar_drag_at(event.column, event.row);
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left)
+                    if app
+                        .scroll_drag
+                        .is_some_and(|drag| drag.target == ScrollTarget::EntityDetail) =>
+                {
+                    app.drag_scrollbar_to(event.row);
+                }
+                MouseEventKind::Up(MouseButton::Left) => app.scroll_drag = None,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if rect_contains(hitbox.content, event.column, event.row)
+                        || hitbox.scrollbar.is_some_and(|bar| {
+                            rect_contains(bar.track, event.column, event.row)
+                        }) =>
+                {
+                    app.scroll_entity_detail(
+                        event.kind == MouseEventKind::ScrollDown,
+                        MOUSE_SCROLL_LINES,
+                    );
+                }
+                _ => {}
+            }
+        }
+        return true;
+    }
     if app.remote_update_dialog.is_some() {
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some(hitbox) = app.remote_update_hitbox
@@ -8346,6 +8422,27 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    if app.entity_detail.is_some() {
+        let page = app
+            .entity_detail_hitbox
+            .map_or(1, |hitbox| usize::from(hitbox.content.height).max(1));
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => app.close_entity_detail(),
+            KeyCode::Up => app.scroll_entity_detail(false, 1),
+            KeyCode::Down => app.scroll_entity_detail(true, 1),
+            KeyCode::PageUp => app.scroll_entity_detail(false, page),
+            KeyCode::PageDown => app.scroll_entity_detail(true, page),
+            KeyCode::Home => {
+                if let Some(popup) = app.entity_detail.as_mut() {
+                    popup.offset = 0;
+                }
+            }
+            KeyCode::End => app.scroll_entity_detail(true, usize::MAX),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.remote_update_dialog.is_some() {
         let controls = app.remote_update_hitbox.unwrap_or_default();
         match key.code {
@@ -8577,6 +8674,14 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('q') => return true,
+        KeyCode::F(2)
+            if app.entity_detail_available()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.open_entity_detail();
+        }
         KeyCode::Esc => app.open_quit_confirmation(),
         KeyCode::Tab | KeyCode::Right => app.set_view(app.view.next()),
         KeyCode::BackTab | KeyCode::Left => app.set_view(app.view.previous()),
@@ -10085,6 +10190,9 @@ fn run_loop(
         if app.poll_startup_progress(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::PROGRESS);
         }
+        if app.poll_entity_detail() {
+            redraw_reasons.insert(RedrawReasons::SNAPSHOT);
+        }
         if app.retry_remote_config_if_due(Instant::now()) {
             redraw_reasons.insert(RedrawReasons::SNAPSHOT);
         }
@@ -10797,7 +10905,10 @@ fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: 
     if account_refresh_enabled && !app.worker_running && refresh_retry_wait.is_none() {
         timeout = timeout.min(app.next_account_refresh.saturating_duration_since(now));
     }
-    if !app.launching_threads.is_empty() || app.remote_action_running.is_some() {
+    if !app.launching_threads.is_empty()
+        || app.remote_action_running.is_some()
+        || app.entity_detail_loading()
+    {
         timeout = timeout.min(BACKGROUND_CHANNEL_POLL);
     }
     if let Some(retry_at) = app.remote_config_retry_not_before {
@@ -11911,6 +12022,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.quit_confirmation_hitbox = None;
     app.version_info_hitbox = None;
     app.resume_confirmation_hitbox = None;
+    app.entity_detail_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
     let initial_tab_area = Rect::new(area.x, area.y, area.width, u16::from(area.height > 0));
@@ -12008,7 +12120,9 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     }) {
         app.trend_drag = None;
     }
-    if app.remote_editor.is_some() {
+    if app.entity_detail.is_some() {
+        app.entity_detail_hitbox = Some(render_entity_detail(frame, area, app));
+    } else if app.remote_editor.is_some() {
         app.remote_editor_hitbox = Some(render_remote_editor(frame, area, app));
     } else if app.remote_update_dialog.is_some() {
         app.remote_update_hitbox = Some(render_remote_update_dialog(frame, area, app));
@@ -15128,22 +15242,35 @@ fn render_summary_controls(
     can_toggle_all_projects: bool,
     can_inspect: bool,
 ) -> SummaryControlsHitbox {
-    const FULL_CONTROLS_WIDTH: u16 = 118;
+    const FULL_CONTROLS_WIDTH: u16 = 130;
     let mut hitbox = SummaryControlsHitbox::default();
     if area.is_empty() {
         return hitbox;
     }
     let compact = area.width < FULL_CONTROLS_WIDTH;
-    let roomy_compact = compact && area.width >= 49;
+    let roomy_compact = compact && area.width >= 60;
     let mut spans = Vec::new();
     let mut x = area.x;
-    for (position, range) in SummaryRange::ALL.into_iter().enumerate() {
+    hitbox.details = append_summary_control(
+        &mut spans,
+        area,
+        &mut x,
+        SummaryControlSpec {
+            leading: "",
+            shortcut: "F2".to_string(),
+            suffix: if compact { "" } else { "Details" },
+            selected: false,
+            shortcuts_active: app.shortcuts_active() && app.entity_detail_available(),
+            theme: app.theme,
+        },
+    );
+    for range in SummaryRange::ALL {
         hitbox.ranges[range.index()] = append_summary_control(
             &mut spans,
             area,
             &mut x,
             SummaryControlSpec {
-                leading: if position == 0 || compact { "" } else { " " },
+                leading: if compact { "" } else { " " },
                 shortcut: range.shortcut().to_string(),
                 suffix: if compact { "" } else { range.label() },
                 selected: app.summary_range == range,
@@ -16703,6 +16830,8 @@ fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
         app.summary_inspected_date = None;
         app.summary_daily_dragging = false;
     }
+    // Controls resolve the selected entity through the prepared history cache.
+    app.summary_cache = Some(cache);
     app.summary_controls_hitbox = Some(render_summary_controls(
         frame,
         controls_and_body[0],
@@ -16713,7 +16842,6 @@ fn render_summary_at(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
         can_inspect,
     ));
     app.summary_project_colors = project_colors;
-    app.summary_cache = Some(cache);
 }
 
 fn render_trend_controls(
@@ -19741,6 +19869,8 @@ fn task_panel_block(
     let full_controls_width = UnicodeWidthStr::width(format!(" {title}").as_str())
         + 2
         + 1
+        + UnicodeWidthStr::width("[F2]Details")
+        + 1
         + UnicodeWidthStr::width("[O]Open")
         + 1
         + UnicodeWidthStr::width("[R]Tree")
@@ -19755,8 +19885,13 @@ fn task_panel_block(
         + UnicodeWidthStr::width(CLEAR_FILTER_LABEL)
         + usize::from(FILTER_CLEAR_GAP_WIDTH + FILTER_MIN_QUERY_WIDTH);
     let compact = usize::from(area.width.saturating_sub(2)) < full_controls_width;
+    let title_label = if compact {
+        title.to_owned()
+    } else {
+        format!(" {title}")
+    };
     let mut spans = vec![Span::styled(
-        format!(" {title}"),
+        title_label.clone(),
         Style::default()
             .fg(palette.title)
             .add_modifier(Modifier::BOLD),
@@ -19770,7 +19905,7 @@ fn task_panel_block(
             .is_some_and(|task| app.task_matches_filter(task))
         && app.selected_task_raw_turn_count() > 0;
     let mut title_x = area.x.saturating_add(1).saturating_add(
-        u16::try_from(UnicodeWidthStr::width(format!(" {title}").as_str())).unwrap_or(u16::MAX),
+        u16::try_from(UnicodeWidthStr::width(title_label.as_str())).unwrap_or(u16::MAX),
     );
     spans.push(Span::raw(" "));
     title_x = title_x.saturating_add(1);
@@ -19792,6 +19927,15 @@ fn task_panel_block(
     ));
     title_x = title_x.saturating_add(1);
 
+    let details = append_entity_detail_control(
+        area,
+        &mut title_x,
+        &mut spans,
+        app.theme,
+        app.focus == Focus::Tasks && app.shortcuts_active() && app.entity_detail_available(),
+        compact,
+    );
+
     if !compact {
         spans.push(Span::raw(" "));
         title_x = title_x.saturating_add(1);
@@ -19807,13 +19951,15 @@ fn task_panel_block(
     } else {
         open_style
     };
-    spans.push(Span::styled("[", open_style));
-    spans.push(Span::styled("O", open_shortcut_style));
-    spans.push(Span::styled(
-        if compact { "]" } else { "]Open" },
-        open_style,
-    ));
-    title_x = title_x.saturating_add(open_width);
+    if !open_terminal.is_empty() {
+        spans.push(Span::styled("[", open_style));
+        spans.push(Span::styled("O", open_shortcut_style));
+        spans.push(Span::styled(
+            if compact { "]" } else { "]Open" },
+            open_style,
+        ));
+        title_x = title_x.saturating_add(open_width);
+    }
 
     if !compact {
         spans.push(Span::raw(" "));
@@ -19840,13 +19986,15 @@ fn task_panel_block(
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD)
     };
-    spans.push(Span::styled("[", tree_style));
-    spans.push(Span::styled("R", tree_shortcut_style));
-    spans.push(Span::styled(
-        if compact { "]" } else { "]Tree" },
-        tree_style,
-    ));
-    title_x = title_x.saturating_add(tree_width);
+    if !toggle_tree.is_empty() {
+        spans.push(Span::styled("[", tree_style));
+        spans.push(Span::styled("R", tree_shortcut_style));
+        spans.push(Span::styled(
+            if compact { "]" } else { "]Tree" },
+            tree_style,
+        ));
+        title_x = title_x.saturating_add(tree_width);
+    }
 
     if !compact {
         spans.push(Span::raw(" "));
@@ -19868,19 +20016,21 @@ fn task_panel_block(
     } else {
         collapse_style
     };
-    spans.push(Span::styled("[", collapse_style));
-    spans.push(Span::styled("E", collapse_shortcut_style));
-    spans.push(Span::styled(
-        if compact {
-            "]"
-        } else if expand_all {
-            "]Expand  "
-        } else {
-            "]Collapse"
-        },
-        collapse_style,
-    ));
-    title_x = title_x.saturating_add(collapse_width);
+    if !collapse_all.is_empty() {
+        spans.push(Span::styled("[", collapse_style));
+        spans.push(Span::styled("E", collapse_shortcut_style));
+        spans.push(Span::styled(
+            if compact {
+                "]"
+            } else if expand_all {
+                "]Expand  "
+            } else {
+                "]Collapse"
+            },
+            collapse_style,
+        ));
+        title_x = title_x.saturating_add(collapse_width);
+    }
 
     let mut source_hitboxes = [Rect::default(); 4];
     let shortcuts_active = app.shortcuts_active();
@@ -19892,6 +20042,9 @@ fn task_panel_block(
         let label = filter.label(compact);
         let label_width = u16::try_from(UnicodeWidthStr::width(label) + 2).unwrap_or(u16::MAX);
         source_hitboxes[filter.index()] = title_hitbox(area, title_x, label_width);
+        if source_hitboxes[filter.index()].is_empty() {
+            break;
+        }
         let selected = app.task_source_filter == filter;
         let style = if selected {
             Style::default()
@@ -19923,7 +20076,8 @@ fn task_panel_block(
 
     spans.push(Span::raw(" "));
     title_x = title_x.saturating_add(1);
-    let search_start = title_x;
+    let search_start = title_x.min(inner_right);
+    let search_visible = inner_right.saturating_sub(search_start) >= "Filter:".len() as u16;
     let query_start = search_start.saturating_add("Filter:".len() as u16);
     let clear_width = u16::try_from(CLEAR_FILTER_LABEL.len()).unwrap_or(u16::MAX);
     let clear_reserve = clear_width
@@ -19953,17 +20107,19 @@ fn task_panel_block(
     } else {
         Style::default().fg(palette.muted)
     };
-    spans.push(Span::styled(
-        "F",
-        if app.focus == Focus::Tasks && app.shortcuts_active() {
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            search_style
-        },
-    ));
-    spans.push(Span::styled("ilter:", search_style));
+    if search_visible {
+        spans.push(Span::styled(
+            "F",
+            if app.focus == Focus::Tasks && app.shortcuts_active() {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                search_style
+            },
+        ));
+        spans.push(Span::styled("ilter:", search_style));
+    }
     let query_right = if clear_search.is_empty() {
         search_right
     } else {
@@ -20068,15 +20224,20 @@ fn task_panel_block(
     let search_x = search_start.min(search_right);
     let controls = TaskControlsHitbox {
         sources: source_hitboxes,
-        search: Rect::new(
-            search_x,
-            area.y,
-            search_right.saturating_sub(search_x),
-            u16::from(area.height > 0),
-        ),
+        search: if search_visible {
+            Rect::new(
+                search_x,
+                area.y,
+                search_right.saturating_sub(search_x),
+                u16::from(area.height > 0),
+            )
+        } else {
+            Rect::default()
+        },
         clear_search,
         enter_turns,
         open_terminal,
+        details,
         toggle_tree,
         collapse_all,
     };
@@ -20096,9 +20257,43 @@ fn title_hitbox(area: Rect, x: u16, width: u16) -> Rect {
     }
 }
 
+fn append_entity_detail_control(
+    area: Rect,
+    x: &mut u16,
+    spans: &mut Vec<Span<'static>>,
+    theme: Theme,
+    active: bool,
+    compact: bool,
+) -> Rect {
+    let suffix = if compact { "]" } else { "]Details" };
+    let width = u16::try_from(UnicodeWidthStr::width(suffix) + 3).unwrap_or(u16::MAX);
+    let gap = u16::from(!compact);
+    let hitbox = title_hitbox(area, x.saturating_add(gap), width);
+    if hitbox.is_empty() {
+        return hitbox;
+    }
+    if gap > 0 {
+        spans.push(Span::raw(" "));
+    }
+    let body = Style::default().fg(theme.palette().muted);
+    let shortcut = if active {
+        body.fg(theme.palette().accent).add_modifier(Modifier::BOLD)
+    } else {
+        body
+    };
+    spans.extend([
+        Span::styled("[", body),
+        Span::styled("F2", shortcut),
+        Span::styled(suffix, body),
+    ]);
+    *x = hitbox.right();
+    hitbox
+}
+
 fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, TurnControlsHitbox) {
     let palette = app.theme.palette();
     let inner_right = area.right().saturating_sub(1);
+    let compact = area.width < 60;
     let mut spans = vec![Span::styled(
         title.to_string(),
         Style::default()
@@ -20109,8 +20304,10 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         .x
         .saturating_add(1)
         .saturating_add(u16::try_from(UnicodeWidthStr::width(title)).unwrap_or(u16::MAX));
-    spans.push(Span::raw(" "));
-    x = x.saturating_add(1);
+    if !compact {
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
     let back_available = app.focus == Focus::Turns && app.shortcuts_active();
     let back_tasks = title_hitbox(area, x, 1);
     spans.push(Span::styled(
@@ -20125,10 +20322,26 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         },
     ));
     x = x.saturating_add(1);
-    spans.push(Span::raw(" "));
-    x = x.saturating_add(1);
+    if !compact {
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
 
-    let search_start = x;
+    let details = append_entity_detail_control(
+        area,
+        &mut x,
+        &mut spans,
+        app.theme,
+        app.focus == Focus::Turns && app.shortcuts_active() && app.entity_detail_available(),
+        compact,
+    );
+    if !details.is_empty() {
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
+
+    let search_start = x.min(inner_right);
+    let search_visible = inner_right.saturating_sub(search_start) >= "Filter:".len() as u16;
     let query_start = search_start.saturating_add("Filter:".len() as u16);
     let clear_width = u16::try_from(CLEAR_FILTER_LABEL.len()).unwrap_or(u16::MAX);
     let clear_reserve = clear_width
@@ -20158,17 +20371,19 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
     } else {
         Style::default().fg(palette.muted)
     };
-    spans.push(Span::styled(
-        "F",
-        if app.focus == Focus::Turns && app.shortcuts_active() {
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            search_style
-        },
-    ));
-    spans.push(Span::styled("ilter:", search_style));
+    if search_visible {
+        spans.push(Span::styled(
+            "F",
+            if app.focus == Focus::Turns && app.shortcuts_active() {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                search_style
+            },
+        ));
+        spans.push(Span::styled("ilter:", search_style));
+    }
     let query_right = if clear_search.is_empty() {
         search_right
     } else {
@@ -20225,12 +20440,17 @@ fn turn_panel_block(area: Rect, app: &App, title: &str) -> (Block<'static>, Turn
         block,
         TurnControlsHitbox {
             back_tasks,
-            search: Rect::new(
-                search_start.min(search_right),
-                area.y,
-                search_right.saturating_sub(search_start.min(search_right)),
-                u16::from(area.height > 0),
-            ),
+            details,
+            search: if search_visible {
+                Rect::new(
+                    search_start.min(search_right),
+                    area.y,
+                    search_right.saturating_sub(search_start.min(search_right)),
+                    u16::from(area.height > 0),
+                )
+            } else {
+                Rect::default()
+            },
             clear_search,
         },
     )

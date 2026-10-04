@@ -5,7 +5,7 @@ expression: many_projects.frame().snapshot_text()
 size=120x40
 rows:
 00| 1 Overview  |  2 Trends  |  U Summary  |  3 Other  |  4 Settings  | [S]Source
-01|[C]Cycle [7]7d [M]30d | [K]Tokens [E]~EST CR. [A]API EQ. | [B] 1d [I]Inspect | [G]All [L]Longx | [↵]Toggle [X]Collapse
+01|[F2][C][7][M] [K][E][A] [B] 1d [I]Inspect [G]All [L] [↵] [X]
 02|┌Usage tree · source All · Cycle · known 360.0K · PARTIAL──┐┌Top projects · Tokens · share of known────────────────────┐
 03|│ Tokens         KNOWN%   TYPE · PROJECT / SESSION / TURN  ││■ project-7                       80.0K  22.2% ██·········│
 04|│▌80.0K          22.2%    [+] PROJ ■ project-7             ││■ project-6                       70.0K  19.4% ██·········│
@@ -58,32 +58,33 @@ styles:
 00:056+014 fg=#7e8691 bg=#121417 mods=none text=" Settings  | ["
 00:070+001 fg=#3fb9c0 bg=#121417 mods=bold text="S"
 00:071+049 fg=#7e8691 bg=#121417 mods=none text="]Source                                          "
-01:000+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-01:001+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="C"
-01:002+006 fg=#121417 bg=#3fb9c0 mods=bold text="]Cycle"
-01:008+002 fg=#7e8691 bg=#121417 mods=none text=" ["
-01:010+001 fg=#3fb9c0 bg=#121417 mods=bold text="7"
-01:011+005 fg=#7e8691 bg=#121417 mods=none text="]7d ["
-01:016+001 fg=#3fb9c0 bg=#121417 mods=bold text="M"
-01:017+007 fg=#7e8691 bg=#121417 mods=none text="]30d | "
-01:024+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
-01:025+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="K"
-01:026+007 fg=#121417 bg=#3fb9c0 mods=bold text="]Tokens"
-01:033+002 fg=#7e8691 bg=#121417 mods=none text=" ["
-01:035+001 fg=#3fb9c0 bg=#121417 mods=bold text="E"
-01:036+011 fg=#7e8691 bg=#121417 mods=none text="]~EST CR. ["
-01:047+001 fg=#3fb9c0 bg=#121417 mods=bold text="A"
-01:048+012 fg=#7e8691 bg=#121417 mods=none text="]API EQ. | ["
-01:060+001 fg=#3fb9c0 bg=#121417 mods=bold text="B"
-01:061+006 fg=#7e8691 bg=#121417 mods=none text="] 1d ["
-01:067+001 fg=#3fb9c0 bg=#121417 mods=bold text="I"
-01:068+012 fg=#7e8691 bg=#121417 mods=none text="]Inspect | ["
-01:080+001 fg=#3fb9c0 bg=#121417 mods=bold text="G"
-01:081+006 fg=#7e8691 bg=#121417 mods=none text="]All ["
-01:087+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
-01:088+010 fg=#7e8691 bg=#121417 mods=none text="]Longx | ["
-01:098+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
-01:099+019 fg=#7e8691 bg=#121417 mods=none text="]Toggle [X]Collapse"
+01:000+004 fg=#7e8691 bg=#121417 mods=none text="[F2]"
+01:004+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+01:005+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="C"
+01:006+001 fg=#121417 bg=#3fb9c0 mods=bold text="]"
+01:007+001 fg=#7e8691 bg=#121417 mods=none text="["
+01:008+001 fg=#3fb9c0 bg=#121417 mods=bold text="7"
+01:009+002 fg=#7e8691 bg=#121417 mods=none text="]["
+01:011+001 fg=#3fb9c0 bg=#121417 mods=bold text="M"
+01:012+002 fg=#7e8691 bg=#121417 mods=none text="] "
+01:014+001 fg=#121417 bg=#3fb9c0 mods=bold text="["
+01:015+001 fg=#121417 bg=#3fb9c0 mods=bold+underline text="K"
+01:016+001 fg=#121417 bg=#3fb9c0 mods=bold text="]"
+01:017+001 fg=#7e8691 bg=#121417 mods=none text="["
+01:018+001 fg=#3fb9c0 bg=#121417 mods=bold text="E"
+01:019+002 fg=#7e8691 bg=#121417 mods=none text="]["
+01:021+001 fg=#3fb9c0 bg=#121417 mods=bold text="A"
+01:022+003 fg=#7e8691 bg=#121417 mods=none text="] ["
+01:025+001 fg=#3fb9c0 bg=#121417 mods=bold text="B"
+01:026+006 fg=#7e8691 bg=#121417 mods=none text="] 1d ["
+01:032+001 fg=#3fb9c0 bg=#121417 mods=bold text="I"
+01:033+010 fg=#7e8691 bg=#121417 mods=none text="]Inspect ["
+01:043+001 fg=#3fb9c0 bg=#121417 mods=bold text="G"
+01:044+006 fg=#7e8691 bg=#121417 mods=none text="]All ["
+01:050+001 fg=#3fb9c0 bg=#121417 mods=bold text="L"
+01:051+003 fg=#7e8691 bg=#121417 mods=none text="] ["
+01:054+001 fg=#3fb9c0 bg=#121417 mods=bold text="↵"
+01:055+005 fg=#7e8691 bg=#121417 mods=none text="] [X]"
 02:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 02:001+056 fg=#f4f6f8 bg=#121417 mods=bold text="Usage tree · source All · Cycle · known 360.0K · PARTIAL"
 02:057+004 fg=#4b525c bg=#121417 mods=none text="──┐┌"
@@ -329,15 +330,15 @@ ViewSummary binding=U rect=28,0,11,1
 ViewOther binding=3 rect=42,0,9,1
 ViewSettings binding=4 rect=54,0,12,1
 HistorySource binding=S rect=69,0,9,1
-SummaryRangeCycle binding=C rect=0,1,8,1
-SummaryRangeSevenDays binding=7 rect=9,1,5,1
-SummaryRangeThirtyDays binding=M rect=15,1,6,1
-SummaryMetricTokens binding=K rect=24,1,9,1
-SummaryMetricEstimated binding=E rect=34,1,11,1
-SummaryMetricApiEquivalent binding=A rect=46,1,10,1
-SummaryBucketGrain binding=B rect=59,1,6,1
-SummaryAllProjects binding=G rect=79,1,6,1
-SummaryLongContext binding=L rect=86,1,8,1
-SummaryInspect binding=I rect=66,1,10,1
-SummaryToggle binding=↵ rect=97,1,9,1
-SummaryCollapseAll binding=X rect=107,1,11,1
+SummaryRangeCycle binding=C rect=4,1,3,1
+SummaryRangeSevenDays binding=7 rect=7,1,3,1
+SummaryRangeThirtyDays binding=M rect=10,1,3,1
+SummaryMetricTokens binding=K rect=14,1,3,1
+SummaryMetricEstimated binding=E rect=17,1,3,1
+SummaryMetricApiEquivalent binding=A rect=20,1,3,1
+SummaryBucketGrain binding=B rect=24,1,6,1
+SummaryAllProjects binding=G rect=42,1,6,1
+SummaryLongContext binding=L rect=49,1,3,1
+SummaryInspect binding=I rect=31,1,10,1
+SummaryToggle binding=↵ rect=53,1,3,1
+SummaryCollapseAll binding=X rect=57,1,3,1

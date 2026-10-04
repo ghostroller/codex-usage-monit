@@ -24,6 +24,7 @@ use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
 mod backfill_memory;
+mod entity_detail;
 mod facts_projection;
 mod history_memory;
 mod integration_scenarios;

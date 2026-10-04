@@ -328,12 +328,18 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 
 Models reserves its body for per-model usage and the `TOTAL` row. Click `[I]Details` in its title or press `i` on Overview to jump to **Other → Diagnostics → Models details** for the selected 5-hour or weekly cycle. This scrollable group contains the reset period, quota-estimation method, API pricing coverage/date, and individual partial-data reasons; Overview keeps a compact partial indicator and the table's estimate markers.
 
+Press `F2` or click `[F2]Details` on Tasks, Turns, or a Summary session/turn to open its details. The popup preserves the selected entity and capture time while showing complete IDs and paths, state evidence, token and pricing coverage, cache/reasoning ratios, known durations, and related sessions. Session details distinguish own and delegated usage and rank observed turns. Local rollout evidence loads in the background and adds recorded messages and attachment metadata, tool arguments/results, command outcomes, file changes, compactions, failures, model/hourly usage, exact subagent links, and recorded configuration and Git metadata. Current Git state is labelled separately. Scroll with the keyboard, mouse wheel, or scrollbar, and use `Esc`, `←`, or `[←]Back` to return.
+
+Recorded detail reads are bounded and do not write message content into the history cache. Redact-content mode skips them. Remote rows and ambiguous local associations retain their collected summary without reading another session's logs. Missing fields and truncation are explicit; Summary uses its selected history range. Context capacity is shown only when recorded, and a matched request-input ratio describes that past request rather than live context occupancy. API-equivalent values use the existing pricing rules and remain estimates with explicit coverage.
+
 Press `?` from any main view, or click `[?]Version info` in **Settings**, to view the running application's version, source build ID, target, and bundled release notes for that version. The information is available offline. Use `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End`, or the mouse wheel to scroll, or click and drag the scrollbar on the right; press `Esc` or `←`, or click `[←]Back`, to return to the previous view.
 
 ### Keyboard controls
 
 | Keys | Action |
 | --- | --- |
+| `F2` on Tasks, Turns, or a Summary session/turn | Open the selected entity's scrollable details. |
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` in details | Scroll; `Esc` / `←` returns to the original selection. |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
 | `1`, `2`, `u`, `3`, `4` | Open Overview, Trends, Summary, Other, or Settings. |
 | `?` | Open the current version's information and bundled release notes. |
@@ -361,7 +367,7 @@ Press `?` from any main view, or click `[?]Version info` in **Settings**, to vie
 | `↑` / `↓`, `Enter`, or the highlighted letter on Settings | Select or toggle a display/column preference. |
 | `o` | Open the selected stopped root task in a new Zellij pane, or offer a resume command for other terminals. |
 | `t` | Toggle dark/light theme. |
-| `q` | Quit. `Esc` opens quit confirmation from the main view. |
+| `q` | Quit; in details, close the popup. `Esc` opens quit confirmation from the main view. |
 
 Printable keys are consumed by a focused text field before global shortcuts. Mouse input is also available for controls, Tasks/Turns rows, tabs, and scrollbars. On Trends, click a chart to inspect its nearest recorded point, or hold the left mouse button and drag to scrub across points.
 

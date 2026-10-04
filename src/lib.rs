@@ -58,6 +58,7 @@ mod replica_fact_followup;
 pub mod report_output;
 pub mod rollout;
 pub mod service;
+mod session_details;
 mod session_index;
 mod session_launch;
 pub mod snapshot;
