@@ -1227,7 +1227,7 @@ fn load_v2_history_since_inner(
             .into_iter()
             .filter(|bucket| bucket.ends_at > since)
             .collect(),
-        weekly_local_points,
+        weekly_local_points: weekly_local_points.into(),
         ..HistoryData::default()
     };
     if let Some(marker) = marker {

@@ -619,7 +619,8 @@ mod tests {
                     10.0,
                 ),
                 quota_point(now, WEEKLY_WINDOW_MINUTES, weekly_reset, 25.0),
-            ],
+            ]
+            .into(),
             half_hour_buckets: vec![
                 bucket(bounds[1] - Duration::hours(2), 1_000, 100, Some(0), &[]),
                 bucket(
@@ -630,7 +631,8 @@ mod tests {
                     &["fixture_partial"],
                 ),
                 bucket(bounds[1] - Duration::minutes(15), 3_000, 300, Some(0), &[]),
-            ],
+            ]
+            .into(),
             warnings: vec!["fixture warning".to_string()],
             read_only: true,
             ..HistoryData::default()
@@ -712,12 +714,13 @@ mod tests {
 
         let weekly_reset = now + Duration::days(3);
         let history = HistoryData {
-            quota_points: vec![quota_point(now, WEEKLY_WINDOW_MINUTES, weekly_reset, 50.0)],
+            quota_points: vec![quota_point(now, WEEKLY_WINDOW_MINUTES, weekly_reset, 50.0)].into(),
             half_hour_buckets: vec![
                 bucket(previous_bounds[0], 100, 1, Some(0), &[]),
                 bucket(current_bounds[0], 200, 2, Some(0), &[]),
                 bucket(current_bounds[1], 300, 3, Some(0), &[]),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -748,11 +751,12 @@ mod tests {
         let first = now - Duration::minutes(70);
         let second = now - Duration::minutes(40);
         let history = HistoryData {
-            quota_points: vec![quota_point(now, WEEKLY_WINDOW_MINUTES, reset, 40.0)],
+            quota_points: vec![quota_point(now, WEEKLY_WINDOW_MINUTES, reset, 40.0)].into(),
             half_hour_buckets: vec![
                 bucket(first, 200_000, 100, Some(0), &[]),
                 bucket(second, 300_000, 100, Some(200), &[]),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -804,11 +808,13 @@ mod tests {
                     10.0,
                 ),
                 quota_point(now, WEEKLY_WINDOW_MINUTES, current_reset, 20.0),
-            ],
+            ]
+            .into(),
             half_hour_buckets: vec![
                 bucket(boundary - Duration::hours(1), 100, 100, Some(0), &[]),
                 bucket(boundary + Duration::hours(1), 200, 200, Some(0), &[]),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -896,7 +902,8 @@ mod tests {
             quota_points: vec![
                 quota_point(now - Duration::minutes(1), 300, now, 90.0),
                 quota_point(now, WEEKLY_WINDOW_MINUTES, reset, 25.0),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -946,11 +953,13 @@ mod tests {
                     future_reset,
                     95.0,
                 ),
-            ],
+            ]
+            .into(),
             half_hour_buckets: vec![
                 bucket(now - Duration::minutes(30), 1_000, 100, Some(0), &[]),
                 future_bucket,
-            ],
+            ]
+            .into(),
             weekly_local_points: vec![WeeklyLocalPoint {
                 observed_at: now + Duration::hours(2),
                 resets_at: future_reset,
@@ -964,7 +973,8 @@ mod tests {
                 estimator_revision: HISTORY_ESTIMATOR_REVISION,
                 call_count: 1,
                 partial_reasons: Vec::new(),
-            }],
+            }]
+            .into(),
             ..HistoryData::default()
         };
 

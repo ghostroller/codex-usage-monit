@@ -1873,7 +1873,7 @@ mod tests {
             starts_at += Duration::minutes(LOCAL_BUCKET_MINUTES);
         }
         let complete = HistoryData {
-            half_hour_buckets: buckets,
+            half_hour_buckets: buckets.into(),
             ..HistoryData::default()
         };
         assert!(summary_history_coverage_complete(&complete, now));
@@ -1981,7 +1981,8 @@ mod tests {
                     project_group("root", "root", "turn-1", 50, 100, Some(25)),
                     project_group("child", "root", "turn-1", 100, 200, Some(75)),
                 ],
-            )],
+            )]
+            .into(),
             ..HistoryData::default()
         };
         let query = SummaryReportQuery::new(
@@ -2023,7 +2024,7 @@ mod tests {
             .collect::<Vec<_>>();
         buckets.push(bucket(at(30, 9, 0), 0, Vec::new()));
         let history = HistoryData {
-            half_hour_buckets: buckets,
+            half_hour_buckets: buckets.into(),
             ..HistoryData::default()
         };
         let prepared = prepare_summary_with_local_time(
@@ -2075,7 +2076,7 @@ mod tests {
         old.estimator_revision = HISTORY_ESTIMATOR_REVISION.saturating_sub(1);
         old.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION.saturating_sub(1);
         let history = HistoryData {
-            half_hour_buckets: vec![old],
+            half_hour_buckets: vec![old].into(),
             ..HistoryData::default()
         };
         let query = SummaryReportQuery::new(
@@ -2134,7 +2135,7 @@ mod tests {
             ),
         ];
         let history = HistoryData {
-            half_hour_buckets: vec![mixed],
+            half_hour_buckets: vec![mixed].into(),
             ..HistoryData::default()
         };
 
@@ -2227,7 +2228,8 @@ mod tests {
                 at(30, 0, 15),
                 10,
                 vec![project_group("root", "root", "turn", 10, 1, Some(0))],
-            )],
+            )]
+            .into(),
             ..HistoryData::default()
         };
         let report = build_summary_report_with_local_time(

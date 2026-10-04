@@ -10400,6 +10400,100 @@ fn initial_refresh_panic_completion(config: &CollectConfig) -> RefreshCompletion
     }
 }
 
+enum RefreshCollectionInputs {
+    Account {
+        cached_account: AccountSnapshot,
+        cached_local_snapshot: Box<Snapshot>,
+    },
+    Local {
+        cached_account: AccountSnapshot,
+        force_materialization: bool,
+    },
+}
+
+impl RefreshCollectionInputs {
+    fn prepare(
+        refresh_account: bool,
+        cached_account: AccountSnapshot,
+        force_materialization: bool,
+        clone_local_snapshot: impl FnOnce() -> Snapshot,
+    ) -> Self {
+        if refresh_account {
+            Self::Account {
+                cached_account,
+                cached_local_snapshot: Box::new(clone_local_snapshot()),
+            }
+        } else {
+            Self::Local {
+                cached_account,
+                force_materialization,
+            }
+        }
+    }
+
+    fn collect(
+        self,
+        config: &CollectConfig,
+        rollout_cache: &Arc<Mutex<RolloutCache>>,
+    ) -> Option<CollectionResult> {
+        match self {
+            Self::Account {
+                cached_account,
+                cached_local_snapshot,
+            } => {
+                let trace = config.trace_log.span_with("tui.account_refresh", || {
+                    TraceFields::new()
+                        .bool("reuseLocalSnapshot", true)
+                        .usize("cachedTasks", cached_local_snapshot.tasks.len())
+                        .usize("cachedTurns", cached_local_snapshot.turns.len())
+                });
+                let refreshed = collect_account_refresh_for_snapshot(
+                    config,
+                    *cached_local_snapshot,
+                    cached_account,
+                );
+                trace.finish_with(
+                    if account_refresh_is_complete(&refreshed) {
+                        TraceOutcome::Ok
+                    } else {
+                        TraceOutcome::Partial
+                    },
+                    || {
+                        TraceFields::new()
+                            .usize("limits", refreshed.snapshot.limits.len())
+                            .usize("tasks", refreshed.snapshot.tasks.len())
+                            .usize("turns", refreshed.snapshot.turns.len())
+                            .bool("rolloutScan", false)
+                    },
+                );
+                Some(refreshed)
+            }
+            Self::Local {
+                cached_account,
+                force_materialization,
+            } => {
+                let mut cache = rollout_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if force_materialization {
+                    Some(collect_snapshot_cached(
+                        config,
+                        Some(cached_account),
+                        false,
+                        &mut cache,
+                    ))
+                } else {
+                    collect_snapshot_cached_if_changed_coalesced(
+                        config,
+                        Some(cached_account),
+                        &mut cache,
+                    )
+                }
+            }
+        }
+    }
+}
+
 fn start_refresh_if_due(
     app: &mut App,
     config: &CollectConfig,
@@ -10578,9 +10672,12 @@ fn start_refresh_if_due(
     }
 
     let worker_config = config.clone();
-    let cached_account = app.account.clone();
-    let cached_local_snapshot = app.local_snapshot.clone();
-    let force_local_materialization = account_window_projection_pending(&app.local_snapshot);
+    let collection_inputs = RefreshCollectionInputs::prepare(
+        account_refresh_due,
+        app.account.clone(),
+        account_window_projection_pending(&app.local_snapshot),
+        || app.local_snapshot.clone(),
+    );
     let worker_sender = context.refresh_sender.clone();
     let worker_cache = Arc::clone(rollout_cache);
     let worker_history = Arc::clone(history_store);
@@ -10596,54 +10693,7 @@ fn start_refresh_if_due(
         send_refresh_completion_catching_panics(
             &worker_sender,
             || {
-                let result = if account_refresh_due {
-                    let trace = worker_config
-                        .trace_log
-                        .span_with("tui.account_refresh", || {
-                            TraceFields::new()
-                                .bool("reuseLocalSnapshot", true)
-                                .usize("cachedTasks", cached_local_snapshot.tasks.len())
-                                .usize("cachedTurns", cached_local_snapshot.turns.len())
-                        });
-                    let refreshed = collect_account_refresh_for_snapshot(
-                        &worker_config,
-                        cached_local_snapshot,
-                        cached_account,
-                    );
-                    trace.finish_with(
-                        if account_refresh_is_complete(&refreshed) {
-                            TraceOutcome::Ok
-                        } else {
-                            TraceOutcome::Partial
-                        },
-                        || {
-                            TraceFields::new()
-                                .usize("limits", refreshed.snapshot.limits.len())
-                                .usize("tasks", refreshed.snapshot.tasks.len())
-                                .usize("turns", refreshed.snapshot.turns.len())
-                                .bool("rolloutScan", false)
-                        },
-                    );
-                    Some(refreshed)
-                } else {
-                    let mut cache = worker_cache
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if force_local_materialization {
-                        Some(collect_snapshot_cached(
-                            &worker_config,
-                            Some(cached_account),
-                            false,
-                            &mut cache,
-                        ))
-                    } else {
-                        collect_snapshot_cached_if_changed_coalesced(
-                            &worker_config,
-                            Some(cached_account),
-                            &mut cache,
-                        )
-                    }
-                };
+                let result = collection_inputs.collect(&worker_config, &worker_cache);
                 let (history_and_recorder, remote_live, remote_overview_history) = {
                     let mut history_store = worker_history
                         .lock()

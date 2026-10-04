@@ -9,6 +9,10 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+mod shared_series;
+
+pub use shared_series::SharedHistorySeries;
+
 #[cfg(test)]
 use crate::api_cost::{API_PRICING_CATALOG_REVISION, ApiCostAggregation};
 use crate::api_cost::{ApiCostAccumulator, current_api_pricing_catalog_revision};
@@ -308,9 +312,9 @@ impl HistoryObservation {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistoryData {
-    pub quota_points: Vec<QuotaPoint>,
-    pub half_hour_buckets: Vec<LocalHalfHourBucket>,
-    pub weekly_local_points: Vec<WeeklyLocalPoint>,
+    pub quota_points: SharedHistorySeries<QuotaPoint>,
+    pub half_hour_buckets: SharedHistorySeries<LocalHalfHourBucket>,
+    pub weekly_local_points: SharedHistorySeries<WeeklyLocalPoint>,
     pub warnings: Vec<String>,
     pub read_only: bool,
     /// Most recent project-history reconstruction attempt for the current
@@ -4471,9 +4475,9 @@ mod tests {
 
         let reset = weekly.resets_at;
         let history = HistoryData {
-            quota_points: observation.quota_points.clone(),
-            half_hour_buckets: observation.half_hour_buckets.clone(),
-            weekly_local_points: observation.weekly_local_points.clone(),
+            quota_points: observation.quota_points.clone().into(),
+            half_hour_buckets: observation.half_hour_buckets.clone().into(),
+            weekly_local_points: observation.weekly_local_points.clone().into(),
             ..HistoryData::default()
         };
         let base = history.estimated_half_hour_series(reset);
@@ -4517,9 +4521,9 @@ mod tests {
         let reset = weekly.resets_at;
 
         let history = HistoryData {
-            quota_points: observation.quota_points,
-            half_hour_buckets: observation.half_hour_buckets,
-            weekly_local_points: observation.weekly_local_points,
+            quota_points: observation.quota_points.into(),
+            half_hour_buckets: observation.half_hour_buckets.into(),
+            weekly_local_points: observation.weekly_local_points.into(),
             ..HistoryData::default()
         };
         let base = history.estimated_half_hour_series(reset);
@@ -5627,7 +5631,7 @@ mod tests {
         let reset = at(2026, 7, 31, 12, 0, 0);
         let start = reset - Duration::days(7);
         let data = HistoryData {
-            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)],
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)].into(),
             half_hour_buckets: vec![
                 local_bucket(start, reset - Duration::hours(1), 10, 100),
                 local_bucket(
@@ -5636,7 +5640,8 @@ mod tests {
                     30,
                     300,
                 ),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
         let half_hours = data.estimated_half_hour_series(reset);
@@ -5666,11 +5671,12 @@ mod tests {
         );
         zero.call_count = 0;
         let data = HistoryData {
-            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 40.0)],
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 40.0)].into(),
             half_hour_buckets: vec![
                 local_bucket(start, start + Duration::minutes(30), 10, 100),
                 zero,
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -5701,17 +5707,19 @@ mod tests {
         );
         second_zero.call_count = 0;
         let data = HistoryData {
-            quota_points: vec![quota_point(second_at, reset, 40.0)],
+            quota_points: vec![quota_point(second_at, reset, 40.0)].into(),
             half_hour_buckets: vec![
                 local_bucket(start, first_at, 10, 100),
                 first_zero.clone(),
                 second_zero.clone(),
                 local_bucket(start + Duration::minutes(45), second_at, 10, 100),
-            ],
+            ]
+            .into(),
             weekly_local_points: vec![
                 weekly_point(first_at, reset, 10, 100),
                 weekly_point(second_at, reset, 20, 200),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -5775,8 +5783,8 @@ mod tests {
         let new_observed_at = at(2026, 8, 1, 12, 0, 0);
         let new_reset = at(2026, 8, 7, 12, 0, 0);
         let data = HistoryData {
-            quota_points: vec![quota_point(old_observed_at, old_reset, 60.0)],
-            weekly_local_points: vec![weekly_point(new_observed_at, new_reset, 10, 100)],
+            quota_points: vec![quota_point(old_observed_at, old_reset, 60.0)].into(),
+            weekly_local_points: vec![weekly_point(new_observed_at, new_reset, 10, 100)].into(),
             ..HistoryData::default()
         };
 
@@ -5791,13 +5799,14 @@ mod tests {
         let last_full = floor_local_bucket(reset) - Duration::minutes(15);
         let last_sample = last_full + Duration::minutes(15);
         let data = HistoryData {
-            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)],
+            quota_points: vec![quota_point(reset - Duration::minutes(1), reset, 60.0)].into(),
             half_hour_buckets: vec![
                 local_bucket(floor_local_bucket(start), first_full, 100, 1_000),
                 local_bucket(first_full, first_full + Duration::minutes(15), 10, 100),
                 local_bucket(last_full, last_sample, 20, 200),
                 local_bucket(floor_local_bucket(reset), reset, 200, 2_000),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
 
@@ -5854,9 +5863,9 @@ mod tests {
         ];
         let observation = HistoryObservation::from_sources(observed_at, &calls, &limits, &[]);
         let data = HistoryData {
-            quota_points: observation.quota_points,
-            half_hour_buckets: observation.half_hour_buckets,
-            weekly_local_points: observation.weekly_local_points,
+            quota_points: observation.quota_points.into(),
+            half_hour_buckets: observation.half_hour_buckets.into(),
+            weekly_local_points: observation.weekly_local_points.into(),
             ..HistoryData::default()
         };
 

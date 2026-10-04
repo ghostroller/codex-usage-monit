@@ -1322,7 +1322,8 @@ mod tests {
                             30,
                         )],
                     ),
-                ],
+                ]
+                .into(),
                 ..HistoryData::default()
             },
             [(node.parse().unwrap(), "remote-a".to_owned())],
@@ -1390,7 +1391,8 @@ mod tests {
                         None,
                         40,
                     )],
-                )],
+                )]
+                .into(),
                 ..HistoryData::default()
             },
             [(
@@ -1450,7 +1452,7 @@ mod tests {
         }];
         let history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![unified_bucket],
+                half_hour_buckets: vec![unified_bucket].into(),
                 ..HistoryData::default()
             },
             [(remote_node.parse().unwrap(), "remote-a".to_owned())],
@@ -1517,7 +1519,7 @@ mod tests {
         }];
         let history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![local_bucket],
+                half_hour_buckets: vec![local_bucket].into(),
                 ..HistoryData::default()
             },
             [(remote_node.parse().unwrap(), "remote-a".to_owned())],
@@ -1563,7 +1565,7 @@ mod tests {
         }];
         let history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![opaque_bucket],
+                half_hour_buckets: vec![opaque_bucket].into(),
                 ..HistoryData::default()
             },
             [(remote_node.parse().unwrap(), "remote-a".to_owned())],
@@ -1609,7 +1611,8 @@ mod tests {
                 half_hour_buckets: vec![
                     bucket(at(9, 50), vec![remote_group("edge", 20)]),
                     bucket(at(11, 0), vec![remote_group("inside", 40)]),
-                ],
+                ]
+                .into(),
                 ..HistoryData::default()
             },
             [(node.parse().unwrap(), "remote-a".to_owned())],
@@ -1635,7 +1638,7 @@ mod tests {
         partial_bucket.partial_reasons = vec!["rollout_scan_incomplete".to_owned()];
         let partial_history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![partial_bucket],
+                half_hour_buckets: vec![partial_bucket].into(),
                 ..HistoryData::default()
             },
             [(node.parse().unwrap(), "remote-a".to_owned())],
@@ -1655,7 +1658,7 @@ mod tests {
 
         let project_warning_history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![bucket(at(11, 0), vec![remote_group])],
+                half_hour_buckets: vec![bucket(at(11, 0), vec![remote_group])].into(),
                 warnings: vec!["project_mapping_partial".to_owned()],
                 ..HistoryData::default()
             },
@@ -1718,7 +1721,7 @@ mod tests {
 
         let history = RemoteOverviewHistory::from_unified(
             &HistoryData {
-                half_hour_buckets: vec![current_bucket, external_bucket],
+                half_hour_buckets: vec![current_bucket, external_bucket].into(),
                 ..HistoryData::default()
             },
             [(node.parse().unwrap(), "remote-a".to_owned())],
@@ -1764,7 +1767,7 @@ mod tests {
             HISTORY_PROJECT_BREAKDOWN_REVISION.saturating_sub(1);
         old_bucket.api_pricing_catalog_revision = API_PRICING_CATALOG_REVISION.saturating_sub(1);
         let history_data = HistoryData {
-            half_hour_buckets: vec![old_bucket],
+            half_hour_buckets: vec![old_bucket].into(),
             ..HistoryData::default()
         };
         let history = RemoteOverviewHistory::from_unified(
@@ -1818,7 +1821,8 @@ mod tests {
                         20,
                     )],
                 ),
-            ],
+            ]
+            .into(),
             ..HistoryData::default()
         };
         let history = RemoteOverviewHistory::from_unified(

@@ -116,7 +116,7 @@ fn summary_bucket(
 
 fn summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
-    harness.app.history.half_hour_buckets = vec![
+    harness.app.history.half_hour_buckets = (vec![
         summary_bucket(
             summary_timestamp("2026-07-09T06:00:00Z"),
             vec![attributed_summary_group(
@@ -179,7 +179,8 @@ fn summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
                 40_000,
             )],
         ),
-    ];
+    ])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('U'));
     harness
@@ -204,10 +205,11 @@ fn summary_many_projects_harness(width: u16, height: u16, theme: Theme) -> TuiHa
             )
         })
         .collect();
-    harness.app.history.half_hour_buckets = vec![summary_bucket(
+    harness.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         groups,
-    )];
+    )])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('U'));
     harness.key(KeyCode::Char('U'));
@@ -352,7 +354,7 @@ fn summary_daily_status_strip_distinguishes_known_zero_partial_and_missing_dates
                 80_000,
             )],
         ));
-        harness.app.history.half_hour_buckets = buckets;
+        harness.app.history.half_hour_buckets = (buckets).into();
         harness.app.summary_cache = None;
         harness.key(KeyCode::Char('U'));
         harness.key(KeyCode::Char('7'));
@@ -595,10 +597,11 @@ fn summary_inspection_is_inactive_without_a_nonzero_project_series() {
         priced_tokens: 100_000,
         ..ApiCostAmount::default()
     };
-    known_zero.app.history.half_hour_buckets = vec![summary_bucket(
+    known_zero.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         vec![group],
-    )];
+    )])
+    .into();
     known_zero.app.summary_cache = None;
     known_zero.key(KeyCode::Char('U'));
     known_zero.key(KeyCode::Char('A'));
@@ -612,10 +615,11 @@ fn summary_inspection_is_inactive_without_a_nonzero_project_series() {
     assert!(!known_zero.click(ControlId::SummaryInspect, ClickEdge::Middle));
 
     let mut no_series = TuiHarness::from_fixture("normal", 60, 24, Theme::Dark);
-    no_series.app.history.half_hour_buckets = vec![summary_bucket(
+    no_series.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         Vec::new(),
-    )];
+    )])
+    .into();
     no_series.app.summary_cache = None;
     no_series.key(KeyCode::Char('U'));
 
@@ -863,7 +867,7 @@ fn summary_all_projects_preference_survives_a_range_where_it_is_inapplicable() {
             )
         })
         .collect();
-    harness.app.history.half_hour_buckets = vec![
+    harness.app.history.half_hour_buckets = (vec![
         summary_bucket(now - ChronoDuration::days(20), older_groups),
         summary_bucket(
             now - ChronoDuration::minutes(15),
@@ -877,7 +881,8 @@ fn summary_all_projects_preference_survives_a_range_where_it_is_inapplicable() {
                 10_000,
             )],
         ),
-    ];
+    ])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('U'));
     harness.key(KeyCode::Char('M'));
@@ -1406,7 +1411,7 @@ fn summary_project_colors_stay_stable_across_range_subsets() {
     );
 
     let now = harness.app.snapshot.as_of;
-    harness.app.history.half_hour_buckets = vec![
+    harness.app.history.half_hour_buckets = (vec![
         summary_bucket(
             now - ChronoDuration::days(20),
             vec![summary_group(
@@ -1431,7 +1436,8 @@ fn summary_project_colors_stay_stable_across_range_subsets() {
                 10_000,
             )],
         ),
-    ];
+    ])
+    .into();
 
     let mut prepared_for = |range| {
         harness.app.summary_range = range;
@@ -1486,13 +1492,13 @@ fn summary_project_colors_stay_stable_across_range_subsets() {
     let mut refreshed = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
     refreshed.app.summary_project_colors.clear();
     refreshed.app.replace_history(HistoryData {
-        half_hour_buckets: vec![recent_bucket.clone()],
+        half_hour_buckets: (vec![recent_bucket.clone()]).into(),
         ..HistoryData::default()
     });
     refreshed.key(KeyCode::Char('U'));
     let color_before_refresh = refreshed.app.summary_project_colors[recent_project];
     refreshed.app.replace_history(HistoryData {
-        half_hour_buckets: vec![older_bucket, recent_bucket],
+        half_hour_buckets: (vec![older_bucket, recent_bucket]).into(),
         ..HistoryData::default()
     });
     refreshed.render();
@@ -1816,13 +1822,14 @@ fn summary_cycle_cache_expires_inside_the_same_fifteen_minute_bucket() {
 #[test]
 fn summary_disambiguates_same_basename_projects_without_showing_paths() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
-    harness.app.history.half_hour_buckets = vec![summary_bucket(
+    harness.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         vec![
             summary_group("first", None, "first-id", "repo", "First", "cli", 2_000),
             summary_group("second", None, "second-id", "repo", "Second", "cli", 1_000),
         ],
-    )];
+    )])
+    .into();
     harness.app.summary_cache = None;
     harness.render();
 
@@ -1836,7 +1843,7 @@ fn summary_disambiguates_same_basename_projects_without_showing_paths() {
 #[test]
 fn summary_ignores_project_metadata_from_outside_the_selected_range() {
     let mut harness = summary_harness(120, 40, Theme::Dark);
-    harness.app.history.half_hour_buckets = vec![
+    harness.app.history.half_hour_buckets = (vec![
         summary_bucket(
             summary_timestamp("2026-06-01T00:00:00Z"),
             vec![summary_group(
@@ -1861,7 +1868,8 @@ fn summary_ignores_project_metadata_from_outside_the_selected_range() {
                 2_000,
             )],
         ),
-    ];
+    ])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('7'));
 
@@ -1874,7 +1882,7 @@ fn summary_ignores_project_metadata_from_outside_the_selected_range() {
 #[test]
 fn summary_live_task_metadata_overrides_stale_history_title() {
     let mut harness = TuiHarness::from_fixture("normal", 120, 40, Theme::Dark);
-    harness.app.history.half_hour_buckets = vec![summary_bucket(
+    harness.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         vec![summary_group(
             "019f52ac-7a9f-7fd1-8dda-e775ef950785",
@@ -1885,7 +1893,8 @@ fn summary_live_task_metadata_overrides_stale_history_title() {
             "cli",
             2_000,
         )],
-    )];
+    )])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('U'));
     harness.key(KeyCode::Enter);
@@ -1918,10 +1927,11 @@ fn summary_api_range_and_lower_bound_marker_remain_visible() {
             observed_tokens: 2_000,
             priced_tokens: 1_000,
         };
-        harness.app.history.half_hour_buckets = vec![summary_bucket(
+        harness.app.history.half_hour_buckets = (vec![summary_bucket(
             summary_timestamp("2026-07-12T03:45:00Z"),
             vec![group],
-        )];
+        )])
+        .into();
         harness.app.summary_cache = None;
         harness.key(KeyCode::Char('U'));
         harness.key(KeyCode::Char('A'));
@@ -1981,7 +1991,7 @@ fn summary_daily_marks_a_fully_covered_non_exact_api_range_as_a_lower_bound() {
     }
     assert!(inserted_usage);
     harness.app.history = HistoryData {
-        half_hour_buckets: buckets,
+        half_hour_buckets: (buckets).into(),
         ..HistoryData::default()
     };
     harness.app.summary_cache = None;
@@ -2090,10 +2100,11 @@ fn summary_longx_does_not_treat_spark_only_metadata_as_unknown_est_usage() {
         call_count: 1,
         ..LocalProjectUsageGroup::default()
     };
-    harness.app.history.half_hour_buckets = vec![summary_bucket(
+    harness.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         vec![group],
-    )];
+    )])
+    .into();
     harness.app.summary_cache = None;
     harness.key(KeyCode::Char('U'));
     harness.key(KeyCode::Char('E'));
@@ -2241,10 +2252,11 @@ fn summary_tree_keeps_direct_and_delegated_unassigned_turn_rows_distinct() {
         delegated_b.session_turn_id = None;
 
         let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
-        harness.app.history.half_hour_buckets = vec![summary_bucket(
+        harness.app.history.half_hour_buckets = (vec![summary_bucket(
             summary_timestamp("2026-07-12T03:45:00Z"),
             vec![direct, delegated_a, delegated_b],
-        )];
+        )])
+        .into();
         harness.app.summary_cache = None;
         harness.key(KeyCode::Char('U'));
         harness.key(KeyCode::Enter);
@@ -2435,10 +2447,11 @@ fn summary_page_scroll_is_not_undone_by_the_selected_row() {
             )
         })
         .collect();
-    harness.app.history.half_hour_buckets = vec![summary_bucket(
+    harness.app.history.half_hour_buckets = (vec![summary_bucket(
         summary_timestamp("2026-07-12T03:45:00Z"),
         groups,
-    )];
+    )])
+    .into();
     harness.app.summary_cache = None;
     harness.render();
 

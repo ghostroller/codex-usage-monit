@@ -24,7 +24,9 @@ use chrono::TimeZone;
 use ratatui::backend::TestBackend;
 
 mod facts_projection;
+mod history_memory;
 mod integration_scenarios;
+mod refresh_memory;
 mod testkit;
 mod version_info;
 
@@ -502,7 +504,7 @@ fn summary_backfill_is_local_one_time_work_and_detects_incomplete_30d_history() 
         starts_at += ChronoDuration::minutes(15);
     }
     let complete = HistoryData {
-        half_hour_buckets: buckets,
+        half_hour_buckets: (buckets).into(),
         ..HistoryData::default()
     };
     assert!(!summary_history_backfill_needed(&complete, now));
@@ -2368,7 +2370,7 @@ fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistor
         ..LocalProjectUsageGroup::default()
     };
     let history = HistoryData {
-        half_hour_buckets: vec![LocalHalfHourBucket {
+        half_hour_buckets: (vec![LocalHalfHourBucket {
             starts_at: as_of - ChronoDuration::minutes(15),
             ends_at: as_of,
             sampled_at: as_of,
@@ -2383,7 +2385,8 @@ fn remote_overview_history_fixture(as_of: DateTime<Utc>) -> RemoteOverviewHistor
             groups: Vec::new(),
             project_groups: vec![group],
             partial_reasons: Vec::new(),
-        }],
+        }])
+        .into(),
         ..HistoryData::default()
     };
     RemoteOverviewHistory::from_unified(&history, [(node, "dev-server".to_owned())], as_of)
@@ -2574,7 +2577,7 @@ fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
         make_group("child", Some("parent"), 20),
     ];
     let history_data = HistoryData {
-        half_hour_buckets: vec![LocalHalfHourBucket {
+        half_hour_buckets: (vec![LocalHalfHourBucket {
             starts_at: as_of - ChronoDuration::minutes(15),
             ends_at: as_of,
             sampled_at: as_of,
@@ -2593,7 +2596,8 @@ fn logical_remote_live_overlay_keeps_host_label_tree_and_single_parent() {
             groups: Vec::new(),
             project_groups: groups,
             partial_reasons: Vec::new(),
-        }],
+        }])
+        .into(),
         ..HistoryData::default()
     };
     let history = RemoteOverviewHistory::from_unified(
@@ -2778,7 +2782,7 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
         day_bounds[1] - ChronoDuration::minutes(15),
     ];
     HistoryData {
-        quota_points: vec![
+        quota_points: (vec![
             QuotaPoint {
                 observed_at: now - ChronoDuration::hours(1),
                 limit_id: "codex".to_string(),
@@ -2815,8 +2819,9 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
                 remaining_percent: 75.0,
                 provenance: Provenance::ServerSnapshot,
             },
-        ],
-        half_hour_buckets: bucket_starts
+        ])
+        .into(),
+        half_hour_buckets: (bucket_starts
             .into_iter()
             .enumerate()
             .map(|(index, starts_at)| LocalHalfHourBucket {
@@ -2842,8 +2847,9 @@ fn trend_history_fixture(now: DateTime<Utc>) -> HistoryData {
                     Vec::new()
                 },
             })
-            .collect(),
-        weekly_local_points: Vec::new(),
+            .collect::<Vec<_>>())
+        .into(),
+        weekly_local_points: (Vec::new()).into(),
         warnings: Vec::new(),
         read_only: false,
         summary_backfill_attempted_at: None,
@@ -4878,7 +4884,7 @@ fn remote_summary_never_overlays_same_id_local_task_metadata() {
         call_count: 1,
         ..LocalProjectUsageGroup::default()
     };
-    app.history.half_hour_buckets = vec![bucket];
+    app.history.half_hour_buckets = (vec![bucket]).into();
     app.history_source_applied_selection =
         HistorySourceSelection::Remote("node-ffffffffffffffffffffffffffffffff".parse().unwrap());
     app.summary_range = SummaryRange::SevenDays;
@@ -10134,7 +10140,7 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
         .collect::<Vec<_>>();
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
-        quota_points: vec![QuotaPoint {
+        quota_points: (vec![QuotaPoint {
             observed_at: now,
             limit_id: "codex".to_string(),
             duration_mins: 10_080,
@@ -10142,8 +10148,9 @@ fn fifteen_minute_bars_render_a_full_day_of_96_samples() {
             used_percent: 50.0,
             remaining_percent: 50.0,
             provenance: Provenance::ServerSnapshot,
-        }],
-        half_hour_buckets: buckets,
+        }])
+        .into(),
+        half_hour_buckets: (buckets).into(),
         ..HistoryData::default()
     };
     app.set_view(View::Trends);
@@ -10228,9 +10235,9 @@ fn api_long_context_toggle_reweights_weekly_and_fifteen_minute_estimates_without
     let observation = HistoryObservation::from_sources(now, &calls, &limits, &[]);
     let mut app = interaction_test_app(1, 1);
     app.replace_history(HistoryData {
-        quota_points: observation.quota_points,
-        half_hour_buckets: observation.half_hour_buckets,
-        weekly_local_points: observation.weekly_local_points,
+        quota_points: (observation.quota_points).into(),
+        half_hour_buckets: (observation.half_hour_buckets).into(),
+        weekly_local_points: (observation.weekly_local_points).into(),
         ..HistoryData::default()
     });
     app.set_view(View::Trends);
@@ -10335,7 +10342,7 @@ fn trend_readouts_reject_expired_quota_and_the_synthetic_weekly_anchor() {
     let weekly_reset = now + ChronoDuration::days(3);
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
-        quota_points: vec![
+        quota_points: (vec![
             QuotaPoint {
                 observed_at: now - ChronoDuration::minutes(1),
                 limit_id: "codex".to_string(),
@@ -10354,7 +10361,8 @@ fn trend_readouts_reject_expired_quota_and_the_synthetic_weekly_anchor() {
                 remaining_percent: 75.0,
                 provenance: Provenance::ServerSnapshot,
             },
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
 
@@ -10380,7 +10388,7 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
     let now = cycle_start + ChronoDuration::minutes(1);
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
-        quota_points: vec![QuotaPoint {
+        quota_points: (vec![QuotaPoint {
             observed_at: now,
             limit_id: "codex".to_string(),
             duration_mins: 10_080,
@@ -10388,8 +10396,9 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
             used_percent: 25.0,
             remaining_percent: 75.0,
             provenance: Provenance::ServerSnapshot,
-        }],
-        weekly_local_points: vec![WeeklyLocalPoint {
+        }])
+        .into(),
+        weekly_local_points: (vec![WeeklyLocalPoint {
             observed_at: cycle_start,
             resets_at: weekly_reset,
             token_usage: TokenUsage {
@@ -10402,7 +10411,8 @@ fn weekly_readout_keeps_a_real_sample_at_the_exact_cycle_start() {
             estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
             call_count: 1,
             partial_reasons: Vec::new(),
-        }],
+        }])
+        .into(),
         ..HistoryData::default()
     };
 
@@ -10461,7 +10471,7 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
         project_groups: Vec::new(),
         partial_reasons: Vec::new(),
     };
-    app.history.half_hour_buckets = vec![
+    app.history.half_hour_buckets = (vec![
         bucket(
             DateTime::parse_from_rfc3339("2026-07-28T08:00:00Z")
                 .unwrap()
@@ -10474,7 +10484,8 @@ fn latest_local_bucket_window_uses_now_and_15_minute_alignment() {
                 .with_timezone(&Utc),
             200,
         ),
-    ];
+    ])
+    .into();
 
     let data = prepare_trend_data_at(&app, now);
 
@@ -10840,10 +10851,11 @@ fn remote_overview_seed_without_remote_sources_preserves_data_and_invalidates_ol
     source_store.save_source_metadata(&remote).unwrap();
     let mut store = TuiHistoryStore::runtime(runtime, Some(lease), Vec::new());
     let seed = HistoryData {
-        half_hour_buckets: vec![tui_runtime_test_bucket(
+        half_hour_buckets: (vec![tui_runtime_test_bucket(
             now - ChronoDuration::minutes(20),
             42,
-        )],
+        )])
+        .into(),
         warnings: vec!["seed usage is incomplete".to_owned()],
         ..HistoryData::default()
     };
@@ -11838,7 +11850,7 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
     };
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
-        quota_points: vec![
+        quota_points: (vec![
             QuotaPoint {
                 observed_at: boundary - ChronoDuration::hours(2),
                 limit_id: "codex".to_string(),
@@ -11875,11 +11887,13 @@ fn half_hour_estimates_merge_cross_reset_cycles_and_restore_older_days() {
                 remaining_percent: 80.0,
                 provenance: Provenance::ServerSnapshot,
             },
-        ],
-        half_hour_buckets: vec![
+        ])
+        .into(),
+        half_hour_buckets: (vec![
             bucket(boundary - ChronoDuration::hours(1), 100),
             bucket(boundary + ChronoDuration::hours(1), 200),
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
 
@@ -11941,7 +11955,7 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
     };
     let mut app = interaction_test_app(1, 1);
     app.history = HistoryData {
-        quota_points: vec![
+        quota_points: (vec![
             QuotaPoint {
                 observed_at: transition - ChronoDuration::minutes(5),
                 limit_id: "codex".to_string(),
@@ -11960,11 +11974,13 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
                 remaining_percent: 90.0,
                 provenance: Provenance::ServerSnapshot,
             },
-        ],
-        half_hour_buckets: vec![
+        ])
+        .into(),
+        half_hour_buckets: (vec![
             bucket(transition - ChronoDuration::minutes(15), transition),
             bucket(transition, transition + ChronoDuration::minutes(15)),
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
 
@@ -11979,7 +11995,7 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
     );
 
     app.history.quota_points.pop();
-    app.history.weekly_local_points = vec![WeeklyLocalPoint {
+    app.history.weekly_local_points = (vec![WeeklyLocalPoint {
         observed_at: now,
         resets_at: new_reset,
         token_usage: TokenUsage {
@@ -11992,7 +12008,8 @@ fn overlapping_early_reset_uses_the_new_weekly_cycle_for_15m_estimates() {
         estimator_revision: crate::history::HISTORY_ESTIMATOR_REVISION,
         call_count: 1,
         partial_reasons: Vec::new(),
-    }];
+    }])
+    .into();
     app.trend_day_offset = 1;
     let viewed_at = now + ChronoDuration::days(1);
     let uncalibrated = prepare_trend_data_at(&app, viewed_at);
@@ -12042,10 +12059,11 @@ fn weekly_reset_dedup_is_order_independent_for_bridging_candidates() {
 
     for order in [[0, 2, 1], [2, 0, 1], [1, 0, 2], [2, 1, 0]] {
         let history = HistoryData {
-            quota_points: order
+            quota_points: (order
                 .into_iter()
                 .map(|index| candidates[index].clone())
-                .collect(),
+                .collect::<Vec<_>>())
+            .into(),
             ..HistoryData::default()
         };
 
@@ -12087,7 +12105,7 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
         partial_reasons: Vec::new(),
     };
     let history = HistoryData {
-        quota_points: vec![QuotaPoint {
+        quota_points: (vec![QuotaPoint {
             observed_at: second_at,
             limit_id: "codex".to_string(),
             duration_mins: 10_080,
@@ -12095,13 +12113,15 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
             used_percent: 40.0,
             remaining_percent: 60.0,
             provenance: Provenance::ServerSnapshot,
-        }],
-        half_hour_buckets: vec![
+        }])
+        .into(),
+        half_hour_buckets: (vec![
             zero_bucket(start + ChronoDuration::minutes(30)),
             zero_bucket(start + ChronoDuration::minutes(45)),
             zero_bucket(start + ChronoDuration::minutes(60)),
-        ],
-        weekly_local_points: vec![
+        ])
+        .into(),
+        weekly_local_points: (vec![
             WeeklyLocalPoint {
                 observed_at: first_at,
                 resets_at: reset,
@@ -12130,7 +12150,8 @@ fn weekly_trends_connect_confirmed_zero_plateaus_and_keep_true_gaps() {
                 call_count: 2,
                 partial_reasons: Vec::new(),
             },
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
     app.replace_history(history.clone());
@@ -12277,7 +12298,7 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
     app.history = HistoryData {
         // Deliberately keep the input out of order so the chart contract does
         // not depend on how a caller assembled HistoryData.
-        quota_points: vec![
+        quota_points: (vec![
             quota_point(
                 300,
                 boundary + ChronoDuration::minutes(5),
@@ -12297,7 +12318,8 @@ fn quota_remaining_trends_retain_previous_reset_cycles_and_show_observed_jumps()
                 boundary + ChronoDuration::minutes(10_080),
                 100.0,
             ),
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
 
@@ -12340,7 +12362,7 @@ fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
         .unwrap()
         .with_timezone(&Utc);
     let history = HistoryData {
-        quota_points: vec![
+        quota_points: (vec![
             QuotaPoint {
                 observed_at: boundary - ChronoDuration::minutes(10),
                 limit_id: "codex".to_string(),
@@ -12359,7 +12381,8 @@ fn quota_remaining_reset_does_not_bridge_a_recorder_outage() {
                 remaining_percent: 97.0,
                 provenance: Provenance::ServerSnapshot,
             },
-        ],
+        ])
+        .into(),
         ..HistoryData::default()
     };
     let points = remaining_trend(&history, 300);

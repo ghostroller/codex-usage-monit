@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file.
 
 - View the running application's version, source build ID, target, and bundled current-version release notes in the TUI with `?` or Settings **[?]Version info**. Scroll with keyboard, mouse wheel, or the draggable scrollbar and return with **[←]Back**.
 
+### Changed
+
+- Avoid copying the complete local TUI snapshot during ordinary rollout refreshes; account refreshes still reuse their own local snapshot without rescanning rollouts.
+- Share quota, usage-bucket and weekly history arrays between cached projections and report views. Changes copy only the modified array, while warnings, read-only state and backfill markers remain independent.
+
 ## [0.6.0] - 2026-10-04
 
 ### Added

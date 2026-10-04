@@ -9618,9 +9618,9 @@ mod tests {
         let observation =
             report_history_collection_result(Provenance::ServerSnapshot).history_observation;
         let history = HistoryData {
-            quota_points: observation.quota_points,
-            half_hour_buckets: observation.half_hour_buckets,
-            weekly_local_points: observation.weekly_local_points,
+            quota_points: observation.quota_points.into(),
+            half_hour_buckets: observation.half_hour_buckets.into(),
+            weekly_local_points: observation.weekly_local_points.into(),
             warnings: vec!["existing".to_owned()],
             read_only: true,
             ..HistoryData::default()
