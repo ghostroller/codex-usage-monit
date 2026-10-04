@@ -328,12 +328,16 @@ The default scan covers the last 7 days and at most 500 rollout files. The TUI r
 
 Models reserves its body for per-model usage and the `TOTAL` row. Click `[I]Details` in its title or press `i` on Overview to jump to **Other → Diagnostics → Models details** for the selected 5-hour or weekly cycle. This scrollable group contains the reset period, quota-estimation method, API pricing coverage/date, and individual partial-data reasons; Overview keeps a compact partial indicator and the table's estimate markers.
 
+Press `?` from any main view, or click `[?]Version info` in **Settings**, to view the running application's version, source build ID, target, and bundled release notes for that version. The information is available offline. Use `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End`, or the mouse wheel to scroll, or click and drag the scrollbar on the right; press `Esc` or `←`, or click `[←]Back`, to return to the previous view.
+
 ### Keyboard controls
 
 | Keys | Action |
 | --- | --- |
 | `Tab` / `→`, `Shift+Tab` / `←` | Move between views. |
 | `1`, `2`, `u`, `3`, `4` | Open Overview, Trends, Summary, Other, or Settings. |
+| `?` | Open the current version's information and bundled release notes. |
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` in version information | Scroll the version information; `Esc` / `←` returns to the previous view. |
 | `c`, `7`, `m` on Summary | Select the current cycle, last 7 days, or last 30 days. |
 | `K`, `e`, `a` on Summary | Rank and chart Tokens, estimated credit-rate equivalents, or API-equivalent cost. |
 | `b` on Summary | Cycle the chart bucket size through `1d`, `12h`, `6h`, `3h`, and `1h`. |

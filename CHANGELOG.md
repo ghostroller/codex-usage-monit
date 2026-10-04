@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- View the running application's version, source build ID, target, and bundled current-version release notes in the TUI with `?` or Settings **[?]Version info**. Scroll with keyboard, mouse wheel, or the draggable scrollbar and return with **[←]Back**.
+
 ## [0.6.0] - 2026-10-04
 
 ### Added

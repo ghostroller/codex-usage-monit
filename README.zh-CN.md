@@ -311,12 +311,16 @@ codex-usage-monit record --foreground
 
 默认扫描最近 7 天、最多 500 个 rollout 文件。TUI 会增量刷新有变化的本地 rollout，并以较低频率刷新远程账户状态。
 
+在任意主视图按 `?`，或点击 **Settings** 中的 `[?]Version info`，即可查看当前运行程序的版本号、源码构建标识、目标平台，以及随程序附带的当前版本更新说明，无需联网。用 `↑` / `↓`、`PgUp` / `PgDn`、`Home` / `End` 或鼠标滚轮浏览，也可以点击或拖动右侧滚动条；按 `Esc` 或 `←`，或点击 `[←]Back`，返回原视图。
+
 ### 键盘操作
 
 | 按键 | 操作 |
 | --- | --- |
 | `Tab` / `→`、`Shift+Tab` / `←` | 在视图之间移动。 |
 | `1`、`2`、`u`、`3`、`4` | 打开 Overview、Trends、Summary、Other 或 Settings。 |
+| `?` | 查看当前版本的信息和随程序附带的更新说明。 |
+| 版本信息中的 `↑` / `↓`、`PgUp` / `PgDn`、`Home` / `End` | 滚动版本信息；`Esc` / `←` 返回原视图。 |
 | Summary 中的 `c`、`7`、`m` | 选择本周期、近 7 天或近 30 天。 |
 | Summary 中的 `K`、`e`、`a` | 按 Tokens、估算 credit 费率等价值或 API 等价费用排行并绘图。 |
 | Summary 中的 `b` | 在 `1d`、`12h`、`6h`、`3h`、`1h` 图表桶之间循环。 |

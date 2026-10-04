@@ -435,6 +435,19 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
         line_contains(screen, "API equivalent", "On")
     });
 
+    session.send(b"?");
+    session.wait_for("version information via keyboard", |screen| {
+        let contents = screen.contents();
+        contents.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION")))
+            && contents.contains("Release notes")
+            && contents.contains("[←]Back")
+    });
+    session.send(b"q");
+    session.wait_for("version popup closes without quitting", |screen| {
+        !screen.contents().contains("Release notes")
+            && line_contains(screen, "API equivalent", "On")
+    });
+
     session.send(b"1");
     session.wait_for("keyboard switch back to Overview", |screen| {
         label_is_bold(screen, "Overview") || label_is_bold(screen, "Ovw")
@@ -481,6 +494,33 @@ fn real_tui_pty_handles_keyboard_mouse_search_resize_and_exit() {
     session.send(b"4");
     session.wait_for("compact keyboard switch to Settings", |screen| {
         label_is_bold(screen, "Set") && screen.contents().contains("API equivalent")
+    });
+
+    // ConPTY can join wrapped rows in contents(); mouse coordinates need the
+    // physical screen rows even when a border reaches the last column.
+    let screen = session.parser.screen();
+    let (column, row) = screen
+        .rows(0, screen.size().1)
+        .enumerate()
+        .find_map(|(row, text)| {
+            text.find("[?]Version info").map(|index| {
+                (
+                    unicode_width::UnicodeWidthStr::width(&text[..index]) as u16,
+                    row as u16,
+                )
+            })
+        })
+        .expect("compact Settings must show the version information control");
+    session.click(column + 14, row);
+    session.wait_for(
+        "compact version information via full-label click",
+        |screen| {
+            screen.contents().contains("Release notes") && screen.contents().contains("[←]Back")
+        },
+    );
+    session.send(b"\x1b[D");
+    session.wait_for("compact version popup returns to Settings", |screen| {
+        !screen.contents().contains("Release notes") && screen.contents().contains("API equivalent")
     });
 
     session.send(b"q");

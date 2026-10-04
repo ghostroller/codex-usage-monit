@@ -57,6 +57,10 @@ pub(super) enum ControlId {
     SettingTokenShare,
     SettingEstimatedQuota,
     SettingApiEquivalent,
+    VersionInfo,
+    VersionInfoUp,
+    VersionInfoDown,
+    VersionInfoBack,
     QuitConfirm,
     QuitCancel,
     ResumeConfirm,
@@ -110,6 +114,10 @@ impl ControlId {
             Self::SettingTokenShare => "P",
             Self::SettingEstimatedQuota => "E",
             Self::SettingApiEquivalent => "A",
+            Self::VersionInfo => "?",
+            Self::VersionInfoUp => "↑",
+            Self::VersionInfoDown => "↓",
+            Self::VersionInfoBack => "←",
         }
     }
 }
@@ -431,6 +439,10 @@ impl TuiHarness {
         (cell.symbol().to_string(), cell.fg, cell.modifier)
     }
 
+    pub(super) fn cell_background(&self, column: u16, row: u16) -> Color {
+        self.terminal.backend().buffer()[(column, row)].bg
+    }
+
     pub(super) fn control_rect(&self, control: ControlId) -> Rect {
         match control {
             ControlId::ViewOverview => self
@@ -574,6 +586,27 @@ impl TuiHarness {
             ControlId::SettingTokenShare => self.setting_rect(SettingItem::TokenShare),
             ControlId::SettingEstimatedQuota => self.setting_rect(SettingItem::EstimatedQuota),
             ControlId::SettingApiEquivalent => self.setting_rect(SettingItem::ApiEquivalent),
+            ControlId::VersionInfo => self
+                .app
+                .settings_controls_hitbox
+                .as_ref()
+                .map(|hitbox| hitbox.version_info)
+                .unwrap_or_default(),
+            ControlId::VersionInfoUp => self
+                .app
+                .version_info_hitbox
+                .map(|hitbox| hitbox.up)
+                .unwrap_or_default(),
+            ControlId::VersionInfoDown => self
+                .app
+                .version_info_hitbox
+                .map(|hitbox| hitbox.down)
+                .unwrap_or_default(),
+            ControlId::VersionInfoBack => self
+                .app
+                .version_info_hitbox
+                .map(|hitbox| hitbox.back)
+                .unwrap_or_default(),
             ControlId::QuitConfirm => self
                 .app
                 .quit_confirmation_hitbox
@@ -712,6 +745,10 @@ impl TuiHarness {
             ControlId::SettingTokenShare,
             ControlId::SettingEstimatedQuota,
             ControlId::SettingApiEquivalent,
+            ControlId::VersionInfo,
+            ControlId::VersionInfoUp,
+            ControlId::VersionInfoDown,
+            ControlId::VersionInfoBack,
             ControlId::QuitConfirm,
             ControlId::QuitCancel,
             ControlId::ResumeConfirm,

@@ -26,6 +26,7 @@ use ratatui::backend::TestBackend;
 mod facts_projection;
 mod integration_scenarios;
 mod testkit;
+mod version_info;
 
 const RESUMABLE_THREAD_ID: &str = "019f52ac-7a9f-7fd1-8dda-e775ef950785";
 

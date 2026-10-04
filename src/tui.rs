@@ -2418,6 +2418,7 @@ struct SummaryControlsHitbox {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SettingsControlsHitbox {
     rows: [Rect; 8],
+    version_info: Rect,
     remote_global: Rect,
     remote_hosts: Vec<Rect>,
     remote_new: Rect,
@@ -2545,6 +2546,15 @@ struct SummaryTreeRow {
 struct QuitConfirmationHitbox {
     confirm: Rect,
     cancel: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VersionInfoHitbox {
+    content: Rect,
+    scrollbar: Option<ScrollbarHitbox>,
+    up: Rect,
+    down: Rect,
+    back: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3192,6 +3202,7 @@ enum ScrollTarget {
     Summary,
     ProjectMappings,
     Diagnostics,
+    VersionInfo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3438,6 +3449,10 @@ struct App {
     scroll_drag: Option<ScrollDrag>,
     quit_confirmation_visible: bool,
     quit_confirmation_hitbox: Option<QuitConfirmationHitbox>,
+    version_info_visible: bool,
+    version_info_offset: usize,
+    version_info_line_count: usize,
+    version_info_hitbox: Option<VersionInfoHitbox>,
     quit_requested: bool,
     turn_reveal_pending: bool,
     /// True only for the real TUI's placeholder first frame. The initial
@@ -3592,6 +3607,10 @@ impl App {
             scroll_drag: None,
             quit_confirmation_visible: false,
             quit_confirmation_hitbox: None,
+            version_info_visible: false,
+            version_info_offset: 0,
+            version_info_line_count: 0,
+            version_info_hitbox: None,
             quit_requested: false,
             turn_reveal_pending: false,
             initial_bootstrap_pending: false,
@@ -4400,6 +4419,7 @@ impl App {
 
     fn shortcuts_active(&self) -> bool {
         !self.focus.is_search()
+            && !self.version_info_visible
             && !self.quit_confirmation_visible
             && self.resume_confirmation.is_none()
             && self.remote_update_dialog.is_none()
@@ -6868,6 +6888,10 @@ impl App {
         let Some(hitbox) = self.settings_controls_hitbox.as_ref() else {
             return false;
         };
+        if rect_contains(hitbox.version_info, column, row) {
+            self.open_version_info();
+            return true;
+        }
         let item = SettingItem::ALL
             .into_iter()
             .find(|item| rect_contains(hitbox.rows[item.index()], column, row));
@@ -7642,6 +7666,33 @@ impl App {
         false
     }
 
+    fn open_version_info(&mut self) {
+        self.version_info_visible = true;
+        self.version_info_offset = 0;
+        self.scroll_drag = None;
+        self.trend_drag = None;
+        self.summary_daily_dragging = false;
+    }
+
+    fn close_version_info(&mut self) {
+        self.version_info_visible = false;
+        self.version_info_hitbox = None;
+        self.scroll_drag = None;
+    }
+
+    fn scroll_version_info(&mut self, down: bool, lines: usize) {
+        let capacity = self
+            .version_info_hitbox
+            .map_or(0, |hitbox| usize::from(hitbox.content.height));
+        self.version_info_offset = scroll_offset(
+            self.version_info_offset,
+            self.version_info_line_count,
+            capacity,
+            down,
+            lines,
+        );
+    }
+
     fn open_quit_confirmation(&mut self) {
         self.quit_confirmation_visible = true;
         self.quit_requested = false;
@@ -7704,6 +7755,9 @@ impl App {
             ScrollTarget::Turns => self.turn_scrollbar_hitbox,
             ScrollTarget::Summary => self.summary_scrollbar_hitbox,
             ScrollTarget::Diagnostics => self.diagnostics_scrollbar_hitbox,
+            ScrollTarget::VersionInfo => {
+                self.version_info_hitbox.and_then(|hitbox| hitbox.scrollbar)
+            }
             ScrollTarget::ProjectMappings => self
                 .settings_controls_hitbox
                 .as_ref()
@@ -7713,6 +7767,7 @@ impl App {
 
     fn begin_scrollbar_drag_at(&mut self, column: u16, row: u16) -> bool {
         let Some((target, hitbox)) = [
+            ScrollTarget::VersionInfo,
             ScrollTarget::Diagnostics,
             ScrollTarget::ProjectMappings,
             ScrollTarget::Summary,
@@ -7731,7 +7786,10 @@ impl App {
         match target {
             ScrollTarget::Tasks => self.transition_to_tasks(),
             ScrollTarget::Turns => self.focus = Focus::Turns,
-            ScrollTarget::Summary | ScrollTarget::ProjectMappings | ScrollTarget::Diagnostics => {}
+            ScrollTarget::Summary
+            | ScrollTarget::ProjectMappings
+            | ScrollTarget::Diagnostics
+            | ScrollTarget::VersionInfo => {}
         }
         let on_thumb = rect_contains(hitbox.thumb, column, row);
         self.scroll_drag = Some(ScrollDrag {
@@ -7781,6 +7839,7 @@ impl App {
             }
             ScrollTarget::Summary => self.summary_offset = offset,
             ScrollTarget::Diagnostics => self.diagnostics_offset = offset,
+            ScrollTarget::VersionInfo => self.version_info_offset = offset,
             ScrollTarget::ProjectMappings => {
                 self.project_mapping_reveal_pending = false;
                 self.project_mapping_offset = offset;
@@ -8013,6 +8072,49 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                 .is_some_and(|hitbox| rect_contains(hitbox.cancel, event.column, event.row))
             {
                 app.close_quit_confirmation();
+            }
+        }
+        return true;
+    }
+
+    if app.version_info_visible {
+        if let Some(hitbox) = app.version_info_hitbox {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.scroll_drag = None;
+                    if rect_contains(hitbox.back, event.column, event.row) {
+                        app.close_version_info();
+                    } else if rect_contains(hitbox.up, event.column, event.row) {
+                        app.scroll_version_info(false, 1);
+                    } else if rect_contains(hitbox.down, event.column, event.row) {
+                        app.scroll_version_info(true, 1);
+                    } else if hitbox
+                        .scrollbar
+                        .is_some_and(|bar| rect_contains(bar.track, event.column, event.row))
+                    {
+                        app.begin_scrollbar_drag_at(event.column, event.row);
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left)
+                    if app
+                        .scroll_drag
+                        .is_some_and(|drag| drag.target == ScrollTarget::VersionInfo) =>
+                {
+                    app.drag_scrollbar_to(event.row);
+                }
+                MouseEventKind::Up(MouseButton::Left) => app.scroll_drag = None,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if rect_contains(hitbox.content, event.column, event.row)
+                        || hitbox.scrollbar.is_some_and(|bar| {
+                            rect_contains(bar.track, event.column, event.row)
+                        }) =>
+                {
+                    app.scroll_version_info(
+                        event.kind == MouseEventKind::ScrollDown,
+                        MOUSE_SCROLL_LINES,
+                    );
+                }
+                _ => {}
             }
         }
         return true;
@@ -8332,6 +8434,25 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    if app.version_info_visible {
+        let page = app
+            .version_info_hitbox
+            .map_or(1, |hitbox| usize::from(hitbox.content.height).max(1));
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('?' | 'q') => {
+                app.close_version_info();
+            }
+            KeyCode::Up => app.scroll_version_info(false, 1),
+            KeyCode::Down => app.scroll_version_info(true, 1),
+            KeyCode::PageUp => app.scroll_version_info(false, page),
+            KeyCode::PageDown => app.scroll_version_info(true, page),
+            KeyCode::Home => app.version_info_offset = 0,
+            KeyCode::End => app.scroll_version_info(true, usize::MAX),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.focus == Focus::TaskSearch {
         match key.code {
             KeyCode::Esc => app.cancel_task_search(),
@@ -8383,6 +8504,15 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => {}
         }
+        return false;
+    }
+
+    if key.code == KeyCode::Char('?')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        app.open_version_info();
         return false;
     }
 
@@ -11713,6 +11843,7 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     app.models_details_hitbox = Rect::default();
     app.diagnostics_scrollbar_hitbox = None;
     app.quit_confirmation_hitbox = None;
+    app.version_info_hitbox = None;
     app.resume_confirmation_hitbox = None;
     let palette = app.theme.palette();
     frame.render_widget(Block::default().style(app.theme.base_style()), area);
@@ -11811,12 +11942,6 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
     }) {
         app.trend_drag = None;
     }
-    if app
-        .scroll_drag
-        .is_some_and(|drag| app.scrollbar_hitbox(drag.target).is_none())
-    {
-        app.scroll_drag = None;
-    }
     if app.remote_editor.is_some() {
         app.remote_editor_hitbox = Some(render_remote_editor(frame, area, app));
     } else if app.remote_update_dialog.is_some() {
@@ -11831,6 +11956,14 @@ fn render_at(frame: &mut Frame<'_>, app: &mut App, now: DateTime<Utc>) {
         app.resume_confirmation_hitbox = Some(render_resume_confirmation(frame, area, app));
     } else if app.quit_confirmation_visible {
         app.quit_confirmation_hitbox = Some(render_quit_confirmation(frame, area, app.theme));
+    } else if app.version_info_visible {
+        app.version_info_hitbox = Some(render_version_info(frame, area, app));
+    }
+    if app
+        .scroll_drag
+        .is_some_and(|drag| app.scrollbar_hitbox(drag.target).is_none())
+    {
+        app.scroll_drag = None;
     }
 }
 
@@ -12967,6 +13100,155 @@ fn render_remote_purge_confirmation(
     RemotePurgeConfirmationHitbox { confirm, cancel }
 }
 
+fn render_version_info(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> VersionInfoHitbox {
+    let palette = app.theme.palette();
+    let popup_width = if area.width >= 8 {
+        area.width.saturating_sub(4).min(100)
+    } else {
+        area.width
+    };
+    let popup_height = if area.height >= 8 {
+        area.height.saturating_sub(4).min(36)
+    } else {
+        area.height
+    };
+    let popup = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(popup_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(popup_height) / 2),
+        popup_width,
+        popup_height,
+    );
+    let block = panel("Version info", app.theme)
+        .border_style(Style::default().fg(palette.accent))
+        .style(app.theme.base_style());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let content = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if inner.is_empty() {
+        app.version_info_line_count = 0;
+        app.version_info_offset = 0;
+        return VersionInfoHitbox {
+            content,
+            ..VersionInfoHitbox::default()
+        };
+    }
+    let title_style = Style::default()
+        .fg(palette.title)
+        .add_modifier(Modifier::BOLD);
+    let notes = crate::version_info::current_release_notes();
+    let mut lines = vec![
+        Line::styled(env!("CARGO_PKG_NAME"), title_style),
+        Line::from(format!("Version: {}", crate::version_info::VERSION)),
+        Line::from(format!(
+            "Released: {}",
+            notes.as_ref().map_or("Unknown", |notes| notes.date)
+        )),
+        Line::from(format!("Target: {}", crate::version_info::TARGET)),
+        Line::from(format!("Build: {}", crate::version_info::BUILD_ID)),
+        Line::default(),
+        Line::styled("Release notes", title_style),
+        Line::default(),
+    ];
+    if let Some(notes) = notes.filter(|notes| !notes.body.is_empty()) {
+        lines.extend(notes.body.lines().map(|line| {
+            if let Some(heading) = line.strip_prefix("### ") {
+                Line::styled(heading, title_style)
+            } else if let Some(item) = line.strip_prefix("- ") {
+                Line::from(format!("• {item}"))
+            } else {
+                Line::from(line)
+            }
+        }));
+    } else {
+        lines.push(Line::from("No bundled release notes for this version."));
+    }
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(palette.foreground))
+        .wrap(Wrap { trim: false });
+    app.version_info_line_count = paragraph.line_count(content.width);
+    app.version_info_offset = app.version_info_offset.min(
+        app.version_info_line_count
+            .saturating_sub(usize::from(content.height)),
+    );
+    frame.render_widget(
+        paragraph.scroll((
+            u16::try_from(app.version_info_offset).unwrap_or(u16::MAX),
+            0,
+        )),
+        content,
+    );
+    let scrollbar = scrollbar_geometry(
+        Rect::new(content.right(), content.y, 1, content.height),
+        app.version_info_line_count,
+        usize::from(content.height),
+        app.version_info_offset,
+    );
+    if let Some(bar) = scrollbar {
+        render_scrollbar(frame, bar, app.theme, true);
+    }
+
+    let controls = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        u16::from(inner.height > 0),
+    );
+    let full = controls.width >= 25;
+    let mut spans = Vec::new();
+    let mut x = controls.x;
+    let mut hitbox = VersionInfoHitbox {
+        content,
+        scrollbar,
+        ..VersionInfoHitbox::default()
+    };
+    // Always retain the return control when only one label fits.
+    let specs: &[(char, &str)] = if controls.width < 13 {
+        &[('←', if full { "Back" } else { "" })]
+    } else {
+        &[
+            ('↑', if full { "Up" } else { "" }),
+            ('↓', if full { "Down" } else { "" }),
+            ('←', if full { "Back" } else { "" }),
+        ]
+    };
+    for &(shortcut, suffix) in specs {
+        let leading = if spans.is_empty() { "" } else { "  " };
+        let control = append_summary_control(
+            &mut spans,
+            controls,
+            &mut x,
+            SummaryControlSpec {
+                leading,
+                shortcut: match shortcut {
+                    '↑' => "↑",
+                    '↓' => "↓",
+                    _ => "←",
+                }
+                .to_string(),
+                suffix,
+                selected: false,
+                shortcuts_active: true,
+                theme: app.theme,
+            },
+        );
+        match shortcut {
+            '↑' => hitbox.up = control,
+            '↓' => hitbox.down = control,
+            _ => hitbox.back = control,
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), controls);
+    hitbox
+}
+
 fn render_quit_confirmation(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -13222,7 +13504,35 @@ fn render_settings_group(
         return;
     }
     let mut block = panel(title, app.theme);
-    if show_hint {
+    if matches!(title, " Settings" | " Display") {
+        let label = if area.width >= 28 { "Version info" } else { "" };
+        let width = u16::try_from(UnicodeWidthStr::width(label))
+            .unwrap_or(u16::MAX)
+            .saturating_add(3);
+        let controls = Rect::new(
+            area.right().saturating_sub(width.saturating_add(1)),
+            area.y,
+            width.min(area.width.saturating_sub(2)),
+            1,
+        );
+        let mut spans = Vec::new();
+        let mut x = controls.x;
+        hitbox.version_info = append_summary_control(
+            &mut spans,
+            controls,
+            &mut x,
+            SummaryControlSpec {
+                leading: "",
+                shortcut: "?".to_string(),
+                suffix: label,
+                selected: false,
+                shortcuts_active: app.shortcuts_active(),
+                theme: app.theme,
+            },
+        );
+        block = block.title_top(Line::from(spans).right_aligned());
+    }
+    if show_hint && area.height > 1 {
         block = block.title_bottom(settings_hint(app));
     }
     let inner = block.inner(area);

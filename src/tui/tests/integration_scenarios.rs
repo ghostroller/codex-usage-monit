@@ -2651,6 +2651,16 @@ fn svg_gallery_is_generated_from_the_same_semantic_frames() {
     quit.key(KeyCode::Esc);
     scenarios.push(("quit-confirmation-60x24", quit));
 
+    for (name, width, height, theme) in [
+        ("version-info-dark-120x40", 120, 40, Theme::Dark),
+        ("version-info-light-60x24", 60, 24, Theme::Light),
+    ] {
+        let mut version = TuiHarness::from_fixture("normal", width, height, theme);
+        version.key(KeyCode::Char('4'));
+        version.key(KeyCode::Char('?'));
+        scenarios.push((name, version));
+    }
+
     for (name, harness) in scenarios {
         let svg = harness.frame().to_svg(name);
         assert!(svg.starts_with("<svg"));

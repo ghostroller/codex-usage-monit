@@ -76,6 +76,7 @@ pub mod trends;
 pub mod tui;
 pub mod ui_state;
 pub mod update;
+mod version_info;
 #[cfg(windows)]
 mod windows_private_directory;
 #[cfg(windows)]

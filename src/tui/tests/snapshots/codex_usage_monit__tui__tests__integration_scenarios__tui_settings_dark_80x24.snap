@@ -1,12 +1,11 @@
 ---
 source: src/tui/tests/integration_scenarios.rs
-assertion_line: 267
 expression: settings.frame().snapshot_text()
 ---
 size=80x24
 rows:
 00| 1 Ovw  |  2 Tr  |  U Sum  |  3 Other  |  4 Set
-01|┌ Display──────────────────────────────┐┌ Table columns────────────────────────┐
+01|┌ Display───────────────[?]Version info┐┌ Table columns────────────────────────┐
 02|│▌ [T]Theme                    Dark    ││  [K]Tokens                   On      │
 03|│  [V]Turns panel              On      ││  [P]Token share              On      │
 04|│  [M]Models panel             On      ││  [E]Estimated quota          On      │
@@ -42,7 +41,11 @@ styles:
 00:044+003 fg=#f4f6f8 bg=#121417 mods=bold text="Set"
 01:000+001 fg=#4b525c bg=#121417 mods=none text="┌"
 01:001+008 fg=#f4f6f8 bg=#121417 mods=bold text=" Display"
-01:009+032 fg=#4b525c bg=#121417 mods=none text="──────────────────────────────┐┌"
+01:009+015 fg=#4b525c bg=#121417 mods=none text="───────────────"
+01:024+001 fg=#7e8691 bg=#121417 mods=none text="["
+01:025+001 fg=#3fb9c0 bg=#121417 mods=bold text="?"
+01:026+013 fg=#7e8691 bg=#121417 mods=none text="]Version info"
+01:039+002 fg=#4b525c bg=#121417 mods=none text="┐┌"
 01:041+014 fg=#f4f6f8 bg=#121417 mods=bold text=" Table columns"
 01:055+025 fg=#4b525c bg=#121417 mods=none text="────────────────────────┐"
 02:000+001 fg=#4b525c bg=#121417 mods=none text="│"
@@ -142,3 +145,4 @@ SettingTokens binding=K rect=41,2,38,1
 SettingTokenShare binding=P rect=41,3,38,1
 SettingEstimatedQuota binding=E rect=41,4,38,1
 SettingApiEquivalent binding=A rect=41,5,38,1
+VersionInfo binding=? rect=24,1,15,1

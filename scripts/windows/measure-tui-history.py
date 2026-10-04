@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import shutil
 import statistics
 import subprocess
@@ -275,12 +276,21 @@ def environment(protocol):
 
 
 def source_build_id(revision):
+    build_script = subprocess.check_output(["git", "-c", f"safe.directory={ROOT.as_posix()}", "show", f"{revision}:build.rs"], cwd=ROOT).decode("utf-8")
+    # Frozen comparison binaries may predate newly bundled inputs. Use each
+    # revision's declared file inputs instead of today's list for both builds.
+    declared = re.search(r"let mut files = vec!\[(.*?)\];", build_script, re.DOTALL)
+    if declared is None:
+        raise RuntimeError(f"unsupported build identity inputs in {revision}:build.rs")
+    explicit = re.findall(r'PathBuf::from\("([^"\n]+)"\)', declared.group(1))
+    if not explicit or len(explicit) != declared.group(1).count("PathBuf::from("):
+        raise RuntimeError(f"unsupported build identity inputs in {revision}:build.rs")
     archive = subprocess.check_output(["git", "-c", f"safe.directory={ROOT.as_posix()}", "archive", "--format=tar", revision,
-                                       "Cargo.toml", "Cargo.lock", "build.rs", "src"], cwd=ROOT)
+                                       *explicit, "src"], cwd=ROOT)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
         files = {member.name: tree.extractfile(member).read().decode("utf-8").replace("\r\n", "\n").encode("utf-8")
-                 for member in tree.getmembers() if member.isfile() and (member.name.endswith(".rs") or member.name in
-                    ("Cargo.toml", "Cargo.lock", "src/remote_agent_manager/release_bootstrap.py", "src/remote_agent_manager/release_bootstrap.ps1"))}
+                 for member in tree.getmembers() if member.isfile() and
+                 (member.name in explicit or (member.name.startswith("src/") and member.name.endswith(".rs")))}
     digest = hashlib.sha256()
     for name, data in sorted(files.items()):
         name = name.encode("utf-8")
