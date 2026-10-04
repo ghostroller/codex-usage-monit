@@ -1,3 +1,4 @@
+use super::super::entity_detail::DetailNode;
 use super::testkit::{TuiHarness, gallery_directory};
 use super::*;
 
@@ -86,14 +87,1749 @@ fn open_with_lines(harness: &mut TuiHarness, lines: Vec<Line<'static>>) {
         &mut harness.app,
         key_event(KeyCode::F(2))
     ));
+    let theme = harness.app.theme;
+    let popup = harness
+        .app
+        .entity_detail
+        .as_mut()
+        .expect("details must open");
+    popup.document = vec![DetailNode::Lines(lines)];
+    // These plain lines have no width-dependent Usage blocks; render wraps them.
+    popup.rebuild(1, theme);
+    harness.render();
+}
+
+fn section_ids(document: &[DetailNode], foldable_only: bool) -> Vec<String> {
+    let mut ids = Vec::new();
+    for node in document {
+        if let DetailNode::Section {
+            id,
+            foldable,
+            children,
+            ..
+        } = node
+        {
+            if !foldable_only || *foldable {
+                ids.push(id.clone());
+            }
+            ids.extend(section_ids(children, foldable_only));
+        }
+    }
+    ids
+}
+
+fn has_usage_node(document: &[DetailNode]) -> bool {
+    document.iter().any(|node| match node {
+        DetailNode::Usage(_) => true,
+        DetailNode::Section { children, .. } => has_usage_node(children),
+        DetailNode::Lines(_) => false,
+    })
+}
+
+fn section_children<'a>(document: &'a [DetailNode], target: &str) -> Option<&'a [DetailNode]> {
+    for node in document {
+        if let DetailNode::Section { id, children, .. } = node {
+            if id == target {
+                return Some(children);
+            }
+            if let Some(found) = section_children(children, target) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn expand_all(harness: &mut TuiHarness) {
+    loop {
+        let popup = harness.app.entity_detail.as_ref().unwrap();
+        let unopened = section_ids(&popup.document, true)
+            .into_iter()
+            .filter(|id| !popup.expanded.contains(id))
+            .collect::<Vec<_>>();
+        if unopened.is_empty() {
+            break;
+        }
+        let width = harness
+            .app
+            .entity_detail_hitbox
+            .map_or(1, |hitbox| hitbox.content.width);
+        let theme = harness.app.theme;
+        let popup = harness.app.entity_detail.as_mut().unwrap();
+        popup.expanded.extend(unopened);
+        popup.rebuild(width, theme);
+        harness.render();
+    }
+}
+
+fn open_expanded(harness: &mut TuiHarness) {
+    open(harness);
+    expand_all(harness);
+}
+
+fn section_expanded(harness: &TuiHarness, id: &str) -> bool {
+    harness
+        .app
+        .entity_detail
+        .as_ref()
+        .unwrap()
+        .expanded
+        .contains(id)
+}
+
+fn focus_section(harness: &mut TuiHarness, id: &str) -> Rect {
+    let limit = harness.app.entity_detail.as_ref().unwrap().headers.len();
+    for _ in 0..=limit {
+        if harness
+            .app
+            .entity_detail
+            .as_ref()
+            .unwrap()
+            .selected_section
+            .as_deref()
+            == Some(id)
+        {
+            // Cycling also scrolls an offscreen selected header into view.
+            if let Some((_, rect)) = harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .section_hitboxes
+                .iter()
+                .find(|(section, _)| section == id)
+            {
+                return *rect;
+            }
+        }
+        let popup = harness.app.entity_detail.as_ref().unwrap();
+        let target = popup
+            .headers
+            .iter()
+            .position(|header| header.id == id)
+            .unwrap_or_else(|| panic!("section {id} must be visible through its ancestors"));
+        let current = popup
+            .headers
+            .iter()
+            .position(|header| Some(&header.id) == popup.selected_section.as_ref());
+        let backwards = match current {
+            Some(current) => {
+                (current + limit - target) % limit < (target + limit - current) % limit
+            }
+            None => target >= limit / 2,
+        };
+        harness.key(if backwards {
+            KeyCode::BackTab
+        } else {
+            KeyCode::Tab
+        });
+    }
+    panic!("section {id} must be selectable and reachable");
+}
+
+fn first_tool_call_id(harness: &TuiHarness) -> String {
+    let document = &harness.app.entity_detail.as_ref().unwrap().document;
+    let calls = section_children(document, "recorded.tools").expect("tool section");
+    calls
+        .iter()
+        .find_map(|node| match node {
+            DetailNode::Section { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("one independently foldable call")
+}
+
+fn tool_body_ids(harness: &TuiHarness, call: &str) -> (String, String) {
+    let document = &harness.app.entity_detail.as_ref().unwrap().document;
+    let children = section_children(document, call).expect("expanded call section");
+    let child = |label: &str| {
+        children
+            .iter()
+            .find_map(|node| match node {
+                DetailNode::Section { id, title, .. } if title.contains(label) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label} section inside call"))
+    };
+    (child("Arguments"), child("Output"))
+}
+
+fn tool_layer_ids(harness: &TuiHarness) -> (String, String, String) {
+    let call = first_tool_call_id(harness);
+    let (arguments, output) = tool_body_ids(harness, &call);
+    (call, arguments, output)
+}
+
+fn expand_tool_layers(harness: &mut TuiHarness) {
+    if !section_expanded(harness, "recorded.tools") {
+        assert!(harness.app.toggle_entity_detail_section("recorded.tools"));
+        harness.render();
+    }
+    let call = first_tool_call_id(harness);
+    if !section_expanded(harness, &call) {
+        assert!(harness.app.toggle_entity_detail_section(&call));
+        harness.render();
+    }
+    let (arguments, output) = tool_body_ids(harness, &call);
+    for id in [arguments, output] {
+        if !section_expanded(harness, &id) {
+            assert!(harness.app.toggle_entity_detail_section(&id));
+            harness.render();
+        }
+    }
+}
+
+fn save_gallery(harness: &TuiHarness, name: &str) {
+    let directory = gallery_directory();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{name}.svg")),
+        harness.frame().to_svg(name),
+    )
+    .unwrap();
+}
+
+fn rendered_row(harness: &TuiHarness, area: Rect, row: u16) -> String {
+    let mut text = String::new();
+    let mut column = area.x;
+    while column < area.right() {
+        let symbol = harness.cell_style(column, row).0;
+        // A wide grapheme's continuation cell is not another space in its text.
+        column += UnicodeWidthStr::width(symbol.as_str()).max(1) as u16;
+        text.push_str(&symbol);
+    }
+    text
+}
+
+fn rendered_region(harness: &TuiHarness, area: Rect) -> String {
+    (area.y..area.bottom())
+        .map(|row| rendered_row(harness, area, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn scroll_to_body_marker(harness: &mut TuiHarness, marker: &str) {
+    let limit = harness.app.entity_detail.as_ref().unwrap().line_count;
+    for _ in 0..=limit {
+        let body = harness.app.entity_detail_hitbox.unwrap().body;
+        if rendered_row(harness, body, body.y).contains(marker) {
+            return;
+        }
+        let previous = harness.app.entity_detail.as_ref().unwrap().offset;
+        harness.key(KeyCode::Down);
+        assert_ne!(
+            harness.app.entity_detail.as_ref().unwrap().offset,
+            previous,
+            "{marker} must remain reachable in the actual body viewport"
+        );
+    }
+    panic!("{marker} must appear within the finite document");
+}
+
+fn sticky_headers(harness: &TuiHarness) -> Vec<(String, Rect)> {
+    let controls = harness.app.entity_detail_hitbox.unwrap();
+    let mut headers = harness
+        .app
+        .entity_detail
+        .as_ref()
+        .unwrap()
+        .section_hitboxes
+        .iter()
+        .filter(|(_, rect)| rect.y < controls.body.y)
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.sort_by_key(|(_, rect)| rect.y);
+    headers
+}
+
+fn assert_section_binding(harness: &TuiHarness, rect: Rect, active: bool) {
+    let mut found = 0;
+    for row in rect.y..rect.bottom() {
+        for column in rect.x..rect.right() {
+            let (symbol, foreground, modifier) = harness.cell_style(column, row);
+            if symbol == "↵" {
+                found += 1;
+                assert_eq!(foreground == harness.app.theme.palette().accent, active);
+                assert_eq!(modifier.contains(Modifier::BOLD), active);
+            } else {
+                assert_ne!(foreground, harness.app.theme.palette().accent);
+            }
+        }
+    }
+    assert_eq!(found, 1, "the exact Enter binding appears once in {rect:?}");
+}
+
+fn sticky_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = detail_harness(width, height, theme);
+    harness.app.local_snapshot.tasks.clear();
+    open_with_lines(&mut harness, Vec::new());
+    let popup = harness.app.entity_detail.as_mut().unwrap();
+    popup.document = vec![
+        DetailNode::Section {
+            id: "fixture.tools".to_string(),
+            title: "Tool calls (812)".to_string(),
+            foldable: true,
+            children: vec![
+                DetailNode::Section {
+                    id: "fixture.call".to_string(),
+                    title: format!("exec_command | {} CALL-TITLE-END", "调用 👩‍💻 ".repeat(24)),
+                    foldable: true,
+                    children: vec![DetailNode::Section {
+                        id: "fixture.output".to_string(),
+                        title: format!("Output | {} OUTPUT-TITLE-END", "工具输出 🧑‍💻 ".repeat(24)),
+                        foldable: true,
+                        children: vec![DetailNode::Lines(
+                            (0..100)
+                                .map(|index| Line::from(format!("OUTPUT-{index:03}")))
+                                .collect(),
+                        )],
+                    }],
+                },
+                DetailNode::Section {
+                    id: "fixture.sibling".to_string(),
+                    title: "Next tool".to_string(),
+                    foldable: true,
+                    children: vec![DetailNode::Lines(
+                        (0..60)
+                            .map(|index| Line::from(format!("SIBLING-{index:03}")))
+                            .collect(),
+                    )],
+                },
+            ],
+        },
+        DetailNode::Section {
+            id: "fixture.following".to_string(),
+            title: "Related".to_string(),
+            foldable: true,
+            children: vec![DetailNode::Lines(
+                (0..60)
+                    .map(|index| Line::from(format!("TAIL-{index:03}")))
+                    .collect(),
+            )],
+        },
+    ];
+    popup.expanded.extend(
+        [
+            "fixture.tools",
+            "fixture.call",
+            "fixture.output",
+            "fixture.sibling",
+            "fixture.following",
+        ]
+        .map(str::to_string),
+    );
+    popup.rebuild(1, theme);
+    harness.render();
+    harness
+}
+
+#[test]
+fn entity_detail_default_width_uses_the_terminal_up_to_140_columns() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(32, 14), (60, 24), (120, 40), (160, 40), (200, 40)] {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            let controls = harness.app.entity_detail_hitbox.unwrap();
+            let popup_width = width.saturating_sub(4).min(140);
+            assert_eq!(controls.content.width, popup_width - 3);
+            assert_eq!(controls.content.x, (width - popup_width) / 2 + 1);
+            assert!(controls.content.right() < width);
+            assert_eq!(
+                controls.body, controls.content,
+                "folded groups have no pins"
+            );
+            assert_eq!(
+                controls.scrollbar.unwrap().track.x,
+                controls.content.right()
+            );
+            if width == 160 && theme == Theme::Dark {
+                save_gallery(&harness, "entity-detail-wide-dark-160x40");
+            }
+            harness.resize(32, 14);
+            assert_eq!(harness.app.entity_detail_hitbox.unwrap().content.width, 25);
+            harness.resize(width, height);
+            assert_eq!(
+                harness.app.entity_detail_hitbox.unwrap().content,
+                controls.content
+            );
+            if width == 160 && theme == Theme::Dark {
+                expand_tool_layers(&mut harness);
+                let (call, _, output) = tool_layer_ids(&harness);
+                focus_section(&mut harness, &output);
+                scroll_to_body_marker(&mut harness, "recorded tool output row 030");
+                assert_eq!(
+                    sticky_headers(&harness)
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["recorded.tools", call.as_str(), output.as_str()]
+                );
+                save_gallery(&harness, "entity-detail-sticky-tools-dark-160x40");
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_detail_sticky_headers_follow_expanded_ancestors_and_leave_body_space() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(120, 40), (32, 14)] {
+            let mut harness = sticky_harness(width, height, theme);
+            assert!(sticky_headers(&harness).is_empty());
+            focus_section(&mut harness, "fixture.output");
+            scroll_to_body_marker(&mut harness, "OUTPUT-030");
+            let controls = harness.app.entity_detail_hitbox.unwrap();
+            let pinned = sticky_headers(&harness);
+            assert_eq!(
+                pinned.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                ["fixture.tools", "fixture.call", "fixture.output"]
+            );
+            assert_eq!(controls.body.y, controls.content.y + 3);
+            assert_eq!(controls.body.height, controls.content.height - 3);
+            assert!(controls.body.height >= 2);
+            assert_eq!(controls.body.bottom(), controls.content.bottom());
+            for (index, (id, rect)) in pinned.iter().enumerate() {
+                assert_eq!(rect.y, controls.content.y + index as u16);
+                assert_eq!(rect.height, 1);
+                assert!(rect.right() <= controls.content.right());
+                assert_section_binding(&harness, *rect, id == "fixture.output");
+                let title = rendered_row(&harness, *rect, rect.y);
+                assert!(UnicodeWidthStr::width(title.as_str()) <= usize::from(rect.width));
+                if id != "fixture.tools" {
+                    assert!(title.contains('…'), "long pinned Unicode title: {title:?}");
+                }
+            }
+            assert!(popup_text(&harness.app).contains("CALL-TITLE-END"));
+            assert!(popup_text(&harness.app).contains("OUTPUT-TITLE-END"));
+            assert!(rendered_region(&harness, controls.body).contains("OUTPUT-030"));
+            let body_offset = harness.app.entity_detail.as_ref().unwrap().offset;
+            let tools = focus_section(&mut harness, "fixture.tools");
+            assert_eq!(
+                harness.app.entity_detail.as_ref().unwrap().offset,
+                body_offset
+            );
+            assert_section_binding(&harness, tools, true);
+            focus_section(&mut harness, "fixture.output");
+            assert_eq!(
+                harness.app.entity_detail.as_ref().unwrap().offset,
+                body_offset
+            );
+            for key in ['t', 'T', ' '] {
+                let before = harness.app.entity_detail.as_ref().unwrap().expanded.clone();
+                harness.key(KeyCode::Char(key));
+                assert_eq!(harness.app.entity_detail.as_ref().unwrap().expanded, before);
+            }
+            let offset = harness.app.entity_detail.as_ref().unwrap().offset;
+            harness.key(KeyCode::PageDown);
+            assert_eq!(
+                harness.app.entity_detail.as_ref().unwrap().offset,
+                offset + usize::from(controls.body.height)
+            );
+            harness.key(KeyCode::PageUp);
+            assert_eq!(harness.app.entity_detail.as_ref().unwrap().offset, offset);
+            if width == 120 && theme == Theme::Dark {
+                harness.resize(160, 40);
+                scroll_to_body_marker(&mut harness, "OUTPUT-030");
+                save_gallery(&harness, "entity-detail-sticky-dark-160x40");
+                harness.resize(width, height);
+            }
+            if width == 32 && theme == Theme::Light {
+                save_gallery(&harness, "entity-detail-sticky-light-32x14");
+            }
+            scroll_to_body_marker(&mut harness, "SIBLING-030");
+            assert_eq!(
+                sticky_headers(&harness)
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                ["fixture.tools", "fixture.sibling"]
+            );
+            scroll_to_body_marker(&mut harness, "TAIL-020");
+            assert_eq!(
+                sticky_headers(&harness)
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                ["fixture.following"]
+            );
+            harness.key(KeyCode::End);
+            let end = harness.app.entity_detail_hitbox.unwrap();
+            let popup = harness.app.entity_detail.as_ref().unwrap();
+            assert_eq!(
+                popup.offset,
+                popup.scroll_limit(usize::from(end.content.height))
+            );
+            assert_eq!(popup.offset, end.scrollbar.unwrap().max_offset);
+            assert!(rendered_region(&harness, end.body).contains("TAIL-059"));
+            assert_binding(&harness, end.down, "↓", false);
+            let previous = popup.offset;
+            mouse_at(
+                &mut harness,
+                MouseEventKind::ScrollDown,
+                end.body.x,
+                end.body.y,
+            );
+            assert_eq!(harness.app.entity_detail.as_ref().unwrap().offset, previous);
+            harness.key(KeyCode::Home);
+            let bar = harness.app.entity_detail_hitbox.unwrap().scrollbar.unwrap();
+            mouse_at(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                bar.thumb.x,
+                bar.thumb.y,
+            );
+            mouse_at(
+                &mut harness,
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.track.x,
+                bar.track.bottom() - 1,
+            );
+            mouse_at(
+                &mut harness,
+                MouseEventKind::Up(MouseButton::Left),
+                bar.track.x,
+                bar.track.bottom() - 1,
+            );
+            let dragged = harness.app.entity_detail_hitbox.unwrap();
+            assert_eq!(
+                harness.app.entity_detail.as_ref().unwrap().offset,
+                dragged.scrollbar.unwrap().max_offset
+            );
+            assert!(rendered_region(&harness, dragged.body).contains("TAIL-059"));
+            assert!(harness.app.scroll_drag.is_none());
+        }
+    }
+}
+
+#[test]
+fn entity_detail_sticky_whole_labels_collapse_their_sections_and_restore_focus() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in [(120, 40), (32, 14)] {
+            let mut harness = sticky_harness(width, height, theme);
+            focus_section(&mut harness, "fixture.output");
+            scroll_to_body_marker(&mut harness, "OUTPUT-030");
+            for id in ["fixture.tools", "fixture.call", "fixture.output"] {
+                let rect = sticky_headers(&harness)
+                    .into_iter()
+                    .find(|(candidate, _)| candidate == id)
+                    .unwrap()
+                    .1;
+                let columns = if width == 32 {
+                    (rect.x..rect.right()).collect::<Vec<_>>()
+                } else {
+                    vec![rect.x, rect.right() - 1]
+                };
+                for column in columns {
+                    let current = sticky_headers(&harness)
+                        .into_iter()
+                        .find(|(candidate, _)| candidate == id)
+                        .unwrap()
+                        .1;
+                    assert!(click_at(&mut harness, current, column));
+                    assert!(!section_expanded(&harness, id));
+                    let popup = harness.app.entity_detail.as_ref().unwrap();
+                    assert_eq!(popup.selected_section.as_deref(), Some(id));
+                    assert!(!popup_text(&harness.app).contains("OUTPUT-030"));
+                    let heading = popup
+                        .section_hitboxes
+                        .iter()
+                        .find(|(candidate, _)| candidate == id)
+                        .unwrap()
+                        .1;
+                    let body = harness.app.entity_detail_hitbox.unwrap().body;
+                    assert!(
+                        heading.y >= body.y,
+                        "collapse restores the real flow heading"
+                    );
+                    assert_section_binding(&harness, heading, true);
+                    harness.key(KeyCode::Enter);
+                    assert!(section_expanded(&harness, id));
+                    scroll_to_body_marker(&mut harness, "OUTPUT-030");
+                }
+            }
+            focus_section(&mut harness, "fixture.output");
+            scroll_to_body_marker(&mut harness, "OUTPUT-030");
+            focus_section(&mut harness, "fixture.tools");
+            for (new_width, new_height) in [(32, 14), (120, 40), (width, height)] {
+                harness.resize(new_width, new_height);
+                assert_eq!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .selected_section
+                        .as_deref(),
+                    Some("fixture.tools")
+                );
+                assert!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .section_hitboxes
+                        .iter()
+                        .any(|(id, rect)| id == "fixture.tools" && !rect.is_empty())
+                );
+                assert!(harness.app.entity_detail_hitbox.unwrap().body.height >= 2);
+                let body = harness.app.entity_detail_hitbox.unwrap().body;
+                assert!(
+                    rendered_row(&harness, body, body.y).contains("OUTPUT-030"),
+                    "resize retains the body position beneath pinned ancestors"
+                );
+            }
+            for (new_width, new_height) in [(32, 11), (24, 10), (16, 9), (8, 5), (3, 2), (1, 1)] {
+                harness.resize(120, 40);
+                focus_section(&mut harness, "fixture.output");
+                scroll_to_body_marker(&mut harness, "OUTPUT-030");
+                harness.resize(new_width, new_height);
+                let controls = harness.app.entity_detail_hitbox.unwrap();
+                let pins = sticky_headers(&harness);
+                assert!(pins.len() <= 3);
+                assert!(pins.len() <= usize::from(controls.content.height.saturating_sub(2)));
+                if new_height >= 10 {
+                    let expected = ["fixture.tools", "fixture.call", "fixture.output"];
+                    let count = usize::from(controls.content.height.saturating_sub(2)).min(3);
+                    assert_eq!(
+                        pins.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                        expected[3 - count..]
+                    );
+                }
+                if controls.content.height >= 2 {
+                    assert!(controls.body.height >= 2);
+                }
+                harness.key(KeyCode::End);
+                assert!(harness.app.entity_detail.is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_detail_sticky_tail_limit_does_not_oscillate_when_an_ancestor_ends() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut harness = detail_harness(60, 17, theme);
+        harness.app.local_snapshot.tasks.clear();
+        open_with_lines(&mut harness, Vec::new());
+        let popup = harness.app.entity_detail.as_mut().unwrap();
+        popup.document = vec![
+            DetailNode::Section {
+                id: "fixture.ending".to_string(),
+                title: "Ending ancestor".to_string(),
+                foldable: true,
+                children: vec![DetailNode::Lines(
+                    (0..90)
+                        .map(|index| Line::from(format!("ANCESTOR-{index:03}")))
+                        .collect(),
+                )],
+            },
+            DetailNode::Lines(
+                (0..9)
+                    .map(|index| Line::from(format!("TAIL-{index:03}")))
+                    .collect(),
+            ),
+        ];
+        popup.expanded.insert("fixture.ending".to_string());
+        popup.rebuild(1, theme);
+        harness.render();
+        let content = harness.app.entity_detail_hitbox.unwrap().content;
+        assert_eq!(content.height, 10);
+        assert_eq!(harness.app.entity_detail.as_ref().unwrap().line_count, 100);
+        assert_eq!(
+            harness.app.entity_detail.as_ref().unwrap().scroll_limit(10),
+            91
+        );
+        harness.app.entity_detail.as_mut().unwrap().offset = 90;
+        harness.render();
+        assert_eq!(sticky_headers(&harness).len(), 1);
+        assert_eq!(harness.app.entity_detail_hitbox.unwrap().body.height, 9);
+        assert!(
+            !rendered_region(&harness, harness.app.entity_detail_hitbox.unwrap().body)
+                .contains("TAIL-008")
+        );
+        harness.key(KeyCode::Down);
+        assert!(sticky_headers(&harness).is_empty());
+        assert_eq!(harness.app.entity_detail_hitbox.unwrap().body.height, 10);
+        for _ in 0..4 {
+            harness.render();
+            harness.key(KeyCode::Down);
+            assert_eq!(harness.app.entity_detail.as_ref().unwrap().offset, 91);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail_hitbox
+                    .unwrap()
+                    .scrollbar
+                    .unwrap()
+                    .max_offset,
+                91
+            );
+            assert!(
+                rendered_region(&harness, harness.app.entity_detail_hitbox.unwrap().body)
+                    .contains("TAIL-008")
+            );
+        }
+        harness.key(KeyCode::Home);
+        harness.key(KeyCode::End);
+        assert_eq!(harness.app.entity_detail.as_ref().unwrap().offset, 91);
+    }
+}
+
+#[test]
+fn entity_detail_sticky_scrollbar_drag_reaches_the_end_after_the_thumb_shrinks() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut harness = detail_harness(80, 42, theme);
+        harness.app.local_snapshot.tasks.clear();
+        open_with_lines(&mut harness, Vec::new());
+        let popup = harness.app.entity_detail.as_mut().unwrap();
+        popup.document = vec![DetailNode::Section {
+            id: "fixture.tools".to_string(),
+            title: "Tool calls".to_string(),
+            foldable: true,
+            children: vec![DetailNode::Section {
+                id: "fixture.call".to_string(),
+                title: "exec_command".to_string(),
+                foldable: true,
+                children: vec![DetailNode::Section {
+                    id: "fixture.output".to_string(),
+                    title: "Output".to_string(),
+                    foldable: true,
+                    children: vec![DetailNode::Lines(
+                        (0..80)
+                            .map(|index| Line::from(format!("OUTPUT-{index:03}")))
+                            .collect(),
+                    )],
+                }],
+            }],
+        }];
+        popup
+            .expanded
+            .extend(["fixture.tools", "fixture.call", "fixture.output"].map(str::to_string));
+        popup.rebuild(1, theme);
+        harness.render();
+        let initial = harness.app.entity_detail_hitbox.unwrap();
+        assert_eq!(initial.content.height, 35);
+        assert_eq!(initial.body.height, 35);
+        assert_eq!(harness.app.entity_detail.as_ref().unwrap().line_count, 83);
+        let bar = initial.scrollbar.unwrap();
+        assert_eq!(bar.max_offset, 51);
+        assert_eq!(bar.thumb.height, 15);
+        mouse_at(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            bar.thumb.x,
+            bar.thumb.bottom() - 1,
+        );
+        assert_eq!(harness.app.scroll_drag.unwrap().grab_row, 14);
+        mouse_at(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            bar.track.x,
+            bar.track.y + 25,
+        );
+        let shrunk = harness.app.entity_detail_hitbox.unwrap();
+        assert_eq!(sticky_headers(&harness).len(), 3);
+        assert_eq!(shrunk.body.height, 32);
+        assert_eq!(shrunk.scrollbar.unwrap().thumb.height, 14);
+        mouse_at(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            bar.track.x,
+            bar.track.bottom() - 1,
+        );
+        let end = harness.app.entity_detail_hitbox.unwrap();
+        assert_eq!(harness.app.entity_detail.as_ref().unwrap().offset, 51);
+        assert_eq!(
+            harness.app.entity_detail.as_ref().unwrap().offset,
+            end.scrollbar.unwrap().max_offset
+        );
+        assert_eq!(harness.app.scroll_drag.unwrap().grab_row, 13);
+        assert!(rendered_region(&harness, end.body).contains("OUTPUT-079"));
+        mouse_at(
+            &mut harness,
+            MouseEventKind::Up(MouseButton::Left),
+            bar.track.x,
+            bar.track.bottom() - 1,
+        );
+        assert!(harness.app.scroll_drag.is_none());
+    }
+}
+
+fn recorded_tools_fixture(
+    captured: DateTime<Utc>,
+    with_tools: bool,
+) -> crate::session_details::SessionDetails {
+    use crate::session_details::{DetailMessage, DetailTool, DetailUsage, SessionDetails};
+
+    let mut data = SessionDetails::default();
+    data.files_read = 1;
+    data.messages.push(DetailMessage {
+        role: "user".to_string(),
+        text: "MESSAGE-BODY-STAYS-HIDDEN-WHEN-TOOLS-EXPAND".to_string(),
+        timestamp: Some(captured),
+        turn_id: Some("fixture-turn".to_string()),
+        phase: Some("commentary".to_string()),
+    });
+    data.metadata
+        .insert("Approval policy".to_string(), "on-request".to_string());
+    if with_tools {
+        data.tools.push(DetailTool {
+            call_id: "fixture-tool-call".to_string(),
+            name: "exec_command".to_string(),
+            arguments: Some("TOOL-ARGUMENTS-MARKER cargo test fixture".to_string()),
+            output: Some(format!(
+                "{}\n工具输出 🧑‍💻 TOOL-OUTPUT-END",
+                (0..80)
+                    .map(|index| format!("recorded tool output row {index:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            exit_code: Some(0),
+            duration_ms: Some(125),
+            timestamp: Some(captured),
+            turn_id: Some("fixture-turn".to_string()),
+            test_command: true,
+        });
+    }
+    data.usage.push(DetailUsage {
+        timestamp: Some(captured),
+        turn_id: Some("fixture-turn".to_string()),
+        model: Some("gpt-5.6-sol".to_string()),
+        service_tier: Some("default".to_string()),
+        tokens: TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..TokenUsage::default()
+        },
+        exact: true,
+    });
+    data
+}
+
+fn recorded_tools_harness(width: u16, height: u16, theme: Theme, with_tools: bool) -> TuiHarness {
+    let mut harness = detail_harness(width, height, theme);
+    // This fixture uses injected evidence and never starts a rollout reader.
+    harness.app.local_snapshot.tasks.clear();
+    open(&mut harness);
+    let data = recorded_tools_fixture(harness.app.snapshot.as_of, with_tools);
     harness
         .app
         .entity_detail
         .as_mut()
-        .expect("details must open")
-        .lines = lines;
-    // Install the long fixture before the first render builds its wrapped-line cache.
+        .unwrap()
+        .set_recorded_details(data, theme);
     harness.render();
+    harness
+}
+
+fn reveal_tools_header(harness: &mut TuiHarness) -> Rect {
+    focus_section(harness, "recorded.tools")
+}
+
+#[test]
+fn entity_detail_large_tool_list_projects_only_expanded_arguments_and_output() {
+    use crate::session_details::{DetailEvidence, DetailTool};
+
+    for (width, height, theme) in [(120, 40, Theme::Dark), (32, 14, Theme::Light)] {
+        let mut harness = recorded_tools_harness(width, height, theme, false);
+        let captured = harness.app.snapshot.as_of;
+        let mut data = recorded_tools_fixture(captured, false);
+        data.tools = (0..812)
+            .map(|index| DetailTool {
+                call_id: if index == 811 {
+                    format!("call-{index:04}-{}ID-END", "调用👩‍💻".repeat(32))
+                } else {
+                    format!("call-{index:04}")
+                },
+                name: format!("tool_{index:03}"),
+                arguments: Some(format!("ARGS-{index:03}")),
+                output: Some(if index == 400 {
+                    format!("UNOPENED-OUTPUT\n{}", "x".repeat(60 * 1024))
+                } else {
+                    format!("OUT-{index:03}")
+                }),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                timestamp: Some(captured),
+                turn_id: Some("fixture-turn".to_string()),
+                test_command: false,
+            })
+            .collect();
+        data.file_changes = (0..16)
+            .map(|index| DetailEvidence {
+                text: format!("UNOPENED-DIFF-{index}\n{}", "+x".repeat(30 * 1024)),
+                timestamp: Some(captured),
+                turn_id: Some("fixture-turn".to_string()),
+            })
+            .collect();
+        harness
+            .app
+            .entity_detail
+            .as_mut()
+            .unwrap()
+            .set_recorded_details(data, theme);
+        harness.render();
+        focus_section(&mut harness, "recorded.tools");
+        harness.key(KeyCode::Enter);
+        let calls = section_children(
+            &harness.app.entity_detail.as_ref().unwrap().document,
+            "recorded.tools",
+        )
+        .unwrap()
+        .iter()
+        .filter_map(|node| match node {
+            DetailNode::Section { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 812, "every recorded call remains selectable");
+        assert!(!popup_text(&harness.app).contains("ARGS-811"));
+        assert!(!popup_text(&harness.app).contains("OUT-811"));
+
+        for index in [811, 0] {
+            let call = &calls[index];
+            focus_section(&mut harness, call);
+            harness.key(KeyCode::Enter);
+            let (arguments, output) = tool_body_ids(&harness, call);
+            for (leaf, marker) in [
+                (&arguments, format!("ARGS-{index:03}")),
+                (&output, format!("OUT-{index:03}")),
+            ] {
+                focus_section(&mut harness, leaf);
+                harness.key(KeyCode::Enter);
+                let header = focus_section(&mut harness, leaf);
+                let body = harness.app.entity_detail_hitbox.unwrap().body;
+                for _ in 0..header.y.saturating_sub(body.y) {
+                    harness.key(KeyCode::Down);
+                }
+                assert!(
+                    popup_text(&harness.app).contains(&marker),
+                    "expanded {leaf} retains its recorded body at {width}x{height}"
+                );
+                assert!(
+                    harness.frame().snapshot_text().contains(&marker),
+                    "expanded {leaf} displays {marker} in the viewport"
+                );
+                for unopened in [
+                    "UNOPENED-DIFF",
+                    "UNOPENED-OUTPUT",
+                    "MESSAGE-BODY-STAYS-HIDDEN",
+                ] {
+                    assert!(!popup_text(&harness.app).contains(unopened));
+                }
+                focus_section(&mut harness, leaf);
+                harness.key(KeyCode::Enter);
+                assert!(!section_expanded(&harness, leaf));
+            }
+            if index == 811 && width == 32 {
+                focus_section(&mut harness, call);
+                // Selecting a pinned ancestor preserves the body position.
+                // Scroll back to its real flow heading before inspecting the
+                // metadata between that heading and Arguments / Output.
+                let header = loop {
+                    let body = harness.app.entity_detail_hitbox.unwrap().body;
+                    if let Some((_, rect)) = harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .section_hitboxes
+                        .iter()
+                        .find(|(id, rect)| id == call && rect.y >= body.y)
+                    {
+                        break *rect;
+                    }
+                    let previous = harness.app.entity_detail.as_ref().unwrap().offset;
+                    harness.key(KeyCode::Up);
+                    assert_ne!(
+                        harness.app.entity_detail.as_ref().unwrap().offset,
+                        previous,
+                        "the real call heading must be reachable above its pinned copy"
+                    );
+                };
+                let content = harness.app.entity_detail_hitbox.unwrap().content;
+                let body = harness.app.entity_detail_hitbox.unwrap().body;
+                for _ in 0..header.y.saturating_sub(body.y) + header.height {
+                    harness.key(KeyCode::Down);
+                }
+                let mut found_continuation = false;
+                let mut found_tail = false;
+                for _ in 0..40 {
+                    for row in content.y..content.bottom() {
+                        let text = (content.x..content.right())
+                            .map(|column| harness.cell_style(column, row).0)
+                            .collect::<String>();
+                        // Wide graphemes occupy a symbol cell plus a blank
+                        // continuation cell, so raw cells do not join as 调用.
+                        if !text.contains("Call ID:")
+                            && (text.contains('调') || text.contains('用'))
+                        {
+                            found_continuation = true;
+                            assert!(text.starts_with("    "), "nested continuation: {text:?}");
+                        }
+                        if text.contains("ID-END") {
+                            found_tail = true;
+                            assert!(text.starts_with("    "), "nested ID tail: {text:?}");
+                        }
+                    }
+                    if found_tail {
+                        break;
+                    }
+                    harness.key(KeyCode::Down);
+                }
+                assert!(
+                    found_continuation,
+                    "long Unicode call ID wraps into the viewport"
+                );
+                assert!(
+                    found_tail,
+                    "the full call ID remains reachable after wrapping"
+                );
+                focus_section(&mut harness, &output);
+                harness.key(KeyCode::Enter);
+                let header = focus_section(&mut harness, &output);
+                let body = harness.app.entity_detail_hitbox.unwrap().body;
+                for _ in 0..header.y.saturating_sub(body.y) {
+                    harness.key(KeyCode::Down);
+                }
+                save_gallery(&harness, "entity-tools-large-list-light-32x14");
+                focus_section(&mut harness, &output);
+                harness.key(KeyCode::Enter);
+            }
+            focus_section(&mut harness, call);
+            harness.key(KeyCode::Enter);
+            assert!(!section_expanded(&harness, call));
+        }
+        assert!(!section_expanded(&harness, "recorded.files"));
+    }
+}
+
+#[test]
+fn entity_detail_tools_use_enter_for_the_list_call_arguments_and_output() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            let initial = harness.state();
+            assert!(!section_expanded(&harness, "recorded.tools"));
+            let collapsed = popup_text(&harness.app);
+            assert!(collapsed.contains("Tool calls (1)"));
+            assert!(collapsed.contains("Usage observations (1)"));
+            for hidden in [
+                "TOOL-ARGUMENTS-MARKER",
+                "TOOL-OUTPUT-END",
+                "MESSAGE-BODY-STAYS-HIDDEN",
+            ] {
+                assert!(!collapsed.contains(hidden));
+            }
+            let header = focus_section(&mut harness, "recorded.tools");
+            assert_binding(&harness, header, "↵", true);
+            for modifiers in [
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+            ] {
+                for key in ['t', 'T', ' '] {
+                    let before = harness.app.entity_detail.as_ref().unwrap().expanded.clone();
+                    handle_key_event(
+                        &mut harness.app,
+                        KeyEvent::new(KeyCode::Char(key), modifiers),
+                    );
+                    harness.render();
+                    assert_eq!(harness.app.entity_detail.as_ref().unwrap().expanded, before);
+                    assert_eq!(harness.app.theme, theme);
+                    assert_eq!(harness.state(), initial);
+                }
+            }
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                handle_key_event(&mut harness.app, KeyEvent::new(KeyCode::Enter, modifiers));
+                harness.render();
+                assert!(!section_expanded(&harness, "recorded.tools"));
+            }
+            for code in ['1', 'U', 'R', 'V', 'd', 'L'] {
+                harness.key(KeyCode::Char(code));
+                assert_eq!(harness.state(), initial);
+                assert_eq!(harness.app.theme, theme);
+            }
+            if width == 120 && theme == Theme::Dark {
+                focus_section(&mut harness, "snapshot.Related");
+                save_gallery(&harness, "entity-sections-folded-dark-120x40");
+                focus_section(&mut harness, "recorded.tools");
+            }
+            harness.key(KeyCode::Enter);
+            assert!(section_expanded(&harness, "recorded.tools"));
+            let call = first_tool_call_id(&harness);
+            assert!(!section_expanded(&harness, &call));
+            assert!(!popup_text(&harness.app).contains("TOOL-ARGUMENTS-MARKER"));
+            assert!(!popup_text(&harness.app).contains("TOOL-OUTPUT-END"));
+            if width == 120 && theme == Theme::Dark {
+                save_gallery(&harness, "entity-tools-list-dark-120x40");
+            }
+            focus_section(&mut harness, &call);
+            harness.key(KeyCode::Enter);
+            assert!(section_expanded(&harness, &call));
+            let (arguments, output) = tool_body_ids(&harness, &call);
+            assert!(!section_expanded(&harness, &arguments));
+            assert!(!section_expanded(&harness, &output));
+            assert!(!popup_text(&harness.app).contains("TOOL-ARGUMENTS-MARKER"));
+            focus_section(&mut harness, &arguments);
+            harness.key(KeyCode::Enter);
+            assert!(section_expanded(&harness, &arguments));
+            assert!(popup_text(&harness.app).contains("TOOL-ARGUMENTS-MARKER"));
+            assert!(!popup_text(&harness.app).contains("TOOL-OUTPUT-END"));
+            focus_section(&mut harness, &output);
+            harness.key(KeyCode::Enter);
+            assert!(section_expanded(&harness, &output));
+            assert!(popup_text(&harness.app).contains("TOOL-OUTPUT-END"));
+            assert!(popup_text(&harness.app).contains("工具输出 🧑‍💻"));
+            assert!(!popup_text(&harness.app).contains("MESSAGE-BODY-STAYS-HIDDEN"));
+            for key in ['t', 'T', ' '] {
+                harness.key(KeyCode::Char(key));
+                assert!(section_expanded(&harness, &output));
+                assert_eq!(harness.app.theme, theme);
+            }
+            if width == 120 && theme == Theme::Dark {
+                focus_section(&mut harness, &call);
+                save_gallery(&harness, "entity-tools-nested-dark-120x40");
+            }
+            assert_eq!(harness.state(), initial);
+            harness.key(KeyCode::Esc);
+            open(&mut harness);
+            let data = recorded_tools_fixture(harness.app.snapshot.as_of, true);
+            harness
+                .app
+                .entity_detail
+                .as_mut()
+                .unwrap()
+                .set_recorded_details(data, theme);
+            harness.render();
+            for id in [
+                "recorded.tools",
+                call.as_str(),
+                arguments.as_str(),
+                output.as_str(),
+            ] {
+                assert!(!section_expanded(&harness, id));
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_detail_tools_use_the_common_footer_and_whole_wrapped_header_hitboxes() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            let initial = harness.app.entity_detail_hitbox.unwrap();
+            reveal_tools_header(&mut harness);
+            assert_binding(&harness, initial.toggle, "↵", true);
+            for column in initial.toggle.x..initial.toggle.right() {
+                assert!(click_at(&mut harness, initial.toggle, column));
+                assert!(section_expanded(&harness, "recorded.tools"));
+                assert_eq!(
+                    harness.app.entity_detail_hitbox.unwrap().toggle,
+                    initial.toggle
+                );
+                assert_eq!(
+                    harness.app.entity_detail_hitbox.unwrap().content,
+                    initial.content
+                );
+                assert!(click_at(&mut harness, initial.toggle, column));
+                assert!(!section_expanded(&harness, "recorded.tools"));
+            }
+            let header = reveal_tools_header(&mut harness);
+            for row in header.y..header.bottom() {
+                for column in header.x..header.right() {
+                    assert!(mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row
+                    ));
+                    assert!(section_expanded(&harness, "recorded.tools"));
+                    assert_eq!(
+                        harness
+                            .app
+                            .entity_detail
+                            .as_ref()
+                            .unwrap()
+                            .selected_section
+                            .as_deref(),
+                        Some("recorded.tools")
+                    );
+                    assert!(mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row
+                    ));
+                    assert!(!section_expanded(&harness, "recorded.tools"));
+                }
+            }
+            harness.resize(24, 14);
+            let resized = harness.app.entity_detail_hitbox.unwrap();
+            assert_binding(&harness, resized.toggle, "↵", true);
+            assert!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .section_hitboxes
+                    .iter()
+                    .any(|(id, rect)| id == "recorded.tools" && !rect.is_empty())
+            );
+            let wrapped = reveal_tools_header(&mut harness);
+            assert!(wrapped.height > 1);
+            for row in wrapped.y..wrapped.bottom() {
+                for column in wrapped.x..wrapped.right() {
+                    mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                    );
+                    assert!(section_expanded(&harness, "recorded.tools"));
+                    mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                    );
+                    assert!(!section_expanded(&harness, "recorded.tools"));
+                }
+            }
+            harness.resize(width, height);
+            let restored = harness.app.entity_detail_hitbox.unwrap();
+            assert_eq!(restored.next, initial.next);
+            assert_eq!(restored.toggle, initial.toggle);
+            assert_eq!(restored.back, initial.back);
+            assert_eq!(restored.content, initial.content);
+        }
+    }
+}
+
+#[test]
+fn entity_detail_nested_collapse_restores_focus_anchor_and_scrollbar_after_resize() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            expand_tool_layers(&mut harness);
+            let (call, _, output) = tool_layer_ids(&harness);
+            focus_section(&mut harness, &output);
+            for (resized_width, resized_height) in [(40, 24), (32, 14), (width, height)] {
+                harness.resize(resized_width, resized_height);
+                assert_eq!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .selected_section
+                        .as_deref(),
+                    Some(output.as_str())
+                );
+                assert!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .section_hitboxes
+                        .iter()
+                        .any(|(id, rect)| id == &output && !rect.is_empty())
+                );
+            }
+            let expanded_count = harness.app.entity_detail.as_ref().unwrap().line_count;
+            harness.key(KeyCode::End);
+            let end = harness.app.entity_detail_hitbox.unwrap();
+            assert_eq!(
+                harness.app.entity_detail.as_ref().unwrap().offset,
+                end.scrollbar.unwrap().max_offset
+            );
+            assert_binding(&harness, end.down, "↓", false);
+            assert!(harness.app.toggle_entity_detail_section(&call));
+            harness.render();
+            let popup = harness.app.entity_detail.as_ref().unwrap();
+            assert_eq!(popup.selected_section.as_deref(), Some(call.as_str()));
+            assert!(!popup.headers.iter().any(|header| header.id == output));
+            assert!(
+                popup
+                    .section_hitboxes
+                    .iter()
+                    .any(|(id, rect)| id == &call && !rect.is_empty())
+            );
+            assert!(popup.line_count < expanded_count);
+            let collapsed = harness.app.entity_detail_hitbox.unwrap();
+            let max_offset = popup.scroll_limit(usize::from(collapsed.content.height));
+            assert!(popup.offset <= max_offset);
+            if let Some(scrollbar) = collapsed.scrollbar {
+                assert_eq!(scrollbar.max_offset, max_offset);
+                assert!(scrollbar.thumb.y >= scrollbar.track.y);
+                assert!(scrollbar.thumb.bottom() <= scrollbar.track.bottom());
+            } else {
+                assert_eq!(max_offset, 0);
+            }
+            assert!(!popup_text(&harness.app).contains("TOOL-OUTPUT-END"));
+            focus_section(&mut harness, "recorded.tools");
+            harness.key(KeyCode::Enter);
+            assert!(!section_expanded(&harness, "recorded.tools"));
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some("recorded.tools")
+            );
+            assert!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .section_hitboxes
+                    .iter()
+                    .any(|(id, rect)| id == "recorded.tools" && !rect.is_empty())
+            );
+        }
+    }
+}
+
+#[test]
+fn entity_detail_t_and_space_are_consumed_without_effect_before_and_after_evidence() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = detail_harness(width, height, theme);
+            harness.app.local_snapshot.tasks.clear();
+            open(&mut harness);
+            let initial = harness.state();
+            for with_recorded in [false, true] {
+                if with_recorded {
+                    let data = recorded_tools_fixture(harness.app.snapshot.as_of, false);
+                    harness
+                        .app
+                        .entity_detail
+                        .as_mut()
+                        .unwrap()
+                        .set_recorded_details(data, theme);
+                    harness.render();
+                    assert!(popup_text(&harness.app).contains("Tool calls (0)"));
+                    assert!(popup_text(&harness.app).contains("Usage observations (1)"));
+                }
+                let controls = harness.app.entity_detail_hitbox.unwrap();
+                let footer = (controls.content.x..controls.back.right())
+                    .map(|column| harness.cell_style(column, controls.back.y).0)
+                    .collect::<String>();
+                assert!(!footer.contains("[T]"));
+                assert!(!footer.contains("Tools"));
+                for key in ['t', 'T', ' '] {
+                    let before = harness.app.entity_detail.as_ref().unwrap().expanded.clone();
+                    harness.key(KeyCode::Char(key));
+                    assert_eq!(harness.app.entity_detail.as_ref().unwrap().expanded, before);
+                    assert_eq!(harness.state(), initial);
+                    assert_eq!(harness.app.theme, theme);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_detail_sections_default_to_closed_while_overview_and_usage_remain_visible() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            let popup = harness.app.entity_detail.as_ref().unwrap();
+            let foldable = section_ids(&popup.document, true);
+            assert!(has_usage_node(&popup.document));
+            assert!(foldable.iter().any(|id| id == "snapshot.Related"));
+            assert!(foldable.iter().any(|id| id == "snapshot.Data notes"));
+            for id in &foldable {
+                assert!(!popup.expanded.contains(id), "{id} defaults closed");
+            }
+            for title in ["Overview", "Usage"] {
+                let id = popup
+                    .document
+                    .iter()
+                    .find_map(|node| match node {
+                        DetailNode::Section {
+                            id,
+                            title: actual,
+                            foldable,
+                            ..
+                        } if actual == title => {
+                            assert!(!foldable, "{title} remains open");
+                            Some(id)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{title} section is retained"));
+                assert!(!popup.headers.iter().any(|header| &header.id == id));
+            }
+            let content = popup_text(&harness.app);
+            assert!(content.contains("Thread ID:"));
+            assert!(content.contains("Own cumulative tokens"));
+            assert!(!content.contains("Approval policy: on-request"));
+            assert!(!content.contains("user | commentary"));
+            assert!(!content.contains("TOOL-ARGUMENTS-MARKER"));
+            assert!(!content.contains("TOOL-OUTPUT-END"));
+            assert!(
+                !popup
+                    .headers
+                    .iter()
+                    .any(|header| header.id.starts_with("recorded.tools/"))
+            );
+            assert!(popup.selected_section.is_none());
+            for header in &popup.headers {
+                let binding = popup.lines[header.line]
+                    .spans
+                    .iter()
+                    .find(|span| span.content.as_ref() == "↵")
+                    .expect("each interactive header displays its actual binding");
+                let active = false;
+                assert_eq!(binding.style.fg == Some(theme.palette().accent), active);
+                assert_eq!(binding.style.add_modifier.contains(Modifier::BOLD), active);
+            }
+
+            expand_all(&mut harness);
+            let expanded = popup_text(&harness.app);
+            for retained in [
+                "Approval policy: on-request",
+                "user | commentary",
+                "Message bodies: hidden",
+                "TOOL-ARGUMENTS-MARKER",
+                "TOOL-OUTPUT-END",
+                "Usage observations (1)",
+            ] {
+                assert!(
+                    expanded.contains(retained),
+                    "retained after explicit expansion: {retained}"
+                );
+            }
+            assert!(!expanded.contains("MESSAGE-BODY-STAYS-HIDDEN"));
+        }
+    }
+}
+
+#[test]
+fn entity_detail_tab_and_shift_tab_cycle_visible_headers_and_footer_actions() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, true);
+            let controls = harness.app.entity_detail_hitbox.unwrap();
+            assert_binding(&harness, controls.next, "Tab", true);
+            assert_binding(&harness, controls.toggle, "↵", false);
+            let order = harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .headers
+                .iter()
+                .map(|header| header.id.clone())
+                .collect::<Vec<_>>();
+            assert!(order.len() > 2);
+            assert!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .is_none()
+            );
+            harness.key(KeyCode::Enter);
+            assert!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .is_none()
+            );
+            harness.key(KeyCode::Tab);
+            let initial = harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .selected_section
+                .clone()
+                .unwrap();
+            assert_eq!(initial, order[0]);
+            assert_binding(&harness, controls.toggle, "↵", true);
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                for key in [
+                    KeyCode::Tab,
+                    KeyCode::BackTab,
+                    KeyCode::Enter,
+                    KeyCode::Char(' '),
+                ] {
+                    let before = harness.app.entity_detail.as_ref().unwrap().expanded.clone();
+                    handle_key_event(&mut harness.app, KeyEvent::new(key, modifiers));
+                    harness.render();
+                    let popup = harness.app.entity_detail.as_ref().unwrap();
+                    assert_eq!(popup.selected_section.as_ref(), Some(&initial));
+                    assert_eq!(popup.expanded, before);
+                }
+            }
+            let start = order.iter().position(|id| id == &initial).unwrap();
+            for step in 1..=order.len() {
+                harness.key(KeyCode::Tab);
+                let selected = &order[(start + step) % order.len()];
+                let popup = harness.app.entity_detail.as_ref().unwrap();
+                assert_eq!(popup.selected_section.as_ref(), Some(selected));
+                assert!(
+                    popup
+                        .section_hitboxes
+                        .iter()
+                        .any(|(id, rect)| id == selected && !rect.is_empty()),
+                    "Tab scrolls {selected} into view"
+                );
+            }
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_ref(),
+                Some(&initial)
+            );
+            harness.key(KeyCode::BackTab);
+            let previous = &order[(start + order.len() - 1) % order.len()];
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_ref(),
+                Some(previous)
+            );
+            handle_key_event(
+                &mut harness.app,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            );
+            harness.render();
+            let previous = &order[(start + order.len() - 2) % order.len()];
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_ref(),
+                Some(previous)
+            );
+
+            for column in controls.next.x..controls.next.right() {
+                let before = harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .clone();
+                assert!(click_at(&mut harness, controls.next, column));
+                assert_ne!(
+                    harness.app.entity_detail.as_ref().unwrap().selected_section,
+                    before
+                );
+                assert_eq!(
+                    harness.app.entity_detail_hitbox.unwrap().next,
+                    controls.next
+                );
+            }
+            let selected_header = focus_section(&mut harness, "snapshot.Related");
+            assert_binding(&harness, selected_header, "↵", true);
+            for column in controls.toggle.x..controls.toggle.right() {
+                let before = section_expanded(&harness, "snapshot.Related");
+                assert!(click_at(&mut harness, controls.toggle, column));
+                assert_ne!(section_expanded(&harness, "snapshot.Related"), before);
+                assert_eq!(
+                    harness.app.entity_detail_hitbox.unwrap().toggle,
+                    controls.toggle
+                );
+            }
+            let before = section_expanded(&harness, "snapshot.Related");
+            harness.key(KeyCode::Char(' '));
+            assert_eq!(section_expanded(&harness, "snapshot.Related"), before);
+            harness.key(KeyCode::Enter);
+            assert_ne!(section_expanded(&harness, "snapshot.Related"), before);
+            harness.key(KeyCode::Enter);
+            assert_eq!(section_expanded(&harness, "snapshot.Related"), before);
+
+            assert!(
+                !harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .headers
+                    .iter()
+                    .any(|header| header.id.starts_with("recorded.tools/"))
+            );
+            focus_section(&mut harness, "recorded.tools");
+            harness.key(KeyCode::Enter);
+            let call = first_tool_call_id(&harness);
+            assert!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .headers
+                    .iter()
+                    .any(|header| header.id == call)
+            );
+            assert!(!section_expanded(&harness, &call));
+            focus_section(&mut harness, &call);
+            focus_section(&mut harness, "recorded.tools");
+            harness.key(KeyCode::Enter);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some("recorded.tools")
+            );
+            assert!(
+                !harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .headers
+                    .iter()
+                    .any(|header| header.id == call)
+            );
+        }
+    }
+}
+
+#[test]
+fn entity_detail_unicode_headers_keep_their_hitboxes_and_selected_identity_on_resize() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = recorded_tools_harness(width, height, theme, false);
+            let title = format!("{} HEADER-END", "中文 👩‍💻 标题 ".repeat(5));
+            let popup = harness.app.entity_detail.as_mut().unwrap();
+            popup.document = vec![
+                DetailNode::Section {
+                    id: "fixture.unicode".to_string(),
+                    title: title.clone(),
+                    foldable: true,
+                    children: vec![DetailNode::Section {
+                        id: "fixture.child".to_string(),
+                        title: "子项 🧑‍💻".to_string(),
+                        foldable: true,
+                        children: vec![DetailNode::Lines(vec![Line::from(
+                            "NESTED-UNICODE-CONTENT",
+                        )])],
+                    }],
+                },
+                DetailNode::Section {
+                    id: "fixture.after".to_string(),
+                    title: "Following section".to_string(),
+                    foldable: true,
+                    children: vec![DetailNode::Lines(
+                        (0..40)
+                            .map(|index| Line::from(format!("after row {index}")))
+                            .collect(),
+                    )],
+                },
+            ];
+            popup.expanded.clear();
+            popup.selected_section = Some("fixture.unicode".to_string());
+            popup.rebuild(1, theme);
+            harness.render();
+            assert!(popup_text(&harness.app).contains(&title));
+            let rect = focus_section(&mut harness, "fixture.unicode");
+            assert!(rect.right() <= harness.app.entity_detail_hitbox.unwrap().content.right());
+            assert!(rect.bottom() <= harness.app.entity_detail_hitbox.unwrap().content.bottom());
+            if width <= 60 {
+                assert!(rect.height > 1);
+            }
+            for row in rect.y..rect.bottom() {
+                for column in rect.x..rect.right() {
+                    mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                    );
+                    assert!(section_expanded(&harness, "fixture.unicode"));
+                    assert_eq!(
+                        harness
+                            .app
+                            .entity_detail
+                            .as_ref()
+                            .unwrap()
+                            .selected_section
+                            .as_deref(),
+                        Some("fixture.unicode")
+                    );
+                    mouse_at(
+                        &mut harness,
+                        MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                    );
+                    assert!(!section_expanded(&harness, "fixture.unicode"));
+                }
+            }
+            harness.key(KeyCode::Enter);
+            focus_section(&mut harness, "fixture.child");
+            harness.key(KeyCode::Enter);
+            assert!(popup_text(&harness.app).contains("NESTED-UNICODE-CONTENT"));
+            for (resized_width, resized_height) in [(40, 24), (32, 14), (width, height)] {
+                harness.resize(resized_width, resized_height);
+                let popup = harness.app.entity_detail.as_ref().unwrap();
+                assert_eq!(popup.selected_section.as_deref(), Some("fixture.child"));
+                assert!(
+                    popup
+                        .section_hitboxes
+                        .iter()
+                        .any(|(id, area)| id == "fixture.child" && !area.is_empty())
+                );
+            }
+            assert!(harness.app.toggle_entity_detail_section("fixture.unicode"));
+            harness.render();
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some("fixture.unicode")
+            );
+            assert!(!popup_text(&harness.app).contains("NESTED-UNICODE-CONTENT"));
+            assert!(
+                !harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .headers
+                    .iter()
+                    .any(|header| header.id == "fixture.child")
+            );
+        }
+    }
 }
 
 #[test]
@@ -162,10 +1898,10 @@ fn entity_detail_entries_and_popup_controls_are_whole_label_clickable() {
                 }
 
                 // Enough independent lines to exercise both scroll buttons at every size.
-                let lines = (0..100)
+                let lines: Vec<_> = (0..100)
                     .map(|index| Line::from(format!("detail row {index}")))
                     .collect();
-                open_with_lines(&mut harness, lines);
+                open_with_lines(&mut harness, lines.clone());
                 let hitbox = harness.app.entity_detail_hitbox.unwrap();
                 for column in hitbox.down.x..hitbox.down.right() {
                     harness.key(KeyCode::Home);
@@ -181,7 +1917,7 @@ fn entity_detail_entries_and_popup_controls_are_whole_label_clickable() {
                 for column in hitbox.back.x..hitbox.back.right() {
                     assert!(click_at(&mut harness, hitbox.back, column));
                     assert!(harness.app.entity_detail.is_none());
-                    open(&mut harness);
+                    open_with_lines(&mut harness, lines.clone());
                 }
             }
         }
@@ -409,6 +2145,7 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
             observed_tokens: 1_700,
             priced_tokens: 850,
         };
+        harness.app.local_snapshot.tasks.clear();
         harness.app.focus_turns();
         harness.render();
         open(&mut harness);
@@ -432,8 +2169,8 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
             "18.96%",
             "10.94%",
             "28.47%",
-            "Input / total: 72.59%",
-            "Output / total: 25.41%",
+            "Input 1,234 (72.59% total)",
+            "Output 432 (25.41% total)",
         ] {
             assert!(content.contains(text), "missing {text:?}: {content}");
         }
@@ -442,6 +2179,47 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
         std::fs::write(
             directory.join(format!("{gallery_name}.svg")),
             harness.frame().to_svg(gallery_name),
+        )
+        .unwrap();
+        // Model a finished evidence load: its folded roots provide enough
+        // trailing content for the Usage heading to reach the viewport top.
+        let data = recorded_tools_fixture(harness.app.snapshot.as_of, false);
+        harness
+            .app
+            .entity_detail
+            .as_mut()
+            .unwrap()
+            .set_recorded_details(data, theme);
+        harness.render();
+        assert!(has_usage_node(
+            &harness.app.entity_detail.as_ref().unwrap().document
+        ));
+        let limit = harness.app.entity_detail.as_ref().unwrap().line_count;
+        let mut usage_visible = false;
+        harness.key(KeyCode::Home);
+        for _ in 0..=limit {
+            let content = harness.app.entity_detail_hitbox.unwrap().content;
+            let first_row = (content.x..content.right())
+                .map(|column| harness.cell_style(column, content.y).0)
+                .collect::<String>();
+            if first_row.trim() == "Usage" {
+                usage_visible = true;
+                break;
+            }
+            let before = harness.app.entity_detail.as_ref().unwrap().offset;
+            harness.key(KeyCode::Down);
+            if harness.app.entity_detail.as_ref().unwrap().offset == before {
+                break;
+            }
+        }
+        assert!(
+            usage_visible,
+            "the actual Usage block remains reachable at {width}x{height}"
+        );
+        let usage_name = gallery_name.replace("entity-detail", "entity-usage");
+        std::fs::write(
+            directory.join(format!("{usage_name}.svg")),
+            harness.frame().to_svg(&usage_name),
         )
         .unwrap();
     }
@@ -461,7 +2239,7 @@ fn entity_detail_derived_turn_statistics_keep_duration_and_count_meanings_distin
         ..TokenUsage::default()
     };
     harness.render();
-    open(&mut harness);
+    open_expanded(&mut harness);
     let content = popup_text(&harness.app);
     for text in [
         "Turns completed: 1",
@@ -486,13 +2264,23 @@ fn entity_detail_derived_turn_statistics_keep_duration_and_count_meanings_distin
     harness.app.snapshot.turns[0].token_usage = TokenUsage::default();
     harness.app.focus_turns();
     harness.render();
-    open(&mut harness);
+    open_expanded(&mut harness);
     let content = popup_text(&harness.app);
     assert!(content.contains("Elapsed at capture: 3210 ms"));
-    assert!(content.contains("Cache read / input: unavailable (zero denominator)"));
-    assert!(content.contains("Reasoning / output: unavailable (zero denominator)"));
-    assert!(content.contains("Input / total: unavailable (zero denominator)"));
-    assert!(content.contains("Output / total: unavailable (zero denominator)"));
+    assert!(content.contains("All ratios: unavailable (zero denominator)"));
+    for component in [
+        "Input 0",
+        "Output 0",
+        "Unclassified 0",
+        "Cached input 0",
+        "Cache write input 0",
+        "Reasoning output 0",
+    ] {
+        assert!(
+            content.contains(component),
+            "missing {component}: {content}"
+        );
+    }
 }
 
 #[test]
@@ -517,14 +2305,14 @@ fn entity_detail_longx_changes_quota_projection_without_changing_api_cost() {
     let with_longx = popup_text(&harness.app);
     assert!(with_longx.contains("Own API equivalent: $1.0000"));
     assert!(!with_longx.contains("Own API equivalent: $9.0000"));
-    assert_ne!(
-        without_longx
+    let quota = |content: &str| {
+        content
             .lines()
-            .find(|line| line.starts_with("Own estimated quota:")),
-        with_longx
-            .lines()
-            .find(|line| line.starts_with("Own estimated quota:")),
-    );
+            .find(|line| line.contains("Estimated quota:"))
+            .expect("the selected scope retains its estimate")
+            .to_string()
+    };
+    assert_ne!(quota(&without_longx), quota(&with_longx));
 }
 
 #[test]
@@ -687,7 +2475,7 @@ fn entity_detail_summary_requires_entity_selection_and_preserves_history_only_me
             harness.render();
             assert_eq!(harness.app.summary_controls_hitbox.unwrap().details, entry);
             assert_binding(&harness, entry, "F2", true);
-            open(&mut harness);
+            open_expanded(&mut harness);
             let content = popup_text(&harness.app);
             assert!(content.contains("Historical title"));
             assert!(content.contains("historical-root"));
@@ -709,7 +2497,7 @@ fn entity_detail_summary_requires_entity_selection_and_preserves_history_only_me
             for row in rows.iter().filter(|row| row.kind == SummaryRowKind::Turn) {
                 harness.app.summary_selected_id = Some(row.id.clone());
                 harness.render();
-                open(&mut harness);
+                open_expanded(&mut harness);
                 let content = popup_text(&harness.app);
                 assert!(content.contains("Model: unavailable"));
                 if row.label.starts_with("Unassigned") {
@@ -778,7 +2566,7 @@ fn entity_detail_summary_rankings_exclude_unassigned_and_unpriced_turns() {
         .unwrap();
     harness.app.summary_selected_id = Some(session.id.clone());
     harness.render();
-    open(&mut harness);
+    open_expanded(&mut harness);
     let content = popup_text(&harness.app);
     assert!(content.contains("Largest known user turn (range): historical-turn (101 tokens)"));
     assert!(content.contains("Largest priced user-turn subtotal (range): priced-zero-turn ("));
@@ -889,7 +2677,7 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     let mut harness = TuiHarness::from_snapshot(snapshot.clone(), 80, 24, Theme::Dark);
     harness.app.focus_turns();
     harness.render();
-    open(&mut harness);
+    open_expanded(&mut harness);
     assert!(popup_text(&harness.app).contains("Recorded details: loading"));
     let now = Instant::now();
     harness.app.last_local_refresh = now;
@@ -906,9 +2694,16 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
         std::thread::sleep(Duration::from_millis(1));
     }
     harness.render();
+    expand_all(&mut harness);
     let content = popup_text(&harness.app);
-    assert!(content.contains("Recorded details (at capture)"));
-    assert!(content.contains(&full_message));
+    assert!(!harness.app.entity_detail_loading());
+    assert!(content.contains("Messages (1)"));
+    assert!(content.contains("Message bodies: hidden"));
+    assert!(content.contains(&format!(
+        "user | phase unrecorded | {} | turn {turn_id}",
+        (captured - ChronoDuration::seconds(1)).to_rfc3339()
+    )));
+    assert!(!content.contains(&full_message));
     assert!(!content.contains("FUTURE-MESSAGE-MUST-NOT-APPEAR"));
     assert!(harness.app.entity_detail.is_some());
     harness.key(KeyCode::Esc);
@@ -920,7 +2715,7 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     let mut remote = TuiHarness::from_snapshot(snapshot, 80, 24, Theme::Dark);
     remote.app.focus_turns();
     remote.render();
-    open(&mut remote);
+    open_expanded(&mut remote);
     assert!(!remote.app.poll_entity_detail());
     assert!(popup_text(&remote.app).contains("no unambiguous local rollout association"));
     assert!(!popup_text(&remote.app).contains("COMPLETE-LOCAL-MESSAGE"));
@@ -1006,7 +2801,7 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
             // A capture can happen after a historical report has ended; its end stays exclusive.
             harness.app.summary_cache.as_mut().unwrap().snapshot_as_of =
                 range.ends_at + ChronoDuration::hours(1);
-            open(&mut harness);
+            open_expanded(&mut harness);
             assert!(
                 harness.app.entity_detail_loading(),
                 "local history supplies an exact owner even after Overview expires"
@@ -1020,8 +2815,24 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
                 std::thread::sleep(Duration::from_millis(1));
             }
             harness.render();
+            expand_all(&mut harness);
             let content = popup_text(&harness.app);
-            assert!(content.contains(body));
+            assert!(content.contains("Messages (1)"));
+            assert!(content.contains(&format!(
+                "user | phase unrecorded | {} | turn historical-turn",
+                (captured - ChronoDuration::minutes(30)).to_rfc3339()
+            )));
+            for excluded in [
+                range.starts_at - ChronoDuration::seconds(1),
+                captured.max(range.ends_at) + ChronoDuration::hours(2),
+                range.ends_at,
+            ] {
+                assert!(!content.contains(&format!(
+                    "user | phase unrecorded | {} |",
+                    excluded.to_rfc3339()
+                )));
+            }
+            assert!(!content.contains(body));
             assert!(!content.contains("BEFORE-SUMMARY-RANGE-MUST-NOT-APPEAR"));
             assert!(!content.contains("AFTER-CAPTURE-MUST-NOT-APPEAR"));
             assert!(!content.contains("EXACT-RANGE-END-MUST-NOT-APPEAR"));
@@ -1036,7 +2847,7 @@ fn entity_detail_reads_local_summary_sessions_that_have_aged_out_of_overview() {
     harness.app.history_source_applied_selection = HistorySourceSelection::AllIncluded;
     harness.app.summary_selected_id = Some(turn_id);
     harness.render();
-    open(&mut harness);
+    open_expanded(&mut harness);
     assert!(!harness.app.entity_detail_loading());
     assert!(!harness.app.poll_entity_detail());
     assert!(popup_text(&harness.app).contains("no unambiguous local rollout association"));
@@ -1166,7 +2977,7 @@ fn entity_detail_restores_only_known_local_scopes_for_historical_summary_ids() {
             ] {
                 harness.app.summary_selected_id = Some(selected.clone());
                 harness.render();
-                open(&mut harness);
+                open_expanded(&mut harness);
                 let allowed = allowed && scope_allowed;
                 assert_eq!(
                     harness.app.entity_detail_loading(),
@@ -1183,10 +2994,15 @@ fn entity_detail_restores_only_known_local_scopes_for_historical_summary_ids() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     harness.render();
+                    expand_all(&mut harness);
                     assert!(
-                        popup_text(&harness.app).contains(body),
+                        popup_text(&harness.app).contains("Messages (1)"),
                         "{case}, {scope_name}, turn={is_turn}"
                     );
+                    assert!(popup_text(&harness.app).contains(&format!(
+                        "user | phase unrecorded | {} | turn historical-turn",
+                        (captured - ChronoDuration::minutes(30)).to_rfc3339()
+                    )));
                 } else {
                     assert!(!harness.app.poll_entity_detail());
                     assert!(
@@ -1196,6 +3012,7 @@ fn entity_detail_restores_only_known_local_scopes_for_historical_summary_ids() {
                     assert!(!popup_text(&harness.app).contains(body));
                 }
                 let content = popup_text(&harness.app);
+                assert!(!content.contains(body));
                 assert!(content.contains(&format!("Thread ID: {expected_thread}")));
                 if is_turn {
                     assert!(content.contains(&format!("Turn ID: {expected_turn}")));

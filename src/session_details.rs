@@ -17,7 +17,9 @@ use walkdir::WalkDir;
 
 use crate::api_cost::{ApiCostAccumulator, format_api_cost_amount};
 use crate::bounded_io::{BoundedLine, read_bounded_line};
-use crate::domain::{AgentInteraction, AgentInteractionKind, RolloutDataset, TokenUsage};
+use crate::domain::{
+    AgentInteraction, AgentInteractionKind, RolloutDataset, TokenUsage, terminal_safe_text,
+};
 
 const MAX_DISCOVERY_ENTRIES: usize = 50_000;
 const MAX_OWNER_PROBES: usize = 512;
@@ -33,16 +35,27 @@ const MAX_WARNINGS: usize = 32;
 const MAX_DISPLAY_LINES: usize = 8_192;
 const MAX_DISPLAY_BYTES: usize = 256 * 1024;
 const DISPLAY_TRUNCATION: &str = "[display truncated: 8,192-line / 256 KiB detail display limit]";
+const REQUIRED_DETAIL_LABELS: [&str; 7] = [
+    "Codex version",
+    "Approval policy",
+    "Sandbox policy",
+    "Permission profile",
+    "Recorded Git branch",
+    "Recorded Git commit",
+    "Reported context window",
+];
 
 /// Limits allocation while building the display, before the UI receives it.
 /// A newline-heavy body must not first produce millions of owned strings.
 #[derive(Default)]
+#[cfg(test)]
 struct DetailLines {
     lines: Vec<String>,
     bytes: usize,
     truncated: bool,
 }
 
+#[cfg(test)]
 impl DetailLines {
     fn push(&mut self, text: String) {
         if self.truncated {
@@ -115,11 +128,285 @@ pub(crate) struct SessionDetails {
     pub(crate) unassigned_records: usize,
     pub(crate) redacted: bool,
     source_discovery_partial: bool,
+    analysis_groups: Option<DetailAnalysisGroups>,
+    tool_retention: HashMap<String, DetailToolRetention>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DetailRetention {
+    #[default]
+    Complete,
+    Truncated,
+    Omitted,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DetailToolRetention {
+    arguments: DetailRetention,
+    output: DetailRetention,
+}
+
+/// Ranges are recorded while constructing the analysis, never recovered by
+/// scanning display labels. They share the existing bounded analysis storage.
+#[derive(Clone, Debug)]
+struct DetailAnalysisGroups {
+    summary: std::ops::Range<usize>,
+    models: std::ops::Range<usize>,
+    hourly: std::ops::Range<usize>,
+}
+
+#[cfg(test)]
+pub(crate) struct SessionDetailDisplay {
+    pub(crate) lines: Vec<String>,
+    pub(crate) tool_header: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionDetailSection {
+    pub id: String,
+    pub title: String,
+    pub lines: Vec<String>,
+    pub children: Vec<SessionDetailSection>,
+}
+
+const SECTION_TRUNCATION_ID: &str = "display-truncation";
+const SECTION_TRUNCATION_TITLE: &str = "Display truncated";
+const SECTION_BODY_OMITTED: &str =
+    "[content omitted by the display limit; collapse another section to inspect]";
+const SECTION_RESERVED_BYTES: usize =
+    SECTION_TRUNCATION_ID.len() + SECTION_TRUNCATION_TITLE.len() + DISPLAY_TRUNCATION.len() + 3;
+
+/// The entire tree shares one display budget, including node titles and IDs.
+/// Reserve a final root node so every truncation is visible within that budget.
+struct DetailSectionBudget<'a> {
+    expanded: &'a HashSet<String>,
+    bytes: usize,
+    lines: usize,
+    truncated: bool,
+    identities: HashMap<String, usize>,
+    placeholders: HashSet<String>,
+}
+
+impl<'a> DetailSectionBudget<'a> {
+    fn new(expanded: &'a HashSet<String>) -> Self {
+        Self {
+            expanded,
+            bytes: 0,
+            lines: 0,
+            truncated: false,
+            identities: HashMap::new(),
+            placeholders: HashSet::new(),
+        }
+    }
+
+    fn section(&mut self, id: String, title: &str) -> Option<SessionDetailSection> {
+        if self.truncated {
+            return None;
+        }
+        let occurrence = self.identities.entry(id.clone()).or_default();
+        *occurrence += 1;
+        let id = if *occurrence == 1 {
+            id
+        } else {
+            format!("{id}/copy-{occurrence}")
+        };
+        let title = terminal_safe_text(&detail_short_title(title, 240));
+        let is_expanded = self.expanded.contains(&id);
+        let lines = 1 + usize::from(is_expanded);
+        let bytes = id.len()
+            + title.len()
+            + 2
+            + if is_expanded {
+                SECTION_BODY_OMITTED.len() + 1
+            } else {
+                0
+            };
+        if self.lines + lines > MAX_DISPLAY_LINES - 2
+            || bytes > MAX_DISPLAY_BYTES.saturating_sub(SECTION_RESERVED_BYTES + self.bytes)
+        {
+            self.truncated = true;
+            return None;
+        }
+        self.bytes += bytes;
+        self.lines += lines;
+        if is_expanded {
+            self.placeholders.insert(id.clone());
+        }
+        Some(SessionDetailSection {
+            id,
+            title,
+            lines: if is_expanded {
+                vec![SECTION_BODY_OMITTED.into()]
+            } else {
+                Vec::new()
+            },
+            children: Vec::new(),
+        })
+    }
+
+    fn is_expanded(&self, section: &SessionDetailSection) -> bool {
+        self.expanded.contains(&section.id)
+    }
+
+    fn clear_placeholder(&mut self, section: &mut SessionDetailSection) {
+        if self.placeholders.remove(&section.id) {
+            section.lines.clear();
+            self.bytes -= SECTION_BODY_OMITTED.len() + 1;
+            self.lines -= 1;
+        }
+    }
+
+    fn add_child(&mut self, section: &mut SessionDetailSection, child: SessionDetailSection) {
+        self.clear_placeholder(section);
+        section.children.push(child);
+    }
+
+    fn child(
+        &mut self,
+        parent: &str,
+        identity: &[&str],
+        title: &str,
+    ) -> Option<SessionDetailSection> {
+        if self.truncated {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for part in identity {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        self.section(format!("{parent}/{:x}", hash.finalize()), title)
+    }
+
+    fn text(&mut self, section: &mut SessionDetailSection, text: &str) {
+        let mut pieces = text.lines();
+        let mut touched = false;
+        while !self.truncated {
+            let Some(line) = pieces.next() else {
+                break;
+            };
+            touched = true;
+            self.clear_placeholder(section);
+            if self.lines >= MAX_DISPLAY_LINES - 2 {
+                self.truncated = true;
+                break;
+            }
+            let available = MAX_DISPLAY_BYTES.saturating_sub(SECTION_RESERVED_BYTES + self.bytes);
+            if available <= 1 {
+                self.truncated = true;
+                break;
+            }
+            let mut boundary = (available - 1).min(line.len());
+            while !line.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            let safe = terminal_safe_text(&line[..boundary]);
+            self.bytes += safe.len() + 1;
+            self.lines += 1;
+            section.lines.push(safe);
+            if boundary < line.len() {
+                self.truncated = true;
+            }
+        }
+        if touched && self.truncated {
+            self.mark_truncated_body(section);
+        }
+    }
+
+    fn mark_truncated_body(&mut self, section: &mut SessionDetailSection) {
+        // Keep a local explanation, including when the retained prefix has
+        // only blank lines. Refund the tail before reserving this marker.
+        if section.lines.iter().all(|line| line.trim().is_empty()) {
+            self.bytes -= section
+                .lines
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+            self.lines -= section.lines.len();
+            section.lines.clear();
+        }
+        let cost = SECTION_BODY_OMITTED.len() + 1;
+        loop {
+            let available = MAX_DISPLAY_BYTES.saturating_sub(SECTION_RESERVED_BYTES + self.bytes);
+            if self.lines < MAX_DISPLAY_LINES - 2 && available >= cost {
+                self.bytes += cost;
+                self.lines += 1;
+                section.lines.push(SECTION_BODY_OMITTED.into());
+                break;
+            }
+            let Some(last) = section.lines.last_mut() else {
+                break;
+            };
+            if self.lines >= MAX_DISPLAY_LINES - 2 {
+                self.bytes -= last.len() + 1;
+                self.lines -= 1;
+                section.lines.pop();
+            } else {
+                let mut boundary = last.len().saturating_sub(cost - available);
+                while !last.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                if boundary == 0 {
+                    self.bytes -= last.len() + 1;
+                    self.lines -= 1;
+                    section.lines.pop();
+                } else {
+                    self.bytes -= last.len() - boundary;
+                    last.truncate(boundary);
+                }
+            }
+        }
+    }
+
+    fn body(
+        &mut self,
+        section: &mut SessionDetailSection,
+        text: Option<&str>,
+        retention: DetailRetention,
+        unavailable: &str,
+    ) {
+        if self.truncated {
+            return;
+        }
+        match (text, retention) {
+            (None, DetailRetention::Omitted) => self.text(
+                section,
+                "[content not retained: 4,096-record / 2 MiB retention limit]",
+            ),
+            (None, _) => self.text(section, unavailable),
+            (Some(text), DetailRetention::Truncated) => {
+                self.text(
+                    section,
+                    "[retained content truncated: 64 KiB per-field / 2 MiB total limit]",
+                );
+                if !text.trim().is_empty() {
+                    self.text(section, text);
+                }
+            }
+            (Some(text), _) if text.trim().is_empty() => {
+                self.text(section, "Recorded content is empty.")
+            }
+            (Some(text), _) => self.text(section, text),
+        }
+    }
+
+    fn finish(self, sections: &mut Vec<SessionDetailSection>) {
+        if self.truncated {
+            sections.push(SessionDetailSection {
+                id: SECTION_TRUNCATION_ID.into(),
+                title: SECTION_TRUNCATION_TITLE.into(),
+                lines: vec![DISPLAY_TRUNCATION.into()],
+                children: Vec::new(),
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DetailMessage {
     pub(crate) role: String,
+    // Keep the existing retained content; production presents metadata only.
+    #[allow(dead_code)]
     pub(crate) text: String,
     pub(crate) timestamp: Option<DateTime<Utc>>,
     pub(crate) turn_id: Option<String>,
@@ -157,7 +444,377 @@ pub(crate) struct DetailEvidence {
 }
 
 impl SessionDetails {
-    pub(crate) fn display_lines(&self) -> Vec<String> {
+    /// Project only visible branches. Expanded identities are raw section IDs,
+    /// without the UI's `recorded.` namespace. Message bodies stay hidden.
+    pub(crate) fn detail_sections(&self, expanded: &HashSet<String>) -> Vec<SessionDetailSection> {
+        let mut budget = DetailSectionBudget::new(expanded);
+        // Fixed roots, and placeholders for expanded roots, precede content.
+        // A later exhausted branch must still explain why it has no body.
+        let mut sections: Vec<_> = [
+            ("analysis", "Analysis / model and hourly usage".to_owned()),
+            ("configuration", "Configuration & Git".to_owned()),
+            (
+                "interactions",
+                format!("Agent interactions ({})", self.agent_interactions.len()),
+            ),
+            (
+                "attachments",
+                format!("Attachments ({})", self.attachments.len()),
+            ),
+            ("messages", format!("Messages ({})", self.messages.len())),
+            ("tools", format!("Tool calls ({})", self.tools.len())),
+            (
+                "files",
+                format!("File changes ({})", self.file_changes.len()),
+            ),
+            ("failures", format!("Failures ({})", self.failures.len())),
+            (
+                "compactions",
+                format!("Context compactions ({})", self.compactions.len()),
+            ),
+            (
+                "observations",
+                format!("Usage observations ({})", self.usage.len()),
+            ),
+            ("source", "Source / read warnings".to_owned()),
+        ]
+        .into_iter()
+        .map(|(id, title)| {
+            budget
+                .section(id.into(), &title)
+                .expect("fixed root headings fit the display budget")
+        })
+        .collect();
+
+        if budget.is_expanded(&sections[10]) {
+            budget.text(
+                &mut sections[10],
+                &format!(
+                    "Local source: {} rollout file(s); {} unassigned record(s)",
+                    self.files_read, self.unassigned_records
+                ),
+            );
+            budget.text(&mut sections[10], "Only explicit turn / item / call identities determine turn ownership. Unassigned content is excluded from a turn detail.");
+            budget.text(&mut sections[10], "Content is loaded on demand, kept in memory, and never fetched from remote sources.");
+            for warning in &self.warnings {
+                if budget.truncated {
+                    break;
+                }
+                budget.text(&mut sections[10], &format!("Note: {warning}"));
+            }
+        }
+        if self.redacted {
+            for section in sections.iter_mut().take(10) {
+                if budget.is_expanded(section) {
+                    budget.text(section, "redacted; raw rollouts were not opened");
+                }
+            }
+            budget.finish(&mut sections);
+            return sections;
+        }
+
+        if budget.is_expanded(&sections[1]) {
+            for (id, title, is_git) in [
+                ("configuration/settings", "Configuration", false),
+                ("configuration/git", "Git (recorded and current)", true),
+            ] {
+                let Some(mut child) = budget.section(id.into(), title) else {
+                    break;
+                };
+                if budget.is_expanded(&child) {
+                    for (key, value) in &self.metadata {
+                        if budget.truncated {
+                            break;
+                        }
+                        if (key.starts_with("Recorded Git ") || key.starts_with("Current Git "))
+                            == is_git
+                        {
+                            budget.text(&mut child, &format!("{key}: {value}"));
+                        }
+                    }
+                    for label in REQUIRED_DETAIL_LABELS {
+                        if label.starts_with("Recorded Git ") == is_git
+                            && self.missing_metadata_label(label)
+                        {
+                            budget.text(&mut child, &format!("{label}: unrecorded"));
+                        }
+                    }
+                }
+                budget.add_child(&mut sections[1], child);
+            }
+        }
+
+        if budget.is_expanded(&sections[0]) {
+            if let Some(groups) = &self.analysis_groups {
+                for (id, title) in [
+                    ("analysis/models", "Model distribution"),
+                    ("analysis/hourly", "Hourly token / API trend (UTC)"),
+                ] {
+                    let Some(child) = budget.section(id.into(), title) else {
+                        break;
+                    };
+                    budget.add_child(&mut sections[0], child);
+                }
+                for line in self
+                    .analysis_lines
+                    .get(groups.summary.clone())
+                    .unwrap_or(&[])
+                {
+                    if budget.truncated {
+                        break;
+                    }
+                    budget.text(&mut sections[0], line);
+                }
+                for (range, child) in [&groups.models, &groups.hourly]
+                    .into_iter()
+                    .zip(&mut sections[0].children)
+                {
+                    if !budget.is_expanded(child) {
+                        continue;
+                    }
+                    let lines = self.analysis_lines.get(range.clone()).unwrap_or(&[]);
+                    if lines.is_empty() {
+                        budget.text(child, "unrecorded / unavailable");
+                    }
+                    for line in lines {
+                        if budget.truncated {
+                            break;
+                        }
+                        budget.text(child, line);
+                    }
+                }
+            } else {
+                if self.analysis_lines.is_empty() {
+                    budget.text(&mut sections[0], &self.absent_label("Analysis evidence"));
+                }
+                for line in &self.analysis_lines {
+                    if budget.truncated {
+                        break;
+                    }
+                    budget.text(&mut sections[0], line);
+                }
+            }
+        }
+
+        if budget.is_expanded(&sections[2]) {
+            budget.text(&mut sections[2], "Child usage is not loaded by this single-thread log projection; an interaction is not a child-usage total.");
+            if self.agent_interactions.is_empty() {
+                budget.text(
+                    &mut sections[2],
+                    "No exact call-ID link recorded in the selected local evidence.",
+                );
+            }
+            for interaction in &self.agent_interactions {
+                if budget.truncated {
+                    break;
+                }
+                let kind = match interaction.kind {
+                    AgentInteractionKind::SpawnStarted => "spawned",
+                    AgentInteractionKind::Interacted => "interacted",
+                    AgentInteractionKind::Unknown => "unknown",
+                };
+                let time = time_label(interaction.occurred_at.or(interaction.requested_at));
+                let Some(mut child) = budget.child(
+                    "interactions",
+                    &[
+                        &interaction.parent_thread_id,
+                        &interaction.parent_turn_id,
+                        &interaction.child_thread_id,
+                        &interaction.call_id,
+                        kind,
+                        &time,
+                    ],
+                    &format!("{kind} child {}", interaction.child_thread_id),
+                ) else {
+                    break;
+                };
+                if budget.is_expanded(&child) {
+                    budget.text(
+                        &mut child,
+                        &format!(
+                            "Parent thread: {} | {}",
+                            interaction.parent_thread_id,
+                            turn_label(Some(&interaction.parent_turn_id))
+                        ),
+                    );
+                    budget.text(
+                        &mut child,
+                        &format!("Call ID: {} | {time}", interaction.call_id),
+                    );
+                }
+                budget.add_child(&mut sections[2], child);
+            }
+        }
+
+        if budget.is_expanded(&sections[4]) {
+            budget.text(&mut sections[4], "Message bodies: hidden");
+            if self.messages.is_empty() {
+                budget.text(&mut sections[4], &self.absent_label("Message metadata"));
+            }
+            for message in &self.messages {
+                if budget.truncated {
+                    break;
+                }
+                budget.text(
+                    &mut sections[4],
+                    &format!(
+                        "{} | {} | {} | {}",
+                        message.role,
+                        message.phase.as_deref().unwrap_or("phase unrecorded"),
+                        time_label(message.timestamp),
+                        turn_label(message.turn_id.as_deref())
+                    ),
+                );
+            }
+        }
+
+        if budget.is_expanded(&sections[9]) {
+            budget.text(&mut sections[9], "Observations are evidence only; cumulative samples are not summed into the overview.");
+            if self.usage.is_empty() {
+                budget.text(&mut sections[9], &self.absent_label("Usage evidence"));
+            }
+            for usage in &self.usage {
+                if budget.truncated {
+                    break;
+                }
+                let time = time_label(usage.timestamp);
+                let model = usage.model.as_deref().unwrap_or("model unrecorded");
+                let tier = usage.service_tier.as_deref().unwrap_or("unrecorded");
+                let tokens = format!("{:?}", usage.tokens);
+                let exact = if usage.exact {
+                    "native request"
+                } else {
+                    "reported last request; attribution incomplete"
+                };
+                let Some(mut child) = budget.child(
+                    "observations",
+                    &[
+                        &time,
+                        usage.turn_id.as_deref().unwrap_or(""),
+                        model,
+                        tier,
+                        &tokens,
+                        exact,
+                    ],
+                    &format!("{model} | total {} | {time}", usage.tokens.total_tokens),
+                ) else {
+                    break;
+                };
+                if budget.is_expanded(&child) {
+                    budget.text(
+                        &mut child,
+                        &format!(
+                            "{} | tier {tier} | {exact}",
+                            turn_label(usage.turn_id.as_deref())
+                        ),
+                    );
+                    budget.text(&mut child, &format!("Input: {} | cached input: {} | output: {} | reasoning output: {} | total: {}", usage.tokens.input_tokens, usage.tokens.cached_input_tokens, usage.tokens.output_tokens, usage.tokens.reasoning_output_tokens, usage.tokens.total_tokens));
+                }
+                budget.add_child(&mut sections[9], child);
+            }
+        }
+
+        if budget.is_expanded(&sections[5]) {
+            if self.tools.is_empty() {
+                budget.text(
+                    &mut sections[5],
+                    &self.absent_label("Tool arguments and outputs"),
+                );
+            }
+            for tool in &self.tools {
+                if budget.truncated {
+                    break;
+                }
+                let exit = tool
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unrecorded".into());
+                let duration = tool
+                    .duration_ms
+                    .map(|ms| format!("{ms} ms"))
+                    .unwrap_or_else(|| "unrecorded".into());
+                let name = detail_short_title(&tool.name, 120);
+                let Some(mut child) = budget.child(
+                    "tools",
+                    &[&tool.call_id, tool.turn_id.as_deref().unwrap_or("")],
+                    &format!("{name} | Exit: {exit} | Duration: {duration}"),
+                ) else {
+                    break;
+                };
+                if budget.is_expanded(&child) {
+                    budget.text(
+                        &mut child,
+                        &format!(
+                            "Call ID: {} | {} | {}",
+                            tool.call_id,
+                            time_label(tool.timestamp),
+                            turn_label(tool.turn_id.as_deref())
+                        ),
+                    );
+                    if tool.test_command {
+                        budget.text(&mut child, "Command mentions a test runner; inspect result");
+                    }
+                    // Reserve both leaf headings/placeholders before reading
+                    // either body, so a large argument cannot blank the output.
+                    for (suffix, title) in [("arguments", "Arguments"), ("output", "Output")] {
+                        if let Some(body) = budget.section(format!("{}/{suffix}", child.id), title)
+                        {
+                            budget.add_child(&mut child, body);
+                        }
+                    }
+                    let retention = self
+                        .tool_retention
+                        .get(&tool.call_id)
+                        .copied()
+                        .unwrap_or_default();
+                    for (body, (text, state, unavailable)) in child.children.iter_mut().zip([
+                        (
+                            tool.arguments.as_deref(),
+                            retention.arguments,
+                            "unrecorded / unavailable in selected local logs",
+                        ),
+                        (
+                            tool.output.as_deref(),
+                            retention.output,
+                            "unrecorded / not completed in this snapshot",
+                        ),
+                    ]) {
+                        if budget.is_expanded(body) {
+                            budget.body(body, text, state, unavailable);
+                        }
+                    }
+                }
+                budget.add_child(&mut sections[5], child);
+            }
+        }
+
+        for (index, label, evidence) in [
+            (3, "Attachment", self.attachments.as_slice()),
+            (7, "Failure", self.failures.as_slice()),
+            (8, "Compaction", self.compactions.as_slice()),
+            (6, "Change / recorded diff", self.file_changes.as_slice()),
+        ] {
+            if !budget.is_expanded(&sections[index]) {
+                continue;
+            }
+            if index == 3 {
+                budget.text(
+                    &mut sections[3],
+                    "Attachment bytes are not opened or downloaded.",
+                );
+            }
+            append_structured_evidence(&mut budget, &mut sections[index], label, evidence);
+        }
+        budget.finish(&mut sections);
+        sections
+    }
+
+    #[cfg(test)]
+    pub(crate) fn display_lines(
+        &self,
+        show_message_bodies: bool,
+        show_tool_calls: bool,
+    ) -> SessionDetailDisplay {
         let mut lines = DetailLines::default();
         lines.extend(self.analysis_lines.iter().cloned());
         if !lines.is_empty() {
@@ -172,19 +829,8 @@ impl SessionDetails {
                 .iter()
                 .map(|(key, value)| format!("{key}: {value}")),
         );
-        for label in [
-            "Codex version",
-            "Approval policy",
-            "Sandbox policy",
-            "Permission profile",
-            "Recorded Git branch",
-            "Recorded Git commit",
-            "Reported context window",
-        ] {
-            if !self.metadata.keys().any(|key| {
-                key.contains(label)
-                    || (label == "Reported context window" && key.contains("context window"))
-            }) {
+        for label in REQUIRED_DETAIL_LABELS {
+            if self.missing_metadata_label(label) {
                 lines.push(format!(
                     "{label}: {}",
                     if self.redacted {
@@ -234,6 +880,8 @@ impl SessionDetails {
         lines.push(format!("Messages ({})", self.messages.len()));
         if self.messages.is_empty() {
             lines.push(self.absent_label("Message bodies"));
+        } else if !show_message_bodies {
+            lines.push("Message bodies: hidden".to_owned());
         }
         for message in &self.messages {
             if lines.truncated {
@@ -250,51 +898,57 @@ impl SessionDetails {
                 time_label(message.timestamp),
                 turn_label(message.turn_id.as_deref())
             ));
-            append_text(&mut lines, &message.text);
-            lines.push(String::new());
-        }
-        lines.push(format!("Tool calls ({})", self.tools.len()));
-        if self.tools.is_empty() {
-            lines.push(self.absent_label("Tool arguments and outputs"));
-        }
-        for tool in &self.tools {
-            if lines.truncated {
-                break;
+            if show_message_bodies {
+                append_text(&mut lines, &message.text);
             }
-            lines.push(format!(
-                "{} | {} | {}",
-                tool.name,
-                time_label(tool.timestamp),
-                turn_label(tool.turn_id.as_deref())
-            ));
-            lines.push(format!("Call ID: {}", tool.call_id));
-            lines.push(format!(
-                "Exit: {} | Duration: {}{}",
-                tool.exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unrecorded".into()),
-                tool.duration_ms
-                    .map(|ms| format!("{ms} ms"))
-                    .unwrap_or_else(|| "unrecorded".into()),
-                if tool.test_command {
-                    " | Command mentions a test runner; inspect result"
-                } else {
-                    ""
-                }
-            ));
-            lines.push("Arguments:".into());
-            append_text(
-                &mut lines,
-                tool.arguments.as_deref().unwrap_or("unrecorded"),
-            );
-            lines.push("Output:".into());
-            append_text(
-                &mut lines,
-                tool.output
-                    .as_deref()
-                    .unwrap_or("unrecorded / not completed in this snapshot"),
-            );
             lines.push(String::new());
+        }
+        let tool_header_index = lines.lines.len();
+        lines.push(format!("Tool calls ({})", self.tools.len()));
+        let tool_header = (!lines.truncated).then_some(tool_header_index);
+        if show_tool_calls {
+            if self.tools.is_empty() {
+                lines.push(self.absent_label("Tool arguments and outputs"));
+            }
+            for tool in &self.tools {
+                if lines.truncated {
+                    break;
+                }
+                lines.push(format!(
+                    "{} | {} | {}",
+                    tool.name,
+                    time_label(tool.timestamp),
+                    turn_label(tool.turn_id.as_deref())
+                ));
+                lines.push(format!("Call ID: {}", tool.call_id));
+                lines.push(format!(
+                    "Exit: {} | Duration: {}{}",
+                    tool.exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unrecorded".into()),
+                    tool.duration_ms
+                        .map(|ms| format!("{ms} ms"))
+                        .unwrap_or_else(|| "unrecorded".into()),
+                    if tool.test_command {
+                        " | Command mentions a test runner; inspect result"
+                    } else {
+                        ""
+                    }
+                ));
+                lines.push("Arguments:".into());
+                append_text(
+                    &mut lines,
+                    tool.arguments.as_deref().unwrap_or("unrecorded"),
+                );
+                lines.push("Output:".into());
+                append_text(
+                    &mut lines,
+                    tool.output
+                        .as_deref()
+                        .unwrap_or("unrecorded / not completed in this snapshot"),
+                );
+                lines.push(String::new());
+            }
         }
         append_evidence(
             &mut lines,
@@ -356,7 +1010,10 @@ impl SessionDetails {
                 .iter()
                 .map(|warning| format!("Note: {warning}")),
         );
-        lines.finish()
+        SessionDetailDisplay {
+            lines: lines.finish(),
+            tool_header,
+        }
     }
 
     fn absent_label(&self, label: &str) -> String {
@@ -368,6 +1025,13 @@ impl SessionDetails {
                 "unrecorded / unavailable in selected local logs"
             }
         )
+    }
+
+    fn missing_metadata_label(&self, label: &str) -> bool {
+        !self.metadata.keys().any(|key| {
+            key.contains(label)
+                || (label == "Reported context window" && key.contains("context window"))
+        })
     }
 
     fn warn(&mut self, warning: impl Into<String>) {
@@ -383,6 +1047,58 @@ impl SessionDetails {
     }
 }
 
+fn detail_retention(original_bytes: usize, retained: Option<&str>) -> DetailRetention {
+    match retained {
+        None => DetailRetention::Omitted,
+        Some(text) if text.len() < original_bytes => DetailRetention::Truncated,
+        Some(_) => DetailRetention::Complete,
+    }
+}
+
+fn detail_short_title(text: &str, limit: usize) -> String {
+    let mut characters = text.chars();
+    let mut title: String = characters.by_ref().take(limit).collect();
+    if characters.next().is_some() {
+        title.push('…');
+    }
+    title
+}
+
+fn append_structured_evidence(
+    budget: &mut DetailSectionBudget<'_>,
+    section: &mut SessionDetailSection,
+    label: &str,
+    evidence: &[DetailEvidence],
+) {
+    if evidence.is_empty() {
+        budget.text(section, "unrecorded / unavailable in selected local logs");
+    }
+    for (index, record) in evidence.iter().enumerate() {
+        if budget.truncated {
+            break;
+        }
+        let time = time_label(record.timestamp);
+        let turn = turn_label(record.turn_id.as_deref());
+        let Some(mut child) = budget.child(
+            &section.id,
+            &[&time, record.turn_id.as_deref().unwrap_or(""), &record.text],
+            &format!("{label} {} | {time} | {turn}", index + 1),
+        ) else {
+            break;
+        };
+        if budget.is_expanded(&child) {
+            budget.body(
+                &mut child,
+                Some(&record.text),
+                DetailRetention::Complete,
+                "unrecorded / unavailable",
+            );
+        }
+        budget.add_child(section, child);
+    }
+}
+
+#[cfg(test)]
 fn append_evidence(
     lines: &mut DetailLines,
     title: &str,
@@ -414,6 +1130,7 @@ fn append_evidence(
     lines.push(String::new());
 }
 
+#[cfg(test)]
 fn append_interaction_lines(lines: &mut DetailLines, interactions: &[AgentInteraction]) {
     lines.push(format!(
         "Exact child-agent interactions ({})",
@@ -443,6 +1160,7 @@ fn append_interaction_lines(lines: &mut DetailLines, interactions: &[AgentIntera
     lines.push(String::new());
 }
 
+#[cfg(test)]
 fn append_text(lines: &mut DetailLines, text: &str) {
     lines.extend(text.lines().map(str::to_owned));
 }
@@ -1008,6 +1726,11 @@ impl<'a> DetailParser<'a> {
                 text.push_str(marker);
             }
             self.result.warn("A message, argument, output or diff was truncated at the 64 KiB per-field / 2 MiB total-content limit.");
+            if text.is_empty() {
+                // A remaining byte budget smaller than one UTF-8 character
+                // cannot retain a body. Do not label it as a recorded empty body.
+                return None;
+            }
         }
         self.content_bytes = self.content_bytes.saturating_add(text.len());
         Some(text)
@@ -1172,10 +1895,18 @@ impl<'a> DetailParser<'a> {
             .map(value_text);
         let test_command =
             arguments.as_deref().is_some_and(is_test_command) && is_command_tool(name);
+        let argument_bytes = arguments.as_ref().map(String::len);
         let arguments = arguments.and_then(|text| self.keep_text(text));
         if self.result.tools.len() >= MAX_RECORDS {
             self.result.warn("The tool-record limit was reached.");
             return;
+        }
+        if let Some(bytes) = argument_bytes {
+            self.result
+                .tool_retention
+                .entry(call_id.into())
+                .or_default()
+                .arguments = detail_retention(bytes, arguments.as_deref());
         }
         self.tool_index
             .insert(call_id.to_owned(), self.result.tools.len());
@@ -1219,11 +1950,21 @@ impl<'a> DetailParser<'a> {
             }
             return;
         };
-        let output = output.and_then(|text| self.keep_text(text));
         let exit = integer(payload, &["exit_code", "exitCode"])
             .or_else(|| output.as_deref().and_then(output_exit));
         let duration = unsigned(payload, &["duration_ms", "durationMs"])
             .or_else(|| output.as_deref().and_then(output_duration));
+        let output_bytes = output.as_ref().map(String::len);
+        let output = output.and_then(|text| self.keep_text(text));
+        if let Some(bytes) = output_bytes
+            && (output.is_some() || self.result.tools[index].output.is_none())
+        {
+            self.result
+                .tool_retention
+                .entry(call_id.into())
+                .or_default()
+                .output = detail_retention(bytes, output.as_deref());
+        }
         let tool = &mut self.result.tools[index];
         if tool.turn_id.is_none() {
             tool.turn_id = turn.or_else(|| self.call_turns.get(call_id).cloned());
@@ -1316,6 +2057,7 @@ impl<'a> DetailParser<'a> {
                 self.conflicted_calls.insert(call_id.to_owned());
             }
             self.call_turns.remove(call_id);
+            self.result.tool_retention.remove(call_id);
             if let Some(index) = self.tool_index.get(call_id).copied() {
                 let tool = &mut self.result.tools[index];
                 tool.turn_id = None;
@@ -1894,7 +2636,9 @@ fn add_usage_analysis(
             "Request-input / context-capacity proxy: unrecorded (no exact request sample).".into(),
         );
     }
+    let summary_range = 0..lines.len();
     lines.push("Model distribution:".into());
+    let model_start = lines.len();
     if models.is_empty() {
         lines.push("unrecorded / no usage evidence in range".into());
     }
@@ -1913,7 +2657,9 @@ fn add_usage_analysis(
             amount.observed_tokens
         ));
     }
+    let model_range = model_start..lines.len();
     lines.push("Hourly token / API trend (UTC):".into());
+    let hourly_start = lines.len();
     if hours.is_empty() {
         lines.push("unrecorded / no usage evidence in range".into());
     }
@@ -1927,6 +2673,11 @@ fn add_usage_analysis(
             amount.observed_tokens
         ));
     }
+    result.analysis_groups = Some(DetailAnalysisGroups {
+        summary: summary_range,
+        models: model_range,
+        hourly: hourly_start..lines.len(),
+    });
     result.analysis_lines = lines;
     result.agent_interactions = dataset
         .agent_interactions
@@ -2025,6 +2776,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn expanded_sections(details: &SessionDetails) -> Vec<SessionDetailSection> {
+        let mut expanded = HashSet::new();
+        for _ in 0..5 {
+            let sections = details.detail_sections(&expanded);
+            let mut nodes = Vec::new();
+            section_nodes(&sections, &mut nodes);
+            let before = expanded.len();
+            expanded.extend(nodes.iter().map(|node| node.id.clone()));
+            if expanded.len() == before {
+                return sections;
+            }
+        }
+        details.detail_sections(&expanded)
+    }
+
+    fn section_nodes<'a>(
+        sections: &'a [SessionDetailSection],
+        nodes: &mut Vec<&'a SessionDetailSection>,
+    ) {
+        for section in sections {
+            nodes.push(section);
+            section_nodes(&section.children, nodes);
+        }
+    }
+
     fn record(kind: &str, payload: Value) -> Value {
         json!({"type":kind,"timestamp":"2026-10-04T01:00:00Z","payload":payload})
     }
@@ -2119,7 +2895,13 @@ mod tests {
         assert!(result.redacted);
         assert_eq!(result.files_read, 0);
         assert!(result.messages.is_empty());
-        assert!(!result.display_lines().join("\n").contains("secret"));
+        assert!(
+            !result
+                .display_lines(true, true)
+                .lines
+                .join("\n")
+                .contains("secret")
+        );
     }
 
     #[test]
@@ -2308,6 +3090,28 @@ mod tests {
         );
         assert!(display.contains("100 / 1000 tokens (10.0%)"), "{display}");
         assert!(!display.contains("1200 tokens"));
+        let analysis = &expanded_sections(&result)[0];
+        assert!(
+            analysis
+                .lines
+                .iter()
+                .any(|line| line.contains("100 / 1000 tokens (10.0%)"))
+        );
+        assert_eq!(analysis.children.len(), 2);
+        assert_eq!(analysis.children[0].id, "analysis/models");
+        assert_eq!(analysis.children[1].id, "analysis/hourly");
+        assert!(
+            analysis.children[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("gpt-5.6-sol: 120 tokens"))
+        );
+        assert!(
+            analysis.children[1]
+                .lines
+                .iter()
+                .any(|line| line.contains("2026-10-04 01:00 UTC: 120 tokens"))
+        );
     }
 
     #[test]
@@ -2511,7 +3315,7 @@ mod tests {
                 .text
                 .contains("path: /recorded/input.csv")
         );
-        let display = result.display_lines().join("\n");
+        let display = result.display_lines(true, true).lines.join("\n");
         assert!(!display.contains("PRIVATE_IMAGE_BLOB") && !display.contains("PRIVATE_FILE_BYTES"));
         assert!(
             display.find("Recorded attachment metadata").unwrap()
@@ -2581,7 +3385,9 @@ mod tests {
                     .collect(),
                 ..SessionDetails::default()
             };
-            let lines = result.display_lines();
+            let display = result.display_lines(true, true);
+            assert!(display.tool_header.is_none());
+            let lines = display.lines;
             assert!(lines.len() <= MAX_DISPLAY_LINES);
             assert!(lines.iter().map(|line| line.len() + 1).sum::<usize>() <= MAX_DISPLAY_BYTES);
             assert_eq!(lines.last().map(String::as_str), Some(DISPLAY_TRUNCATION));
@@ -2627,10 +3433,585 @@ mod tests {
             }],
             ..SessionDetails::default()
         };
-        let lines = result.display_lines();
+        let lines = result.display_lines(true, true).lines;
         assert!(lines.iter().any(|line| line == "第一行"));
         assert!(lines.iter().any(|line| line == "second line 🧑‍💻"));
         assert!(!lines.iter().any(|line| line == DISPLAY_TRUNCATION));
+    }
+
+    #[test]
+    fn session_details_display_collapses_tools_without_hiding_later_evidence() {
+        let result = SessionDetails {
+            messages: vec![DetailMessage {
+                role: "user".into(),
+                text: "retained message body".into(),
+                timestamp: None,
+                turn_id: Some("one".into()),
+                phase: None,
+            }],
+            tools: vec![DetailTool {
+                call_id: "retained-call-id".into(),
+                name: "retained-tool-name".into(),
+                arguments: Some("retained arguments".into()),
+                output: Some("retained output\nsecond output line".into()),
+                exit_code: Some(7),
+                duration_ms: Some(120),
+                timestamp: None,
+                turn_id: Some("one".into()),
+                test_command: true,
+            }],
+            file_changes: vec![DetailEvidence {
+                text: "retained recorded diff".into(),
+                timestamp: None,
+                turn_id: Some("one".into()),
+            }],
+            usage: vec![DetailUsage {
+                timestamp: None,
+                turn_id: Some("one".into()),
+                model: Some("retained-usage-model".into()),
+                service_tier: None,
+                tokens: TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    total_tokens: 5,
+                    ..TokenUsage::default()
+                },
+                exact: true,
+            }],
+            ..SessionDetails::default()
+        };
+        let collapsed = result.display_lines(false, false);
+        let header = collapsed.tool_header.expect("tool header remains visible");
+        assert_eq!(collapsed.lines[header], "Tool calls (1)");
+        let collapsed_text = collapsed.lines.join("\n");
+        for hidden in [
+            "retained message body",
+            "retained-tool-name",
+            "retained-call-id",
+            "retained arguments",
+            "retained output",
+            "Exit: 7",
+        ] {
+            assert!(!collapsed_text.contains(hidden));
+        }
+        assert!(collapsed_text.contains("Message bodies: hidden"));
+        assert!(
+            collapsed.lines[header + 1..]
+                .iter()
+                .any(|line| line == "retained recorded diff")
+        );
+        assert!(
+            collapsed.lines[header + 1..]
+                .iter()
+                .any(|line| line.contains("retained-usage-model") && line.contains("total 5"))
+        );
+
+        let expanded = result.display_lines(true, true);
+        assert_eq!(
+            expanded.lines[expanded.tool_header.unwrap()],
+            "Tool calls (1)"
+        );
+        let expanded_text = expanded.lines.join("\n");
+        for visible in [
+            "retained message body",
+            "retained-tool-name",
+            "retained-call-id",
+            "retained arguments",
+            "retained output\nsecond output line",
+            "Exit: 7 | Duration: 120 ms",
+        ] {
+            assert!(expanded_text.contains(visible));
+        }
+        assert_eq!(result.messages[0].text, "retained message body");
+        assert_eq!(
+            result.tools[0].arguments.as_deref(),
+            Some("retained arguments")
+        );
+        assert_eq!(
+            result.tools[0].output.as_deref(),
+            Some("retained output\nsecond output line")
+        );
+        assert_eq!(result.tools[0].exit_code, Some(7));
+        assert_eq!(result.tools[0].duration_ms, Some(120));
+
+        let empty = SessionDetails::default();
+        let collapsed = empty.display_lines(true, false);
+        assert_eq!(
+            collapsed.lines[collapsed.tool_header.unwrap()],
+            "Tool calls (0)"
+        );
+        assert!(
+            !collapsed
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Tool arguments and outputs:"))
+        );
+        assert!(
+            empty
+                .display_lines(true, true)
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Tool arguments and outputs:"))
+        );
+    }
+
+    #[test]
+    fn session_details_sections_use_typed_hierarchy_and_stable_unique_identities() {
+        let tool = DetailTool {
+            call_id: "same-call".into(),
+            name: "exec\u{1b}\u{202e}command".into(),
+            arguments: Some("cargo\ttest\nTool calls (999)".into()),
+            output: Some("Output:\nrecorded result".into()),
+            exit_code: Some(7),
+            duration_ms: Some(120),
+            timestamp: None,
+            turn_id: Some("one".into()),
+            test_command: true,
+        };
+        let mut other_turn = tool.clone();
+        other_turn.turn_id = Some("two".into());
+        let result = SessionDetails {
+            messages: vec![DetailMessage {
+                role: "user".into(),
+                text: "PRIVATE MESSAGE BODY".into(),
+                timestamp: None,
+                turn_id: Some("one".into()),
+                phase: Some("question".into()),
+            }],
+            tools: vec![tool.clone(), other_turn, tool],
+            metadata: BTreeMap::from([
+                ("Model".into(), "recorded-model".into()),
+                ("Recorded Git commit".into(), "historical-commit".into()),
+                ("Current Git commit".into(), "current-commit".into()),
+            ]),
+            file_changes: vec![DetailEvidence {
+                text: "recorded diff".into(),
+                timestamp: None,
+                turn_id: Some("one".into()),
+            }],
+            usage: vec![DetailUsage {
+                timestamp: None,
+                turn_id: Some("one".into()),
+                model: Some("recorded-model".into()),
+                service_tier: None,
+                tokens: TokenUsage {
+                    total_tokens: 5,
+                    ..TokenUsage::default()
+                },
+                exact: false,
+            }],
+            ..SessionDetails::default()
+        };
+        let sections = expanded_sections(&result);
+        assert_eq!(sections, expanded_sections(&result));
+        let mut nodes = Vec::new();
+        section_nodes(&sections, &mut nodes);
+        let ids: HashSet<_> = nodes.iter().map(|node| &node.id).collect();
+        assert_eq!(ids.len(), nodes.len());
+        assert!(nodes.iter().all(|node| {
+            !node.title.contains("PRIVATE MESSAGE BODY")
+                && node
+                    .lines
+                    .iter()
+                    .all(|line| !line.contains("PRIVATE MESSAGE BODY"))
+        }));
+        assert!(nodes.iter().all(|node| {
+            node.title
+                .chars()
+                .all(|ch| !ch.is_control() && ch != '\u{202e}')
+                && node
+                    .lines
+                    .iter()
+                    .all(|line| line.chars().all(|ch| !ch.is_control() && ch != '\u{202e}'))
+        }));
+        let configuration = &sections[1];
+        assert_eq!(configuration.children[0].id, "configuration/settings");
+        assert!(
+            configuration.children[0]
+                .lines
+                .iter()
+                .any(|line| line == "Model: recorded-model")
+        );
+        for label in [
+            "Approval policy",
+            "Sandbox policy",
+            "Reported context window",
+        ] {
+            assert!(
+                configuration.children[0]
+                    .lines
+                    .iter()
+                    .any(|line| line == &format!("{label}: unrecorded"))
+            );
+        }
+        assert_eq!(configuration.children[1].id, "configuration/git");
+        assert!(
+            configuration.children[1]
+                .lines
+                .iter()
+                .any(|line| line == "Recorded Git commit: historical-commit")
+        );
+        assert!(
+            configuration.children[1]
+                .lines
+                .iter()
+                .any(|line| line == "Current Git commit: current-commit")
+        );
+        let tools = &sections[5];
+        assert_eq!(tools.children.len(), 3);
+        assert!(
+            tools.lines.is_empty(),
+            "tool summaries are child titles, not duplicate parent rows"
+        );
+        assert!(
+            tools
+                .children
+                .iter()
+                .all(|child| child.title.contains("Exit: 7 | Duration: 120 ms"))
+        );
+        for child in &tools.children {
+            assert_eq!(child.children.len(), 2);
+            assert_eq!(child.children[0].id, format!("{}/arguments", child.id));
+            assert_eq!(child.children[0].lines, ["cargo test", "Tool calls (999)"]);
+            assert_eq!(child.children[1].id, format!("{}/output", child.id));
+            assert_eq!(child.children[1].lines, ["Output:", "recorded result"]);
+        }
+        assert_eq!(sections[6].children[0].lines, ["recorded diff"]);
+        assert!(
+            sections[9].children[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("attribution incomplete"))
+        );
+        let mut updated = result.clone();
+        updated.tools[0].output = Some("later output".into());
+        assert_eq!(
+            expanded_sections(&updated)[5].children[0].id,
+            tools.children[0].id
+        );
+        assert_eq!(
+            result.tools[0].arguments.as_deref(),
+            Some("cargo\ttest\nTool calls (999)")
+        );
+        assert_eq!(result.messages[0].text, "PRIVATE MESSAGE BODY");
+
+        let redacted = SessionDetails {
+            redacted: true,
+            ..result
+        };
+        let mut nodes = Vec::new();
+        let redacted_sections = expanded_sections(&redacted);
+        section_nodes(&redacted_sections, &mut nodes);
+        assert!(nodes.iter().all(|node| node.lines.iter().all(|line| {
+            !line.contains("recorded result") && !line.contains("PRIVATE MESSAGE BODY")
+        })));
+    }
+
+    #[test]
+    fn session_details_sections_share_bounds_and_keep_source_and_configuration_before_bodies() {
+        for (body, oversized_analysis) in [
+            ("x\n".repeat(MAX_TEXT_BYTES / 2), false),
+            ("界".repeat(MAX_TEXT_BYTES / 3), false),
+            (String::new(), true),
+        ] {
+            let result = SessionDetails {
+                metadata: BTreeMap::from([("Codex version".into(), "recorded-version".into())]),
+                analysis_lines: if oversized_analysis {
+                    vec!["x\n".repeat(MAX_CONTENT_BYTES / 2)]
+                } else {
+                    Vec::new()
+                },
+                tools: (0..MAX_CONTENT_BYTES / MAX_TEXT_BYTES)
+                    .map(|index| DetailTool {
+                        call_id: index.to_string(),
+                        name: "exec_command".into(),
+                        arguments: None,
+                        output: Some(body.clone()),
+                        exit_code: None,
+                        duration_ms: None,
+                        timestamp: None,
+                        turn_id: None,
+                        test_command: false,
+                    })
+                    .collect(),
+                warnings: vec!["retained read warning".into()],
+                ..SessionDetails::default()
+            };
+            let sections = expanded_sections(&result);
+            assert!(
+                sections[1].children[0]
+                    .lines
+                    .iter()
+                    .any(|line| line == "Codex version: recorded-version")
+            );
+            assert!(
+                sections[10]
+                    .lines
+                    .iter()
+                    .any(|line| line == "Note: retained read warning")
+            );
+            assert_eq!(sections.last().unwrap().id, SECTION_TRUNCATION_ID);
+            assert_eq!(sections.last().unwrap().lines, [DISPLAY_TRUNCATION]);
+            let mut nodes = Vec::new();
+            section_nodes(&sections, &mut nodes);
+            let total_lines: usize = nodes.iter().map(|node| 1 + node.lines.len()).sum();
+            let total_bytes: usize = nodes
+                .iter()
+                .map(|node| {
+                    node.id.len()
+                        + node.title.len()
+                        + 2
+                        + node.lines.iter().map(|line| line.len() + 1).sum::<usize>()
+                })
+                .sum();
+            assert!(total_lines <= MAX_DISPLAY_LINES);
+            assert!(total_bytes <= MAX_DISPLAY_BYTES);
+            assert!(
+                nodes
+                    .iter()
+                    .all(|node| node.lines.iter().all(|line| !line.contains('\n')))
+            );
+            assert!(
+                result
+                    .tools
+                    .iter()
+                    .all(|tool| tool.output.as_deref() == Some(body.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn session_details_812_tools_only_charge_visible_bodies_and_keep_selected_text() {
+        let first_arguments = format!("FIRST_ARGUMENTS:{}", "a".repeat(471));
+        let first_output = format!("FIRST_OUTPUT:{}:OUTPUT_END", "o".repeat(40_759));
+        assert_eq!(first_arguments.len(), 487);
+        assert_eq!(first_output.len(), 40_783);
+        let mut result = SessionDetails {
+            tools: (0..812)
+                .map(|index| DetailTool {
+                    call_id: format!("call-{index}"),
+                    name: "exec".into(),
+                    arguments: Some(format!("arguments-{index}")),
+                    output: Some(format!("output-{index}")),
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    timestamp: None,
+                    turn_id: Some("one".into()),
+                    test_command: false,
+                })
+                .collect(),
+            metadata: BTreeMap::from([(
+                "Sandbox policy".into(),
+                "HIDDEN_CONFIGURATION".repeat(3000),
+            )]),
+            file_changes: vec![DetailEvidence {
+                text: "HIDDEN_DIFF".repeat(5900),
+                timestamp: None,
+                turn_id: Some("one".into()),
+            }],
+            ..SessionDetails::default()
+        };
+        result.tools[0].arguments = Some(first_arguments.clone());
+        result.tools[0].output = Some(first_output.clone());
+        result.tools[1].output = Some("HIDDEN_OTHER_OUTPUT".repeat(3600));
+        let collapsed = result.detail_sections(&HashSet::new());
+        assert_eq!(collapsed[5].title, "Tool calls (812)");
+        assert!(
+            collapsed
+                .iter()
+                .all(|section| section.lines.is_empty() && section.children.is_empty())
+        );
+
+        let mut expanded = HashSet::from(["tools".into()]);
+        let listed = result.detail_sections(&expanded);
+        assert_eq!(listed[5].children.len(), 812);
+        assert!(
+            listed[5]
+                .children
+                .iter()
+                .all(|child| child.lines.is_empty() && child.children.is_empty())
+        );
+        let identities: Vec<_> = listed[5]
+            .children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect();
+        for index in [0, 811] {
+            expanded = HashSet::from([
+                "tools".into(),
+                identities[index].clone(),
+                format!("{}/arguments", identities[index]),
+                format!("{}/output", identities[index]),
+            ]);
+            let sections = result.detail_sections(&expanded);
+            assert_eq!(sections[5].children.len(), 812);
+            assert_eq!(
+                sections[5]
+                    .children
+                    .iter()
+                    .map(|child| child.id.clone())
+                    .collect::<Vec<_>>(),
+                identities
+            );
+            let selected = &sections[5].children[index];
+            assert_eq!(
+                selected.children[0].lines,
+                [result.tools[index].arguments.as_deref().unwrap()]
+            );
+            assert_eq!(
+                selected.children[1].lines,
+                [result.tools[index].output.as_deref().unwrap()]
+            );
+            let mut nodes = Vec::new();
+            section_nodes(&sections, &mut nodes);
+            assert!(
+                nodes
+                    .iter()
+                    .filter(|node| expanded.contains(&node.id))
+                    .all(|node| !node.children.is_empty()
+                        || node.lines.iter().any(|line| !line.trim().is_empty()))
+            );
+            assert!(nodes.iter().all(|node| node.lines.iter().all(|line| {
+                !line.contains("HIDDEN_DIFF")
+                    && !line.contains("HIDDEN_OTHER_OUTPUT")
+                    && !line.contains("HIDDEN_CONFIGURATION")
+            })));
+            assert!(nodes.iter().all(|node| node.id != SECTION_TRUNCATION_ID));
+        }
+        assert_eq!(
+            result.tools[0].arguments.as_deref(),
+            Some(first_arguments.as_str())
+        );
+        assert_eq!(
+            result.tools[0].output.as_deref(),
+            Some(first_output.as_str())
+        );
+    }
+
+    #[test]
+    fn session_details_expanded_bodies_distinguish_empty_missing_and_retention_limits() {
+        let mut parser = parser(None);
+        parser.record(&record(
+            "response_item",
+            json!({"type":"function_call","call_id":"missing","turn_id":"one","name":"exec"}),
+        ));
+        parser.record(&record("response_item", json!({"type":"function_call","call_id":"empty","turn_id":"one","name":"exec","arguments":""})));
+        parser.record(&record(
+            "response_item",
+            json!({"type":"function_call_output","call_id":"empty","turn_id":"one","output":""}),
+        ));
+        parser.record(&record("response_item", json!({"type":"function_call","call_id":"partial","turn_id":"one","name":"exec","arguments":"p".repeat(MAX_TEXT_BYTES + 1)})));
+        parser.content_bytes = MAX_CONTENT_BYTES - 1;
+        parser.record(&record("response_item", json!({"type":"function_call","call_id":"omitted","turn_id":"one","name":"exec","arguments":"界"})));
+        // Preserve short exit/duration metadata before dropping a full output.
+        parser.content_bytes = MAX_CONTENT_BYTES;
+        parser.record(&record("response_item", json!({"type":"function_call_output","call_id":"omitted","turn_id":"one","output":"Wall time: 1.25 seconds\nProcess exited with code 7\nOutput:\nrecorded stdout"})));
+        let result = parser.finish();
+        let tools = &expanded_sections(&result)[5];
+        assert!(
+            tools.children[0].children[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("unrecorded"))
+        );
+        assert_eq!(
+            tools.children[1].children[0].lines,
+            ["Recorded content is empty."]
+        );
+        assert_eq!(
+            tools.children[1].children[1].lines,
+            ["Recorded content is empty."]
+        );
+        assert!(tools.children[2].children[0].lines[0].contains("retained content truncated"));
+        assert!(tools.children[3].children.iter().all(|body| {
+            body.lines
+                .iter()
+                .any(|line| line.contains("content not retained"))
+        }));
+        assert!(
+            tools.children[3]
+                .title
+                .contains("Exit: 7 | Duration: 1250 ms")
+        );
+        assert!(result.tools[3].arguments.is_none());
+        assert!(result.tools[3].output.is_none());
+        assert_eq!(
+            result.tool_retention["omitted"].arguments,
+            DetailRetention::Omitted
+        );
+        assert_eq!(
+            result.tool_retention["omitted"].output,
+            DetailRetention::Omitted
+        );
+    }
+
+    #[test]
+    fn session_details_display_limit_keeps_expanded_leaves_explained() {
+        let result = SessionDetails {
+            tools: vec![DetailTool {
+                call_id: "both-leaves".into(),
+                name: "exec".into(),
+                arguments: Some("argument line\n".repeat(MAX_TEXT_BYTES)),
+                output: Some("real output".into()),
+                exit_code: None,
+                duration_ms: None,
+                timestamp: None,
+                turn_id: None,
+                test_command: false,
+            }],
+            file_changes: vec![DetailEvidence {
+                text: "recorded diff".into(),
+                timestamp: None,
+                turn_id: None,
+            }],
+            ..SessionDetails::default()
+        };
+        let listed = result.detail_sections(&HashSet::from(["tools".into()]));
+        let call_id = listed[5].children[0].id.clone();
+        let expanded = HashSet::from([
+            "tools".into(),
+            "files".into(),
+            "source".into(),
+            call_id.clone(),
+            format!("{call_id}/arguments"),
+            format!("{call_id}/output"),
+        ]);
+        let sections = result.detail_sections(&expanded);
+        let output = &sections[5].children[0].children[1];
+        assert_eq!(output.lines, [SECTION_BODY_OMITTED]);
+        assert_eq!(sections[6].lines, [SECTION_BODY_OMITTED]);
+        let mut nodes = Vec::new();
+        section_nodes(&sections, &mut nodes);
+        assert!(
+            nodes
+                .iter()
+                .filter(|node| expanded.contains(&node.id))
+                .all(|node| !node.children.is_empty()
+                    || node.lines.iter().any(|line| !line.trim().is_empty()))
+        );
+        assert!(nodes.iter().map(|node| 1 + node.lines.len()).sum::<usize>() <= MAX_DISPLAY_LINES);
+        assert!(
+            nodes
+                .iter()
+                .map(|node| node.id.len()
+                    + node.title.len()
+                    + 2
+                    + node.lines.iter().map(|line| line.len() + 1).sum::<usize>())
+                .sum::<usize>()
+                <= MAX_DISPLAY_BYTES
+        );
+        let mut leading_blank = result;
+        leading_blank.tools[0].arguments =
+            Some(format!("{}visible tail", "\n".repeat(MAX_TEXT_BYTES)));
+        let sections = leading_blank.detail_sections(&expanded);
+        assert_eq!(
+            sections[5].children[0].children[0].lines,
+            [SECTION_BODY_OMITTED]
+        );
+        assert_eq!(
+            sections[5].children[0].children[1].lines,
+            [SECTION_BODY_OMITTED]
+        );
     }
 
     #[test]

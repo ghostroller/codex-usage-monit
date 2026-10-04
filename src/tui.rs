@@ -7849,6 +7849,10 @@ impl App {
             self.scroll_drag = None;
             return false;
         };
+        // Sticky headers or a resize can shorten the thumb during a drag.
+        // Keep the grabbed row inside its current height so the end remains reachable.
+        drag.grab_row = drag.grab_row.min(hitbox.thumb.height.saturating_sub(1));
+        self.scroll_drag = Some(drag);
         let travel = hitbox.track.height.saturating_sub(hitbox.thumb.height);
         let pointer_row = row.saturating_sub(hitbox.track.y);
         let thumb_row = pointer_row.saturating_sub(drag.grab_row).min(travel);
@@ -8014,6 +8018,18 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent) -> bool {
                         app.scroll_entity_detail(false, 1);
                     } else if rect_contains(hitbox.down, event.column, event.row) {
                         app.scroll_entity_detail(true, 1);
+                    } else if rect_contains(hitbox.next, event.column, event.row) {
+                        app.cycle_entity_detail_section(true);
+                    } else if rect_contains(hitbox.toggle, event.column, event.row) {
+                        app.toggle_entity_detail_selected();
+                    } else if let Some(id) = app.entity_detail.as_ref().and_then(|detail| {
+                        detail
+                            .section_hitboxes
+                            .iter()
+                            .find(|(_, rect)| rect_contains(*rect, event.column, event.row))
+                            .map(|(id, _)| id.clone())
+                    }) {
+                        app.toggle_entity_detail_section(&id);
                     } else if hitbox
                         .scrollbar
                         .is_some_and(|bar| rect_contains(bar.track, event.column, event.row))
@@ -8425,7 +8441,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if app.entity_detail.is_some() {
         let page = app
             .entity_detail_hitbox
-            .map_or(1, |hitbox| usize::from(hitbox.content.height).max(1));
+            .map_or(1, |hitbox| usize::from(hitbox.body.height).max(1));
         match key.code {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => app.close_entity_detail(),
             KeyCode::Up => app.scroll_entity_detail(false, 1),
@@ -8438,6 +8454,17 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::End => app.scroll_entity_detail(true, usize::MAX),
+            KeyCode::Tab if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                app.cycle_entity_detail_section(!key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            KeyCode::BackTab
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.cycle_entity_detail_section(false);
+            }
+            KeyCode::Enter if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                app.toggle_entity_detail_selected();
+            }
             _ => {}
         }
         return false;

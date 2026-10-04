@@ -2,16 +2,349 @@ use super::*;
 use crate::summary_report::SummaryCoverageState;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod usage;
+use usage::UsageBlock;
+
+#[derive(Debug)]
+pub(super) enum DetailNode {
+    Lines(Vec<Line<'static>>),
+    Usage(UsageBlock),
+    Section {
+        id: String,
+        title: String,
+        foldable: bool,
+        children: Vec<DetailNode>,
+    },
+}
+
+#[derive(Debug)]
+pub(super) struct DetailHeader {
+    pub(super) id: String,
+    pub(super) line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug)]
+struct WrappedDetailHeader {
+    id: String,
+    range: std::ops::Range<usize>,
+    section_end: usize,
+    line: usize,
+    width: usize,
+}
+
+enum DetailScrollAnchor {
+    Header { id: String, row: usize },
+    Body { id: String, offset: usize },
+}
+
 #[derive(Debug)]
 pub(super) struct EntityDetailPopup {
     pub(super) title: String,
     pub(super) lines: Vec<Line<'static>>,
     pub(super) offset: usize,
     pub(super) line_count: usize,
+    pub(super) document: Vec<DetailNode>,
+    pub(super) expanded: HashSet<String>,
+    pub(super) selected_section: Option<String>,
+    pub(super) headers: Vec<DetailHeader>,
+    pub(super) section_hitboxes: Vec<(String, Rect)>,
+    recorded: Option<crate::session_details::SessionDetails>,
+    recorded_expanded: Option<HashSet<String>>,
     receiver: Option<Receiver<crate::session_details::SessionDetails>>,
     cancel: Option<Arc<AtomicBool>>,
     wrapped: Vec<Line<'static>>,
     wrapped_width: Option<u16>,
+    wrapped_height: usize,
+    wrapped_headers: Vec<WrappedDetailHeader>,
+    header_anchor: Option<(String, usize)>,
+}
+
+impl EntityDetailPopup {
+    fn recording_status(&mut self, status: &str, theme: Theme) {
+        self.document.retain(|node| {
+            !matches!(node,
+                DetailNode::Lines(lines) if lines.iter().any(|line|
+                    line.spans.iter().any(|span| span.content.starts_with("Recorded details:")))
+            )
+        });
+        self.document.push(DetailNode::Lines(vec![
+            Line::default(),
+            Line::from(status.to_owned()),
+        ]));
+        self.rebuild(self.wrapped_width.unwrap_or(96), theme);
+    }
+
+    pub(super) fn set_recorded_details(
+        &mut self,
+        data: crate::session_details::SessionDetails,
+        theme: Theme,
+    ) {
+        self.document.retain(|node| {
+            !matches!(node,
+                DetailNode::Lines(lines) if lines.iter().any(|line|
+                    line.spans.iter().any(|span| span.content.starts_with("Recorded details:")))
+            )
+        });
+        // Replacing injected evidence must not duplicate groups or inherit their state.
+        self.document.retain(|node| {
+            !matches!(node,
+                DetailNode::Section { id, .. } if id.starts_with("recorded.")
+            )
+        });
+        self.expanded.retain(|id| !id.starts_with("recorded."));
+        if self
+            .selected_section
+            .as_ref()
+            .is_some_and(|id| id.starts_with("recorded."))
+        {
+            self.selected_section = None;
+        }
+        self.recorded = Some(data);
+        self.recorded_expanded = None;
+        self.rebuild(self.wrapped_width.unwrap_or(96), theme);
+    }
+
+    pub(super) fn rebuild(&mut self, width: u16, theme: Theme) {
+        if let Some(data) = &self.recorded {
+            let expanded = self
+                .expanded
+                .iter()
+                .filter_map(|id| id.strip_prefix("recorded.").map(str::to_owned))
+                .collect::<HashSet<_>>();
+            if self.recorded_expanded.as_ref() != Some(&expanded) {
+                self.document.retain(|node| {
+                    !matches!(node,
+                        DetailNode::Section { id, .. } if id.starts_with("recorded.")
+                    )
+                });
+                self.document.extend(
+                    data.detail_sections(&expanded)
+                        .into_iter()
+                        .map(recorded_section),
+                );
+                self.recorded_expanded = Some(expanded);
+            }
+        }
+        self.lines.clear();
+        self.headers.clear();
+        project_detail_nodes(
+            &self.document,
+            &self.expanded,
+            self.selected_section.as_deref(),
+            width,
+            theme,
+            0,
+            &mut self.lines,
+            &mut self.headers,
+        );
+        self.wrapped_width = None;
+    }
+
+    fn anchor_header(&mut self, id: &str) {
+        let body_capacity = self
+            .wrapped_height
+            .saturating_sub(self.sticky_headers(self.offset, self.wrapped_height).len());
+        let row = self
+            .wrapped_headers
+            .iter()
+            .find(|header| header.id == id)
+            .filter(|header| {
+                header.range.end > self.offset
+                    && header.range.start < self.offset.saturating_add(body_capacity)
+            })
+            .map_or(0, |header| header.range.start.saturating_sub(self.offset));
+        self.header_anchor = Some((id.to_owned(), row));
+    }
+
+    fn sticky_limit(capacity: usize) -> usize {
+        // Keep at least two rows for the actual content in compact terminals.
+        capacity.saturating_sub(2).min(3)
+    }
+
+    fn sticky_headers(&self, offset: usize, capacity: usize) -> Vec<&WrappedDetailHeader> {
+        let mut ancestors: Vec<_> = self
+            .wrapped_headers
+            .iter()
+            .filter(|header| {
+                self.expanded.contains(&header.id)
+                    && header.range.end <= offset
+                    && offset < header.section_end
+            })
+            .collect();
+        let skip = ancestors.len().saturating_sub(Self::sticky_limit(capacity));
+        ancestors.drain(..skip);
+        ancestors
+    }
+
+    pub(super) fn scroll_limit(&self, capacity: usize) -> usize {
+        if capacity == 0 {
+            return 0;
+        }
+        let count = self.wrapped.len();
+        let start = count.saturating_sub(capacity);
+        // A pinned ancestor can end near the bottom. Iterating a dynamic clamp
+        // can then bounce between two offsets. Search the at-most-four tail
+        // positions once and choose the first that exposes the final line.
+        let end = start
+            .saturating_add(Self::sticky_limit(capacity))
+            .min(count.saturating_sub(1));
+        (start..=end)
+            .find(|&offset| {
+                let body = capacity.saturating_sub(self.sticky_headers(offset, capacity).len());
+                offset.saturating_add(body) >= count
+            })
+            .unwrap_or(end)
+    }
+
+    fn resize_anchor(&self) -> Option<DetailScrollAnchor> {
+        let sticky = self.sticky_headers(self.offset, self.wrapped_height);
+        let body_capacity = self.wrapped_height.saturating_sub(sticky.len());
+        let visible = |header: &&WrappedDetailHeader| {
+            header.range.end > self.offset
+                && header.range.start < self.offset.saturating_add(body_capacity)
+        };
+        if let Some(id) = self.selected_section.as_deref() {
+            if let Some(header) = self
+                .wrapped_headers
+                .iter()
+                .filter(visible)
+                .find(|header| header.id == id)
+            {
+                return Some(DetailScrollAnchor::Header {
+                    id: header.id.clone(),
+                    row: header.range.start.saturating_sub(self.offset),
+                });
+            }
+            if sticky.iter().any(|header| header.id == id)
+                && let Some(header) = sticky.last()
+            {
+                return Some(DetailScrollAnchor::Body {
+                    id: header.id.clone(),
+                    offset: self.offset.saturating_sub(header.range.end),
+                });
+            }
+        }
+        if let Some(header) = sticky.last() {
+            return Some(DetailScrollAnchor::Body {
+                id: header.id.clone(),
+                offset: self.offset.saturating_sub(header.range.end),
+            });
+        }
+        self.wrapped_headers
+            .iter()
+            .find(visible)
+            .map(|header| DetailScrollAnchor::Header {
+                id: header.id.clone(),
+                row: header.range.start.saturating_sub(self.offset),
+            })
+    }
+}
+
+fn recorded_section(section: crate::session_details::SessionDetailSection) -> DetailNode {
+    let mut lines = Vec::new();
+    append_enrichment(&mut lines, section.lines);
+    let mut children = vec![DetailNode::Lines(lines)];
+    children.extend(section.children.into_iter().map(recorded_section));
+    DetailNode::Section {
+        id: format!("recorded.{}", section.id),
+        title: terminal_safe_text(&section.title),
+        foldable: true,
+        children,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_detail_nodes(
+    nodes: &[DetailNode],
+    expanded: &HashSet<String>,
+    selected: Option<&str>,
+    width: u16,
+    theme: Theme,
+    depth: usize,
+    lines: &mut Vec<Line<'static>>,
+    headers: &mut Vec<DetailHeader>,
+) {
+    let palette = theme.palette();
+    for node in nodes {
+        match node {
+            DetailNode::Lines(values) => {
+                lines.extend(values.iter().cloned().map(|mut line| {
+                    if depth > 0 && !line.spans.is_empty() {
+                        line.spans.insert(0, Span::raw("  ".repeat(depth)));
+                    }
+                    line
+                }));
+            }
+            DetailNode::Usage(block) => lines.extend(block.render(width, theme)),
+            DetailNode::Section {
+                id,
+                title,
+                foldable,
+                children,
+            } => {
+                if depth == 0 && !lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                let header_index = headers.len();
+                if *foldable {
+                    let focused = selected == Some(id.as_str());
+                    let key_style = if focused {
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.foreground)
+                    };
+                    let style = if focused {
+                        Style::default()
+                            .fg(palette.title)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.foreground)
+                    };
+                    headers.push(DetailHeader {
+                        id: id.clone(),
+                        line: lines.len(),
+                        end_line: 0,
+                    });
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}[", "  ".repeat(depth)), style),
+                        Span::styled("↵", key_style),
+                        Span::styled(
+                            format!(
+                                "] {} {title}",
+                                if expanded.contains(id) { "▾" } else { "▸" }
+                            ),
+                            style,
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::styled(
+                        title.clone(),
+                        Style::default()
+                            .fg(palette.title)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if !foldable || expanded.contains(id) {
+                    project_detail_nodes(
+                        children,
+                        expanded,
+                        selected,
+                        width,
+                        theme,
+                        depth + usize::from(*foldable),
+                        lines,
+                        headers,
+                    );
+                }
+                if *foldable {
+                    headers[header_index].end_line = lines.len();
+                }
+            }
+        }
+    }
 }
 
 impl Drop for EntityDetailPopup {
@@ -25,9 +358,12 @@ impl Drop for EntityDetailPopup {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct EntityDetailHitbox {
     pub(super) content: Rect,
+    pub(super) body: Rect,
     pub(super) scrollbar: Option<ScrollbarHitbox>,
     pub(super) up: Rect,
     pub(super) down: Rect,
+    pub(super) next: Rect,
+    pub(super) toggle: Rect,
     pub(super) back: Rect,
 }
 
@@ -86,10 +422,10 @@ impl App {
             as_of,
         }) = target
         else {
-            detail.lines.push(Line::default());
-            detail.lines.push(Line::from(
+            detail.recording_status(
                 "Recorded details: unavailable (no unambiguous local rollout association)",
-            ));
+                self.theme,
+            );
             return;
         };
         let codex_home = self.snapshot.codex_home.clone();
@@ -97,10 +433,10 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (sender, receiver) = mpsc::channel();
-        detail.lines.push(Line::default());
-        detail.lines.push(Line::from(
+        detail.recording_status(
             "Recorded details: loading local evidence at capture...",
-        ));
+            self.theme,
+        );
         detail.receiver = Some(receiver);
         detail.cancel = Some(cancel);
         thread::spawn(move || {
@@ -129,25 +465,16 @@ impl App {
         match receiver.try_recv() {
             Ok(data) => {
                 detail.receiver = None;
-                detail.lines.pop();
-                detail.lines.push(Line::styled(
-                    "Recorded details (at capture)",
-                    Style::default()
-                        .fg(self.theme.palette().title)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                append_enrichment(&mut detail.lines, data.display_lines());
-                detail.wrapped_width = None;
+                detail.set_recorded_details(data, self.theme);
                 true
             }
             Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 detail.receiver = None;
-                detail.lines.pop();
-                detail.lines.push(Line::from(
+                detail.recording_status(
                     "Recorded details: unavailable (reader did not return evidence)",
-                ));
-                detail.wrapped_width = None;
+                    self.theme,
+                );
                 true
             }
         }
@@ -170,8 +497,76 @@ impl App {
             .entity_detail_hitbox
             .map_or(0, |hitbox| usize::from(hitbox.content.height));
         if let Some(detail) = self.entity_detail.as_mut() {
-            detail.offset = scroll_offset(detail.offset, detail.line_count, capacity, down, lines);
+            detail.offset = if down {
+                detail
+                    .offset
+                    .saturating_add(lines)
+                    .min(detail.scroll_limit(capacity))
+            } else {
+                detail.offset.saturating_sub(lines)
+            };
         }
+    }
+
+    pub(super) fn toggle_entity_detail_section(&mut self, id: &str) -> bool {
+        let Some(detail) = self.entity_detail.as_mut() else {
+            return false;
+        };
+        if !detail.headers.iter().any(|header| header.id == id) {
+            return false;
+        }
+        detail.anchor_header(id);
+        detail.selected_section = Some(id.to_owned());
+        if !detail.expanded.remove(id) {
+            detail.expanded.insert(id.to_owned());
+        }
+        detail.rebuild(detail.wrapped_width.unwrap_or(96), self.theme);
+        self.scroll_drag = None;
+        true
+    }
+
+    pub(super) fn toggle_entity_detail_selected(&mut self) -> bool {
+        let id = self
+            .entity_detail
+            .as_ref()
+            .and_then(|detail| detail.selected_section.clone());
+        id.is_some_and(|id| self.toggle_entity_detail_section(&id))
+    }
+
+    pub(super) fn cycle_entity_detail_section(&mut self, forward: bool) {
+        let Some(detail) = self
+            .entity_detail
+            .as_mut()
+            .filter(|detail| !detail.headers.is_empty())
+        else {
+            return;
+        };
+        let current = detail
+            .headers
+            .iter()
+            .position(|header| Some(&header.id) == detail.selected_section.as_ref());
+        let count = detail.headers.len();
+        let index = match (current, forward) {
+            (None, true) => 0,
+            (None, false) => count - 1,
+            (Some(index), true) => (index + 1) % count,
+            (Some(index), false) => (index + count - 1) % count,
+        };
+        let id = detail.headers[index].id.clone();
+        if detail
+            .sticky_headers(detail.offset, detail.wrapped_height)
+            .iter()
+            .any(|header| header.id == id)
+        {
+            // Selecting a pinned ancestor keeps the body at its current place.
+            // Toggling it still returns to that ancestor's original heading.
+            detail.header_anchor = None;
+        } else {
+            detail.anchor_header(&id);
+        }
+        detail.selected_section = Some(id);
+        detail.rebuild(detail.wrapped_width.unwrap_or(96), self.theme);
+        self.scroll_drag = None;
     }
 }
 
@@ -318,50 +713,100 @@ fn detail_enrichment_target(app: &App) -> Option<DetailReadTarget> {
 }
 
 struct DetailLines {
-    lines: Vec<Line<'static>>,
-    heading_style: Style,
+    document: Vec<DetailNode>,
+    path: Vec<usize>,
+    theme: Theme,
 }
 
 impl DetailLines {
     fn new(app: &App) -> Self {
         Self {
-            lines: Vec::new(),
-            heading_style: Style::default()
-                .fg(app.theme.palette().title)
-                .add_modifier(Modifier::BOLD),
+            document: Vec::new(),
+            path: Vec::new(),
+            theme: app.theme,
         }
     }
 
     fn section(&mut self, title: &str) {
-        if !self.lines.is_empty() {
-            self.lines.push(Line::default());
+        self.path.clear();
+        self.document.push(DetailNode::Section {
+            id: format!("snapshot.{title}"),
+            title: title.to_owned(),
+            foldable: !matches!(title, "Overview" | "Usage"),
+            children: Vec::new(),
+        });
+        self.path.push(self.document.len() - 1);
+    }
+
+    fn children(&mut self) -> &mut Vec<DetailNode> {
+        let mut children = &mut self.document;
+        for &index in &self.path {
+            let DetailNode::Section { children: next, .. } = &mut children[index] else {
+                unreachable!("the builder only enters sections");
+            };
+            children = next;
         }
-        self.lines
-            .push(Line::styled(title.to_owned(), self.heading_style));
+        children
+    }
+
+    fn subsection(&mut self, id: String, title: String) {
+        let children = self.children();
+        children.push(DetailNode::Section {
+            id,
+            title: terminal_safe_text(&title),
+            foldable: true,
+            children: Vec::new(),
+        });
+        let index = children.len() - 1;
+        self.path.push(index);
+    }
+
+    fn end_subsection(&mut self) {
+        self.path.pop();
     }
 
     fn field(&mut self, name: &str, value: impl std::fmt::Display) {
-        self.lines.push(Line::from(format!(
-            "{name}: {}",
-            terminal_safe_text(&value.to_string())
-        )));
+        self.children()
+            .push(DetailNode::Lines(vec![Line::from(format!(
+                "{name}: {}",
+                terminal_safe_text(&value.to_string())
+            ))]));
     }
 
     fn note(&mut self, value: &str) {
-        self.lines.push(Line::from(terminal_safe_text(value)));
+        self.children()
+            .push(DetailNode::Lines(vec![Line::from(terminal_safe_text(
+                value,
+            ))]));
+    }
+
+    fn usage(&mut self, block: UsageBlock) {
+        self.children().push(DetailNode::Usage(block));
     }
 
     fn finish(self, title: &str) -> EntityDetailPopup {
-        EntityDetailPopup {
+        let mut popup = EntityDetailPopup {
             title: title.to_owned(),
-            lines: self.lines,
+            lines: Vec::new(),
+            document: self.document,
+            expanded: HashSet::new(),
+            selected_section: None,
+            headers: Vec::new(),
+            section_hitboxes: Vec::new(),
             offset: 0,
             line_count: 0,
+            recorded: None,
+            recorded_expanded: None,
             receiver: None,
             cancel: None,
             wrapped: Vec::new(),
             wrapped_width: None,
-        }
+            wrapped_height: 0,
+            wrapped_headers: Vec::new(),
+            header_anchor: None,
+        };
+        popup.rebuild(96, self.theme);
+        popup
     }
 }
 
@@ -400,41 +845,10 @@ fn elapsed(start: Option<DateTime<Utc>>, end: DateTime<Utc>) -> Option<u64> {
 }
 
 fn tokens(lines: &mut DetailLines, label: &str, usage: TokenUsage) {
-    lines.field(label, usage.total_tokens);
-    lines.field("Input", usage.input_tokens);
-    lines.field("Cached input", usage.cached_input_tokens);
-    lines.field("Cache write input", usage.cache_write_input_tokens);
-    lines.field("Output", usage.output_tokens);
-    lines.field("Reasoning output", usage.reasoning_output_tokens);
-    lines.field("Unclassified", usage.unclassified());
-    lines.field(
-        "Input / total",
-        ratio(usage.input_tokens, usage.total_tokens),
-    );
-    lines.field(
-        "Output / total",
-        ratio(usage.output_tokens, usage.total_tokens),
-    );
-    lines.field(
-        "Cache read / input",
-        ratio(usage.cached_input_tokens, usage.input_tokens),
-    );
-    lines.field(
-        "Cache write / input",
-        ratio(usage.cache_write_input_tokens, usage.input_tokens),
-    );
-    lines.field(
-        "Reasoning / output",
-        ratio(usage.reasoning_output_tokens, usage.output_tokens),
-    );
-}
-
-fn ratio(numerator: u64, denominator: u64) -> String {
-    if denominator == 0 {
-        "unavailable (zero denominator)".to_string()
-    } else {
-        format!("{:.2}%", numerator as f64 / denominator as f64 * 100.0)
-    }
+    lines.usage(UsageBlock::Tokens {
+        label: label.to_owned(),
+        usage,
+    });
 }
 
 fn api_amount(
@@ -443,26 +857,11 @@ fn api_amount(
     amount: ApiCostAmount,
     state: ApiCostWindowState,
 ) {
-    lines.field(
-        &format!("{prefix} API equivalent"),
-        format_scoped_api_cost_amount(state, amount),
-    );
-    lines.field(
-        "Priced token coverage",
-        format!(
-            "{} / {} ({})",
-            amount.priced_tokens,
-            amount.observed_tokens,
-            ratio(amount.priced_tokens, amount.observed_tokens)
-        ),
-    );
-    lines.field(
-        "Usage samples",
-        format!(
-            "{} observed; {} priced",
-            amount.observed_samples, amount.priced_samples
-        ),
-    );
+    lines.usage(UsageBlock::Cost {
+        prefix: prefix.to_owned(),
+        amount,
+        state,
+    });
 }
 
 fn scope_usage(
@@ -471,17 +870,11 @@ fn scope_usage(
     usage: WindowUsage,
     state: ApiCostWindowState,
 ) {
-    tokens(lines, &format!("{label} window tokens"), usage.token_usage);
-    lines.field(
-        &format!("{label} TOKEN%"),
-        format!("{:.4}%", usage.local_token_share_percent),
-    );
-    lines.field(
-        &format!("{label} estimated quota"),
-        format_estimated_quota(usage.estimated_quota_percent, usage.quota_confidence),
-    );
-    lines.field("Quota confidence", format!("{:?}", usage.quota_confidence));
-    api_amount(lines, label, usage.api_equivalent_cost, state);
+    lines.usage(UsageBlock::Scope {
+        label: label.to_owned(),
+        usage,
+        state,
+    });
 }
 
 fn workspace_label(source: Option<&str>) -> &'static str {
@@ -675,6 +1068,13 @@ fn task_detail(app: &App, task: &TaskRecord) -> EntityDetailPopup {
         children.len().saturating_add(1),
     );
     for child in children {
+        lines.subsection(
+            format!("snapshot.Related.{}", child.thread_id),
+            format!(
+                "{} · {} tokens",
+                child.title, child.token_usage.total_tokens
+            ),
+        );
         lines.field("Child thread", &child.thread_id);
         lines.field("Child title", &child.title);
         lines.field("Child status", format!("{:?}", child.status));
@@ -714,6 +1114,7 @@ fn task_detail(app: &App, task: &TaskRecord) -> EntityDetailPopup {
                 ),
             );
         }
+        lines.end_subsection();
     }
     lines.section("Data notes");
     overview_notes(&mut lines, app);
@@ -1246,6 +1647,63 @@ fn wrapped_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     output
 }
 
+/// Continuations stay inside their nested section instead of returning to the
+/// root margin when a long call ID, path or output line wraps.
+fn wrapped_detail_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let Some(first) = line.spans.first() else {
+        return wrapped_lines(std::slice::from_ref(line), width);
+    };
+    let indent = first
+        .content
+        .bytes()
+        .take_while(|byte| *byte == b' ')
+        .count();
+    if indent == 0 || indent >= usize::from(width) {
+        return wrapped_lines(std::slice::from_ref(line), width);
+    }
+    let mut body = line.clone();
+    body.spans[0].content = first.content[indent..].to_owned().into();
+    let mut wrapped = wrapped_lines(&[body], width - indent as u16);
+    for row in &mut wrapped {
+        row.spans
+            .insert(0, Span::styled(" ".repeat(indent), first.style));
+    }
+    wrapped
+}
+
+/// Pinned copies take one row. The original heading still wraps in full in the
+/// scrollable document, and shortcut styling survives Unicode-safe truncation.
+fn sticky_detail_line(line: &Line<'static>, width: u16) -> Line<'static> {
+    if line.width() <= usize::from(width) {
+        return line.clone();
+    }
+    let mut result = Line::default().style(line.style);
+    if width == 0 {
+        return result;
+    }
+    let available = usize::from(width).saturating_sub(1);
+    let mut used = 0;
+    for span in &line.spans {
+        let mut chunk = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let next = UnicodeWidthStr::width(grapheme);
+            if used + next > available {
+                if !chunk.is_empty() {
+                    result.spans.push(Span::styled(chunk, span.style));
+                }
+                result.spans.push(Span::styled("…", span.style));
+                return result;
+            }
+            chunk.push_str(grapheme);
+            used += next;
+        }
+        if !chunk.is_empty() {
+            result.spans.push(Span::styled(chunk, span.style));
+        }
+    }
+    result
+}
+
 fn append_enrichment(lines: &mut Vec<Line<'static>>, values: Vec<String>) {
     const MAX_BYTES: usize = 256 * 1024;
     const MAX_LINES: usize = 8_192;
@@ -1286,7 +1744,7 @@ pub(super) fn render_entity_detail(
 ) -> EntityDetailHitbox {
     let palette = app.theme.palette();
     let width = if area.width >= 8 {
-        area.width.saturating_sub(4).min(100)
+        area.width.saturating_sub(4).min(140)
     } else {
         area.width
     };
@@ -1317,30 +1775,106 @@ pub(super) fn render_entity_detail(
         inner.width.saturating_sub(1),
         inner.height.saturating_sub(1),
     );
-    if detail.wrapped_width != Some(content.width) {
-        detail.wrapped = wrapped_lines(&detail.lines, content.width);
+    let capacity = usize::from(content.height);
+    if detail.wrapped_width != Some(content.width) || detail.wrapped_height != capacity {
+        let anchor = detail
+            .header_anchor
+            .take()
+            .map(|(id, row)| DetailScrollAnchor::Header { id, row })
+            .or_else(|| detail.resize_anchor());
+        detail.rebuild(content.width, app.theme);
+        detail.wrapped.clear();
+        detail.wrapped_headers.clear();
+        let mut line_offsets = Vec::with_capacity(detail.lines.len() + 1);
+        for line in &detail.lines {
+            line_offsets.push(detail.wrapped.len());
+            detail
+                .wrapped
+                .extend(wrapped_detail_line(line, content.width));
+        }
+        line_offsets.push(detail.wrapped.len());
+        detail
+            .wrapped_headers
+            .extend(detail.headers.iter().map(|header| WrappedDetailHeader {
+                id: header.id.clone(),
+                range: line_offsets[header.line]..line_offsets[header.line + 1],
+                section_end: line_offsets[header.end_line],
+                line: header.line,
+                width: detail.lines[header.line].width(),
+            }));
+        if let Some(anchor) = anchor {
+            let (id, row, body_offset) = match anchor {
+                DetailScrollAnchor::Header { id, row } => (id, row, None),
+                DetailScrollAnchor::Body { id, offset } => (id, 0, Some(offset)),
+            };
+            if let Some(header) = detail.wrapped_headers.iter().find(|header| header.id == id) {
+                detail.offset = if let Some(offset) = body_offset {
+                    header
+                        .range
+                        .end
+                        .saturating_add(offset)
+                        .min(header.section_end.saturating_sub(1))
+                } else {
+                    // Leave room for ancestors above the selected heading.
+                    let body = capacity.saturating_sub(EntityDetailPopup::sticky_limit(capacity));
+                    let row = row.min(body.saturating_sub(header.range.len().min(body)));
+                    header.range.start.saturating_sub(row)
+                };
+            }
+        }
         detail.wrapped_width = Some(content.width);
+        detail.wrapped_height = capacity;
     }
     detail.line_count = detail.wrapped.len();
-    let capacity = usize::from(content.height);
-    detail.offset = detail
-        .offset
-        .min(detail.line_count.saturating_sub(capacity));
+    let max_offset = detail.scroll_limit(capacity);
+    detail.offset = detail.offset.min(max_offset);
+    let sticky = detail.sticky_headers(detail.offset, capacity);
+    let pinned_count = sticky.len() as u16;
+    let body = Rect::new(
+        content.x,
+        content.y.saturating_add(pinned_count),
+        content.width,
+        content.height.saturating_sub(pinned_count),
+    );
+    let body_capacity = usize::from(body.height);
+    let pinned: Vec<_> = sticky
+        .iter()
+        .map(|header| {
+            let line = sticky_detail_line(&detail.lines[header.line], content.width);
+            (header.id.clone(), line)
+        })
+        .collect();
     let visible = detail
         .wrapped
         .iter()
         .skip(detail.offset)
-        .take(capacity)
+        .take(body_capacity)
         .cloned()
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().fg(palette.foreground)),
-        content,
+        body,
     );
+    if !pinned.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                pinned
+                    .iter()
+                    .map(|(_, line)| line.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .style(
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.gauge_track),
+            ),
+            Rect::new(content.x, content.y, content.width, pinned_count),
+        );
+    }
     let scrollbar = scrollbar_geometry(
         Rect::new(content.right(), content.y, 1, content.height),
-        detail.line_count,
-        capacity,
+        max_offset.saturating_add(body_capacity),
+        body_capacity,
         detail.offset,
     );
     if let Some(bar) = scrollbar {
@@ -1354,27 +1888,76 @@ pub(super) fn render_entity_detail(
     );
     let mut hitbox = EntityDetailHitbox {
         content,
+        body,
         scrollbar,
         ..EntityDetailHitbox::default()
     };
+    let has_sections = !detail.headers.is_empty();
+    detail.section_hitboxes.clear();
+    for (row, (id, line)) in pinned.iter().enumerate() {
+        detail.section_hitboxes.push((
+            id.clone(),
+            Rect::new(
+                content.x,
+                content.y.saturating_add(row as u16),
+                line.width().min(usize::from(content.width)) as u16,
+                1,
+            ),
+        ));
+    }
+    for header in &detail.wrapped_headers {
+        let start = header.range.start.max(detail.offset);
+        let end = header
+            .range
+            .end
+            .min(detail.offset.saturating_add(body_capacity));
+        if start < end {
+            let width = if header.range.len() == 1 {
+                header.width.min(usize::from(content.width)) as u16
+            } else {
+                content.width
+            };
+            let rect = Rect::new(
+                body.x,
+                body.y.saturating_add((start - detail.offset) as u16),
+                width,
+                (end - start) as u16,
+            );
+            detail.section_hitboxes.push((header.id.clone(), rect));
+        }
+    }
     let mut spans = Vec::new();
     let mut x = controls.x;
-    let full = controls.width >= 26;
-    let specs: &[(&str, &str, bool)] = if controls.width < 13 {
-        &[("←", "", true)]
-    } else {
-        &[
-            ("↑", if full { " Up" } else { "" }, detail.offset > 0),
-            (
-                "↓",
-                if full { " Down" } else { "" },
-                detail.offset < detail.line_count.saturating_sub(capacity),
-            ),
-            ("←", if full { " Back" } else { "" }, true),
-        ]
-    };
-    for &(key, suffix, active) in specs {
-        let leading = if spans.is_empty() { "" } else { "  " };
+    let full = controls.width >= if has_sections { 55 } else { 26 };
+    let mut specs: Vec<(&str, &str, bool)> = Vec::new();
+    let scroll_controls = !has_sections || controls.width >= 21;
+    if scroll_controls && controls.width >= 13 {
+        specs.push(("↑", if full { " Up" } else { "" }, detail.offset > 0));
+        specs.push((
+            "↓",
+            if full { " Down" } else { "" },
+            detail.offset < max_offset,
+        ));
+    }
+    if has_sections && controls.width >= 14 {
+        specs.push(("Tab", if full { " Next" } else { "" }, true));
+    }
+    if has_sections && controls.width >= 7 {
+        specs.push((
+            "↵",
+            if full { " Toggle" } else { "" },
+            detail.selected_section.is_some(),
+        ));
+    }
+    specs.push(("←", if full { " Back" } else { "" }, true));
+    for (key, suffix, active) in specs {
+        let leading = if spans.is_empty() {
+            ""
+        } else if full {
+            "  "
+        } else {
+            " "
+        };
         let control = append_summary_control(
             &mut spans,
             controls,
@@ -1391,6 +1974,8 @@ pub(super) fn render_entity_detail(
         match key {
             "↑" => hitbox.up = control,
             "↓" => hitbox.down = control,
+            "Tab" => hitbox.next = control,
+            "↵" => hitbox.toggle = control,
             _ => hitbox.back = control,
         }
     }
