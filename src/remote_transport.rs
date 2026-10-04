@@ -3532,7 +3532,7 @@ mod tests {
         path: &Path,
         cancellation: &AtomicBool,
         timeout: Duration,
-    ) -> Result<libc::pid_t, String> {
+    ) -> Result<(libc::pid_t, Instant), String> {
         let deadline = Instant::now() + timeout;
         let ready = loop {
             if let Some(pid) = read_complete_fixture_pid(path) {
@@ -3548,8 +3548,9 @@ mod tests {
         };
         // Even fixture startup failure must release the running transport and
         // clean up its process tree before the parent reports the failure.
+        let cancel_started = Instant::now();
         cancellation.store(true, Ordering::Release);
-        ready
+        ready.map(|pid| (pid, cancel_started))
     }
 
     #[cfg(unix)]
@@ -3573,10 +3574,11 @@ mod tests {
         }
         fs::write(&path, "12345\n").unwrap();
         let cancellation = AtomicBool::new(false);
-        assert_eq!(
-            cancel_after_fixture_pid(&path, &cancellation, Duration::ZERO).unwrap(),
-            12345
-        );
+        let before = Instant::now();
+        let cancelled = cancel_after_fixture_pid(&path, &cancellation, Duration::ZERO).unwrap();
+        let after = Instant::now();
+        assert_eq!(cancelled.0, 12345);
+        assert!(before <= cancelled.1 && cancelled.1 <= after);
         assert!(cancellation.load(Ordering::Acquire));
     }
 
@@ -3821,7 +3823,7 @@ mod tests {
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwait\n",
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\ncat >/dev/null\nwait\n",
                 descendant_pid_path.display()
             ),
         )
@@ -3839,23 +3841,21 @@ mod tests {
             timeout: Duration::from_secs(5),
             ..RemoteProbeOptions::default()
         };
-        let started = Instant::now();
-
         let result = probe_remote_with_program_and_environment(
             script_path,
             "dev-server",
             &options,
             &environment,
         );
-        let descendant_pid = trigger
+        let (descendant_pid, cancel_started) = trigger
             .join()
             .unwrap()
-            .expect("fake SSH cancellation fixture did not become ready");
+            .unwrap_or_else(|reason| panic!("fake SSH cancellation fixture did not become ready: {reason}; probe result: {result:?}"));
         let error = result.unwrap_err();
 
         assert!(matches!(error, RemoteTransportError::Cancelled { .. }));
         assert!(!error.process_containment_uncertain());
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(cancel_started.elapsed() < Duration::from_secs(2));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
@@ -3996,7 +3996,7 @@ mod tests {
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 30' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nwait\n",
+                "#!/bin/sh\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 30' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\ncat >/dev/null\nwait\n",
                 holder_pid_path.display(),
                 holder_pid_path.display(),
             ),
@@ -4015,24 +4015,28 @@ mod tests {
             timeout: Duration::from_secs(5),
             ..RemoteProbeOptions::default()
         };
-        let started = Instant::now();
-
         let result = probe_remote_with_program_and_environment(
             script_path,
             "dev-server",
             &options,
             &environment,
         );
-        let holder_pid = trigger
-            .join()
-            .unwrap()
-            .expect("escaped proxy cancellation fixture did not become ready");
-        let holder_survived = unsafe { libc::kill(holder_pid, 0) } == 0;
-        if holder_survived {
+        let readiness = trigger.join();
+        // Clean up a published escaped holder before asserting any readiness
+        // or probe result. A deadline can race with the final PID publication.
+        let holder_pid = readiness
+            .as_ref()
+            .ok()
+            .and_then(|ready| ready.as_ref().ok())
+            .map(|(pid, _)| *pid)
+            .or_else(|| read_complete_fixture_pid(&holder_pid_path));
+        let holder_survived = holder_pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+        if let Some(holder_pid) = holder_pid.filter(|_| holder_survived) {
             unsafe {
                 libc::kill(holder_pid, libc::SIGKILL);
             }
         }
+        let (_, cancel_started) = readiness.unwrap().unwrap_or_else(|reason| panic!("escaped proxy cancellation fixture did not become ready: {reason}; probe result: {result:?}"));
 
         let error = result.unwrap_err();
         assert!(matches!(error, RemoteTransportError::Cancelled { .. }));
@@ -4048,7 +4052,7 @@ mod tests {
             "escaped holder was not surfaced in cancellation diagnostics: {error}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            cancel_started.elapsed() < Duration::from_secs(2),
             "escaped pipe workers made cancellation unbounded"
         );
     }
