@@ -1639,13 +1639,15 @@ mod executable_path_tests {
     #[cfg(unix)]
     #[test]
     fn remote_native_path_is_one_literal_argument_even_with_shell_syntax() {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let executable = root
             .path()
             .join("Application Support 中文 \\ '$(touch SHOULD_NOT_EXIST); agent");
-        std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/print-argv.sh"),
+            &executable,
+        )
+        .unwrap();
         let path = executable.to_str().unwrap();
         crate::remotes_config::validate_agent_executable(path).unwrap();
         let command = remote_executable_command(path, &["remote-agent", "export"]).unwrap();
@@ -2761,6 +2763,20 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    fn fake_ssh_fixture(directory: &Path, name: &str) -> PathBuf {
+        // Executable bytes stay in a checked-in fixture; only per-test links,
+        // response frames and PID files are created. A concurrent fork cannot
+        // inherit a writer for the executable and trigger Linux ETXTBSY.
+        let path = directory.join(name);
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock-ssh.sh"),
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn ssh_argv_is_fixed_and_dynamic_host_is_one_argument() {
         let command = build_ssh_command(
@@ -3178,7 +3194,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let response_path = directory.path().join("response.frame");
-        let script_path = directory.path().join("fake-ssh");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh");
         let descendant_pid_path = directory.path().join("normal-descendant.pid");
         let now = Utc::now();
         let response = RemoteProbeResponse {
@@ -3206,17 +3222,6 @@ mod tests {
             encode_remote_frame(&response, RemoteFrameLimits::default()).unwrap(),
         )
         .unwrap();
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\ncat '{}'\n",
-                descendant_pid_path.display(),
-                response_path.display(),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
-
         let report =
             probe_remote_with_program(script_path, "dev-server", &RemoteProbeOptions::default())
                 .unwrap();
@@ -3332,7 +3337,7 @@ mod tests {
         fs::create_dir(&bin).unwrap();
         let response_path = directory.path().join("response.frame");
         let ssh_path = bin.join("ssh");
-        let helper_path = bin.join("ssh-proxy-helper");
+        fake_ssh_fixture(&bin, "ssh-proxy-helper");
         let now = Utc::now();
         let response = RemoteProbeResponse {
             protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -3359,18 +3364,13 @@ mod tests {
             encode_remote_frame(&response, RemoteFrameLimits::default()).unwrap(),
         )
         .unwrap();
-        fs::write(&ssh_path, "#!/bin/sh\nexec ssh-proxy-helper \"$@\"\n").unwrap();
-        fs::write(
-            &helper_path,
-            format!(
-                "#!/bin/sh\n/bin/cat >/dev/null\n/bin/cat '{}'\n",
-                response_path.display()
-            ),
+        // PATH resolution canonicalizes SSH, so its static proxy must not use
+        // $0 to locate data. The PATH-selected helper retains its per-test link.
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock-ssh-proxy.sh"),
+            &ssh_path,
         )
         .unwrap();
-        for path in [&ssh_path, &helper_path] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
         let environment = SshCommandEnvironment::new(Some(env::join_paths([&bin]).unwrap()));
 
         let report = probe_remote_with_environment(
@@ -3399,7 +3399,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let response_path = directory.path().join("delta-response.frame");
-        let script_path = directory.path().join("fake-ssh-delta");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-delta");
         let observed_at = Utc::now();
         let source = SourceGeneration {
             node_id: "node-22222222222222222222222222222222".parse().unwrap(),
@@ -3468,16 +3468,6 @@ mod tests {
             encode_remote_frame(&response, RemoteFrameLimits::default()).unwrap(),
         )
         .unwrap();
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\ncat '{}'\n",
-                response_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
-
         let report: RemoteExchangeReport<DeltaPayload, EmptyRemotePayload> =
             exchange_remote_with_program(
                 script_path.clone(),
@@ -3626,17 +3616,8 @@ mod tests {
     #[test]
     fn continuous_stdout_is_killed_at_the_negotiated_frame_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-stdout-overflow");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-stdout-overflow");
         let descendant_pid_path = directory.path().join("stdout-descendant.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwhile :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; done\n",
-                descendant_pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let options = RemoteProbeOptions {
             timeout: Duration::from_secs(5),
             max_response_bytes: crate::remote_protocol::MIN_REMOTE_RESPONSE_ENCODED_BYTES,
@@ -3661,13 +3642,7 @@ mod tests {
     #[test]
     fn stdout_limit_wins_when_fake_ssh_exits_immediately() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-fast-stdout-overflow");
-        fs::write(
-            &script_path,
-            "#!/bin/sh\ncat >/dev/null\ni=0\nwhile [ \"$i\" -lt 200 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; i=$((i + 1)); done\nexit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-fast-stdout-overflow");
         let options = RemoteProbeOptions {
             timeout: Duration::from_secs(5),
             max_response_bytes: crate::remote_protocol::MIN_REMOTE_RESPONSE_ENCODED_BYTES,
@@ -3686,17 +3661,8 @@ mod tests {
     #[test]
     fn continuous_stderr_is_killed_at_the_diagnostic_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-stderr-overflow");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-stderr-overflow");
         let descendant_pid_path = directory.path().join("stderr-descendant.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwhile :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >&2; done\n",
-                descendant_pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let options = RemoteProbeOptions {
             timeout: Duration::from_secs(5),
             ..RemoteProbeOptions::default()
@@ -3727,17 +3693,8 @@ mod tests {
     #[test]
     fn timeout_terminates_the_fake_ssh_process_group() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-hang");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-hang");
         let descendant_pid_path = directory.path().join("timeout-descendant.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '{}'\nwait\n",
-                descendant_pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let mut command = Command::new(script_path);
         configure_process_tree(&mut command, true);
         let mut child = command
@@ -3803,9 +3760,7 @@ mod tests {
     #[test]
     fn probe_reports_timeout_without_assuming_descendant_startup() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-timeout");
-        fs::write(&script_path, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-timeout");
         let options = RemoteProbeOptions {
             timeout: Duration::from_millis(100),
             ..RemoteProbeOptions::default()
@@ -3818,17 +3773,8 @@ mod tests {
     #[test]
     fn cancellation_terminates_the_fake_ssh_process_group() {
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-cancel");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-cancel");
         let descendant_pid_path = directory.path().join("descendant.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\ncat >/dev/null\nwait\n",
-                descendant_pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancellation_worker = Arc::clone(&cancellation);
         let pid_path = descendant_pid_path.clone();
@@ -3879,18 +3825,8 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-escaped-holder");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-escaped-holder");
         let holder_pid_path = directory.path().join("holder.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 30' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nexit 0\n",
-                holder_pid_path.display(),
-                holder_pid_path.display(),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let mut command = Command::new(script_path);
         configure_process_tree(&mut command, true);
         let mut child = command
@@ -3991,18 +3927,8 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let script_path = directory.path().join("fake-ssh-cancel-escaped-holder");
+        let script_path = fake_ssh_fixture(directory.path(), "fake-ssh-cancel-escaped-holder");
         let holder_pid_path = directory.path().join("holder.pid");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nperl -MPOSIX -e 'POSIX::setsid(); open(my $f, q(>), q({})); print $f \"$$\\n\"; close($f); sleep 30' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\ncat >/dev/null\nwait\n",
-                holder_pid_path.display(),
-                holder_pid_path.display(),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         let trigger_cancellation = Arc::clone(&cancellation);
         let pid_path = holder_pid_path.clone();

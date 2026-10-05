@@ -522,7 +522,7 @@ impl Drop for ProcessTree {
 /// Authentication remains owned by `codex app-server`; this adapter does not read
 /// `auth.json` and does not call any write or control methods.
 pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot> {
-    fetch_account_snapshot_inner(config, None)
+    fetch_account_snapshot_inner(config, None, app_server_rpc_deadline)
 }
 
 /// Collects account data while assigning the caller's logical snapshot time.
@@ -535,12 +535,13 @@ pub(crate) fn fetch_account_snapshot_as_of(
     config: &CollectConfig,
     as_of: DateTime<Utc>,
 ) -> Result<AccountSnapshot> {
-    fetch_account_snapshot_inner(config, Some(as_of))
+    fetch_account_snapshot_inner(config, Some(as_of), app_server_rpc_deadline)
 }
 
 fn fetch_account_snapshot_inner(
     config: &CollectConfig,
     snapshot_as_of: Option<DateTime<Utc>>,
+    mut rpc_deadline: impl FnMut(Duration) -> Result<Instant>,
 ) -> Result<AccountSnapshot> {
     let operation_trace = config
         .trace_log
@@ -749,7 +750,7 @@ fn fetch_account_snapshot_inner(
             )
             .context("failed to initialize codex app-server")?;
 
-            let deadline = app_server_rpc_deadline(config.app_server_timeout)?;
+            let deadline = rpc_deadline(config.app_server_timeout)?;
 
             match wait_for_response(
                 INITIALIZE_ID,
@@ -801,7 +802,7 @@ fn fetch_account_snapshot_inner(
             return Err(error);
         }
 
-        let deadline = app_server_rpc_deadline(config.app_server_timeout)?;
+        let deadline = rpc_deadline(config.app_server_timeout)?;
 
         let rate_limits;
         let rate_limits_rpc_category;
@@ -2225,40 +2226,51 @@ mod diagnostic_tests {
     #[cfg(unix)]
     #[test]
     fn initialize_and_rate_limit_reads_receive_independent_rpc_deadlines() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let fake_codex = temp.path().join("private-two-phase-codex");
-        fs::write(
-            &fake_codex,
-            br#"#!/bin/sh
-IFS= read -r initialize || exit 1
-sleep 0.25
-printf '%s\n' '{"id":1,"result":{}}'
-IFS= read -r initialized || exit 2
-IFS= read -r limits || exit 3
-sleep 0.25
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":null}}}'
-IFS= read -r usage || exit 4
-printf '%s\n' '{"id":3,"result":{"summary":{},"dailyUsageBuckets":[]}}'
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        // A checked-in executable also avoids Linux ETXTBSY races between
+        // creating a fixture and concurrent test processes spawning children.
+        let fake_codex = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mock-codex-immediate-account.sh");
         let config = CollectConfig {
             codex_bin: Some(fake_codex),
             app_server_timeout: Duration::from_millis(400),
             ..CollectConfig::default()
         };
 
-        let started = Instant::now();
-        let snapshot = fetch_account_snapshot(&config).unwrap();
+        // Advance a scripted phase clock by 250ms between the actual primary
+        // RPC deadline requests. Anchor it ahead of real time only as an I/O
+        // watchdog: scheduler delays no longer determine the regression result.
+        let phase_start = Instant::now() + Duration::from_secs(5);
+        let phase_duration = Duration::from_millis(250);
+        let mut deadlines = Vec::new();
+        let snapshot = super::fetch_account_snapshot_inner(&config, None, |timeout| {
+            assert_eq!(timeout, config.app_server_timeout);
+            assert!(
+                deadlines.len() < 2,
+                "optional usage must inherit the rate-limit deadline"
+            );
+            let phase_now = phase_start + phase_duration * deadlines.len() as u32;
+            let deadline = phase_now.checked_add(timeout).unwrap();
+            deadlines.push(deadline);
+            Ok(deadline)
+        })
+        .unwrap();
 
         assert_eq!(snapshot.limits.len(), 1);
-        assert!(
-            started.elapsed() >= Duration::from_millis(500),
-            "the fixture must exceed one shared 400ms deadline"
+        assert_eq!(snapshot.limits[0].limit_id, "independent-deadline-fixture");
+        assert!(snapshot.errors.is_empty());
+        assert_eq!(
+            deadlines,
+            [
+                phase_start + config.app_server_timeout,
+                phase_start + phase_duration + config.app_server_timeout,
+            ],
+            "initialize and rate-limit reads must each create their own deadline"
         );
+        let second_response_at = phase_start + phase_duration * 2;
+        assert!(second_response_at > deadlines[0]);
+        assert!(second_response_at < deadlines[1]);
+        // Optional usage has a separate 100ms grace and may legitimately be
+        // absent under load; its response is covered by dedicated usage tests.
     }
 
     #[cfg(unix)]
