@@ -1,5 +1,113 @@
 # Dependency advisory disposition
 
+## 2026-10-05 test dependency update
+
+The second batch uses the same `codex/dependency-updates` worktree, based on
+`70c64fc8b5b00d541f7055f56070e51eb7715b51`.
+
+| Dependency | Locked before | Locked after | Reason |
+| --- | --- | --- | --- |
+| vt100 | 0.15.2 | 0.16.2 | Maintain the PTY/ConPTY parser, adopt the shared Unicode 17 width table and include the upstream cursor-restore-after-resize fix; see the [upstream changelog](https://github.com/doy/vt100-rust/blob/eb66ffaf7d771c13303ef73b29f6f2a56fdacecf/CHANGELOG.md). |
+| insta | 1.48.0 | 1.49.0 | Keep snapshot tooling current; see the [published crate](https://crates.io/crates/insta/1.49.0). |
+| vte | 0.11.1 | 0.15.0 | Required vt100 parser dependency. |
+
+Both direct dependencies remain development dependencies. The only test API
+migration is `Parser::set_size(rows, columns)` to
+`Parser::screen_mut().set_size(rows, columns)` in `tests/tui_pty.rs`.
+The 232 packages reachable from production/build dependency roots retain their
+versions, checksums and dependency edges. Build identity can still change because
+the manifest and lockfile are build inputs.
+The lock removes unicode-width 0.1.14 and vte_generate_state_changes 0.1.2;
+vt100 now shares the already locked unicode-width 0.2.2 with the application.
+No other package versions change. The parser still computes individual character
+widths, so this does not establish complete grapheme-width emulation for variation
+sequences or ZWJ emoji. All 14 existing semantic snapshots remain unchanged.
+
+### Advisory audit
+
+cargo-audit 0.22.2 checked all 254 locked packages against 1,290 advisories:
+zero vulnerabilities and zero advisory warnings, with no ignored advisories or
+platform filters. The existing RustSec database was reused with `--no-fetch` at
+commit `ef6173cbc5c50ec8166f9a5b28f07834144373ee`, dated
+`2026-10-03T10:14:03+02:00`; registry/yanked checking remained enabled.
+The command was:
+
+```sh
+/Users/user/Workspace/codex-usage-monit/target/dependency-review-2026-10-05/tools/bin/cargo-audit audit --deny warnings --db /Users/user/Workspace/codex-usage-monit/target/dependency-review-2026-10-05/advisory-db --no-fetch --json
+```
+
+The report and execution record are
+`target/dependency-test-updates-2026-10-05/audit.json` and `audit-evidence.json`.
+The database Git identity is in the execution record because the no-fetch audit
+JSON omits the last-commit/last-updated fields.
+
+### Local verification
+
+The full local runs used Rust 1.97.0 and the stable four-file implementation
+diff SHA-256
+`7aeaa232881f3d3e737fabaf4668eca1f36f38178e6fccd60105c4315ae6883a`.
+The lockfile SHA-256 is
+`fd3ec5a49e74d86652bea1354d197ad4733475aec409a6e727ba70c25826752d`.
+Per-file hashes are recorded in
+`target/dependency-test-updates-2026-10-05/source-freeze.json`.
+The complete `build.rs` input hashes are in `tested-build-inputs.json` in the
+same directory.
+Only this audit documentation was added after the runs; tested product inputs
+were checked against the frozen hashes before committing.
+
+| Platform | Full command | Result and evidence |
+| --- | --- | --- |
+| macOS 15.7.2 / ARM64 | `sh scripts/verify-unix.sh` | Passed: 2,036 Rust tests, 0 failures, 3 ignored; format, Clippy, Python contracts (80 + 10), PTY (2/2), preview, installer and offline CLI smoke. Source-before/after records and logs: `target/dependency-test-updates-2026-10-05/macos-full.{json,log}`. |
+| Linux / ARM64 Docker | `sh scripts/test-linux-docker.sh` | Passed: 2,033 Rust tests, 0 failures, 3 ignored; full Unix pipeline including PTY (2/2). Snapshot SHA-256 `a890f6dee0034f22a8340c189b932aabcd7eacc0be13e086c1518dc087e452f6`; `verify.log`, `source.json` and `result.json` in `/Volumes/File/codex-usage-monit-docker-build/runs/20261005T004309Z-arm64-66882/`. Copies and invocation record are in this batch's ignored evidence directory. |
+| Windows 11 ARM64 UTM / x64 MSVC target | Full recovery invocation below | Passed: 1,990 Rust tests across 13 targets, 0 failures, 4 ignored; format, Clippy, 25 Python contracts, 105 PowerShell 5.1 contracts, ConPTY (2/2) and real CLI/offline JSON smoke. Archive SHA-256 `bb2c2ecdf820b9536263908764b44f84faa6c0523511919d905d166deee9e931`. |
+
+The native macOS command was recorded by
+`python3 target/dependency-test-updates-2026-10-05/run-check.py macos-full -- sh scripts/verify-unix.sh`.
+Before that checkpoint, the focused PTY/measurement target run passed both real
+PTY tests and left the opt-in synthetic measurement ignored. The focused
+`semantic_frames_cover_full_compact_and_diagnostic_layouts` test passed without
+updating any snapshots. Their logs are `macos-focused-pty.log` and
+`macos-focused-snapshots.log` in the same evidence directory.
+
+The Windows doctor reported ready. The full run reused the documented
+[interactive-user recovery](config-lock-test-stability-2026-10-04.zh-CN.md)
+and its unchanged helpers from the first batch:
+
+```sh
+python3 target/dependency-updates-2026-10-05/verify_windows_interactive.py \
+  --interactive-user 'WIN-MM0JRLGM2Q3\user' \
+  --python-dir 'C:\Tools\codex-usage-monit\python-3.13.16-arm64' \
+  --private-temp 'C:\Users\user\AppData\Local\Temp' \
+  --toolchain-home 'C:\Users\user' \
+  --pwsh-path 'C:\Tools\codex-usage-monit\powershell-7.6.5-arm64\pwsh.exe' \
+  --target x86_64-pc-windows-msvc \
+  --output-dir target/dependency-test-updates-2026-10-05/windows-interactive-x64
+```
+
+The result is in
+`target/dependency-test-updates-2026-10-05/windows-interactive-x64/018d570626134a43b59e688ae875f923/`:
+`result.json`, `verify.log`, `interactive-context.json`, `source-binding.json`,
+`verification-summary.json` and `task-cleanup.json`.
+The account was `WIN-MM0JRLGM2Q3\user`, administrator=true, session 1;
+the guest confirmed the private user TEMP and the existing Python toolchain.
+Result, request and archive identities match this run, its base commit and
+the tested source files. Cleanup confirms that the temporary task was removed,
+its process tree stopped and no process IDs remained.
+
+Rust pass counts include only the main all-target results; nested child results
+and the preview gallery rerun are excluded. Unix leaves three manual/measurement
+Rust tests ignored and six Windows-only Python contracts skipped. Windows also
+ignores the manual proxy case requiring `CODEX_USAGE_MONIT_PREVIOUS_TEST_BINARY`.
+No verification stages were skipped. macOS and Linux coverage is ARM64; Windows
+uses the supported x64 target through Windows x64 emulation in the ARM64 VM,
+under the logged-in administrator account. This does not establish Windows ARM64
+agent support or unelevated Windows service behavior.
+The package/checksum/API and dependency-graph review is preserved in
+`target/dependency-test-updates-2026-10-05/review-evidence.json`.
+Documentation, source binding and snapshot checks are recorded in
+`target/dependency-test-updates-2026-10-05/documentation-check.json`.
+No hosted CI, push, release tag or publication was requested for this batch.
+
 ## 2026-10-05 dependency update
 
 Implemented in a separate worktree on `codex/dependency-updates`, based on

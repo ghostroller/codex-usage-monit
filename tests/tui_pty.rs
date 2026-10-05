@@ -147,7 +147,7 @@ impl PtySession {
             pixel_height: 0,
         };
         self.master.resize(size).unwrap();
-        self.parser.set_size(rows, columns);
+        self.parser.screen_mut().set_size(rows, columns);
     }
 
     fn wait_for_new_output(

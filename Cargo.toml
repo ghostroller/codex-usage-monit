@@ -60,11 +60,11 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 fs2 = "0.4"
-insta = "1.48"
+insta = "1.49"
 portable-pty = "0.9"
 pretty_assertions = "1.4"
 tempfile = "3.14"
-vt100 = "0.15"
+vt100 = "0.16.2"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
