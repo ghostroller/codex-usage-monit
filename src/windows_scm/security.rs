@@ -589,17 +589,34 @@ mod tests {
         );
         fixture_acl(&ancestor, "(A;;0x4;;;WD)(A;OICIIO;FA;;;CO)"); // create siblings + inherit-only owner
         validate().unwrap();
-        assert!(
+        let validate_other_target = || {
             validate_executable_components(
                 &executable,
                 "S-1-5-21-1-2-3-9999",
                 executable
                     .ancestors()
                     .skip(1)
-                    .take_while(|path| path.starts_with(&root))
+                    .take_while(|path| path.starts_with(&root)),
             )
-            .is_err()
+        };
+        if sid == "S-1-5-18" {
+            // SYSTEM owns this fixture when the UTM Guest Agent runs it.
+            // Its protected code/ancestor grants remain trusted for another
+            // service target; ordinary user-owned code is target-specific.
+            validate_other_target().unwrap();
+        } else {
+            assert!(validate_other_target().is_err());
+        }
+        // A real foreign principal's write grant must still be rejected even
+        // when SYSTEM owns the code and the target SID is changed.
+        fixture_acl(&executable, "(A;;GW;;;BU)"); // BUILTIN\Users, S-1-5-32-545
+        assert!(
+            validate()
+                .unwrap_err()
+                .to_string()
+                .contains("machine_codex_untrusted")
         );
+        assert!(validate_other_target().is_err());
     }
 
     #[test]

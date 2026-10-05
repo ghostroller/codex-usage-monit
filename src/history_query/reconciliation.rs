@@ -176,9 +176,24 @@ fn build_replica_evidence_index(
     })
 }
 
+#[derive(Default)]
+struct ObservedThreadSources {
+    all: BTreeMap<String, BTreeSet<usize>>,
+    by_day: BTreeMap<(String, DateTime<Utc>), BTreeSet<usize>>,
+    opaque_by_day: BTreeMap<DateTime<Utc>, BTreeSet<usize>>,
+}
+
+fn utc_day_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    timestamp
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_utc()
+}
+
 fn build_replica_thread_bucket_index(
     slices: &[SourceSlice],
-) -> io::Result<(ReplicaThreadBucketIndex, BTreeMap<String, BTreeSet<usize>>)> {
+) -> io::Result<(ReplicaThreadBucketIndex, ObservedThreadSources)> {
     let mut by_source = Vec::new();
     by_source.try_reserve(slices.len()).map_err(|error| {
         io::Error::other(format!(
@@ -247,7 +262,7 @@ fn build_replica_thread_bucket_index(
                 "could not allocate active replica project-group totals: {error}"
             ))
         })?;
-    let mut observed_sources = BTreeMap::<String, BTreeSet<usize>>::new();
+    let mut observed_sources = ObservedThreadSources::default();
     for (source_index, source) in slices.iter().enumerate() {
         let mut source_threads = HashMap::<String, Vec<IndexedThreadBucket>>::new();
         let mut source_project_group_positions = Vec::new();
@@ -313,6 +328,11 @@ fn build_replica_thread_bucket_index(
             if residual.is_none_or(|residual| !bucket_project_residual_is_zero(residual)) {
                 source_opaque_positions.push(bucket_position);
                 source_opaque_active[bucket_position] = true;
+                observed_sources
+                    .opaque_by_day
+                    .entry(utc_day_start(bucket.starts_at))
+                    .or_default()
+                    .insert(source_index);
             }
             source_bucket_residuals.push(residual);
             let mut bucket_group_positions = HashMap::<String, Vec<usize>>::new();
@@ -385,7 +405,13 @@ fn build_replica_thread_bucket_index(
                     });
                 }
                 observed_sources
-                    .entry(thread_id)
+                    .all
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .insert(source_index);
+                observed_sources
+                    .by_day
+                    .entry((thread_id, utc_day_start(bucket.starts_at)))
                     .or_default()
                     .insert(source_index);
             }
@@ -774,8 +800,20 @@ pub(super) fn resolve_logical_replicas(
     // a v1 -> v2 migration can persist buckets before its matching digest, so
     // digest-only candidate detection is not sufficient to make an all-source
     // query additive-safe.
-    let (mut thread_bucket_index, observed_thread_sources) =
+    let (mut thread_bucket_index, mut observed_thread_sources) =
         build_replica_thread_bucket_index(slices)?;
+    // A digest also proves physical thread association when its source has no
+    // project breakdown. Later opaque days still need the same conservative
+    // overlap handling as sources associated through explicit project groups.
+    for (source_index, source) in evidence.iter().enumerate() {
+        for digest in &source.digests {
+            observed_thread_sources
+                .all
+                .entry(digest.replica().thread_id().as_str().to_owned())
+                .or_default()
+                .insert(source_index);
+        }
+    }
     let candidates = detect_replica_candidates(evidence.iter().flat_map(|source| {
         source
             .digests
@@ -787,6 +825,7 @@ pub(super) fn resolve_logical_replicas(
     }));
     if candidates.is_empty()
         && !observed_thread_sources
+            .all
             .values()
             .any(|source_indices| source_indices.len() > 1)
     {
@@ -830,7 +869,6 @@ pub(super) fn resolve_logical_replicas(
     let mut touched = BTreeMap::<(usize, DateTime<Utc>), BucketProjectResidual>::new();
     let mut handled_ranges =
         BTreeMap::<(String, usize), Vec<(DateTime<Utc>, DateTime<Utc>)>>::new();
-    let mut thread_authorities = BTreeMap::<String, usize>::new();
     for candidate in &candidates {
         let Some(resolution) =
             plan_replica_resolution(candidate, evidence, &evidence_index, project_mapping)?
@@ -839,15 +877,12 @@ pub(super) fn resolve_logical_replicas(
         };
         let thread_id = candidate.thread_id();
         let thread_key = thread_id.as_str().to_owned();
-        thread_authorities
-            .entry(thread_key.clone())
-            .or_insert(resolution.authority_index);
         let mut candidate_source_indices = resolution
             .participants
             .iter()
             .map(|participant| participant.source_index)
             .collect::<BTreeSet<_>>();
-        if let Some(observed_sources) = observed_thread_sources.get(&thread_key) {
+        if let Some(observed_sources) = observed_thread_sources.all.get(&thread_key) {
             candidate_source_indices.extend(observed_sources.iter().copied().filter(
                 |source_index| {
                     source_has_thread_group_in_range(
@@ -1059,30 +1094,16 @@ pub(super) fn resolve_logical_replicas(
         normalize_time_ranges(ranges);
     }
 
-    // Reconcile observations that were not backed by a cross-source digest
-    // candidate. This includes a source whose digest is temporarily missing
-    // and sessions imported from the v1 bucket family only. Keep one stable
-    // authority and remove all other physical copies. Fully decomposed buckets
-    // retain their provable non-session groups; an opaque bucket is zeroed so
-    // uncertainty can only make the aggregate a lower bound, never a double
-    // count.
-    for (thread_key, source_indices) in &observed_thread_sources {
-        if source_indices.len() < 2 {
+    // Thread identity spans dates even when physical copies contain disjoint
+    // days. Keep one logical identity without suppressing fully attributed
+    // unique days. An opaque bucket in an associated source can still contain
+    // the same thread, so absence of a project group is not absence of a copy.
+    for (thread_key, associated_sources) in &observed_thread_sources.all {
+        if associated_sources.len() < 2 {
             continue;
         }
-        let authority_index = thread_authorities
-            .get(thread_key)
-            .copied()
-            .unwrap_or_else(|| {
-                choose_observed_thread_authority(
-                    thread_key,
-                    source_indices,
-                    evidence,
-                    &evidence_index,
-                )
-            });
         let logical_id = format!("logical-thread:{thread_key}");
-        for source_index in source_indices {
+        for source_index in associated_sources {
             report.logical_threads.insert(
                 (
                     evidence[*source_index].source_id.as_str().to_owned(),
@@ -1091,50 +1112,132 @@ pub(super) fn resolve_logical_replicas(
                 logical_id.clone(),
             );
         }
-
-        let mut suppressed_unbound_copy = false;
-        for source_index in source_indices
-            .iter()
-            .copied()
-            .filter(|source_index| *source_index != authority_index)
-        {
-            let ranges = handled_ranges
-                .get(&(thread_key.clone(), source_index))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if !source_has_unhandled_thread_group(
-                &thread_bucket_index,
-                source_index,
-                &slices[source_index],
-                thread_key,
-                ranges,
-            ) {
+        // Enumerate at most one thread's days at a time. Materializing the
+        // thread x opaque-day product would exceed the bounded evidence input.
+        let days = observed_thread_sources
+            .by_day
+            .range(
+                (thread_key.clone(), DateTime::<Utc>::MIN_UTC)
+                    ..=(thread_key.clone(), DateTime::<Utc>::MAX_UTC),
+            )
+            .map(|((_, day), _)| *day)
+            .chain(
+                observed_thread_sources
+                    .opaque_by_day
+                    .iter()
+                    .filter(|(_, sources)| {
+                        sources
+                            .iter()
+                            .any(|source| associated_sources.contains(source))
+                    })
+                    .map(|(day, _)| *day),
+            )
+            .collect::<BTreeSet<_>>();
+        for range_start in days {
+            let range_end = range_start
+                .checked_add_signed(Duration::days(1))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let mut source_indices = observed_thread_sources
+                .by_day
+                .get(&(thread_key.clone(), range_start))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(opaque_sources) = observed_thread_sources.opaque_by_day.get(&range_start) {
+                for &source_index in opaque_sources.intersection(associated_sources) {
+                    let ranges = handled_ranges
+                        .get(&(thread_key.clone(), source_index))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if source_has_unhandled_opaque_bucket(
+                        &thread_bucket_index,
+                        source_index,
+                        &slices[source_index],
+                        range_start,
+                        range_end,
+                        ranges,
+                    ) {
+                        source_indices.insert(source_index);
+                    }
+                }
+            }
+            if source_indices.len() < 2 {
                 continue;
             }
-            suppress_unbound_replica_outside_ranges(
-                &mut thread_bucket_index,
-                source_index,
-                &mut slices[source_index],
+            // A first candidate's authority must not decide another UTC day.
+            // Keep the existing lower bound in genuinely uncertain overlaps.
+            let authority_index = choose_observed_thread_authority(
                 thread_key,
-                ranges,
-                &mut touched,
+                &source_indices,
+                evidence,
+                &evidence_index,
+                range_start,
+                range_end,
             );
-            suppressed_unbound_copy = true;
-        }
-        if suppressed_unbound_copy {
-            mark_unhandled_authority_lower_bound(
-                &thread_bucket_index,
-                authority_index,
-                &mut slices[authority_index],
-                thread_key,
-                handled_ranges
-                    .get(&(thread_key.clone(), authority_index))
+            let mut suppressed_unbound_copy = false;
+            for source_index in source_indices
+                .iter()
+                .copied()
+                .filter(|source_index| *source_index != authority_index)
+            {
+                let ranges = handled_ranges
+                    .get(&(thread_key.clone(), source_index))
                     .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            );
-            report
-                .warnings
-                .push(DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string());
+                    .unwrap_or(&[]);
+                if !source_has_unhandled_thread_group(
+                    &thread_bucket_index,
+                    source_index,
+                    &slices[source_index],
+                    thread_key,
+                    range_start,
+                    range_end,
+                    ranges,
+                ) && !source_has_unhandled_opaque_bucket(
+                    &thread_bucket_index,
+                    source_index,
+                    &slices[source_index],
+                    range_start,
+                    range_end,
+                    ranges,
+                ) {
+                    continue;
+                }
+                suppress_unbound_replica_outside_ranges(
+                    &mut thread_bucket_index,
+                    source_index,
+                    &mut slices[source_index],
+                    thread_key,
+                    range_start,
+                    range_end,
+                    ranges,
+                    &mut touched,
+                );
+                suppressed_unbound_copy = true;
+            }
+            if suppressed_unbound_copy {
+                ensure_authority_project_consistency(
+                    &mut thread_bucket_index,
+                    authority_index,
+                    &mut slices[authority_index],
+                    range_start,
+                    range_end,
+                    &mut touched,
+                );
+                mark_unhandled_authority_lower_bound(
+                    &thread_bucket_index,
+                    authority_index,
+                    &mut slices[authority_index],
+                    thread_key,
+                    range_start,
+                    range_end,
+                    handled_ranges
+                        .get(&(thread_key.clone(), authority_index))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
+                report
+                    .warnings
+                    .push(DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string());
+            }
         }
     }
 
@@ -1242,6 +1345,8 @@ fn choose_observed_thread_authority(
     source_indices: &BTreeSet<usize>,
     evidence: &[SourceReplicaEvidence],
     evidence_index: &ReplicaEvidenceIndex,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
 ) -> usize {
     let mut digest_authority: Option<(usize, &SourceSessionDigest)> = None;
     for source_index in source_indices {
@@ -1252,6 +1357,9 @@ fn choose_observed_thread_authority(
         };
         for digest_position in digest_positions {
             let digest = &evidence[*source_index].digests[*digest_position];
+            if digest.range_start() >= range_end || digest.range_end() <= range_start {
+                continue;
+            }
             let replace = digest_authority.is_none_or(|(best_index, best_digest)| {
                 authority_is_better(
                     &evidence[*source_index],
@@ -1301,24 +1409,50 @@ fn normalize_time_ranges(ranges: &mut Vec<(DateTime<Utc>, DateTime<Utc>)>) {
     ranges.truncate(output_len);
 }
 
+fn source_has_unhandled_opaque_bucket(
+    index: &ReplicaThreadBucketIndex,
+    source_index: usize,
+    source: &SourceSlice,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+    handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> bool {
+    if index.active_opaque_counts[source_index] == 0 {
+        return false;
+    }
+    let positions = &index.opaque_positions[source_index];
+    let (start, end) = bucket_position_bounds_in_range(positions, source, range_start, range_end);
+    positions[start..end].iter().any(|position| {
+        index.opaque_active[source_index][*position]
+            && !timestamp_in_ranges(source.buckets[*position].starts_at, handled_ranges)
+    })
+}
+
 fn source_has_unhandled_thread_group(
     index: &ReplicaThreadBucketIndex,
     source_index: usize,
     source: &SourceSlice,
     thread_id: &str,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
     handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
 ) -> bool {
-    index.by_source[source_index]
-        .get(thread_id)
-        .is_some_and(|positions| {
-            positions.iter().any(|position| {
-                position.active
-                    && !timestamp_in_ranges(
-                        source.buckets[position.bucket_position].starts_at,
-                        handled_ranges,
-                    )
-            })
-        })
+    thread_bucket_positions_in_range(
+        index,
+        source_index,
+        source,
+        thread_id,
+        range_start,
+        range_end,
+    )
+    .iter()
+    .any(|position| {
+        position.active
+            && !timestamp_in_ranges(
+                source.buckets[position.bucket_position].starts_at,
+                handled_ranges,
+            )
+    })
 }
 
 fn mark_unhandled_authority_lower_bound(
@@ -1326,11 +1460,18 @@ fn mark_unhandled_authority_lower_bound(
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &str,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
     handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
 ) {
-    let Some(positions) = index.by_source[source_index].get(thread_id) else {
-        return;
-    };
+    let positions = thread_bucket_positions_in_range(
+        index,
+        source_index,
+        source,
+        thread_id,
+        range_start,
+        range_end,
+    );
     for position in positions {
         if !position.active {
             continue;
@@ -1783,11 +1924,14 @@ fn suppress_unbound_replica_range(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn suppress_unbound_replica_outside_ranges(
     index: &mut ReplicaThreadBucketIndex,
     source_index: usize,
     source: &mut SourceSlice,
     thread_id: &str,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
     handled_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
     touched: &mut BTreeMap<(usize, DateTime<Utc>), BucketProjectResidual>,
 ) {
@@ -1796,7 +1940,11 @@ fn suppress_unbound_replica_outside_ranges(
         source_index,
         source,
         thread_id,
-        ReplicaBucketSelection::Outside(handled_ranges),
+        ReplicaBucketSelection::Outside {
+            start: range_start,
+            end: range_end,
+            handled_ranges,
+        },
         touched,
     );
 }
@@ -1807,23 +1955,34 @@ enum ReplicaBucketSelection<'a> {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     },
-    Outside(&'a [(DateTime<Utc>, DateTime<Utc>)]),
+    Outside {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        handled_ranges: &'a [(DateTime<Utc>, DateTime<Utc>)],
+    },
 }
 
 impl ReplicaBucketSelection<'_> {
     fn contains(self, timestamp: DateTime<Utc>) -> bool {
         match self {
             Self::Range { start, end } => timestamp >= start && timestamp < end,
-            Self::Outside(ranges) => !timestamp_in_ranges(timestamp, ranges),
+            Self::Outside {
+                start,
+                end,
+                handled_ranges,
+            } => {
+                timestamp >= start
+                    && timestamp < end
+                    && !timestamp_in_ranges(timestamp, handled_ranges)
+            }
         }
     }
 
     fn bounds(self, positions: &[usize], source: &SourceSlice) -> (usize, usize) {
         match self {
-            Self::Range { start, end } => {
+            Self::Range { start, end } | Self::Outside { start, end, .. } => {
                 bucket_position_bounds_in_range(positions, source, start, end)
             }
-            Self::Outside(_) => (0, positions.len()),
         }
     }
 
@@ -1833,7 +1992,7 @@ impl ReplicaBucketSelection<'_> {
         source: &SourceSlice,
     ) -> (usize, usize) {
         match self {
-            Self::Range { start, end } => {
+            Self::Range { start, end } | Self::Outside { start, end, .. } => {
                 let first = positions.partition_point(|position| {
                     source.buckets[position.bucket_position].starts_at < start
                 });
@@ -1842,7 +2001,6 @@ impl ReplicaBucketSelection<'_> {
                 });
                 (first, last)
             }
-            Self::Outside(_) => (0, positions.len()),
         }
     }
 }
@@ -2408,7 +2566,14 @@ mod budget_tests {
         );
         assert_eq!(index.opaque_positions[0], [target_position]);
         assert_eq!(index.active_opaque_counts[0], 1);
-        assert_eq!(observed["target-thread"], BTreeSet::from([0]));
+        assert_eq!(observed.all["target-thread"], BTreeSet::from([0]));
+        assert_eq!(
+            observed.by_day[&(
+                "target-thread".to_owned(),
+                utc_day_start(source.buckets[target_position].starts_at)
+            )],
+            BTreeSet::from([0])
+        );
 
         let starts_at = source.buckets[target_position].starts_at;
         let mut touched = BTreeMap::new();

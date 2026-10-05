@@ -987,9 +987,21 @@ mod tests {
             )
     }
 
-    fn manifest(bytes: &[u8]) -> AgentManifest {
+    fn release_fixture_identity() -> AgentInfo {
         let mut info = AgentInfo::local();
-        info.target = info.target.replace("-linux-gnu", "-linux-musl");
+        // These fixtures model an eligible remote release, independently of
+        // the test runner. Native Windows ARM64 builds are not release assets.
+        info.target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc".into()
+        } else {
+            info.target.replace("-linux-gnu", "-linux-musl")
+        };
+        assert!(TARGETS.contains(&info.target.as_str()));
+        info
+    }
+
+    fn manifest(bytes: &[u8]) -> AgentManifest {
+        let info = release_fixture_identity();
         AgentManifest {
             schema_version: 1,
             file: artifact_name(&info.target),
@@ -1434,7 +1446,8 @@ mod tests {
     #[test]
     fn candidate_install_accepts_native_windows_canonical_path() {
         let environment = SshCommandEnvironment::default();
-        let required = AgentInfo::local();
+        let mut required = release_fixture_identity();
+        required.target = "x86_64-pc-windows-msvc".into();
         let digest = checksum(b"bytes");
         let installed = r"\\?\C:\Users\Name 用户\AppData\Local\codex-usage-monit\versions\selected\codex-usage-monit.exe";
         let mut actual = required.clone();
@@ -1462,15 +1475,48 @@ mod tests {
     #[test]
     fn bootstrap_is_stable_json_and_rejects_protocol_drift_even_at_same_version() {
         let local = AgentInfo::local();
-        local.validate().unwrap();
-        let mut remote: AgentInfo =
-            serde_json::from_slice(&serde_json::to_vec(&local).unwrap()).unwrap();
+        assert_eq!(local.target, env!("MONIT_BUILD_TARGET"));
+        if local.target == "aarch64-pc-windows-msvc" {
+            assert!(
+                local
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("agent_target_unsupported")
+            );
+        } else {
+            local.validate().unwrap();
+        }
+        let encoded = serde_json::to_vec(&local).unwrap();
+        let mut remote: AgentInfo = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&remote).unwrap(), encoded);
         remote.protocol_version -= 1;
         let error = remote.check_protocol().unwrap_err().to_string();
         assert!(error.contains("agent_version_mismatch"));
         assert!(error.contains("Old data protocols are not supported"));
         remote.schema_version = 2;
         assert!(remote.validate().is_err());
+    }
+
+    #[test]
+    fn windows_arm64_identity_is_not_an_eligible_release_fixture() {
+        let mut data = manifest(b"agent");
+        data.agent.target = "aarch64-pc-windows-msvc".into();
+        data.file = artifact_name(&data.agent.target);
+        assert!(!TARGETS.contains(&data.agent.target.as_str()));
+        assert!(
+            data.agent
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("agent_target_unsupported")
+        );
+        assert!(
+            validate_manifest(&data, &data.agent.target)
+                .unwrap_err()
+                .to_string()
+                .contains("agent_target_unsupported")
+        );
     }
 
     #[test]
@@ -1501,13 +1547,24 @@ mod tests {
         );
         for change in ["target", "version", "protocol", "path"] {
             let mut data = manifest(b"agent");
+            let required_target = data.agent.target.clone();
             match change {
-                "target" => data.agent.target = "aarch64-apple-darwin".into(),
+                "target" => {
+                    data.agent.target = if required_target == "x86_64-pc-windows-msvc" {
+                        "aarch64-apple-darwin"
+                    } else {
+                        "x86_64-pc-windows-msvc"
+                    }
+                    .into()
+                }
                 "version" => data.agent.version = "0.0.1".into(),
                 "protocol" => data.agent.protocol_version -= 1,
                 _ => data.file = "../other.exe".into(),
             }
-            assert!(validate_manifest(&data, "x86_64-pc-windows-msvc").is_err());
+            assert!(
+                validate_manifest(&data, &required_target).is_err(),
+                "{change}"
+            );
         }
         let mut installed = AgentInfo::local();
         installed.executable_sha256 = Some(checksum(b"changed"));
@@ -1547,34 +1604,14 @@ mod tests {
                     return Ok(output(64, b"", b"unrecognized subcommand 'info'"));
                 }
                 if args.contains("uname -s -m") {
-                    #[cfg(windows)]
-                    {
-                        return Ok(output(1, b"", b"not recognized"));
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        return Ok(output(
-                            0,
-                            if cfg!(target_arch = "aarch64") {
-                                b"Darwin arm64"
-                            } else {
-                                b"Darwin x86_64"
-                            },
-                            b"",
-                        ));
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        return Ok(output(
-                            0,
-                            if cfg!(target_arch = "aarch64") {
-                                b"Linux aarch64"
-                            } else {
-                                b"Linux x86_64"
-                            },
-                            b"",
-                        ));
-                    }
+                    return Ok(match data.agent.target.as_str() {
+                        "x86_64-pc-windows-msvc" => output(1, b"", b"not recognized"),
+                        "aarch64-apple-darwin" => output(0, b"Darwin arm64", b""),
+                        "x86_64-apple-darwin" => output(0, b"Darwin x86_64", b""),
+                        "aarch64-unknown-linux-musl" => output(0, b"Linux aarch64", b""),
+                        "x86_64-unknown-linux-musl" => output(0, b"Linux x86_64", b""),
+                        other => panic!("unsupported deployment fixture target: {other}"),
+                    });
                 }
                 if fixture_calls_agent(&remote, &["remote-agent", "install"]) {
                     return Ok(output(
@@ -1596,6 +1633,7 @@ mod tests {
                     return Ok(output(0, &serde_json::to_vec(&info).unwrap(), b""));
                 }
                 if remote.contains("RuntimeInformation]::OSArchitecture") {
+                    assert_eq!(data.agent.target, "x86_64-pc-windows-msvc");
                     return Ok(output(0, b"X64", b""));
                 }
                 assert!(

@@ -216,6 +216,39 @@ fn summary_many_projects_harness(width: u16, height: u16, theme: Theme) -> TuiHa
     harness
 }
 
+fn summary_shared_projects_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
+    let mut harness = TuiHarness::from_fixture("normal", width, height, theme);
+    harness.app.history.half_hour_buckets = vec![summary_bucket(
+        summary_timestamp("2026-07-12T03:45:00Z"),
+        [
+            ("project:alpha", "Alpha", 20_000),
+            ("project:beta", "Beta", 10_000),
+        ]
+        .into_iter()
+        .map(|(project, label, tokens)| {
+            summary_group(
+                "logical-thread:shared",
+                None,
+                project,
+                label,
+                "Shared session",
+                "desktop",
+                tokens,
+            )
+        })
+        .collect(),
+    )]
+    .into();
+    harness.app.summary_cache = None;
+    harness.key(KeyCode::Char('U'));
+    harness.app.summary_expanded_nodes.extend([
+        summary_project_node_id("project:alpha"),
+        summary_project_node_id("project:beta"),
+    ]);
+    harness.render();
+    harness
+}
+
 fn summary_mouse(harness: &mut TuiHarness, kind: MouseEventKind, column: u16, row: u16) -> bool {
     let handled = handle_mouse_event(
         &mut harness.app,
@@ -1702,7 +1735,14 @@ fn summary_collapse_all_has_keyboard_mouse_parity_and_stable_whole_label_hitbox(
                 assert_eq!(harness.app.summary_expanded_nodes.len(), 2);
                 assert_eq!(
                     harness.app.summary_selected_id.as_deref(),
-                    Some("turn:alpha-root:alpha-user-turn")
+                    Some(
+                        summary_turn_node_id(
+                            "alpha-id",
+                            "alpha-root",
+                            &SummaryTurnKey::Exact("alpha-user-turn".into())
+                        )
+                        .as_str()
+                    )
                 );
                 assert_eq!(
                     harness.control_rect(ControlId::SummaryCollapseAll),
@@ -2222,7 +2262,14 @@ fn summary_tree_defaults_collapsed_and_enter_expands_project_then_session() {
         session_expanded[2].metrics.token_usage.total_tokens,
         190_000
     );
-    assert_eq!(session_expanded[2].id, "turn:alpha-root:alpha-user-turn");
+    assert_eq!(
+        session_expanded[2].id,
+        summary_turn_node_id(
+            "alpha-id",
+            "alpha-root",
+            &SummaryTurnKey::Exact("alpha-user-turn".into())
+        )
+    );
     let expanded = harness.frame().snapshot_text();
     assert!(expanded.contains("TURN Explain"));
     assert!(!expanded.contains("[ ] TURN"));
@@ -2287,13 +2334,23 @@ fn summary_tree_keeps_direct_and_delegated_unassigned_turn_rows_distinct() {
         let rows = harness.app.summary_rows();
         let direct = rows
             .iter()
-            .find(|row| row.id == "turn-unassigned-session:root")
+            .find(|row| {
+                row.id
+                    == summary_turn_node_id("alpha-id", "root", &SummaryTurnKey::UnassignedSession)
+            })
             .unwrap();
         assert_eq!(direct.label, "Unassigned session usage");
         assert_eq!(direct.metrics.token_usage.total_tokens, 10_000);
         let delegated = rows
             .iter()
-            .find(|row| row.id == "turn-unassigned-delegated:root")
+            .find(|row| {
+                row.id
+                    == summary_turn_node_id(
+                        "alpha-id",
+                        "root",
+                        &SummaryTurnKey::UnassignedDelegated,
+                    )
+            })
             .unwrap();
         assert_eq!(delegated.label, "Unassigned delegated usage");
         assert_eq!(delegated.metrics.token_usage.total_tokens, 50_000);
@@ -2307,6 +2364,204 @@ fn summary_tree_keeps_direct_and_delegated_unassigned_turn_rows_distinct() {
         let frame = harness.frame().snapshot_text();
         assert!(frame.contains("Unassigned"), "{frame}");
         assert!(!frame.contains("preview must not mask"), "{frame}");
+    }
+}
+
+#[test]
+fn summary_shared_sessions_keep_keyboard_mouse_selection_and_expansion_in_their_project() {
+    for (width, height, theme) in [
+        (120, 40, Theme::Dark),
+        (120, 40, Theme::Light),
+        (60, 24, Theme::Dark),
+        (60, 24, Theme::Light),
+    ] {
+        for mouse in [false, true] {
+            let mut harness = summary_shared_projects_harness(width, height, theme);
+            let rows = harness.app.summary_rows();
+            assert_eq!(rows.len(), 4);
+            let alpha_session = rows[1].id.clone();
+            let beta_session = rows[3].id.clone();
+            assert_ne!(alpha_session, beta_session);
+
+            if mouse {
+                harness.app.summary_offset = usize::MAX;
+                harness.render();
+                let table = harness.app.summary_table_hitbox.unwrap();
+                assert!(summary_mouse(
+                    &mut harness,
+                    MouseEventKind::Down(MouseButton::Left),
+                    table.rows.right() - 2,
+                    table.rows.y + u16::try_from(3 - table.offset).unwrap(),
+                ));
+            } else {
+                for _ in 0..3 {
+                    harness.key(KeyCode::Down);
+                }
+            }
+            let rows = harness.app.summary_rows();
+            assert_eq!(harness.app.summary_selected_index(&rows), 3);
+            assert_eq!(
+                harness.app.summary_selected_id.as_ref(),
+                Some(&beta_session)
+            );
+
+            if mouse {
+                let marker = harness
+                    .app
+                    .summary_tree_marker_hitboxes
+                    .iter()
+                    .find(|marker| marker.node_id == beta_session)
+                    .unwrap()
+                    .area;
+                assert!(summary_mouse(
+                    &mut harness,
+                    MouseEventKind::Down(MouseButton::Left),
+                    marker.right() - 1,
+                    marker.y,
+                ));
+            } else {
+                harness.key(KeyCode::Enter);
+            }
+            let rows = harness.app.summary_rows();
+            assert_eq!(rows.len(), 5);
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == alpha_session)
+                    .unwrap()
+                    .collapsed
+            );
+            assert!(
+                !rows
+                    .iter()
+                    .find(|row| row.id == beta_session)
+                    .unwrap()
+                    .collapsed
+            );
+            harness.key(KeyCode::Down);
+            let rows = harness.app.summary_rows();
+            assert_eq!(harness.app.summary_selected_index(&rows), 4);
+            assert_eq!(rows[4].kind, SummaryRowKind::Turn);
+            assert_eq!(rows[4].metrics.token_usage.total_tokens, 10_000);
+
+            harness.key(KeyCode::Home);
+            harness.key(KeyCode::Down);
+            harness.key(KeyCode::Enter);
+            let rows = harness.app.summary_rows();
+            assert_eq!(rows.len(), 6);
+            assert!(
+                !rows
+                    .iter()
+                    .find(|row| row.id == beta_session)
+                    .unwrap()
+                    .collapsed
+            );
+            harness.key(KeyCode::Char('-'));
+            let rows = harness.app.summary_rows();
+            assert_eq!(rows.len(), 5);
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == alpha_session)
+                    .unwrap()
+                    .collapsed
+            );
+            assert!(
+                !rows
+                    .iter()
+                    .find(|row| row.id == beta_session)
+                    .unwrap()
+                    .collapsed
+            );
+            harness.key(KeyCode::Char('X'));
+            assert!(harness.app.summary_expanded_nodes.is_empty());
+            assert_eq!(harness.app.summary_rows().len(), 2);
+            assert_eq!(
+                harness.app.summary_selected_id,
+                Some(summary_project_node_id("project:alpha"))
+            );
+        }
+    }
+}
+
+#[test]
+fn summary_shared_turns_have_unique_rows_and_preserve_project_and_thread_details() {
+    fn expand_sections(nodes: &[entity_detail::DetailNode], expanded: &mut HashSet<String>) {
+        for node in nodes {
+            if let entity_detail::DetailNode::Section { id, children, .. } = node {
+                expanded.insert(id.clone());
+                expand_sections(children, expanded);
+            }
+        }
+    }
+
+    for (width, height, theme) in [(120, 40, Theme::Dark), (60, 24, Theme::Light)] {
+        let mut harness = summary_shared_projects_harness(width, height, theme);
+        let sessions = harness
+            .app
+            .summary_rows()
+            .into_iter()
+            .filter(|row| row.kind == SummaryRowKind::Session)
+            .map(|row| row.id);
+        harness.app.summary_expanded_nodes.extend(sessions);
+        harness.render();
+        let rows = harness.app.summary_rows();
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows.iter().map(|row| &row.id).collect::<HashSet<_>>().len(),
+            6
+        );
+
+        for (index, project, tokens) in [
+            (1, "project:alpha", 20_000),
+            (2, "project:alpha", 20_000),
+            (4, "project:beta", 10_000),
+            (5, "project:beta", 10_000),
+        ] {
+            assert!(harness.app.select_summary_index(index, true));
+            harness.render();
+            assert_eq!(
+                harness
+                    .app
+                    .summary_selected_index(&harness.app.summary_rows()),
+                index
+            );
+            assert_eq!(
+                harness.app.summary_rows()[index]
+                    .metrics
+                    .token_usage
+                    .total_tokens,
+                tokens
+            );
+            harness.key(KeyCode::F(2));
+            let popup = harness.app.entity_detail.as_mut().unwrap();
+            expand_sections(&popup.document, &mut popup.expanded);
+            popup.rebuild(80, theme);
+            let fields = popup
+                .lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                fields.contains(&format!("Project ID: {project}")),
+                "{fields}"
+            );
+            assert!(
+                fields.contains("Thread ID: logical-thread:shared"),
+                "{fields}"
+            );
+            harness.key(KeyCode::Esc);
+            assert_eq!(
+                harness
+                    .app
+                    .summary_selected_index(&harness.app.summary_rows()),
+                index
+            );
+        }
     }
 }
 
@@ -2369,7 +2624,7 @@ fn summary_tree_markers_are_whole_mouse_targets_for_project_and_session() {
             assert_eq!(rows[2].kind, SummaryRowKind::Turn);
             assert_eq!(
                 harness.app.summary_selected_id.as_deref(),
-                Some("thread:alpha-root")
+                Some(summary_thread_node_id("alpha-id", "alpha-root").as_str())
             );
         }
     }

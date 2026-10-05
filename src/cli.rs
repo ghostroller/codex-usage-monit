@@ -5014,16 +5014,14 @@ fn output_paths_for_command(cli: &Cli) -> Vec<(&'static str, PathBuf)> {
     if let Some(path) = cli.trace_log.as_deref() {
         paths.push(("--trace-log", path.to_path_buf()));
     }
-    if cli.log_level != LogLevel::Off && cli.log_file.is_some() {
-        for (label, path) in [
-            ("--trace-log rotation", &cli.trace_log),
-            ("--perf-log rotation", &cli.perf_log),
-        ] {
-            if let Some(path) = path {
-                let mut backup = path.as_os_str().to_os_string();
-                backup.push(".1");
-                paths.push((label, PathBuf::from(backup)));
-            }
+    for (label, path) in [
+        ("--trace-log rotation", &cli.trace_log),
+        ("--perf-log rotation", &cli.perf_log),
+    ] {
+        if let Some(path) = path {
+            let mut backup = path.as_os_str().to_os_string();
+            backup.push(".1");
+            paths.push((label, PathBuf::from(backup)));
         }
     }
     if let Some(path) = status_file_for_command(cli) {
@@ -5077,8 +5075,10 @@ fn status_file_for_command(cli: &Cli) -> Option<PathBuf> {
 }
 
 fn normalize_output_path(path: &Path, current_dir: &Path) -> PathBuf {
-    let absolute = lexical_normalize(&absolute_path_from(path.to_path_buf(), current_dir));
-    canonicalize_existing_ancestor(&absolute).unwrap_or(absolute)
+    let absolute = absolute_path_from(path.to_path_buf(), current_dir);
+    // Resolve existing symlinks before reducing `..`: symlink/.. refers to the
+    // target's parent, which may differ from the symlink's lexical parent.
+    canonicalize_existing_ancestor(&absolute).unwrap_or_else(|| lexical_normalize(&absolute))
 }
 
 fn absolute_path_from(path: PathBuf, current_dir: &Path) -> PathBuf {
@@ -5118,8 +5118,9 @@ fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
             }
             return Some(lexical_normalize(&canonical));
         }
-        let file_name = ancestor.file_name()?.to_owned();
-        suffix.push(file_name);
+        // Missing suffixes may themselves end in `..`. Preserve those
+        // components until an existing ancestor has resolved every symlink.
+        suffix.push(ancestor.components().next_back()?.as_os_str().to_owned());
         ancestor = ancestor.parent()?;
     }
 }
@@ -9333,6 +9334,74 @@ mod tests {
     }
 
     #[test]
+    fn output_log_rotations_reject_status_aliases_without_event_logging() {
+        let temp = tempfile::tempdir().unwrap();
+        for event_options in [
+            vec![],
+            vec!["--log-level", "off"],
+            vec!["--log-level", "off", "--log-file", "unused-events.jsonl"],
+        ] {
+            for log_flag in ["--perf-log", "--trace-log"] {
+                let mut arguments = vec!["codex-usage-monit", log_flag, "runtime.jsonl"];
+                arguments.extend(event_options.iter().copied());
+                arguments.extend(["record", "--status-file", "runtime.jsonl.1"]);
+                let cli = Cli::try_parse_from(arguments).unwrap();
+
+                let error = validate_output_path_conflicts_from(&cli, temp.path()).unwrap_err();
+
+                assert!(error.to_string().contains(&format!("{log_flag} rotation")));
+                assert!(error.to_string().contains("--status-file"));
+            }
+        }
+    }
+
+    #[test]
+    fn output_log_rotations_reject_other_loggers_without_event_logging() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("runtime.jsonl.1");
+        fs::write(&backup, b"keep this file\n").unwrap();
+        for event_options in [
+            vec![],
+            vec!["--log-level", "off"],
+            vec!["--log-level", "off", "--log-file", "unused-events.jsonl"],
+        ] {
+            for (rotating_flag, other_flag) in [
+                ("--perf-log", "--startup-log"),
+                ("--trace-log", "--startup-log"),
+                ("--perf-log", "--trace-log"),
+                ("--trace-log", "--perf-log"),
+            ] {
+                let mut arguments = vec![
+                    OsString::from("codex-usage-monit"),
+                    OsString::from(rotating_flag),
+                    temp.path().join("runtime.jsonl").into_os_string(),
+                    OsString::from(other_flag),
+                    backup.as_os_str().to_owned(),
+                ];
+                arguments.extend(event_options.iter().map(OsString::from));
+                arguments.push(OsString::from("snapshot"));
+                let cli = Cli::try_parse_from(arguments).unwrap();
+                let error = validate_output_path_conflicts_from(&cli, temp.path()).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{rotating_flag} rotation"))
+                );
+                assert!(error.to_string().contains(other_flag));
+
+                let started = Instant::now();
+                assert!(
+                    run_with(cli, started, started)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("output path conflict")
+                );
+                assert_eq!(fs::read(&backup).unwrap(), b"keep this file\n");
+            }
+        }
+    }
+
+    #[test]
     fn health_recorder_status_rejects_aliases_with_either_log() {
         let temp = tempfile::tempdir().unwrap();
         let current_dir = temp.path();
@@ -9429,6 +9498,95 @@ mod tests {
         ])
         .unwrap();
         assert!(validate_output_path_conflicts_from(&cli, temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_paths_reject_symlink_parent_components_before_truncation() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let working = temp.path().join("working");
+        let real = temp.path().join("real");
+        fs::create_dir(&working).unwrap();
+        fs::create_dir_all(real.join("nested")).unwrap();
+        symlink(real.join("nested"), working.join("alias")).unwrap();
+
+        for (other_options, filename) in [
+            (
+                vec!["--perf-log", "../real/events.jsonl", "snapshot"],
+                "events.jsonl",
+            ),
+            (
+                vec!["record", "--status-file", "../real/recorder-status.json"],
+                "recorder-status.json",
+            ),
+            (
+                vec!["health", "--history-dir", "../real/history-v1"],
+                "recorder-status.json",
+            ),
+        ] {
+            let target = real.join(filename);
+            fs::write(&target, b"keep this file\n").unwrap();
+            let mut arguments = vec![
+                OsString::from("codex-usage-monit"),
+                OsString::from("--startup-log"),
+                working.join("alias/..").join(filename).into_os_string(),
+            ];
+            // Use absolute paths for run_with without changing the process cwd.
+            arguments.extend(other_options.into_iter().map(|argument| {
+                if argument.starts_with("../real/") {
+                    working.join(argument).into_os_string()
+                } else {
+                    OsString::from(argument)
+                }
+            }));
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let error = validate_output_path_conflicts_from(&cli, &working).unwrap_err();
+            assert!(error.to_string().contains("output path conflict"));
+
+            let started = Instant::now();
+            assert!(
+                run_with(cli, started, started)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("output path conflict")
+            );
+            assert_eq!(fs::read(target).unwrap(), b"keep this file\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_paths_preserve_symlinks_before_normalizing_missing_suffixes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let working = temp.path().join("working");
+        let real = temp.path().join("real");
+        fs::create_dir(&working).unwrap();
+        fs::create_dir_all(real.join("nested")).unwrap();
+        symlink(real.join("nested"), working.join("alias")).unwrap();
+
+        for (aliased, resolved) in [
+            ("alias/../logs/events.jsonl", "logs/events.jsonl"),
+            ("alias/../missing/../logs/events.jsonl", "logs/events.jsonl"),
+            (
+                "alias/missing/../logs/events.jsonl",
+                "nested/logs/events.jsonl",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                OsString::from("codex-usage-monit"),
+                OsString::from("--startup-log"),
+                OsString::from(aliased),
+                OsString::from("--perf-log"),
+                real.join(resolved).into_os_string(),
+                OsString::from("snapshot"),
+            ])
+            .unwrap();
+            assert!(validate_output_path_conflicts_from(&cli, &working).is_err());
+        }
     }
 
     #[cfg(windows)]

@@ -262,12 +262,10 @@ pub(super) fn prepare_recorder_lock_state_root(path: &Path) -> io::Result<()> {
             .mode(0o700)
             .create(path)?;
     }
-    #[cfg(not(unix))]
-    {
-        #[cfg(windows)]
-        reject_windows_recorder_lock_reparse_components(path)?;
-        fs::create_dir_all(path)?;
-    }
+    #[cfg(windows)]
+    crate::windows_private_directory::create_dir_all(path)?;
+    #[cfg(not(any(unix, windows)))]
+    fs::create_dir_all(path)?;
 
     let metadata = fs::symlink_metadata(path)?;
     validate_recorder_lock_state_root(path, &metadata)
@@ -516,11 +514,6 @@ fn invalid_recorder_lock_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-#[cfg(windows)]
-fn reject_windows_recorder_lock_reparse_components(path: &Path) -> io::Result<()> {
-    crate::source_identity::reject_windows_reparse_components(path, "recorder state root")
-}
-
 fn try_acquire_named_private_root_lock(
     state_root: &Path,
     file_name: &str,
@@ -705,4 +698,129 @@ pub fn write_recorder_status(path: &Path, status: &RecorderStatusFile) -> io::Re
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     contents.push(b'\n');
     write_private_atomically(path, &contents)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    fn public_parent(path: &Path, trustee: &str) {
+        struct Descriptor(PSECURITY_DESCRIPTOR);
+        impl Drop for Descriptor {
+            fn drop(&mut self) {
+                // SAFETY: the SDDL conversion returns a LocalAlloc allocation.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+
+        let user = windows_current_user_sid().unwrap();
+        let sddl = format!(
+            "O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;{trustee})"
+        )
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: SDDL is terminated and descriptor is a writable output.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = Descriptor(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let path = crate::atomic_file::windows_wide_path(path).unwrap();
+        // SAFETY: the path and descriptor remain alive throughout creation.
+        assert_ne!(unsafe { CreateDirectoryW(path.as_ptr(), &attributes) }, 0);
+    }
+
+    #[test]
+    fn windows_recorder_and_cutover_locks_initialize_beneath_public_parent() {
+        for trustee in ["WD", "BU"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let parent = temporary.path().join("public");
+            public_parent(&parent, trustee);
+            let state = parent.join("missing/recorder");
+            let recorder = match try_acquire_recorder_instance_lock(&state.join("history-v1"))
+                .expect("first recorder must create a private state root")
+            {
+                TryRecorderInstanceLock::Acquired(guard) => guard,
+                TryRecorderInstanceLock::Busy => panic!("isolated recorder must acquire its lock"),
+            };
+            validate_windows_private_directory(&state, "recorder state root").unwrap();
+            validate_windows_private_file(recorder.path(), &recorder.file, "recorder lock")
+                .unwrap();
+            assert!(matches!(
+                try_acquire_recorder_instance_lock(&state.join("history-v1")).unwrap(),
+                TryRecorderInstanceLock::Busy
+            ));
+            drop(recorder);
+
+            let coordination = parent.join("missing/service-registration");
+            for mode in [
+                CoordinationLockMode::Shared,
+                CoordinationLockMode::Exclusive,
+            ] {
+                let gate = match try_acquire_named_private_root_lock(
+                    &coordination,
+                    SERVICE_CUTOVER_LOCK_FILE,
+                    mode,
+                )
+                .expect("first service gate must create a private coordination root")
+                {
+                    TryRecorderInstanceLock::Acquired(guard) => guard,
+                    TryRecorderInstanceLock::Busy => panic!("isolated gate must acquire its lock"),
+                };
+                validate_windows_private_directory(&coordination, "service coordination root")
+                    .unwrap();
+                validate_windows_private_file(gate.path(), &gate.file, "service gate").unwrap();
+                drop(gate);
+            }
+            assert_eq!(
+                validate_windows_private_directory(&parent, "public parent")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "creating private children must not change the public parent's ACL"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_recorder_lock_rejects_existing_public_state_without_repairing_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("public-state");
+        public_parent(&state, "WD");
+        fs::write(state.join("sentinel"), b"keep existing data").unwrap();
+        assert_eq!(
+            try_acquire_recorder_instance_lock(&state.join("history-v1"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            fs::read(state.join("sentinel")).unwrap(),
+            b"keep existing data"
+        );
+        assert!(!state.join(RECORDER_INSTANCE_LOCK_FILE).exists());
+        assert!(validate_windows_private_directory(&state, "existing state").is_err());
+    }
 }

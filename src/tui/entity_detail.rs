@@ -872,7 +872,7 @@ fn detail_enrichment_target(app: &App) -> Option<DetailReadTarget> {
                         .checked_sub_signed(ChronoDuration::nanoseconds(1))?;
                     let as_of = cache.snapshot_as_of.min(range_last);
                     if selected.kind == SummaryRowKind::Session
-                        && selected.id == summary_thread_node_id(&session.thread_id)
+                        && selected.id == summary_thread_node_id(&project.key, &session.thread_id)
                     {
                         return Some(DetailReadTarget {
                             thread_id: raw_thread_id.to_owned(),
@@ -883,7 +883,8 @@ fn detail_enrichment_target(app: &App) -> Option<DetailReadTarget> {
                     }
                     for turn in &session.turns {
                         if selected.kind == SummaryRowKind::Turn
-                            && selected.id == summary_turn_node_id(&session.thread_id, &turn.key)
+                            && selected.id
+                                == summary_turn_node_id(&project.key, &session.thread_id, &turn.key)
                             && let SummaryTurnKey::Exact(turn_id) = &turn.key
                         {
                             let raw_turn_id = raw_local_history_identity(app, turn_id)?;
@@ -1609,13 +1610,14 @@ fn summary_detail(app: &App) -> Option<EntityDetailPopup> {
         }
         for session in &project.sessions {
             if selected.kind == SummaryRowKind::Session
-                && selected.id == summary_thread_node_id(&session.thread_id)
+                && selected.id == summary_thread_node_id(&project.key, &session.thread_id)
             {
                 return Some(summary_entity_detail(app, cache, project, session, None));
             }
             for turn in &session.turns {
                 if selected.kind == SummaryRowKind::Turn
-                    && selected.id == summary_turn_node_id(&session.thread_id, &turn.key)
+                    && selected.id
+                        == summary_turn_node_id(&project.key, &session.thread_id, &turn.key)
                 {
                     return Some(summary_entity_detail(
                         app,

@@ -100,7 +100,7 @@ function Assert-TestTemporaryEnvironment {
 
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     Write-Host "Windows verification account: $($identity.Name) [$($identity.User.Value)]"
-    Write-Host "Windows effective test temp: $temporaryRoot (TEMP=$env:TEMP; TMP=$env:TMP)"
+    Write-Host "Windows effective test temp: $temporaryRoot (TEMP=$env:TEMP; TMP=$env:TMP; SystemTemp=$env:SystemTemp)"
     Write-Host "PowerShell: $($PSVersionTable.PSVersion); PSModulePath: $env:PSModulePath"
     # Inspect the permissions a real fixture inherits, without repairing the
     # caller's TEMP or granting any account privileges. Inherit-only ACEs on
@@ -409,6 +409,7 @@ $originalCargoTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DI
 $originalCargoBuildDir = [Environment]::GetEnvironmentVariable("CARGO_BUILD_BUILD_DIR", "Process")
 $originalTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
 $originalTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+$originalSystemTemp = [Environment]::GetEnvironmentVariable('SystemTemp', 'Process')
 $originalModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
 $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($CargoTargetDir)
 $env:CARGO_BUILD_BUILD_DIR = [System.IO.Path]::GetFullPath($CargoBuildDir)
@@ -418,6 +419,13 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($TestTempDir)) {
         $env:TEMP = [IO.Path]::GetFullPath($TestTempDir)
         $env:TMP = $env:TEMP
+        if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18') {
+            # Updated Windows/.NET resolves SYSTEM temp through GetTempPath2,
+            # which ignores TEMP/TMP. Apply the explicit selection only to this
+            # process; the same existence, Git and inherited-ACL checks below
+            # must pass before any test or smoke fixture runs.
+            $env:SystemTemp = $env:TEMP
+        }
     }
     if ($PSVersionTable.PSEdition -eq 'Desktop') {
         # A Windows PowerShell child of pwsh can inherit PowerShell 7 modules.
@@ -519,6 +527,7 @@ finally {
     foreach ($entry in @(
         @{ Name = 'TEMP'; Value = $originalTemp },
         @{ Name = 'TMP'; Value = $originalTmp },
+        @{ Name = 'SystemTemp'; Value = $originalSystemTemp },
         @{ Name = 'PSModulePath'; Value = $originalModulePath }
     )) {
         if ($null -eq $entry.Value) {

@@ -65,6 +65,8 @@ try {
     Set-Acl -LiteralPath $root -AclObject $acl
     $testTemp = Join-Path $root 'temp'
     New-Item -ItemType Directory -Path $testTemp | Out-Null
+    $callerSystemTemp = Join-Path $root 'caller-system-temp'
+    New-Item -ItemType Directory -Path $callerSystemTemp | Out-Null
     $nestedTemp = Join-Path $root 'repository\temp'
     New-Item -ItemType Directory -Path $nestedTemp -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $root 'repository\.git') | Out-Null
@@ -150,7 +152,7 @@ fn main() {
                 }
                 if ($case.Name -eq "skip-smoke") { $invoke += " -SkipSmoke" }
                 $assertEnvironment = @'
-foreach ($name in @('TEMP', 'TMP', 'PSModulePath')) {
+foreach ($name in @('TEMP', 'TMP', 'SystemTemp', 'PSModulePath')) {
     if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $originalEnvironment[$name]) {
         throw "Verification did not restore $name."
     }
@@ -168,9 +170,10 @@ if ($LASTEXITCODE -ne 0) { throw "Successful verification leaked LASTEXITCODE=$L
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = NATIVE_PREFERENCE
 $originalPreference = $PSNativeCommandUseErrorActionPreference
+CALLER_SYSTEM_TEMP
 INHERITED_TEMP
 $originalEnvironment = @{}
-foreach ($name in @('TEMP', 'TMP', 'PSModulePath')) {
+foreach ($name in @('TEMP', 'TMP', 'SystemTemp', 'PSModulePath')) {
     $originalEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 $global:LASTEXITCODE = 37
@@ -185,6 +188,15 @@ function rustc { 'host: verification-fixture'; $global:LASTEXITCODE = 0 }
                     '$env:TEMP = ' + (Quote-PowerShellLiteral $selectedTemp) + "`n" + '$env:TMP = $env:TEMP'
                 } else { '' }
                 $wrapper = $wrapper.Replace('INHERITED_TEMP', $inheritedTemp)
+                # Both caller states are exercised inside the existing 78
+                # cases. SYSTEM's current GetTempPath2 uses this variable;
+                # ordinary users still select TEMP/TMP, leaving it unchanged.
+                $systemTempSetup = if ($nativePreference -eq '$true') {
+                    '$env:SystemTemp = ' + (Quote-PowerShellLiteral $callerSystemTemp)
+                } else {
+                    'Remove-Item -Path Env:SystemTemp -ErrorAction SilentlyContinue'
+                }
+                $wrapper = $wrapper.Replace('CALLER_SYSTEM_TEMP', $systemTempSetup)
                 if ($mode -eq "utm") {
                     # The UTM supervisor assigns zero only after the script
                     # returns without an exception. Failures must still throw.
@@ -213,6 +225,12 @@ function rustc { 'host: verification-fixture'; $global:LASTEXITCODE = 0 }
                     -not $result.Output.Contains($case.Diagnostic) -or
                     -not $result.Output.Contains("Windows verification failed:")) {
                     throw "Expected diagnostic failure for $($case.Name) ($mode, $nativePreference), exit=$($result.ExitCode):`n$($result.Output)"
+                }
+                if ($case.Name -notin @('valid-zero', 'skip-smoke', 'temp-missing', 'temp-in-repository')) {
+                    $expectedTemp = [IO.Path]::GetFullPath($selectedTemp).TrimEnd('\', '/') + '\'
+                    if (-not $result.Output.Contains("Windows effective test temp: $expectedTemp (")) {
+                        throw "Verification ignored the selected -TestTempDir for $($case.Name) ($mode, $nativePreference):`n$($result.Output)"
+                    }
                 }
                 if (Test-Path -LiteralPath $selectedTemp -PathType Container) {
                     $probes = @(Get-ChildItem -LiteralPath $selectedTemp -Filter 'monit-temp-probe-*' -Force)

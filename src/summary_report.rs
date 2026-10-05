@@ -2016,6 +2016,70 @@ mod tests {
     }
 
     #[test]
+    fn report_preserves_unmerged_projects_for_one_logical_session() {
+        let now = at(30, 10, 7);
+        let snapshot = snapshot(now);
+        let alpha = project_group(
+            "logical-thread:shared",
+            "logical-thread:shared",
+            "turn",
+            100,
+            10,
+            Some(1),
+        );
+        let mut beta = project_group(
+            "logical-thread:shared",
+            "logical-thread:shared",
+            "turn",
+            200,
+            20,
+            Some(2),
+        );
+        beta.project_id = Some("project-beta".to_string());
+        beta.project_label = Some("beta".to_string());
+        let history = HistoryData {
+            half_hour_buckets: vec![bucket(at(30, 8, 15), 300, vec![alpha, beta])].into(),
+            ..HistoryData::default()
+        };
+        let query = SummaryReportQuery::new(
+            SummaryRange::SevenDays,
+            SummaryGrain::Hours6,
+            SummaryMetric::Tokens,
+            false,
+            now,
+        );
+        let report =
+            build_summary_report_with_local_time(&snapshot, &history, query, |timestamp| {
+                timestamp.naive_utc()
+            });
+        assert_eq!(report.metrics.token_usage.total_tokens, 300);
+        assert_eq!(report.projects.len(), 2);
+        for (key, label, tokens, estimated, api) in [
+            ("project-alpha", "alpha", 100, 10, 1_000),
+            ("project-beta", "beta", 200, 20, 2_000),
+        ] {
+            let project = report
+                .projects
+                .iter()
+                .find(|project| project.key == key)
+                .unwrap();
+            assert_eq!(project.label, label);
+            assert_eq!(project.metrics.token_usage.total_tokens, tokens);
+            assert_eq!(project.metrics.estimated_cost_units, estimated);
+            assert_eq!(
+                project.metrics.api_equivalent_cost.minimum_pico_usd.value(),
+                api
+            );
+            assert_eq!(project.sessions.len(), 1);
+            assert_eq!(project.sessions[0].thread_id, "logical-thread:shared");
+            assert_eq!(project.sessions[0].metrics.token_usage.total_tokens, tokens);
+            assert_eq!(project.buckets[0].metrics.token_usage.total_tokens, tokens);
+        }
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["projects"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn hourly_chart_distinguishes_complete_partial_and_missing_coverage() {
         let now = at(30, 10, 7);
         let snapshot = snapshot(now);

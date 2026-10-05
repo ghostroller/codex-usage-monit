@@ -30,7 +30,10 @@ TEMP outside any Git checkout: repository-discovery tests intentionally inspect
 all ancestor directories, so a checkout-local TEMP is not a non-repository fixture.
 
 `verify.ps1 -TestTempDir C:\path\to\private-temp` optionally selects an existing
-test directory for both `TEMP` and `TMP`. Without this option it inherits the
+test directory for both `TEMP` and `TMP`. Under `SYSTEM`, it also selects that
+directory through the process's `SystemTemp`, which current Windows uses instead
+of `TEMP`/`TMP` for [GetTempPath2](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2w).
+Without this option it inherits the
 caller's environment. Before tests or smoke checks, the runner rejects a missing
 directory, a Git checkout ancestor, or fixture ACLs inherited by identities other
 than the executing account, SYSTEM and Administrators. It prints the effective
@@ -51,7 +54,7 @@ powershell.exe -NoProfile -File .\scripts\windows\verify.ps1 -TestTempDir C:\pri
 
 The Windows PowerShell entry scopes `PSModulePath` to that engine's built-in
 modules so a parent PowerShell 7 module path cannot select incompatible cmdlets.
-`TEMP`, `TMP` and `PSModulePath` are restored on success and failure. Registry,
+`TEMP`, `TMP`, `SystemTemp` and `PSModulePath` are restored on success and failure. Registry,
 symbolic-link and ACL-repair fixtures still require their actual permissions;
 this preflight does not make a restricted sandbox equivalent to the normal
 Windows account. Record any separate normal-account supplement explicitly.

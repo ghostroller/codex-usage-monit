@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 
 TARGETS = {
     "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin",
@@ -55,32 +56,106 @@ def package(binary, output, metadata_only=False):
     suffix = ".exe" if "windows" in target else ".tar.gz"
     filename = f"codex-usage-monit-{target}{suffix}"
     destination = output / filename
-    if suffix == ".exe":
-        if binary != destination.resolve():
-            shutil.copyfile(binary, destination)
-    else:
-        with tarfile.open(destination, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
-            member = tarfile.TarInfo("codex-usage-monit")
-            member.size = size
-            member.mode = 0o755
-            with binary.open("rb") as stream:
-                archive.addfile(member, stream)
-    artifact = {"target": target, "file": filename, "size": destination.stat().st_size,
-                "sha256": sha256(destination), "binarySize": size, "binarySha256": digest}
     manifest = {key: info[key] for key in IDENTITY}
-    manifest["artifacts"] = [artifact]
-    validate_artifact(output, artifact)
     name = f"release-metadata-{target}.json" if metadata_only else "release-manifest.json"
-    if not metadata_only and (output / name).exists():
-        previous = json.loads((output / name).read_text(encoding="utf-8"))
-        if any(previous.get(key) != manifest[key] for key in IDENTITY):
+    existing_artifacts = []
+    target_references = []
+    # Both manifest forms can refer to the payload being replaced. Validate
+    # all existing references before writing any published file, including the
+    # same target; a rejected build must leave the previous bundle usable.
+    for previous_name in ("release-manifest.json", f"release-metadata-{target}.json"):
+        previous_path = output / previous_name
+        if previous_path.is_symlink():
+            raise ValueError("Existing release metadata must be an ordinary file")
+        if not previous_path.exists():
+            continue
+        previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        validate_identity(previous)
+        if (set(previous) != {*IDENTITY, "artifacts"}
+                or not isinstance(previous["artifacts"], list)
+                or not 1 <= len(previous["artifacts"]) <= len(TARGETS)):
+            raise ValueError("Invalid existing release metadata")
+        if any(previous.get(key) != manifest[key] or type(previous.get(key)) is not type(manifest[key])
+               for key in IDENTITY):
             raise ValueError("Development bundle identities disagree; use an empty output directory")
+        seen = set()
         for existing in previous["artifacts"]:
-            if existing["target"] != target:
-                validate_artifact(output, existing)
-                manifest["artifacts"].append(existing)
-        manifest["artifacts"].sort(key=lambda entry: entry["target"])
-    (output / name).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            validate_artifact(output, existing)
+            if existing["target"] in seen:
+                raise ValueError("Duplicate release target")
+            seen.add(existing["target"])
+            if previous_name.startswith("release-metadata-") and (
+                    len(previous["artifacts"]) != 1 or existing["target"] != target):
+                raise ValueError("Expected one matching artifact in existing target metadata")
+            if existing["target"] == target:
+                target_references.append((previous_name, existing))
+            if previous_name == name and existing["target"] != target:
+                existing_artifacts.append(existing)
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ValueError("Existing release payload must be an ordinary file")
+
+    reusable_artifact = next((artifact for _, artifact in target_references
+                              if artifact["binarySize"] == size and artifact["binarySha256"] == digest), None)
+    if reusable_artifact is None and any(reference != name for reference, _ in target_references):
+        raise ValueError("Release payload is referenced by other metadata; use an empty output directory")
+
+    staging = Path(tempfile.mkdtemp(prefix=".release-package-", dir=output))
+    preserve_staging = False
+    try:
+        payload = staging / filename
+        if reusable_artifact is not None:
+            # Retain the archive bytes/hash when the native binary is unchanged,
+            # including when another manifest also references this payload.
+            shutil.copyfile(destination, payload)
+        elif suffix == ".exe":
+            shutil.copyfile(binary, payload)
+        else:
+            with tarfile.open(payload, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+                member = tarfile.TarInfo("codex-usage-monit")
+                member.size = size
+                member.mode = 0o755
+                with binary.open("rb") as stream:
+                    archive.addfile(member, stream)
+        artifact = {"target": target, "file": filename, "size": payload.stat().st_size,
+                    "sha256": sha256(payload), "binarySize": size, "binarySha256": digest}
+        validate_artifact(staging, artifact)
+        manifest["artifacts"] = sorted([artifact, *existing_artifacts], key=lambda entry: entry["target"])
+        metadata = staging / name
+        metadata.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        # Stage on the same filesystem so each publication is an atomic rename.
+        # The two files cannot be renamed together: retain the old payload for
+        # rollback if publishing its manifest fails. A Windows release pipeline
+        # may already have staged the input at its final destination; keep that
+        # file in place and publish only its metadata.
+        payload_unchanged = reusable_artifact is not None or (
+            suffix == ".exe" and binary == destination.resolve())
+        backup = staging / "previous-payload"
+        if not payload_unchanged and destination.exists():
+            shutil.copy2(destination, backup)
+        payload_published = False
+        try:
+            if not payload_unchanged:
+                payload.replace(destination)
+                payload_published = True
+            metadata.replace(output / name)
+        except BaseException as error:
+            if payload_published:
+                try:
+                    if backup.exists():
+                        backup.replace(destination)
+                    else:
+                        destination.unlink()
+                except OSError as rollback_error:
+                    preserve_staging = True
+                    raise RuntimeError(
+                        f"Package publication failed and payload recovery failed: {rollback_error}; "
+                        f"retained staging and previous payload: {staging}"
+                    ) from error
+            raise
+    finally:
+        if not preserve_staging:
+            shutil.rmtree(staging, ignore_errors=True)
     print(f"Packaged {target} build {info['buildId']}: {output / name}")
     return manifest
 

@@ -305,7 +305,7 @@ fn summarize_samples_with_local_mapping(
     let mut metadata = HashMap::<String, ThreadMetadata>::new();
     let mut metadata_samples = samples.iter().collect::<Vec<_>>();
     metadata_samples.sort_by_key(|sample| sample.timestamp);
-    for sample in metadata_samples {
+    for sample in &metadata_samples {
         merge_metadata(&mut metadata, sample);
     }
 
@@ -335,6 +335,25 @@ fn summarize_samples_with_local_mapping(
             &mut visiting,
         );
     }
+    // Labels may change without changing project identity. Keep their newest
+    // value per explicit project, including metadata outside the query window,
+    // rather than lending one project's label to another on the same thread.
+    let mut project_labels = HashMap::new();
+    let mut project_cwds = HashMap::new();
+    for sample in metadata_samples {
+        if let Some(key) = sample.project_key.as_ref().filter(|key| !key.is_empty()) {
+            if let Some(label) = sample
+                .project_label
+                .as_ref()
+                .filter(|label| !label.is_empty())
+            {
+                project_labels.insert(key.clone(), (sample.timestamp, label.clone()));
+            }
+            if let Some(cwd) = &sample.cwd {
+                project_cwds.insert(key.clone(), cwd.clone());
+            }
+        }
+    }
     let mut resolved_session_threads = HashMap::<String, String>::new();
     for thread_id in metadata.keys() {
         let mut visiting = HashSet::new();
@@ -363,15 +382,34 @@ fn summarize_samples_with_local_mapping(
         let metrics = sample.metrics();
         let date = local_date(sample.timestamp);
         let hour = local_hour(sample.timestamp);
-        let cwd = resolved_cwds
-            .get(&sample.thread_id)
+        let explicit_project_key = sample.project_key.as_ref().filter(|key| !key.is_empty());
+        let resolved_project_key = resolved_project_keys.get(&sample.thread_id);
+        let cwd = if let Some(key) = explicit_project_key {
+            sample
+                .cwd
+                .clone()
+                .or_else(|| project_cwds.get(key).cloned())
+        } else {
+            resolved_cwds
+                .get(&sample.thread_id)
+                .cloned()
+                .flatten()
+                .or_else(|| sample.cwd.clone())
+        };
+        // A logical session can contribute to several unmerged projects.
+        // Thread/parent metadata fills missing attribution only; it must never
+        // replace the explicit identity attached to an observed contribution.
+        let key = explicit_project_key
             .cloned()
-            .flatten()
-            .or_else(|| sample.cwd.clone());
-        let key = resolved_project_keys
-            .get(&sample.thread_id)
-            .cloned()
+            .or_else(|| resolved_project_key.cloned())
             .unwrap_or_else(|| project_key(cwd.as_deref()));
+        let label = project_labels.get(&key).or_else(|| {
+            explicit_project_key
+                .is_none()
+                .then(|| resolved_project_labels.get(&sample.thread_id))
+                .flatten()
+                .and_then(|label| label.as_ref())
+        });
 
         totals.add_assign(metrics);
         days.entry(date).or_default().add_assign(metrics);
@@ -387,10 +425,7 @@ fn summarize_samples_with_local_mapping(
         if project.cwd.is_none() {
             project.cwd = cwd;
         }
-        if let Some((label_at, label)) = resolved_project_labels
-            .get(&sample.thread_id)
-            .and_then(|label| label.as_ref())
-        {
+        if let Some((label_at, label)) = label {
             let replace = project
                 .label
                 .as_ref()
@@ -618,6 +653,11 @@ fn merge_metadata(metadata: &mut HashMap<String, ThreadMetadata>, sample: &Summa
         .as_deref()
         .is_some_and(|value| !value.is_empty())
     {
+        if entry.project_key != sample.project_key {
+            entry.project_label = None;
+            entry.project_label_at = None;
+            entry.cwd = None;
+        }
         entry.project_key = sample.project_key.clone();
     }
     if sample
@@ -1442,6 +1482,144 @@ mod tests {
                 .iter()
                 .any(|project| project.key == "another-id" && project.label == "new-name")
         );
+    }
+
+    #[test]
+    fn opaque_project_ids_keep_a_logical_sessions_nonoverlapping_contributions_separate() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        let mut alpha = sample(
+            at(1, 1),
+            "logical-thread:shared",
+            None,
+            None,
+            metrics(100, 10, 1),
+        );
+        alpha.project_key = Some("project-alpha".to_string());
+        alpha.project_label = Some("Alpha".to_string());
+        let mut beta = sample(
+            at(1, 1),
+            "logical-thread:shared",
+            None,
+            None,
+            metrics(200, 20, 2),
+        );
+        beta.project_key = Some("project-beta".to_string());
+        beta.project_label = Some("Beta".to_string());
+
+        for samples in [vec![alpha.clone(), beta.clone()], vec![beta, alpha]] {
+            let summary = summarize_samples(&samples, window, FixedOffset::east_opt(0).unwrap());
+            assert_eq!(summary.totals.token_usage.total_tokens, 300);
+            assert_eq!(summary.projects.len(), 2);
+            for (key, label, tokens) in [
+                ("project-alpha", "Alpha", 100),
+                ("project-beta", "Beta", 200),
+            ] {
+                let project = summary
+                    .projects
+                    .iter()
+                    .find(|project| project.key == key)
+                    .unwrap();
+                assert_eq!(project.label, label);
+                assert_eq!(project.totals.token_usage.total_tokens, tokens);
+                assert_eq!(project.sessions[0].thread_id, "logical-thread:shared");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_project_metadata_outside_the_window_does_not_reassign_other_projects() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        let mut alpha = sample(at(1, 1), "thread", None, None, metrics(100, 10, 1));
+        alpha.project_key = Some("project-alpha".to_string());
+        alpha.project_label = Some("Alpha".to_string());
+        let mut beta = sample(at(1, 2), "thread", None, None, metrics(200, 20, 2));
+        beta.project_key = Some("project-beta".to_string());
+        beta.project_label = Some("Beta".to_string());
+        let mut renamed_alpha = sample(at(2, 1), "thread", None, None, SummaryMetrics::default());
+        renamed_alpha.project_key = Some("project-alpha".to_string());
+        renamed_alpha.project_label = Some("Renamed Alpha".to_string());
+
+        let summary = summarize_samples(
+            &[renamed_alpha, beta, alpha],
+            window,
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        assert_eq!(summary.projects.len(), 2);
+        let alpha = summary
+            .projects
+            .iter()
+            .find(|project| project.key == "project-alpha")
+            .unwrap();
+        let beta = summary
+            .projects
+            .iter()
+            .find(|project| project.key == "project-beta")
+            .unwrap();
+        assert_eq!(alpha.label, "Renamed Alpha");
+        assert_eq!(alpha.totals.token_usage.total_tokens, 100);
+        assert_eq!(beta.label, "Beta");
+        assert_eq!(beta.totals.token_usage.total_tokens, 200);
+    }
+
+    #[test]
+    fn explicit_projects_do_not_borrow_another_projects_missing_metadata() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        for (cwd, expected_label) in [(None, UNKNOWN_PROJECT_LABEL), (Some("/work/beta"), "beta")] {
+            for delegated in [false, true] {
+                let mut alpha = sample(
+                    at(1, 1),
+                    "root",
+                    None,
+                    Some("/work/alpha"),
+                    metrics(100, 10, 1),
+                );
+                alpha.project_key = Some("project-alpha".to_string());
+                alpha.project_label = Some("Alpha".to_string());
+                let mut beta = sample(
+                    at(1, 2),
+                    if delegated { "child" } else { "root" },
+                    delegated.then_some("root"),
+                    cwd,
+                    metrics(200, 20, 2),
+                );
+                beta.project_key = Some("project-beta".to_string());
+
+                let summary =
+                    summarize_samples(&[beta, alpha], window, FixedOffset::east_opt(0).unwrap());
+                let beta = summary
+                    .projects
+                    .iter()
+                    .find(|project| project.key == "project-beta")
+                    .unwrap();
+                assert_eq!(beta.label, expected_label);
+                assert_eq!(beta.cwd.as_deref(), cwd.map(Path::new));
+                assert_eq!(beta.totals.token_usage.total_tokens, 200);
+            }
+        }
+    }
+
+    #[test]
+    fn samples_without_a_project_key_keep_parent_metadata_fallback() {
+        let window = SummaryWindow::new(at(1, 0), at(2, 0)).unwrap();
+        let mut root = sample(
+            at(1, 1),
+            "root",
+            None,
+            Some("/work/alpha"),
+            metrics(100, 10, 1),
+        );
+        root.project_key = Some("project-alpha".to_string());
+        root.project_label = Some("Alpha".to_string());
+        let child = sample(at(1, 2), "child", Some("root"), None, metrics(50, 5, 1));
+        let summary = summarize_samples(&[child, root], window, FixedOffset::east_opt(0).unwrap());
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.projects[0].key, "project-alpha");
+        assert_eq!(summary.projects[0].label, "Alpha");
+        assert_eq!(
+            summary.projects[0].cwd.as_deref(),
+            Some(Path::new("/work/alpha"))
+        );
+        assert_eq!(summary.projects[0].totals.token_usage.total_tokens, 150);
     }
 
     #[test]

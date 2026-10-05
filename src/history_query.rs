@@ -2335,44 +2335,7 @@ mod tests {
                 &bucket_records,
             )
             .unwrap();
-        if !facts.is_empty() {
-            for digest in &mut digests {
-                let range_facts = facts
-                    .iter()
-                    .filter_map(|record| match record.change() {
-                        crate::source_history::UsageEventFactChange::Upsert(fact)
-                            if fact.occurred_at() >= digest.range_start()
-                                && fact.occurred_at() < digest.range_end() =>
-                        {
-                            Some(fact.as_ref())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                let (fingerprint, project_fingerprint) =
-                    crate::source_export::canonical_fact_fingerprints_for_test(
-                        digest.replica(),
-                        digest.range_start(),
-                        digest.range_end(),
-                        &range_facts,
-                    )
-                    .unwrap();
-                *digest = SourceSessionDigest::new(
-                    digest.replica().clone(),
-                    digest.range_start(),
-                    digest.range_end(),
-                    digest.covered_through(),
-                    fingerprint,
-                    project_fingerprint,
-                    digest.event_count(),
-                    digest.exact_event_identity(),
-                    digest.coverage_complete(),
-                    digest.observed_project_keys().to_vec(),
-                    digest.metrics().clone(),
-                )
-                .unwrap();
-            }
-        }
+        bind_replica_digests_to_facts(&mut digests, &facts);
         let validated_digests = digests
             .iter()
             .map(crate::source_history::FactDigestBinding::from_digest)
@@ -2420,6 +2383,144 @@ mod tests {
                 &batch.batch_id,
             )
             .unwrap();
+    }
+
+    fn bind_replica_digests_to_facts(
+        digests: &mut [SourceSessionDigest],
+        facts: &[UsageEventFactRecord],
+    ) {
+        if !facts.is_empty() {
+            for digest in digests {
+                let range_facts = facts
+                    .iter()
+                    .filter_map(|record| match record.change() {
+                        crate::source_history::UsageEventFactChange::Upsert(fact)
+                            if fact.occurred_at() >= digest.range_start()
+                                && fact.occurred_at() < digest.range_end() =>
+                        {
+                            Some(fact.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (fingerprint, project_fingerprint) =
+                    crate::source_export::canonical_fact_fingerprints_for_test(
+                        digest.replica(),
+                        digest.range_start(),
+                        digest.range_end(),
+                        &range_facts,
+                    )
+                    .unwrap();
+                *digest = SourceSessionDigest::new(
+                    digest.replica().clone(),
+                    digest.range_start(),
+                    digest.range_end(),
+                    digest.covered_through(),
+                    fingerprint,
+                    project_fingerprint,
+                    digest.event_count(),
+                    digest.exact_event_identity(),
+                    digest.coverage_complete(),
+                    digest.observed_project_keys().to_vec(),
+                    digest.metrics().clone(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn install_remote_replica_history(
+        ownership: &HistoryOwnershipStore,
+        store: &SourceHistoryStore,
+        metadata: &SourceMetadata,
+        buckets: Vec<LocalHalfHourBucket>,
+        mut digests: Vec<SourceSessionDigest>,
+        facts: Vec<UsageEventFactRecord>,
+    ) {
+        bind_replica_digests_to_facts(&mut digests, &facts);
+        digests.sort_by_key(SourceSessionDigest::range_start);
+        let lease = ownership.acquire_writer_lease().unwrap();
+        let manifest = initialized_manifest(ownership).unwrap();
+        let authority = ownership.authorize_v2_write(&lease, &manifest).unwrap();
+        let writer = store.writer(&authority).unwrap();
+        writer.save_source_metadata(metadata).unwrap();
+        let generation: SourceHistoryRemoteGenerationId =
+            "ingest-gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+        let binding = SourceHistoryRemoteBinding::new(
+            SourceGeneration {
+                node_id: metadata.source_id().clone(),
+                generation: NonZeroU64::new(1).unwrap(),
+            },
+            crate::remote_agent::current_revisions(),
+        )
+        .unwrap();
+        writer
+            .ensure_remote_history_generation(
+                metadata.source_id(),
+                RedactionProfile::Redacted,
+                &generation,
+                &binding,
+            )
+            .unwrap();
+        let validated_digests = digests
+            .iter()
+            .map(crate::source_history::FactDigestBinding::from_digest)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let buckets = buckets
+            .into_iter()
+            .map(|bucket| SourceBucketRecord::upsert(1, bucket).unwrap())
+            .collect::<Vec<_>>();
+        let digests = digests
+            .into_iter()
+            .map(|digest| SourceSessionDigestRecord::upsert(1, digest).unwrap())
+            .collect::<Vec<_>>();
+        writer
+            .apply_remote_history_generation_page(
+                metadata.source_id(),
+                RedactionProfile::Redacted,
+                &generation,
+                &binding,
+                &buckets,
+                &digests,
+                &[],
+            )
+            .unwrap();
+        writer
+            .activate_remote_history_generation(
+                metadata.source_id(),
+                RedactionProfile::Redacted,
+                None,
+                &generation,
+                &binding,
+                at(4, 0, 0),
+            )
+            .unwrap();
+        if !facts.is_empty() {
+            let batch = CompleteFactBatch {
+                batch_id: FactBatchId::generate().unwrap(),
+                kind: FactBatchKind::Snapshot,
+                replica: SessionReplicaKey::new(
+                    metadata.source_id().clone(),
+                    "thread".parse().unwrap(),
+                ),
+                expected_active_version: None,
+                remote_binding: Some(binding),
+                validated_digests,
+                activate_cursor: FactCursor::new(1, facts.len() as u64).unwrap(),
+                completed_at: at(4, 0, 0),
+                changes: facts,
+            };
+            writer
+                .stage_and_activate_complete_fact_batch(
+                    metadata.source_id(),
+                    RedactionProfile::Redacted,
+                    &batch,
+                )
+                .unwrap();
+        }
     }
 
     fn weekly(
@@ -2979,6 +3080,452 @@ mod tests {
             source_b_only.history.half_hour_buckets[0].project_groups[0]
                 .thread_id
                 .ends_with(SOURCE_B)
+        );
+    }
+
+    #[test]
+    fn replica_unique_later_day_with_complete_remote_facts_remains_visible() {
+        assert_replica_unique_days_visible(true, false, true);
+    }
+
+    #[test]
+    fn replica_unique_later_day_without_facts_or_complete_digests_remains_visible() {
+        for partial in [false, true] {
+            assert_replica_unique_days_visible(false, partial, true);
+        }
+    }
+
+    #[test]
+    fn replica_disjoint_days_keep_usage_and_share_one_logical_thread() {
+        assert_replica_unique_days_visible(false, false, false);
+    }
+
+    #[test]
+    fn replica_overlapping_day_without_evidence_still_uses_one_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let local = source(
+            SOURCE_A,
+            "alpha",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        let remote = source(
+            SOURCE_B,
+            "beta",
+            SourceKind::Ssh,
+            RedactionProfile::Redacted,
+        );
+        install_local_replica_history(
+            &store,
+            &local,
+            vec![bucket(at(2, 10, 0), 10, observed('a').as_str())],
+            Vec::new(),
+            Vec::new(),
+        );
+        install_remote_replica_history(
+            &ownership,
+            &store,
+            &remote,
+            vec![bucket(at(2, 11, 0), 20, observed('b').as_str())],
+            Vec::new(),
+            Vec::new(),
+        );
+        let result = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        assert_eq!(
+            result
+                .history
+                .half_hour_buckets
+                .iter()
+                .map(|b| b.token_usage.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        assert!(
+            result
+                .history
+                .warnings
+                .contains(&DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string())
+        );
+    }
+
+    #[test]
+    fn replica_opaque_later_day_without_digest_keeps_one_lower_bound() {
+        assert_replica_opaque_day_visible(true, false, false);
+    }
+
+    #[test]
+    fn replica_opaque_later_day_with_remote_fact_authority_keeps_other_threads() {
+        assert_replica_opaque_day_visible(true, true, true);
+    }
+
+    #[test]
+    fn replica_fully_attributed_other_thread_day_keeps_unique_usage() {
+        assert_replica_opaque_day_visible(false, true, false);
+    }
+
+    #[test]
+    fn replica_digest_only_source_with_two_opaque_days_keeps_one_lower_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let local = source(
+            SOURCE_A,
+            "alpha",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        let remote = source(
+            SOURCE_B,
+            "beta",
+            SourceKind::Ssh,
+            RedactionProfile::Redacted,
+        );
+        let mut local_later = bucket(at(3, 10, 0), 20, observed('a').as_str());
+        local_later.project_groups.clear();
+        install_local_replica_history(
+            &store,
+            &local,
+            vec![
+                bucket(at(2, 10, 0), 10, observed('a').as_str()),
+                local_later,
+            ],
+            vec![session_digest(
+                local.source_id(),
+                at(2, 0, 0),
+                'a',
+                10,
+                1,
+                observed('a'),
+            )],
+            Vec::new(),
+        );
+        let mut remote_first = bucket(at(2, 10, 0), 10, observed('b').as_str());
+        let mut remote_later = bucket(at(3, 10, 0), 20, observed('b').as_str());
+        remote_first.project_groups.clear();
+        remote_later.project_groups.clear();
+        install_remote_replica_history(
+            &ownership,
+            &store,
+            &remote,
+            vec![remote_first, remote_later],
+            vec![session_digest(
+                remote.source_id(),
+                at(2, 0, 0),
+                'a',
+                10,
+                1,
+                observed('b'),
+            )],
+            Vec::new(),
+        );
+        let result = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        let totals = result
+            .history
+            .half_hour_buckets
+            .iter()
+            .map(|b| (b.starts_at, b.token_usage.total_tokens))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(totals.get(&at(2, 10, 0)), Some(&10));
+        assert_eq!(totals.get(&at(3, 10, 0)), Some(&20));
+    }
+
+    fn assert_replica_opaque_day_visible(opaque: bool, other_thread: bool, with_facts: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let local = source(
+            SOURCE_A,
+            "alpha",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        let remote = source(
+            SOURCE_B,
+            "beta",
+            SourceKind::Ssh,
+            RedactionProfile::Redacted,
+        );
+        let project_a = observed('a');
+        let project_b = observed('b');
+        let other_total = if other_thread { 90 } else { 0 };
+        let mut local_later = bucket_with_calls(
+            at(3, 10, 0),
+            other_total + if opaque { 20 } else { 0 },
+            project_a.as_str(),
+            u64::from(other_thread) + u64::from(opaque),
+        );
+        local_later.project_groups.clear();
+        if other_thread {
+            let mut group = bucket(at(3, 10, 0), 90, project_a.as_str())
+                .project_groups
+                .remove(0);
+            group.thread_id = "other-thread".into();
+            group.session_thread_id = Some("other-thread".into());
+            local_later.project_groups.push(group);
+        }
+        install_local_replica_history(
+            &store,
+            &local,
+            vec![bucket(at(2, 10, 0), 10, project_a.as_str()), local_later],
+            vec![session_digest(
+                local.source_id(),
+                at(2, 0, 0),
+                'a',
+                10,
+                1,
+                project_a.clone(),
+            )],
+            if with_facts {
+                vec![usage_fact(
+                    local.source_id(),
+                    "shared-day-two",
+                    at(2, 10, 1),
+                    10,
+                    project_a,
+                )]
+            } else {
+                Vec::new()
+            },
+        );
+        let mut remote_digests = vec![session_digest(
+            remote.source_id(),
+            at(2, 0, 0),
+            'a',
+            10,
+            1,
+            project_b.clone(),
+        )];
+        let remote_facts = if with_facts {
+            remote_digests.push(session_digest(
+                remote.source_id(),
+                at(3, 0, 0),
+                'b',
+                20,
+                1,
+                project_b.clone(),
+            ));
+            vec![
+                usage_fact(
+                    remote.source_id(),
+                    "shared-day-two",
+                    at(2, 10, 1),
+                    10,
+                    project_b.clone(),
+                ),
+                usage_fact(
+                    remote.source_id(),
+                    "unique-day-three",
+                    at(3, 10, 1),
+                    20,
+                    project_b.clone(),
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        install_remote_replica_history(
+            &ownership,
+            &store,
+            &remote,
+            vec![
+                bucket(at(2, 10, 0), 10, project_b.as_str()),
+                bucket(at(3, 10, 0), 20, project_b.as_str()),
+            ],
+            remote_digests,
+            remote_facts,
+        );
+        let result = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        let later = result
+            .history
+            .half_hour_buckets
+            .iter()
+            .find(|b| b.starts_at == at(3, 10, 0))
+            .unwrap();
+        assert_eq!(later.token_usage.total_tokens, other_total + 20);
+        if other_thread {
+            assert_eq!(
+                later
+                    .project_groups
+                    .iter()
+                    .filter(|g| g.thread_id.starts_with("other-thread"))
+                    .map(|g| g.token_usage.total_tokens)
+                    .sum::<u64>(),
+                90
+            );
+        }
+        if opaque {
+            assert!(
+                result
+                    .history
+                    .warnings
+                    .contains(&DUPLICATE_SESSION_DEDUP_UNAVAILABLE_WARNING.to_string())
+            );
+        }
+        let physical = load_unified_history_since_selected(
+            &ownership,
+            &store,
+            local.source_id(),
+            &HistorySourceSelection::Remote(remote.source_id().clone()),
+            at(2, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            physical
+                .history
+                .half_hour_buckets
+                .iter()
+                .map(|b| b.token_usage.total_tokens)
+                .sum::<u64>(),
+            30
+        );
+    }
+
+    fn assert_replica_unique_days_visible(with_facts: bool, partial: bool, shared_day: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let codex_home = directory.path().join("codex-home");
+        let (ownership, store) = stores(&root, &codex_home, RedactionProfile::Redacted);
+        let local = source(
+            SOURCE_A,
+            "alpha",
+            SourceKind::Local,
+            RedactionProfile::Redacted,
+        );
+        let remote = source(
+            SOURCE_B,
+            "beta",
+            SourceKind::Ssh,
+            RedactionProfile::Redacted,
+        );
+        let project_a = observed('a');
+        let project_b = observed('b');
+        let make_digest = |source_id: &NodeId, day, fingerprint, total, project| {
+            let digest = session_digest(source_id, at(day, 0, 0), fingerprint, total, 1, project);
+            if !partial {
+                return digest;
+            }
+            SourceSessionDigest::new(
+                digest.replica().clone(),
+                digest.range_start(),
+                digest.range_end(),
+                at(day, 12, 0),
+                digest.fingerprint().clone(),
+                digest.project_breakdown_fingerprint().clone(),
+                digest.event_count(),
+                digest.exact_event_identity(),
+                false,
+                digest.observed_project_keys().to_vec(),
+                digest.metrics().clone(),
+            )
+            .unwrap()
+        };
+        install_local_replica_history(
+            &store,
+            &local,
+            vec![bucket(at(2, 10, 0), 10, project_a.as_str())],
+            vec![make_digest(
+                local.source_id(),
+                2,
+                'a',
+                10,
+                project_a.clone(),
+            )],
+            if with_facts {
+                vec![usage_fact(
+                    local.source_id(),
+                    "shared-day-two",
+                    at(2, 10, 1),
+                    10,
+                    project_a,
+                )]
+            } else {
+                Vec::new()
+            },
+        );
+        let mut remote_buckets = vec![bucket(at(3, 10, 0), 20, project_b.as_str())];
+        let mut remote_digests = vec![make_digest(
+            remote.source_id(),
+            3,
+            'b',
+            20,
+            project_b.clone(),
+        )];
+        let mut remote_facts = if with_facts {
+            vec![usage_fact(
+                remote.source_id(),
+                "unique-day-three",
+                at(3, 10, 1),
+                20,
+                project_b.clone(),
+            )]
+        } else {
+            Vec::new()
+        };
+        if shared_day {
+            remote_buckets.push(bucket(at(2, 10, 0), 10, project_b.as_str()));
+            remote_digests.push(make_digest(
+                remote.source_id(),
+                2,
+                'a',
+                10,
+                project_b.clone(),
+            ));
+            if with_facts {
+                remote_facts.push(usage_fact(
+                    remote.source_id(),
+                    "shared-day-two",
+                    at(2, 10, 1),
+                    10,
+                    project_b,
+                ));
+            }
+        }
+        install_remote_replica_history(
+            &ownership,
+            &store,
+            &remote,
+            remote_buckets,
+            remote_digests,
+            remote_facts,
+        );
+        let physical = load_unified_history_since_selected(
+            &ownership,
+            &store,
+            local.source_id(),
+            &HistorySourceSelection::Remote(remote.source_id().clone()),
+            at(2, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            physical
+                .history
+                .half_hour_buckets
+                .iter()
+                .map(|b| b.token_usage.total_tokens)
+                .sum::<u64>(),
+            if shared_day { 30 } else { 20 }
+        );
+        let result = load_unified_history_since(&ownership, &store, at(2, 0, 0)).unwrap();
+        let totals = result
+            .history
+            .half_hour_buckets
+            .iter()
+            .map(|bucket| (bucket.starts_at, bucket.token_usage.total_tokens))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(totals.get(&at(2, 10, 0)), Some(&10));
+        assert_eq!(totals.get(&at(3, 10, 0)), Some(&20));
+        assert!(
+            result
+                .history
+                .half_hour_buckets
+                .iter()
+                .flat_map(|b| &b.project_groups)
+                .all(|group| group.thread_id == "logical-thread:thread")
         );
     }
 

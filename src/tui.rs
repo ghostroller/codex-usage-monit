@@ -14772,18 +14772,27 @@ fn summary_project_node_id(project_key: &str) -> String {
     format!("project:{project_key}")
 }
 
-fn summary_thread_node_id(thread_id: &str) -> String {
-    format!("thread:{thread_id}")
+fn summary_thread_node_id(project_key: &str, thread_id: &str) -> String {
+    // A logical session can contribute to several projects. Length-prefix the
+    // project key so colons in either identity cannot create ambiguous IDs.
+    format!("thread:{}:{project_key}:{thread_id}", project_key.len())
 }
 
-fn summary_turn_node_id(session_thread_id: &str, key: &SummaryTurnKey) -> String {
+fn summary_turn_node_id(
+    project_key: &str,
+    session_thread_id: &str,
+    key: &SummaryTurnKey,
+) -> String {
+    let session_id = summary_thread_node_id(project_key, session_thread_id);
     match key {
-        SummaryTurnKey::Exact(turn_id) => format!("turn:{session_thread_id}:{turn_id}"),
+        SummaryTurnKey::Exact(turn_id) => {
+            format!("turn:{}:{session_id}:{turn_id}", session_id.len())
+        }
         SummaryTurnKey::UnassignedSession => {
-            format!("turn-unassigned-session:{session_thread_id}")
+            format!("turn-unassigned-session:{session_id}")
         }
         SummaryTurnKey::UnassignedDelegated => {
-            format!("turn-unassigned-delegated:{session_thread_id}")
+            format!("turn-unassigned-delegated:{session_id}")
         }
     }
 }
@@ -14877,6 +14886,7 @@ fn sorted_summary_turns(
 }
 
 fn append_summary_session_rows(
+    project_key: &str,
     session: &SessionSummary,
     metric: SummaryMetric,
     api_long_context: bool,
@@ -14884,7 +14894,7 @@ fn append_summary_session_rows(
     guides: &mut Vec<bool>,
     rows: &mut Vec<SummaryTreeRow>,
 ) {
-    let id = summary_thread_node_id(&session.thread_id);
+    let id = summary_thread_node_id(project_key, &session.thread_id);
     let has_children = !session.turns.is_empty();
     let collapsed = has_children && !expanded.contains(&id);
     rows.push(SummaryTreeRow {
@@ -14910,7 +14920,7 @@ fn append_summary_session_rows(
     for (position, turn) in turns.into_iter().enumerate() {
         guides.push(position + 1 == turn_count);
         rows.push(SummaryTreeRow {
-            id: summary_turn_node_id(&session.thread_id, &turn.key),
+            id: summary_turn_node_id(project_key, &session.thread_id, &turn.key),
             kind: SummaryRowKind::Turn,
             prefix: summary_tree_prefix(guides),
             label: match &turn.key {
@@ -14966,6 +14976,7 @@ fn summary_tree_rows(
         for (position, session) in sessions.into_iter().enumerate() {
             guides.push(position + 1 == session_count);
             append_summary_session_rows(
+                &project.key,
                 session,
                 metric,
                 api_long_context,
