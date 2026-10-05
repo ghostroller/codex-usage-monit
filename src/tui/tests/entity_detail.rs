@@ -3,6 +3,7 @@ use super::testkit::{TuiHarness, gallery_directory};
 use super::*;
 
 const SIZES: [(u16, u16); 4] = [(120, 40), (80, 24), (60, 24), (32, 14)];
+const MESSAGE_PREVIEW_SECTION: &str = "snapshot.message-preview";
 
 fn detail_harness(width: u16, height: u16, theme: Theme) -> TuiHarness {
     TuiHarness::from_snapshot(interaction_test_app(3, 2).snapshot, width, height, theme)
@@ -22,6 +23,96 @@ fn popup_text(app: &App) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn full_preview_message() -> String {
+    let mut message = String::from(
+        "请完整展示当前用户消息并保留多行段落。这里有中文标题、路径和编号，正文不能只显示截断预览。\n",
+    );
+    for index in 1..=24 {
+        message.push_str(&format!(
+            "第{index:02}段：逐项核对会话信息与精确数字，路径 /tmp/中文项目/消息.rs，Unicode 家庭 👨‍👩‍👧‍👦 和重音 e\u{301} 需要保留。\n"
+        ));
+    }
+    message.push_str("终端控制字符：\u{1b}[31m安全内容\u{1b}[0m\t\r\u{202e}VISIBLE-SAFE-TEXT\n");
+    message.push_str("完整中文多行消息末尾 PREVIEW-FULL-END");
+    message
+}
+
+fn snapshot_preview(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= 72 {
+        normalized
+    } else {
+        format!("{}...", normalized.chars().take(69).collect::<String>())
+    }
+}
+
+fn preview_turn_harness(width: u16, height: u16, theme: Theme, message: &str) -> TuiHarness {
+    let mut harness = detail_harness(width, height, theme);
+    harness.app.snapshot.turns[0].message_preview = Some(snapshot_preview(message));
+    harness.app.local_snapshot.tasks.clear();
+    harness.app.focus_turns();
+    harness.render();
+    harness
+}
+
+fn recorded_preview_messages(
+    captured: DateTime<Utc>,
+    turn_id: &str,
+    message: &str,
+) -> crate::session_details::SessionDetails {
+    use crate::session_details::{DetailMessage, SessionDetails};
+
+    let mut data = SessionDetails::default();
+    data.files_read = 1;
+    for (role, id, body) in [
+        ("user", Some(turn_id), message),
+        (
+            "assistant",
+            Some(turn_id),
+            "ASSISTANT-CONTENT-MUST-STAY-HIDDEN",
+        ),
+        (
+            "user",
+            Some("other-turn"),
+            "OTHER-TURN-CONTENT-MUST-STAY-HIDDEN",
+        ),
+        ("user", None, "UNASSIGNED-CONTENT-MUST-STAY-HIDDEN"),
+        (
+            "user",
+            Some(turn_id),
+            "<environment_context>CONTEXT-CONTENT-MUST-STAY-HIDDEN</environment_context>",
+        ),
+    ] {
+        data.messages.push(DetailMessage {
+            role: role.into(),
+            text: body.into(),
+            timestamp: Some(captured - ChronoDuration::seconds(1)),
+            turn_id: id.map(str::to_owned),
+            phase: None,
+        });
+    }
+    // Native event and response records can repeat the same user message.
+    // Its duplicate must not make the exact preview match ambiguous.
+    data.messages.push(data.messages[0].clone());
+    data
+}
+
+fn inject_preview_messages(harness: &mut TuiHarness, message: &str) {
+    let data = recorded_preview_messages(
+        harness.app.snapshot.as_of,
+        &harness.app.snapshot.turns[0].turn_id,
+        message,
+    );
+    let theme = harness.app.theme;
+    harness
+        .app
+        .entity_detail
+        .as_mut()
+        .unwrap()
+        .set_recorded_details(data, theme);
+    harness.render();
 }
 
 fn assert_comparison_row(content: &str, label: &str, values: &[&str]) {
@@ -313,7 +404,7 @@ fn has_usage_node(document: &[DetailNode]) -> bool {
     document.iter().any(|node| match node {
         DetailNode::Usage(_) => true,
         DetailNode::Section { children, .. } => has_usage_node(children),
-        DetailNode::Lines(_) => false,
+        _ => false,
     })
 }
 
@@ -368,6 +459,35 @@ fn section_expanded(harness: &TuiHarness, id: &str) -> bool {
         .contains(id)
 }
 
+fn closed_preview_teaser(harness: &TuiHarness) -> String {
+    let popup = harness.app.entity_detail.as_ref().unwrap();
+    assert!(!popup.expanded.contains(MESSAGE_PREVIEW_SECTION));
+    let header = popup
+        .headers
+        .iter()
+        .find(|header| header.id == MESSAGE_PREVIEW_SECTION)
+        .expect("the collapsed preview has its own heading");
+    let teaser = popup.lines[header.line + 1].to_string();
+    assert!(teaser.trim_start().starts_with("Saved preview:"));
+    assert_eq!(
+        popup
+            .lines
+            .iter()
+            .filter(|line| line.to_string().trim_start().starts_with("Saved preview:"))
+            .count(),
+        1,
+        "a collapsed preview contributes exactly one teaser line"
+    );
+    assert!(
+        UnicodeWidthStr::width(teaser.as_str())
+            <= usize::from(harness.app.entity_detail_hitbox.unwrap().content.width),
+        "the collapsed teaser must fit one actual content row: {teaser:?}"
+    );
+    assert!(!teaser.chars().any(char::is_control));
+    assert!(!teaser.contains('\u{202e}'));
+    teaser
+}
+
 fn focus_section(harness: &mut TuiHarness, id: &str) -> Rect {
     let limit = harness.app.entity_detail.as_ref().unwrap().headers.len();
     for _ in 0..=limit {
@@ -416,6 +536,16 @@ fn focus_section(harness: &mut TuiHarness, id: &str) -> Rect {
         });
     }
     panic!("section {id} must be selectable and reachable");
+}
+
+fn focus_preview_with_teaser(harness: &mut TuiHarness) -> Rect {
+    let mut heading = focus_section(harness, MESSAGE_PREVIEW_SECTION);
+    if heading.bottom() >= harness.app.entity_detail_hitbox.unwrap().body.bottom() {
+        harness.key(KeyCode::Down);
+        heading = focus_section(harness, MESSAGE_PREVIEW_SECTION);
+    }
+    assert!(heading.bottom() < harness.app.entity_detail_hitbox.unwrap().body.bottom());
+    heading
 }
 
 fn first_tool_call_id(harness: &TuiHarness) -> String {
@@ -2604,6 +2734,436 @@ fn entity_detail_keeps_full_unicode_title_id_and_path_available_by_scrolling() {
 }
 
 #[test]
+fn entity_detail_message_preview_defaults_closed_and_expands_only_the_selected_user_message() {
+    let message = full_preview_message();
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            let mut harness = preview_turn_harness(width, height, theme, &message);
+            open(&mut harness);
+            let popup = harness.app.entity_detail.as_ref().unwrap();
+            assert!(section_ids(&popup.document, true).contains(&MESSAGE_PREVIEW_SECTION.into()));
+            assert_eq!(popup.headers.first().unwrap().id, MESSAGE_PREVIEW_SECTION);
+            assert!(!popup.expanded.contains(MESSAGE_PREVIEW_SECTION));
+            let heading = popup.lines[popup.headers[0].line].to_string();
+            assert_eq!(heading.trim(), "[↵] ▸ Message preview");
+            let binding = popup.lines[popup.headers[0].line]
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == "↵")
+                .unwrap();
+            assert_ne!(binding.style.fg, Some(theme.palette().accent));
+            assert!(!binding.style.add_modifier.contains(Modifier::BOLD));
+            let teaser = closed_preview_teaser(&harness);
+            let full_teaser = format!("  Saved preview: {}", snapshot_preview(&message));
+            if UnicodeWidthStr::width(full_teaser.as_str())
+                <= usize::from(harness.app.entity_detail_hitbox.unwrap().content.width)
+            {
+                assert_eq!(teaser, full_teaser);
+            } else {
+                assert!(
+                    teaser.ends_with('…'),
+                    "a narrow teaser is explicitly shortened"
+                );
+            }
+            assert!(!popup_text(&harness.app).contains("Full message:"));
+            assert!(!popup_text(&harness.app).contains("Full message unavailable"));
+            harness.key(KeyCode::Enter);
+            assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+
+            inject_preview_messages(&mut harness, &message);
+            assert_eq!(closed_preview_teaser(&harness), teaser);
+            assert!(!popup_text(&harness.app).contains("PREVIEW-FULL-END"));
+            let initial = harness.state();
+            harness.key(KeyCode::Tab);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some(MESSAGE_PREVIEW_SECTION)
+            );
+            let heading = focus_preview_with_teaser(&mut harness);
+            assert_eq!(heading.height, 1, "the preview heading stays compact");
+            assert_section_binding(&harness, heading, true);
+            let preview_row = heading.bottom();
+            let body = harness.app.entity_detail_hitbox.unwrap().body;
+            assert!(
+                preview_row < body.bottom(),
+                "the teaser is visible below its heading"
+            );
+            assert_eq!(
+                rendered_row(&harness, body, preview_row).trim(),
+                teaser.trim()
+            );
+            assert!(
+                !harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .section_hitboxes
+                    .iter()
+                    .any(|(_, hitbox)| hitbox.y <= preview_row && preview_row < hitbox.bottom()),
+                "the teaser row is not a shortcut-labelled control"
+            );
+            mouse_at(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                body.x,
+                preview_row,
+            );
+            assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some(MESSAGE_PREVIEW_SECTION),
+                "clicking the teaser does not add a separate focus target"
+            );
+            harness.key(KeyCode::Enter);
+            assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+            let expanded = popup_text(&harness.app);
+            for included in [
+                "第01段",
+                "第24段",
+                "VISIBLE-SAFE-TEXT",
+                "PREVIEW-FULL-END",
+                "👨‍👩‍👧‍👦",
+                "e\u{301}",
+            ] {
+                assert!(
+                    expanded.contains(included),
+                    "full preview preserves {included}: {expanded}"
+                );
+            }
+            for excluded in [
+                "ASSISTANT-CONTENT-MUST-STAY-HIDDEN",
+                "OTHER-TURN-CONTENT-MUST-STAY-HIDDEN",
+                "UNASSIGNED-CONTENT-MUST-STAY-HIDDEN",
+                "CONTEXT-CONTENT-MUST-STAY-HIDDEN",
+            ] {
+                assert!(
+                    !expanded.contains(excluded),
+                    "the preview must not expose {excluded}"
+                );
+            }
+            assert!(!expanded.contains('\u{1b}'));
+            assert!(!expanded.contains('\u{202e}'));
+            assert!(!expanded.contains('\r'));
+            assert!(!expanded.contains('\t'));
+            assert_eq!(harness.state(), initial);
+
+            focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+            harness.key(KeyCode::Enter);
+            assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+            assert_eq!(closed_preview_teaser(&harness), teaser);
+            let heading = focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+            for column in heading.x..heading.right() {
+                let current = focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+                assert_eq!(current, heading, "collapsed whole-label geometry is stable");
+                assert!(click_at(&mut harness, current, column));
+                assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+                harness.key(KeyCode::Enter);
+                assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+            }
+            harness.key(KeyCode::Tab);
+            assert_ne!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some(MESSAGE_PREVIEW_SECTION)
+            );
+            harness.key(KeyCode::BackTab);
+            assert_eq!(
+                harness
+                    .app
+                    .entity_detail
+                    .as_ref()
+                    .unwrap()
+                    .selected_section
+                    .as_deref(),
+                Some(MESSAGE_PREVIEW_SECTION)
+            );
+            let smaller = if width > 32 { (32, 14) } else { (120, 40) };
+            harness.resize(smaller.0, smaller.1);
+            let resized = focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+            assert_eq!(resized.height, 1);
+            assert_section_binding(&harness, resized, true);
+            closed_preview_teaser(&harness);
+
+            focus_section(&mut harness, "recorded.messages");
+            harness.key(KeyCode::Enter);
+            let metadata = popup_text(&harness.app);
+            assert!(metadata.contains("Message bodies: hidden"));
+            assert!(!metadata.contains("PREVIEW-FULL-END"));
+            assert!(!metadata.contains("ASSISTANT-CONTENT-MUST-STAY-HIDDEN"));
+        }
+    }
+}
+
+#[test]
+fn entity_detail_closed_message_preview_is_one_safe_row_and_respects_redaction() {
+    let message = "SECRET-PREVIEW-TEXT is the selected user message. RECORDED-FULL-MESSAGE-END";
+    for theme in [Theme::Dark, Theme::Light] {
+        for (width, height) in SIZES {
+            for case in [
+                "unicode",
+                "missing",
+                "snapshot-redacted",
+                "recorded-redacted",
+            ] {
+                let mut harness = preview_turn_harness(width, height, theme, message);
+                if case == "unicode" {
+                    harness.app.snapshot.turns[0].message_preview = Some(format!(
+                        "家 👨‍👩‍👧‍👦 e\u{301} /tmp/中文/消息.rs\n\t\u{1b}[31m\u{202e} {} LONG-CLOSED-SNAPSHOT-END",
+                        "长预览应当按显示列截断且不能另起一行。".repeat(12)
+                    ));
+                } else if case == "missing" {
+                    harness.app.snapshot.turns[0].message_preview = None;
+                } else if case == "snapshot-redacted" {
+                    harness.app.local_redact_content = true;
+                }
+                harness.render();
+                open(&mut harness);
+                if case == "recorded-redacted" {
+                    let mut data = recorded_preview_messages(
+                        harness.app.snapshot.as_of,
+                        &harness.app.snapshot.turns[0].turn_id,
+                        message,
+                    );
+                    data.redacted = true;
+                    harness
+                        .app
+                        .entity_detail
+                        .as_mut()
+                        .unwrap()
+                        .set_recorded_details(data, theme);
+                    harness.render();
+                }
+                let teaser = closed_preview_teaser(&harness);
+                let content = popup_text(&harness.app);
+                assert!(
+                    !content.contains("Full message"),
+                    "closed preview does not resolve a full message: {case}"
+                );
+                assert!(!content.contains("LONG-CLOSED-SNAPSHOT-END"));
+                assert!(!content.contains("RECORDED-FULL-MESSAGE-END"));
+                assert!(!content.contains("ASSISTANT-CONTENT-MUST-STAY-HIDDEN"));
+                assert!(!content.contains("CONTEXT-CONTENT-MUST-STAY-HIDDEN"));
+                match case {
+                    "unicode" => {
+                        assert!(teaser.ends_with('…'));
+                        assert!(teaser.contains('家'));
+                        if teaser.contains('👨') {
+                            assert!(
+                                teaser.contains("👨‍👩‍👧‍👦"),
+                                "truncation preserves the whole emoji grapheme"
+                            );
+                        }
+                        if width >= 60 {
+                            assert!(teaser.contains("👨‍👩‍👧‍👦"));
+                            assert!(teaser.contains("e\u{301}"));
+                        }
+                        if width == 120 {
+                            save_gallery(
+                                &harness,
+                                match theme {
+                                    Theme::Dark => "entity-message-preview-closed-dark-120x40",
+                                    Theme::Light => "entity-message-preview-closed-light-120x40",
+                                },
+                            );
+                        }
+                    }
+                    "missing" => assert!(teaser.contains("unavail")),
+                    _ => {
+                        assert!(teaser.contains("content"));
+                        assert!(!content.contains("SECRET-PREVIEW-TEXT"));
+                    }
+                }
+                let heading = focus_preview_with_teaser(&mut harness);
+                assert_eq!(heading.height, 1);
+                assert_eq!(
+                    rendered_row(
+                        &harness,
+                        harness.app.entity_detail_hitbox.unwrap().body,
+                        heading.bottom()
+                    )
+                    .trim(),
+                    teaser.trim(),
+                    "one physical teaser row at {width}x{height}: {case}"
+                );
+                harness.key(KeyCode::Tab);
+                assert_ne!(
+                    harness
+                        .app
+                        .entity_detail
+                        .as_ref()
+                        .unwrap()
+                        .selected_section
+                        .as_deref(),
+                    Some(MESSAGE_PREVIEW_SECTION),
+                    "the teaser adds no extra Tab target"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_detail_message_preview_keeps_expansion_when_evidence_arrives_and_generates_gallery() {
+    let message = full_preview_message();
+    for (width, height, theme, name) in [
+        (160, 45, Theme::Dark, "entity-message-preview-dark-160x45"),
+        (60, 24, Theme::Light, "entity-message-preview-light-60x24"),
+    ] {
+        let mut harness = preview_turn_harness(width, height, theme, &message);
+        open(&mut harness);
+        focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+        harness.key(KeyCode::Enter);
+        let fallback = popup_text(&harness.app);
+        assert!(fallback.contains(&snapshot_preview(&message)));
+        assert!(fallback.contains("Full message unavailable"));
+        assert!(!fallback.contains("PREVIEW-FULL-END"));
+        inject_preview_messages(&mut harness, &message);
+        assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+        assert_eq!(
+            harness
+                .app
+                .entity_detail
+                .as_ref()
+                .unwrap()
+                .selected_section
+                .as_deref(),
+            Some(MESSAGE_PREVIEW_SECTION)
+        );
+        assert!(popup_text(&harness.app).contains("PREVIEW-FULL-END"));
+        let heading = focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+        let body = harness.app.entity_detail_hitbox.unwrap().body;
+        for _ in 0..heading.y.saturating_sub(body.y) {
+            harness.key(KeyCode::Down);
+        }
+        save_gallery(&harness, name);
+        let mut seen_tail = false;
+        let limit = harness.app.entity_detail.as_ref().unwrap().line_count;
+        for _ in 0..=limit {
+            if rendered_region(&harness, harness.app.entity_detail_hitbox.unwrap().body)
+                .contains("PREVIEW-FULL-END")
+            {
+                seen_tail = true;
+                break;
+            }
+            let before = harness.app.entity_detail.as_ref().unwrap().offset;
+            harness.key(KeyCode::Down);
+            if harness.app.entity_detail.as_ref().unwrap().offset == before {
+                break;
+            }
+        }
+        assert!(
+            seen_tail,
+            "the long preview's final line is reachable at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn entity_detail_message_preview_falls_back_for_missing_stale_ambiguous_and_redacted_messages() {
+    use crate::session_details::{DetailMessage, SessionDetails};
+
+    let message = full_preview_message();
+    for case in [
+        "missing",
+        "stale",
+        "other-turn",
+        "assistant",
+        "ambiguous",
+        "redacted",
+    ] {
+        let mut harness = preview_turn_harness(80, 24, Theme::Dark, &message);
+        open(&mut harness);
+        let captured = harness.app.snapshot.as_of;
+        let turn_id = harness.app.snapshot.turns[0].turn_id.clone();
+        let mut data = SessionDetails::default();
+        data.files_read = 1;
+        data.redacted = case == "redacted";
+        if case != "missing" {
+            data.messages.push(DetailMessage {
+                role: if case == "assistant" {
+                    "assistant"
+                } else {
+                    "user"
+                }
+                .into(),
+                text: if case == "stale" {
+                    "STALE-MESSAGE-MUST-NOT-APPEAR".into()
+                } else {
+                    message.clone()
+                },
+                timestamp: Some(captured - ChronoDuration::seconds(1)),
+                turn_id: Some(
+                    if case == "other-turn" {
+                        "other-turn"
+                    } else {
+                        &turn_id
+                    }
+                    .into(),
+                ),
+                phase: None,
+            });
+        }
+        if case == "ambiguous" {
+            let mut alternative = data.messages[0].clone();
+            alternative
+                .text
+                .push_str("\nDIFFERENT-BODY-WITH-SAME-PREVIEW");
+            data.messages.push(alternative);
+        }
+        harness
+            .app
+            .entity_detail
+            .as_mut()
+            .unwrap()
+            .set_recorded_details(data, Theme::Dark);
+        harness.render();
+        focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+        harness.key(KeyCode::Enter);
+        let content = popup_text(&harness.app);
+        if case == "redacted" {
+            assert!(
+                !content.contains(&snapshot_preview(&message)),
+                "redaction suppresses the saved preview too"
+            );
+            assert!(content.contains("content redacted"));
+        } else {
+            assert!(
+                content.contains(&snapshot_preview(&message)),
+                "snapshot fallback retained: {case}"
+            );
+        }
+        assert!(
+            content.contains("Full message unavailable"),
+            "explicit fallback: {case}"
+        );
+        assert!(
+            !content.contains("PREVIEW-FULL-END"),
+            "no fabricated full message: {case}"
+        );
+        assert!(!content.contains("STALE-MESSAGE-MUST-NOT-APPEAR"));
+        assert!(!content.contains("DIFFERENT-BODY-WITH-SAME-PREVIEW"));
+    }
+}
+
+#[test]
 fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
     for (width, height, theme, gallery_name) in [
         (120, 40, Theme::Dark, "entity-detail-dark-120x40"),
@@ -2639,7 +3199,6 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
         open(&mut harness);
         let content = popup_text(&harness.app);
         for text in [
-            "visible user preview",
             "turn-0-0",
             "model-0",
             "high",
@@ -2667,6 +3226,12 @@ fn entity_detail_turn_shows_exact_token_components_and_api_pricing_coverage() {
         ] {
             assert!(content.contains(text), "missing {text:?}: {content}");
         }
+        assert!(closed_preview_teaser(&harness).contains("visible user preview"));
+        assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+        assert_eq!(
+            harness.app.entity_detail.as_ref().unwrap().headers[0].id,
+            MESSAGE_PREVIEW_SECTION
+        );
         let headers = content
             .lines()
             .filter(|line| line.contains("Metric"))
@@ -2955,6 +3520,95 @@ fn historical_summary_harness(width: u16, height: u16, theme: Theme) -> TuiHarne
 }
 
 #[test]
+fn entity_detail_summary_message_preview_requires_an_exact_turn_and_keeps_unassigned_private() {
+    let message = full_preview_message();
+    let saved = snapshot_preview(&message);
+    for (width, height, theme) in [(120, 40, Theme::Dark), (32, 14, Theme::Light)] {
+        let mut harness = historical_summary_harness(width, height, theme);
+        harness.app.history.half_hour_buckets[0].project_groups[0].message_preview =
+            Some(saved.clone());
+        harness.app.summary_cache = None;
+        harness.render();
+        let project = harness
+            .app
+            .summary_rows()
+            .into_iter()
+            .find(|row| row.kind == SummaryRowKind::Project)
+            .unwrap()
+            .id;
+        harness.app.summary_expanded_nodes.insert(project);
+        harness.render();
+        let session = harness
+            .app
+            .summary_rows()
+            .into_iter()
+            .find(|row| row.kind == SummaryRowKind::Session)
+            .unwrap()
+            .id;
+        harness.app.summary_expanded_nodes.insert(session.clone());
+        harness.app.summary_selected_id = Some(session);
+        harness.render();
+        open(&mut harness);
+        assert!(
+            !section_ids(&harness.app.entity_detail.as_ref().unwrap().document, true)
+                .contains(&MESSAGE_PREVIEW_SECTION.into()),
+            "session details do not add a message-body control"
+        );
+        harness.key(KeyCode::Esc);
+        let rows = harness.app.summary_rows();
+        let exact = rows
+            .iter()
+            .find(|row| row.kind == SummaryRowKind::Turn && row.label == saved)
+            .unwrap()
+            .id
+            .clone();
+        let unassigned = rows
+            .iter()
+            .find(|row| row.kind == SummaryRowKind::Turn && row.label.starts_with("Unassigned"))
+            .unwrap()
+            .id
+            .clone();
+        for (selected, has_exact_turn) in [(exact, true), (unassigned, false)] {
+            harness.app.summary_selected_id = Some(selected);
+            harness.render();
+            open(&mut harness);
+            assert!(!section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+            assert!(!popup_text(&harness.app).contains("PREVIEW-FULL-END"));
+            let data =
+                recorded_preview_messages(harness.app.snapshot.as_of, "historical-turn", &message);
+            harness
+                .app
+                .entity_detail
+                .as_mut()
+                .unwrap()
+                .set_recorded_details(data, theme);
+            harness.render();
+            focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+            harness.key(KeyCode::Enter);
+            let content = popup_text(&harness.app);
+            if has_exact_turn {
+                assert!(content.contains("Turn ID: historical-turn"));
+                assert!(content.contains("Full message from local log:"));
+                assert!(content.contains("PREVIEW-FULL-END"));
+            } else {
+                assert!(content.contains("Turn ID: unavailable"));
+                assert!(content.contains("Full message unavailable"));
+                assert!(!content.contains("PREVIEW-FULL-END"));
+                assert!(!content.contains(&saved));
+            }
+            for excluded in [
+                "ASSISTANT-CONTENT-MUST-STAY-HIDDEN",
+                "OTHER-TURN-CONTENT-MUST-STAY-HIDDEN",
+                "CONTEXT-CONTENT-MUST-STAY-HIDDEN",
+            ] {
+                assert!(!content.contains(excluded));
+            }
+            harness.key(KeyCode::Esc);
+        }
+    }
+}
+
+#[test]
 fn entity_detail_summary_requires_entity_selection_and_preserves_history_only_metadata() {
     for theme in [Theme::Dark, Theme::Light] {
         for (width, height) in SIZES {
@@ -3181,6 +3835,7 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
         "{} COMPLETE-LOCAL-MESSAGE",
         "long recorded message ".repeat(20)
     );
+    snapshot.turns[0].message_preview = Some(snapshot_preview(&full_message));
     let log = [
         record(captured - ChronoDuration::seconds(2), "session_meta", serde_json::json!({"id": thread_id})),
         record(captured - ChronoDuration::seconds(1), "event_msg", serde_json::json!({"type": "user_message", "turn_id": turn_id, "message": full_message})),
@@ -3192,6 +3847,9 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     harness.render();
     open_expanded(&mut harness);
     assert!(popup_text(&harness.app).contains("Recorded details: loading"));
+    assert!(popup_text(&harness.app).contains("Full message: loading local log..."));
+    assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+    focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
     let now = Instant::now();
     harness.app.last_local_refresh = now;
     assert_eq!(
@@ -3216,7 +3874,21 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
         "user | phase unrecorded | {} | turn {turn_id}",
         (captured - ChronoDuration::seconds(1)).to_rfc3339()
     )));
-    assert!(!content.contains(&full_message));
+    assert!(
+        content.contains(&full_message),
+        "the matching current-turn preview receives its full body"
+    );
+    assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+    assert_eq!(
+        harness
+            .app
+            .entity_detail
+            .as_ref()
+            .unwrap()
+            .selected_section
+            .as_deref(),
+        Some(MESSAGE_PREVIEW_SECTION)
+    );
     assert!(!content.contains("FUTURE-MESSAGE-MUST-NOT-APPEAR"));
     assert!(harness.app.entity_detail.is_some());
     harness.key(KeyCode::Esc);
@@ -3231,7 +3903,239 @@ fn entity_detail_local_enrichment_updates_the_modal_and_keeps_remote_content_sep
     open_expanded(&mut remote);
     assert!(!remote.app.poll_entity_detail());
     assert!(popup_text(&remote.app).contains("no unambiguous local rollout association"));
+    assert!(popup_text(&remote.app).contains("Full message unavailable"));
+    assert!(popup_text(&remote.app).contains(&snapshot_preview(&full_message)));
     assert!(!popup_text(&remote.app).contains("COMPLETE-LOCAL-MESSAGE"));
+}
+
+#[test]
+fn entity_detail_message_preview_survives_an_exhausted_tool_retention_budget() {
+    const TOOL_FIELD_BYTES: usize = 64 * 1024;
+    const TOOL_COUNT: usize = 32;
+    const FULL_END: &str = "SHORT-PREVIEW-AFTER-TOOLS-END";
+
+    let directory = tempfile::tempdir().unwrap();
+    let sessions = directory.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut snapshot = interaction_test_app(1, 1).snapshot;
+    snapshot.codex_home = directory.path().to_owned();
+    let captured = snapshot.as_of;
+    let thread_id = snapshot.tasks[0].thread_id.clone();
+    let turn_id = snapshot.turns[0].turn_id.clone();
+    let message = format!(
+        "{}{FULL_END}",
+        "请完整显示这条短用户消息。"
+            .chars()
+            .cycle()
+            .take(90 - FULL_END.chars().count())
+            .collect::<String>()
+    );
+    assert_eq!(message.chars().count(), 90);
+    snapshot.turns[0].message_preview = Some(snapshot_preview(&message));
+    let record = |timestamp: DateTime<Utc>, kind: &str, payload: serde_json::Value| {
+        serde_json::json!({"timestamp": timestamp, "type": kind, "payload": payload}).to_string()
+    };
+    let mut records = vec![record(
+        captured - ChronoDuration::seconds(4),
+        "session_meta",
+        serde_json::json!({"id": thread_id}),
+    )];
+    // All calls belong to the selected turn. The failure must be caused by
+    // retained-content exhaustion, independent of other-turn filtering.
+    for index in 0..TOOL_COUNT {
+        records.push(record(
+            captured - ChronoDuration::seconds(3),
+            "response_item",
+            serde_json::json!({
+                "type": "function_call", "call_id": format!("budget-{index:02}"),
+                "turn_id": turn_id, "name": format!("retained-budget-tool-{index:02}"),
+                "arguments": "x".repeat(TOOL_FIELD_BYTES),
+            }),
+        ));
+    }
+    assert_eq!(TOOL_COUNT * TOOL_FIELD_BYTES, 2 * 1024 * 1024);
+    records.push(record(
+        captured - ChronoDuration::seconds(2),
+        "event_msg",
+        serde_json::json!({
+            "type": "item_completed", "thread_id": thread_id, "turn_id": turn_id,
+            "item": {"type": "UserMessage", "id": "short-selected-message", "content": [{"text": message}]},
+        }),
+    ));
+    records.push(record(
+        captured - ChronoDuration::seconds(1),
+        "response_item",
+        serde_json::json!({
+            "type": "function_call", "call_id": "late-budget-call", "turn_id": turn_id,
+            "name": "late-budget-tool", "arguments": "LATE-TOOL-ARGUMENTS-MUST-STAY-OMITTED",
+        }),
+    ));
+    records.push(record(
+        captured - ChronoDuration::seconds(1),
+        "response_item",
+        serde_json::json!({
+            "type": "function_call_output", "call_id": "late-budget-call", "turn_id": turn_id,
+            "output": "LATE-TOOL-OUTPUT-MUST-STAY-OMITTED", "exit_code": 7, "duration_ms": 125,
+        }),
+    ));
+    assert!(records.iter().all(|line| line.len() < 2 * 1024 * 1024));
+    let log = records.join("\n");
+    assert!(log.len() < 3 * 1024 * 1024, "the source stays bounded");
+    std::fs::write(sessions.join(format!("rollout-{thread_id}.jsonl")), log).unwrap();
+
+    let mut harness = TuiHarness::from_snapshot(snapshot, 80, 24, Theme::Dark);
+    harness.app.focus_turns();
+    harness.render();
+    open(&mut harness);
+    closed_preview_teaser(&harness);
+    focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+    harness.key(KeyCode::Enter);
+    assert!(popup_text(&harness.app).contains("Full message: loading local log..."));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !harness.app.poll_entity_detail() {
+        assert!(
+            Instant::now() < deadline,
+            "the bounded budget-exhaustion reader did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    harness.render();
+    let content = popup_text(&harness.app);
+    assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+    assert_eq!(
+        harness
+            .app
+            .entity_detail
+            .as_ref()
+            .unwrap()
+            .selected_section
+            .as_deref(),
+        Some(MESSAGE_PREVIEW_SECTION)
+    );
+    assert!(content.contains("Full message from local log:"));
+    assert!(
+        content.contains(&message),
+        "a short selected message is not starved by tool bodies"
+    );
+    assert!(!content.contains("Full message unavailable"));
+    assert!(content.contains("Tool calls (33)"));
+    focus_section(&mut harness, "recorded.source");
+    harness.key(KeyCode::Enter);
+    assert!(
+        popup_text(&harness.app).contains("2 MiB retained-content limit"),
+        "the original shared budget remains exhausted"
+    );
+
+    focus_section(&mut harness, "recorded.tools");
+    harness.key(KeyCode::Enter);
+    let calls = section_children(
+        &harness.app.entity_detail.as_ref().unwrap().document,
+        "recorded.tools",
+    )
+    .unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|node| matches!(node, DetailNode::Section { .. }))
+            .count(),
+        TOOL_COUNT + 1
+    );
+    let late = calls
+        .iter()
+        .find_map(|node| match node {
+            DetailNode::Section { id, title, .. } if title.contains("late-budget-tool") => {
+                assert!(title.contains("Exit: 7 | Duration: 125 ms"));
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .expect("the late tool metadata survives retention exhaustion");
+    focus_section(&mut harness, &late);
+    harness.key(KeyCode::Enter);
+    let (arguments, output) = tool_body_ids(&harness, &late);
+    for id in [arguments, output] {
+        focus_section(&mut harness, &id);
+        harness.key(KeyCode::Enter);
+    }
+    let content = popup_text(&harness.app);
+    assert!(content.contains("Call ID: late-budget-call"));
+    assert_eq!(
+        content
+            .matches("[content not retained: 4,096-record / 2 MiB retention limit]")
+            .count(),
+        2
+    );
+    assert!(!content.contains("LATE-TOOL-ARGUMENTS-MUST-STAY-OMITTED"));
+    assert!(!content.contains("LATE-TOOL-OUTPUT-MUST-STAY-OMITTED"));
+
+    focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+    harness.key(KeyCode::Enter);
+    closed_preview_teaser(&harness);
+    focus_section(&mut harness, "recorded.messages");
+    harness.key(KeyCode::Enter);
+    let content = popup_text(&harness.app);
+    assert!(content.contains("Message bodies: hidden"));
+    assert!(
+        !content.contains(FULL_END),
+        "the reserved body is shown only in the expanded preview"
+    );
+}
+
+#[test]
+fn entity_detail_message_preview_handles_missing_owner_and_redacted_local_reads() {
+    let message = full_preview_message();
+    for case in ["missing-file", "owner-mismatch", "redacted"] {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut snapshot = interaction_test_app(1, 1).snapshot;
+        snapshot.codex_home = directory.path().to_owned();
+        snapshot.turns[0].message_preview = Some(snapshot_preview(&message));
+        let captured = snapshot.as_of;
+        let thread_id = snapshot.tasks[0].thread_id.clone();
+        let turn_id = snapshot.turns[0].turn_id.clone();
+        if case != "missing-file" {
+            let owner = if case == "owner-mismatch" {
+                "different-owner"
+            } else {
+                &thread_id
+            };
+            let records = [
+                serde_json::json!({"timestamp": captured - ChronoDuration::seconds(2), "type": "session_meta", "payload": {"id": owner}}).to_string(),
+                serde_json::json!({"timestamp": captured - ChronoDuration::seconds(1), "type": "event_msg", "payload": {"type": "user_message", "turn_id": turn_id, "message": message}}).to_string(),
+            ].join("\n");
+            std::fs::write(sessions.join(format!("rollout-{thread_id}.jsonl")), records).unwrap();
+        }
+        let mut harness = TuiHarness::from_snapshot(snapshot, 60, 24, Theme::Light);
+        harness.app.local_redact_content = case == "redacted";
+        harness.app.focus_turns();
+        harness.render();
+        open(&mut harness);
+        focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+        harness.key(KeyCode::Enter);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !harness.app.poll_entity_detail() {
+            assert!(
+                Instant::now() < deadline,
+                "bounded {case} reader did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        harness.render();
+        let content = popup_text(&harness.app);
+        assert!(section_expanded(&harness, MESSAGE_PREVIEW_SECTION));
+        assert!(
+            content.contains("Full message unavailable"),
+            "explicit {case} fallback"
+        );
+        assert!(!content.contains("PREVIEW-FULL-END"));
+        if case == "redacted" {
+            assert!(content.contains("content redacted"));
+            assert!(!content.contains(&snapshot_preview(&message)));
+        } else {
+            assert!(content.contains(&snapshot_preview(&message)));
+        }
+    }
 }
 
 #[test]
@@ -3544,6 +4448,8 @@ fn entity_detail_refresh_keeps_the_open_identity_and_frozen_values() {
     harness.app.focus_turns();
     harness.render();
     open(&mut harness);
+    focus_section(&mut harness, MESSAGE_PREVIEW_SECTION);
+    harness.key(KeyCode::Enter);
     let original = popup_text(&harness.app);
     let title = harness.app.entity_detail.as_ref().unwrap().title.clone();
     let mut snapshot = harness.app.snapshot.clone();
@@ -3569,6 +4475,7 @@ fn entity_detail_refresh_keeps_the_open_identity_and_frozen_values() {
     assert_eq!(harness.app.entity_detail.as_ref().unwrap().title, title);
     assert_eq!(popup_text(&harness.app), original);
     assert!(original.contains("turn-1-1"));
+    assert!(original.contains("message 1/1"));
     assert!(!original.contains("new snapshot message"));
     let selected = harness.app.selected_turn_record().unwrap().turn_id.clone();
     harness.key(KeyCode::Esc);

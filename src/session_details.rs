@@ -3,6 +3,7 @@
 //! Conversation content stays in memory and is never added to the history cache.
 //! Explicit item/turn/call identities are used instead of time-based attribution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -130,6 +131,85 @@ pub(crate) struct SessionDetails {
     source_discovery_partial: bool,
     analysis_groups: Option<DetailAnalysisGroups>,
     tool_retention: HashMap<String, DetailToolRetention>,
+    message_preview_candidates: Vec<DetailMessagePreviewCandidate>,
+    preview_reserve: Option<DetailPreviewReserve>,
+}
+
+pub(crate) struct MessagePreviewReadTarget<'a> {
+    pub(crate) thread_id: &'a str,
+    pub(crate) turn_id: &'a str,
+    pub(crate) preview: Option<&'a str>,
+}
+
+struct DetailReadSelection<'a> {
+    turn_id: Option<&'a str>,
+    preview_requested: bool,
+    preview: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+struct DetailPreviewReserve {
+    turn_id: String,
+    requested_preview: Option<String>,
+    entries: HashMap<[u8; 32], DetailReservedPreview>,
+    bytes: usize,
+    incomplete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DetailReservedPreview {
+    preview: String,
+    text: Option<String>,
+    retention: DetailRetention,
+    event_format: bool,
+}
+
+impl DetailPreviewReserve {
+    fn new(turn_id: &str, preview: Option<&str>) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            requested_preview: preview
+                .filter(|preview| !preview.trim().is_empty())
+                .map(str::to_owned),
+            entries: HashMap::new(),
+            bytes: 0,
+            incomplete: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DetailMessagePreviewCandidate {
+    turn_id: Option<String>,
+    preview: Option<String>,
+    original_digest: Option<[u8; 32]>,
+    authored_ranges: Vec<std::ops::Range<usize>>,
+    message_index: Option<usize>,
+    retention: DetailRetention,
+    event_format: bool,
+}
+
+enum DetailMessageOrigin<'a> {
+    EventMessage,
+    Item {
+        id: Option<&'a str>,
+        authored_ranges: Vec<std::ops::Range<usize>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessagePreviewUnavailable {
+    ExactTurnRequired,
+    Redacted,
+    NoMatchingUserMessage,
+    Ambiguous,
+    RetentionLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessagePreviewText<'a> {
+    Available { text: Cow<'a, str>, truncated: bool },
+    Unavailable(MessagePreviewUnavailable),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -405,8 +485,7 @@ impl<'a> DetailSectionBudget<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct DetailMessage {
     pub(crate) role: String,
-    // Keep the existing retained content; production presents metadata only.
-    #[allow(dead_code)]
+    // Only the exact-turn Message preview can expose retained user content.
     pub(crate) text: String,
     pub(crate) timestamp: Option<DateTime<Utc>>,
     pub(crate) turn_id: Option<String>,
@@ -444,6 +523,138 @@ pub(crate) struct DetailEvidence {
 }
 
 impl SessionDetails {
+    /// Match retained user-authored text using an exact turn and the same
+    /// normalized 72-character preview used by rollout collection. The rest of
+    /// the detail tree remains metadata-only for messages and context.
+    pub(crate) fn message_preview_text<'a>(
+        &'a self,
+        turn_id: Option<&str>,
+        preview: Option<&str>,
+    ) -> MessagePreviewText<'a> {
+        use MessagePreviewUnavailable as Missing;
+        if self.redacted {
+            return MessagePreviewText::Unavailable(Missing::Redacted);
+        }
+        let Some(turn_id) = turn_id.filter(|turn| !turn.is_empty()) else {
+            return MessagePreviewText::Unavailable(Missing::ExactTurnRequired);
+        };
+        if self
+            .preview_reserve
+            .as_ref()
+            .is_some_and(|reserve| reserve.turn_id == turn_id && reserve.incomplete)
+        {
+            return MessagePreviewText::Unavailable(Missing::RetentionLimit);
+        }
+        let preview = preview.filter(|preview| !preview.trim().is_empty());
+        let mut matched_digest = None;
+        let mut retained: Option<(Cow<'a, str>, bool, bool)> = None;
+        let mut matched = false;
+        for candidate in &self.message_preview_candidates {
+            if candidate.turn_id.as_deref() != Some(turn_id)
+                || candidate.preview.is_none()
+                || preview.is_some_and(|preview| candidate.preview.as_deref() != Some(preview))
+            {
+                continue;
+            }
+            let Some(digest) = candidate.original_digest else {
+                continue;
+            };
+            if matched_digest.is_some_and(|matched| matched != digest) {
+                return MessagePreviewText::Unavailable(Missing::Ambiguous);
+            }
+            matched_digest = Some(digest);
+            matched = true;
+            if let Some(message) = candidate
+                .message_index
+                .and_then(|index| self.messages.get(index))
+                .filter(|message| {
+                    message.role == "user" && message.turn_id.as_deref() == Some(turn_id)
+                })
+            {
+                let truncated = candidate.retention != DetailRetention::Complete;
+                if let Some(text) = retained_authored_text(message, &candidate.authored_ranges)
+                    && prefer_message_preview(
+                        retained
+                            .as_ref()
+                            .map(|(text, partial, event)| (text.len(), *partial, *event)),
+                        (text.len(), truncated, candidate.event_format),
+                    )
+                {
+                    retained = Some((text, truncated, candidate.event_format));
+                }
+            }
+        }
+        if let Some(reserve) = self
+            .preview_reserve
+            .as_ref()
+            .filter(|reserve| reserve.turn_id == turn_id)
+        {
+            for (digest, candidate) in &reserve.entries {
+                if preview.is_some_and(|preview| candidate.preview != preview) {
+                    continue;
+                }
+                if matched_digest.is_some_and(|matched| matched != *digest) {
+                    return MessagePreviewText::Unavailable(Missing::Ambiguous);
+                }
+                matched_digest = Some(*digest);
+                matched = true;
+                if let Some(text) = candidate.text.as_deref() {
+                    let truncated = candidate.retention != DetailRetention::Complete;
+                    if prefer_message_preview(
+                        retained
+                            .as_ref()
+                            .map(|(text, partial, event)| (text.len(), *partial, *event)),
+                        (text.len(), truncated, candidate.event_format),
+                    ) {
+                        retained = Some((Cow::Borrowed(text), truncated, candidate.event_format));
+                    }
+                }
+            }
+        }
+        // Hand-built records (and older in-memory fixtures) have no parser
+        // retention evidence. Still require authored text and exact identities.
+        let evidenced_indices: HashSet<_> = self
+            .message_preview_candidates
+            .iter()
+            .filter_map(|candidate| candidate.message_index)
+            .collect();
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.role != "user"
+                || message.turn_id.as_deref() != Some(turn_id)
+                || evidenced_indices.contains(&index)
+            {
+                continue;
+            }
+            let Some(text) = user_authored_message_text(&message.text) else {
+                continue;
+            };
+            if preview
+                .is_some_and(|preview| normalized_turn_preview(text).as_deref() != Some(preview))
+            {
+                continue;
+            }
+            let digest = normalized_authored_digest(text);
+            if matched_digest.is_some_and(|matched| matched != digest) {
+                return MessagePreviewText::Unavailable(Missing::Ambiguous);
+            }
+            matched_digest = Some(digest);
+            matched = true;
+            if prefer_message_preview(
+                retained
+                    .as_ref()
+                    .map(|(text, partial, event)| (text.len(), *partial, *event)),
+                (text.len(), false, false),
+            ) {
+                retained = Some((Cow::Borrowed(text), false, false));
+            }
+        }
+        match retained {
+            Some((text, truncated, _)) => MessagePreviewText::Available { text, truncated },
+            None if matched => MessagePreviewText::Unavailable(Missing::RetentionLimit),
+            None => MessagePreviewText::Unavailable(Missing::NoMatchingUserMessage),
+        }
+    }
+
     /// Project only visible branches. Expanded identities are raw section IDs,
     /// without the UI's `recorded.` namespace. Message bodies stay hidden.
     pub(crate) fn detail_sections(&self, expanded: &HashSet<String>) -> Vec<SessionDetailSection> {
@@ -1221,6 +1432,53 @@ pub(crate) fn load_session_details_in_range(
     as_of: Option<DateTime<Utc>>,
     cancelled: &AtomicBool,
 ) -> SessionDetails {
+    load_session_details_inner(
+        codex_home,
+        thread_id,
+        DetailReadSelection {
+            turn_id,
+            preview_requested: false,
+            preview: None,
+        },
+        redact_content,
+        starts_at,
+        as_of,
+        cancelled,
+    )
+}
+
+pub(crate) fn load_session_details_with_preview_in_range(
+    codex_home: &Path,
+    target: &MessagePreviewReadTarget<'_>,
+    redact_content: bool,
+    starts_at: Option<DateTime<Utc>>,
+    as_of: Option<DateTime<Utc>>,
+    cancelled: &AtomicBool,
+) -> SessionDetails {
+    load_session_details_inner(
+        codex_home,
+        target.thread_id,
+        DetailReadSelection {
+            turn_id: Some(target.turn_id),
+            preview_requested: true,
+            preview: target.preview,
+        },
+        redact_content,
+        starts_at,
+        as_of,
+        cancelled,
+    )
+}
+
+fn load_session_details_inner(
+    codex_home: &Path,
+    thread_id: &str,
+    selection: DetailReadSelection<'_>,
+    redact_content: bool,
+    starts_at: Option<DateTime<Utc>>,
+    as_of: Option<DateTime<Utc>>,
+    cancelled: &AtomicBool,
+) -> SessionDetails {
     let mut result = SessionDetails {
         redacted: redact_content,
         ..SessionDetails::default()
@@ -1232,6 +1490,14 @@ pub(crate) fn load_session_details_in_range(
     if thread_id.is_empty() || thread_id.len() > 1024 {
         result.warn("Invalid local thread identity; details were not loaded.");
         return result;
+    }
+    let turn_id = selection.turn_id;
+    if selection.preview_requested {
+        let Some(turn_id) = turn_id.filter(|turn| !turn.is_empty() && turn.len() <= 1024) else {
+            result.warn("An exact local turn identity is required to retain a message preview.");
+            return result;
+        };
+        result.preview_reserve = Some(DetailPreviewReserve::new(turn_id, selection.preview));
     }
     let files = discover_files(codex_home, thread_id, cancelled, &mut result);
     let mut parser = DetailParser::new(thread_id, turn_id, as_of, result);
@@ -1615,7 +1881,10 @@ impl<'a> DetailParser<'a> {
                             turn,
                             time,
                             Some("final_answer".into()),
-                            None,
+                            DetailMessageOrigin::Item {
+                                id: None,
+                                authored_ranges: Vec::new(),
+                            },
                         );
                     }
                 }
@@ -1743,10 +2012,24 @@ impl<'a> DetailParser<'a> {
         turn: Option<String>,
         time: Option<DateTime<Utc>>,
         phase: Option<String>,
-        id: Option<&str>,
+        origin: DetailMessageOrigin<'_>,
     ) {
         if !self.accept_turn(turn.as_deref()) || text.is_empty() {
             return;
+        }
+        let (id, event_format, authored_ranges) = match origin {
+            DetailMessageOrigin::EventMessage => (
+                None,
+                true,
+                user_authored_message_range(&text).into_iter().collect(),
+            ),
+            DetailMessageOrigin::Item {
+                id,
+                authored_ranges,
+            } => (id, false, authored_ranges),
+        };
+        if role == "user" {
+            self.reserve_message_preview(&text, &authored_ranges, turn.as_deref(), event_format);
         }
         let identity = id.map(|id| format!("message-id:{id}")).unwrap_or_else(|| {
             format!(
@@ -1761,7 +2044,60 @@ impl<'a> DetailParser<'a> {
         if self.seen.len() >= MAX_RECORDS || !self.seen.insert(identity) {
             return;
         }
-        if let Some(text) = self.keep_text(text) {
+        let candidate = if role == "user" {
+            let authored: Vec<_> = authored_ranges
+                .iter()
+                .filter_map(|range| text.get(range.clone()))
+                .collect();
+            Some(DetailMessagePreviewCandidate {
+                turn_id: turn.clone(),
+                preview: normalized_words_preview(
+                    authored.iter().flat_map(|part| part.split_whitespace()),
+                ),
+                original_digest: (!authored.is_empty()).then(|| {
+                    normalized_words_digest(
+                        authored.iter().flat_map(|part| part.split_whitespace()),
+                    )
+                }),
+                authored_ranges,
+                message_index: None,
+                retention: DetailRetention::Omitted,
+                event_format,
+            })
+        } else {
+            None
+        };
+        let original_bytes = text.len();
+        let text = self.keep_text(text);
+        if let Some(mut candidate) = candidate {
+            let raw_retention = detail_retention(original_bytes, text.as_deref());
+            let retained_prefix = text.as_ref().map_or(0, |text| {
+                if raw_retention == DetailRetention::Truncated {
+                    text.strip_suffix("\n[truncated: detail text limit]")
+                        .map_or(text.len(), str::len)
+                } else {
+                    text.len()
+                }
+            });
+            let complete = candidate
+                .authored_ranges
+                .iter()
+                .all(|range| range.end <= retained_prefix);
+            candidate.authored_ranges.retain_mut(|range| {
+                range.end = range.end.min(retained_prefix);
+                range.start < range.end
+            });
+            candidate.retention = if candidate.authored_ranges.is_empty() {
+                DetailRetention::Omitted
+            } else if complete {
+                DetailRetention::Complete
+            } else {
+                DetailRetention::Truncated
+            };
+            candidate.message_index = text.as_ref().map(|_| self.result.messages.len());
+            self.result.message_preview_candidates.push(candidate);
+        }
+        if let Some(text) = text {
             self.result.messages.push(DetailMessage {
                 role: role.into(),
                 text,
@@ -1769,6 +2105,89 @@ impl<'a> DetailParser<'a> {
                 turn_id: turn,
                 phase,
             });
+        }
+    }
+
+    fn reserve_message_preview(
+        &mut self,
+        text: &str,
+        ranges: &[std::ops::Range<usize>],
+        turn_id: Option<&str>,
+        event_format: bool,
+    ) {
+        let Some(reserve) = self
+            .result
+            .preview_reserve
+            .as_mut()
+            .filter(|reserve| turn_id == Some(reserve.turn_id.as_str()))
+        else {
+            return;
+        };
+        let authored: Vec<_> = ranges
+            .iter()
+            .filter_map(|range| text.get(range.clone()))
+            .collect();
+        let Some(preview) =
+            normalized_words_preview(authored.iter().flat_map(|part| part.split_whitespace()))
+        else {
+            return;
+        };
+        let digest =
+            normalized_words_digest(authored.iter().flat_map(|part| part.split_whitespace()));
+        if reserve.entries.len() >= MAX_RECORDS && !reserve.entries.contains_key(&digest) {
+            reserve.incomplete = true;
+            self.result.warn("Targeted message preview reached the 4,096-candidate limit; uniqueness could not be verified.");
+            return;
+        }
+        // Preserve fingerprints for all exact-turn authored candidates so a
+        // later no-preview lookup cannot ignore a different user request.
+        let requested = reserve
+            .requested_preview
+            .as_deref()
+            .is_none_or(|requested| requested == preview);
+        let previous = reserve.entries.get(&digest).map(|entry| {
+            (
+                entry.text.as_ref().map_or(0, String::len),
+                entry.retention,
+                entry.event_format,
+                entry.text.is_some(),
+            )
+        });
+        let old_bytes = previous.map_or(0, |(bytes, _, _, _)| bytes);
+        let available = MAX_TEXT_BYTES.saturating_sub(reserve.bytes - old_bytes);
+        let (body, retention) = if requested {
+            bounded_authored_text(&authored, available)
+        } else {
+            (None, DetailRetention::Omitted)
+        };
+        let new_bytes = body.as_ref().map_or(0, String::len);
+        let replace = previous.is_none_or(|(bytes, old_retention, old_event, present)| {
+            !present
+                || (old_retention == DetailRetention::Truncated
+                    && retention == DetailRetention::Complete)
+                || (old_retention == DetailRetention::Truncated
+                    && retention == DetailRetention::Truncated
+                    && new_bytes > bytes)
+                || (event_format
+                    && !old_event
+                    && retention == old_retention
+                    && (retention == DetailRetention::Complete || bytes == new_bytes))
+        });
+        if replace {
+            reserve.bytes = reserve.bytes - old_bytes + new_bytes;
+            reserve.entries.insert(
+                digest,
+                DetailReservedPreview {
+                    preview,
+                    text: body,
+                    retention,
+                    event_format,
+                },
+            );
+        }
+        let saved_retention = reserve.entries.get(&digest).map(|entry| entry.retention);
+        if requested && saved_retention != Some(DetailRetention::Complete) {
+            self.result.warn("Targeted user-message preview was truncated or omitted at its independent 64 KiB total retained-content limit.");
         }
     }
 
@@ -1781,13 +2200,21 @@ impl<'a> DetailParser<'a> {
         let turn = turn.or_else(|| id.and_then(|id| self.item_turns.get(id).cloned()));
         self.collect_attachments(payload, turn.as_deref(), time);
         if let Some(text) = content_text(payload) {
+            let authored_ranges = if role == "user" {
+                user_message_content_ranges(payload)
+            } else {
+                Vec::new()
+            };
             self.push_message(
                 role,
                 text,
                 turn,
                 time,
                 string(payload, &["phase"]).map(str::to_owned),
-                id,
+                DetailMessageOrigin::Item {
+                    id,
+                    authored_ranges,
+                },
             );
         }
     }
@@ -1805,7 +2232,14 @@ impl<'a> DetailParser<'a> {
         };
         self.collect_attachments(payload, turn.as_deref(), time);
         if let Some(text) = string(payload, &["message"]) {
-            self.push_message(role, text.to_owned(), turn, time, None, None);
+            self.push_message(
+                role,
+                text.to_owned(),
+                turn,
+                time,
+                None,
+                DetailMessageOrigin::EventMessage,
+            );
         }
     }
 
@@ -1820,13 +2254,21 @@ impl<'a> DetailParser<'a> {
                 };
                 self.collect_attachments(item, turn.as_deref(), time);
                 if let Some(text) = content_text(item) {
+                    let authored_ranges = if role == "user" {
+                        user_message_content_ranges(item)
+                    } else {
+                        Vec::new()
+                    };
                     self.push_message(
                         role,
                         text,
                         turn,
                         time,
                         string(item, &["phase"]).map(str::to_owned),
-                        string(item, &["id"]),
+                        DetailMessageOrigin::Item {
+                            id: string(item, &["id"]),
+                            authored_ranges,
+                        },
                     );
                 }
             }
@@ -2209,6 +2651,15 @@ impl<'a> DetailParser<'a> {
                 .tools
                 .retain(|tool| tool.turn_id.as_deref() == Some(selected));
         }
+        let mut original_indices: Vec<_> = (0..self.result.messages.len()).collect();
+        original_indices.sort_by_key(|&index| self.result.messages[index].timestamp);
+        let mut new_indices = vec![0; original_indices.len()];
+        for (new, old) in original_indices.into_iter().enumerate() {
+            new_indices[old] = new;
+        }
+        for candidate in &mut self.result.message_preview_candidates {
+            candidate.message_index = candidate.message_index.map(|old| new_indices[old]);
+        }
         self.result
             .messages
             .sort_by_key(|message| message.timestamp);
@@ -2251,6 +2702,190 @@ fn content_text(payload: &Value) -> Option<String> {
         .filter_map(|part| string(part, &["text"]))
         .collect();
     (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn user_message_content_ranges(payload: &Value) -> Vec<std::ops::Range<usize>> {
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut offset = 0;
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for part in content {
+        let Some(text) = string(part, &["text"]) else {
+            continue;
+        };
+        // Keep offsets for every part in the original content_text join.
+        // Only explicit authored types can contribute to the preview body.
+        if string(part, &["type"])
+            .is_none_or(|kind| matches!(kind, "input_text" | "text" | "InputText" | "Text"))
+            && let Some(range) = user_authored_message_range(text)
+        {
+            let range = range.start + offset..range.end + offset;
+            if let Some(previous) = ranges.last_mut()
+                && previous.end + 1 == range.start
+            {
+                // Consecutive authored parts share only the original newline.
+                previous.end = range.end;
+            } else {
+                ranges.push(range);
+            }
+        }
+        offset += text.len() + 1;
+    }
+    ranges
+}
+
+/// Mirror rollout's authored-input filtering without normalizing the body.
+/// Preserve its original newlines; only an explicit editor request marker
+/// strips the injected preamble, as it does for the collected turn preview.
+fn user_authored_message_text(value: &str) -> Option<&str> {
+    user_authored_message_range(value).and_then(|range| value.get(range))
+}
+
+fn user_authored_message_range(value: &str) -> Option<std::ops::Range<usize>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || [
+            "# AGENTS.md instructions for ",
+            "<environment_context>",
+            "<codex_internal_context",
+            "<turn_aborted>",
+            "<recommended_plugins>",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return None;
+    }
+    const REQUEST_MARKERS: [&str; 4] = [
+        "## My request:",
+        "# My request:",
+        "## My request for Codex:",
+        "# My request for Codex:",
+    ];
+    let request = REQUEST_MARKERS
+        .iter()
+        .filter_map(|marker| trimmed.rfind(marker).map(|index| (index, *marker)))
+        .max_by_key(|(index, _)| *index)
+        .and_then(|(index, marker)| {
+            let tail_start = value.len() - value.trim_start().len() + index + marker.len();
+            let tail = &value[tail_start..];
+            let request = tail.trim();
+            let start = tail_start + tail.len() - tail.trim_start().len();
+            (!request.is_empty()).then_some(start..start + request.len())
+        });
+    request.or(Some(0..value.len()))
+}
+
+fn normalized_turn_preview(text: &str) -> Option<String> {
+    normalized_words_preview(text.split_whitespace())
+}
+
+fn normalized_words_preview<'a>(words: impl Iterator<Item = &'a str>) -> Option<String> {
+    // title_preview first normalizes whitespace and limits to 96 characters;
+    // apply_user_message then takes 69 characters plus "..." when over 72.
+    // Reading at most 73 normalized characters produces the same turn value.
+    let mut characters = words
+        .enumerate()
+        .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
+    let mut preview: String = characters.by_ref().take(72).collect();
+    if preview.is_empty() {
+        return None;
+    }
+    if characters.next().is_some() {
+        let boundary = preview
+            .char_indices()
+            .nth(69)
+            .map(|(index, _)| index)
+            .unwrap_or(preview.len());
+        preview.truncate(boundary);
+        preview.push_str("...");
+    }
+    Some(preview)
+}
+
+fn normalized_authored_digest(text: &str) -> [u8; 32] {
+    normalized_words_digest(text.split_whitespace())
+}
+
+fn normalized_words_digest<'a>(words: impl Iterator<Item = &'a str>) -> [u8; 32] {
+    // Compare the entire authored body, never the shortened preview. This
+    // deduplicates alternate event/response whitespace representations while
+    // distinct requests sharing a preview prefix remain ambiguous.
+    let mut digest = Sha256::new();
+    for (index, word) in words.enumerate() {
+        if index > 0 {
+            digest.update(b" ");
+        }
+        digest.update(word.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn retained_authored_text<'a>(
+    message: &'a DetailMessage,
+    ranges: &[std::ops::Range<usize>],
+) -> Option<Cow<'a, str>> {
+    match ranges {
+        [] => None,
+        [range] => message.text.get(range.clone()).map(Cow::Borrowed),
+        _ => ranges
+            .iter()
+            .map(|range| message.text.get(range.clone()))
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| Cow::Owned(parts.join("\n"))),
+    }
+}
+
+/// Candidate tuples contain retained byte length, partial state, and whether
+/// the text preserves the original event format. Completeness wins first;
+/// partial copies prefer more retained text, with event format breaking ties.
+fn prefer_message_preview(current: Option<(usize, bool, bool)>, next: (usize, bool, bool)) -> bool {
+    current.is_none_or(|(old_bytes, old_partial, old_event)| {
+        let (bytes, partial, event) = next;
+        if partial != old_partial {
+            return !partial;
+        }
+        if partial && bytes != old_bytes {
+            return bytes > old_bytes;
+        }
+        event && !old_event
+    })
+}
+
+fn bounded_authored_text(parts: &[&str], limit: usize) -> (Option<String>, DetailRetention) {
+    let original_bytes = parts
+        .iter()
+        .fold(0usize, |bytes, part| bytes.saturating_add(part.len()))
+        .saturating_add(parts.len().saturating_sub(1));
+    let mut body = String::with_capacity(original_bytes.min(limit));
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            if body.len() == limit {
+                break;
+            }
+            body.push('\n');
+        }
+        let available = limit.saturating_sub(body.len());
+        let mut boundary = part.len().min(available);
+        while !part.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        body.push_str(&part[..boundary]);
+        if boundary < part.len() {
+            break;
+        }
+    }
+    if body.is_empty() {
+        (None, DetailRetention::Omitted)
+    } else {
+        let retention = if body.len() == original_bytes {
+            DetailRetention::Complete
+        } else {
+            DetailRetention::Truncated
+        };
+        (Some(body), retention)
+    }
 }
 
 fn is_attachment_kind(kind: &str) -> bool {
@@ -2861,6 +3496,654 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].text, "selected");
         assert_eq!(result.unassigned_records, 1);
+    }
+
+    #[test]
+    fn session_details_message_preview_matches_exact_turn_and_authored_parts() {
+        let mut parser = parser(None);
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"two","message":"first line\nsecond line\t终"}),
+        ));
+        let mut message = record(
+            "response_item",
+            json!({"type":"message","id":"selected","role":"user","turn_id":"one","content":[
+                {"type":"ContextMarkdown","text":"injected context must stay hidden"},
+                {"type":"input_text","text":"<environment_context>injected environment</environment_context>"},
+                {"type":"input_text","text":"first line\nsecond line\t终"},
+                {"type":"input_image","text":"attachment text must stay hidden"}
+            ]}),
+        );
+        message["timestamp"] = json!("2026-10-04T00:59:00Z");
+        parser.record(&message);
+        parser.record(&record("response_item", json!({"type":"message","role":"assistant","turn_id":"one","content":[{"text":"assistant secret"}]})));
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","message":"unassigned secret"}),
+        ));
+        let result = parser.finish();
+        assert_eq!(
+            result.message_preview_text(Some("one"), Some("first line second line 终")),
+            MessagePreviewText::Available {
+                text: "first line\nsecond line\t终".into(),
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            result.message_preview_text(Some("one"), Some("another preview")),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::NoMatchingUserMessage)
+        );
+        assert_eq!(
+            result.message_preview_text(None, Some("first line second line 终")),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::ExactTurnRequired)
+        );
+        let sections = expanded_sections(&result);
+        let mut nodes = Vec::new();
+        section_nodes(&sections, &mut nodes);
+        assert!(
+            !nodes
+                .iter()
+                .flat_map(|node| &node.lines)
+                .any(|line| { line.contains("first line") || line.contains("assistant secret") })
+        );
+    }
+
+    #[test]
+    fn session_details_message_preview_rejects_distinct_messages_with_the_same_prefix() {
+        let mut parser = parser(Some("one"));
+        let prefix = "界".repeat(69);
+        for (id, tail) in [
+            ("first", "long first request"),
+            ("second", "long second request"),
+        ] {
+            parser.record(&record("response_item", json!({"type":"message","id":id,"role":"user","turn_id":"one","content":[{"type":"input_text","text":format!("{prefix}{tail}")}]})));
+        }
+        let result = parser.finish();
+        let preview = format!("{prefix}...");
+        for preview in [Some(preview.as_str()), None] {
+            assert_eq!(
+                result.message_preview_text(Some("one"), preview),
+                MessagePreviewText::Unavailable(MessagePreviewUnavailable::Ambiguous)
+            );
+        }
+    }
+
+    #[test]
+    fn session_details_message_preview_deduplicates_full_event_and_response_text() {
+        let mut parser = parser(Some("one"));
+        let text = "first line\n\nsecond  line\t终...";
+        parser.record(&record("response_item", json!({"type":"message","id":"original","role":"user","turn_id":"one","content":[{"type":"input_text","text":text}]})));
+        let mut event = record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":text}),
+        );
+        event["timestamp"] = json!("2026-10-04T01:00:01Z");
+        parser.record(&event);
+        let result = parser.finish();
+        assert_eq!(result.messages.len(), 2);
+        for preview in [Some("first line second line 终..."), None] {
+            assert_eq!(
+                result.message_preview_text(Some("one"), preview),
+                MessagePreviewText::Available {
+                    text: text.into(),
+                    truncated: false
+                }
+            );
+        }
+        assert_eq!(
+            normalized_turn_preview(&"x".repeat(72)),
+            Some("x".repeat(72))
+        );
+        assert_eq!(
+            normalized_turn_preview(&"x".repeat(73)),
+            Some(format!("{}...", "x".repeat(69)))
+        );
+    }
+
+    #[test]
+    fn session_details_message_preview_prefers_event_format_for_split_response_copies() {
+        let mut parser = parser(Some("one"));
+        parser.record(&record(
+            "response_item",
+            json!({"type":"message","id":"original","role":"user","turn_id":"one","content":[
+                {"type":"input_text","text":"first line"},
+                {"type":"input_text","text":"second line"}
+            ]}),
+        ));
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":"first line  second line"}),
+        ));
+        let result = parser.finish();
+        for preview in [Some("first line second line"), None] {
+            assert_eq!(
+                result.message_preview_text(Some("one"), preview),
+                MessagePreviewText::Available {
+                    text: "first line  second line".into(),
+                    truncated: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn session_details_message_preview_reports_truncated_and_omitted_retention() {
+        let mut parser = parser(None);
+        let long_text = "界".repeat(MAX_TEXT_BYTES);
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"truncated","message":long_text}),
+        ));
+        parser.content_bytes = MAX_CONTENT_BYTES;
+        parser.record(&record("event_msg", json!({"type":"user_message","turn_id":"omitted","message":"this request was not retained"})));
+        let result = parser.finish();
+        let preview = normalized_turn_preview(&long_text).unwrap();
+        let MessagePreviewText::Available { text, truncated } =
+            result.message_preview_text(Some("truncated"), Some(&preview))
+        else {
+            panic!("the exact truncated request must remain selectable");
+        };
+        assert!(truncated);
+        assert!(text.len() <= MAX_TEXT_BYTES);
+        assert!(!text.contains("[truncated: detail text limit]"));
+        assert!(
+            result.messages[0]
+                .text
+                .ends_with("[truncated: detail text limit]")
+        );
+        assert_eq!(
+            result.message_preview_text(Some("omitted"), Some("this request was not retained")),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::RetentionLimit)
+        );
+        assert_eq!(
+            result.message_preview_text(Some("omitted"), None),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::RetentionLimit)
+        );
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_details_message_preview_no_preview_still_requires_one_authored_request() {
+        let mut parser = parser(Some("one"));
+        parser.record(&record("event_msg", json!({"type":"user_message","turn_id":"one","message":"# AGENTS.md instructions for /project\nprivate instructions"})));
+        parser.record(&record("event_msg", json!({"type":"user_message","turn_id":"one","message":"editor context\n## My request:\nactual request\nwith details"})));
+        let result = parser.finish();
+        assert_eq!(
+            result.message_preview_text(Some("one"), None),
+            MessagePreviewText::Available {
+                text: "actual request\nwith details".into(),
+                truncated: false,
+            }
+        );
+        let mut redacted = result;
+        redacted.redacted = true;
+        assert_eq!(
+            redacted.message_preview_text(Some("one"), None),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::Redacted)
+        );
+    }
+
+    #[test]
+    fn session_details_message_preview_preserves_raw_identity_counts_and_shared_budget() {
+        let mut parser = parser(Some("one"));
+        let synthetic = "# AGENTS.md instructions for /project\nprivate instructions";
+        let first = "first editor preamble\n## My request:\nactual request\nwith details";
+        let second = "second editor preamble\n## My request:\nactual request\nwith details";
+        for text in [synthetic, synthetic, first, second] {
+            parser.record(&record(
+                "event_msg",
+                json!({"type":"user_message","turn_id":"one","message":text}),
+            ));
+        }
+        assert_eq!(parser.result.messages.len(), 3);
+        assert_eq!(parser.seen.len(), 3);
+        assert_eq!(parser.record_count, 3);
+        assert_eq!(
+            parser.content_bytes,
+            synthetic.len() + first.len() + second.len()
+        );
+        let result = parser.finish();
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            [synthetic, first, second]
+        );
+        assert_eq!(
+            result.message_preview_text(Some("one"), None),
+            MessagePreviewText::Available {
+                text: "actual request\nwith details".into(),
+                truncated: false,
+            }
+        );
+
+        let mut parser = self::parser(Some("one"));
+        parser.content_bytes = MAX_CONTENT_BYTES - synthetic.len();
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":synthetic}),
+        ));
+        parser.record(&record("response_item", json!({"type":"function_call","call_id":"later","turn_id":"one","name":"exec","arguments":"must still share the original retention budget"})));
+        let result = parser.finish();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].text, synthetic);
+        assert!(result.tools[0].arguments.is_none());
+        assert_eq!(
+            result.tool_retention["later"].arguments,
+            DetailRetention::Omitted
+        );
+    }
+
+    #[test]
+    fn session_details_message_preview_context_only_keeps_metadata_without_fallback_body() {
+        let mut parser = parser(Some("one"));
+        let text = "ordinary-looking injected context";
+        parser.record(&record("response_item", json!({"type":"message","id":"context-only","role":"user","turn_id":"one","content":[{"type":"ContextMarkdown","text":text}]})));
+        let result = parser.finish();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].text, text);
+        for preview in [Some(text), None] {
+            assert_eq!(
+                result.message_preview_text(Some("one"), preview),
+                MessagePreviewText::Unavailable(MessagePreviewUnavailable::NoMatchingUserMessage)
+            );
+        }
+    }
+
+    #[test]
+    fn session_details_message_preview_disjoint_authored_ranges_join_without_context() {
+        let mut parser = parser(Some("one"));
+        parser.record(&record(
+            "response_item",
+            json!({"type":"message","id":"mixed","role":"user","turn_id":"one","content":[
+                {"type":"input_text","text":"first line\nfirst details"},
+                {"type":"ContextMarkdown","text":"context must stay hidden"},
+                {"type":"input_text","text":"second line\nsecond details"}
+            ]}),
+        ));
+        let original =
+            "first line\nfirst details\ncontext must stay hidden\nsecond line\nsecond details";
+        assert_eq!(parser.content_bytes, original.len());
+        let result = parser.finish();
+        assert_eq!(result.messages[0].text, original);
+        let MessagePreviewText::Available { text, truncated } = result.message_preview_text(
+            Some("one"),
+            Some("first line first details second line second details"),
+        ) else {
+            panic!("authored fragments must remain available");
+        };
+        assert!(!truncated);
+        assert!(matches!(&text, Cow::Owned(_)));
+        assert_eq!(
+            text,
+            "first line\nfirst details\nsecond line\nsecond details"
+        );
+    }
+
+    #[test]
+    fn session_details_message_preview_ranges_respect_original_raw_field_truncation() {
+        for (prefix, suffix, expected) in [
+            (
+                "",
+                "selected request",
+                MessagePreviewText::Unavailable(MessagePreviewUnavailable::RetentionLimit),
+            ),
+            (
+                "first request",
+                "last request",
+                MessagePreviewText::Available {
+                    text: "first request".into(),
+                    truncated: true,
+                },
+            ),
+            (
+                "first request",
+                "",
+                MessagePreviewText::Available {
+                    text: "first request".into(),
+                    truncated: false,
+                },
+            ),
+        ] {
+            let mut parser = parser(Some("one"));
+            parser.record(&record(
+                "response_item",
+                json!({"type":"message","id":"mixed","role":"user","turn_id":"one","content":[
+                    {"type":"input_text","text":prefix},
+                    {"type":"ContextMarkdown","text":"c".repeat(MAX_TEXT_BYTES + 32)},
+                    {"type":"input_text","text":suffix}
+                ]}),
+            ));
+            assert_eq!(parser.content_bytes, MAX_TEXT_BYTES);
+            let result = parser.finish();
+            assert_eq!(result.messages.len(), 1);
+            assert!(
+                result.messages[0]
+                    .text
+                    .ends_with("[truncated: detail text limit]")
+            );
+            assert_eq!(result.message_preview_text(Some("one"), None), expected);
+        }
+    }
+
+    #[test]
+    fn session_details_targeted_preview_reader_preserves_old_shared_budget_and_recovers_short_request()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        let mut records = vec![record("session_meta", json!({"id":"thread"}))];
+        for index in 0..32 {
+            records.push(record("response_item", json!({"type":"function_call","call_id":format!("other-{index}"),"turn_id":"other","name":"exec","arguments":"x".repeat(MAX_TEXT_BYTES)})));
+        }
+        let text = "selected user's complete request\nwith its original newlines";
+        records.push(record("event_msg", json!({"type":"item_completed","turn_id":"one","item":{"type":"UserMessage","id":"selected","content":[{"type":"text","text":text}]}})));
+        records.push(record("response_item", json!({"type":"function_call","call_id":"late","turn_id":"one","name":"exec","arguments":"late arguments still share the old budget"})));
+        let content = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(directory.join("thread.jsonl"), content).unwrap();
+        let preview = normalized_turn_preview(text).unwrap();
+        let old = load_session_details(root.path(), "thread", Some("one"), false);
+        let target = MessagePreviewReadTarget {
+            thread_id: "thread",
+            turn_id: "one",
+            preview: Some(&preview),
+        };
+        let new = load_session_details_with_preview_in_range(
+            root.path(),
+            &target,
+            false,
+            None,
+            None,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            old.message_preview_text(Some("one"), Some(&preview)),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::RetentionLimit)
+        );
+        assert_eq!(
+            new.message_preview_text(Some("one"), Some(&preview)),
+            MessagePreviewText::Available {
+                text: text.into(),
+                truncated: false
+            }
+        );
+        assert!(old.preview_reserve.is_none());
+        assert_eq!(new.preview_reserve.as_ref().unwrap().bytes, text.len());
+        assert_eq!(old.messages.len(), new.messages.len());
+        assert!(new.messages.is_empty());
+        assert_eq!(old.tools.len(), new.tools.len());
+        assert_eq!(new.tools.len(), 1);
+        assert!(old.tools[0].arguments.is_none());
+        assert!(new.tools[0].arguments.is_none());
+        assert_eq!(
+            old.tool_retention["late"].arguments,
+            new.tool_retention["late"].arguments
+        );
+    }
+
+    #[test]
+    fn session_details_targeted_preview_reader_obeys_exact_preview_owner_range_and_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sessions");
+        std::fs::create_dir(&directory).unwrap();
+        let mut records = vec![record("session_meta", json!({"id":"thread"}))];
+        records.push(record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"other","message":"selected request"}),
+        ));
+        records.push(record(
+            "event_msg",
+            json!({"type":"user_message","message":"selected request"}),
+        ));
+        records.push(record("response_item", json!({"type":"message","turn_id":"one","role":"assistant","content":[{"text":"selected request"}]})));
+        records.push(record("response_item", json!({"type":"message","turn_id":"one","role":"user","content":[{"type":"ContextMarkdown","text":"selected request"}]})));
+        records.push(record("event_msg", json!({"type":"user_message","turn_id":"one","message":"<environment_context>selected request</environment_context>"})));
+        let mut old = record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":"selected request"}),
+        );
+        old["timestamp"] = json!("2026-10-04T00:00:00Z");
+        records.push(old);
+        let mut future = record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":"selected request"}),
+        );
+        future["timestamp"] = json!("2026-10-04T02:00:00Z");
+        records.push(future);
+        records.push(record("session_meta", json!({"id":"parent"})));
+        records.push(record("response_item", json!({"type":"message","turn_id":"one","role":"user","content":[{"type":"input_text","text":"selected request"}]})));
+        records.push(record("session_meta", json!({"id":"thread"})));
+        records.push(record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":"actual authored request"}),
+        ));
+        std::fs::write(
+            directory.join("thread.jsonl"),
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let starts_at = Some(timestamp(&json!("2026-10-04T00:59:00Z")).unwrap());
+        let as_of = Some(timestamp(&json!("2026-10-04T01:00:00Z")).unwrap());
+        let target = MessagePreviewReadTarget {
+            thread_id: "thread",
+            turn_id: "one",
+            preview: Some("selected request"),
+        };
+        let details = load_session_details_with_preview_in_range(
+            root.path(),
+            &target,
+            false,
+            starts_at,
+            as_of,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            details.message_preview_text(Some("one"), target.preview),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::NoMatchingUserMessage)
+        );
+        let reserve = details.preview_reserve.as_ref().unwrap();
+        assert_eq!(reserve.bytes, 0);
+        assert_eq!(reserve.entries.len(), 1);
+        assert!(reserve.entries.values().all(|entry| entry.text.is_none()));
+        assert_eq!(
+            details.message_preview_text(Some("other"), target.preview),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::NoMatchingUserMessage)
+        );
+        let redacted = load_session_details_with_preview_in_range(
+            root.path(),
+            &target,
+            true,
+            starts_at,
+            as_of,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(redacted.files_read, 0);
+        assert!(redacted.preview_reserve.is_none());
+        assert_eq!(
+            redacted.message_preview_text(Some("one"), target.preview),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::Redacted)
+        );
+    }
+
+    #[test]
+    fn session_details_targeted_preview_ignores_exhausted_shared_seen_and_record_limits() {
+        let mut parser = parser(Some("one"));
+        parser.result.preview_reserve =
+            Some(DetailPreviewReserve::new("one", Some("selected request")));
+        parser
+            .seen
+            .extend((0..MAX_RECORDS).map(|index| format!("already-seen-{index}")));
+        parser.record_count = MAX_RECORDS;
+        parser.content_bytes = MAX_CONTENT_BYTES;
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":"selected request"}),
+        ));
+        assert_eq!(parser.content_bytes, MAX_CONTENT_BYTES);
+        assert_eq!(parser.record_count, MAX_RECORDS);
+        assert_eq!(parser.seen.len(), MAX_RECORDS);
+        let details = parser.finish();
+        assert!(details.messages.is_empty());
+        assert_eq!(
+            details.message_preview_text(Some("one"), Some("selected request")),
+            MessagePreviewText::Available {
+                text: "selected request".into(),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn session_details_targeted_preview_total_cap_deduplicates_and_keeps_ambiguity_evidence() {
+        let mut parser = parser(Some("one"));
+        parser.result.preview_reserve = Some(DetailPreviewReserve::new("one", None));
+        parser.content_bytes = MAX_CONTENT_BYTES;
+        for (turn, text) in [
+            ("one", "first line\nsecond line"),
+            ("one", "first line second line"),
+            ("other", "unrelated request"),
+        ] {
+            parser.record(&record(
+                "event_msg",
+                json!({"type":"user_message","turn_id":turn,"message":text}),
+            ));
+        }
+        let reserve = parser.result.preview_reserve.as_ref().unwrap();
+        assert_eq!(reserve.entries.len(), 1);
+        assert_eq!(reserve.bytes, "first line\nsecond line".len());
+        let long_text = "界".repeat(MAX_TEXT_BYTES);
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":long_text}),
+        ));
+        let reserve = parser.result.preview_reserve.as_ref().unwrap();
+        assert!(reserve.bytes <= MAX_TEXT_BYTES);
+        assert_eq!(
+            reserve.bytes,
+            reserve
+                .entries
+                .values()
+                .map(|entry| entry.text.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+        );
+        let details = parser.finish();
+        let long_preview = normalized_turn_preview(&long_text).unwrap();
+        let MessagePreviewText::Available { text, truncated } =
+            details.message_preview_text(Some("one"), Some(&long_preview))
+        else {
+            panic!("the bounded authored prefix must remain inspectable");
+        };
+        assert!(truncated);
+        assert!(!text.is_empty());
+        assert!(text.len() < MAX_TEXT_BYTES);
+        assert!(text.chars().all(|ch| ch == '界'));
+        assert_eq!(
+            details.message_preview_text(Some("one"), None),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::Ambiguous)
+        );
+
+        let mut parser = self::parser(Some("one"));
+        let prefix = "x".repeat(69);
+        let preview = format!("{prefix}...");
+        parser.result.preview_reserve = Some(DetailPreviewReserve::new("one", Some(&preview)));
+        parser.content_bytes = MAX_CONTENT_BYTES;
+        for suffix in ["different first tail", "different second tail"] {
+            parser.record(&record("event_msg", json!({"type":"user_message","turn_id":"one","message":format!("{prefix}{suffix}")})));
+        }
+        assert_eq!(
+            parser
+                .finish()
+                .message_preview_text(Some("one"), Some(&preview)),
+            MessagePreviewText::Unavailable(MessagePreviewUnavailable::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn session_details_targeted_preview_event_format_replacement_refunds_budget_and_keeps_complete_text()
+     {
+        for (response, event, exhaust_remaining) in [
+            ("first\nsecond", "first  second", false),
+            ("first  \nsecond", "first second", false),
+            ("first\nsecond", "first                      second", true),
+        ] {
+            let mut parser = parser(Some("one"));
+            parser.result.preview_reserve = Some(DetailPreviewReserve::new("one", None));
+            parser.content_bytes = MAX_CONTENT_BYTES;
+            parser.record(&record("response_item", json!({"type":"message","id":"original","turn_id":"one","role":"user","content":[{"type":"input_text","text":response}]})));
+            if exhaust_remaining {
+                let remaining =
+                    MAX_TEXT_BYTES - parser.result.preview_reserve.as_ref().unwrap().bytes;
+                parser.record(&record(
+                    "event_msg",
+                    json!({"type":"user_message","turn_id":"one","message":"z".repeat(remaining)}),
+                ));
+            }
+            parser.record(&record(
+                "event_msg",
+                json!({"type":"user_message","turn_id":"one","message":event}),
+            ));
+            let reserve = parser.result.preview_reserve.as_ref().unwrap();
+            assert!(reserve.bytes <= MAX_TEXT_BYTES);
+            assert_eq!(
+                reserve.bytes,
+                reserve
+                    .entries
+                    .values()
+                    .map(|entry| entry.text.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+            );
+            let expected = if exhaust_remaining { response } else { event };
+            if !exhaust_remaining {
+                assert_eq!(reserve.bytes, event.len());
+            }
+            let details = parser.finish();
+            assert_eq!(
+                details.message_preview_text(Some("one"), Some("first second")),
+                MessagePreviewText::Available {
+                    text: expected.into(),
+                    truncated: false
+                }
+            );
+            assert!(!details.warnings.iter().any(|warning| {
+                warning.contains("Targeted user-message preview was truncated or omitted")
+            }));
+        }
+    }
+
+    #[test]
+    fn session_details_targeted_preview_prefers_longer_reserved_prefix_over_short_shared_prefix() {
+        let mut parser = parser(Some("one"));
+        let text = "x".repeat(MAX_TEXT_BYTES + 100);
+        let preview = normalized_turn_preview(&text).unwrap();
+        parser.result.preview_reserve = Some(DetailPreviewReserve::new("one", Some(&preview)));
+        parser.content_bytes = MAX_CONTENT_BYTES - 64;
+        parser.record(&record(
+            "event_msg",
+            json!({"type":"user_message","turn_id":"one","message":text}),
+        ));
+        let details = parser.finish();
+        assert_eq!(details.messages.len(), 1);
+        assert_eq!(details.messages[0].text.len(), 64);
+        let MessagePreviewText::Available { text, truncated } =
+            details.message_preview_text(Some("one"), Some(&preview))
+        else {
+            panic!("the longest retained authored prefix must be available");
+        };
+        assert!(truncated);
+        assert_eq!(text.len(), MAX_TEXT_BYTES);
+        assert!(text.chars().all(|ch| ch == 'x'));
     }
 
     #[test]
