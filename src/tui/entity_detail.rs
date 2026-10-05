@@ -9,12 +9,23 @@ use usage::UsageBlock;
 pub(super) enum DetailNode {
     Lines(Vec<Line<'static>>),
     Usage(UsageBlock),
+    MessagePreview {
+        turn_id: Option<String>,
+        preview: Option<String>,
+        redacted: bool,
+    },
     Section {
         id: String,
         title: String,
         foldable: bool,
         children: Vec<DetailNode>,
     },
+}
+
+#[derive(Clone, Copy)]
+struct MessagePreviewContext<'a> {
+    recorded: Option<&'a crate::session_details::SessionDetails>,
+    loading: bool,
 }
 
 #[derive(Debug)]
@@ -135,6 +146,10 @@ impl EntityDetailPopup {
             width,
             theme,
             0,
+            MessagePreviewContext {
+                recorded: self.recorded.as_ref(),
+                loading: self.receiver.is_some(),
+            },
             &mut self.lines,
             &mut self.headers,
         );
@@ -254,6 +269,108 @@ fn recorded_section(section: crate::session_details::SessionDetailSection) -> De
     }
 }
 
+fn captured_message_preview(nodes: &[DetailNode]) -> Option<&str> {
+    nodes.iter().find_map(|node| match node {
+        DetailNode::MessagePreview { preview, .. } => preview.as_deref(),
+        DetailNode::Section { children, .. } => captured_message_preview(children),
+        _ => None,
+    })
+}
+
+fn message_preview_lines(
+    turn_id: Option<&str>,
+    preview: Option<&str>,
+    redacted: bool,
+    context: MessagePreviewContext<'_>,
+) -> Vec<Line<'static>> {
+    use crate::session_details::{MessagePreviewText, MessagePreviewUnavailable};
+
+    if redacted || context.recorded.is_some_and(|data| data.redacted) {
+        return vec![Line::from("Full message unavailable: content redacted.")];
+    }
+    let status = if turn_id.is_none_or(str::is_empty) {
+        "Full message unavailable: no exact turn association."
+    } else if let Some(data) = context.recorded {
+        match data.message_preview_text(turn_id, preview) {
+            MessagePreviewText::Available { text, truncated } => {
+                let mut lines = vec![Line::from(if truncated {
+                    "Message from local log (truncated at the retention limit):"
+                } else {
+                    "Full message from local log:"
+                })];
+                append_enrichment(
+                    &mut lines,
+                    text.split('\n').take(8_193).map(str::to_owned).collect(),
+                );
+                return lines;
+            }
+            MessagePreviewText::Unavailable(reason) => match reason {
+                MessagePreviewUnavailable::ExactTurnRequired => {
+                    "Full message unavailable: no exact turn association."
+                }
+                MessagePreviewUnavailable::Redacted => {
+                    return vec![Line::from("Full message unavailable: content redacted.")];
+                }
+                MessagePreviewUnavailable::NoMatchingUserMessage => {
+                    "Full message unavailable: no matching user message in the local log."
+                }
+                MessagePreviewUnavailable::Ambiguous => {
+                    "Full message unavailable: multiple user messages match this preview."
+                }
+                MessagePreviewUnavailable::RetentionLimit => {
+                    "Full message unavailable: message content was not retained within the detail limits."
+                }
+            },
+        }
+    } else if context.loading {
+        "Full message: loading local log..."
+    } else {
+        "Full message unavailable: no accessible local message evidence."
+    };
+    let mut lines = vec![Line::from(status)];
+    if let Some(preview) = preview.filter(|text| !text.trim().is_empty()) {
+        lines.push(Line::from("Saved preview:"));
+        append_enrichment(
+            &mut lines,
+            preview.split('\n').take(8_193).map(str::to_owned).collect(),
+        );
+    } else {
+        lines.push(Line::from("Saved preview: unavailable."));
+    }
+    lines
+}
+
+fn collapsed_message_preview_line(
+    preview: Option<&str>,
+    redacted: bool,
+    context: MessagePreviewContext<'_>,
+    width: u16,
+    depth: usize,
+) -> Line<'static> {
+    let text = if redacted || context.recorded.is_some_and(|data| data.redacted) {
+        "Saved preview: content redacted.".to_owned()
+    } else {
+        let preview = preview
+            .map(terminal_safe_text)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty());
+        match preview {
+            Some(preview) => format!("Saved preview: {preview}"),
+            None => "Saved preview: unavailable.".to_owned(),
+        }
+    };
+    let indent = depth
+        .saturating_mul(2)
+        .min(usize::from(width.saturating_sub(1)));
+    // This teaser only uses the captured short preview. Resolve the retained
+    // user body exclusively through the expanded MessagePreview projection.
+    let mut line = sticky_detail_line(&Line::from(text), width.saturating_sub(indent as u16));
+    if indent > 0 {
+        line.spans.insert(0, Span::raw(" ".repeat(indent)));
+    }
+    line
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_detail_nodes(
     nodes: &[DetailNode],
@@ -262,12 +379,35 @@ fn project_detail_nodes(
     width: u16,
     theme: Theme,
     depth: usize,
+    preview_context: MessagePreviewContext<'_>,
     lines: &mut Vec<Line<'static>>,
     headers: &mut Vec<DetailHeader>,
 ) {
     let palette = theme.palette();
     for node in nodes {
         match node {
+            DetailNode::MessagePreview {
+                turn_id,
+                preview,
+                redacted,
+            } => {
+                let indent = "  ".repeat(depth);
+                lines.extend(
+                    message_preview_lines(
+                        turn_id.as_deref(),
+                        preview.as_deref(),
+                        *redacted,
+                        preview_context,
+                    )
+                    .into_iter()
+                    .map(|mut line| {
+                        if !indent.is_empty() && !line.spans.is_empty() {
+                            line.spans.insert(0, Span::raw(indent.clone()));
+                        }
+                        line
+                    }),
+                );
+            }
             DetailNode::Lines(values) => {
                 lines.extend(values.iter().cloned().map(|mut line| {
                     if depth > 0 && !line.spans.is_empty() {
@@ -352,9 +492,26 @@ fn project_detail_nodes(
                         width,
                         theme,
                         depth + usize::from(*foldable),
+                        preview_context,
                         lines,
                         headers,
                     );
+                } else if id == "snapshot.message-preview"
+                    && let Some((preview, redacted)) = children.iter().find_map(|child| match child
+                    {
+                        DetailNode::MessagePreview {
+                            preview, redacted, ..
+                        } => Some((preview.as_deref(), *redacted)),
+                        _ => None,
+                    })
+                {
+                    lines.push(collapsed_message_preview_line(
+                        preview,
+                        redacted,
+                        preview_context,
+                        width,
+                        depth + 1,
+                    ));
                 }
                 if *foldable {
                     headers[header_index].end_line = lines.len();
@@ -447,6 +604,7 @@ impl App {
         };
         let codex_home = self.snapshot.codex_home.clone();
         let redact = self.local_redact_content;
+        let saved_preview = captured_message_preview(&detail.document).map(str::to_owned);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (sender, receiver) = mpsc::channel();
@@ -457,15 +615,31 @@ impl App {
         detail.receiver = Some(receiver);
         detail.cancel = Some(cancel);
         thread::spawn(move || {
-            let data = crate::session_details::load_session_details_in_range(
-                &codex_home,
-                &thread_id,
-                turn_id.as_deref(),
-                redact,
-                starts_at,
-                Some(as_of),
-                &worker_cancel,
-            );
+            let data = if let Some(turn_id) = turn_id.as_deref() {
+                let target = crate::session_details::MessagePreviewReadTarget {
+                    thread_id: &thread_id,
+                    turn_id,
+                    preview: saved_preview.as_deref(),
+                };
+                crate::session_details::load_session_details_with_preview_in_range(
+                    &codex_home,
+                    &target,
+                    redact,
+                    starts_at,
+                    Some(as_of),
+                    &worker_cancel,
+                )
+            } else {
+                crate::session_details::load_session_details_in_range(
+                    &codex_home,
+                    &thread_id,
+                    None,
+                    redact,
+                    starts_at,
+                    Some(as_of),
+                    &worker_cancel,
+                )
+            };
             if !worker_cancel.load(Ordering::Relaxed) {
                 let _ = sender.send(data);
             }
@@ -733,6 +907,7 @@ struct DetailLines {
     document: Vec<DetailNode>,
     path: Vec<usize>,
     theme: Theme,
+    redacted: bool,
 }
 
 impl DetailLines {
@@ -741,6 +916,7 @@ impl DetailLines {
             document: Vec::new(),
             path: Vec::new(),
             theme: app.theme,
+            redacted: app.local_redact_content,
         }
     }
 
@@ -799,6 +975,17 @@ impl DetailLines {
 
     fn usage(&mut self, block: UsageBlock) {
         self.children().push(DetailNode::Usage(block));
+    }
+
+    fn message_preview(&mut self, turn_id: Option<&str>, preview: Option<&str>) {
+        let redacted = self.redacted;
+        self.subsection("snapshot.message-preview".into(), "Message preview".into());
+        self.children().push(DetailNode::MessagePreview {
+            turn_id: turn_id.map(str::to_owned),
+            preview: preview.filter(|_| !redacted).map(str::to_owned),
+            redacted,
+        });
+        self.end_subsection();
     }
 
     fn finish(self, title: &str) -> EntityDetailPopup {
@@ -1324,10 +1511,7 @@ fn turn_detail(app: &App, turn: &TurnRecord) -> EntityDetailPopup {
     lines.field("Captured at", timestamp(Some(app.snapshot.as_of)));
     lines.field("Thread ID", &turn.thread_id);
     lines.field("Turn ID", &turn.turn_id);
-    lines.field(
-        "Message preview",
-        optional_text(turn.message_preview.as_deref()),
-    );
+    lines.message_preview(Some(&turn.turn_id), turn.message_preview.as_deref());
     lines.field("Model", optional_text(turn.model.as_deref()));
     lines.field(
         "Reasoning effort",
@@ -1377,7 +1561,7 @@ fn turn_detail(app: &App, turn: &TurnRecord) -> EntityDetailPopup {
     }
     lines.section("Data notes");
     overview_notes(&mut lines, app);
-    lines.note("Message preview retains at most the first 72 characters. Missing full content cannot be recovered from this snapshot.");
+    lines.note("Message preview is collapsed by default. Expanding it reads the matching user message from captured local evidence; unavailable or truncated content is labelled. The saved snapshot preview retains up to 72 characters.");
     lines.note("Elapsed is measured at capture; completion duration prefers the logged value and otherwise uses end minus start.");
     lines.finish("Turn details")
 }
@@ -1491,9 +1675,11 @@ fn summary_entity_detail(
                 SummaryTurnKey::UnassignedDelegated => "Unassigned delegated usage",
             },
         );
-        lines.field(
-            "Message preview",
-            optional_text(turn.message_preview.as_deref()),
+        lines.message_preview(
+            turn.key
+                .exact_turn_id()
+                .and_then(|id| raw_local_history_identity(app, id)),
+            turn.message_preview.as_deref(),
         );
         lines.field("Started", timestamp(turn.started_at));
     } else {

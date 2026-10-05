@@ -310,6 +310,7 @@ impl SemanticFrame {
 pub(super) struct TuiHarness {
     pub(super) app: App,
     terminal: Terminal<TestBackend>,
+    rendered_buffer: Buffer,
     _mapping_directory: tempfile::TempDir,
 }
 
@@ -348,6 +349,7 @@ impl TuiHarness {
         let mut harness = Self {
             app,
             terminal,
+            rendered_buffer: Buffer::empty(Rect::new(0, 0, width, height)),
             _mapping_directory: mapping_directory,
         };
         harness.render();
@@ -360,10 +362,12 @@ impl TuiHarness {
 
     pub(super) fn render_at(&mut self, now: DateTime<Utc>) {
         let app = &mut self.app;
-        with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
+        self.rendered_buffer = with_test_display_offset(FixedOffset::east_opt(0).unwrap(), || {
             self.terminal
                 .draw(|frame| super::super::render_at(frame, app, now))
-                .expect("test frame must render");
+                .expect("test frame must render")
+                .buffer
+                .clone()
         });
     }
 
@@ -431,16 +435,19 @@ impl TuiHarness {
     }
 
     pub(super) fn frame(&self) -> SemanticFrame {
-        SemanticFrame::from_buffer(self.terminal.backend().buffer(), self.visible_controls())
+        // TestBackend applies only changed cells and does not emulate a real
+        // terminal clearing wide-glyph continuation cells. CompletedFrame is
+        // the authoritative rendered image, including those blank cells.
+        SemanticFrame::from_buffer(&self.rendered_buffer, self.visible_controls())
     }
 
     pub(super) fn cell_style(&self, column: u16, row: u16) -> (String, Color, Modifier) {
-        let cell = &self.terminal.backend().buffer()[(column, row)];
+        let cell = &self.rendered_buffer[(column, row)];
         (cell.symbol().to_string(), cell.fg, cell.modifier)
     }
 
     pub(super) fn cell_background(&self, column: u16, row: u16) -> Color {
-        self.terminal.backend().buffer()[(column, row)].bg
+        self.rendered_buffer[(column, row)].bg
     }
 
     pub(super) fn control_rect(&self, control: ControlId) -> Rect {
@@ -641,7 +648,7 @@ impl TuiHarness {
         let binding = control.binding();
         let palette = self.app.theme.palette();
         let cell = (area.x..area.right())
-            .map(|column| &self.terminal.backend().buffer()[(column, area.y)])
+            .map(|column| &self.rendered_buffer[(column, area.y)])
             .find(|cell| cell.symbol() == binding)
             .unwrap_or_else(|| panic!("{control:?} does not render binding {binding}"));
         assert!(
@@ -661,7 +668,7 @@ impl TuiHarness {
         let binding = control.binding();
         let palette = self.app.theme.palette();
         let cell = (area.x..area.right())
-            .map(|column| &self.terminal.backend().buffer()[(column, area.y)])
+            .map(|column| &self.rendered_buffer[(column, area.y)])
             .find(|cell| cell.symbol() == binding)
             .unwrap_or_else(|| panic!("{control:?} does not render binding {binding}"));
         assert_ne!(cell.fg, palette.accent, "{control:?} shortcut color");
@@ -905,4 +912,35 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[test]
+fn tui_harness_completed_frames_preserve_cjk_continuations() {
+    let mut harness = TuiHarness::from_fixture("empty", 5, 1, Theme::Dark);
+    // Moving CJK glyphs leaves a former wide-glyph cell inside the next
+    // glyph's continuation. When that continuation later becomes an ordinary
+    // space, a diff-only TestBackend can still contain the earlier glyph.
+    // A real terminal clears that cell while printing the intervening glyph.
+    for text in ["甲乙a", "a甲 P", "ab P"] {
+        harness.rendered_buffer = harness
+            .terminal
+            .draw(|frame| frame.render_widget(text, frame.area()))
+            .expect("minimal CJK frame must render")
+            .buffer
+            .clone();
+    }
+    assert_eq!(harness.frame().rows[0], "ab P ");
+    assert_eq!(harness.cell_style(2, 0).0, " ");
+    assert_eq!(harness.cell_style(3, 0).0, "P");
+    assert_eq!(
+        harness.cell_background(2, 0),
+        harness.rendered_buffer[(2, 0)].bg
+    );
+    // Keep the regression valid if TestBackend gains real-terminal handling:
+    // whichever internal diff cells it stores, the UI oracle is the full frame.
+    let backend_row = display_row(harness.terminal.backend().buffer(), 0);
+    if backend_row != "ab P " {
+        assert_eq!(backend_row, "ab乙 ");
+        assert_eq!(harness.frame().rows[0], "ab P ");
+    }
 }
