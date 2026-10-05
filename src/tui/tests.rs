@@ -5602,6 +5602,36 @@ fn unicode_text_helpers_preserve_cursor_and_display_width_contracts() {
 }
 
 #[test]
+fn unicode_text_helpers_respect_wide_quote_variations_in_narrow_panels() {
+    // Unicode's fullwidth quotation variation is one grapheme occupying two
+    // cells. Search and truncation must budget the sequence as a whole.
+    let quote = "\u{201c}\u{fe01}";
+    assert_eq!(
+        truncate_display_text(&format!("{quote}ab"), 3),
+        format!("{quote}…")
+    );
+    assert_eq!(
+        truncate_middle_display_text(&format!("abc{quote}z"), 5),
+        format!("a…{quote}z")
+    );
+    assert_eq!(compact_search_text(&format!("prefix{quote}"), 2), "<");
+    assert_eq!(
+        compact_search_text(&format!("prefix{quote}"), 3),
+        format!("<{quote}")
+    );
+
+    let value = format!("a{quote}b");
+    assert_eq!(
+        search_cursor_window(&value, 2, 3),
+        (String::new(), "b".to_string(), true)
+    );
+    assert_eq!(
+        search_cursor_window(&value, 2, 4),
+        (quote.to_string(), "b".to_string(), true)
+    );
+}
+
+#[test]
 fn scrollbar_geometry_maps_offsets_to_a_proportional_thumb() {
     let track = Rect::new(79, 7, 1, 10);
     assert!(scrollbar_geometry(track, 10, 10, 0).is_none());

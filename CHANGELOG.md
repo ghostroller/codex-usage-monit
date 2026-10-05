@@ -11,9 +11,14 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Update Unicode display-width rules to Unicode 17 and the CLI parser to Clap 4.6.7.
 - Avoid copying the complete local TUI snapshot during ordinary rollout refreshes; account refreshes still reuse their own local snapshot without rescanning rollouts.
 - Share quota, usage-bucket and weekly history arrays between cached projections and report views. Changes copy only the modified array, while warnings, read-only state and backfill markers remain independent.
 - Reuse immutable parsed rollout events during 30-day Summary backfill, keeping scan selection, reductions and refresh state independent of the live cache. Store events in shared bounded chunks and move large event payloads out of the common event slot while preserving the on-disk cache format.
+
+### Fixed
+
+- Keep session pane titles and launch error messages within their display-width limits without splitting Unicode grapheme clusters.
 
 ## [0.6.0] - 2026-10-04
 

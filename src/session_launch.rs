@@ -9,7 +9,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::domain::{TaskRecord, TaskStatus};
 use crate::trace::{TraceFields, TraceOutcome, process_trace_log};
@@ -1061,13 +1062,13 @@ fn truncate_display_width(value: &str, max_width: usize) -> String {
     let content_width = max_width.saturating_sub(suffix.len());
     let mut result = String::new();
     let mut width = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width > content_width {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > content_width {
             break;
         }
-        result.push(character);
-        width += character_width;
+        result.push_str(grapheme);
+        width += grapheme_width;
     }
     result.push_str(&suffix[..suffix.len().min(max_width)]);
     result

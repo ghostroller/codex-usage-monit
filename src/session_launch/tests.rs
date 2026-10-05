@@ -663,6 +663,29 @@ fn pane_name_removes_controls_bidi_and_truncates_by_display_width() {
 }
 
 #[test]
+fn pane_name_and_process_message_budget_complete_unicode_graphemes() {
+    for sequence in ["\u{201c}\u{fe01}", "👩\u{200d}💻"] {
+        let title = sequence.repeat(PANE_NAME_MAX_WIDTH);
+        let name = pane_name(THREAD_ID, &title);
+        assert!(name.starts_with("codex 019f52ac - "));
+        assert!(name.ends_with("..."));
+        assert!(UnicodeWidthStr::width(name.as_str()) <= PANE_NAME_MAX_WIDTH);
+        let title = name.strip_prefix("codex 019f52ac - ").unwrap();
+        let title = title.strip_suffix("...").unwrap();
+        assert!(!title.is_empty());
+        assert!(title.graphemes(true).all(|grapheme| grapheme == sequence));
+
+        let message = sequence.repeat(PROCESS_MESSAGE_MAX_WIDTH);
+        let message = process_message(message.as_bytes());
+        assert!(message.ends_with("..."));
+        assert!(UnicodeWidthStr::width(message.as_str()) <= PROCESS_MESSAGE_MAX_WIDTH);
+        let message = message.strip_suffix("...").unwrap();
+        assert!(!message.is_empty());
+        assert!(message.graphemes(true).all(|grapheme| grapheme == sequence));
+    }
+}
+
+#[test]
 fn parses_only_terminal_pane_ids() {
     assert_eq!(
         parse_created_pane_id(b"terminal_42\n").unwrap().as_str(),
