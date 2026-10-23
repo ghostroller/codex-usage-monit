@@ -32,7 +32,7 @@ _Deterministically rendered from the integration-test fixture. Local and hosted 
 - **Interactive terminal UI** — Filter, search, switch scopes, expand task trees, inspect turns/models, and resume tasks without leaving the terminal.
 - **Scriptable CLI** — Export the same Summary, Trends, and unified health data used by the TUI as human-readable text or stable camelCase JSON, select snapshot sections, and filter turns by thread.
 - **Server-friendly** — Works in SSH, tmux, and Zellij sessions; Linux release binaries are static musl builds with no host glibc dependency.
-- **Read-only monitoring** — Reads local Codex data and account gauges without reading `auth.json` or consuming reset credits.
+- **Read-only collection, explicit session deletion** — Reads local Codex data and account gauges without reading `auth.json` or consuming reset credits. Confirmed deletion from session details preserves usage before calling Codex.
 - **Low-overhead refreshes** — Uses a persistent incremental cache and event-driven TUI updates to avoid repeatedly parsing unchanged rollouts.
 
 ## Installation
@@ -539,6 +539,12 @@ The monitor reads Codex rollouts under `sessions` and `archived_sessions`, reads
 
 Opening a task is an explicit action: `o` can launch `codex resume` in Zellij, while choosing Copy only writes the resume command to the terminal clipboard. See [Terminal resume behavior](docs/codex-terminal-resume.md) for details.
 
+Session details also provide an explicit, confirmed deletion action for eligible local sessions. Before asking Codex to delete a session and its spawned descendants, monit durably saves their own usage events and the small amount of metadata needed for identification and project attribution. Messages, tool arguments/output, Git data and session configuration are not part of this usage ledger. Active sessions, ambiguous targets and incomplete captures cannot be deleted through this action.
+
+Sessions confirmed deleted by monit appear under one initially collapsed **由 monit 删除的会话** (Monit-deleted sessions) root at the bottom of Overview's Tasks list, in both flat and tree modes. Enter or click the root to expand it. Its children provide saved usage details; the root is a display group, not another task. Their original usage remains in window totals, model breakdowns and historical calculations, using its original event times and without counting it again. Sessions deleted elsewhere receive no additional tracking.
+
+The deletion ledger is persistent user data, independent of the rollout cache and rebuildable history. Keep it with application-state backups: after the Codex logs are deleted it supplies the retained usage evidence. A failed or interrupted deletion retains its operation record for verification; monit does not automatically repeat a deletion with an uncertain result. Captured usage is evidence through the recorded capture time, not a guarantee that another Codex process could not write between capture and deletion.
+
 The persistent cache can contain limited task titles and message previews. Use `--redact-content` to replace titles with `[redacted]`, omit message previews, and write new data to a separate redacted cache, or use `--no-rollout-cache` to disable the parsed cache. Redacted mode does not delete a cache created by an earlier non-redacted run.
 
 Default cache locations:
@@ -555,7 +561,7 @@ History and recorder state are user data rather than a rebuildable parse cache. 
 - Linux: `$XDG_STATE_HOME/codex-usage-monit`, or `~/.local/state/codex-usage-monit`
 - Windows: `%LOCALAPPDATA%\codex-usage-monit`
 
-Set `CODEX_USAGE_MONIT_STATE_DIR` to override the state directory. History is retained for 90 days in namespaced UTC-day JSON shards. `--no-rollout-cache` does not disable history, and uninstalling the background service does not delete it.
+Set `CODEX_USAGE_MONIT_STATE_DIR` to override the state directory. Source-aware history uses SQLite under `history-v2`, with a 90-day retention policy. The separate `deleted-sessions-v1` ledger is scoped to the Codex home and is not removed by history retention or rebuilds. `--no-rollout-cache` does not disable history or this ledger, and uninstalling the background service does not delete them.
 
 ## Troubleshooting and diagnostics
 

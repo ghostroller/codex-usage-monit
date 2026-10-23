@@ -525,6 +525,454 @@ pub fn fetch_account_snapshot(config: &CollectConfig) -> Result<AccountSnapshot>
     fetch_account_snapshot_inner(config, None, app_server_rpc_deadline)
 }
 
+/// Explicit local session management, separate from account collection. Only
+/// `delete_thread` mutates sessions; callers must persist their audit first.
+pub(crate) mod session_management {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::process::ChildStdin;
+
+    use super::*;
+
+    pub(crate) const MAX_DELETION_THREADS: usize = 512;
+    const MAX_LIST_PAGES: usize = 32;
+    const MAX_MANAGEMENT_MESSAGES: usize = 4_096;
+    const MANAGEMENT_LIFETIME: Duration = Duration::from_secs(120);
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ManagedThread {
+        pub(crate) id: String,
+        pub(crate) parent_thread_id: Option<String>,
+        pub(crate) path: PathBuf,
+        pub(crate) name: Option<String>,
+        pub(crate) runtime_status: String,
+        pub(crate) ephemeral: bool,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ManagementRpcError {
+        pub(crate) code: Option<i64>,
+        pub(crate) message: String,
+    }
+
+    impl std::fmt::Display for ManagementRpcError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} (RPC code {:?})", self.message, self.code)
+        }
+    }
+
+    impl std::error::Error for ManagementRpcError {}
+
+    pub(crate) fn resolve_executable(config: &CollectConfig) -> Result<PathBuf> {
+        let command = codex_command(config)?;
+        let program = std::path::Path::new(command.get_program());
+        if program.components().count() > 1 || program.is_absolute() {
+            return std::fs::canonicalize(program).context("local Codex executable is unavailable");
+        }
+        let path = config
+            .app_server_path
+            .clone()
+            .or_else(|| std::env::var_os("PATH"))
+            .context("PATH is unavailable for local Codex resolution")?;
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join(program);
+            if candidate.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&candidate)?.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                return std::fs::canonicalize(candidate)
+                    .context("local Codex executable is unavailable");
+            }
+        }
+        bail!("local Codex executable was not found in PATH")
+    }
+
+    pub(crate) fn is_missing_thread(error: &anyhow::Error, thread_id: &str) -> bool {
+        let Some(rpc) = error.downcast_ref::<ManagementRpcError>() else {
+            return false;
+        };
+        // Never turn a generic I/O/protocol failure into proof of deletion.
+        // These are the explicit local thread/read not-found diagnostics.
+        let message = rpc.message.to_ascii_lowercase();
+        matches!(rpc.code, Some(-32600 | -32602 | -32004))
+            && [
+                "thread not found",
+                "thread was not found",
+                "no rollout found for thread id",
+                "no session found for",
+                "thread does not exist",
+            ]
+            .iter()
+            .filter_map(|prefix| message.strip_prefix(*prefix))
+            .any(|suffix| {
+                suffix
+                    .trim_start_matches(|character: char| {
+                        character.is_whitespace() || matches!(character, ':' | '\'' | '"' | '`')
+                    })
+                    .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
+                    .next()
+                    == Some(thread_id)
+            })
+    }
+
+    pub(crate) struct SessionManagementClient {
+        child: Option<ChildGuard>,
+        stdin: Option<ChildStdin>,
+        receiver: Option<mpsc::Receiver<ReaderEvent>>,
+        stdout_reader: Option<thread::JoinHandle<()>>,
+        stderr_reader: Option<thread::JoinHandle<()>>,
+        reader_done: Option<mpsc::Receiver<ReaderTask>>,
+        stderr: Arc<Mutex<String>>,
+        timeout: Duration,
+        overall_deadline: Instant,
+        next_id: u64,
+    }
+
+    impl SessionManagementClient {
+        pub(crate) fn connect(config: &CollectConfig) -> Result<Self> {
+            if config.offline || config.app_server_timeout.is_zero() {
+                bail!("session management requires a local app-server with a nonzero timeout");
+            }
+            let mut command = codex_command(config)?;
+            command
+                .args(["app-server", "--listen", "stdio://"])
+                .env("CODEX_HOME", &config.codex_home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(path) = &config.app_server_path {
+                command.env("PATH", path);
+            }
+            configure_process_tree(&mut command);
+            let mut child = command
+                .spawn()
+                .context("failed to start local session management")?;
+            let process_tree = match attach_process_tree(&mut child) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("failed to contain session management process");
+                }
+            };
+            let mut child = ChildGuard {
+                child,
+                process_tree,
+                startup_trace: config.startup_trace.clone(),
+                trace_log: config.trace_log.clone(),
+                reaped: false,
+            };
+            let stdin = child
+                .child
+                .stdin
+                .take()
+                .context("session management stdin missing")?;
+            let stdout = child
+                .child
+                .stdout
+                .take()
+                .context("session management stdout missing")?;
+            let stderr = child
+                .child
+                .stderr
+                .take()
+                .context("session management stderr missing")?;
+            let (sender, receiver) = mpsc::sync_channel(APP_SERVER_READER_QUEUE);
+            let (done_sender, reader_done) = mpsc::channel();
+            let stdout_done = done_sender.clone();
+            let stdout_reader = thread::spawn(move || {
+                read_stdout(stdout, sender);
+                let _ = stdout_done.send(ReaderTask::Stdout);
+            });
+            let stderr_output = Arc::new(Mutex::new(String::new()));
+            let stderr_writer = Arc::clone(&stderr_output);
+            let stderr_reader = thread::spawn(move || {
+                capture_stderr(stderr, stderr_writer);
+                let _ = done_sender.send(ReaderTask::Stderr);
+            });
+            let mut client = Self {
+                child: Some(child),
+                stdin: Some(stdin),
+                receiver: Some(receiver),
+                stdout_reader: Some(stdout_reader),
+                stderr_reader: Some(stderr_reader),
+                reader_done: Some(reader_done),
+                stderr: stderr_output,
+                timeout: config.app_server_timeout,
+                overall_deadline: app_server_rpc_deadline(MANAGEMENT_LIFETIME)?,
+                next_id: 1,
+            };
+            client.rpc(
+                "initialize",
+                json!({
+                    "clientInfo": {"name":"codex-usage-monit-session-management","version":env!("CARGO_PKG_VERSION")},
+                    "capabilities": {"experimentalApi":true}
+                }),
+            )?;
+            write_message(
+                client.stdin.as_mut().unwrap(),
+                &json!({"method":"initialized"}),
+            )?;
+            Ok(client)
+        }
+
+        fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+            let id = self.next_id;
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .context("management request ID exhausted")?;
+            let deadline = app_server_rpc_deadline(self.timeout)?.min(self.overall_deadline);
+            if deadline <= Instant::now() {
+                return Err(app_server_timeout_error(method, &self.stderr));
+            }
+            write_message(
+                self.stdin
+                    .as_mut()
+                    .context("session management connection closed")?,
+                &json!({"id":id,"method":method,"params":params}),
+            )?;
+            for _ in 0..MAX_MANAGEMENT_MESSAGES {
+                match recv_event(
+                    deadline,
+                    self.receiver.as_ref().unwrap(),
+                    method,
+                    &self.stderr,
+                )? {
+                    ReaderEvent::Message(message) if response_id(&message) == Some(id) => {
+                        if let Some(error) = message.get("error") {
+                            return Err(ManagementRpcError {
+                                code: error.get("code").and_then(Value::as_i64),
+                                message: compact_diagnostic_text(
+                                    error
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown management error"),
+                                    RPC_ERROR_MESSAGE_LIMIT,
+                                ),
+                            }
+                            .into());
+                        }
+                        return message
+                            .get("result")
+                            .cloned()
+                            .context("management reply has no result");
+                    }
+                    ReaderEvent::Message(_) => {}
+                    ReaderEvent::Malformed(_) => {
+                        bail!("invalid or oversized session management response")
+                    }
+                    ReaderEvent::Eof => {
+                        bail!("session management closed while waiting for {method}")
+                    }
+                }
+            }
+            bail!("session management notification budget exceeded")
+        }
+
+        pub(crate) fn read_thread(&mut self, thread_id: &str) -> Result<ManagedThread> {
+            let result = self.rpc("thread/read", json!({"threadId":thread_id}))?;
+            let thread = parse_thread(result.get("thread").context("missing thread summary")?)?;
+            if thread.id != thread_id {
+                bail!("thread/read returned a different thread identity");
+            }
+            Ok(thread)
+        }
+
+        pub(crate) fn descendants(&mut self, root: &str) -> Result<Vec<ManagedThread>> {
+            let mut threads = Vec::new();
+            let mut ids = HashSet::new();
+            for archived in [false, true] {
+                let mut cursor: Option<String> = None;
+                let mut cursors = HashSet::new();
+                let mut complete = false;
+                for _ in 0..MAX_LIST_PAGES {
+                    let result = self.rpc("thread/list", json!({
+                        "ancestorThreadId":root,"archived":archived,"limit":100,"cursor":cursor,"useStateDbOnly":true,
+                        "sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"]
+                    }))?;
+                    let data = result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .context("thread/list has no data array")?;
+                    for entry in data {
+                        let thread = parse_thread(entry)?;
+                        if thread.id == root || !ids.insert(thread.id.clone()) {
+                            bail!("descendant listing repeated a thread or returned its root");
+                        }
+                        if threads.len() + 1 >= MAX_DELETION_THREADS {
+                            bail!("session deletion descendant budget exceeded");
+                        }
+                        threads.push(thread);
+                    }
+                    match result.get("nextCursor") {
+                        None | Some(Value::Null) => {
+                            complete = true;
+                            break;
+                        }
+                        Some(Value::String(next))
+                            if !next.is_empty() && cursors.insert(next.clone()) =>
+                        {
+                            cursor = Some(next.clone())
+                        }
+                        _ => bail!("invalid or repeated descendant pagination cursor"),
+                    }
+                }
+                if !complete {
+                    bail!("session deletion descendant pagination budget exceeded");
+                }
+            }
+            Ok(threads)
+        }
+
+        pub(crate) fn delete_thread(&mut self, thread_id: &str) -> Result<()> {
+            let result = self.rpc("thread/delete", json!({"threadId":thread_id}))?;
+            if !result.as_object().is_some_and(Map::is_empty) {
+                bail!("unexpected thread/delete response; deletion outcome is unknown");
+            }
+            Ok(())
+        }
+    }
+
+    fn parse_thread(value: &Value) -> Result<ManagedThread> {
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .context("thread identity missing")?
+            .to_owned();
+        let path = value
+            .get("path")
+            .and_then(Value::as_str)
+            .context("persisted thread path missing")?
+            .into();
+        let runtime_status = value
+            .pointer("/status/type")
+            .and_then(Value::as_str)
+            .context("thread runtime status unavailable")?
+            .to_owned();
+        let ephemeral = value
+            .get("ephemeral")
+            .and_then(Value::as_bool)
+            .context("thread persistence status unavailable")?;
+        Ok(ManagedThread {
+            id,
+            parent_thread_id: value
+                .get("parentThreadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            path,
+            name: value.get("name").and_then(Value::as_str).map(str::to_owned),
+            runtime_status,
+            ephemeral,
+        })
+    }
+
+    impl Drop for SessionManagementClient {
+        fn drop(&mut self) {
+            // EOF is sent immediately, including on success. Never leave the
+            // app-server waiting for stdin during its shutdown/cleanup grace.
+            drop(self.stdin.take());
+            if let Some(mut child) = self.child.take() {
+                let _ = child.terminate_and_reap();
+            }
+            drop(self.receiver.take());
+            if let (Some(stdout), Some(stderr), Some(done)) = (
+                self.stdout_reader.take(),
+                self.stderr_reader.take(),
+                self.reader_done.take(),
+            ) {
+                finish_reader_threads(stdout, stderr, done);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        #[test]
+        fn management_summaries_require_explicit_persistence_and_runtime_state() {
+            let base = json!({
+                "id":ID,"path":"/tmp/isolated/sessions/rollout.jsonl",
+                "ephemeral":false,"status":{"type":"notLoaded"},
+                "parentThreadId":null,"source":"cli","name":"saved title"
+            });
+            let parsed = parse_thread(&base).unwrap();
+            assert_eq!(parsed.id, ID);
+            assert_eq!(parsed.runtime_status, "notLoaded");
+            assert!(!parsed.ephemeral);
+            for key in ["id", "path", "ephemeral", "status"] {
+                let mut missing = base.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(parse_thread(&missing).is_err(), "missing {key}");
+            }
+            let mut active = base;
+            active["status"] = json!({"type":"active","activeFlags":["waitingOnApproval"]});
+            assert_eq!(parse_thread(&active).unwrap().runtime_status, "active");
+        }
+
+        #[test]
+        fn a_generic_failure_never_confirms_thread_absence() {
+            let missing = || ManagementRpcError {
+                code: Some(-32600),
+                message: format!("no rollout found for thread id {ID}"),
+            };
+            assert!(is_missing_thread(&anyhow::Error::new(missing()), ID));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(missing()),
+                "different-thread"
+            ));
+            assert!(!is_missing_thread(
+                &anyhow!("no rollout found for thread id {ID}"),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(ManagementRpcError {
+                    code: Some(-32001),
+                    message: format!("no rollout found for thread id {ID}")
+                }),
+                ID
+            ));
+            assert!(!is_missing_thread(
+                &anyhow::Error::new(ManagementRpcError {
+                    code: Some(-32600),
+                    message: format!("permission denied reading thread {ID}")
+                }),
+                ID
+            ));
+        }
+
+        #[test]
+        fn not_found_diagnostics_must_name_the_exact_missing_thread() {
+            for message in [
+                format!("no rollout found for thread id {ID}"),
+                format!("thread not found: {ID}"),
+                format!("thread not found: `{ID}`"),
+            ] {
+                assert!(is_missing_thread(
+                    &anyhow::Error::new(ManagementRpcError {
+                        code: Some(-32600),
+                        message
+                    }),
+                    ID
+                ));
+            }
+            let other = "22222222-2222-4222-8222-222222222222";
+            let error = anyhow::Error::new(ManagementRpcError {
+                code: Some(-32600),
+                message: format!("no rollout found for thread id {other} while reading {ID}"),
+            });
+            assert!(!is_missing_thread(&error, ID));
+        }
+    }
+}
+
 /// Collects account data while assigning the caller's logical snapshot time.
 ///
 /// Snapshot orchestration starts local and remote collection from one boundary;

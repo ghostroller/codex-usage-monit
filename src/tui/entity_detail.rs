@@ -51,6 +51,7 @@ enum DetailScrollAnchor {
 
 #[derive(Debug)]
 pub(super) struct EntityDetailPopup {
+    pub(super) delete_target: Option<super::session_management::SessionDeleteTarget>,
     pub(super) title: String,
     pub(super) lines: Vec<Line<'static>>,
     pub(super) offset: usize,
@@ -531,6 +532,7 @@ impl Drop for EntityDetailPopup {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct EntityDetailHitbox {
+    pub(super) delete: Rect,
     pub(super) content: Rect,
     pub(super) body: Rect,
     pub(super) scrollbar: Option<ScrollbarHitbox>,
@@ -572,15 +574,55 @@ impl App {
             View::Summary => summary_detail(self),
             _ => None,
         };
-        let Some(detail) = detail else {
+        let Some(mut detail) = detail else {
             return false;
         };
+        if self.view == View::Overview
+            && self.focus == Focus::Tasks
+            && let Some(task) = self.selected_task_record()
+        {
+            if self.is_deleted_task(task) {
+                detail = deleted_task_detail(self, task);
+            } else if !matches!(task.status, TaskStatus::Unknown | TaskStatus::Stale)
+                && !task.status.is_active()
+                && is_local_entity(
+                    self,
+                    &task.thread_id,
+                    task.source.as_deref(),
+                    task.cwd.as_deref(),
+                )
+                && !task.thread_id.contains('@')
+                && !task.thread_id.starts_with("logical-thread:")
+                && self
+                    .session_management
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| {
+                        !config.offline && config.codex_home == self.snapshot.codex_home
+                    })
+            {
+                detail.delete_target = Some(super::session_management::SessionDeleteTarget {
+                    thread_id: task.thread_id.clone(),
+                    title: task.title.clone(),
+                    codex_home: self.snapshot.codex_home.clone(),
+                });
+                detail.document.push(DetailNode::Section {
+                    id: super::session_management::DELETE_ACTION_SECTION.into(),
+                    title: "Delete session…".into(),
+                    foldable: true,
+                    children: Vec::new(),
+                });
+                detail.rebuild(96, self.theme);
+            }
+        }
         self.entity_detail = Some(detail);
         self.entity_detail_hitbox = None;
         self.scroll_drag = None;
         self.trend_drag = None;
         self.summary_daily_dragging = false;
-        self.start_entity_detail_enrichment();
+        if !self.selected_deleted_task() {
+            self.start_entity_detail_enrichment();
+        }
         true
     }
 
@@ -700,6 +742,9 @@ impl App {
     }
 
     pub(super) fn toggle_entity_detail_section(&mut self, id: &str) -> bool {
+        if id == super::session_management::DELETE_ACTION_SECTION {
+            return self.request_session_delete();
+        }
         let Some(detail) = self.entity_detail.as_mut() else {
             return false;
         };
@@ -991,6 +1036,7 @@ impl DetailLines {
 
     fn finish(self, title: &str) -> EntityDetailPopup {
         let mut popup = EntityDetailPopup {
+            delete_target: None,
             title: title.to_owned(),
             lines: Vec::new(),
             document: self.document,
@@ -1383,6 +1429,28 @@ fn task_detail(app: &App, task: &TaskRecord) -> EntityDetailPopup {
     lines.note("Own/delegated/total values use the complete trusted subtree, independent of tree expansion and search filters.");
     lines.note("Session span includes idle gaps. Completed turn durations may overlap; their sum is not wall-clock work time.");
     lines.finish("Session details")
+}
+
+fn deleted_task_detail(app: &App, task: &TaskRecord) -> EntityDetailPopup {
+    let mut lines = DetailLines::new(app);
+    lines.section("Overview");
+    lines.field("Title", &task.title);
+    let raw_id = app.deleted_thread_identity(task).unwrap_or(&task.thread_id);
+    lines.field("Thread ID", raw_id);
+    lines.field("State", "Deleted by monit");
+    if let Some(record) = app.session_management.deleted.get(raw_id) {
+        lines.field("Deleted at", timestamp(record.deleted_at));
+        lines.field("Usage captured at", timestamp(Some(record.captured_at)));
+    }
+    entity_usage(
+        &mut lines,
+        app,
+        vec![("Own".into(), task.token_usage)],
+        vec![("Own".into(), detail_task_window_usage(app, task))],
+    );
+    lines.section("Data notes");
+    lines.note("Only short identification and retained usage remain. Session content is unavailable; this record cannot be resumed or deleted again.");
+    lines.finish("Deleted session usage")
 }
 
 fn turn_statistics(lines: &mut DetailLines, app: &App, turns: &[&TurnRecord]) {
@@ -2000,6 +2068,7 @@ pub(super) fn render_entity_detail(
     area: Rect,
     app: &mut App,
 ) -> EntityDetailHitbox {
+    let delete_available = app.entity_delete_available();
     let palette = app.theme.palette();
     let width = if area.width >= 8 {
         area.width.saturating_sub(4).min(140)
@@ -2186,9 +2255,15 @@ pub(super) fn render_entity_detail(
     }
     let mut spans = Vec::new();
     let mut x = controls.x;
-    let full = controls.width >= if has_sections { 55 } else { 26 };
+    let has_delete = detail.delete_target.is_some();
+    let full = controls.width
+        >= if has_sections {
+            55 + u16::from(has_delete) * 12
+        } else {
+            26
+        };
     let mut specs: Vec<(&str, &str, bool)> = Vec::new();
-    let scroll_controls = !has_sections || controls.width >= 21;
+    let scroll_controls = !has_sections || controls.width >= if has_delete { 25 } else { 21 };
     if scroll_controls && controls.width >= 13 {
         specs.push(("↑", if full { " Up" } else { "" }, detail.offset > 0));
         specs.push((
@@ -2206,6 +2281,9 @@ pub(super) fn render_entity_detail(
             if full { " Toggle" } else { "" },
             detail.selected_section.is_some(),
         ));
+    }
+    if has_delete && controls.width >= 12 {
+        specs.push(("X", if full { " Delete" } else { "" }, delete_available));
     }
     specs.push(("←", if full { " Back" } else { "" }, true));
     for (key, suffix, active) in specs {
@@ -2234,6 +2312,7 @@ pub(super) fn render_entity_detail(
             "↓" => hitbox.down = control,
             "Tab" => hitbox.next = control,
             "↵" => hitbox.toggle = control,
+            "X" => hitbox.delete = control,
             _ => hitbox.back = control,
         }
     }

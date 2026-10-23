@@ -29,6 +29,7 @@ mod facts_projection;
 mod history_memory;
 mod integration_scenarios;
 mod refresh_memory;
+mod session_management;
 mod testkit;
 mod version_info;
 
@@ -2336,6 +2337,7 @@ fn collapsed_remote_subtree_uses_projected_window_tokens_not_live_cumulative_tok
         },
     ]);
     let collapsed = TaskListRow {
+        kind: TaskRowKind::Session,
         index: root_index,
         prefix: String::new(),
         depth: 0,
@@ -14890,6 +14892,7 @@ fn event_log_tui_initialization_distinguishes_loading_ready_and_unavailable() {
         let runtime =
             HistoryRuntime::new(temp.path().join("state/history-v1"), &codex_home, false).unwrap();
         let completion = RefreshCompletion {
+            deleted_sessions: None,
             result: None,
             remote_live: None,
             remote_overview_history: None,

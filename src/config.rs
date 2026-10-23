@@ -13,6 +13,8 @@ pub struct CollectConfig {
     pub codex_bin: Option<PathBuf>,
     pub app_server_path: Option<OsString>,
     pub rollout_cache_dir: Option<PathBuf>,
+    /// Independent user-data ledger; never part of the disposable rollout cache.
+    pub deleted_sessions_dir: Option<PathBuf>,
     pub lookback_days: i64,
     pub max_files: usize,
     pub active_grace: Duration,
@@ -32,6 +34,7 @@ impl Default for CollectConfig {
             codex_bin: None,
             app_server_path: None,
             rollout_cache_dir: None,
+            deleted_sessions_dir: None,
             lookback_days: 7,
             max_files: 500,
             active_grace: Duration::from_secs(5 * 60),
