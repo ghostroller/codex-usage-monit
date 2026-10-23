@@ -28,6 +28,7 @@ mod entity_detail;
 mod facts_projection;
 mod history_memory;
 mod integration_scenarios;
+mod poisoned_refresh;
 mod refresh_memory;
 mod testkit;
 mod version_info;
@@ -1266,7 +1267,7 @@ fn caught_refresh_worker_panic(failure: RefreshWorkerFailure) -> RefreshCompleti
     send_refresh_completion_catching_panics(
         &sender,
         || panic!("private worker panic payload"),
-        || refresh_worker_panic_completion(failure),
+        || refresh_worker_failure_completion(failure),
     );
     receiver
         .recv_timeout(Duration::from_secs(1))
@@ -14875,7 +14876,7 @@ fn event_log_tui_initialization_distinguishes_loading_ready_and_unavailable() {
         // Retry remains loading, while the actual worker failure stays visible.
         apply_refresh_completion(
             &mut app,
-            refresh_worker_panic_completion(RefreshWorkerFailure::Initial),
+            refresh_worker_failure_completion(RefreshWorkerFailure::Initial),
         );
         app.observe_diagnostics();
         assert!(app.history_initialization_pending);

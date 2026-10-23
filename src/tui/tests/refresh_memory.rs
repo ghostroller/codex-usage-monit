@@ -60,7 +60,7 @@ fn local_refresh_collects_rollouts_without_copying_a_cached_snapshot() {
             force_materialization,
             || panic!("a local refresh must not copy the previous snapshot"),
         );
-        let result = inputs.collect(&config, &cache).unwrap();
+        let result = inputs.collect(&config, &cache).unwrap().unwrap();
 
         assert_eq!(result.snapshot.tasks.len(), 1);
         assert_eq!(result.snapshot.tasks[0].thread_id, RESUMABLE_THREAD_ID);
@@ -112,7 +112,7 @@ fn account_refresh_copies_local_projection_once_and_does_not_rescan_rollouts() {
         copies.set(copies.get() + 1);
         local.clone()
     });
-    let result = inputs.collect(&config, &cache).unwrap();
+    let result = inputs.collect(&config, &cache).unwrap().unwrap();
 
     assert_eq!(copies.get(), 1);
     assert_eq!(result.snapshot.tasks.len(), 1);

@@ -1,4 +1,7 @@
 //! Native SCM lifecycle; all recorder data is opened as the service account.
+//!
+//! The `windows_service` dispatcher and callback macro own the SCM ABI boundary;
+//! this module uses their safe wrappers rather than converting raw callbacks.
 use super::*;
 use std::{
     ffi::OsString,

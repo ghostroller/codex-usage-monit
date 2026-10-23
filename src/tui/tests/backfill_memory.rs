@@ -83,7 +83,8 @@ fn summary_backfill_memory_releases_live_lock_and_preserves_recent_selection() {
         assert_eq!(backfill_cache.last_refresh().reused_files, 1);
         assert_eq!(backfill_cache.last_refresh().full_parsed_files, 1);
         result
-    });
+    })
+    .unwrap();
     assert_eq!(backfill.snapshot.tasks.len(), 2);
     assert_eq!(backfill.snapshot.turns.len(), 2);
     assert_eq!(
@@ -124,7 +125,8 @@ fn summary_backfill_memory_panic_leaves_live_cache_usable() {
                 backfill_cache,
             );
             panic!("failed backfill after widening the scan");
-        });
+        })
+        .unwrap();
     }));
     assert!(result.is_err());
     assert_eq!(cache.lock().unwrap().metrics(), metrics);

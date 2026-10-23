@@ -1,6 +1,7 @@
 # Repository Guidance
 
 - If `.agent/environment.local.md` exists, read it before running tests, builds, or CI-related operations. It only supplements machine-specific environment differences and does not override project-level rules.
+- Follow [the Rust style and review policy](docs/rust-style.md) for new or substantially changed Rust code. Adopt additional lints per audited module; preserve the application-specific exceptions and staged migration scope.
 
 ## Model catalog maintenance
 

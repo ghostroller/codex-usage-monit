@@ -1,5 +1,6 @@
 //! Explicit administrator-managed SCM services. This store never shares the
 //! current-user install receipt, launcher pointer, or Task Scheduler trust.
+#![deny(clippy::undocumented_unsafe_blocks)]
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -472,6 +473,8 @@ fn service_error_code(error: &windows_service::Error) -> Option<u32> {
 struct CreationHandle(SC_HANDLE);
 impl Drop for CreationHandle {
     fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns a non-null SCM/service handle from
+        // OpenSCManagerW/CreateServiceW, and closes it once with the matching API.
         unsafe { CloseServiceHandle(self.0) };
     }
 }
@@ -673,9 +676,20 @@ fn change_registration(
     command: Option<&[u16]>,
     credentials: Option<(&[u16], &Secret)>,
 ) -> io::Result<()> {
+    if let Some(command) = command {
+        validate_terminated_wide(command)?;
+    }
+    if let Some((account, password)) = credentials {
+        validate_terminated_wide(account)?;
+        validate_terminated_wide(&password.0)?;
+    }
     // The crate's change_config requires a complete replacement. Keep partial
     // Win32 changes so fencing startup never rewrites credentials or ImagePath;
     // credentials also stay in the caller's single explicitly wiped buffer.
+    // SAFETY: service keeps its handle alive. Every supplied string was checked
+    // above to include a trailing NUL within its borrowed slice; all buffers,
+    // including the zeroizing password, outlive this synchronous call. Null
+    // optional pointers request no change and the tag-ID output is unused.
     let result = unsafe {
         ChangeServiceConfigW(
             service.raw_handle(),
@@ -696,6 +710,16 @@ fn change_registration(
     } else {
         Ok(())
     }
+}
+
+fn validate_terminated_wide(value: &[u16]) -> io::Result<()> {
+    if value.last() != Some(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "machine_service_invalid: unterminated Windows string",
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_upgrade(
@@ -827,6 +851,8 @@ pub fn install(options: MachineInstallOptions, password_stdin: bool) -> Result<M
     let display = security::wide(&format!("Codex usage recorder ({})", receipt.name))?;
     let command = security::wide(&image_path(&receipt, &receipt.selected))?;
     let account = security::wide(&receipt.account)?;
+    // SAFETY: null machine/database pointers select the local active SCM
+    // database. A successful manager handle is checked and uniquely owned below.
     let creation_manager = unsafe {
         OpenSCManagerW(
             ptr::null(),
@@ -840,6 +866,11 @@ pub fn install(options: MachineInstallOptions, password_stdin: bool) -> Result<M
         io::Error::last_os_error()
     );
     let creation_manager = CreationHandle(creation_manager);
+    // SAFETY: the manager is live with CREATE_SERVICE access. wide() supplied
+    // terminated name/display/command/account buffers, and Secret contains the
+    // terminated password; all remain alive until this synchronous call returns.
+    // Unused optional inputs/output are null. The successful service handle is
+    // checked and owned independently of the manager handle.
     let service = unsafe {
         CreateServiceW(
             creation_manager.0,
@@ -1096,6 +1127,19 @@ pub fn run(name: &str, config: &Path) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scm_registration_rejects_unterminated_windows_strings() {
+        for value in [&[][..], &[b'x' as u16][..]] {
+            assert_eq!(
+                validate_terminated_wide(value).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "a safe SCM wrapper must reject buffers without an in-bounds terminator"
+            );
+        }
+        validate_terminated_wide(&[0]).unwrap();
+        validate_terminated_wide(&security::wide("service argument").unwrap()).unwrap();
+    }
 
     #[test]
     fn scm_query_maps_absent_registration_without_swallowing_other_errors() {

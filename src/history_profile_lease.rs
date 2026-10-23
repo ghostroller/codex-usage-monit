@@ -141,7 +141,7 @@ impl HistoryProfileLeaseGuard {
             ));
         }
 
-        let leases = local_leases();
+        let leases = local_leases()?;
         let Some(state) = leases.get(&self.identity) else {
             return Err(invalid_data(
                 "history profile lease is absent from process-local ownership state",
@@ -199,7 +199,7 @@ pub fn try_acquire_history_profile_lease(
     let file = open_stable_lock(&directory)?;
     let identity = stable_file_identity(&file)?;
 
-    if let Some(active_profile) = local_conflict(identity, &profile_id, redaction_profile) {
+    if let Some(active_profile) = local_conflict(identity, &profile_id, redaction_profile)? {
         validate_opened_lock(&directory, &file, identity)?;
         let active_profile = match active_profile {
             Some(active_profile) => Some(active_profile),
@@ -276,7 +276,7 @@ fn try_switch_profile(
     profile_id: HistoryProfileId,
     redaction_profile: RedactionProfile,
 ) -> io::Result<TryHistoryProfileLease> {
-    let Some(mut transition) = LocalTransition::begin(identity) else {
+    let Some(mut transition) = LocalTransition::begin(identity)? else {
         validate_opened_lock(&directory, &file, identity)?;
         return busy_result(&directory, &profile_id);
     };
@@ -431,7 +431,7 @@ fn finish_shared_acquisition(
     redaction_profile: RedactionProfile,
 ) -> io::Result<TryHistoryProfileLease> {
     {
-        let mut leases = local_leases();
+        let mut leases = local_leases()?;
         let state = leases.entry(identity).or_default();
         if state.transition
             || (state.shared_count != 0 && state.shared_profile != Some(redaction_profile))
@@ -500,38 +500,44 @@ fn local_lease_map() -> &'static Mutex<HashMap<StableFileIdentity, LocalLeaseSta
     LOCAL_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn local_leases() -> MutexGuard<'static, HashMap<StableFileIdentity, LocalLeaseState>> {
-    local_lease_map()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn local_leases() -> io::Result<MutexGuard<'static, HashMap<StableFileIdentity, LocalLeaseState>>> {
+    local_lease_map().lock().map_err(|_| {
+        invalid_data("process-local history profile ownership was interrupted; restart required")
+    })
 }
 
 fn local_conflict(
     identity: StableFileIdentity,
     profile_id: &HistoryProfileId,
     requested: RedactionProfile,
-) -> Option<Option<ActiveHistoryProfile>> {
-    let leases = local_leases();
-    let state = leases.get(&identity)?;
+) -> io::Result<Option<Option<ActiveHistoryProfile>>> {
+    let leases = local_leases()?;
+    let Some(state) = leases.get(&identity) else {
+        return Ok(None);
+    };
     if state.transition {
-        return Some(
+        return Ok(Some(
             state
                 .shared_profile
                 .map(|active| active_profile(profile_id.clone(), active)),
-        );
+        ));
     }
     if state.shared_count != 0 && state.shared_profile != Some(requested) {
-        return Some(
+        return Ok(Some(
             state
                 .shared_profile
                 .map(|active| active_profile(profile_id.clone(), active)),
-        );
+        ));
     }
-    None
+    Ok(None)
 }
 
 fn release_local_shared(identity: StableFileIdentity, profile: RedactionProfile) {
-    let mut leases = local_leases();
+    // The OS lock is already released. Keep poisoned bookkeeping unusable for
+    // future acquisitions instead of touching it or panicking during Drop.
+    let Ok(mut leases) = local_leases() else {
+        return;
+    };
     let mut remove = false;
     if let Some(state) = leases.get_mut(&identity) {
         if state.shared_profile == Some(profile) && state.shared_count != 0 {
@@ -553,21 +559,21 @@ struct LocalTransition {
 }
 
 impl LocalTransition {
-    fn begin(identity: StableFileIdentity) -> Option<Self> {
-        let mut leases = local_leases();
+    fn begin(identity: StableFileIdentity) -> io::Result<Option<Self>> {
+        let mut leases = local_leases()?;
         let state = leases.entry(identity).or_default();
         if state.transition || state.shared_count != 0 {
-            return None;
+            return Ok(None);
         }
         state.transition = true;
-        Some(Self {
+        Ok(Some(Self {
             identity,
             finished: false,
-        })
+        }))
     }
 
     fn finish_with_shared(&mut self, redaction_profile: RedactionProfile) -> io::Result<()> {
-        let mut leases = local_leases();
+        let mut leases = local_leases()?;
         let state = leases.get_mut(&self.identity).ok_or_else(|| {
             invalid_data("history profile transition lost process-local ownership state")
         })?;
@@ -589,7 +595,11 @@ impl Drop for LocalTransition {
         if self.finished {
             return;
         }
-        let mut leases = local_leases();
+        // A failed transition must not recover interrupted authorization state
+        // while unwinding. Later acquisitions report the poisoned owner.
+        let Ok(mut leases) = local_leases() else {
+            return;
+        };
         let mut remove = false;
         if let Some(state) = leases.get_mut(&self.identity) {
             state.transition = false;
@@ -1481,6 +1491,73 @@ mod tests {
 
     fn profile() -> HistoryProfileId {
         PROFILE.parse().unwrap()
+    }
+
+    #[test]
+    fn poisoned_profile_ownership_rejects_access_and_releases_os_lock() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        const CHILD: &str = "CODEX_USAGE_MONIT_POISONED_PROFILE_OWNER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Poison is process-wide and deliberately permanent. Isolate this
+            // regression from other tests instead of clearing real owner state.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "history_profile_lease::tests::poisoned_profile_ownership_rejects_access_and_releases_os_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child failed: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let state = private_state_root(directory.path());
+        let guard = acquire(&state, profile(), RedactionProfile::Redacted);
+        let identity = guard.identity;
+        let path = guard.lock_path().to_owned();
+        let other = acquire(
+            &state,
+            OTHER_PROFILE.parse().unwrap(),
+            RedactionProfile::Redacted,
+        );
+        let other_identity = other.identity;
+        drop(other);
+        let transition = LocalTransition::begin(other_identity).unwrap().unwrap();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut leases = local_lease_map().lock().unwrap();
+                leases.get_mut(&identity).unwrap().shared_count = 0;
+                panic!("interrupted profile ownership update");
+            }))
+            .is_err()
+        );
+
+        assert_eq!(
+            guard.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(guard))).is_ok());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(transition))).is_ok());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        std::fs::File::try_lock(&file).expect("dropping the guard must still release its OS lock");
+        std::fs::File::unlock(&file).unwrap();
+        assert_eq!(
+            try_acquire_history_profile_lease(&state, profile(), RedactionProfile::Redacted)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(LocalTransition::begin(identity).is_err());
+        assert!(local_lease_map().is_poisoned());
     }
 
     fn acquire(

@@ -183,14 +183,31 @@ impl GitProjectEvidenceResolver {
 
     pub(crate) fn with_persistent_cache(path: PathBuf) -> Self {
         let cache = read_persistent_git_cache(&path).unwrap_or_default();
-        let mut resolver = Self::default();
-        resolver.persistent = Some(PersistentGitEvidenceState {
-            path,
-            cache,
-            dirty: false,
-            protected_keys: HashSet::new(),
-        });
-        resolver
+        Self {
+            persistent: Some(PersistentGitEvidenceState {
+                path,
+                cache,
+                dirty: false,
+                protected_keys: HashSet::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Persists reusable evidence only after the caller completes its collection.
+    ///
+    /// Dropping a resolver never writes: a failed collection or a panic while
+    /// holding its owner's mutex must not publish partially updated cache state.
+    /// Cache persistence remains optional, so callers may ignore I/O failures.
+    pub(crate) fn persist_completed_collection(&mut self) -> io::Result<()> {
+        let Some(persistent) = self.persistent.as_mut() else {
+            return Ok(());
+        };
+        if persistent.dirty {
+            persist_git_evidence_cache(persistent)?;
+            persistent.dirty = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn collection_stats(&self) -> GitEvidenceCollectionStats {
@@ -380,9 +397,10 @@ impl GitProjectEvidenceResolver {
 
     #[cfg(test)]
     pub(crate) fn with_runner(runner: GitCommandRunner) -> Self {
-        let mut resolver = Self::default();
-        resolver.runner = runner;
-        resolver
+        Self {
+            runner,
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]
@@ -391,11 +409,12 @@ impl GitProjectEvidenceResolver {
         total_budget: Duration,
         command_timeout: Duration,
     ) -> Self {
-        let mut resolver = Self::default();
-        resolver.deadline = Instant::now() + total_budget;
-        resolver.command_timeout = command_timeout;
-        resolver.runner = runner;
-        resolver
+        Self {
+            deadline: Instant::now() + total_budget,
+            command_timeout,
+            runner,
+            ..Self::default()
+        }
     }
 }
 
@@ -447,17 +466,6 @@ impl PersistentGitEvidence {
             ));
         }
         Ok(())
-    }
-}
-
-impl Drop for GitProjectEvidenceResolver {
-    fn drop(&mut self) {
-        let Some(persistent) = self.persistent.as_mut() else {
-            return;
-        };
-        if persistent.dirty && persist_git_evidence_cache(persistent).is_ok() {
-            persistent.dirty = false;
-        }
     }
 }
 
@@ -1632,6 +1640,8 @@ mod tests {
             let stats = resolver.collection_stats();
             assert_eq!(stats.commands, 2);
             assert_eq!(stats.workspaces, 1);
+            assert!(!cache_path.exists(), "uncommitted evidence stays in memory");
+            resolver.persist_completed_collection().unwrap();
             evidence
         };
         let encoded = std::fs::read_to_string(&cache_path).unwrap();
@@ -1647,6 +1657,87 @@ mod tests {
         assert_eq!(stats.workspaces, 0);
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(PERSISTENT_RUNNER_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_collection_drops_dirty_git_evidence_without_persisting() {
+        fn failed_collection(workspace: &Path, cache_path: &Path) -> io::Result<()> {
+            let mut resolver =
+                GitProjectEvidenceResolver::with_persistent_cache(cache_path.to_path_buf());
+            resolver.runner = persistent_success_runner;
+            resolver.begin_collection();
+            assert!(matches!(
+                resolver.inspect(workspace),
+                GitProjectEvidence::Repository { .. }
+            ));
+            Err(io::Error::other(
+                "collection failed after inspecting a workspace",
+            ))
+        }
+
+        let _guard = PERSISTENT_RUNNER_TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let cache_path = directory.path().join("state/git-evidence-cache-v1.json");
+        let result = failed_collection(&workspace, &cache_path);
+
+        assert!(result.is_err());
+        assert!(
+            !cache_path.exists(),
+            "dropping a failed collection must not commit its dirty evidence"
+        );
+    }
+
+    #[test]
+    fn poisoned_resolver_drop_preserves_the_last_committed_git_evidence() {
+        fn interrupted_runner(
+            _cwd: &Path,
+            _arguments: &[&str],
+            _timeout: Duration,
+        ) -> io::Result<Vec<u8>> {
+            panic!("interrupted while inspecting another workspace");
+        }
+
+        let _guard = PERSISTENT_RUNNER_TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workspaces = ["committed", "pending", "interrupted"].map(|name| {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::canonicalize(path).unwrap()
+        });
+        let cache_path = directory.path().join("state/git-evidence-cache-v1.json");
+        let mut resolver = GitProjectEvidenceResolver::with_persistent_cache(cache_path.clone());
+        resolver.runner = persistent_success_runner;
+        resolver.begin_collection();
+        assert!(matches!(
+            resolver.inspect(&workspaces[0]),
+            GitProjectEvidence::Repository { .. }
+        ));
+        resolver.persist_completed_collection().unwrap();
+        let committed = std::fs::read(&cache_path).unwrap();
+        let resolver = Mutex::new(resolver);
+
+        std::thread::scope(|scope| {
+            let interrupted = scope.spawn(|| {
+                let mut resolver = resolver.lock().unwrap();
+                resolver.begin_collection();
+                assert!(matches!(
+                    resolver.inspect(&workspaces[1]),
+                    GitProjectEvidence::Repository { .. }
+                ));
+                resolver.runner = interrupted_runner;
+                resolver.inspect(&workspaces[2]);
+            });
+            assert!(interrupted.join().is_err());
+        });
+        assert!(resolver.is_poisoned());
+        drop(resolver);
+
+        assert_eq!(
+            std::fs::read(&cache_path).unwrap(),
+            committed,
+            "dropping a poisoned owner must not publish its pending evidence"
+        );
     }
 
     #[test]
@@ -1673,6 +1764,7 @@ mod tests {
                 resolver.inspect(workspaces.last().unwrap()),
                 GitProjectEvidence::Unavailable
             );
+            resolver.persist_completed_collection().unwrap();
         }
 
         let mut rebuilt = GitProjectEvidenceResolver::with_persistent_cache(cache_path);
@@ -1710,6 +1802,7 @@ mod tests {
                 resolver.inspect(&workspace),
                 GitProjectEvidence::Repository { .. }
             ));
+            resolver.persist_completed_collection().unwrap();
         }
         let mut cache = read_persistent_git_cache(&cache_path).unwrap();
         let entry = cache.entries.values_mut().next().unwrap();

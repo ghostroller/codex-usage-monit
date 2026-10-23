@@ -2665,6 +2665,8 @@ enum RefreshWorkerFailure {
     SummaryBackfill,
     AccountRefresh,
     LocalRefresh,
+    HistoryStatePoisoned,
+    RolloutCachePoisoned,
 }
 
 impl RefreshWorkerFailure {
@@ -2677,11 +2679,24 @@ impl RefreshWorkerFailure {
             Self::SummaryBackfill => "30-day summary backfill worker panicked; retry deferred",
             Self::AccountRefresh => "account refresh worker panicked; retrying after backoff",
             Self::LocalRefresh => "local refresh worker panicked; retrying after backoff",
+            Self::HistoryStatePoisoned => {
+                "history state was interrupted; refresh stopped for this session; restart the TUI"
+            }
+            Self::RolloutCachePoisoned => {
+                "rollout cache was interrupted; refresh stopped for this session; restart the TUI"
+            }
         }
+    }
+
+    fn stops_refresh(self) -> bool {
+        matches!(
+            self,
+            Self::HistoryStatePoisoned | Self::RolloutCachePoisoned
+        )
     }
 }
 
-fn refresh_worker_panic_completion(failure: RefreshWorkerFailure) -> RefreshCompletion {
+fn refresh_worker_failure_completion(failure: RefreshWorkerFailure) -> RefreshCompletion {
     RefreshCompletion {
         result: None,
         remote_live: None,
@@ -2692,6 +2707,19 @@ fn refresh_worker_panic_completion(failure: RefreshWorkerFailure) -> RefreshComp
         refreshed_account: false,
         summary_backfill: failure == RefreshWorkerFailure::SummaryBackfill,
         worker_failure: Some(failure),
+    }
+}
+
+fn poisoned_refresh_state(
+    rollout_cache: &Mutex<RolloutCache>,
+    history_store: &Mutex<TuiHistoryStore>,
+) -> Option<RefreshWorkerFailure> {
+    if history_store.is_poisoned() {
+        Some(RefreshWorkerFailure::HistoryStatePoisoned)
+    } else if rollout_cache.is_poisoned() {
+        Some(RefreshWorkerFailure::RolloutCachePoisoned)
+    } else {
+        None
     }
 }
 
@@ -3471,6 +3499,9 @@ struct App {
     history_initialization_pending: bool,
     worker_running: bool,
     refresh_retry_not_before: Option<Instant>,
+    // A poisoned business-state mutex invalidates the whole refresh session.
+    // Never reuse its contents or retry against the same shared instance.
+    refresh_stopped: bool,
     startup_progress_tracker: Option<StartupLoadProgressTracker>,
     startup_progress: StartupLoadProgress,
     startup_progress_last_redraw: Instant,
@@ -3627,6 +3658,7 @@ impl App {
             history_initialization_pending: false,
             worker_running: false,
             refresh_retry_not_before: None,
+            refresh_stopped: false,
             startup_progress_tracker: None,
             startup_progress: StartupLoadProgress::default(),
             startup_progress_last_redraw: Instant::now(),
@@ -4587,6 +4619,9 @@ impl App {
     }
 
     fn request_history_source(&mut self, selection: HistorySourceSelection) {
+        if self.refresh_stopped {
+            return;
+        }
         if selection == self.history_source_selection
             && !self.history_source_loading
             && self.history_source_query_error.is_none()
@@ -4598,6 +4633,9 @@ impl App {
     }
 
     fn force_history_source_refresh(&mut self) {
+        if self.refresh_stopped {
+            return;
+        }
         self.history_source_generation = self.history_source_generation.wrapping_add(1);
         self.history_source_loading = true;
         self.history_source_query_pending = true;
@@ -6516,6 +6554,35 @@ impl App {
         push_warning(&mut self.snapshot, &warning);
         push_warning(&mut self.local_snapshot, &warning);
         self.local_snapshot_partial = true;
+        if failure.stops_refresh() {
+            self.refresh_stopped = true;
+            self.worker_running = false;
+            self.refresh_retry_not_before = None;
+            self.initial_bootstrap_pending = false;
+            self.history_initialization_pending = false;
+            self.history_source_loading = false;
+            self.history_source_query_pending = false;
+            self.history_source_status = None;
+            self.history_source_query_error = Some(warning.clone());
+            self.history.read_only = true;
+            self.summary_backfill_pending = false;
+            self.summary_backfill_running = false;
+            for snapshot in [&mut self.snapshot, &mut self.local_snapshot] {
+                for source in &mut snapshot.sources {
+                    if source.status == "loading" {
+                        source.status = "error".to_owned();
+                        source.message = Some(warning.clone());
+                    }
+                }
+            }
+            if let Some(tracker) = self.startup_progress_tracker.take() {
+                tracker.finish();
+                self.startup_progress = tracker.snapshot();
+            }
+            self.event_log
+                .record(LogLevel::Error, "tui.refresh_stopped", &warning);
+            return true;
+        }
         self.refresh_retry_not_before =
             Some(now.checked_add(REFRESH_WORKER_PANIC_RETRY).unwrap_or(now));
 
@@ -6559,6 +6626,8 @@ impl App {
                 self.schedule_account_refresh_retry(now);
             }
             RefreshWorkerFailure::LocalRefresh => {}
+            RefreshWorkerFailure::HistoryStatePoisoned
+            | RefreshWorkerFailure::RolloutCachePoisoned => {}
         }
         true
     }
@@ -9808,7 +9877,16 @@ fn flush_staged_history_on_exit(
     let total_started = Instant::now();
     let mut store = match history_store.try_lock() {
         Ok(store) => store,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            // A panic may have interrupted a multi-field staging update. The
+            // durable state remains the source of truth; do not flush this copy.
+            event_log.record(
+                LogLevel::Error,
+                "history.flush_on_exit",
+                "history state was interrupted; uncommitted history was not flushed",
+            );
+            return;
+        }
         // Never turn a prompt terminal exit into a wait for an expensive
         // initial rollout/history worker. The worker owns the staged data and
         // the process is already exiting; a recorder or the next refresh can
@@ -10364,9 +10442,9 @@ fn collect_initial_refresh_completion(
     }
     let activation_span = config.startup_trace.span("tui.history_activate");
     let (history_preparation, history_source_state) = {
-        let mut history_store = history_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(mut history_store) = history_store.lock() else {
+            return refresh_worker_failure_completion(RefreshWorkerFailure::HistoryStatePoisoned);
+        };
         let preparation = history_store.prepare_deferred_runtime(
             &config.codex_home,
             config.redact_content,
@@ -10389,9 +10467,9 @@ fn collect_initial_refresh_completion(
     let refresh_account = false;
     let snapshot_span = config.startup_trace.span("tui.initial_snapshot");
     let result = {
-        let mut cache = rollout_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(mut cache) = rollout_cache.lock() else {
+            return refresh_worker_failure_completion(RefreshWorkerFailure::RolloutCachePoisoned);
+        };
         collect_snapshot_cached(config, None, refresh_account, &mut cache)
     };
     snapshot_span.finish_with(|| {
@@ -10412,9 +10490,9 @@ fn collect_initial_refresh_completion(
     let history_observation = report_history_observation(&result, config.offline);
     let history_span = config.startup_trace.span("tui.initial_history");
     let (projection, recorder_health, remote_live, remote_overview_history) = {
-        let mut history_store = history_store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(mut history_store) = history_store.lock() else {
+            return refresh_worker_failure_completion(RefreshWorkerFailure::HistoryStatePoisoned);
+        };
         history_store.with_query_request(result.snapshot.as_of, |history_store| {
             let (projection, recorder_health) = stage_and_load_history_selected(
                 history_store,
@@ -10570,7 +10648,7 @@ impl RefreshCollectionInputs {
         self,
         config: &CollectConfig,
         rollout_cache: &Arc<Mutex<RolloutCache>>,
-    ) -> Option<CollectionResult> {
+    ) -> Result<Option<CollectionResult>, RefreshWorkerFailure> {
         match self {
             Self::Account {
                 cached_account,
@@ -10601,7 +10679,7 @@ impl RefreshCollectionInputs {
                             .bool("rolloutScan", false)
                     },
                 );
-                Some(refreshed)
+                Ok(Some(refreshed))
             }
             Self::Local {
                 cached_account,
@@ -10609,8 +10687,8 @@ impl RefreshCollectionInputs {
             } => {
                 let mut cache = rollout_cache
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if force_materialization {
+                    .map_err(|_| RefreshWorkerFailure::RolloutCachePoisoned)?;
+                Ok(if force_materialization {
                     Some(collect_snapshot_cached(
                         config,
                         Some(cached_account),
@@ -10623,7 +10701,7 @@ impl RefreshCollectionInputs {
                         Some(cached_account),
                         &mut cache,
                     )
-                }
+                })
             }
         }
     }
@@ -10632,16 +10710,16 @@ impl RefreshCollectionInputs {
 fn with_summary_backfill_cache<T>(
     rollout_cache: &Arc<Mutex<RolloutCache>>,
     collect: impl FnOnce(&mut RolloutCache) -> T,
-) -> T {
+) -> Result<T, RefreshWorkerFailure> {
     let mut cache = {
         let cache = rollout_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .map_err(|_| RefreshWorkerFailure::RolloutCachePoisoned)?;
         cache.fork_for_history_scan()
     };
     // Scanning and reducing the wider range must not hold the live-cache lock.
     // Release its shared parsed events before staging the resulting history.
-    collect(&mut cache)
+    Ok(collect(&mut cache))
 }
 
 fn start_refresh_if_due(
@@ -10653,8 +10731,17 @@ fn start_refresh_if_due(
     refresh_worker: &mut RefreshWorker,
 ) -> bool {
     let now = Instant::now();
+    if app.refresh_stopped {
+        return false;
+    }
     if app.worker_running {
         return false;
+    }
+    // Check before the retry deadline so a caught panic holding either mutex
+    // immediately stops the session. The lock sites also check poison because
+    // a worker may be interrupted after this preflight.
+    if let Some(failure) = poisoned_refresh_state(rollout_cache, history_store) {
+        return app.record_refresh_worker_failure(failure, now, Utc::now());
     }
     if app.refresh_retry_wait(now).is_some() {
         return false;
@@ -10685,7 +10772,12 @@ fn start_refresh_if_due(
                         startup_progress.as_ref(),
                     )
                 },
-                || initial_refresh_panic_completion(&worker_config),
+                || {
+                    poisoned_refresh_state(&worker_cache, &worker_history).map_or_else(
+                        || initial_refresh_panic_completion(&worker_config),
+                        refresh_worker_failure_completion,
+                    )
+                },
             );
         }));
         return true;
@@ -10701,13 +10793,15 @@ fn start_refresh_if_due(
             send_refresh_completion_catching_panics(
                 &worker_sender,
                 || {
-                    let projection = worker_history
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .load_since_with_staged_selected(
-                            &worker_selection,
-                            history_view_since(Utc::now()),
+                    let Ok(mut history_store) = worker_history.lock() else {
+                        return refresh_worker_failure_completion(
+                            RefreshWorkerFailure::HistoryStatePoisoned,
                         );
+                    };
+                    let projection = history_store.load_since_with_staged_selected(
+                        &worker_selection,
+                        history_view_since(Utc::now()),
+                    );
                     RefreshCompletion {
                         result: None,
                         remote_live: None,
@@ -10723,7 +10817,13 @@ fn start_refresh_if_due(
                         worker_failure: None,
                     }
                 },
-                || refresh_worker_panic_completion(RefreshWorkerFailure::HistorySourceQuery),
+                || {
+                    refresh_worker_failure_completion(if worker_history.is_poisoned() {
+                        RefreshWorkerFailure::HistoryStatePoisoned
+                    } else {
+                        RefreshWorkerFailure::HistorySourceQuery
+                    })
+                },
             );
         }));
         return true;
@@ -10764,9 +10864,12 @@ fn start_refresh_if_due(
             send_refresh_completion_catching_panics(
                 &worker_sender,
                 || {
-                    let result = with_summary_backfill_cache(&worker_cache, |cache| {
+                    let result = match with_summary_backfill_cache(&worker_cache, |cache| {
                         collect_snapshot_cached(&worker_config, None, false, cache)
-                    });
+                    }) {
+                        Ok(result) => result,
+                        Err(failure) => return refresh_worker_failure_completion(failure),
+                    };
                     let SummaryBackfillObservation {
                         scan_complete,
                         observed_at,
@@ -10775,9 +10878,11 @@ fn start_refresh_if_due(
                         observation,
                     } = SummaryBackfillObservation::from_collection(result);
                     let (mut projection, recorder_health) = {
-                        let mut history_store = worker_history
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let Ok(mut history_store) = worker_history.lock() else {
+                            return refresh_worker_failure_completion(
+                                RefreshWorkerFailure::HistoryStatePoisoned,
+                            );
+                        };
                         let (mut projection, recorder_health) =
                             stage_full_and_load_history_selected(
                                 &mut history_store,
@@ -10816,7 +10921,12 @@ fn start_refresh_if_due(
                         worker_failure: None,
                     }
                 },
-                || refresh_worker_panic_completion(RefreshWorkerFailure::SummaryBackfill),
+                || {
+                    refresh_worker_failure_completion(
+                        poisoned_refresh_state(&worker_cache, &worker_history)
+                            .unwrap_or(RefreshWorkerFailure::SummaryBackfill),
+                    )
+                },
             );
         }));
         return true;
@@ -10844,11 +10954,16 @@ fn start_refresh_if_due(
         send_refresh_completion_catching_panics(
             &worker_sender,
             || {
-                let result = collection_inputs.collect(&worker_config, &worker_cache);
+                let result = match collection_inputs.collect(&worker_config, &worker_cache) {
+                    Ok(result) => result,
+                    Err(failure) => return refresh_worker_failure_completion(failure),
+                };
                 let (history_and_recorder, remote_live, remote_overview_history) = {
-                    let mut history_store = worker_history
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Ok(mut history_store) = worker_history.lock() else {
+                        return refresh_worker_failure_completion(
+                            RefreshWorkerFailure::HistoryStatePoisoned,
+                        );
+                    };
                     let query_now = result
                         .as_ref()
                         .map_or_else(Utc::now, |result| result.snapshot.as_of);
@@ -10907,7 +11022,12 @@ fn start_refresh_if_due(
                     worker_failure: None,
                 }
             },
-            || refresh_worker_panic_completion(worker_failure),
+            || {
+                refresh_worker_failure_completion(
+                    poisoned_refresh_state(&worker_cache, &worker_history)
+                        .unwrap_or(worker_failure),
+                )
+            },
         );
     }));
     false
@@ -10922,14 +11042,20 @@ fn next_run_loop_poll_timeout(app: &App, now: Instant, account_refresh_enabled: 
     let local_refresh_wait =
         LOCAL_REFRESH.saturating_sub(now.saturating_duration_since(app.last_local_refresh));
     let refresh_retry_wait = app.refresh_retry_wait(now);
-    let mut timeout = if app.worker_running {
+    let mut timeout = if app.refresh_stopped {
+        LOCAL_REFRESH
+    } else if app.worker_running {
         BACKGROUND_CHANNEL_POLL
     } else if let Some(retry_wait) = refresh_retry_wait {
         retry_wait
     } else {
         local_refresh_wait
     };
-    if account_refresh_enabled && !app.worker_running && refresh_retry_wait.is_none() {
+    if account_refresh_enabled
+        && !app.refresh_stopped
+        && !app.worker_running
+        && refresh_retry_wait.is_none()
+    {
         timeout = timeout.min(app.next_account_refresh.saturating_duration_since(now));
     }
     if !app.launching_threads.is_empty()
@@ -12210,7 +12336,7 @@ fn render_history_source_control(
     } else {
         Style::default().fg(palette.muted)
     };
-    let shortcut_style = if !app.shortcuts_active() {
+    let shortcut_style = if !app.shortcuts_active() || app.refresh_stopped {
         style
     } else if selected {
         style.add_modifier(Modifier::UNDERLINED)

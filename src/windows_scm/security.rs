@@ -1,4 +1,7 @@
 //! Machine installation ACLs are independent of current-user private stores.
+//!
+//! Win32 is needed here for token/account SIDs, known folders, and explicit
+//! owner/DACL inspection; standard filesystem permissions cannot express them.
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::OsString,
@@ -37,14 +40,24 @@ pub(super) fn wide(value: &str) -> Result<Vec<u16>> {
     Ok(value.encode_utf16().chain(Some(0)).collect())
 }
 
+/// Copies a Windows UTF-16 string, rejecting strings beyond the scan limit.
+///
+/// # Safety
+///
+/// A non-null `value` must be aligned and readable in one allocation through
+/// its first NUL, or for 32,768 code units if no earlier NUL exists. That memory
+/// must remain alive and unmodified for this call. The scan limit bounds work;
+/// it cannot make a dangling or short unterminated buffer safe to read.
 pub(super) unsafe fn read_wide(value: *const u16) -> Result<String> {
     ensure!(!value.is_null(), "machine_invalid: missing Windows string");
     for length in 0..32768 {
-        // SAFETY: callers supply a Windows API-owned NUL-terminated string.
+        // SAFETY: the caller guarantees readable, aligned storage through this
+        // index until the first NUL or the scan limit, without concurrent writes.
         if unsafe { *value.add(length) } == 0 {
-            return Ok(String::from_utf16_lossy(unsafe {
-                std::slice::from_raw_parts(value, length)
-            }));
+            // SAFETY: the scanned prefix is initialized, immutable u16 storage
+            // in one live allocation, and the bounded length fits in isize.
+            let text = unsafe { std::slice::from_raw_parts(value, length) };
+            return Ok(String::from_utf16_lossy(text));
         }
     }
     anyhow::bail!("machine_invalid: oversized Windows string")
@@ -53,12 +66,17 @@ pub(super) unsafe fn read_wide(value: *const u16) -> Result<String> {
 pub(super) fn require_administrator() -> Result<()> {
     let mut token = ptr::null_mut();
     ensure!(
+        // SAFETY: the current-process pseudo-handle is accepted by this API;
+        // token is writable output storage for a separately owned query handle.
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
         "machine_admin_required: {}",
         io::Error::last_os_error()
     );
     let mut elevation = TOKEN_ELEVATION::default();
     let mut returned = 0;
+    // SAFETY: token is live with TOKEN_QUERY, and elevation is aligned writable
+    // storage matching TokenElevation and the supplied size; returned is DWORD
+    // output storage. Neither pointer escapes this synchronous call.
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -68,6 +86,8 @@ pub(super) fn require_administrator() -> Result<()> {
             &mut returned,
         )
     };
+    // SAFETY: OpenProcessToken succeeded and this function owns its handle;
+    // GetTokenInformation does not consume it, and no later call uses it.
     unsafe { CloseHandle(token) };
     ensure!(
         ok != 0 && elevation.TokenIsElevated != 0,
@@ -83,6 +103,8 @@ pub(super) fn account_sid(account: &str) -> Result<String> {
     );
     let name = wide(account)?;
     let (mut bytes, mut domain_len, mut kind) = (0, 0, 0);
+    // SAFETY: name is terminated and live; zero sizes with null buffers request
+    // required lengths, and the three scalar outputs are writable locals.
     unsafe {
         LookupAccountNameW(
             ptr::null(),
@@ -101,6 +123,9 @@ pub(super) fn account_sid(account: &str) -> Result<String> {
     let mut sid = vec![0_u32; (bytes as usize).div_ceil(4)];
     let mut domain = vec![0_u16; domain_len as usize];
     ensure!(
+        // SAFETY: name remains terminated. sid is DWORD-aligned and covers bytes;
+        // domain covers domain_len UTF-16 units. Both are exclusively writable
+        // and their lengths are supplied in the API's respective units.
         unsafe {
             LookupAccountNameW(
                 ptr::null(),
@@ -119,6 +144,8 @@ pub(super) fn account_sid(account: &str) -> Result<String> {
         kind == SidTypeUser,
         "machine_account_invalid: service account must be a user, not a group"
     );
+    // SAFETY: successful LookupAccountNameW initialized a complete SID in the
+    // aligned sid allocation, which remains alive throughout conversion.
     let sid = unsafe { crate::windows_private_directory::sid_string(sid.as_mut_ptr().cast()) }?;
     ensure!(
         !matches!(sid.as_str(), "S-1-5-18" | "S-1-5-19" | "S-1-5-20"),
@@ -129,17 +156,25 @@ pub(super) fn account_sid(account: &str) -> Result<String> {
 
 pub(super) fn current_sid() -> Result<String> {
     let user = crate::source_identity::windows_current_user_sid()?;
+    // SAFETY: user owns the token-information storage containing this valid SID
+    // and is kept alive until sid_string finishes reading it.
     Ok(unsafe { crate::windows_private_directory::sid_string(user.as_psid()) }?)
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
     let mut value = ptr::null_mut();
+    // SAFETY: id borrows a live GUID; null token selects the current user, and
+    // value is writable output storage for the API's allocated UTF-16 string.
     let result = unsafe { SHGetKnownFolderPath(id, 0, ptr::null_mut(), &mut value) };
     ensure!(
         result >= 0 && !value.is_null(),
         "machine_profile_unavailable: Windows known folder failed with HRESULT {result:#x}"
     );
+    // SAFETY: successful SHGetKnownFolderPath returned a non-null terminated
+    // UTF-16 allocation, which is neither modified nor freed during this copy.
     let text = unsafe { read_wide(value) };
+    // SAFETY: SHGetKnownFolderPath transfers a CoTaskMem allocation to us; the
+    // copy above has finished, and we release it once with its matching allocator.
     unsafe { CoTaskMemFree(value.cast()) };
     Ok(PathBuf::from(OsString::from_wide(
         &text?.encode_utf16().collect::<Vec<_>>(),
@@ -166,6 +201,9 @@ pub(super) fn runtime_environment() -> Result<Vec<(&'static str, PathBuf)>> {
 struct Descriptor(PSECURITY_DESCRIPTOR);
 impl Drop for Descriptor {
     fn drop(&mut self) {
+        // SAFETY: Descriptor uniquely owns a buffer allocated by the security
+        // APIs with LocalAlloc. No interior owner/ACL/SID pointer is used after
+        // this guard is dropped, and LocalFree is the required release API.
         unsafe { LocalFree(self.0) };
     }
 }
@@ -176,6 +214,9 @@ fn descriptor(reader: &str) -> Result<Descriptor> {
     ))?;
     let mut descriptor = ptr::null_mut();
     ensure!(
+        // SAFETY: sddl is a live terminated string; descriptor is writable output
+        // storage and the optional length output is null. Success transfers a
+        // LocalAlloc descriptor that is immediately guarded below.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -203,6 +244,8 @@ pub(super) fn create_directory(path: &Path, reader: &str) -> Result<()> {
     };
     let path_wide = crate::atomic_file::windows_wide_path(path)?;
     ensure!(
+        // SAFETY: path_wide is terminated; attributes has the required size and
+        // points to the live descriptor. Windows consumes both during the call.
         unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } != 0,
         "machine_directory_failed: {}",
         io::Error::last_os_error()
@@ -220,6 +263,9 @@ pub(super) fn create_file(path: &Path, reader: &str) -> Result<fs::File> {
         bInheritHandle: 0,
     };
     let wide = crate::atomic_file::windows_wide_path(path)?;
+    // SAFETY: wide is terminated and attributes references a live descriptor
+    // with its correct size. CREATE_NEW has no template handle, and none of
+    // these borrowed buffers is retained by CreateFileW after it returns.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -236,6 +282,8 @@ pub(super) fn create_file(path: &Path, reader: &str) -> Result<fs::File> {
         "machine_file_failed: {}",
         io::Error::last_os_error()
     );
+    // SAFETY: CreateFileW succeeded, yielding a handle owned only here. This
+    // transfers its sole close responsibility to File; no raw owner remains.
     Ok(unsafe { fs::File::from_raw_handle(handle) })
 }
 
@@ -338,6 +386,9 @@ fn validate_path_security(path: &Path, policy: PathTrust<'_>) -> Result<()> {
     crate::source_identity::reject_windows_reparse_components(path, "service path")?;
     let wide = crate::atomic_file::windows_wide_path(path)?;
     let (mut owner, mut acl, mut descriptor) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    // SAFETY: wide is terminated and the three output pointers are writable.
+    // OWNER/DACL flags match the requested outputs; success returns a separately
+    // allocated descriptor containing the owner/ACL pointers, guarded below.
     let error = unsafe {
         GetNamedSecurityInfoW(
             wide.as_ptr(),
@@ -356,6 +407,8 @@ fn validate_path_security(path: &Path, policy: PathTrust<'_>) -> Result<()> {
         !owner.is_null() && !acl.is_null(),
         "machine_acl_untrusted: owner/DACL is absent"
     );
+    // SAFETY: owner is the non-null SID returned inside the live descriptor;
+    // conversion only reads it, and _descriptor outlives the returned String.
     let owner = unsafe { crate::windows_private_directory::sid_string(owner) }?;
     // Windows owns Program Files and volume roots as this fixed service SID.
     // Only executable ancestry accepts it; machine receipts and private output
@@ -377,6 +430,8 @@ fn validate_path_security(path: &Path, policy: PathTrust<'_>) -> Result<()> {
     let mut control = 0;
     let mut revision = 0;
     ensure!(
+        // SAFETY: descriptor is the live result of GetNamedSecurityInfoW; both
+        // scalar output pointers are properly aligned writable locals.
         unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0,
         "machine_acl_unverifiable: {}",
         io::Error::last_os_error()
@@ -403,12 +458,19 @@ fn validate_path_security(path: &Path, policy: PathTrust<'_>) -> Result<()> {
             write_mask = GENERIC_ALL | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD;
         }
     }
-    for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+    // SAFETY: acl is the non-null ACL returned in the live descriptor allocation,
+    // which is a private snapshot and is never mutated during this traversal.
+    let ace_count = unsafe { (*acl).AceCount };
+    for index in 0..u32::from(ace_count) {
         let mut ace = ptr::null_mut();
         ensure!(
+            // SAFETY: acl remains alive and unmodified; index is below its
+            // reported AceCount, and ace is writable pointer output storage.
             unsafe { GetAce(acl, index, &mut ace) } != 0,
             "machine_acl_unverifiable: cannot inspect ACE"
         );
+        // SAFETY: successful GetAce returns a DWORD-aligned ACE in the live
+        // descriptor; every ACE begins with an initialized ACE_HEADER.
         let header = unsafe { &*ace.cast::<ACE_HEADER>() };
         if matches!(policy, PathTrust::ExecutableDirectory { .. })
             && u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
@@ -424,10 +486,18 @@ fn validate_path_security(path: &Path, policy: PathTrust<'_>) -> Result<()> {
             "machine_acl_untrusted: unsupported ACE type"
         );
         if header.AceType == 0 {
+            // SAFETY: the checked ACE type identifies ACCESS_ALLOWED_ACE, whose
+            // initialized fixed prefix is DWORD-aligned in the live descriptor.
             let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            // SAFETY: this OS-supplied access-allowed ACE contains a complete SID
+            // at SidStart, followed by its variable-length tail. Derive the SID
+            // pointer from the original ACE pointer, not a reference to the
+            // fixed-size prefix, so it retains access to that tail allocation.
             let sid = unsafe {
                 crate::windows_private_directory::sid_string(
-                    (&raw const allowed.SidStart).cast_mut().cast(),
+                    ace.cast::<u8>()
+                        .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                        .cast(),
                 )
             }?;
             ensure!(
@@ -495,6 +565,26 @@ pub(super) fn write_file(path: &Path, reader: &str, bytes: &[u8]) -> Result<()> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn scm_read_wide_obeys_termination_and_scan_limit() {
+        // SAFETY: null is explicitly accepted and rejected before dereference.
+        assert!(unsafe { read_wide(ptr::null()) }.is_err());
+        let empty = [0_u16];
+        // SAFETY: empty is aligned, live, immutable, and terminated in bounds.
+        assert_eq!(unsafe { read_wide(empty.as_ptr()) }.unwrap(), "");
+        let text = [b'A' as u16, 0xd800, 0, b'B' as u16];
+        // SAFETY: text remains live and immutable through its in-bounds NUL.
+        assert_eq!(unsafe { read_wide(text.as_ptr()) }.unwrap(), "A\u{fffd}");
+
+        let mut bounded = vec![b'x' as u16; 32768];
+        // SAFETY: the allocation provides every code unit in the documented
+        // scan range even though it intentionally contains no terminator.
+        assert!(unsafe { read_wide(bounded.as_ptr()) }.is_err());
+        bounded[32767] = 0;
+        // SAFETY: bounded is terminated at the final readable scan position.
+        assert_eq!(unsafe { read_wide(bounded.as_ptr()) }.unwrap().len(), 32767);
+    }
+
     fn fixture_acl(path: &Path, extra_aces: &str) {
         use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
         let sid = current_sid().unwrap();
@@ -504,6 +594,8 @@ mod tests {
         .unwrap();
         let mut descriptor = ptr::null_mut();
         assert_ne!(
+            // SAFETY: sddl is terminated and descriptor is writable output;
+            // successful conversion is guarded by Descriptor immediately below.
             unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     sddl.as_ptr(),
@@ -517,6 +609,8 @@ mod tests {
         let descriptor = Descriptor(descriptor);
         let (mut present, mut acl, mut defaulted) = (0, ptr::null_mut(), 0);
         assert_ne!(
+            // SAFETY: descriptor owns the successfully converted security
+            // descriptor; all outputs are live, aligned writable locals.
             unsafe {
                 GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
             },
@@ -524,6 +618,9 @@ mod tests {
         );
         let path = crate::atomic_file::windows_wide_path(path).unwrap();
         assert_eq!(
+            // SAFETY: path is terminated and acl belongs to the still-live
+            // descriptor. Only DACL information is requested; unused SID/SACL
+            // pointers are null and the API does not retain the input ACL.
             unsafe {
                 SetNamedSecurityInfoW(
                     path.as_ptr(),
@@ -636,6 +733,8 @@ mod tests {
         .unwrap();
         let mut descriptor = ptr::null_mut();
         assert_ne!(
+            // SAFETY: the fixture SDDL is terminated, descriptor is writable
+            // output, and the successful allocation is guarded below.
             unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     sddl.as_ptr(),
@@ -653,6 +752,8 @@ mod tests {
             bInheritHandle: 0,
         };
         let path = crate::atomic_file::windows_wide_path(&public).unwrap();
+        // SAFETY: path is terminated; attributes has its correct size and points
+        // to a live descriptor for the duration of this directory creation call.
         assert_ne!(unsafe { CreateDirectoryW(path.as_ptr(), &attributes) }, 0);
         validate_runtime_path(&public, &sid).unwrap();
         assert!(validate_private_output(&public, &sid, true).is_err());

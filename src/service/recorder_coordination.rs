@@ -33,6 +33,20 @@ const SERVICE_COORDINATION_DIRECTORY: &str = "service-registration-v1";
 static HELD_RECORDER_LOCKS: LazyLock<Mutex<HashSet<RecorderLockIdentity>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+#[cfg(test)]
+thread_local! {
+    static RECORDER_ACQUISITION_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_recorder_acquisition_validation_hook() {
+    let hook = RECORDER_ACQUISITION_VALIDATION_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecorderStatusFile {
@@ -186,6 +200,9 @@ pub struct RecorderInstanceLockGuard {
     pub(super) file: File,
     pub(super) path: PathBuf,
     pub(super) identity: RecorderLockIdentity,
+    // False only while the private acquisition candidate owns a reservation
+    // but has not acquired the OS lock. Published guards always hold both.
+    os_lock_acquired: bool,
 }
 
 impl RecorderInstanceLockGuard {
@@ -205,8 +222,10 @@ impl fmt::Debug for RecorderInstanceLockGuard {
 
 impl Drop for RecorderInstanceLockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::File::unlock(&self.file);
-        held_recorder_locks().remove(&self.identity);
+        if self.os_lock_acquired {
+            let _ = std::fs::File::unlock(&self.file);
+        }
+        release_held_recorder_lock(self.identity);
     }
 }
 
@@ -241,10 +260,21 @@ fn recorder_state_root(history_dir: &Path) -> io::Result<PathBuf> {
         })
 }
 
-fn held_recorder_locks() -> std::sync::MutexGuard<'static, HashSet<RecorderLockIdentity>> {
-    HELD_RECORDER_LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn held_recorder_locks() -> io::Result<std::sync::MutexGuard<'static, HashSet<RecorderLockIdentity>>>
+{
+    HELD_RECORDER_LOCKS.lock().map_err(|_| {
+        invalid_recorder_lock_data(
+            "process-local recorder ownership was interrupted; restart required",
+        )
+    })
+}
+
+fn release_held_recorder_lock(identity: RecorderLockIdentity) {
+    // Cleanup must still release OS resources, but cannot trust or repair
+    // interrupted process-local ownership. Future acquisitions fail closed.
+    if let Ok(mut held) = held_recorder_locks() {
+        held.remove(&identity);
+    }
 }
 
 pub(super) fn prepare_recorder_lock_state_root(path: &Path) -> io::Result<()> {
@@ -524,46 +554,55 @@ fn try_acquire_named_private_root_lock(
     let file = open_recorder_lock_file(state_root, file_name)?;
     let identity = recorder_lock_identity(&file)?;
 
-    {
-        let mut held = held_recorder_locks();
-        if !held.insert(identity) {
-            drop(held);
-            validate_opened_recorder_lock(state_root, file_name, &file, identity)?;
-            return Ok(TryRecorderInstanceLock::Busy);
-        }
+    // Reserve this identity without serializing unrelated roots' filesystem
+    // and ACL validation behind the process-wide registry mutex.
+    let reserved = held_recorder_locks()?.insert(identity);
+    if !reserved {
+        #[cfg(test)]
+        run_recorder_acquisition_validation_hook();
+        validate_opened_recorder_lock(state_root, file_name, &file, identity)?;
+        // The current owner may have finished while validation ran. Busy is
+        // still conservative, but poisoned ownership must be reported.
+        let _held = held_recorder_locks()?;
+        return Ok(TryRecorderInstanceLock::Busy);
     }
 
-    let lock_result = match mode {
-        CoordinationLockMode::Shared => std::fs::File::try_lock_shared(&file),
-        CoordinationLockMode::Exclusive => std::fs::File::try_lock(&file),
+    // Keep this guard private until OS acquisition and the final registry
+    // fence succeed. Its Drop releases both resources on every early return,
+    // including validation failure, poison and an ordinary busy OS lock.
+    let mut candidate = RecorderInstanceLockGuard {
+        file,
+        path,
+        identity,
+        os_lock_acquired: false,
     };
-    match lock_result {
-        Ok(()) => {
-            if let Err(error) =
-                validate_opened_recorder_lock(state_root, file_name, &file, identity)
-            {
-                let _ = std::fs::File::unlock(&file);
-                held_recorder_locks().remove(&identity);
-                return Err(error);
-            }
-            Ok(TryRecorderInstanceLock::Acquired(
-                RecorderInstanceLockGuard {
-                    file,
-                    path,
-                    identity,
-                },
-            ))
+    let lock_result = match mode {
+        CoordinationLockMode::Shared => std::fs::File::try_lock_shared(&candidate.file),
+        CoordinationLockMode::Exclusive => std::fs::File::try_lock(&candidate.file),
+    };
+    candidate.os_lock_acquired = match lock_result {
+        Ok(()) => true,
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    };
+    #[cfg(test)]
+    run_recorder_acquisition_validation_hook();
+    validate_opened_recorder_lock(state_root, file_name, &candidate.file, identity)?;
+    {
+        // Another owner could poison the registry during I/O. Only hand out a
+        // guard while the reservation is still present in trusted bookkeeping.
+        // End this scope before candidate Drop can re-enter registry cleanup.
+        let held = held_recorder_locks()?;
+        if !held.contains(&identity) {
+            return Err(invalid_recorder_lock_data(
+                "recorder lock reservation disappeared during validation",
+            ));
         }
-        Err(std::fs::TryLockError::WouldBlock) => {
-            let validation = validate_opened_recorder_lock(state_root, file_name, &file, identity);
-            held_recorder_locks().remove(&identity);
-            validation?;
-            Ok(TryRecorderInstanceLock::Busy)
-        }
-        Err(std::fs::TryLockError::Error(error)) => {
-            held_recorder_locks().remove(&identity);
-            Err(error)
-        }
+    }
+    if candidate.os_lock_acquired {
+        Ok(TryRecorderInstanceLock::Acquired(candidate))
+    } else {
+        Ok(TryRecorderInstanceLock::Busy)
     }
 }
 
@@ -698,6 +737,167 @@ pub fn write_recorder_status(path: &Path, status: &RecorderStatusFile) -> io::Re
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     contents.push(b'\n');
     write_private_atomically(path, &contents)
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+
+    #[test]
+    fn recorder_validation_releases_registry_and_rejects_concurrent_poison() {
+        use std::process::Command;
+
+        const CHILD: &str = "CODEX_USAGE_MONIT_RECORDER_VALIDATION_POISON_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            // Each branch poisons process-wide state permanently. Isolate all
+            // three rather than clearing poison or relying on test ordering.
+            for mode in ["acquired", "local_busy", "os_busy"] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "service::recorder_coordination::poison_tests::recorder_validation_releases_registry_and_rejects_concurrent_poison",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{mode} child failed: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let history = directory.path().join("state/history-v1");
+        let TryRecorderInstanceLock::Acquired(guard) =
+            try_acquire_recorder_instance_lock(&history).unwrap()
+        else {
+            panic!("isolated recorder must acquire its lock");
+        };
+        let path = guard.path().to_owned();
+        let local_owner = if mode == "local_busy" {
+            Some(guard)
+        } else {
+            drop(guard);
+            None
+        };
+        let os_owner = if mode == "os_busy" {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            std::fs::File::try_lock(&file).unwrap();
+            Some(file)
+        } else {
+            None
+        };
+
+        RECORDER_ACQUISITION_VALIDATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                // This must succeed synchronously: a regression fails here
+                // instead of blocking a helper thread behind the registry.
+                let held = HELD_RECORDER_LOCKS
+                    .try_lock()
+                    .expect("filesystem validation must not hold the global registry");
+                assert_eq!(held.len(), 1, "the identity remains reserved during I/O");
+                drop(held);
+                let poisoner = std::thread::spawn(|| {
+                    let mut held = HELD_RECORDER_LOCKS.lock().unwrap();
+                    held.clear();
+                    panic!("another owner interrupted the registry during validation");
+                });
+                assert!(poisoner.join().is_err());
+            }));
+        });
+
+        assert_eq!(
+            try_acquire_recorder_instance_lock(&history)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+            "the final fence must reject poisoned ownership in {mode}",
+        );
+        assert!(HELD_RECORDER_LOCKS.is_poisoned());
+        if mode != "acquired" {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(
+                matches!(
+                    std::fs::File::try_lock(&probe),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ),
+                "rejecting a busy acquisition must not unlock its existing owner",
+            );
+        }
+        drop(local_owner);
+        drop(os_owner);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        std::fs::File::try_lock(&probe)
+            .expect("failed acquisition and guard cleanup must release every OS lock");
+        std::fs::File::unlock(&probe).unwrap();
+    }
+
+    #[test]
+    fn poisoned_recorder_ownership_rejects_acquisition_and_releases_os_lock() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::process::Command;
+
+        const CHILD: &str = "CODEX_USAGE_MONIT_POISONED_RECORDER_OWNER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::recorder_coordination::poison_tests::poisoned_recorder_ownership_rejects_acquisition_and_releases_os_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child failed: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let history = directory.path().join("state/history-v1");
+        let TryRecorderInstanceLock::Acquired(guard) =
+            try_acquire_recorder_instance_lock(&history).unwrap()
+        else {
+            panic!("isolated recorder must acquire its lock");
+        };
+        let path = guard.path().to_owned();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut held = HELD_RECORDER_LOCKS.lock().unwrap();
+                held.clear();
+                panic!("interrupted recorder ownership update");
+            }))
+            .is_err()
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(guard))).is_ok());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        std::fs::File::try_lock(&file).expect("dropping the guard must still release its OS lock");
+        std::fs::File::unlock(&file).unwrap();
+        assert_eq!(
+            try_acquire_recorder_instance_lock(&history)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(HELD_RECORDER_LOCKS.is_poisoned());
+    }
 }
 
 #[cfg(all(test, windows))]

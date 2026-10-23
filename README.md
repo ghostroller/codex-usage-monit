@@ -701,6 +701,7 @@ The TUI interaction suite uses Unix PTYs or Windows ConPTY; cross-target
 compilation checks do not establish Windows runtime results.
 
 - [Local-first testing and manual CI](docs/testing.md)
+- [Rust style and review policy](docs/rust-style.md)
 - [Linux Docker testing](docs/linux-testing.md)
 - [Data capabilities and limits](docs/codex-data-capabilities.md)
 - [Terminal resume behavior](docs/codex-terminal-resume.md)

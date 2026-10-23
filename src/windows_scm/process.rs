@@ -1,4 +1,7 @@
 //! Atomic job membership closes the suspended-child crash window.
+//!
+//! Native process creation is required to install the job and inherited-handle
+//! lists atomically; `Command::spawn` does not expose these startup attributes.
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::{OsStr, OsString},
@@ -26,6 +29,8 @@ use windows_sys::Win32::{
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
+        // SAFETY: Handle owns a successful Win32 handle result, is not cloned,
+        // and closes that handle exactly once without transferring it elsewhere.
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -39,6 +44,10 @@ fn check(success: i32) -> Result<()> {
 }
 fn inherited(file: &File) -> Result<Handle> {
     let mut handle = ptr::null_mut();
+    // SAFETY: file keeps its source handle open for this call. Both process
+    // pseudo-handles denote this process, and handle is writable output storage.
+    // DUPLICATE_SAME_ACCESS creates a distinct, inheritable handle owned below;
+    // it does not transfer or close the borrowed File's handle.
     unsafe {
         check(DuplicateHandle(
             GetCurrentProcess(),
@@ -61,6 +70,9 @@ impl Attributes {
 }
 impl Drop for Attributes {
     fn drop(&mut self) {
+        // SAFETY: Attributes is constructed only after successful initialization.
+        // Its allocation has not moved/reallocated, and spawn keeps the attribute
+        // value arrays and their handles alive until after this destructor.
         unsafe { DeleteProcThreadAttributeList(self.pointer()) };
     }
 }
@@ -76,10 +88,14 @@ impl Child {
         self.pid
     }
     pub(super) fn try_wait(&self) -> Result<Option<u32>> {
+        // SAFETY: self owns the process handle returned by CreateProcessW, with
+        // synchronization access, and the borrow prevents its drop during wait.
         match unsafe { WaitForSingleObject(self.process.0, 0) } {
             WAIT_TIMEOUT => Ok(None),
             WAIT_OBJECT_0 => {
                 let mut code = 0;
+                // SAFETY: the owned process handle is live and code is writable
+                // DWORD storage; the preceding wait observed process termination.
                 unsafe {
                     check(GetExitCodeProcess(self.process.0, &mut code))?;
                 }
@@ -89,10 +105,14 @@ impl Child {
         }
     }
     pub(super) fn terminate(&self) -> Result<()> {
+        // SAFETY: self owns a live job handle with termination access from
+        // CreateJobObjectW. Termination does not consume or close that handle.
         unsafe {
             check(TerminateJobObject(self.job.0, 1))?;
         }
         ensure!(
+            // SAFETY: the owned process handle remains open after job termination
+            // and has synchronization access; no Rust pointers cross this call.
             unsafe { WaitForSingleObject(self.process.0, 10000) } == WAIT_OBJECT_0,
             "machine_process_stop_failed: recorder did not exit after job termination"
         );
@@ -174,6 +194,8 @@ fn environment(command: &Command) -> Result<Vec<u16>> {
 pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
     let stdin = inherited(&File::open("NUL")?)?;
     let log = inherited(log)?;
+    // SAFETY: null attributes and name request an unnamed, non-inheritable job
+    // with default security. A successful handle is immediately owned below.
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     ensure!(
         !job.is_null(),
@@ -183,6 +205,8 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
     let job = Handle(job);
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: job is live; limits is initialized, correctly aligned, and matches
+    // the information class and byte count. Windows reads it only for this call.
     unsafe {
         check(SetInformationJobObject(
             job.0,
@@ -192,6 +216,8 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
         ))?;
     }
     let mut bytes = 0;
+    // SAFETY: this documented sizing call uses a null list and writable SIZE_T
+    // output. No attribute-list storage is accessed in this first call.
     unsafe {
         InitializeProcThreadAttributeList(ptr::null_mut(), 2, 0, &mut bytes);
     }
@@ -201,6 +227,8 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
         io::Error::last_os_error()
     );
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    // SAFETY: the allocation is pointer-aligned and covers the requested byte
+    // count. It is uniquely writable and not resized after list initialization.
     unsafe {
         check(InitializeProcThreadAttributeList(
             storage.as_mut_ptr().cast(),
@@ -209,9 +237,15 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
             &mut bytes,
         ))?;
     }
-    let mut attributes = Attributes(storage);
+    // UpdateProcThreadAttribute retains these arrays until list destruction.
+    // Declare them before the guard so they outlive it on every return path.
     let mut handles = [stdin.0, log.0];
     let mut jobs = [job.0];
+    let mut attributes = Attributes(storage);
+    // SAFETY: the list was initialized for two entries. Both arrays have the
+    // matching byte sizes and outlive the list, as do their owned handles. The
+    // HANDLE_LIST contains real inheritable duplicates, never pseudo-handles;
+    // JOB_LIST contains our live job. Reserved flags/outputs are zero/null.
     unsafe {
         check(UpdateProcThreadAttribute(
             attributes.pointer(),
@@ -256,6 +290,12 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
     line.push(0);
     let environment = environment(command)?;
     let mut information = PROCESS_INFORMATION::default();
+    // SAFETY: application/directory are NUL-terminated; line is a writable,
+    // bounded NUL-terminated buffer; environment is a double-NUL-terminated UTF-16
+    // block. All remain alive through this call. startup has the extended size,
+    // a live attribute list, and live inheritable standard handles, consistent
+    // with EXTENDED_STARTUPINFO_PRESENT and bInheritHandles=TRUE. information is
+    // writable output storage; its two handles are owned only on success.
     unsafe {
         check(CreateProcessW(
             application.as_ptr(),
@@ -266,7 +306,9 @@ pub(super) fn spawn(command: &Command, log: &File) -> Result<Child> {
             CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             environment.as_ptr().cast(),
             directory.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
-            &startup.StartupInfo,
+            // Keep the pointer derived from the whole extended allocation:
+            // Windows also reads lpAttributeList after the STARTUPINFOW prefix.
+            (&raw const startup).cast(),
             &mut information,
         ))?;
     }
@@ -361,13 +403,19 @@ mod tests {
         let pid = receiver
             .recv_timeout(Duration::from_secs(15))
             .expect("atomic spawn must publish child PID");
+        // SAFETY: OpenProcess accepts the fixture PID as a value, not a pointer.
+        // The returned synchronization handle is checked and uniquely owned.
         let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         assert!(!process.is_null(), "fixture child must still be alive");
         let process = Handle(process);
+        // SAFETY: process owns the checked handle opened with SYNCHRONIZE and
+        // remains alive across this non-consuming wait.
         assert_eq!(unsafe { WaitForSingleObject(process.0, 0) }, WAIT_TIMEOUT);
         parent.0.kill().unwrap();
         parent.0.wait().unwrap();
         assert_eq!(
+            // SAFETY: killing the parent does not close this process's separate
+            // synchronization handle to the child, which remains owned here.
             unsafe { WaitForSingleObject(process.0, 5000) },
             WAIT_OBJECT_0,
             "closing the crashed parent's sole job handle must terminate the child"

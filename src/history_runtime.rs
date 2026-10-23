@@ -431,10 +431,12 @@ impl HistoryRuntime {
         observation: &HistoryObservation,
         tasks: &[TaskRecord],
     ) -> io::Result<()> {
-        let mut git = self
-            .git_project_evidence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut git = self.git_project_evidence.lock().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Git project evidence state was interrupted; restart before registering projects",
+            )
+        })?;
         git.begin_collection();
         let descriptors = local_project_descriptors_with_resolver(tasks, observation, &mut git);
         if descriptors.is_empty() {
@@ -1840,6 +1842,56 @@ mod tests {
             restarted_group.project_label.as_deref(),
             Some("logical workspace")
         );
+    }
+
+    #[test]
+    fn poisoned_project_evidence_rejects_registration_without_changing_mappings() {
+        let directory = tempdir().unwrap();
+        let runtime = runtime(directory.path(), false);
+        let first_project = directory.path().join("first-project");
+        let next_project = directory.path().join("next-project");
+        fs::create_dir(&first_project).unwrap();
+        fs::create_dir(&next_project).unwrap();
+        let observation = sample_observation(at(30, 9, 0), 10);
+        runtime
+            .normalize_and_register_local_collection_observation(
+                &observation,
+                &[project_task(first_project)],
+            )
+            .1
+            .unwrap();
+        let mapping_path = runtime.project_mapping_store.path().unwrap().to_path_buf();
+        let committed = fs::read(&mapping_path).unwrap();
+
+        let evidence = &runtime.git_project_evidence;
+        thread::scope(|scope| {
+            let interrupted = scope.spawn(|| {
+                let mut evidence = evidence.lock().unwrap();
+                evidence.begin_collection();
+                panic!("interrupted while holding Git project evidence");
+            });
+            assert!(interrupted.join().is_err());
+        });
+        assert!(runtime.git_project_evidence.is_poisoned());
+
+        let tasks = [project_task(next_project)];
+        for _ in 0..2 {
+            let (normalized, registration) =
+                runtime.normalize_and_register_local_collection_observation(&observation, &tasks);
+            let error = registration.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("state was interrupted"));
+            assert_eq!(normalized.half_hour_buckets[0].token_usage.total_tokens, 10);
+            let prepared = runtime.prepare_local_collection_observation(&observation, &tasks);
+            assert!(
+                prepared.half_hour_buckets[0]
+                    .partial_reasons
+                    .contains(&PROJECT_MAPPING_REGISTRATION_FAILED_WARNING.to_owned())
+            );
+            assert_eq!(fs::read(&mapping_path).unwrap(), committed);
+        }
+        drop(runtime);
+        assert_eq!(fs::read(&mapping_path).unwrap(), committed);
     }
 
     #[test]

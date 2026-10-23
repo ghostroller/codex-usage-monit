@@ -383,6 +383,10 @@ pub fn prepare_remote_delta_page(
         }
     };
 
+    // Evidence is an optional performance cache. Publish it only after all
+    // fallible page preparation succeeds, and never replace that result with
+    // a cache write failure.
+    let _ = git_project_evidence.persist_completed_collection();
     Ok(PreparedRemoteDeltaPage {
         durable_page,
         inputs,
@@ -1623,6 +1627,73 @@ mod tests {
         let (retry_page, retry_payload) = retry.decode().unwrap();
         assert_eq!(retry_page.next_delta_cursor, first_page.next_delta_cursor);
         assert_eq!(retry_payload.stats.journal_records_scanned, 0);
+    }
+
+    #[test]
+    fn completed_export_persists_git_evidence_and_tolerates_cache_write_failure() {
+        for blocked_cache in [false, true] {
+            let (_directory, config, store, identity, now) = fixture();
+            let revisions = current_revisions();
+            let state_root = create_revision_state(&store, &identity, &revisions, now);
+            let cache_path = state_root.join(GIT_EVIDENCE_CACHE_FILE);
+            if blocked_cache {
+                fs::create_dir(&cache_path).unwrap();
+            }
+
+            let prepared = prepare_remote_delta_page(
+                &config,
+                &store,
+                &identity,
+                &revisions,
+                RedactionProfile::Redacted,
+                &request(now),
+                now,
+            )
+            .expect("optional Git cache persistence must not fail a prepared export");
+            let (_, payload) = prepared.decode().unwrap();
+            assert!(!payload.bucket_changes.is_empty());
+            assert!(prepared.inputs.stats.git_workspaces_probed > 0);
+            if blocked_cache {
+                assert!(cache_path.is_dir());
+            } else {
+                let cache: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+                assert!(!cache["entries"].as_object().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_export_after_live_collection_does_not_publish_git_evidence() {
+        let (directory, config, store, identity, now) = fixture();
+        let rollout = directory
+            .path()
+            .join("sessions/2026/08/30/rollout-remote.jsonl");
+        let contents = fs::read_to_string(&rollout).unwrap();
+        fs::write(&rollout, contents.replace("gpt-5.6-sol", &"x".repeat(257))).unwrap();
+        let revisions = current_revisions();
+        let mut request = request(now);
+        request.include_live = true;
+
+        assert!(matches!(
+            prepare_remote_delta_page(
+                &config,
+                &store,
+                &identity,
+                &revisions,
+                RedactionProfile::Redacted,
+                &request,
+                now,
+            ),
+            Err(RemoteDeltaPrepareError::Internal(_))
+        ));
+        let cache_path = revision_bound_state_root(&store, &revisions)
+            .unwrap()
+            .join(GIT_EVIDENCE_CACHE_FILE);
+        assert!(
+            !cache_path.exists(),
+            "an aggregate failure must not publish the preceding live probe's cache"
+        );
     }
 
     #[test]
